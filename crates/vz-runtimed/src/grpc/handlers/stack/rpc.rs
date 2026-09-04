@@ -87,18 +87,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             let mut projected = observed;
             for action in &apply_result.actions {
                 match action {
-                    Action::ServiceCreate { service_name }
-                    | Action::ServiceRecreate { service_name } => {
+                    Action::ServiceCreate { target, .. }
+                    | Action::ServiceRecreate { target, .. } => {
                         if let Some(status) = projected
                             .iter_mut()
-                            .find(|status| status.service_name == *service_name)
+                            .find(|status| status.replica == *target)
                         {
                             status.phase = ServicePhase::Pending;
                             status.last_error = None;
                             status.ready = false;
                         } else {
                             projected.push(ServiceObservedState {
-                                service_name: service_name.clone(),
+                                replica: target.clone(),
+                                applied_config_digest: None,
                                 phase: ServicePhase::Pending,
                                 container_id: None,
                                 failed_create_ownership: None,
@@ -107,10 +108,10 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                             });
                         }
                     }
-                    Action::ServiceRemove { service_name } => {
+                    Action::ServiceRemove { target, .. } => {
                         if let Some(status) = projected
                             .iter_mut()
-                            .find(|status| status.service_name == *service_name)
+                            .find(|status| status.replica == *target)
                         {
                             status.phase = ServicePhase::Stopped;
                             status.last_error = None;
@@ -158,20 +159,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             return Ok(stack_stream_response(events, None));
         }
 
-        let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-        if let Err(error) = std::fs::create_dir_all(&stack_dir) {
-            events.push(Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::InternalError,
-                format!(
-                    "failed to create stack runtime directory {}: {error}",
-                    stack_dir.display()
-                ),
-                Some(request_id.clone()),
-                BTreeMap::new(),
-            ))));
-            return Ok(stack_stream_response(events, None));
-        }
-
         let preview_store = match self.daemon.open_dedicated_state_store() {
             Ok(store) => store,
             Err(error) => {
@@ -179,7 +166,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 return Ok(stack_stream_response(events, None));
             }
         };
-        let apply_result = match apply(&spec, &preview_store, &health_statuses) {
+        let apply_result = match plan_apply(&spec, &preview_store, &health_statuses) {
             Ok(result) => result,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
@@ -228,6 +215,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             }
         };
         let runtime = DaemonContainerRuntime::new(self.daemon.clone());
+        let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
         let executor =
             match StackExecutor::new_scoped(runtime, exec_store, &stack_dir, workload_scope) {
                 Ok(executor) => executor,
@@ -353,6 +341,15 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        // Hold one daemon-wide per-stack lease across admission, stack-wide
+        // finalizer effects, claimed commit, and receipt persistence. Exact
+        // duplicate requests wait here and observe the first request's durable
+        // receipt instead of concurrently consuming the same active claim.
+        let teardown_finalizer_lock = self
+            .daemon
+            .teardown_finalizer_lock(&stack_name)
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let _teardown_finalizer_guard = teardown_finalizer_lock.lock_owned().await;
         let workload_scope = validate_stack_cleanup_request_scope(
             self.daemon.as_ref(),
             request.scope.as_ref(),
@@ -373,6 +370,135 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 &metadata,
                 &request_id,
             )?;
+        }
+
+        let teardown_request_digest = teardown_request_digest(
+            &stack_name,
+            &workload_scope,
+            &request_id,
+            request.dry_run,
+            request.remove_volumes,
+        );
+        let teardown_session_id = teardown_reconcile_session_id(&teardown_request_digest);
+        let (existing_teardown_session, existing_receipt) = self
+            .daemon
+            .with_state_store(|store| {
+                let exact = if request.dry_run {
+                    None
+                } else {
+                    store.load_reconcile_session(&teardown_session_id)?
+                };
+                let receipt = store
+                    .list_receipts_for_entity("stack", &stack_name)?
+                    .into_iter()
+                    .find(|receipt| {
+                        receipt.operation == "teardown_stack" && receipt.request_id == request_id
+                    });
+                if receipt.is_some() {
+                    return Ok((exact, receipt));
+                }
+                let active = store.load_active_reconcile_session(&stack_name)?;
+                if let Some(active) = active
+                    && exact
+                        .as_ref()
+                        .is_none_or(|session| session.session_id != active.session_id)
+                {
+                    return Err(StackError::Machine {
+                        code: MachineErrorCode::StateConflict,
+                        message: format!(
+                            "stack `{stack_name}` has active reconcile operation `{}`; resume that exact operation before teardown",
+                            active.operation_id
+                        ),
+                    });
+                }
+                if let Some(session) = &exact
+                    && (session.stack_name != stack_name
+                        || !vz_stack::matches_claimed_teardown_operation(
+                            &session.operation_id,
+                            &request_id,
+                        ))
+                {
+                    return Err(StackError::Machine {
+                        code: MachineErrorCode::StateConflict,
+                        message: format!(
+                            "teardown session `{teardown_session_id}` belongs to another stack or operation"
+                        ),
+                    });
+                }
+                Ok((exact, receipt))
+            })
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        if let Some(receipt) = existing_receipt {
+            if receipt.entity_type != "stack"
+                || receipt.entity_id != stack_name
+                || receipt.status != "success"
+                || receipt
+                    .metadata
+                    .get("request_digest")
+                    .and_then(serde_json::Value::as_str)
+                    != Some(teardown_request_digest.as_str())
+            {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::StateConflict,
+                    format!("request `{request_id}` is already bound to a different receipt"),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            let changed_actions = receipt
+                .metadata
+                .get("changed_actions")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        "persisted teardown receipt has invalid changed_actions".to_string(),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))
+                })?;
+            let removed_volumes = receipt
+                .metadata
+                .get("removed_volumes")
+                .and_then(serde_json::Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| {
+                    status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        "persisted teardown receipt has invalid removed_volumes".to_string(),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))
+                })?;
+            let event = teardown_stack_completion_event(
+                &request_id,
+                1,
+                runtime_v2::TeardownStackResponse {
+                    request_id: request_id.clone(),
+                    stack_name,
+                    changed_actions,
+                    removed_volumes,
+                },
+                &receipt.receipt_id,
+            );
+            return Ok(stack_stream_response(
+                vec![Ok(event)],
+                Some(&receipt.receipt_id),
+            ));
+        }
+        if let Some(session) = &existing_teardown_session
+            && session.status != vz_stack::ReconcileSessionStatus::Active
+        {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!(
+                    "teardown reconcile session `{}` is terminal without a final receipt; refusing unfenced stack-wide effect replay",
+                    session.session_id
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
         }
 
         let (desired, observed) = self
@@ -409,14 +535,29 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             disk_size_mb: None,
         };
         let health_statuses = HashMap::new();
-        let apply_result = match self.daemon.with_state_store(|store| {
-            if request.dry_run {
-                plan_apply(&empty_spec, store, &health_statuses)
+        let teardown_actions = match self.daemon.with_state_store(|store| {
+            if let Some(session) = &existing_teardown_session {
+                let actions = store.load_reconcile_session_actions(&session.session_id)?;
+                if actions.is_empty()
+                    || actions.iter().any(|action| {
+                        !matches!(action, Action::ServiceRemove { .. })
+                            || action.precondition().workload().stack_id != stack_name
+                    })
+                {
+                    return Err(StackError::Machine {
+                        code: MachineErrorCode::StateConflict,
+                        message: format!(
+                            "teardown session `{}` does not contain an exact remove-only action plan",
+                            session.session_id
+                        ),
+                    });
+                }
+                Ok(actions)
             } else {
-                apply(&empty_spec, store, &health_statuses)
+                Ok(plan_apply(&empty_spec, store, &health_statuses)?.actions)
             }
         }) {
-            Ok(result) => result,
+            Ok(actions) => actions,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
                 return Ok(stack_stream_response(events, None));
@@ -431,7 +572,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 runtime_v2::TeardownStackResponse {
                     request_id: request_id.clone(),
                     stack_name,
-                    changed_actions: apply_result.actions.len() as u32,
+                    changed_actions: teardown_actions.len() as u32,
                     removed_volumes: 0,
                 },
                 "",
@@ -439,27 +580,25 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             return Ok(stack_stream_response(events, None));
         }
 
-        if !apply_result.actions.is_empty() {
-            sequence += 1;
-            events.push(Ok(teardown_stack_progress_event(
-                &request_id,
-                sequence,
-                "executing",
-                "executing stack teardown actions",
-            )));
-            let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-            if let Err(error) = std::fs::create_dir_all(&stack_dir) {
-                events.push(Err(status_from_machine_error(MachineError::new(
-                    MachineErrorCode::InternalError,
-                    format!(
-                        "failed to create stack runtime directory {}: {error}",
-                        stack_dir.display()
-                    ),
-                    Some(request_id.clone()),
-                    BTreeMap::new(),
-                ))));
-                return Ok(stack_stream_response(events, None));
-            }
+        if teardown_actions.is_empty() {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                "non-dry teardown with no service actions requires a durable stack-level finalizer claim"
+                    .to_string(),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))));
+            return Ok(stack_stream_response(events, None));
+        }
+
+        sequence += 1;
+        events.push(Ok(teardown_stack_progress_event(
+            &request_id,
+            sequence,
+            "executing",
+            "executing stack teardown actions",
+        )));
+        let pending_teardown = {
             let exec_store = match self.daemon.open_dedicated_state_store() {
                 Ok(store) => store,
                 Err(error) => {
@@ -468,7 +607,8 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 }
             };
             let runtime = DaemonContainerRuntime::new(self.daemon.clone());
-            let mut executor = match StackExecutor::new_scoped_for_cleanup(
+            let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
+            let executor = match StackExecutor::new_scoped_for_cleanup(
                 runtime,
                 exec_store,
                 &stack_dir,
@@ -480,9 +620,11 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     return Ok(stack_stream_response(events, None));
                 }
             };
-            let execution_result = match executor.execute_with_operation(
+            let mut executor = executor;
+            let admission = match executor.begin_claimed_teardown_batch(
                 &empty_spec,
-                &apply_result.actions,
+                &teardown_actions,
+                &teardown_session_id,
                 &request_id,
                 0,
             ) {
@@ -492,13 +634,33 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     return Ok(stack_stream_response(events, None));
                 }
             };
-            if let Some(response) =
-                teardown_execution_failure_response(&execution_result, &request_id, &mut events)
-            {
-                // Do not remove volumes or persist StackDestroyed/a success receipt after a
-                // partially failed teardown.
-                return Ok(response);
+            match admission {
+                vz_stack::ClaimedTeardownAdmission::Ready(pending) => pending,
+                vz_stack::ClaimedTeardownAdmission::Failed(execution_result) => {
+                    events.push(Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::BackendUnavailable,
+                        execution_result
+                            .errors
+                            .first()
+                            .map(|(_, error)| error.clone())
+                            .unwrap_or_else(|| {
+                                "claimed stack teardown did not commit every exact remove outcome"
+                                    .to_string()
+                            }),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))));
+                    return Ok(stack_stream_response(events, None));
+                }
             }
+        };
+
+        if let Err(error) = self
+            .daemon
+            .with_state_store(|store| store.save_desired_state(&stack_name, &empty_spec))
+        {
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(stack_stream_response(events, None));
         }
 
         sequence += 1;
@@ -538,7 +700,49 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             0
         };
 
-        let changed_actions = apply_result.actions.len() as u32;
+        let commit_store = match self.daemon.open_dedicated_state_store() {
+            Ok(store) => store,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
+        let commit_runtime = DaemonContainerRuntime::new(self.daemon.clone());
+        let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
+        let mut commit_executor = match StackExecutor::new_scoped_for_cleanup(
+            commit_runtime,
+            commit_store,
+            &stack_dir,
+            workload_scope,
+        ) {
+            Ok(executor) => executor,
+            Err(error) => {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
+        let execution_result =
+            match commit_executor.commit_claimed_teardown_batch(*pending_teardown) {
+                Ok(result) => result,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
+        if !execution_result.all_succeeded()
+            || execution_result.outcomes.len() != teardown_actions.len()
+        {
+            events.push(Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                "claimed teardown commit did not preserve every successful remove outcome"
+                    .to_string(),
+                Some(request_id.clone()),
+                BTreeMap::new(),
+            ))));
+            return Ok(stack_stream_response(events, None));
+        }
+
+        let changed_actions = teardown_actions.len() as u32;
         let removed_volumes = removed_volumes as u32;
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
@@ -568,6 +772,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                         status: "success".to_string(),
                         created_at: now,
                         metadata: receipt_stack_teardown_metadata(
+                            &teardown_request_digest,
                             changed_actions,
                             removed_volumes,
                         )?,
@@ -742,7 +947,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
         } else {
             observed
                 .iter()
-                .filter(|entry| entry.service_name == service_filter)
+                .filter(|entry| entry.replica.service_name == service_filter)
                 .collect()
         };
         if targets.is_empty() {
@@ -771,13 +976,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     status_from_stack_error(
                         StackError::Network(format!(
                             "failed to load logs for service {}: {error}",
-                            entry.service_name
+                            entry.replica.display_name()
                         )),
                         &request_id,
                     )
                 })?;
             logs.push(runtime_v2::StackServiceLog {
-                service_name: entry.service_name.clone(),
+                service_name: entry.replica.display_name(),
                 output: tail_output(&output, tail),
             });
         }
@@ -861,9 +1066,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             if let Err(status) = execute_stack_service_action(
                 self.daemon.clone(),
                 &spec,
-                Action::ServiceRemove {
-                    service_name: service_name.clone(),
-                },
+                TargetedActionKind::Remove,
+                ServiceReplicaKey::first(service_name.clone())
+                    .map_err(|error| status_from_stack_error(error, &request_id))?,
                 workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::StateConflict,
@@ -879,7 +1084,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Ok(store
                     .load_observed_state(&stack_name)?
                     .into_iter()
-                    .find(|service| service.service_name == service_name)
+                    .find(|service| {
+                        service.replica.service_name == service_name && service.replica.index() == 1
+                    })
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
             .map_err(|error| status_from_stack_error(error, &request_id))
@@ -1006,9 +1213,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             if let Err(status) = execute_stack_service_action(
                 self.daemon.clone(),
                 &spec,
-                Action::ServiceCreate {
-                    service_name: service_name.clone(),
-                },
+                TargetedActionKind::Create,
+                ServiceReplicaKey::first(service_name.clone())
+                    .map_err(|error| status_from_stack_error(error, &request_id))?,
                 workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::InternalError,
@@ -1024,7 +1231,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Ok(store
                     .load_observed_state(&stack_name)?
                     .into_iter()
-                    .find(|service| service.service_name == service_name)
+                    .find(|service| {
+                        service.replica.service_name == service_name && service.replica.index() == 1
+                    })
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
             .map_err(|error| status_from_stack_error(error, &request_id))
@@ -1149,9 +1358,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
         if let Err(status) = execute_stack_service_action(
             self.daemon.clone(),
             &spec,
-            Action::ServiceRecreate {
-                service_name: service_name.clone(),
-            },
+            TargetedActionKind::Recreate,
+            ServiceReplicaKey::first(service_name.clone())
+                .map_err(|error| status_from_stack_error(error, &request_id))?,
             workload_scope,
             &request_id,
             MachineErrorCode::InternalError,
@@ -1166,7 +1375,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Ok(store
                     .load_observed_state(&stack_name)?
                     .into_iter()
-                    .find(|service| service.service_name == service_name)
+                    .find(|service| {
+                        service.replica.service_name == service_name && service.replica.index() == 1
+                    })
                     .unwrap_or_else(|| default_stopped_service(&service_name)))
             })
             .map_err(|error| status_from_stack_error(error, &request_id))
@@ -1292,9 +1503,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             execute_stack_service_action(
                 self.daemon.clone(),
                 &run_spec,
-                Action::ServiceCreate {
-                    service_name: run_service_name.clone(),
-                },
+                TargetedActionKind::Create,
+                ServiceReplicaKey::first(run_service_name.clone())
+                    .map_err(|error| status_from_stack_error(error, &request_id))?,
                 workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::InternalError,
@@ -1432,9 +1643,9 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             execute_stack_service_action(
                 self.daemon.clone(),
                 &run_spec,
-                Action::ServiceRemove {
-                    service_name: run_service_name.clone(),
-                },
+                TargetedActionKind::Remove,
+                ServiceReplicaKey::first(run_service_name.clone())
+                    .map_err(|error| status_from_stack_error(error, &request_id))?,
                 workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::StateConflict,
@@ -1604,7 +1815,7 @@ mod tests {
 
     #[tokio::test]
     async fn teardown_execution_failure_returns_only_a_terminal_error() {
-        let result = ExecutionResult {
+        let result = vz_stack::ExecutionResult {
             succeeded: 1,
             failed: 2,
             errors: vec![
@@ -1612,6 +1823,7 @@ mod tests {
                 ("worker".to_string(), "remove failed".to_string()),
             ],
             skipped_mounts: Vec::new(),
+            outcomes: Vec::new(),
         };
         let mut events = vec![Ok(teardown_stack_progress_event(
             "req-teardown-failure",
@@ -1660,7 +1872,7 @@ mod tests {
         let mut events = Vec::new();
         assert!(
             teardown_execution_failure_response(
-                &ExecutionResult::default(),
+                &vz_stack::ExecutionResult::default(),
                 "req-teardown-success",
                 &mut events,
             )
@@ -1671,7 +1883,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn teardown_runtime_shutdown_failure_has_no_success_side_effects() {
+    async fn zero_action_teardown_refuses_unfenced_runtime_and_volume_mutation() {
         let (tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-failure";
         let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
@@ -1691,8 +1903,6 @@ mod tests {
             .ensure_stack_runtime(stack_name, Vec::new(), Default::default())
             .await
             .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
-        daemon.manager().backend().fail_next_shared_vm_shutdown();
-
         let volume_path = tmp
             .path()
             .join("runtime")
@@ -1742,18 +1952,18 @@ mod tests {
         }
 
         let error = terminal_error
-            .unwrap_or_else(|| panic!("shutdown failure must terminate the teardown stream"));
-        assert_eq!(error.code(), tonic::Code::Unavailable);
-        assert!(error.message().contains("shutdown_sandbox failed"));
+            .unwrap_or_else(|| panic!("unfenced zero-action teardown must terminate the stream"));
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("stack-level finalizer claim"));
         assert!(error.message().contains("req-shutdown-failure"));
-        assert!(phases.iter().any(|phase| phase == "shutting_down_runtime"));
+        assert!(!phases.iter().any(|phase| phase == "shutting_down_runtime"));
         assert!(!phases.iter().any(|phase| phase == "removing_volumes"));
         assert!(!phases.iter().any(|phase| phase == "persisting"));
         assert!(!completion_seen);
         assert!(volume_path.exists(), "volume deletion must not run");
         assert!(
             daemon.manager().has_stack_runtime(stack_name),
-            "failed shutdown should leave the runtime active"
+            "unfenced teardown must leave the runtime active"
         );
 
         let (receipts, stack_events) = daemon
@@ -1776,21 +1986,311 @@ mod tests {
         );
     }
 
+    #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_finalizer_failure_leaves_active_claim_for_exact_retry() {
+        let (tmp, daemon) = stack_test_daemon();
+        let stack_name = "shutdown-retry";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
+        let service = StackServiceImpl::new(daemon.clone());
+        seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
+
+        let volume_path = tmp
+            .path()
+            .join("runtime")
+            .join("stacks")
+            .join(stack_name)
+            .join("volumes")
+            .join("data");
+        std::fs::create_dir_all(&volume_path).unwrap();
+        daemon.manager().backend().fail_next_shared_vm_shutdown();
+        let request = || runtime_v2::TeardownStackRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-shutdown-retry".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: stack_name.to_string(),
+            remove_volumes: true,
+            dry_run: false,
+            scope: Some(wire_scope.clone()),
+        };
+
+        let first = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request()),
+        )
+        .await
+        .expect("first teardown stream");
+        let mut first_stream = first.into_inner();
+        let mut first_error = None;
+        while let Some(item) = first_stream.next().await {
+            if let Err(error) = item {
+                first_error = Some(error);
+            }
+        }
+        let first_error = first_error.expect("injected shutdown failure");
+        assert_eq!(
+            first_error.code(),
+            tonic::Code::Unavailable,
+            "unexpected teardown failure: {first_error}"
+        );
+        assert!(volume_path.exists());
+        let active = daemon
+            .with_state_store(|store| store.load_active_reconcile_session(stack_name))
+            .unwrap()
+            .expect("teardown claims remain active");
+        assert!(
+            vz_stack::matches_claimed_teardown_operation(
+                &active.operation_id,
+                "req-shutdown-retry"
+            ),
+            "durable teardown operation must remain correlated to its request"
+        );
+        let changed_option_error = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(runtime_v2::TeardownStackRequest {
+                remove_volumes: false,
+                ..request()
+            }),
+        )
+        .await
+        .expect_err("changed finalizer option must not reuse active teardown claims");
+        assert_eq!(changed_option_error.code(), tonic::Code::FailedPrecondition);
+        assert!(volume_path.exists());
+
+        let retry = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request()),
+        )
+        .await
+        .expect("exact teardown retry stream");
+        let mut retry_stream = retry.into_inner();
+        let mut completion = false;
+        while let Some(item) = retry_stream.next().await {
+            let event = item.expect("exact retry must succeed");
+            completion |= matches!(
+                event.payload,
+                Some(runtime_v2::teardown_stack_event::Payload::Completion(_))
+            );
+        }
+        assert!(completion);
+        assert!(!volume_path.exists());
+        assert!(!daemon.manager().has_stack_runtime(stack_name));
+        assert!(
+            daemon
+                .with_state_store(|store| store.load_active_reconcile_session(stack_name))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn concurrent_identical_teardowns_serialize_the_finalizer_and_replay_receipt() {
+        let (_tmp, daemon) = stack_test_daemon();
+        let stack_name = "concurrent-shutdown";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
+        seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
+
+        let held_finalizer = daemon
+            .teardown_finalizer_lock(stack_name)
+            .expect("stack finalizer lock")
+            .lock_owned()
+            .await;
+        let baseline_shutdowns = daemon.manager().backend().shared_vm_shutdown_count();
+        let spawn_request = |daemon: Arc<RuntimeDaemon>, scope| {
+            tokio::spawn(async move {
+                let service = StackServiceImpl::new(daemon);
+                let response = runtime_v2::stack_service_server::StackService::teardown_stack(
+                    &service,
+                    tonic::Request::new(runtime_v2::TeardownStackRequest {
+                        metadata: Some(runtime_v2::RequestMetadata {
+                            request_id: "req-concurrent-shutdown".to_string(),
+                            idempotency_key: String::new(),
+                            trace_id: String::new(),
+                        }),
+                        stack_name: "concurrent-shutdown".to_string(),
+                        remove_volumes: false,
+                        dry_run: false,
+                        scope: Some(scope),
+                    }),
+                )
+                .await
+                .expect("teardown stream");
+                let receipt_id = response
+                    .metadata()
+                    .get("x-receipt-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_string);
+                let mut stream = response.into_inner();
+                let mut completed = false;
+                while let Some(item) = stream.next().await {
+                    let event = item.expect("teardown event");
+                    completed |= matches!(
+                        event.payload,
+                        Some(runtime_v2::teardown_stack_event::Payload::Completion(_))
+                    );
+                }
+                (receipt_id, completed)
+            })
+        };
+        let first = spawn_request(daemon.clone(), wire_scope.clone());
+        let second = spawn_request(daemon.clone(), wire_scope);
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        assert!(
+            !first.is_finished() && !second.is_finished(),
+            "both requests must wait behind the shared finalizer lock"
+        );
+        drop(held_finalizer);
+
+        let (first_receipt, first_completed) = first.await.expect("first teardown task");
+        let (second_receipt, second_completed) = second.await.expect("second teardown task");
+        assert!(first_completed && second_completed);
+        assert_eq!(first_receipt, second_receipt);
+        assert!(first_receipt.is_some());
+        assert_eq!(
+            daemon.manager().backend().shared_vm_shutdown_count(),
+            baseline_shutdowns + 1,
+            "the duplicate request must replay the receipt without rerunning broad shutdown"
+        );
+        let receipts = daemon
+            .with_state_store(|store| store.list_receipts_for_entity("stack", stack_name))
+            .expect("list teardown receipts");
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.operation == "teardown_stack")
+                .count(),
+            1
+        );
+    }
+
     #[tokio::test]
-    async fn teardown_runtime_shutdown_succeeds_on_current_thread_runtime() {
+    async fn teardown_rejects_interrupted_apply_without_touching_its_claim() {
+        let (tmp, daemon) = stack_test_daemon();
+        let stack_name = "interrupted-apply";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
+        let spec = parse_stack_spec(
+            stack_name,
+            "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
+            ".",
+        )
+        .expect("stack spec");
+        let session_id = "rs-interrupted-apply";
+        let operation_id = "req-original-apply";
+        let actions = daemon
+            .with_state_store(|store| {
+                store.save_desired_state(stack_name, &spec)?;
+                let actions = plan_apply(&spec, store, &HashMap::new())?.actions;
+                let now = current_unix_secs();
+                let session = vz_stack::ReconcileSession {
+                    session_id: session_id.to_string(),
+                    stack_name: stack_name.to_string(),
+                    operation_id: operation_id.to_string(),
+                    status: vz_stack::ReconcileSessionStatus::Active,
+                    actions_hash: vz_stack::compute_actions_hash(&actions),
+                    next_action_index: 0,
+                    total_actions: actions.len(),
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                };
+                store.create_reconcile_batch(&session, &actions)?;
+                let claims = store.start_reconcile_batch(
+                    session_id,
+                    stack_name,
+                    operation_id,
+                    0,
+                    &actions,
+                )?;
+                assert_eq!(claims.len(), 1);
+                Ok(actions)
+            })
+            .expect("seed interrupted apply claim");
+        let stack_dir = tmp.path().join("runtime").join("stacks").join(stack_name);
+        assert!(!stack_dir.exists());
+
+        let service = StackServiceImpl::new(daemon.clone());
+        let error = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(runtime_v2::TeardownStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-teardown".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                remove_volumes: true,
+                dry_run: false,
+                scope: Some(wire_scope),
+            }),
+        )
+        .await
+        .expect_err("teardown must not reinterpret an interrupted apply claim");
+
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains(operation_id));
+        let replayed = daemon
+            .with_state_store(|store| {
+                let active = store
+                    .load_active_reconcile_session(stack_name)?
+                    .expect("original active session");
+                assert_eq!(active.session_id, session_id);
+                assert_eq!(active.operation_id, operation_id);
+                assert_eq!(active.next_action_index, 0);
+                assert_eq!(store.load_reconcile_session_actions(session_id)?, actions);
+                assert_eq!(store.load_desired_state(stack_name)?, Some(spec.clone()));
+                assert!(store.load_observed_state(stack_name)?.is_empty());
+                store.start_reconcile_batch(session_id, stack_name, operation_id, 0, &actions)
+            })
+            .expect("original claim remains exactly replayable");
+        assert_eq!(replayed.len(), 1);
+        assert!(!stack_dir.exists());
+    }
+
+    #[tokio::test]
+    async fn teardown_receipt_replay_is_read_only_even_with_newer_active_apply() {
         let (_tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-success";
         let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
-        let empty_spec = StackSpec {
-            name: stack_name.to_string(),
-            services: Vec::new(),
-            networks: Vec::new(),
-            volumes: Vec::new(),
-            secrets: Vec::new(),
-            disk_size_mb: None,
-        };
+        let workload_scope =
+            vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope).unwrap();
+        let spec = parse_stack_spec(
+            stack_name,
+            "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
+            ".",
+        )
+        .unwrap();
+        let request_id = "req-shutdown-success";
+        let request_digest =
+            teardown_request_digest(stack_name, &workload_scope, request_id, false, false);
         daemon
-            .with_state_store(|store| store.save_desired_state(stack_name, &empty_spec))
+            .with_state_store(|store| {
+                store.save_desired_state(stack_name, &spec)?;
+                let actions = plan_apply(&spec, store, &HashMap::new())?.actions;
+                let session = vz_stack::ReconcileSession {
+                    session_id: "rs-newer-apply".to_string(),
+                    stack_name: stack_name.to_string(),
+                    operation_id: "req-newer-apply".to_string(),
+                    status: vz_stack::ReconcileSessionStatus::Active,
+                    actions_hash: vz_stack::compute_actions_hash(&actions),
+                    next_action_index: 0,
+                    total_actions: actions.len(),
+                    started_at: 10,
+                    updated_at: 10,
+                    completed_at: None,
+                };
+                store.create_reconcile_batch(&session, &actions)?;
+                store.save_receipt(&Receipt {
+                    receipt_id: "receipt-shutdown-success".to_string(),
+                    operation: "teardown_stack".to_string(),
+                    entity_id: stack_name.to_string(),
+                    entity_type: "stack".to_string(),
+                    request_id: request_id.to_string(),
+                    status: "success".to_string(),
+                    created_at: 9,
+                    metadata: receipt_stack_teardown_metadata(&request_digest, 2, 0)?,
+                })
+            })
             .unwrap_or_else(|error| panic!("persist desired stack: {error}"));
         daemon
             .manager()
@@ -1799,11 +2299,30 @@ mod tests {
             .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
 
         let service = StackServiceImpl::new(daemon.clone());
+        for (dry_run, remove_volumes) in [(false, true), (true, false)] {
+            let error = runtime_v2::stack_service_server::StackService::teardown_stack(
+                &service,
+                tonic::Request::new(runtime_v2::TeardownStackRequest {
+                    metadata: Some(runtime_v2::RequestMetadata {
+                        request_id: request_id.to_string(),
+                        idempotency_key: String::new(),
+                        trace_id: String::new(),
+                    }),
+                    stack_name: stack_name.to_string(),
+                    remove_volumes,
+                    dry_run,
+                    scope: Some(wire_scope.clone()),
+                }),
+            )
+            .await
+            .expect_err("receipt replay requires the exact teardown option tuple");
+            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        }
         let response = runtime_v2::stack_service_server::StackService::teardown_stack(
             &service,
             tonic::Request::new(runtime_v2::TeardownStackRequest {
                 metadata: Some(runtime_v2::RequestMetadata {
-                    request_id: "req-shutdown-success".to_string(),
+                    request_id: request_id.to_string(),
                     idempotency_key: String::new(),
                     trace_id: String::new(),
                 }),
@@ -1815,21 +2334,27 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("teardown stream should start: {error}"));
-        assert!(response.metadata().get("x-receipt-id").is_some());
+        assert_eq!(
+            response
+                .metadata()
+                .get("x-receipt-id")
+                .and_then(|value| value.to_str().ok()),
+            Some("receipt-shutdown-success")
+        );
 
         let mut stream = response.into_inner();
-        let mut completion_seen = false;
+        let mut completion = None;
         while let Some(item) = stream.next().await {
             let event = item.unwrap_or_else(|error| panic!("teardown should succeed: {error}"));
-            if matches!(
-                event.payload,
-                Some(runtime_v2::teardown_stack_event::Payload::Completion(_))
-            ) {
-                completion_seen = true;
+            if let Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) = event.payload
+            {
+                completion = done.response;
             }
         }
-        assert!(completion_seen);
-        assert!(!daemon.manager().has_stack_runtime(stack_name));
+        let completion = completion.expect("stored completion response");
+        assert_eq!(completion.changed_actions, 2);
+        assert_eq!(completion.removed_volumes, 0);
+        assert!(daemon.manager().has_stack_runtime(stack_name));
 
         let (receipts, stack_events) = daemon
             .with_state_store(|store| {
@@ -1839,16 +2364,19 @@ mod tests {
                 ))
             })
             .unwrap_or_else(|error| panic!("inspect teardown persistence: {error}"));
-        assert!(
+        assert_eq!(
             receipts
                 .iter()
-                .any(|receipt| receipt.operation == "teardown_stack")
+                .filter(|receipt| receipt.operation == "teardown_stack")
+                .count(),
+            1
         );
-        assert!(
-            stack_events
-                .iter()
-                .any(|event| matches!(event, StackEvent::StackDestroyed { .. }))
-        );
+        assert!(stack_events.is_empty());
+        let active = daemon
+            .with_state_store(|store| store.load_active_reconcile_session(stack_name))
+            .unwrap()
+            .unwrap();
+        assert_eq!(active.operation_id, "req-newer-apply");
     }
 
     #[test]
@@ -1924,11 +2452,90 @@ services:
     #[test]
     fn default_stopped_service_uses_stopped_phase() {
         let service = default_stopped_service("api");
-        assert_eq!(service.service_name, "api");
+        assert_eq!(service.replica.service_name, "api");
         assert_eq!(service.phase, ServicePhase::Stopped);
         assert_eq!(service.container_id, None);
         assert_eq!(service.last_error, None);
         assert!(!service.ready);
+    }
+
+    #[test]
+    fn stack_status_projection_preserves_base_service_and_exact_replica_index() {
+        let observed = [1, 2].map(|replica_index| ServiceObservedState {
+            replica: ServiceReplicaKey::new("web", replica_index).unwrap(),
+            applied_config_digest: None,
+            phase: ServicePhase::Running,
+            container_id: Some(format!("ctr-web-{replica_index}")),
+            failed_create_ownership: None,
+            last_error: None,
+            ready: true,
+        });
+
+        let statuses = observed
+            .iter()
+            .map(stack_status_from_observed)
+            .collect::<Vec<_>>();
+        assert_eq!(statuses[0].service_name, "web");
+        assert_eq!(statuses[0].replica_index, 1);
+        assert_eq!(statuses[1].service_name, "web");
+        assert_eq!(statuses[1].replica_index, 2);
+    }
+
+    #[test]
+    fn targeted_session_identity_binds_request_action_and_exact_replica() {
+        let api_one = ServiceReplicaKey::new("api", 1).unwrap();
+        let api_two = ServiceReplicaKey::new("api", 2).unwrap();
+        let expected =
+            targeted_reconcile_session_id("demo", &api_one, TargetedActionKind::Create, "req-1");
+
+        assert_eq!(
+            targeted_reconcile_session_id("demo", &api_one, TargetedActionKind::Create, "req-1"),
+            expected
+        );
+        assert_ne!(
+            targeted_reconcile_session_id("demo", &api_two, TargetedActionKind::Create, "req-1"),
+            expected
+        );
+        assert_ne!(
+            targeted_reconcile_session_id("demo", &api_one, TargetedActionKind::Remove, "req-1"),
+            expected
+        );
+        assert_ne!(
+            targeted_reconcile_session_id("other", &api_one, TargetedActionKind::Create, "req-1"),
+            expected
+        );
+        assert_ne!(
+            targeted_reconcile_session_id("demo", &api_one, TargetedActionKind::Create, "req-2"),
+            expected
+        );
+    }
+
+    #[test]
+    fn teardown_session_identity_binds_stack_and_request() {
+        let (_, daemon) = stack_test_daemon();
+        let scope = seed_owned_stack_topology(daemon.as_ref(), "demo");
+        let scope = vz_runtime_translate::machine_workload_scope_from_proto(&scope).unwrap();
+        let expected = teardown_request_digest("demo", &scope, "req-1", false, false);
+        assert_eq!(
+            teardown_request_digest("demo", &scope, "req-1", false, false),
+            expected
+        );
+        assert_ne!(
+            teardown_request_digest("demo", &scope, "req-2", false, false),
+            expected
+        );
+        assert_ne!(
+            teardown_request_digest("demo", &scope, "req-1", false, true),
+            expected
+        );
+        assert_ne!(
+            teardown_request_digest("demo", &scope, "req-1", true, false),
+            expected
+        );
+        assert_eq!(
+            teardown_reconcile_session_id(&expected),
+            teardown_reconcile_session_id(&expected)
+        );
     }
 
     #[test]
@@ -1937,7 +2544,8 @@ services:
             "req-1".to_string(),
             "demo".to_string(),
             ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: ServiceReplicaKey::first("web").unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web-1".to_string()),
                 failed_create_ownership: None,
@@ -2275,6 +2883,46 @@ services:
         wire_scope
     }
 
+    async fn seed_running_stack_service(
+        daemon: Arc<RuntimeDaemon>,
+        stack_name: &str,
+        wire_scope: &runtime_v2::MachineWorkloadScope,
+    ) {
+        daemon
+            .manager()
+            .backend()
+            .enable_exact_generation_lifecycle();
+        let spec = parse_stack_spec(
+            stack_name,
+            "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
+            ".",
+        )
+        .expect("stack spec");
+        daemon
+            .with_state_store(|store| store.save_desired_state(stack_name, &spec))
+            .expect("save desired stack state");
+        let service = StackServiceImpl::new(daemon.clone());
+        let response = runtime_v2::stack_service_server::StackService::start_stack_service(
+            &service,
+            tonic::Request::new(runtime_v2::StackServiceActionRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: format!("req-{stack_name}-start"),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                service_name: "web".to_string(),
+                scope: Some(wire_scope.clone()),
+            }),
+        )
+        .await
+        .expect("start service stream");
+        let completion = read_stack_service_action_completion(response).await;
+        let observed = completion.service.expect("started service status");
+        assert_eq!(observed.phase, "running");
+        assert!(!observed.container_id.is_empty());
+    }
+
     async fn read_stack_service_action_completion(
         response: Response<StackServiceActionEventStream>,
     ) -> runtime_v2::StackServiceActionResponse {
@@ -2310,7 +2958,8 @@ services:
                 store.save_observed_state(
                     "demo",
                     &ServiceObservedState {
-                        service_name: "web".to_string(),
+                        replica: ServiceReplicaKey::first("web").unwrap(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Stopped,
                         container_id: None,
                         failed_create_ownership: None,
@@ -2358,7 +3007,8 @@ services:
                 store.save_observed_state(
                     "demo",
                     &ServiceObservedState {
-                        service_name: "web".to_string(),
+                        replica: ServiceReplicaKey::first("web").unwrap(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Running,
                         container_id: Some("ctr-web-1".to_string()),
                         failed_create_ownership: None,

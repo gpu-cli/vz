@@ -76,6 +76,8 @@ pub(crate) struct ApplyStackRequest {
 #[derive(Debug, Serialize, ToSchema)]
 pub(crate) struct StackServiceStatusPayload {
     pub(crate) service_name: String,
+    #[schema(minimum = 1)]
+    pub(crate) replica_index: u32,
     pub(crate) phase: String,
     pub(crate) ready: bool,
     pub(crate) container_id: String,

@@ -54,8 +54,9 @@ struct StackApplyReceiptMetadata {
 }
 
 #[derive(Debug, Serialize)]
-struct StackTeardownReceiptMetadata {
+struct StackTeardownReceiptMetadata<'a> {
     event_type: &'static str,
+    request_digest: &'a str,
     changed_actions: u32,
     removed_volumes: u32,
 }
@@ -153,11 +154,13 @@ pub(in crate::grpc) fn receipt_stack_apply_metadata(
 }
 
 pub(in crate::grpc) fn receipt_stack_teardown_metadata(
+    request_digest: &str,
     changed_actions: u32,
     removed_volumes: u32,
 ) -> Result<Value, StackError> {
     metadata_value(StackTeardownReceiptMetadata {
         event_type: "stack_destroyed",
+        request_digest,
         changed_actions,
         removed_volumes,
     })

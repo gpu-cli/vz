@@ -536,7 +536,9 @@ fn full_pipeline_up_then_down() {
     let scope = install_planning_authority(&store, &spec.name);
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
-    let executor = StackExecutor::new_scoped(runtime, exec_store, dir.path(), scope).unwrap();
+    let stack_data_dir = dir.path().join("runtime").join("stacks").join(&spec.name);
+    assert!(!stack_data_dir.exists());
+    let executor = StackExecutor::new_scoped(runtime, exec_store, &stack_data_dir, scope).unwrap();
     let mut orchestrator = StackOrchestrator::new(
         executor,
         store,
@@ -825,7 +827,9 @@ fn port_allocation_tracked_through_lifecycle() {
     let scope = install_planning_authority(&store, &spec.name);
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
-    let executor = StackExecutor::new_scoped(runtime, exec_store, dir.path(), scope).unwrap();
+    let stack_data_dir = dir.path().join("runtime").join("stacks").join(&spec.name);
+    assert!(!stack_data_dir.exists());
+    let executor = StackExecutor::new_scoped(runtime, exec_store, &stack_data_dir, scope).unwrap();
     let mut orchestrator = StackOrchestrator::new(
         executor,
         store,

@@ -5,9 +5,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use vz_runtime_contract::{
-    Build, BuildSpec, BuildState, ContainerInfo, ContainerLogs, ContainerStatus, Event, EventScope,
-    ExecConfig, ExecOutput, ImageInfo, PortMapping, PruneResult, RunConfig, RuntimeBackend,
-    RuntimeCapabilities, RuntimeError, StackResourceHint,
+    Build, BuildSpec, BuildState, ContainerCreateReceipt, ContainerGenerationInspection,
+    ContainerGenerationOwnership, ContainerGenerationReleaseOutcome, ContainerGenerationScope,
+    ContainerInfo, ContainerLogs, ContainerStatus, Event, EventScope, ExecConfig, ExecOutput,
+    GenerationCleanupOutcome, ImageInfo, OwnedCreateError, PortMapping, PruneResult, RunConfig,
+    RuntimeBackend, RuntimeCapabilities, RuntimeError, StackResourceHint,
 };
 
 #[cfg(target_os = "macos")]
@@ -29,13 +31,23 @@ struct MockBuildRecord {
     next_event_id: u64,
 }
 
+#[derive(Debug, Clone)]
+struct MockGenerationRecord {
+    ownership: ContainerGenerationOwnership,
+    published: bool,
+}
+
 #[derive(Debug, Default)]
 pub struct TestRuntimeBackend {
     next_container_seq: AtomicU64,
     next_build_seq: AtomicU64,
+    next_generation_seq: AtomicU64,
+    exact_generation_supported: AtomicBool,
     fail_next_shared_vm_shutdown: AtomicBool,
+    shared_vm_shutdown_count: AtomicU64,
     shared_vms: Mutex<HashSet<String>>,
     containers: Mutex<HashMap<String, MockContainerRecord>>,
+    generations: Mutex<HashMap<String, MockGenerationRecord>>,
     live_exec_sessions: Mutex<HashSet<String>>,
     builds: Mutex<HashMap<String, MockBuildRecord>>,
 }
@@ -44,6 +56,17 @@ impl TestRuntimeBackend {
     #[cfg(test)]
     pub(crate) fn fail_next_shared_vm_shutdown(&self) {
         self.fail_next_shared_vm_shutdown
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared_vm_shutdown_count(&self) -> u64 {
+        self.shared_vm_shutdown_count.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn enable_exact_generation_lifecycle(&self) {
+        self.exact_generation_supported
             .store(true, Ordering::SeqCst);
     }
 
@@ -126,6 +149,33 @@ impl TestRuntimeBackend {
             .map_err(|_| Self::lock_poisoned_error("containers"))?;
         containers.insert(container_id.clone(), record);
         Ok(container_id)
+    }
+
+    fn cleanup_generation_internal(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+    ) -> Result<GenerationCleanupOutcome, RuntimeError> {
+        ownership.validate().map_err(RuntimeError::InvalidConfig)?;
+        let mut generations = self
+            .generations
+            .lock()
+            .map_err(|_| Self::lock_poisoned_error("generations"))?;
+        let Some(record) = generations.get(&ownership.container_id) else {
+            return Ok(GenerationCleanupOutcome::AlreadyAbsent);
+        };
+        if record.ownership != *ownership {
+            return Err(RuntimeError::InvalidConfig(
+                "exact container generation ownership does not match test backend state"
+                    .to_string(),
+            ));
+        }
+        generations.remove(&ownership.container_id);
+        drop(generations);
+        self.containers
+            .lock()
+            .map_err(|_| Self::lock_poisoned_error("containers"))?
+            .remove(&ownership.container_id);
+        Ok(GenerationCleanupOutcome::Removed)
     }
 
     fn ensure_container_exists(&self, container_id: &str) -> Result<(), RuntimeError> {
@@ -402,6 +452,237 @@ impl RuntimeBackend for TestRuntimeBackend {
         ready(self.create_container_internal(Some(stack_id), image, config))
     }
 
+    fn reserve_container_generation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> impl Future<Output = Result<ContainerGenerationOwnership, RuntimeError>> {
+        let result = (|| {
+            if !self.exact_generation_supported.load(Ordering::SeqCst) {
+                return Err(Self::unsupported_operation(
+                    "reserve_container_generation",
+                    "test backend exact generation lifecycle is disabled",
+                ));
+            }
+            scope.validate().map_err(RuntimeError::InvalidConfig)?;
+            if container_id.trim().is_empty() {
+                return Err(RuntimeError::InvalidConfig(
+                    "container_id cannot be empty".to_string(),
+                ));
+            }
+            let mut generations = self
+                .generations
+                .lock()
+                .map_err(|_| Self::lock_poisoned_error("generations"))?;
+            if let Some(record) = generations.get(container_id) {
+                if record.ownership.scope.as_deref() == Some(scope) {
+                    return Ok(record.ownership.clone());
+                }
+                return Err(RuntimeError::InvalidConfig(
+                    "container_id is owned by another exact reservation".to_string(),
+                ));
+            }
+            let ownership = ContainerGenerationOwnership {
+                container_id: container_id.to_string(),
+                generation: self.next_generation_seq.fetch_add(1, Ordering::SeqCst) + 1,
+                stack_id: scope.stack_id.clone(),
+                scope: Some(Box::new(scope.clone())),
+            };
+            generations.insert(
+                container_id.to_string(),
+                MockGenerationRecord {
+                    ownership: ownership.clone(),
+                    published: false,
+                },
+            );
+            Ok(ownership)
+        })();
+        ready(result)
+    }
+
+    fn inspect_container_reservation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> impl Future<Output = Result<ContainerGenerationInspection, RuntimeError>> {
+        if !self.exact_generation_supported.load(Ordering::SeqCst) {
+            return ready(Err(Self::unsupported_operation(
+                "inspect_container_reservation",
+                "test backend exact generation lifecycle is disabled",
+            )));
+        }
+        let result = self
+            .generations
+            .lock()
+            .map_err(|_| Self::lock_poisoned_error("generations"))
+            .map(|generations| match generations.get(container_id) {
+                None => ContainerGenerationInspection::Absent,
+                Some(record) if record.ownership.scope.as_deref() != Some(scope) => {
+                    ContainerGenerationInspection::Foreign
+                }
+                Some(record) if record.published => {
+                    ContainerGenerationInspection::Published(record.ownership.clone())
+                }
+                Some(record) => {
+                    ContainerGenerationInspection::ReservedUnpublished(record.ownership.clone())
+                }
+            });
+        ready(result)
+    }
+
+    fn inspect_container_generation(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<ContainerGenerationInspection, RuntimeError>> {
+        if !self.exact_generation_supported.load(Ordering::SeqCst) {
+            return ready(Err(Self::unsupported_operation(
+                "inspect_container_generation",
+                "test backend exact generation lifecycle is disabled",
+            )));
+        }
+        let result = self
+            .generations
+            .lock()
+            .map_err(|_| Self::lock_poisoned_error("generations"))
+            .map(
+                |generations| match generations.get(&ownership.container_id) {
+                    None => ContainerGenerationInspection::Absent,
+                    Some(record) if record.ownership == *ownership && record.published => {
+                        ContainerGenerationInspection::Published(record.ownership.clone())
+                    }
+                    Some(record) if record.ownership == *ownership => {
+                        ContainerGenerationInspection::ReservedUnpublished(record.ownership.clone())
+                    }
+                    Some(record) if record.ownership.scope == ownership.scope => {
+                        ContainerGenerationInspection::Replacement
+                    }
+                    Some(_) => ContainerGenerationInspection::Foreign,
+                },
+            );
+        ready(result)
+    }
+
+    fn activate_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        image: &str,
+        config: RunConfig,
+    ) -> impl Future<Output = Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>>> {
+        let result = (|| {
+            if !self.exact_generation_supported.load(Ordering::SeqCst) {
+                return Err(OwnedCreateError::unowned(Self::unsupported_operation(
+                    "activate_container_generation",
+                    "test backend exact generation lifecycle is disabled",
+                )));
+            }
+            ownership
+                .validate()
+                .map_err(RuntimeError::InvalidConfig)
+                .map_err(OwnedCreateError::unowned)?;
+            {
+                let generations = self.generations.lock().map_err(|_| {
+                    OwnedCreateError::unowned(Self::lock_poisoned_error("generations"))
+                })?;
+                let Some(record) = generations.get(&ownership.container_id) else {
+                    return Err(OwnedCreateError::unowned(RuntimeError::InvalidConfig(
+                        "exact container generation was not reserved".to_string(),
+                    )));
+                };
+                if record.ownership != ownership || record.published {
+                    return Err(OwnedCreateError::unowned(RuntimeError::InvalidConfig(
+                        "exact container generation is not an unpublished reservation".to_string(),
+                    )));
+                }
+            }
+            let container_id = self
+                .create_container_internal(Some(&ownership.stack_id), image, config)
+                .map_err(|error| OwnedCreateError {
+                    error,
+                    cleanup: Some(ownership.clone()),
+                })?;
+            if container_id != ownership.container_id {
+                return Err(OwnedCreateError {
+                    error: RuntimeError::InvalidConfig(
+                        "activated container_id differs from exact reservation".to_string(),
+                    ),
+                    cleanup: Some(ownership),
+                });
+            }
+            self.generations
+                .lock()
+                .map_err(|_| OwnedCreateError::unowned(Self::lock_poisoned_error("generations")))?
+                .get_mut(&container_id)
+                .ok_or_else(|| {
+                    OwnedCreateError::unowned(RuntimeError::InvalidConfig(
+                        "exact reservation disappeared during activation".to_string(),
+                    ))
+                })?
+                .published = true;
+            Ok(ContainerCreateReceipt {
+                container_id,
+                ownership: Some(ownership),
+            })
+        })();
+        ready(result)
+    }
+
+    fn release_container_reservation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<ContainerGenerationReleaseOutcome, RuntimeError>> {
+        let result = (|| {
+            if !self.exact_generation_supported.load(Ordering::SeqCst) {
+                return Err(Self::unsupported_operation(
+                    "release_container_reservation",
+                    "test backend exact generation lifecycle is disabled",
+                ));
+            }
+            let mut generations = self
+                .generations
+                .lock()
+                .map_err(|_| Self::lock_poisoned_error("generations"))?;
+            match generations.get(&ownership.container_id) {
+                None => Ok(ContainerGenerationReleaseOutcome::AlreadyAbsent),
+                Some(record) if record.ownership == ownership && !record.published => {
+                    generations.remove(&ownership.container_id);
+                    Ok(ContainerGenerationReleaseOutcome::Released)
+                }
+                Some(_) => Err(RuntimeError::InvalidConfig(
+                    "cannot release a foreign or published exact generation".to_string(),
+                )),
+            }
+        })();
+        ready(result)
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<GenerationCleanupOutcome, RuntimeError>> {
+        if !self.exact_generation_supported.load(Ordering::SeqCst) {
+            return ready(Err(Self::unsupported_operation(
+                "cleanup_container_generation",
+                "test backend exact generation lifecycle is disabled",
+            )));
+        }
+        ready(self.cleanup_generation_internal(&ownership))
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        _signal: Option<String>,
+        _grace_period: Option<std::time::Duration>,
+    ) -> impl Future<Output = Result<GenerationCleanupOutcome, RuntimeError>> {
+        if !self.exact_generation_supported.load(Ordering::SeqCst) {
+            return ready(Err(Self::unsupported_operation(
+                "stop_and_remove_container_generation",
+                "test backend exact generation lifecycle is disabled",
+            )));
+        }
+        ready(self.cleanup_generation_internal(&ownership))
+    }
+
     fn network_setup(
         &self,
         _stack_id: &str,
@@ -419,6 +700,7 @@ impl RuntimeBackend for TestRuntimeBackend {
     }
 
     fn shutdown_shared_vm(&self, stack_id: &str) -> impl Future<Output = Result<(), RuntimeError>> {
+        self.shared_vm_shutdown_count.fetch_add(1, Ordering::SeqCst);
         let result = (|| {
             if self
                 .fail_next_shared_vm_shutdown

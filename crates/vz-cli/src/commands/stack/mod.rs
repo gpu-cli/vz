@@ -17,7 +17,8 @@ use tracing::debug;
 
 use vz_runtime_proto::runtime_v2;
 use vz_stack::{
-    EventRecord, ServiceObservedState, ServicePhase, StackEvent, StackSpec, parse_compose_with_dir,
+    EventRecord, ServiceObservedState, ServicePhase, ServiceReplicaKey, StackEvent, StackSpec,
+    parse_compose_with_dir,
 };
 
 use super::runtime_daemon::{

@@ -412,6 +412,15 @@ pub struct StackContainerCreateSelector {
 impl StackContainerCreateSelector {
     fn to_intent(&self, service_generation: u64, now: u64) -> StackContainerCreateIntent {
         let reservation_id = deterministic_reservation_id(self, service_generation);
+        self.to_intent_with_reservation_id(service_generation, reservation_id, now)
+    }
+
+    fn to_intent_with_reservation_id(
+        &self,
+        service_generation: u64,
+        reservation_id: String,
+        now: u64,
+    ) -> StackContainerCreateIntent {
         StackContainerCreateIntent {
             schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
             scope: ContainerGenerationScope {
@@ -478,6 +487,1224 @@ impl StackContainerGenerationBinding {
 }
 
 impl StateStore {
+    fn reject_foreign_started_claim_for_target(
+        &self,
+        stack_id: &str,
+        service_name: &str,
+        replica_index: u32,
+    ) -> Result<(), StackError> {
+        // Only v7 started rows are atomic, immutable Action-v3 claims. Older
+        // schemas have neither the replica projection nor trusted claim
+        // authority and are handled by their fail-closed migrations.
+        if self.schema_version()? < 7 {
+            return Ok(());
+        }
+        let claim = self
+            .conn
+            .query_row(
+                "SELECT audit.session_id, audit.action_index, session.operation_id
+                 FROM reconcile_audit_log audit
+                 JOIN reconcile_sessions session ON session.session_id = audit.session_id
+                 WHERE audit.stack_name = ?1 AND audit.service_name = ?2
+                   AND audit.replica_index = ?3 AND audit.status = 'started'",
+                params![stack_id, service_name, i64::from(replica_index)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((session_id, action_index, operation_id)) = claim else {
+            return Ok(());
+        };
+        let action_index = usize::try_from(action_index)
+            .map_err(|_| StackError::InvalidSpec("negative started claim index".to_string()))?;
+        conflict(format!(
+            "raw journal mutation for `{stack_id}/{service_name}#{replica_index}` is fenced by started claim `{session_id}` operation `{operation_id}` action {action_index}"
+        ))
+    }
+
+    pub(super) fn require_claimed_action_state(
+        &self,
+        claim: &super::ReconcileActionClaim,
+    ) -> Result<Action, StackError> {
+        let action = self.require_started_action_claim(claim)?;
+        self.validate_reconcile_action_claim_replay(
+            claim.key.session_id(),
+            claim.key.operation_id(),
+            claim.key.absolute_action_index(),
+            &action,
+        )?;
+        Ok(action)
+    }
+
+    /// Check the exact claim/action bijection before any external effects.
+    /// Claim-qualified mutations still revalidate independently.
+    pub fn validate_reconcile_action_claim(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        expected_session_id: &str,
+        expected_operation_id: &str,
+        expected_absolute_action_index: usize,
+        expected: &Action,
+    ) -> Result<(), StackError> {
+        expected.validate()?;
+        self.with_immediate_transaction(|store| {
+            if claim.key.session_id() != expected_session_id
+                || claim.key.operation_id() != expected_operation_id
+                || claim.key.absolute_action_index() != expected_absolute_action_index
+            {
+                return conflict("opaque reconcile claim metadata does not match the execution");
+            }
+            let actual = store.require_claimed_action_state(claim)?;
+            if &actual != expected {
+                return conflict("opaque reconcile claim does not match the supplied action");
+            }
+            Ok(())
+        })
+    }
+
+    fn require_unique_latest_claimed_predecessor(
+        &self,
+        action: &Action,
+        reservation_id: &str,
+        service_generation: u64,
+    ) -> Result<StackContainerCreateIntent, StackError> {
+        let workload = action.precondition().workload();
+        let mut statement = self.conn.prepare(
+            "SELECT reservation_id, service_generation
+             FROM stack_container_create_intents
+             WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+             ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    workload.stack_id,
+                    action.target().service_name,
+                    i64::from(action.target().index()),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((latest_reservation, latest_generation)) = rows.first() else {
+            return conflict("claimed exact predecessor disappeared");
+        };
+        let latest_generation = persisted_u64("service_generation", *latest_generation)?;
+        if latest_reservation != reservation_id
+            || latest_generation != service_generation
+            || rows.get(1).is_some_and(|(_, generation)| {
+                u64::try_from(*generation).ok() == Some(service_generation)
+            })
+        {
+            return conflict("claimed exact predecessor is no longer the unique latest head");
+        }
+        self.require_stack_container_create_intent(reservation_id)
+    }
+
+    /// Inspect the exact planned predecessor while revalidating the opaque
+    /// claim. An unbound Intent is returned explicitly for runtime inspection;
+    /// this read never infers absence or terminalizes journal state.
+    pub fn inspect_claimed_predecessor(
+        &self,
+        claim: &super::ReconcileActionClaim,
+    ) -> Result<super::ClaimedPredecessorInspection, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let workload = action.precondition().workload();
+            let mut statement = store.conn.prepare(
+                "SELECT reservation_id, service_generation
+                 FROM stack_container_create_intents
+                 WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+                 ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        workload.stack_id,
+                        action.target().service_name,
+                        i64::from(action.target().index()),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if rows.len() == 2 && rows[0].1 == rows[1].1 {
+                return conflict("claimed inspection found an ambiguous latest journal generation");
+            }
+            let successor_generation = match action.precondition().journal_head() {
+                ExpectedJournalHead::NeverJournaled => 1,
+                ExpectedJournalHead::Exact {
+                    service_generation, ..
+                } => service_generation.checked_add(1).ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed inspection successor generation overflow".to_string(),
+                    )
+                })?,
+            };
+            if let Some((reservation_id, generation)) = rows.first() {
+                let generation = persisted_u64("service_generation", *generation)?;
+                if generation == successor_generation {
+                    if matches!(&action, Action::ServiceRemove { .. }) {
+                        return conflict("claimed remove cannot adopt a successor generation");
+                    }
+                    let intent = store.require_unique_latest_claimed_successor(
+                        claim,
+                        &action,
+                        reservation_id,
+                    )?;
+                    let binding = store
+                        .load_stack_container_generation_binding(&intent.scope.reservation_id)?;
+                    if let Some(binding) = &binding {
+                        store.validate_binding_against_intent(binding, &intent)?;
+                    }
+                    if !status_binding_is_structurally_valid(intent.status, binding.is_some()) {
+                        return conflict(
+                            "claim-linked successor has an impossible journal status/binding shape",
+                        );
+                    }
+                    return Ok(super::ClaimedPredecessorInspection::ClaimLinkedSuccessor {
+                        intent,
+                        binding,
+                    });
+                }
+                if generation > successor_generation {
+                    return conflict("claimed inspection found a later foreign journal head");
+                }
+            }
+            match action.precondition().journal_head() {
+                ExpectedJournalHead::NeverJournaled => {
+                    if !rows.is_empty()
+                        || store
+                            .load_service_observed(
+                                &workload.stack_id,
+                                &action.target().service_name,
+                                action.target().index(),
+                            )?
+                            .is_some()
+                    {
+                        return conflict(
+                            "claimed NeverJournaled inspection no longer proves true absence",
+                        );
+                    }
+                    Ok(super::ClaimedPredecessorInspection::NeverJournaled)
+                }
+                ExpectedJournalHead::Exact {
+                    reservation_id,
+                    service_generation,
+                    ownership,
+                } => {
+                    let intent = store.require_unique_latest_claimed_predecessor(
+                        &action,
+                        reservation_id,
+                        *service_generation,
+                    )?;
+                    let binding = store.load_stack_container_generation_binding(reservation_id)?;
+                    let discovered_cleanup_binding = ownership.is_none()
+                        && binding.is_some()
+                        && matches!(&action, Action::ServiceRemove { .. })
+                        && matches!(
+                            intent.status,
+                            StackContainerCreateStatus::CleanupPending
+                                | StackContainerCreateStatus::Cleaned
+                        );
+                    if binding.as_ref().map(|value| &value.ownership) != ownership.as_ref()
+                        && !discovered_cleanup_binding
+                    {
+                        return conflict("claimed predecessor binding changed during inspection");
+                    }
+                    match (intent.status, binding) {
+                        (
+                            StackContainerCreateStatus::Intent
+                            | StackContainerCreateStatus::Blocked,
+                            None,
+                        ) => Ok(
+                            super::ClaimedPredecessorInspection::ExactUnboundNeedsInspection {
+                                intent,
+                            },
+                        ),
+                        (StackContainerCreateStatus::Failed, None) => {
+                            Ok(super::ClaimedPredecessorInspection::ExactUnboundFailed { intent })
+                        }
+                        (_, None) => conflict(
+                            "claimed exact unbound predecessor has an impossible inspection state",
+                        ),
+                        (
+                            StackContainerCreateStatus::Reserved
+                            | StackContainerCreateStatus::Running
+                            | StackContainerCreateStatus::Blocked,
+                            Some(binding),
+                        ) => Ok(
+                            super::ClaimedPredecessorInspection::ExactBoundNeedsCleanup {
+                                intent,
+                                binding,
+                            },
+                        ),
+                        (StackContainerCreateStatus::CleanupPending, Some(binding)) => Ok(
+                            super::ClaimedPredecessorInspection::ExactBoundCleanupPending {
+                                intent,
+                                binding,
+                            },
+                        ),
+                        (StackContainerCreateStatus::Cleaned, Some(binding)) => {
+                            Ok(super::ClaimedPredecessorInspection::ExactBoundCleaned {
+                                intent,
+                                binding,
+                            })
+                        }
+                        (_, Some(_)) => conflict(
+                            "claimed exact bound predecessor has an impossible inspection state",
+                        ),
+                    }
+                }
+            }
+        })
+    }
+
+    /// Begin cleanup of only the exact bound predecessor named by the claim.
+    pub fn begin_claimed_predecessor_cleanup(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership: Some(expected_ownership),
+            } = action.precondition().journal_head()
+            else {
+                return conflict("claimed action has no exact bound predecessor to clean");
+            };
+            let mut intent = store.require_unique_latest_claimed_predecessor(
+                &action,
+                reservation_id,
+                *service_generation,
+            )?;
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed predecessor lost its exact generation binding".to_string(),
+                    )
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            if binding.ownership != *expected_ownership {
+                return conflict("claimed cleanup predecessor ownership changed");
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Stopping,
+                container_id: Some(binding.ownership.container_id.clone()),
+                failed_create_ownership: Some(binding.ownership),
+                last_error: intent.last_error.clone(),
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::CleanupPending {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if !matches!(
+                intent.status,
+                StackContainerCreateStatus::Reserved
+                    | StackContainerCreateStatus::Running
+                    | StackContainerCreateStatus::Blocked
+            ) {
+                return conflict("claimed predecessor cannot begin exact cleanup from its status");
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::CleanupPending;
+            intent.updated_at = now;
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Complete cleanup of only the exact predecessor named by the claim.
+    pub fn complete_claimed_predecessor_cleanup(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership: expected_ownership,
+            } = action.precondition().journal_head()
+            else {
+                return conflict("claimed action has no exact predecessor to complete");
+            };
+            let mut intent = store.require_unique_latest_claimed_predecessor(
+                &action,
+                reservation_id,
+                *service_generation,
+            )?;
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed predecessor lost its exact generation binding".to_string(),
+                    )
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            match expected_ownership {
+                Some(expected) if binding.ownership != *expected => {
+                    return conflict("claimed cleanup predecessor ownership changed");
+                }
+                None if !matches!(&action, Action::ServiceRemove { .. })
+                    || !matches!(
+                        intent.status,
+                        StackContainerCreateStatus::CleanupPending
+                            | StackContainerCreateStatus::Cleaned
+                    ) =>
+                {
+                    return conflict(
+                        "only claimed remove may complete discovered predecessor cleanup",
+                    );
+                }
+                _ => {}
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Stopped,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::Cleaned {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if intent.status != StackContainerCreateStatus::CleanupPending {
+                return conflict("claimed predecessor cleanup was not begun");
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Cleaned;
+            intent.last_error = None;
+            intent.updated_at = now;
+            intent.completed_at = Some(now);
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Record exact runtime ownership discovered for the claimed unbound
+    /// remove predecessor and move it directly into cleanup. This is an
+    /// executor-supplied runtime decision, never an inference from DB absence.
+    pub fn bind_claimed_predecessor_for_cleanup(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        binding: &StackContainerGenerationBinding,
+    ) -> Result<StackContainerGenerationBinding, StackError> {
+        binding.validate()?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            if !matches!(action, Action::ServiceRemove { .. }) {
+                return conflict("only claimed remove may bind an unbound predecessor");
+            }
+            let ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership: None,
+            } = action.precondition().journal_head()
+            else {
+                return conflict("claimed predecessor was not planned as exact unbound");
+            };
+            if binding.reservation_id != *reservation_id {
+                return conflict("runtime ownership names a foreign predecessor reservation");
+            }
+            let mut intent = store.require_unique_latest_claimed_predecessor(
+                &action,
+                reservation_id,
+                *service_generation,
+            )?;
+            store.validate_binding_against_intent(binding, &intent)?;
+            if let Some(existing) = store.load_stack_container_generation_binding(reservation_id)? {
+                if existing.same_immutable_authority(binding)
+                    && intent.status == StackContainerCreateStatus::CleanupPending
+                {
+                    return Ok(existing);
+                }
+                return conflict("claimed predecessor already has foreign runtime ownership");
+            }
+            if !matches!(
+                intent.status,
+                StackContainerCreateStatus::Intent | StackContainerCreateStatus::Blocked
+            ) {
+                return conflict("claimed unbound predecessor cannot bind for cleanup from status");
+            }
+            if binding.bound_at < intent.updated_at {
+                return invalid("claimed cleanup binding predates predecessor intent");
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Stopping,
+                container_id: Some(binding.ownership.container_id.clone()),
+                failed_create_ownership: Some(binding.ownership.clone()),
+                last_error: intent.last_error.clone(),
+                ready: false,
+            };
+            store.insert_stack_container_generation_binding(binding, &intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::CleanupPending;
+            intent.updated_at = binding.bound_at;
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(binding.clone())
+        })
+    }
+
+    /// Record an executor-confirmed absence for the exact unbound predecessor.
+    /// Calling this method is the explicit decision; inspection alone is inert.
+    pub fn publish_claimed_unbound_predecessor_failure(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reason: &str,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        validate_digest("reason", reason)?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership: None,
+            } = action.precondition().journal_head()
+            else {
+                return conflict("claimed predecessor is not exact unbound");
+            };
+            let mut intent = store.require_unique_latest_claimed_predecessor(
+                &action,
+                reservation_id,
+                *service_generation,
+            )?;
+            if store
+                .load_stack_container_generation_binding(reservation_id)?
+                .is_some()
+            {
+                return conflict("claimed unbound predecessor absence decision is stale");
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Failed,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: Some(reason.to_string()),
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::Failed
+                && intent.last_error.as_deref() == Some(reason)
+            {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if !matches!(
+                intent.status,
+                StackContainerCreateStatus::Intent | StackContainerCreateStatus::Blocked
+            ) {
+                return conflict("claimed unbound predecessor absence decision is stale");
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Failed;
+            intent.last_error = Some(reason.to_string());
+            intent.updated_at = now;
+            intent.completed_at = Some(now);
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Prove that a claimed remove still names the unique latest predecessor,
+    /// that cleanup/terminalization is complete, and that no successor exists.
+    /// The caller must already hold the encompassing immediate transaction.
+    pub(super) fn require_claimed_remove_release_target(
+        &self,
+        claim: &super::ReconcileActionClaim,
+    ) -> Result<ServiceReplicaKey, StackError> {
+        let action = self.require_claimed_action_state(claim)?;
+        if !matches!(&action, Action::ServiceRemove { .. }) {
+            return conflict("resource release requires a claimed remove action");
+        }
+        let ExpectedJournalHead::Exact {
+            reservation_id,
+            service_generation,
+            ownership,
+        } = action.precondition().journal_head()
+        else {
+            return conflict("claimed remove has no exact predecessor");
+        };
+        let intent = self.require_unique_latest_claimed_predecessor(
+            &action,
+            reservation_id,
+            *service_generation,
+        )?;
+        let binding = self.load_stack_container_generation_binding(reservation_id)?;
+        if let Some(binding) = &binding {
+            self.validate_binding_against_intent(binding, &intent)?;
+        }
+        let terminal = match (ownership, binding.as_ref()) {
+            (Some(expected), Some(binding)) => {
+                binding.ownership == *expected
+                    && intent.status == StackContainerCreateStatus::Cleaned
+            }
+            (None, None) => intent.status == StackContainerCreateStatus::Failed,
+            (None, Some(_)) => intent.status == StackContainerCreateStatus::Cleaned,
+            (Some(_), None) => false,
+        };
+        if !terminal {
+            return conflict(
+                "claimed remove predecessor is not safely terminal for resource release",
+            );
+        }
+        self.require_journal_observed_consistent(&intent)?;
+        Ok(action.target().clone())
+    }
+
+    /// Reserve exactly generation 1 after `NeverJournaled`, or exactly N+1
+    /// after the claimed predecessor is terminal. Scope and action linkage are
+    /// derived from the durable claim; a caller cannot redirect this create.
+    pub fn preview_claimed_successor_reservation(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        requested_container_id: &str,
+    ) -> Result<ContainerGenerationScope, StackError> {
+        validate_text("requested_container_id", requested_container_id)?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            if !matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            ) {
+                return conflict("claimed remove action cannot preview a successor reservation");
+            }
+            let expected_generation = expected_claimed_successor_generation(&action)?;
+            let expected_scope = claimed_successor_scope(
+                claim,
+                &action,
+                expected_generation,
+                requested_container_id,
+            )?;
+            let workload = action.precondition().workload();
+            let mut statement = store.conn.prepare(
+                "SELECT reservation_id, service_generation
+                 FROM stack_container_create_intents
+                 WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+                 ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        workload.stack_id,
+                        action.target().service_name,
+                        i64::from(action.target().index()),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if rows.len() == 2 && rows[0].1 == rows[1].1 {
+                return conflict(
+                    "claimed successor preview found an ambiguous latest journal generation",
+                );
+            }
+            if let Some((reservation_id, generation)) = rows.first() {
+                let generation = persisted_u64("service_generation", *generation)?;
+                if generation == expected_generation {
+                    let existing = store.require_unique_latest_claimed_successor(
+                        claim,
+                        &action,
+                        reservation_id,
+                    )?;
+                    if existing.scope != expected_scope
+                        || existing.requested_container_id != requested_container_id
+                    {
+                        return conflict(
+                            "claim-linked successor reservation differs from the exact preview",
+                        );
+                    }
+                    return Ok(expected_scope);
+                }
+                if generation > expected_generation {
+                    return conflict(
+                        "claimed successor preview found a later foreign journal head",
+                    );
+                }
+            }
+
+            match action.precondition().journal_head() {
+                ExpectedJournalHead::NeverJournaled => {
+                    if !rows.is_empty()
+                        || store
+                            .load_service_observed(
+                                &workload.stack_id,
+                                &action.target().service_name,
+                                action.target().index(),
+                            )?
+                            .is_some()
+                    {
+                        return conflict(
+                            "claimed NeverJournaled preview no longer proves true absence",
+                        );
+                    }
+                }
+                ExpectedJournalHead::Exact {
+                    reservation_id,
+                    service_generation,
+                    ..
+                } => {
+                    store.require_unique_latest_claimed_predecessor(
+                        &action,
+                        reservation_id,
+                        *service_generation,
+                    )?;
+                }
+            }
+            Ok(expected_scope)
+        })
+    }
+
+    pub fn resolve_or_begin_claimed_successor(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        input: &super::ClaimedCreateInput,
+        allocation: &super::ClaimedAllocatorTarget,
+        now: u64,
+    ) -> Result<StackContainerCreateIntent, StackError> {
+        self.resolve_or_begin_claimed_successor_inner(claim, input, allocation, now, false)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn resolve_or_begin_claimed_successor_after_allocator_failpoint(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        input: &super::ClaimedCreateInput,
+        allocation: &super::ClaimedAllocatorTarget,
+        now: u64,
+    ) -> Result<StackContainerCreateIntent, StackError> {
+        self.resolve_or_begin_claimed_successor_inner(claim, input, allocation, now, true)
+    }
+
+    fn resolve_or_begin_claimed_successor_inner(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        input: &super::ClaimedCreateInput,
+        allocation: &super::ClaimedAllocatorTarget,
+        now: u64,
+        fail_after_allocator_upsert: bool,
+    ) -> Result<StackContainerCreateIntent, StackError> {
+        validate_text("requested_container_id", &input.requested_container_id)?;
+        validate_digest("definition_digest", &input.definition_digest)?;
+        validate_digest("applied_config_digest", &input.applied_config_digest)?;
+        if input.activation_payload_sha256.len() != 64
+            || !input
+                .activation_payload_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return invalid(
+                "claimed activation payload digest must be exactly 64 lowercase hexadecimal bytes",
+            );
+        }
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            if !matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            ) {
+                return conflict("claimed remove action cannot reserve a successor generation");
+            }
+            let workload = action.precondition().workload();
+            let expected_generation = expected_claimed_successor_generation(&action)?;
+            let expected_scope = claimed_successor_scope(
+                claim,
+                &action,
+                expected_generation,
+                &input.requested_container_id,
+            )?;
+            let action_digest = claimed_successor_action_digest(claim, input, allocation)?;
+            let selector = StackContainerCreateSelector {
+                project_id: workload.project_id.clone(),
+                environment_id: workload.environment_id.clone(),
+                machine_id: workload.machine_id.clone(),
+                machine_incarnation_id: workload.machine_incarnation_id.clone(),
+                environment_generation: action.precondition().environment_generation(),
+                stack_id: workload.stack_id.clone(),
+                service_name: action.target().service_name.clone(),
+                replica_index: action.target().index(),
+                requested_container_id: input.requested_container_id.clone(),
+                definition_digest: input.definition_digest.clone(),
+                action_digest,
+                applied_config_digest: input.applied_config_digest.clone(),
+            };
+
+            let mut statement = store.conn.prepare(
+                "SELECT reservation_id, service_generation
+                 FROM stack_container_create_intents
+                 WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+                 ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+            )?;
+            let rows = statement
+                .query_map(
+                    params![
+                        workload.stack_id,
+                        action.target().service_name,
+                        i64::from(action.target().index()),
+                    ],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                )?
+                .collect::<Result<Vec<_>, _>>()?;
+            drop(statement);
+            if rows.len() == 2 && rows[0].1 == rows[1].1 {
+                return conflict("claimed successor found an ambiguous latest journal generation");
+            }
+
+            if let Some((latest_reservation, latest_generation)) = rows.first() {
+                let latest_generation =
+                    persisted_u64("service_generation", *latest_generation)?;
+                if latest_generation == expected_generation {
+                    let existing =
+                        store.require_stack_container_create_intent(latest_reservation)?;
+                    if !claim.key.matches_activation_digest(&existing.action_digest)?
+                        || !selector.matches(&existing)
+                        || existing.scope != expected_scope
+                    {
+                        return conflict(
+                            "claimed successor generation belongs to another execution identity",
+                        );
+                    }
+                    store.validate_intent_topology(&existing)?;
+                    store.require_journal_observed_consistent(&existing)?;
+                    store.require_claimed_allocator_target_exact(
+                        &workload.stack_id,
+                        action.target(),
+                        allocation,
+                    )?;
+                    return Ok(existing);
+                }
+            }
+
+            match action.precondition().journal_head() {
+                ExpectedJournalHead::NeverJournaled => {
+                    if !rows.is_empty()
+                        || store
+                            .load_service_observed(
+                                &workload.stack_id,
+                                &action.target().service_name,
+                                action.target().index(),
+                            )?
+                            .is_some()
+                    {
+                        return conflict(
+                            "claimed NeverJournaled successor no longer has an absent predecessor",
+                        );
+                    }
+                }
+                ExpectedJournalHead::Exact {
+                    reservation_id,
+                    service_generation,
+                    ownership,
+                } => {
+                    let predecessor = store.require_unique_latest_claimed_predecessor(
+                        &action,
+                        reservation_id,
+                        *service_generation,
+                    )?;
+                    let binding = store
+                        .load_stack_container_generation_binding(reservation_id)?;
+                    if binding.as_ref().map(|value| &value.ownership) != ownership.as_ref() {
+                        return conflict("claimed successor predecessor binding changed");
+                    }
+                    let terminal = match ownership {
+                        Some(_) => predecessor.status == StackContainerCreateStatus::Cleaned,
+                        None => predecessor.status == StackContainerCreateStatus::Failed,
+                    };
+                    if !terminal {
+                        return conflict(
+                            "claimed successor predecessor has not reached its exact terminal state",
+                        );
+                    }
+                    store.require_journal_observed_consistent(&predecessor)?;
+                }
+            }
+
+            let intent = selector.to_intent_with_reservation_id(
+                expected_generation,
+                expected_scope.reservation_id.clone(),
+                now,
+            );
+            intent.validate()?;
+            store.validate_intent_topology(&intent)?;
+            store.validate_journal_workload_owner(&intent)?;
+            store.upsert_claimed_allocator_target_inner(
+                &workload.stack_id,
+                action.target(),
+                allocation,
+            )?;
+            if fail_after_allocator_upsert {
+                return Err(StackError::InvalidSpec(
+                    "injected failure after claimed allocator upsert".to_string(),
+                ));
+            }
+            store.insert_stack_container_create_intent(&intent)?;
+            store.save_journal_observed_state(&intent, &creating_observed_state(&intent)?)?;
+            Ok(intent)
+        })
+    }
+
+    fn require_unique_latest_claimed_successor(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        action: &Action,
+        reservation_id: &str,
+    ) -> Result<StackContainerCreateIntent, StackError> {
+        let expected_generation = match action.precondition().journal_head() {
+            ExpectedJournalHead::NeverJournaled => 1,
+            ExpectedJournalHead::Exact {
+                service_generation, ..
+            } => service_generation.checked_add(1).ok_or_else(|| {
+                StackError::InvalidSpec("claimed successor generation overflow".to_string())
+            })?,
+        };
+        let workload = action.precondition().workload();
+        let mut statement = self.conn.prepare(
+            "SELECT reservation_id, service_generation
+             FROM stack_container_create_intents
+             WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+             ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+        )?;
+        let rows = statement
+            .query_map(
+                params![
+                    workload.stack_id,
+                    action.target().service_name,
+                    i64::from(action.target().index()),
+                ],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?
+            .collect::<Result<Vec<_>, _>>()?;
+        let Some((latest_reservation, latest_generation)) = rows.first() else {
+            return conflict("claimed successor reservation disappeared");
+        };
+        if latest_reservation != reservation_id
+            || persisted_u64("service_generation", *latest_generation)? != expected_generation
+            || rows.get(1).is_some_and(|(_, generation)| {
+                u64::try_from(*generation).ok() == Some(expected_generation)
+            })
+        {
+            return conflict("claimed successor is no longer the unique latest generation");
+        }
+        let intent = self.require_stack_container_create_intent(reservation_id)?;
+        if !claim.key.matches_activation_digest(&intent.action_digest)? {
+            return conflict("successor journal is not linked to the exact started claim");
+        }
+        self.validate_intent_topology(&intent)?;
+        self.require_journal_observed_consistent(&intent)?;
+        Ok(intent)
+    }
+
+    /// Bind runtime ownership only to this claim's immediate successor.
+    pub fn bind_claimed_successor_generation(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        binding: &StackContainerGenerationBinding,
+    ) -> Result<StackContainerGenerationBinding, StackError> {
+        binding.validate()?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent = store.require_unique_latest_claimed_successor(
+                claim,
+                &action,
+                &binding.reservation_id,
+            )?;
+            store.validate_binding_against_intent(binding, &intent)?;
+            if let Some(existing) =
+                store.load_stack_container_generation_binding(&binding.reservation_id)?
+            {
+                if existing.same_immutable_authority(binding)
+                    && intent.status == StackContainerCreateStatus::Reserved
+                {
+                    return Ok(existing);
+                }
+                return conflict("claimed successor already has a different runtime binding");
+            }
+            if intent.status != StackContainerCreateStatus::Intent {
+                return conflict("claimed successor cannot bind from its current status");
+            }
+            if binding.bound_at < intent.updated_at {
+                return invalid("claimed successor binding predates its journal intent");
+            }
+            store.insert_stack_container_generation_binding(binding, &intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Reserved;
+            intent.updated_at = binding.bound_at;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(binding.clone())
+        })
+    }
+
+    /// Publish activation success only for this claim's immediate successor.
+    pub fn publish_claimed_successor_success(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reservation_id: &str,
+        ready: bool,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent =
+                store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed successor has no runtime generation binding".to_string(),
+                    )
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            let applied_config_digest = intent.applied_config_digest.clone().ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "claimed successor has no applied configuration digest".to_string(),
+                )
+            })?;
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: Some(applied_config_digest),
+                phase: ServicePhase::Running,
+                container_id: Some(intent.requested_container_id.clone()),
+                failed_create_ownership: Some(binding.ownership),
+                last_error: None,
+                ready,
+            };
+            if intent.status == StackContainerCreateStatus::Running {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if intent.status != StackContainerCreateStatus::Reserved {
+                return conflict("claimed successor cannot publish success from its status");
+            }
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Running;
+            intent.updated_at = now;
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Publish an activation failure only for this claim's immediate successor.
+    pub fn publish_claimed_successor_failure(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reservation_id: &str,
+        error: &str,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        validate_digest("error", error)?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent =
+                store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
+            let binding = store.load_stack_container_generation_binding(reservation_id)?;
+            if let Some(binding) = &binding {
+                store.validate_binding_against_intent(binding, &intent)?;
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Failed,
+                container_id: binding
+                    .as_ref()
+                    .map(|binding| binding.ownership.container_id.clone()),
+                failed_create_ownership: binding.as_ref().map(|binding| binding.ownership.clone()),
+                last_error: Some(error.to_string()),
+                ready: false,
+            };
+            let expected_status = if observed.failed_create_ownership.is_some() {
+                StackContainerCreateStatus::Blocked
+            } else {
+                StackContainerCreateStatus::Failed
+            };
+            if intent.status == expected_status && intent.last_error.as_deref() == Some(error) {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if !matches!(
+                intent.status,
+                StackContainerCreateStatus::Intent | StackContainerCreateStatus::Reserved
+            ) {
+                return conflict("claimed successor cannot publish failure from its status");
+            }
+            let before = intent.clone();
+            intent.status = expected_status;
+            intent.last_error = Some(error.to_string());
+            intent.updated_at = now;
+            intent.completed_at = intent.status.is_terminal().then_some(now);
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Move a bound, claim-linked successor into exact cleanup. Activation
+    /// failure remains `Blocked` until this distinct cleanup decision is made.
+    pub fn begin_claimed_successor_cleanup(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reservation_id: &str,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent =
+                store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed successor has no exact cleanup ownership".to_string(),
+                    )
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Stopping,
+                container_id: Some(binding.ownership.container_id.clone()),
+                failed_create_ownership: Some(binding.ownership),
+                last_error: intent.last_error.clone(),
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::CleanupPending {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if intent.status != StackContainerCreateStatus::Blocked {
+                return conflict("claimed successor cannot begin cleanup from its status");
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::CleanupPending;
+            intent.updated_at = now;
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Complete cleanup of only the bound immediate successor linked to this
+    /// started claim.
+    pub fn complete_claimed_successor_cleanup(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reservation_id: &str,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent =
+                store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "claimed successor lost its exact cleanup ownership".to_string(),
+                    )
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Stopped,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::Cleaned {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if intent.status != StackContainerCreateStatus::CleanupPending {
+                return conflict("claimed successor cleanup was not begun");
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Cleaned;
+            intent.last_error = None;
+            intent.updated_at = now;
+            intent.completed_at = Some(now);
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Publish a blocked state only for this claim's immediate successor.
+    pub fn publish_claimed_successor_blocked(
+        &self,
+        claim: &super::ReconcileActionClaim,
+        reservation_id: &str,
+        reason: &str,
+        now: u64,
+    ) -> Result<ServiceObservedState, StackError> {
+        validate_digest("reason", reason)?;
+        self.with_immediate_transaction(|store| {
+            let action = store.require_claimed_action_state(claim)?;
+            let mut intent =
+                store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
+            let binding = store.load_stack_container_generation_binding(reservation_id)?;
+            if let Some(binding) = &binding {
+                store.validate_binding_against_intent(binding, &intent)?;
+            }
+            let observed = ServiceObservedState {
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
+                phase: ServicePhase::Failed,
+                container_id: binding
+                    .as_ref()
+                    .map(|binding| binding.ownership.container_id.clone()),
+                failed_create_ownership: binding.as_ref().map(|binding| binding.ownership.clone()),
+                last_error: Some(reason.to_string()),
+                ready: false,
+            };
+            if intent.status == StackContainerCreateStatus::Blocked
+                && intent.last_error.as_deref() == Some(reason)
+            {
+                store.require_exact_observed(&intent, &observed)?;
+                return Ok(observed);
+            }
+            if intent.status != StackContainerCreateStatus::Reserved || binding.is_none() {
+                return conflict("claimed successor cannot publish blocked from its status");
+            }
+            let before = intent.clone();
+            intent.status = StackContainerCreateStatus::Blocked;
+            intent.last_error = Some(reason.to_string());
+            intent.updated_at = now;
+            intent.completed_at = None;
+            store.save_journal_observed_state(&intent, &observed)?;
+            store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
     /// Revalidate one persisted Action-v3 fence immediately before its started
     /// claim is made durable.
     ///
@@ -778,23 +2005,34 @@ impl StateStore {
             } if intent.scope.reservation_id == *reservation_id
                 && intent.service_generation == *service_generation =>
             {
+                let discovered_cleanup_binding = ownership.is_none()
+                    && current_binding.is_some()
+                    && matches!(
+                        intent.status,
+                        StackContainerCreateStatus::CleanupPending
+                            | StackContainerCreateStatus::Cleaned
+                    )
+                    && matches!(action, Action::ServiceRemove { .. });
                 if current_binding.as_ref().map(|binding| &binding.ownership) != ownership.as_ref()
+                    && !discovered_cleanup_binding
                 {
                     return conflict(
                         "claimed action replay predecessor binding no longer matches its fence",
                     );
                 }
-                matches!(
-                    action,
-                    Action::ServiceCreate { .. }
-                        | Action::ServiceRecreate { .. }
-                        | Action::ServiceRemove { .. }
-                ) && matches!(
-                    intent.status,
-                    StackContainerCreateStatus::CleanupPending
-                        | StackContainerCreateStatus::Cleaned
-                        | StackContainerCreateStatus::Blocked
-                )
+                match action {
+                    Action::ServiceRecreate { .. } => matches!(
+                        intent.status,
+                        StackContainerCreateStatus::CleanupPending
+                            | StackContainerCreateStatus::Cleaned
+                    ),
+                    Action::ServiceCreate { .. } | Action::ServiceRemove { .. } => matches!(
+                        intent.status,
+                        StackContainerCreateStatus::CleanupPending
+                            | StackContainerCreateStatus::Cleaned
+                            | StackContainerCreateStatus::Blocked
+                    ),
+                }
             }
             ExpectedJournalHead::Exact {
                 service_generation, ..
@@ -1225,6 +2463,11 @@ impl StateStore {
             return invalid("new stack container create intent must be pristine");
         }
         self.with_immediate_transaction(|store| {
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             if let Some(existing) =
                 store.load_stack_container_create_intent(&intent.scope.reservation_id)?
             {
@@ -1340,6 +2583,11 @@ impl StateStore {
         let probe = selector.to_intent(1, now);
         probe.validate()?;
         self.with_immediate_transaction(|store| {
+            store.reject_foreign_started_claim_for_target(
+                &selector.stack_id,
+                &selector.service_name,
+                selector.replica_index,
+            )?;
             let active_id = store
                 .conn
                 .query_row(
@@ -1439,6 +2687,11 @@ impl StateStore {
                         binding.reservation_id
                     ))
                 })?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             store.validate_binding_against_intent(binding, &intent)?;
             if let Some(existing) =
                 store.load_stack_container_generation_binding(&binding.reservation_id)?
@@ -1523,6 +2776,11 @@ impl StateStore {
         self.with_immediate_transaction(|store| {
             let mut intent =
                 store.require_stack_container_create_intent(&binding.reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             store.validate_binding_against_intent(binding, &intent)?;
             if let Some(existing) =
                 store.load_stack_container_generation_binding(&binding.reservation_id)?
@@ -1836,6 +3094,11 @@ impl StateStore {
         validate_digest("reason", reason)?;
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             let observed = ServiceObservedState {
                 replica: replica_key(&intent)?,
                 applied_config_digest: None,
@@ -1895,6 +3158,11 @@ impl StateStore {
     ) -> Result<ServiceObservedState, StackError> {
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             let binding = store
                 .load_stack_container_generation_binding(reservation_id)?
                 .ok_or_else(|| {
@@ -1961,6 +3229,11 @@ impl StateStore {
             .reservation_id;
         self.with_immediate_transaction(|store| {
             let intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             if intent.status != StackContainerCreateStatus::Running {
                 return conflict(format!(
                     "reservation `{reservation_id}` cannot publish readiness from status `{}`",
@@ -2028,6 +3301,11 @@ impl StateStore {
         validate_digest("error", error)?;
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             if !matches!(
                 intent.status,
                 StackContainerCreateStatus::Intent | StackContainerCreateStatus::Reserved
@@ -2079,6 +3357,11 @@ impl StateStore {
         validate_digest("reason", reason)?;
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             let binding = store.load_stack_container_generation_binding(reservation_id)?;
             if let Some(binding) = &binding {
                 store.validate_binding_against_intent(binding, &intent)?;
@@ -2129,6 +3412,11 @@ impl StateStore {
     ) -> Result<ServiceObservedState, StackError> {
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             let binding = store
                 .load_stack_container_generation_binding(reservation_id)?
                 .ok_or_else(|| {
@@ -2183,6 +3471,11 @@ impl StateStore {
     ) -> Result<ServiceObservedState, StackError> {
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
+            store.reject_foreign_started_claim_for_target(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )?;
             let binding = store
                 .load_stack_container_generation_binding(reservation_id)?
                 .ok_or_else(|| {
@@ -3061,7 +4354,7 @@ pub(super) fn legal_fresh_claim_predecessor(
     }
     match action {
         Action::ServiceCreate { .. } => match status {
-            StackContainerCreateStatus::Blocked => true,
+            StackContainerCreateStatus::Blocked => bound,
             StackContainerCreateStatus::Cleaned | StackContainerCreateStatus::Failed => true,
             StackContainerCreateStatus::Intent
             | StackContainerCreateStatus::Reserved
@@ -3112,6 +4405,127 @@ fn creating_observed_state(
 
 fn replica_key(intent: &StackContainerCreateIntent) -> Result<ServiceReplicaKey, StackError> {
     ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index)
+}
+
+fn expected_claimed_successor_generation(action: &Action) -> Result<u64, StackError> {
+    match action.precondition().journal_head() {
+        ExpectedJournalHead::NeverJournaled => Ok(1),
+        ExpectedJournalHead::Exact {
+            service_generation, ..
+        } => service_generation.checked_add(1).ok_or_else(|| {
+            StackError::InvalidSpec("claimed successor service generation overflow".to_string())
+        }),
+    }
+}
+
+fn claimed_successor_scope(
+    claim: &super::ReconcileActionClaim,
+    action: &Action,
+    service_generation: u64,
+    requested_container_id: &str,
+) -> Result<ContainerGenerationScope, StackError> {
+    let workload = action.precondition().workload();
+    Ok(ContainerGenerationScope {
+        reservation_id: deterministic_claimed_reservation_id(
+            claim,
+            action,
+            service_generation,
+            requested_container_id,
+        )?,
+        project_id: workload.project_id.clone(),
+        environment_id: workload.environment_id.clone(),
+        machine_id: workload.machine_id.clone(),
+        machine_incarnation_id: Some(workload.machine_incarnation_id.clone()),
+        stack_id: workload.stack_id.clone(),
+    })
+}
+
+fn deterministic_claimed_reservation_id(
+    claim: &super::ReconcileActionClaim,
+    action: &Action,
+    service_generation: u64,
+    requested_container_id: &str,
+) -> Result<String, StackError> {
+    let mut digest = Sha256::new();
+    fn frame(digest: &mut Sha256, field: &[u8]) {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    let workload = action.precondition().workload();
+    frame(&mut digest, b"vz-stack-create-reservation-v2");
+    // The canonical v3 prefix is itself the collision-resistant digest of the
+    // full session, operation, absolute index, action kind/target, and action.
+    frame(
+        &mut digest,
+        claim.key.activation_digest_prefix()?.as_bytes(),
+    );
+    frame(&mut digest, workload.project_id.as_str().as_bytes());
+    frame(&mut digest, workload.environment_id.as_str().as_bytes());
+    frame(&mut digest, workload.machine_id.as_str().as_bytes());
+    frame(
+        &mut digest,
+        workload.machine_incarnation_id.as_str().as_bytes(),
+    );
+    frame(&mut digest, workload.stack_id.as_bytes());
+    frame(
+        &mut digest,
+        &action.precondition().environment_generation().to_be_bytes(),
+    );
+    frame(&mut digest, action.target().service_name.as_bytes());
+    frame(&mut digest, &action.target().index().to_be_bytes());
+    frame(&mut digest, &service_generation.to_be_bytes());
+    frame(&mut digest, requested_container_id.as_bytes());
+    Ok(format!("vzscr2-sha256:{:x}", digest.finalize()))
+}
+
+fn claimed_successor_action_digest(
+    claim: &super::ReconcileActionClaim,
+    input: &super::ClaimedCreateInput,
+    allocation: &super::ClaimedAllocatorTarget,
+) -> Result<String, StackError> {
+    let allocation = super::persistence::normalized_claimed_allocator_target(allocation);
+    let mut digest = Sha256::new();
+    fn frame(digest: &mut Sha256, field: &[u8]) {
+        digest.update((field.len() as u64).to_be_bytes());
+        digest.update(field);
+    }
+    frame(&mut digest, b"vz-stack-claimed-successor-payload-v1");
+    frame(&mut digest, input.requested_container_id.as_bytes());
+    frame(&mut digest, input.definition_digest.as_bytes());
+    frame(&mut digest, input.applied_config_digest.as_bytes());
+    frame(&mut digest, input.activation_payload_sha256.as_bytes());
+    for port in &allocation.ports {
+        frame(&mut digest, b"port");
+        frame(&mut digest, port.protocol.as_bytes());
+        frame(&mut digest, &port.container_port.to_be_bytes());
+        frame(&mut digest, &port.host_port.to_be_bytes());
+    }
+    match &allocation.service_ip {
+        Some(ip) => {
+            frame(&mut digest, b"service-ip-some");
+            frame(&mut digest, ip.as_bytes());
+        }
+        None => frame(&mut digest, b"service-ip-none"),
+    }
+    for lease in &allocation.service_network_ips {
+        frame(&mut digest, b"network-ip");
+        frame(&mut digest, lease.network_name.as_bytes());
+        frame(&mut digest, lease.ip.as_bytes());
+    }
+    match allocation.mount_tag_offset {
+        Some(offset) => {
+            let offset = u64::try_from(offset)
+                .map_err(|_| StackError::InvalidSpec("mount tag offset exceeds u64".to_string()))?;
+            frame(&mut digest, b"mount-tag-offset-some");
+            frame(&mut digest, &offset.to_be_bytes());
+        }
+        None => frame(&mut digest, b"mount-tag-offset-none"),
+    }
+    Ok(format!(
+        "{}{:x}",
+        claim.key.activation_digest_prefix()?,
+        digest.finalize()
+    ))
 }
 
 fn deterministic_reservation_id(

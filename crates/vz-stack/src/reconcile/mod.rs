@@ -55,6 +55,21 @@ pub enum Action {
     },
 }
 
+/// Caller intent for one exact service-replica lifecycle action.
+///
+/// This enum deliberately carries no predecessor evidence. [`StateStore`]
+/// captures that evidence from its authoritative snapshot before returning an
+/// executable [`Action`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TargetedActionKind {
+    /// Create a missing or stopped exact replica.
+    Create,
+    /// Replace an existing exact replica.
+    Recreate,
+    /// Remove an existing exact replica.
+    Remove,
+}
+
 /// Effect-free action kind and target before StateStore attaches authority.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) enum ActionDraft {
@@ -121,6 +136,49 @@ pub(crate) fn attach_action_preconditions(
         .zip(preconditions)
         .map(|(draft, precondition)| draft.into_action(precondition))
         .collect())
+}
+
+impl StateStore {
+    /// Plan one exact targeted action and attach authoritative predecessor evidence.
+    ///
+    /// The caller supplies only lifecycle intent and an exact replica key. The
+    /// observed state and journal head are loaded and validated by the store in
+    /// the same snapshot used to capture the action precondition.
+    pub fn plan_targeted_action(
+        &self,
+        stack_id: &str,
+        kind: TargetedActionKind,
+        target: ServiceReplicaKey,
+    ) -> Result<Action, StackError> {
+        target.validate()?;
+        let observed =
+            self.load_observed_state_for_replica(stack_id, &target.service_name, target.index())?;
+        let draft = match kind {
+            TargetedActionKind::Create => ActionDraft::Create { target, observed },
+            TargetedActionKind::Recreate => ActionDraft::Recreate {
+                target: target.clone(),
+                observed: observed.ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "cannot recreate missing replica `{}`",
+                        target.display_name()
+                    ))
+                })?,
+            },
+            TargetedActionKind::Remove => ActionDraft::Remove {
+                target: target.clone(),
+                observed: observed.ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "cannot remove missing replica `{}`",
+                        target.display_name()
+                    ))
+                })?,
+            },
+        };
+        let mut actions = attach_action_preconditions(stack_id, self, vec![draft])?;
+        actions.pop().ok_or_else(|| {
+            StackError::InvalidSpec("targeted action planning returned no action".to_string())
+        })
+    }
 }
 
 #[cfg(test)]
@@ -384,6 +442,17 @@ pub(crate) fn publish_test_container_running(
     target: &ServiceReplicaKey,
     applied_config_digest: &str,
 ) -> ServiceObservedState {
+    publish_test_container_running_with_ready(store, stack_id, target, applied_config_digest, true)
+}
+
+#[cfg(test)]
+pub(crate) fn publish_test_container_running_with_ready(
+    store: &StateStore,
+    stack_id: &str,
+    target: &ServiceReplicaKey,
+    applied_config_digest: &str,
+    ready: bool,
+) -> ServiceObservedState {
     let (intent, existing_binding) = store
         .resolve_or_begin_stack_container_create(
             &test_create_selector(store, stack_id, target, applied_config_digest),
@@ -407,7 +476,7 @@ pub(crate) fn publish_test_container_running(
             .unwrap();
     }
     store
-        .publish_stack_container_create_success(&intent.scope.reservation_id, true, 12)
+        .publish_stack_container_create_success(&intent.scope.reservation_id, ready, 12)
         .unwrap()
 }
 
@@ -817,6 +886,27 @@ impl ReconcileActionExecutionKey {
             && payload
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    }
+
+    pub(crate) fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    pub(crate) fn operation_id(&self) -> &str {
+        &self.operation_id
+    }
+
+    pub(crate) fn absolute_action_index(&self) -> usize {
+        self.absolute_action_index
+    }
+
+    pub(crate) fn matches_action(&self, action: &Action) -> Result<bool, StackError> {
+        Ok(Self::new(
+            &self.session_id,
+            &self.operation_id,
+            self.absolute_action_index,
+            action,
+        )? == *self)
     }
 }
 

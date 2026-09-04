@@ -1,4 +1,4 @@
-use super::create::PreparedCreate;
+use super::create::{PreparedCreate, generated_runtime_container_id};
 use super::dispatch::compute_topo_levels;
 use super::*;
 use serde::{Deserialize, Serialize};
@@ -12,19 +12,40 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::state_store::{
-    StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
-    StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    ClaimedAllocatorNetworkIp, ClaimedAllocatorTarget, ClaimedCreateInput,
+    ClaimedPredecessorInspection, ReconcileActionClaim, StackContainerCreateIntent,
+    StackContainerCreateStatus, StackContainerGenerationBinding,
 };
 use vz_runtime_contract::{
     ContainerCreateReceipt, ContainerGenerationInspection, ContainerGenerationOwnership,
 };
 
 struct ScopedActivation {
+    claim: ReconcileActionClaim,
     target: ServiceReplicaKey,
     intent: StackContainerCreateIntent,
     ownership: ContainerGenerationOwnership,
     image: String,
     config: vz_runtime_contract::RunConfig,
+}
+
+enum ClaimedPreflightDecision {
+    None,
+    UnboundAbsent {
+        claim: ReconcileActionClaim,
+    },
+    UnboundOwned {
+        claim: ReconcileActionClaim,
+        intent: StackContainerCreateIntent,
+        binding: StackContainerGenerationBinding,
+        inspection: ContainerGenerationInspection,
+    },
+    BoundCleanup {
+        claim: ReconcileActionClaim,
+        intent: StackContainerCreateIntent,
+        binding: StackContainerGenerationBinding,
+        inspection: ContainerGenerationInspection,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,7 +81,7 @@ pub(super) struct ScopedSecretInput {
 type LoadedSecretInputs = (BTreeMap<String, Vec<u8>>, BTreeMap<String, String>);
 
 impl<R: ContainerRuntime> StackExecutor<R> {
-    pub(super) fn prepare_scoped_batch_manifest(
+    pub(crate) fn stage_scoped_batch_manifest(
         &mut self,
         spec: &StackSpec,
         actions: &[Action],
@@ -177,6 +198,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let staging_root = owner_dir.parent().ok_or_else(|| {
             StackError::InvalidSpec("scoped activation owner directory has no parent".to_string())
         })?;
+        // The daemon intentionally does not create a stack runtime directory
+        // before claimed execution.  The immutable manifest is the one
+        // permitted pre-claim filesystem write, so its staging path must be
+        // able to establish the otherwise-missing stack directory itself.
+        // Runtime subdirectories (volumes, disks, and sandbox state) are still
+        // created only after claim admission and whole-batch preflight.
+        ensure_manifest_data_directory(&self.data_dir)?;
         if staging_root.exists() {
             validate_private_directory(staging_root)?;
         } else {
@@ -231,6 +259,53 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         Ok(())
     }
 
+    pub(crate) fn require_scoped_batch_manifest(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<(), StackError> {
+        let authority = self
+            .scoped_authority
+            .as_ref()
+            .ok_or_else(|| scope_state_conflict("scoped manifest requires authority"))?;
+        let manifest_path =
+            scoped_manifest_owner_dir(&self.data_dir, &authority.scope, operation_id)
+                .join("manifest.json");
+        if !manifest_path.exists() {
+            return Err(scope_state_conflict(
+                "scoped activation manifest is missing after action claim admission",
+            ));
+        }
+        self.stage_scoped_batch_manifest(
+            spec,
+            actions,
+            session_id,
+            operation_id,
+            first_action_index,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn prepare_scoped_batch_manifest(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<(), StackError> {
+        self.stage_scoped_batch_manifest(
+            spec,
+            actions,
+            session_id,
+            operation_id,
+            first_action_index,
+        )
+    }
+
     fn batch_has_matching_active_journal(
         &self,
         actions: &[Action],
@@ -273,11 +348,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &mut self,
         spec: &StackSpec,
         actions: &[Action],
+        claims: &[ReconcileActionClaim],
         service_map: &HashMap<&str, &ServiceSpec>,
         batch: (&str, &str, usize),
         skipped_mounts: Vec<crate::volume::SkippedMount>,
     ) -> Result<ExecutionResult, StackError> {
-        let (session_id, operation_id, first_action_index) = batch;
+        let (_session_id, _operation_id, first_action_index) = batch;
         let authority = self
             .scoped_authority
             .clone()
@@ -311,19 +387,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let target = action.target();
                 let service_name = target.service_name.as_str();
                 let replica_index = target.replica_index.get();
-                if let Err(error) = self.recover_stale_scoped_replica(target) {
-                    record_action_error(&mut result, &mut outcome_failures, target, error);
-                    continue;
-                }
                 let action_index = actions
                     .iter()
                     .position(|candidate| std::ptr::eq(candidate, action))
                     .ok_or_else(|| StackError::InvalidSpec("action index was lost".to_string()))?;
-                let absolute_action_index = first_action_index
-                    .checked_add(action_index)
-                    .ok_or_else(|| {
-                        StackError::InvalidSpec("absolute action index overflow".to_string())
-                    })?;
+                let claim = &claims[action_index];
                 let Some(service) = service_map.get(service_name).copied() else {
                     record_action_error(
                         &mut result,
@@ -335,69 +403,76 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     );
                     continue;
                 };
-                if matches!(action, Action::ServiceCreate { .. }) {
-                    match self.admit_existing_running_replica(target) {
-                        Ok(true) => {
-                            result.succeeded += 1;
-                            continue;
-                        }
-                        Ok(false) => {}
-                        Err(error) => {
-                            record_action_error(&mut result, &mut outcome_failures, target, error);
-                            continue;
-                        }
-                    }
-                }
+                let prior_ports = self.ports.ports_for_replica(target).map(ToOwned::to_owned);
                 let prepared =
                     match self.prepare_create(spec, service_map, service_name, replica_index) {
                         Ok(prepared) => prepared,
                         Err(error) => {
+                            self.ports
+                                .restore_replica_allocation(target, prior_ports.clone());
                             record_action_error(&mut result, &mut outcome_failures, target, error);
                             continue;
                         }
                     };
-                let action_digest = scoped_action_digest(
-                    session_id,
-                    operation_id,
-                    absolute_action_index,
-                    action,
+                let activation_payload_sha256 = match scoped_activation_payload_sha256(
                     &prepared,
                     spec,
                     &self.scoped_secret_digests,
-                )?;
-                let selector = StackContainerCreateSelector {
-                    project_id: authority.scope.project_id.clone(),
-                    environment_id: authority.scope.environment_id.clone(),
-                    machine_id: authority.scope.machine_id.clone(),
-                    machine_incarnation_id: authority.scope.machine_incarnation_id.clone(),
-                    environment_generation: authority.environment_generation,
-                    stack_id: authority.scope.stack_id.clone(),
-                    service_name: service_name.to_string(),
-                    replica_index,
-                    requested_container_id: prepared.requested_container_id.clone(),
-                    definition_digest: authority.definition_digest.clone(),
-                    action_digest,
-                    applied_config_digest: crate::reconcile::service_config_digest(service),
-                };
-                if matches!(action, Action::ServiceRecreate { .. })
-                    && let Err(error) =
-                        self.cleanup_recreate_predecessor(target, &selector.action_digest)
-                {
-                    record_action_error(&mut result, &mut outcome_failures, target, error);
-                    continue;
-                }
-                let (intent, binding) = match self
-                    .store
-                    .resolve_or_begin_stack_container_create(&selector, unix_now())
-                {
-                    Ok(resolution) => resolution,
+                ) {
+                    Ok(digest) => digest,
                     Err(error) => {
+                        self.ports.restore_replica_allocation(target, prior_ports);
                         record_action_error(&mut result, &mut outcome_failures, target, error);
                         continue;
                     }
                 };
-                match self.admit_scoped_activation(&intent, binding) {
+                let input = ClaimedCreateInput {
+                    requested_container_id: prepared.requested_container_id.clone(),
+                    definition_digest: authority.definition_digest.clone(),
+                    applied_config_digest: crate::reconcile::service_config_digest(service),
+                    activation_payload_sha256,
+                };
+                let mut service_network_ips = self
+                    .service_network_ips
+                    .get(target)
+                    .into_iter()
+                    .flat_map(|networks| networks.iter())
+                    .map(|(network_name, ip)| ClaimedAllocatorNetworkIp {
+                        network_name: network_name.clone(),
+                        ip: ip.clone(),
+                    })
+                    .collect::<Vec<_>>();
+                service_network_ips.sort_by(|left, right| {
+                    left.network_name
+                        .cmp(&right.network_name)
+                        .then_with(|| left.ip.cmp(&right.ip))
+                });
+                let allocation = ClaimedAllocatorTarget {
+                    ports: self
+                        .ports
+                        .ports_for_replica(target)
+                        .unwrap_or_default()
+                        .to_vec(),
+                    service_ip: self.service_ips.get(target).cloned(),
+                    service_network_ips,
+                    mount_tag_offset: self.mount_tag_offsets.get(service_name).copied(),
+                };
+                let intent = match self.store.resolve_or_begin_claimed_successor(
+                    claim,
+                    &input,
+                    &allocation,
+                    unix_now(),
+                ) {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        self.ports.restore_replica_allocation(target, prior_ports);
+                        record_action_error(&mut result, &mut outcome_failures, target, error);
+                        continue;
+                    }
+                };
+                match self.admit_claimed_activation(claim, &intent) {
                     Ok(Some(ownership)) => activations.push(ScopedActivation {
+                        claim: claim.clone(),
                         target: target.clone(),
                         intent,
                         ownership,
@@ -417,7 +492,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 if !pulled.contains(&activation.image) {
                     if let Err(error) = self.runtime.pull(&activation.image) {
                         let message = format!("image pull failed: {error}");
-                        match self.fail_and_cleanup_scoped(&activation.intent, &message) {
+                        match self.fail_and_cleanup_claimed_successor(
+                            &activation.claim,
+                            &activation.intent,
+                            &message,
+                        ) {
                             Ok(()) => record_action_error(
                                 &mut result,
                                 &mut outcome_failures,
@@ -474,7 +553,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         if let Err(error) = validate_exact_receipt(&activation.ownership, &receipt)
                         {
                             let message = error.to_string();
-                            match self.fail_and_cleanup_scoped(&activation.intent, &message) {
+                            match self.fail_and_cleanup_claimed_successor(
+                                &activation.claim,
+                                &activation.intent,
+                                &message,
+                            ) {
                                 Ok(()) => record_action_error(
                                     &mut result,
                                     &mut outcome_failures,
@@ -490,7 +573,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             }
                             continue;
                         }
-                        match self.store.publish_stack_container_create_success(
+                        match self.store.publish_claimed_successor_success(
+                            &activation.claim,
                             &activation.intent.scope.reservation_id,
                             false,
                             unix_now(),
@@ -500,7 +584,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 let reason = format!(
                                     "runtime activation completed but journal publication failed: {error}"
                                 );
-                                match self.fail_and_cleanup_scoped(&activation.intent, &reason) {
+                                match self.fail_and_cleanup_claimed_successor(
+                                    &activation.claim,
+                                    &activation.intent,
+                                    &reason,
+                                ) {
                                     Ok(()) => record_action_error(
                                         &mut result,
                                         &mut outcome_failures,
@@ -524,8 +612,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             .as_ref()
                             .is_some_and(|cleanup| cleanup != &activation.ownership)
                         {
-                            let error = self.block_scoped_intent(
-                                &activation.intent,
+                            let error = scope_state_conflict(
                                 "activation returned foreign cleanup ownership",
                             );
                             record_action_error(
@@ -536,7 +623,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             );
                             continue;
                         }
-                        match self.fail_and_cleanup_scoped(&activation.intent, &message) {
+                        match self.fail_and_cleanup_claimed_successor(
+                            &activation.claim,
+                            &activation.intent,
+                            &message,
+                        ) {
                             Ok(()) => record_action_error(
                                 &mut result,
                                 &mut outcome_failures,
@@ -556,7 +647,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
 
         for action in removes {
-            match self.execute_scoped_remove(spec, action.target()) {
+            let action_index = actions
+                .iter()
+                .position(|candidate| std::ptr::eq(candidate, action))
+                .ok_or_else(|| StackError::InvalidSpec("action index was lost".to_string()))?;
+            match self.execute_claimed_remove(&claims[action_index], action.target()) {
                 Ok(()) => result.succeeded += 1,
                 Err(error) => {
                     record_action_error(&mut result, &mut outcome_failures, action.target(), error)
@@ -589,15 +684,274 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         Ok(result)
     }
 
-    fn admit_scoped_activation(
+    pub(super) fn preflight_claimed_predecessors(
         &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        claims: &[ReconcileActionClaim],
+    ) -> HashMap<ServiceReplicaKey, String> {
+        let mut failures = HashMap::new();
+        let mut decisions = Vec::with_capacity(actions.len());
+        for (action, claim) in actions.iter().zip(claims) {
+            match self.inspect_claimed_predecessor_decision(spec, action, claim) {
+                Ok(decision) => decisions.push((action.target().clone(), decision)),
+                Err(error) => {
+                    failures.insert(action.target().clone(), error.to_string());
+                }
+            }
+        }
+        if !failures.is_empty() {
+            return failures;
+        }
+        for (target, decision) in decisions {
+            if let Err(error) = self.apply_claimed_preflight_decision(decision) {
+                failures.insert(target, error.to_string());
+                break;
+            }
+        }
+        failures
+    }
+
+    fn inspect_claimed_predecessor_decision(
+        &self,
+        spec: &StackSpec,
+        action: &Action,
+        claim: &ReconcileActionClaim,
+    ) -> Result<ClaimedPreflightDecision, StackError> {
+        let inspection = self.store.inspect_claimed_predecessor(claim)?;
+        let claim_linked_successor = matches!(
+            inspection,
+            ClaimedPredecessorInspection::ClaimLinkedSuccessor { .. }
+        );
+        let decision = match inspection {
+            ClaimedPredecessorInspection::ClaimLinkedSuccessor { intent, binding } => {
+                if matches!(
+                    intent.status,
+                    StackContainerCreateStatus::Cleaned | StackContainerCreateStatus::Failed
+                ) {
+                    return Ok(ClaimedPreflightDecision::None);
+                }
+                match binding {
+                    Some(binding) => {
+                        let inspection = self
+                            .runtime
+                            .inspect_container_generation(&binding.ownership)?;
+                        validate_exact_inspection(&binding.ownership, &inspection)?;
+                    }
+                    None => match self.runtime.inspect_container_reservation(
+                        &intent.scope,
+                        &intent.requested_container_id,
+                    )? {
+                        ContainerGenerationInspection::Absent => {}
+                        ContainerGenerationInspection::ReservedUnpublished(ownership)
+                        | ContainerGenerationInspection::Published(ownership) => {
+                            exact_binding_for_intent(&intent, ownership)?;
+                        }
+                        other => {
+                            return Err(scope_state_conflict(format!(
+                                "claim-linked successor reservation is unsafe: {other:?}"
+                            )));
+                        }
+                    },
+                }
+                Ok(ClaimedPreflightDecision::None)
+            }
+            ClaimedPredecessorInspection::NeverJournaled
+            | ClaimedPredecessorInspection::ExactUnboundFailed { .. }
+            | ClaimedPredecessorInspection::ExactBoundCleaned { .. } => {
+                Ok(ClaimedPreflightDecision::None)
+            }
+            ClaimedPredecessorInspection::ExactUnboundNeedsInspection { intent } => {
+                if !matches!(action, Action::ServiceRemove { .. }) {
+                    return Err(scope_state_conflict(
+                        "an unbound predecessor must be removed before a successor is created",
+                    ));
+                }
+                match self
+                    .runtime
+                    .inspect_container_reservation(&intent.scope, &intent.requested_container_id)?
+                {
+                    ContainerGenerationInspection::Absent => {
+                        Ok(ClaimedPreflightDecision::UnboundAbsent {
+                            claim: claim.clone(),
+                        })
+                    }
+                    ContainerGenerationInspection::ReservedUnpublished(ownership) => {
+                        let binding = exact_binding_for_intent(&intent, ownership.clone())?;
+                        Ok(ClaimedPreflightDecision::UnboundOwned {
+                            claim: claim.clone(),
+                            intent,
+                            binding,
+                            inspection: ContainerGenerationInspection::ReservedUnpublished(
+                                ownership,
+                            ),
+                        })
+                    }
+                    ContainerGenerationInspection::Published(ownership) => {
+                        let binding = exact_binding_for_intent(&intent, ownership.clone())?;
+                        Ok(ClaimedPreflightDecision::UnboundOwned {
+                            claim: claim.clone(),
+                            intent,
+                            binding,
+                            inspection: ContainerGenerationInspection::Published(ownership),
+                        })
+                    }
+                    other => Err(scope_state_conflict(format!(
+                        "claimed unbound predecessor ownership is unsafe: {other:?}"
+                    ))),
+                }
+            }
+            ClaimedPredecessorInspection::ExactBoundNeedsCleanup { intent, binding }
+            | ClaimedPredecessorInspection::ExactBoundCleanupPending { intent, binding } => {
+                let inspection = self
+                    .runtime
+                    .inspect_container_generation(&binding.ownership)?;
+                validate_exact_inspection(&binding.ownership, &inspection)?;
+                Ok(ClaimedPreflightDecision::BoundCleanup {
+                    claim: claim.clone(),
+                    intent,
+                    binding,
+                    inspection,
+                })
+            }
+        }?;
+        if !claim_linked_successor
+            && matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            )
+        {
+            self.inspect_fresh_claimed_successor_reservation(spec, action, claim, &decision)?;
+        }
+        Ok(decision)
+    }
+
+    fn inspect_fresh_claimed_successor_reservation(
+        &self,
+        spec: &StackSpec,
+        action: &Action,
+        claim: &ReconcileActionClaim,
+        predecessor: &ClaimedPreflightDecision,
+    ) -> Result<(), StackError> {
+        let target = action.target();
+        let service = spec
+            .services
+            .iter()
+            .find(|service| service.name == target.service_name)
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "action target references unknown service `{}`",
+                    target.service_name
+                ))
+            })?;
+        let replicas = service.resources.replicas.max(1);
+        if target.index() > replicas {
+            return Err(StackError::InvalidSpec(format!(
+                "action target `{}` exceeds service replica count {replicas}",
+                target.display_name()
+            )));
+        }
+        let requested_container_id = if let Some(base_name) = service.container_name.as_deref() {
+            if replicas > 1 && target.index() > 1 {
+                format!("{base_name}-{}", target.index())
+            } else {
+                base_name.to_string()
+            }
+        } else {
+            generated_runtime_container_id(&spec.name, &target.service_name, target.index())
+        };
+        let scope = self
+            .store
+            .preview_claimed_successor_reservation(claim, &requested_container_id)?;
+        match self
+            .runtime
+            .inspect_container_reservation(&scope, &requested_container_id)?
+        {
+            ContainerGenerationInspection::Absent => Ok(()),
+            // A recreate normally reuses its predecessor's runtime ID. The
+            // successor scope therefore sees that still-live exact predecessor
+            // as foreign until pass two removes it. It is safe to admit only
+            // when the earlier exact-generation inspection captured that same
+            // ID; cleanup remains generation-qualified and fences a race.
+            ContainerGenerationInspection::Foreign
+                if matches!(
+                    predecessor,
+                    ClaimedPreflightDecision::BoundCleanup { binding, .. }
+                        if binding.ownership.container_id == requested_container_id
+                ) =>
+            {
+                Ok(())
+            }
+            other => Err(scope_state_conflict(format!(
+                "fresh claimed successor reservation is unsafe before admission: {other:?}"
+            ))),
+        }
+    }
+
+    fn apply_claimed_preflight_decision(
+        &mut self,
+        decision: ClaimedPreflightDecision,
+    ) -> Result<(), StackError> {
+        match decision {
+            ClaimedPreflightDecision::None => Ok(()),
+            ClaimedPreflightDecision::UnboundAbsent { claim } => {
+                self.store.publish_claimed_unbound_predecessor_failure(
+                    &claim,
+                    "claimed remove confirmed the exact reservation absent",
+                    unix_now(),
+                )?;
+                Ok(())
+            }
+            ClaimedPreflightDecision::UnboundOwned {
+                claim,
+                intent,
+                binding,
+                inspection,
+            } => {
+                let binding = self
+                    .store
+                    .bind_claimed_predecessor_for_cleanup(&claim, &binding)?;
+                self.cleanup_claimed_predecessor_with_inspection(
+                    &claim, &intent, &binding, inspection,
+                )
+            }
+            ClaimedPreflightDecision::BoundCleanup {
+                claim,
+                intent,
+                binding,
+                inspection,
+            } => self
+                .cleanup_claimed_predecessor_with_inspection(&claim, &intent, &binding, inspection),
+        }
+    }
+
+    fn cleanup_claimed_predecessor_with_inspection(
+        &mut self,
+        claim: &ReconcileActionClaim,
         intent: &StackContainerCreateIntent,
-        binding: Option<StackContainerGenerationBinding>,
+        binding: &StackContainerGenerationBinding,
+        inspection: ContainerGenerationInspection,
+    ) -> Result<(), StackError> {
+        self.store
+            .begin_claimed_predecessor_cleanup(claim, unix_now())?;
+        self.cleanup_exact_runtime_generation(intent, &binding.ownership, inspection)?;
+        self.store
+            .complete_claimed_predecessor_cleanup(claim, unix_now())?;
+        Ok(())
+    }
+
+    fn admit_claimed_activation(
+        &mut self,
+        claim: &ReconcileActionClaim,
+        intent: &StackContainerCreateIntent,
     ) -> Result<Option<ContainerGenerationOwnership>, StackError> {
+        let binding = self
+            .store
+            .load_stack_container_generation_binding(&intent.scope.reservation_id)?;
         match intent.status {
             StackContainerCreateStatus::Running => {
                 let binding = binding.ok_or_else(|| {
-                    StackError::InvalidSpec("Running create is missing its binding".to_string())
+                    StackError::InvalidSpec("Running successor is missing binding".to_string())
                 })?;
                 match self
                     .runtime
@@ -608,38 +962,15 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     {
                         Ok(None)
                     }
-                    ContainerGenerationInspection::Absent => {
-                        self.cleanup_scoped_binding(intent, &binding)?;
-                        Err(scope_state_conflict(
-                            "journal Running generation was absent and has been terminalized",
-                        ))
-                    }
-                    other => Err(self.block_scoped_intent(
-                        intent,
-                        &format!("journal Running does not match runtime state: {other:?}"),
-                    )),
+                    other => Err(scope_state_conflict(format!(
+                        "claimed Running successor does not match runtime: {other:?}"
+                    ))),
                 }
             }
-            StackContainerCreateStatus::CleanupPending => {
-                let binding = binding.ok_or_else(|| {
-                    StackError::InvalidSpec("cleanup-pending create is missing binding".to_string())
-                })?;
-                self.cleanup_scoped_binding(intent, &binding)?;
-                Err(scope_state_conflict(
-                    "prior scoped activation required cleanup; retry will allocate a new attempt",
-                ))
-            }
-            StackContainerCreateStatus::Blocked => Err(scope_state_conflict(
-                intent
-                    .last_error
-                    .clone()
-                    .unwrap_or_else(|| "scoped create is blocked".to_string()),
-            )),
             StackContainerCreateStatus::Intent => {
                 if binding.is_some() {
-                    return Err(self.block_scoped_intent(
-                        intent,
-                        "Intent unexpectedly has a generation binding",
+                    return Err(scope_state_conflict(
+                        "claimed Intent successor unexpectedly has a binding",
                     ));
                 }
                 let ownership = match self
@@ -652,31 +983,35 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             &intent.requested_container_id,
                         )?
                     }
-                    ContainerGenerationInspection::ReservedUnpublished(ownership) => ownership,
-                    ContainerGenerationInspection::Published(ownership) => {
-                        let binding = self.bind_scoped_ownership(intent, ownership)?;
-                        self.fail_and_cleanup_scoped(
+                    ContainerGenerationInspection::ReservedUnpublished(found) => found,
+                    ContainerGenerationInspection::Published(found) => {
+                        let binding = exact_binding_for_intent(intent, found)?;
+                        self.store
+                            .bind_claimed_successor_generation(claim, &binding)?;
+                        self.fail_and_cleanup_claimed_successor(
+                            claim,
                             intent,
-                            "reservation was already published without journal Running proof",
+                            "successor was published without journal Running proof",
                         )?;
-                        return Err(scope_state_conflict(format!(
-                            "published orphan generation {} was cleaned",
-                            binding.ownership.generation
-                        )));
-                    }
-                    other => {
-                        return Err(self.block_scoped_intent(
-                            intent,
-                            &format!("reservation cannot be safely adopted: {other:?}"),
+                        return Err(scope_state_conflict(
+                            "published successor orphan was cleaned",
                         ));
                     }
+                    other => {
+                        return Err(scope_state_conflict(format!(
+                            "claimed successor reservation is unsafe: {other:?}"
+                        )));
+                    }
                 };
-                let binding = self.bind_scoped_ownership(intent, ownership)?;
+                let binding = exact_binding_for_intent(intent, ownership)?;
+                let binding = self
+                    .store
+                    .bind_claimed_successor_generation(claim, &binding)?;
                 Ok(Some(binding.ownership))
             }
             StackContainerCreateStatus::Reserved => {
                 let binding = binding.ok_or_else(|| {
-                    StackError::InvalidSpec("Reserved create is missing binding".to_string())
+                    StackError::InvalidSpec("Reserved successor is missing binding".to_string())
                 })?;
                 match self
                     .runtime
@@ -690,261 +1025,111 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     ContainerGenerationInspection::Published(found)
                         if found == binding.ownership =>
                     {
-                        self.fail_and_cleanup_scoped(
+                        self.fail_and_cleanup_claimed_successor(
+                            claim,
                             intent,
-                            "generation was published without journal Running proof",
+                            "successor was published without journal Running proof",
                         )?;
                         Err(scope_state_conflict(
-                            "published orphan generation was cleaned",
+                            "published successor orphan was cleaned",
                         ))
                     }
                     ContainerGenerationInspection::Absent => {
-                        self.fail_and_cleanup_scoped(
+                        self.fail_and_cleanup_claimed_successor(
+                            claim,
                             intent,
-                            "reserved generation disappeared before activation",
+                            "reserved successor disappeared before activation",
                         )?;
-                        Err(scope_state_conflict("reserved generation disappeared"))
+                        Err(scope_state_conflict("reserved successor disappeared"))
                     }
-                    other => Err(self.block_scoped_intent(
-                        intent,
-                        &format!("bound generation cannot be safely used: {other:?}"),
-                    )),
+                    other => Err(scope_state_conflict(format!(
+                        "bound successor ownership is unsafe: {other:?}"
+                    ))),
                 }
             }
+            StackContainerCreateStatus::Blocked | StackContainerCreateStatus::CleanupPending => {
+                let binding = binding.ok_or_else(|| {
+                    StackError::InvalidSpec("nonterminal successor is missing binding".to_string())
+                })?;
+                self.cleanup_claimed_successor(claim, intent, &binding)?;
+                Err(scope_state_conflict(
+                    "prior claimed activation required cleanup",
+                ))
+            }
             StackContainerCreateStatus::Cleaned | StackContainerCreateStatus::Failed => Err(
-                scope_state_conflict("terminal create attempt cannot be resumed"),
+                scope_state_conflict("terminal claimed successor cannot be resumed"),
             ),
         }
     }
 
-    fn admit_existing_running_replica(
+    fn fail_and_cleanup_claimed_successor(
         &mut self,
-        target: &ServiceReplicaKey,
-    ) -> Result<bool, StackError> {
-        let authority = self.scoped_authority.as_ref().ok_or_else(|| {
-            scope_state_conflict("scoped running-replica admission requires authority")
-        })?;
-        let mut matches = self
-            .store
-            .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?
-            .into_iter()
-            .filter(|record| {
-                record.intent.service_name == target.service_name
-                    && record.intent.replica_index == target.replica_index.get()
-                    && record.intent.scope.machine_incarnation_id.as_ref()
-                        == Some(&authority.scope.machine_incarnation_id)
-                    && record.intent.status == StackContainerCreateStatus::Running
-            });
-        let Some(record) = matches.next() else {
-            return Ok(false);
-        };
-        if matches.next().is_some() {
-            return Err(scope_state_conflict(format!(
-                "replica `{}` has multiple Running reservations",
-                exact_target_label(target)
-            )));
-        }
-        match self.admit_scoped_activation(&record.intent, record.binding)? {
-            None => Ok(true),
-            Some(_) => Err(scope_state_conflict(
-                "Running replica unexpectedly requested a second activation",
-            )),
-        }
-    }
-
-    fn recover_stale_scoped_replica(
-        &mut self,
-        target: &ServiceReplicaKey,
-    ) -> Result<(), StackError> {
-        let authority = self
-            .scoped_authority
-            .as_ref()
-            .ok_or_else(|| scope_state_conflict("scoped recovery requires authority"))?;
-        let records = self
-            .store
-            .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
-        for record in records.into_iter().filter(|record| {
-            record.intent.service_name == target.service_name
-                && record.intent.replica_index == target.replica_index.get()
-        }) {
-            match record.disposition {
-                StackContainerRecoveryDisposition::Activatable => {}
-                StackContainerRecoveryDisposition::CleanupOnly { .. } => {
-                    let binding = record.binding.ok_or_else(|| {
-                        self.block_scoped_intent(
-                            &record.intent,
-                            "cleanup-only recovery record is missing exact ownership",
-                        )
-                    })?;
-                    self.cleanup_scoped_binding(&record.intent, &binding)?;
-                }
-                StackContainerRecoveryDisposition::Abandonable { stale_reason } => {
-                    match self.runtime.inspect_container_reservation(
-                        &record.intent.scope,
-                        &record.intent.requested_container_id,
-                    )? {
-                        ContainerGenerationInspection::Absent => {
-                            self.store.abandon_stale_stack_container_create(
-                                &record.intent.scope.reservation_id,
-                                &stale_reason,
-                                unix_now(),
-                            )?;
-                        }
-                        ContainerGenerationInspection::ReservedUnpublished(ownership)
-                        | ContainerGenerationInspection::Published(ownership) => {
-                            let binding = StackContainerGenerationBinding {
-                                reservation_id: record.intent.scope.reservation_id.clone(),
-                                service_name: record.intent.service_name.clone(),
-                                ownership,
-                                bound_at: unix_now().max(record.intent.updated_at),
-                            };
-                            let binding = self
-                                .store
-                                .bind_stack_container_generation_for_cleanup(&binding)?;
-                            self.cleanup_scoped_binding(&record.intent, &binding)?;
-                        }
-                        other => {
-                            return Err(self.block_scoped_intent(
-                                &record.intent,
-                                &format!("stale reservation is unsafe: {other:?}"),
-                            ));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    fn cleanup_recreate_predecessor(
-        &mut self,
-        target: &ServiceReplicaKey,
-        action_digest: &str,
-    ) -> Result<(), StackError> {
-        let authority = self
-            .scoped_authority
-            .as_ref()
-            .ok_or_else(|| scope_state_conflict("scoped replacement requires authority"))?;
-        let records = self
-            .store
-            .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
-        let Some(record) = records.into_iter().find(|record| {
-            record.intent.service_name == target.service_name
-                && record.intent.replica_index == target.replica_index.get()
-        }) else {
-            return Ok(());
-        };
-        if record.intent.action_digest == action_digest {
-            return Ok(());
-        }
-        if !matches!(
-            record.disposition,
-            StackContainerRecoveryDisposition::Activatable
-        ) {
-            return Err(scope_state_conflict(
-                "recreate predecessor is not eligible for current-scope cleanup",
-            ));
-        }
-        if let Some(binding) = record.binding {
-            return self.cleanup_scoped_binding(&record.intent, &binding);
-        }
-        match self.runtime.inspect_container_reservation(
-            &record.intent.scope,
-            &record.intent.requested_container_id,
-        )? {
-            ContainerGenerationInspection::Absent => {
-                self.store.publish_stack_container_create_failure(
-                    &record.intent.scope.reservation_id,
-                    "superseded unbound create had no runtime reservation",
-                    unix_now(),
-                )?;
-                Ok(())
-            }
-            ContainerGenerationInspection::ReservedUnpublished(ownership)
-            | ContainerGenerationInspection::Published(ownership) => {
-                let binding = self.bind_scoped_ownership(&record.intent, ownership)?;
-                self.cleanup_scoped_binding(&record.intent, &binding)
-            }
-            other => Err(self.block_scoped_intent(
-                &record.intent,
-                &format!("recreate predecessor ownership is unsafe: {other:?}"),
-            )),
-        }
-    }
-
-    fn bind_scoped_ownership(
-        &self,
-        intent: &StackContainerCreateIntent,
-        ownership: ContainerGenerationOwnership,
-    ) -> Result<StackContainerGenerationBinding, StackError> {
-        if ownership.container_id != intent.requested_container_id
-            || ownership.scope.as_deref() != Some(&intent.scope)
-            || ownership.stack_id != intent.scope.stack_id
-            || ownership.validate().is_err()
-        {
-            return Err(self.block_scoped_intent(
-                intent,
-                "runtime returned ownership outside the exact reservation",
-            ));
-        }
-        self.store
-            .bind_stack_container_generation(&StackContainerGenerationBinding {
-                reservation_id: intent.scope.reservation_id.clone(),
-                service_name: intent.service_name.clone(),
-                ownership,
-                bound_at: unix_now().max(intent.updated_at),
-            })
-    }
-
-    fn fail_and_cleanup_scoped(
-        &mut self,
+        claim: &ReconcileActionClaim,
         intent: &StackContainerCreateIntent,
         reason: &str,
     ) -> Result<(), StackError> {
+        self.store.publish_claimed_successor_failure(
+            claim,
+            &intent.scope.reservation_id,
+            reason,
+            unix_now(),
+        )?;
         let binding = self
             .store
             .load_stack_container_generation_binding(&intent.scope.reservation_id)?;
         if let Some(binding) = binding {
-            // A bound failure must enter CleanupPending while the immutable
-            // ownership proof still fences deletion. It must never become a
-            // terminal Failed row before exact runtime cleanup completes.
-            self.store
-                .begin_stack_container_cleanup(&intent.scope.reservation_id, unix_now())?;
-            self.cleanup_scoped_binding(intent, &binding)?;
-        } else {
-            self.store.publish_stack_container_create_failure(
-                &intent.scope.reservation_id,
-                reason,
-                unix_now(),
-            )?;
+            self.cleanup_claimed_successor(claim, intent, &binding)?;
         }
         Ok(())
     }
 
-    fn cleanup_scoped_binding(
+    fn cleanup_claimed_successor(
         &mut self,
+        claim: &ReconcileActionClaim,
         intent: &StackContainerCreateIntent,
         binding: &StackContainerGenerationBinding,
     ) -> Result<(), StackError> {
-        let current = self
-            .store
-            .load_stack_container_create_intent(&intent.scope.reservation_id)?
-            .ok_or_else(|| StackError::InvalidSpec("cleanup intent disappeared".to_string()))?;
-        if current.status != StackContainerCreateStatus::CleanupPending {
-            self.store
-                .begin_stack_container_cleanup(&intent.scope.reservation_id, unix_now())?;
-        }
-        match self
+        let inspection = self
             .runtime
-            .inspect_container_generation(&binding.ownership)?
-        {
+            .inspect_container_generation(&binding.ownership)?;
+        match &inspection {
             ContainerGenerationInspection::Absent => {}
             ContainerGenerationInspection::ReservedUnpublished(found)
-                if found == binding.ownership =>
-            {
-                self.runtime.release_container_reservation(found)?;
+            | ContainerGenerationInspection::Published(found)
+                if found == &binding.ownership => {}
+            other => {
+                return Err(scope_state_conflict(format!(
+                    "claimed successor cleanup ownership is unsafe: {other:?}"
+                )));
             }
-            ContainerGenerationInspection::Published(found) if found == binding.ownership => {
+        }
+        self.store.begin_claimed_successor_cleanup(
+            claim,
+            &intent.scope.reservation_id,
+            unix_now(),
+        )?;
+        self.cleanup_exact_runtime_generation(intent, &binding.ownership, inspection)?;
+        self.store.complete_claimed_successor_cleanup(
+            claim,
+            &intent.scope.reservation_id,
+            unix_now(),
+        )?;
+        Ok(())
+    }
+
+    fn cleanup_exact_runtime_generation(
+        &self,
+        intent: &StackContainerCreateIntent,
+        ownership: &ContainerGenerationOwnership,
+        inspection: ContainerGenerationInspection,
+    ) -> Result<(), StackError> {
+        match inspection {
+            ContainerGenerationInspection::Absent => Ok(()),
+            ContainerGenerationInspection::ReservedUnpublished(found) if found == *ownership => {
+                self.runtime.release_container_reservation(found)?;
+                Ok(())
+            }
+            ContainerGenerationInspection::Published(found) if found == *ownership => {
                 let desired = self.store.load_desired_state(&intent.scope.stack_id)?;
                 let service = desired.as_ref().and_then(|spec| {
                     spec.services
@@ -957,138 +1142,63 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     .map(std::time::Duration::from_secs);
                 self.runtime
                     .stop_and_remove_container_generation(found, signal, grace)?;
+                Ok(())
             }
-            other => {
-                return Err(self.block_scoped_intent(
-                    intent,
-                    &format!("cleanup ownership no longer matches runtime: {other:?}"),
-                ));
-            }
+            other => Err(scope_state_conflict(format!(
+                "exact cleanup inspection changed unexpectedly: {other:?}"
+            ))),
         }
-        self.store
-            .publish_stack_container_cleanup_success(&intent.scope.reservation_id, unix_now())?;
-        Ok(())
     }
 
-    fn execute_scoped_remove(
+    fn execute_claimed_remove(
         &mut self,
-        spec: &StackSpec,
+        claim: &ReconcileActionClaim,
         target: &ServiceReplicaKey,
     ) -> Result<(), StackError> {
-        let authority = self
-            .scoped_authority
-            .clone()
-            .ok_or_else(|| scope_state_conflict("scoped removal requires authority"))?;
-        let records = self
-            .store
-            .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
-        let matching: Vec<_> = records
-            .into_iter()
-            .filter(|record| {
-                record.intent.service_name == target.service_name
-                    && record.intent.replica_index == target.replica_index.get()
-                    && record.intent.scope.machine_incarnation_id.as_ref()
-                        == Some(&authority.scope.machine_incarnation_id)
-            })
-            .collect();
-        if matching.len() > 1 {
-            return Err(scope_state_conflict(format!(
-                "replica `{}` maps to multiple scoped replica reservations",
-                exact_target_label(target)
-            )));
-        }
-        if matching.is_empty() {
-            let legacy = self
-                .store
-                .load_observed_state(&spec.name)?
-                .into_iter()
-                .any(|state| {
-                    state.replica == *target
-                        && (state.container_id.is_some() || state.failed_create_ownership.is_some())
-                });
-            if legacy {
-                return Err(scope_state_conflict(format!(
-                    "replica `{}` has no scoped journal cleanup authority",
-                    exact_target_label(target)
-                )));
-            }
-            self.ports.release_replica(target);
-            return Ok(());
-        }
-        for record in matching {
-            if let StackContainerRecoveryDisposition::Abandonable { stale_reason } =
-                &record.disposition
-            {
-                match self.runtime.inspect_container_reservation(
-                    &record.intent.scope,
-                    &record.intent.requested_container_id,
-                )? {
-                    ContainerGenerationInspection::Absent => {
-                        self.store.abandon_stale_stack_container_create(
-                            &record.intent.scope.reservation_id,
-                            stale_reason,
-                            unix_now(),
-                        )?;
-                        continue;
-                    }
-                    ContainerGenerationInspection::ReservedUnpublished(ownership)
-                    | ContainerGenerationInspection::Published(ownership) => {
-                        let binding = StackContainerGenerationBinding {
-                            reservation_id: record.intent.scope.reservation_id.clone(),
-                            service_name: record.intent.service_name.clone(),
-                            ownership,
-                            bound_at: unix_now().max(record.intent.updated_at),
-                        };
-                        let binding = self
-                            .store
-                            .bind_stack_container_generation_for_cleanup(&binding)?;
-                        self.cleanup_scoped_binding(&record.intent, &binding)?;
-                        continue;
-                    }
-                    other => {
-                        return Err(self.block_scoped_intent(
-                            &record.intent,
-                            &format!("stale unbound reservation is unsafe: {other:?}"),
-                        ));
-                    }
-                }
-            }
-            match (record.intent.status, record.binding) {
-                (StackContainerCreateStatus::Intent, None) => {
-                    self.store.publish_stack_container_create_failure(
-                        &record.intent.scope.reservation_id,
-                        "create removed before runtime reservation",
-                        unix_now(),
-                    )?;
-                }
-                (StackContainerCreateStatus::Blocked, _) => {
-                    return Err(scope_state_conflict(format!(
-                        "replica `{}` has a blocked reservation",
-                        exact_target_label(target)
-                    )));
-                }
-                (_, Some(binding)) => self.cleanup_scoped_binding(&record.intent, &binding)?,
-                _ => {
-                    return Err(self.block_scoped_intent(
-                        &record.intent,
-                        "nonterminal create is missing cleanup binding",
-                    ));
-                }
-            }
-        }
+        self.store.release_claimed_allocator_target(claim)?;
         self.ports.release_replica(target);
+        self.service_ips.remove(target);
+        self.service_network_ips.remove(target);
         Ok(())
     }
+}
 
-    fn block_scoped_intent(&self, intent: &StackContainerCreateIntent, reason: &str) -> StackError {
-        match self.store.publish_stack_container_blocked(
-            &intent.scope.reservation_id,
-            reason,
-            unix_now(),
-        ) {
-            Ok(_) => scope_state_conflict(reason),
-            Err(error) => error,
+fn exact_binding_for_intent(
+    intent: &StackContainerCreateIntent,
+    ownership: ContainerGenerationOwnership,
+) -> Result<StackContainerGenerationBinding, StackError> {
+    if ownership.container_id != intent.requested_container_id
+        || ownership.scope.as_deref() != Some(&intent.scope)
+        || ownership.stack_id != intent.scope.stack_id
+        || ownership.validate().is_err()
+    {
+        return Err(scope_state_conflict(
+            "runtime returned ownership outside the exact reservation",
+        ));
+    }
+    Ok(StackContainerGenerationBinding {
+        reservation_id: intent.scope.reservation_id.clone(),
+        service_name: intent.service_name.clone(),
+        ownership,
+        bound_at: unix_now().max(intent.updated_at),
+    })
+}
+
+fn validate_exact_inspection(
+    ownership: &ContainerGenerationOwnership,
+    inspection: &ContainerGenerationInspection,
+) -> Result<(), StackError> {
+    match inspection {
+        ContainerGenerationInspection::Absent => Ok(()),
+        ContainerGenerationInspection::ReservedUnpublished(found)
+        | ContainerGenerationInspection::Published(found)
+            if found == ownership =>
+        {
+            Ok(())
         }
+        other => Err(scope_state_conflict(format!(
+            "claimed predecessor ownership no longer matches runtime: {other:?}"
+        ))),
     }
 }
 
@@ -1131,27 +1241,11 @@ fn unix_now() -> u64 {
         .as_secs()
 }
 
-fn scoped_action_digest(
-    session_id: &str,
-    operation_id: &str,
-    absolute_action_index: usize,
-    action: &Action,
+pub(super) fn scoped_activation_payload_sha256(
     prepared: &PreparedCreate,
     spec: &StackSpec,
     secret_digests: &BTreeMap<String, String>,
 ) -> Result<String, StackError> {
-    if prepared.target != *action.target() {
-        return Err(scope_state_conflict(
-            "prepared activation target differs from the exact action target",
-        ));
-    }
-    let identity_prefix = crate::reconcile::ReconcileActionExecutionKey::new(
-        session_id,
-        operation_id,
-        absolute_action_index,
-        action,
-    )?
-    .activation_digest_prefix()?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"schema", b"vz.stack.activation-payload.v2");
     hash_field(&mut hasher, b"image", prepared.image.as_bytes());
@@ -1187,7 +1281,7 @@ fn scoped_action_digest(
         })?;
         hash_field(&mut hasher, b"secret_sha256", digest.as_bytes());
     }
-    Ok(format!("{identity_prefix}{:x}", hasher.finalize()))
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn hash_run_config(
@@ -1459,6 +1553,53 @@ fn create_private_directory(path: &Path) -> Result<(), StackError> {
     sync_directory(path.parent().ok_or_else(|| {
         StackError::InvalidSpec("private staging directory has no parent".to_string())
     })?)
+}
+
+fn ensure_manifest_data_directory(path: &Path) -> Result<(), StackError> {
+    let mut missing = Vec::new();
+    let mut ancestor = path;
+    loop {
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(_) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                missing.push(ancestor.to_path_buf());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "scoped activation data path has no existing parent".to_string(),
+                    )
+                })?;
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+
+    if missing.is_empty() {
+        return validate_private_directory(path);
+    }
+
+    // Refuse to traverse a symlink/non-directory anchor. The daemon's
+    // configured runtime root may predate the private stack hierarchy and use
+    // ordinary directory permissions; every missing component below that
+    // trusted root is created privately one component at a time.
+    validate_directory_anchor(ancestor)?;
+    for directory in missing.iter().rev() {
+        create_private_directory(directory)?;
+    }
+    validate_private_directory(path.parent().ok_or_else(|| {
+        StackError::InvalidSpec("scoped activation data path has no stack root".to_string())
+    })?)?;
+    validate_private_directory(path)?;
+    Ok(())
+}
+
+fn validate_directory_anchor(path: &Path) -> Result<(), StackError> {
+    let metadata = std::fs::symlink_metadata(path)?;
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(scope_state_conflict(
+            "scoped activation data ancestor is not a real directory",
+        ));
+    }
+    Ok(())
 }
 
 fn validate_private_directory(path: &Path) -> Result<(), StackError> {

@@ -383,19 +383,25 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
         // Clean up only legacy completed markers; persistence failures are fatal.
         cleanup_orphaned_reconcile_progress(&self.reconcile_store, &spec.name)?;
+        // Rehydrate exact target allocator inputs before an incomplete claimed
+        // successor is replayed and byte-compared.
+        self.executor.restore_allocator_state(&spec.name)?;
         // Resume any incomplete action batch before starting new planning rounds.
         self.resume_incomplete_apply(spec)?;
         // Rehydrate persisted health poll state so restart recovery preserves debounce context.
         self.health_poller
             .restore_from_store(&self.reconcile_store, &spec.name)?;
 
-        // Ensure a sandbox exists for this stack.
-        let sandbox = self.ensure_sandbox(spec)?;
-        let sandbox_id = sandbox.sandbox_id.clone();
-        let mut sandbox_marked_ready = sandbox.state != SandboxState::Creating;
-
-        // Restore allocator state from a prior run (crash recovery).
-        self.executor.restore_allocator_state(&spec.name)?;
+        // Sandbox inspection is read-only. Creation/replacement is deferred
+        // until an exact action batch has been durably admitted.
+        let existing_sandbox = self.reconcile_store.load_sandbox_for_stack(&spec.name)?;
+        let mut sandbox_id = existing_sandbox
+            .as_ref()
+            .filter(|sandbox| !sandbox.state.is_terminal())
+            .map(|sandbox| sandbox.sandbox_id.clone());
+        let mut sandbox_marked_ready = existing_sandbox.as_ref().is_some_and(|sandbox| {
+            !sandbox.state.is_terminal() && sandbox.state != SandboxState::Creating
+        });
 
         for round in 1..=self.config.max_rounds {
             info!(round, "orchestration round");
@@ -428,6 +434,8 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
             // 2. Execute any new actions.
             let exec_result = if !apply_result.actions.is_empty() {
+                self.executor
+                    .validate_scoped_batch_inputs(spec, &apply_result.actions)?;
                 let operation_id = Self::next_operation_id(&spec.name, round);
                 let session_id = Self::next_session_id(&spec.name, round);
                 let now = SystemTime::now()
@@ -448,28 +456,73 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     updated_at: now,
                     completed_at: None,
                 };
-                self.reconcile_store
-                    .create_reconcile_batch(&session, &apply_result.actions)?;
-                self.reconcile_store.start_reconcile_batch(
-                    &session_id,
-                    &spec.name,
-                    &operation_id,
-                    0,
-                    &apply_result.actions,
-                )?;
-
-                info!(
-                    actions = apply_result.actions.len(),
-                    deferred = apply_result.deferred.len(),
-                    "executing actions"
-                );
-                let result = self.executor.execute_with_session(
+                self.executor.stage_scoped_batch_manifest(
                     spec,
                     &apply_result.actions,
                     &session_id,
                     &operation_id,
                     0,
                 )?;
+                self.reconcile_store
+                    .create_reconcile_batch(&session, &apply_result.actions)?;
+                let claims = self.reconcile_store.start_reconcile_batch(
+                    &session_id,
+                    &spec.name,
+                    &operation_id,
+                    0,
+                    &apply_result.actions,
+                )?;
+                if claims.len() != apply_result.actions.len() {
+                    return Err(StackError::InvalidSpec(
+                        "admitted claim count differs from exact action count".to_string(),
+                    ));
+                }
+                for (index, (action, claim)) in apply_result.actions.iter().zip(&claims).enumerate()
+                {
+                    self.reconcile_store.validate_reconcile_action_claim(
+                        claim,
+                        &session_id,
+                        &operation_id,
+                        index,
+                        action,
+                    )?;
+                }
+                info!(
+                    actions = apply_result.actions.len(),
+                    deferred = apply_result.deferred.len(),
+                    "executing actions"
+                );
+                let result = match self.executor.preflight_scoped_claims(
+                    spec,
+                    &apply_result.actions,
+                    &session_id,
+                    &operation_id,
+                    0,
+                    &claims,
+                )? {
+                    Some(failed) => failed,
+                    None => {
+                        if apply_result.actions.iter().any(|action| {
+                            matches!(
+                                action,
+                                crate::reconcile::Action::ServiceCreate { .. }
+                                    | crate::reconcile::Action::ServiceRecreate { .. }
+                            )
+                        }) {
+                            let sandbox = self.ensure_sandbox(spec)?;
+                            sandbox_marked_ready = sandbox.state != SandboxState::Creating;
+                            sandbox_id = Some(sandbox.sandbox_id);
+                        }
+                        self.executor.execute_with_session(
+                            spec,
+                            &apply_result.actions,
+                            &session_id,
+                            &operation_id,
+                            0,
+                            &claims,
+                        )?
+                    }
+                };
                 let commit = self.reconcile_store.commit_reconcile_batch(
                     &session_id,
                     &spec.name,
@@ -525,8 +578,23 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             // 2b. Mark sandbox ready once first successful execution.
             if !sandbox_marked_ready {
                 if let Some(ref result) = exec_result {
-                    if result.succeeded > 0 {
-                        self.transition_sandbox_ready(spec, &sandbox_id)?;
+                    let activated = result.outcomes.iter().any(|outcome| {
+                        matches!(
+                            outcome.action_kind,
+                            crate::executor::ReconcileActionKind::Create
+                                | crate::executor::ReconcileActionKind::Recreate
+                        ) && matches!(
+                            outcome.result,
+                            crate::executor::ActionOutcomeResult::Succeeded
+                        )
+                    });
+                    if activated {
+                        let sandbox_id = sandbox_id.as_deref().ok_or_else(|| {
+                            StackError::InvalidSpec(
+                                "successful scoped execution has no admitted sandbox".to_string(),
+                            )
+                        })?;
+                        self.transition_sandbox_ready(spec, sandbox_id)?;
                         sandbox_marked_ready = true;
                     }
                 }
@@ -560,6 +628,8 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 restart_drafts,
             )?;
             if !restart_actions.is_empty() {
+                self.executor
+                    .validate_scoped_batch_inputs(spec, &restart_actions)?;
                 info!(
                     restarts = restart_actions.len(),
                     "executing restart actions"
@@ -583,22 +653,59 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     updated_at: now,
                     completed_at: None,
                 };
-                self.reconcile_store
-                    .create_reconcile_batch(&session, &restart_actions)?;
-                self.reconcile_store.start_reconcile_batch(
-                    &session_id,
-                    &spec.name,
-                    &operation_id,
-                    0,
-                    &restart_actions,
-                )?;
-                let restart_result = self.executor.execute_with_session(
+                self.executor.stage_scoped_batch_manifest(
                     spec,
                     &restart_actions,
                     &session_id,
                     &operation_id,
                     0,
                 )?;
+                self.reconcile_store
+                    .create_reconcile_batch(&session, &restart_actions)?;
+                let claims = self.reconcile_store.start_reconcile_batch(
+                    &session_id,
+                    &spec.name,
+                    &operation_id,
+                    0,
+                    &restart_actions,
+                )?;
+                if claims.len() != restart_actions.len() {
+                    return Err(StackError::InvalidSpec(
+                        "admitted restart claim count differs from exact action count".to_string(),
+                    ));
+                }
+                for (index, (action, claim)) in restart_actions.iter().zip(&claims).enumerate() {
+                    self.reconcile_store.validate_reconcile_action_claim(
+                        claim,
+                        &session_id,
+                        &operation_id,
+                        index,
+                        action,
+                    )?;
+                }
+                let restart_result = match self.executor.preflight_scoped_claims(
+                    spec,
+                    &restart_actions,
+                    &session_id,
+                    &operation_id,
+                    0,
+                    &claims,
+                )? {
+                    Some(failed) => failed,
+                    None => {
+                        let sandbox = self.ensure_sandbox(spec)?;
+                        sandbox_marked_ready = sandbox.state != SandboxState::Creating;
+                        sandbox_id = Some(sandbox.sandbox_id);
+                        self.executor.execute_with_session(
+                            spec,
+                            &restart_actions,
+                            &session_id,
+                            &operation_id,
+                            0,
+                            &claims,
+                        )?
+                    }
+                };
                 self.reconcile_store.commit_reconcile_batch(
                     &session_id,
                     &spec.name,
@@ -784,6 +891,14 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         let Some(progress) = self.reconcile_store.load_reconcile_progress(&spec.name)? else {
             return Ok(None);
         };
+        if crate::executor::is_claimed_teardown_operation(&progress.operation_id) {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message:
+                    "teardown-finalizing reconcile session requires its typed commit authority"
+                        .to_string(),
+            });
+        }
 
         let total = progress.actions.len();
         if progress.next_action_index >= total {
@@ -822,21 +937,69 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             "resuming incomplete apply operation"
         );
 
-        self.reconcile_store.start_reconcile_batch(
-            &session.session_id,
-            &spec.name,
-            &progress.operation_id,
-            progress.next_action_index,
-            &remaining,
-        )?;
-
-        let result = self.executor.execute_with_session(
+        self.executor.require_scoped_batch_manifest(
             spec,
             &remaining,
             &session.session_id,
             &progress.operation_id,
             progress.next_action_index,
         )?;
+        let claims = self.reconcile_store.start_reconcile_batch(
+            &session.session_id,
+            &spec.name,
+            &progress.operation_id,
+            progress.next_action_index,
+            &remaining,
+        )?;
+        if claims.len() != remaining.len() {
+            return Err(StackError::InvalidSpec(
+                "resumed claim count differs from exact action count".to_string(),
+            ));
+        }
+        for (relative_index, (action, claim)) in remaining.iter().zip(&claims).enumerate() {
+            let absolute_index = progress
+                .next_action_index
+                .checked_add(relative_index)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec("absolute action index overflow".to_string())
+                })?;
+            self.reconcile_store.validate_reconcile_action_claim(
+                claim,
+                &session.session_id,
+                &progress.operation_id,
+                absolute_index,
+                action,
+            )?;
+        }
+        let result = match self.executor.preflight_scoped_claims(
+            spec,
+            &remaining,
+            &session.session_id,
+            &progress.operation_id,
+            progress.next_action_index,
+            &claims,
+        )? {
+            Some(failed) => failed,
+            None => {
+                if remaining.iter().any(|action| {
+                    matches!(
+                        action,
+                        crate::reconcile::Action::ServiceCreate { .. }
+                            | crate::reconcile::Action::ServiceRecreate { .. }
+                    )
+                }) {
+                    self.ensure_sandbox(spec)?;
+                }
+                self.executor.execute_with_session(
+                    spec,
+                    &remaining,
+                    &session.session_id,
+                    &progress.operation_id,
+                    progress.next_action_index,
+                    &claims,
+                )?
+            }
+        };
         self.reconcile_store.commit_reconcile_batch(
             &session.session_id,
             &spec.name,
@@ -855,7 +1018,10 @@ mod tests {
 
     use super::*;
     use crate::executor::tests_support::MockContainerRuntime;
-    use crate::spec::{HealthCheckSpec, ServiceDependency, ServiceKind, ServiceSpec, StackSpec};
+    use crate::spec::{
+        HealthCheckSpec, SecretDef, SecretSource, ServiceDependency, ServiceKind, ServiceSecretRef,
+        ServiceSpec, StackSpec,
+    };
 
     fn svc(name: &str) -> ServiceSpec {
         ServiceSpec {
@@ -940,11 +1106,16 @@ mod tests {
         stack_id: &str,
     ) -> (StackOrchestrator<MockContainerRuntime>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let db_path = tmp.path().join("state.db");
         let exec_store = StateStore::open(&db_path).unwrap();
-        crate::reconcile::install_test_planning_authority(&exec_store, stack_id);
+        let scope = crate::reconcile::test_planning_scope(&exec_store, stack_id);
         let reconcile_store = StateStore::open(&db_path).unwrap();
-        let executor = StackExecutor::new(runtime, exec_store, tmp.path());
+        let executor = StackExecutor::new_scoped(runtime, exec_store, tmp.path(), scope).unwrap();
         let orch = StackOrchestrator::new(
             executor,
             reconcile_store,
@@ -962,6 +1133,11 @@ mod tests {
         stack_id: &str,
     ) -> (StackOrchestrator<MockContainerRuntime>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(
+            tmp.path(),
+            std::os::unix::fs::PermissionsExt::from_mode(0o700),
+        )
+        .unwrap();
         let db_path = tmp.path().join("state.db");
         let exec_store = StateStore::open(&db_path).unwrap();
         let scope = crate::reconcile::test_planning_scope(&exec_store, stack_id);
@@ -996,7 +1172,7 @@ mod tests {
     #[test]
     fn reports_failed_services_without_false_convergence() {
         let mut runtime = MockContainerRuntime::new();
-        runtime.fail_create = true;
+        runtime.fail_scoped_activation = true;
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
         orch.config.max_rounds = 1;
         let spec = stack("app", vec![svc("web")]);
@@ -1006,7 +1182,7 @@ mod tests {
         assert!(!result.converged);
         assert_eq!(result.rounds, 1);
         assert_eq!(result.services_ready, 0);
-        assert_eq!(result.services_failed, 1);
+        assert_eq!(result.services_failed, 0);
     }
 
     #[test]
@@ -1031,10 +1207,20 @@ mod tests {
                 ..svc("web")
             }],
         );
-        let result = orch.run(&spec, None).unwrap();
-
-        assert!(!result.converged);
-        assert_eq!(result.rounds, 3);
+        let error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
+        assert!(
+            !orch
+                .executor()
+                .runtime()
+                .call_log()
+                .iter()
+                .any(|(operation, _)| operation == "exec")
+        );
     }
 
     #[test]
@@ -1044,10 +1230,20 @@ mod tests {
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
         let spec = stack("app", vec![svc_with_healthcheck("web")]);
 
-        let result = orch.run(&spec, None).unwrap();
-
-        assert!(result.converged);
-        assert_eq!(result.services_ready, 1);
+        let error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
+        assert!(
+            !orch
+                .executor()
+                .runtime()
+                .call_log()
+                .iter()
+                .any(|(operation, _)| operation == "exec")
+        );
     }
 
     #[test]
@@ -1108,11 +1304,11 @@ mod tests {
         assert_eq!(result.services_ready, 2);
 
         // Verify db was created before web.
-        // Multi-service stacks use create_in_sandbox instead of create.
+        // Claimed scoped stacks activate an exact reserved generation.
         let calls = orch.executor.runtime().call_log();
         let create_calls: Vec<&str> = calls
             .iter()
-            .filter(|(op, _)| op == "create" || op == "create_in_sandbox")
+            .filter(|(op, _)| op == "activate_scoped")
             .map(|(_, arg)| arg.as_str())
             .collect();
         assert_eq!(create_calls.len(), 2);
@@ -1131,6 +1327,113 @@ mod tests {
         assert_eq!(result.rounds, 1);
         assert_eq!(result.services_ready, 0);
         assert_eq!(result.services_failed, 0);
+    }
+
+    #[test]
+    fn manifest_staging_failure_leaves_no_reconcile_session_or_progress() {
+        let runtime = MockContainerRuntime::new();
+        let (mut orch, tmp) = make_orchestrator_shared_for(runtime, "stage-failure");
+        let mut service = svc("web");
+        service.secrets.push(ServiceSecretRef {
+            source: "token".to_string(),
+            target: "token".to_string(),
+            mode: 0o444,
+            uid: 0,
+            gid: 0,
+        });
+        let mut spec = stack("stage-failure", vec![service]);
+        spec.secrets.push(SecretDef {
+            name: "token".to_string(),
+            source: SecretSource::File(
+                tmp.path()
+                    .join("missing-secret")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+        });
+
+        let error = orch.run(&spec, None).unwrap_err();
+
+        assert!(error.to_string().contains("failed to read secret"));
+        assert!(
+            orch.reconcile_store
+                .list_reconcile_sessions(&spec.name, 10)
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            orch.reconcile_store
+                .load_reconcile_progress(&spec.name)
+                .unwrap()
+                .is_none()
+        );
+        assert!(orch.executor.runtime().call_log().is_empty());
+    }
+
+    #[test]
+    fn remove_only_batch_does_not_create_missing_sandbox_metadata() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_scoped(runtime, "app");
+        let up_spec = stack("app", vec![svc("web")]);
+        assert!(orch.run(&up_spec, None).unwrap().converged);
+        let sandbox = orch
+            .reconcile_store
+            .load_sandbox_for_stack("app")
+            .unwrap()
+            .unwrap();
+        orch.reconcile_store
+            .delete_sandbox(&sandbox.sandbox_id)
+            .unwrap();
+        let create_calls_before = orch
+            .executor
+            .runtime()
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "create_sandbox")
+            .count();
+
+        let down_spec = stack("app", vec![]);
+        assert!(orch.run(&down_spec, None).unwrap().converged);
+
+        assert!(
+            orch.reconcile_store
+                .load_sandbox_for_stack("app")
+                .unwrap()
+                .is_none()
+        );
+        let create_calls_after = orch
+            .executor
+            .runtime()
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "create_sandbox")
+            .count();
+        assert_eq!(create_calls_after, create_calls_before);
+    }
+
+    #[test]
+    fn remove_only_batch_does_not_promote_creating_sandbox() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_scoped(runtime, "app");
+        let up_spec = stack("app", vec![svc("web")]);
+        assert!(orch.run(&up_spec, None).unwrap().converged);
+        let mut sandbox = orch
+            .reconcile_store
+            .load_sandbox_for_stack("app")
+            .unwrap()
+            .unwrap();
+        sandbox.state = SandboxState::Creating;
+        orch.reconcile_store.save_sandbox(&sandbox).unwrap();
+
+        let down_spec = stack("app", vec![]);
+        assert!(orch.run(&down_spec, None).unwrap().converged);
+
+        let sandbox = orch
+            .reconcile_store
+            .load_sandbox_for_stack("app")
+            .unwrap()
+            .unwrap();
+        assert_eq!(sandbox.state, SandboxState::Creating);
     }
 
     #[test]
@@ -1192,18 +1495,6 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, StackEvent::StackApplyStarted { .. })),
             "should receive StackApplyStarted"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::ServiceCreating { .. })),
-            "should receive ServiceCreating"
-        );
-        assert!(
-            events
-                .iter()
-                .any(|e| matches!(e, StackEvent::ServiceReady { .. })),
-            "should receive ServiceReady"
         );
     }
 
@@ -1282,6 +1573,15 @@ mod tests {
             .store()
             .create_reconcile_batch(&session, &pending)
             .unwrap();
+        orch.executor_mut()
+            .stage_scoped_batch_manifest(
+                &spec,
+                &pending,
+                &session.session_id,
+                &session.operation_id,
+                0,
+            )
+            .unwrap();
 
         let result = orch.run(&spec, None).unwrap();
         assert!(result.converged);
@@ -1298,13 +1598,76 @@ mod tests {
             .runtime()
             .call_log()
             .into_iter()
-            .filter(|(op, _)| op == "create" || op == "create_in_sandbox")
+            .filter(|(op, _)| op == "activate_scoped")
             .count();
         assert_eq!(create_calls, 1);
     }
 
     #[test]
-    fn outer_executor_error_reopens_with_started_audits_and_old_exact_cursor() {
+    fn generic_resume_cannot_terminalize_teardown_finalizer_session() {
+        let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
+        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let up_spec = stack("app", vec![svc("web")]);
+        assert!(orch.run(&up_spec, None).unwrap().converged);
+        let observed = orch.executor().store().load_observed_state("app").unwrap();
+        let actions = crate::reconcile::attach_action_preconditions(
+            "app",
+            orch.executor().store(),
+            vec![crate::reconcile::ActionDraft::Remove {
+                target: observed[0].replica.clone(),
+                observed: observed[0].clone(),
+            }],
+        )
+        .unwrap();
+        let down_spec = stack("app", vec![]);
+        let operation_id = format!(
+            "{}guarded-resume",
+            crate::state_store::CLAIMED_TEARDOWN_OPERATION_PREFIX
+        );
+        let session = ReconcileSession {
+            session_id: "session-guarded-teardown".to_string(),
+            stack_name: "app".to_string(),
+            operation_id: operation_id.clone(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: actions.len(),
+            started_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        orch.executor_mut()
+            .stage_scoped_batch_manifest(
+                &down_spec,
+                &actions,
+                &session.session_id,
+                &operation_id,
+                0,
+            )
+            .unwrap();
+        orch.reconcile_store
+            .create_reconcile_batch(&session, &actions)
+            .unwrap();
+        orch.reconcile_store
+            .start_reconcile_batch(&session.session_id, "app", &operation_id, 0, &actions)
+            .unwrap();
+        let calls_before = orch.executor().runtime().call_log();
+
+        let error = orch.run(&down_spec, None).unwrap_err();
+
+        assert!(error.to_string().contains("typed commit authority"));
+        let session = orch
+            .reconcile_store
+            .load_reconcile_session("session-guarded-teardown")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.status, ReconcileSessionStatus::Active);
+        assert_eq!(session.next_action_index, 0);
+        assert_eq!(orch.executor().runtime().call_log(), calls_before);
+    }
+
+    #[test]
+    fn pure_batch_validation_failure_precedes_manifest_session_and_runtime_effects() {
         let runtime = MockContainerRuntime::new();
         let (mut orch, tmp) = make_orchestrator_shared_for(runtime, "outer-error");
         let mut service = svc("api");
@@ -1320,48 +1683,34 @@ mod tests {
             .run(&spec, None)
             .expect_err("executor must reject fixed host ports for replicated services");
         assert!(error.to_string().contains("fixed host port"));
-        let session = orch
-            .reconcile_store
-            .load_active_reconcile_session("outer-error")
-            .unwrap()
-            .unwrap();
-        assert_eq!(session.next_action_index, 0);
-        let actions = orch
-            .reconcile_store
-            .load_reconcile_session_actions(&session.session_id)
-            .unwrap();
-        assert_eq!(actions.len(), 2);
         assert!(
             orch.reconcile_store
-                .load_audit_log_for_session(&session.session_id)
+                .list_reconcile_sessions("outer-error", 10)
                 .unwrap()
-                .iter()
-                .all(|entry| entry.status == "started")
+                .is_empty()
         );
+        assert!(
+            orch.reconcile_store
+                .load_reconcile_progress("outer-error")
+                .unwrap()
+                .is_none()
+        );
+        assert!(orch.executor.runtime().call_log().is_empty());
         drop(orch);
 
         let reopened = StateStore::open(&tmp.path().join("state.db")).unwrap();
-        let reopened_session = reopened
-            .load_active_reconcile_session("outer-error")
-            .unwrap()
-            .unwrap();
-        assert_eq!(reopened_session.session_id, session.session_id);
-        assert_eq!(reopened_session.next_action_index, 0);
-        let progress = reopened
-            .load_reconcile_progress("outer-error")
-            .unwrap()
-            .unwrap();
-        assert_eq!(progress.next_action_index, 0);
-        assert_eq!(progress.actions, actions);
-        reopened
-            .start_reconcile_batch(
-                &session.session_id,
-                "outer-error",
-                &session.operation_id,
-                0,
-                &actions,
-            )
-            .unwrap();
+        assert!(
+            reopened
+                .load_active_reconcile_session("outer-error")
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            reopened
+                .load_reconcile_progress("outer-error")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1536,12 +1885,12 @@ mod tests {
             }],
         );
 
-        let result = orch.run(&spec, None).unwrap();
-        assert!(!result.converged);
-        assert_eq!(result.rounds, 3);
-        // Service is Running but not ready (health check failing).
-        assert_eq!(result.services_ready, 0);
-        assert_eq!(result.services_failed, 0);
+        let error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
 
         // Service phase in state store should be Running (not Creating or Stopping).
         let observed = orch.executor().store().load_observed_state("app").unwrap();
@@ -1558,23 +1907,32 @@ mod tests {
             web.container_id.is_some(),
             "container ID should still be present"
         );
+        assert!(!web.ready);
+        assert!(
+            !orch
+                .executor()
+                .runtime()
+                .call_log()
+                .iter()
+                .any(|(operation, _)| operation == "exec")
+        );
     }
 
     #[test]
     fn max_rounds_exhaustion_with_create_failure_leaves_failed_state() {
         let mut runtime = MockContainerRuntime::new();
-        runtime.fail_create = true;
+        runtime.fail_scoped_activation = true;
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
         orch.config.max_rounds = 1;
 
         let spec = stack("app", vec![svc("web")]);
 
         let result = orch.run(&spec, None).unwrap();
-        // Create fails every round → service stays Failed → reconciler
-        // keeps retrying → hits max_rounds.
+        // Claimed activation failure cleans its exact generation before the
+        // failed batch is replanned; no failed ownership is left behind.
         assert!(!result.converged);
         assert_eq!(result.rounds, 1);
-        assert_eq!(result.services_failed, 1);
+        assert_eq!(result.services_failed, 0);
 
         let observed = orch.executor().store().load_observed_state("app").unwrap();
         let web = observed
@@ -1583,8 +1941,8 @@ mod tests {
             .unwrap();
         assert_eq!(
             web.phase,
-            ServicePhase::Failed,
-            "service should be Failed, not stuck in Creating"
+            ServicePhase::Stopped,
+            "failed claimed generation must be terminally cleaned"
         );
         assert!(
             orch.reconcile_store
@@ -1679,19 +2037,30 @@ mod tests {
             }],
         );
 
-        let r1 = orch.run(&spec, None).unwrap();
-        assert!(!r1.converged);
-        assert_eq!(r1.rounds, 2);
+        let first_error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            first_error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
 
         // Second run: health check now passes → should converge.
         orch.executor.runtime_mut().exec_exit_code = 0;
         orch.config.max_rounds = 10;
-        let r2 = orch.run(&spec, None).unwrap();
+        let second_error = orch.run(&spec, None).unwrap_err();
         assert!(
-            r2.converged,
-            "should converge on second run when health checks pass"
+            second_error
+                .to_string()
+                .contains("exact-generation exec authority")
         );
-        assert_eq!(r2.services_ready, 1);
+        assert!(
+            !orch
+                .executor()
+                .runtime()
+                .call_log()
+                .iter()
+                .any(|(operation, _)| operation == "exec")
+        );
     }
 
     #[test]
@@ -1732,14 +2101,29 @@ mod tests {
 
         // Run once to create services and fail health checks.
         orch.config.max_rounds = 2;
-        let r1 = orch.run(&spec, None).unwrap();
-        assert!(!r1.converged);
+        let first_error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            first_error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
 
         // Now make health checks pass.
         orch.executor.runtime_mut().exec_exit_code = 0;
         orch.config.max_rounds = 10;
-        let r2 = orch.run(&spec, None).unwrap();
-        assert!(r2.converged, "both services should converge");
-        assert_eq!(r2.services_ready, 2);
+        let second_error = orch.run(&spec, None).unwrap_err();
+        assert!(
+            second_error
+                .to_string()
+                .contains("exact-generation exec authority")
+        );
+        assert!(
+            !orch
+                .executor()
+                .runtime()
+                .call_log()
+                .iter()
+                .any(|(operation, _)| operation == "exec")
+        );
     }
 }

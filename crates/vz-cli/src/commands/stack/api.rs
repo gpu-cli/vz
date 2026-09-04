@@ -16,6 +16,7 @@ pub(super) struct ApiErrorEnvelope {
 #[derive(Debug, Deserialize)]
 pub(super) struct ApiStackServiceStatus {
     pub(super) service_name: String,
+    pub(super) replica_index: u32,
     pub(super) phase: String,
     pub(super) ready: bool,
     pub(super) container_id: String,
@@ -196,6 +197,7 @@ pub(super) fn stack_service_status_from_api(
 ) -> runtime_v2::StackServiceStatus {
     runtime_v2::StackServiceStatus {
         service_name: payload.service_name,
+        replica_index: payload.replica_index,
         phase: payload.phase,
         ready: payload.ready,
         container_id: payload.container_id,

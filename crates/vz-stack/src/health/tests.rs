@@ -550,6 +550,48 @@ fn poller_pass_marks_service_ready() {
 }
 
 #[test]
+fn poller_fails_closed_before_container_id_exec_for_scoped_generation() {
+    let runtime = MockContainerRuntime::new();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack_with_hc(
+        "scoped-health",
+        vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }],
+    );
+    let target = crate::state_store::ServiceReplicaKey::first("web").unwrap();
+    crate::reconcile::publish_test_container_running_with_ready(
+        &store,
+        &spec.name,
+        &target,
+        "scoped-health-config",
+        false,
+    );
+
+    let mut poller = HealthPoller::new();
+    let error = poller.poll_all(&runtime, &store, &spec).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("exact-generation exec authority")
+    );
+    assert!(
+        !runtime
+            .call_log()
+            .iter()
+            .any(|(operation, _)| operation == "exec")
+    );
+    assert!(
+        !store
+            .load_observed_state_for_replica(&spec.name, "web", 1)
+            .unwrap()
+            .unwrap()
+            .ready
+    );
+}
+
+#[test]
 fn poller_failure_emits_event_without_failing_service() {
     let mut runtime = MockContainerRuntime::new();
     runtime.exec_exit_code = 1;

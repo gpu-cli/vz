@@ -162,22 +162,64 @@ All planned journal writes use claim-qualified APIs equivalent to:
 
 ```rust
 require_started_action_claim(claim, action)
-begin_expected_generation_cleanup(claim, target, expected, now)
-resolve_or_begin_claimed_create(claim, selector, precondition, now)
+inspect_claimed_predecessor(claim)
+begin_claimed_predecessor_cleanup(claim, now)
+complete_claimed_predecessor_cleanup(claim, now)
+resolve_or_begin_claimed_successor(claim, runtime_input, exact_allocation, now)
+bind_claimed_successor_generation(claim, binding)
+publish_claimed_successor_success(claim, reservation, ready, now)
 ```
 
-`begin_expected_generation_cleanup` loads the named reservation directly. It
+Before resolving a fresh create or recreate successor, the executor derives the
+exact requested container ID and asks StateStore for a deterministic,
+claim-qualified reservation preview. The preview performs full claim
+validation, writes nothing, and uses a versioned digest of the complete
+execution key, topology authority, target, generation, and requested ID. The
+executor inspects that exact runtime reservation during whole-batch preflight;
+anything other than `Absent` is a conflict unless StateStore has already proven
+that it is this claim's linked successor. Successor resolution must return the
+same previewed identity exactly.
+
+The predecessor inspection result is safe by construction. An exact unbound
+`Intent` or `Blocked` result explicitly requires inspection of that exact
+runtime reservation before any journal mutation. An exact unbound terminal
+`Failed` result explicitly forbids a runtime call. Bound and never-journaled
+results are distinct variants. Bound inspection further separates a generation
+that needs cleanup, a `CleanupPending` crash-replay generation, and historical
+terminal `Cleaned` evidence for which a runtime call is forbidden. Callers do
+not infer these obligations by interpreting a generic status value.
+
+`begin_claimed_predecessor_cleanup` loads the named reservation directly. It
 requires that reservation and service generation to remain the latest head,
 requires the binding to equal the action's complete ownership, validates the
 observed projection and workload authority, and CAS-transitions only that intent
 to cleanup. Same-claim replay may continue its own exact cleanup. A foreign or
 later head is always a state conflict.
 
-`resolve_or_begin_claimed_create` initially requires the exact planned head or
+`resolve_or_begin_claimed_successor` initially requires the exact planned head or
 true `NeverJournaled` state. After claimed exact cleanup, it permits the planned
 head in `Cleaned` and reserves precisely its successor generation. Replay may
 adopt that successor only when its journal action digest binds the same execution
 key and action hash. It never adopts an arbitrary active generation.
+
+A bound successor activation failure is first published as nonterminal
+`Blocked`. Separate claim-qualified successor cleanup begin and complete calls
+perform `Blocked -> CleanupPending -> Cleaned` around the exact runtime cleanup.
+No failure publication may assert that runtime cleanup has begun, and replay
+accepts only the same durable evidence rather than overwriting its reason.
+
+Allocator mutation follows the same authority boundary. Create and recreate
+persist only the claimed target's port, network, and derived service mount-tag
+allocation in the same transaction that reserves the claim-linked successor
+intent. The predecessor must already be terminal; replay requires both the
+linked successor and exact allocation bytes, and never overwrites them with new
+input. Every sibling lease and mount offset is preserved. Remove atomically
+revalidates its started claim, exact terminal predecessor, and absence of a
+successor in the same transaction that removes only that target's leases.
+Replaying after commit is an idempotent already-released result. A transaction-
+time authorization token is not mutation authority. Whole-stack allocator
+replacement and every raw journal mutator reject while a relevant started
+claim exists; recovery receives no exemption.
 
 User-planned mutation code must not scan current records by target and then act
 on the first match. Recovery may enumerate journal records, but it is a separate
@@ -189,16 +231,21 @@ turns a stale user plan into authority over a replacement.
 The required order is:
 
 1. validate definitions and capture the immutable operation input snapshot;
-2. derive the pure plan and persist its session/progress identity;
-3. atomically revalidate all action fences and acquire all batch claims;
-4. revalidate the claim and current authority, then perform read-only exact
-   runtime inspection;
-5. only then create or update sandbox state, activation manifests, staged
+2. derive the pure plan and stage its immutable scoped manifest before creating
+   a session or acquiring a claim; a staging failure leaves no active session;
+3. persist the exact session/progress identity;
+4. atomically revalidate all action fences and acquire all batch claims;
+5. revalidate every claim and current authority, validate all successor inputs,
+   derive every deterministic reservation preview, and perform the complete
+   batch of read-only exact runtime inspections;
+6. only when every action passes may claimed predecessor cleanup begin; if any
+   action fails preflight, every predecessor and successor remains untouched;
+7. only then create or update sandbox state, activation manifests, staged
    secrets, volumes, network/port allocations, guest state, or runtime state;
-6. for recreate or create with a bound predecessor, admit and complete exact
+8. for recreate or create with a bound predecessor, admit and complete exact
    generation cleanup before releasing/reassigning ports or preparing the new
    create; and
-7. reserve, bind, activate, and publish the claimed successor. Remove releases
+9. reserve, bind, activate, and publish the claimed successor. Remove releases
    resources only after exact cleanup and a final no-successor check.
 
 The immutable operation input manifest defined by `vz-mzs.2.5.5.8` is the only
@@ -212,6 +259,58 @@ during execution. Runtime inspection and exact-generation stop/remove remain
 the final fence against an out-of-band runtime replacement. Any replacement
 result fails closed without touching the replacement.
 
+Terminal replay never reconstructs a result by re-reading mutable activation
+inputs, allocator state, bindings, or the runtime. A completed or failed
+session is replayable only when its immutable session identity, complete action
+plan, terminal cursor/status, and one terminal audit row for every exact action
+form a verified bijection. The executor reconstructs the original ordered
+outcomes from those audits and performs zero external or database mutation.
+Missing, duplicate, nonterminal, mismatched, or tampered audit evidence is a
+state conflict rather than permission to execute again.
+
+## Stack teardown finalizer authority
+
+Stack teardown contains effects outside individual replica removal: persisting
+the empty desired state, shutting down stack-wide runtime resources, optionally
+removing volumes, and publishing the terminal event and receipt. Those effects
+must not run after the remove claims have been released, because a concurrent
+apply could publish a replacement generation in the gap.
+
+A non-dry teardown with replica removals therefore uses a reserved durable
+operation purpose and a typed two-phase executor API:
+
+1. acquire the exact remove claims and execute the remove-only action batch;
+2. return one opaque pending-finalizer authority while the session and all
+   claims remain active;
+3. while holding that authority, persist empty desired state, shut down the
+   stack runtime, and perform the requested volume cleanup; and
+4. claim-qualify the terminal batch commit, then atomically persist the
+   terminal event and request-bound receipt.
+
+Generic claimed execution, generic orchestrator resume, and the generic
+StateStore batch commit reject the reserved teardown purpose. The privileged
+StateStore commit is crate-private, accepts the pending token's exact claims,
+and transactionally revalidates the remove-only action/claim bijection before
+releasing the fence. A failed remove batch is committed by the typed executor
+without granting broad-finalizer authority. A non-dry teardown with no replica
+actions fails closed until a durable stack-level finalizer claim exists.
+
+The daemon serializes teardown finalizers per stack from the first persisted
+identity/receipt check through final receipt publication. This makes the opaque
+pending authority single-consumer within the one daemon process that owns the
+state store: an identical concurrent retry waits, then observes the first
+terminal receipt instead of repeating broad effects after the generation fence
+has been released. Process loss releases the in-memory serialization guard but
+not the durable session/claims. A terminal session without its final receipt
+fails closed; exact crash-window receipt replay and stable effect counters are
+completed under `vz-mzs.2.5.5.11` rather than by rerunning unfenced effects.
+
+The teardown request identity binds the stack, complete workload scope,
+request ID, dry-run bit, and volume-removal bit. Active-session retry and
+terminal receipt replay validate that same digest. Reusing a completed request
+ID with different options, including switching to dry-run, is a zero-effect
+state conflict.
+
 ## Persistence, hashing, and audit
 
 Action serialization is schema version 3 in sessions, progress, scoped
@@ -223,10 +322,22 @@ explicit; decorated-name concatenation is not an encoding.
 
 The scoped executor identity also includes the full single-action hash and
 session ID. Journal `action_digest` binds the execution key and action hash, so
-a crash replay can distinguish its own successor from a foreign generation.
+a crash replay can distinguish its own successor from a foreign generation. A
+successor's canonical journal digest additionally binds the full normalized
+runtime-create input and exact normalized allocator result, so replay cannot
+silently reuse a changed manifest, secret, mount, network, or port assignment.
 Audit identity may retain only the action hash when the referenced v3 session is
 immutable and retained. Loading a session, progress record, scoped manifest, or
 audit re-computes and verifies the full hash before admission.
+
+Every control-plane status projection carries replica identity as the tuple
+`(service_name, replica_index)`, where the index is one-based and zero is
+invalid. `service_name` remains the undecorated Compose service key so config,
+port, and dependency lookup cannot alias it with a name that happens to end in
+digits. A decorated display name is presentation-only and is never decoded back
+into authority. In particular, `(api, 2)` and `(api-2, 1)` remain distinct over
+gRPC, the HTTP bridge, and CLI reconstruction. Older wire payloads that omit the
+replica index fail closed instead of silently acquiring replica-one authority.
 
 ## Store v5 to v6 migration
 
@@ -299,6 +410,15 @@ the following:
 9. `(api, replica 2)` and `(api-2, replica 1)` remain distinct; removal of an
    exact unbound failed head makes no runtime call; stale failures preserve all
    port and network ownership.
+10. Generic executor, orchestrator-resume, and StateStore commit paths cannot
+    terminalize a pending teardown. A wrong, missing, reordered, or foreign
+    claim and a cleanup executor for another stack all fail without releasing
+    the active fence.
+11. Two concurrent identical teardown requests cannot both consume broad
+    finalizer authority. The delayed request observes the first receipt and
+    cannot shut down or remove resources from a replacement admitted after the
+    first teardown commits. Changing any request-bound option conflicts before
+    mutation, and a non-dry zero-action teardown performs no broad effect.
 
 These tests supplement the host×Machine-target and aggregate E2E requirements
 in the 0.4 goal. They do not replace release-built local-Mac evidence.

@@ -163,6 +163,20 @@ impl HealthPoller {
             let Some(ref container_id) = obs.container_id else {
                 continue;
             };
+            if obs
+                .failed_create_ownership
+                .as_ref()
+                .and_then(|ownership| ownership.scope.as_deref())
+                .is_some_and(|scope| scope.machine_incarnation_id.is_some())
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "scoped health check for `{}` requires exact-generation exec authority",
+                        obs.replica.display_name()
+                    ),
+                });
+            }
 
             // Track when we first saw this service running.
             let start_time = *self.start_times.entry(svc.name.clone()).or_insert(now);
@@ -262,18 +276,16 @@ impl HealthPoller {
                 if !was_ready {
                     // First pass — mark ready.
                     info!(service = %svc.name, "health check passed, service ready");
-                    store.save_observed_state(
-                        &spec.name,
-                        &ServiceObservedState {
-                            replica: obs.replica.clone(),
-                            applied_config_digest: obs.applied_config_digest.clone(),
-                            phase: ServicePhase::Running,
-                            container_id: Some(container_id.clone()),
-                            failed_create_ownership: obs.failed_create_ownership.clone(),
-                            last_error: None,
-                            ready: true,
-                        },
-                    )?;
+                    let ready_state = ServiceObservedState {
+                        replica: obs.replica.clone(),
+                        applied_config_digest: obs.applied_config_digest.clone(),
+                        phase: ServicePhase::Running,
+                        container_id: Some(container_id.clone()),
+                        failed_create_ownership: obs.failed_create_ownership.clone(),
+                        last_error: None,
+                        ready: true,
+                    };
+                    store.save_observed_state(&spec.name, &ready_state)?;
                     store.emit_event(
                         &spec.name,
                         &StackEvent::HealthCheckPassed {

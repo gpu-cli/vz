@@ -93,14 +93,14 @@ pub(super) fn print_ps_table(observed: &[ServiceObservedState], desired: Option<
         let mem = "N/A";
 
         let ports = ports_map
-            .get(svc.service_name.as_str())
+            .get(svc.replica.service_name.as_str())
             .map(|p| p.join(", "))
             .unwrap_or_else(|| "-".to_string());
 
         let cid = svc.container_id.as_deref().unwrap_or("-");
         println!(
             "{:<wn$} {:<ws$} {:<wh$} {:<wc$} {:<wm$} {:<wp$} {:<wcid$}",
-            svc.service_name,
+            svc.replica.display_name(),
             status,
             health,
             cpu,

@@ -8,10 +8,11 @@ mod placement_scheduler;
 #[cfg(any(test, feature = "test-backend"))]
 mod test_backend;
 
+use std::collections::HashMap;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
@@ -136,6 +137,7 @@ pub struct RuntimeDaemon {
     config: RuntimedConfig,
     manager: WorkspaceRuntimeManager<PlatformBackend>,
     state_store: Mutex<StateStore>,
+    teardown_finalizer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     execution_sessions: ExecutionSessionRegistry,
     placement_scheduler: PlacementScheduler,
     checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
@@ -355,6 +357,7 @@ impl RuntimeDaemon {
             config,
             manager,
             state_store: Mutex::new(state_store),
+            teardown_finalizer_locks: Mutex::new(HashMap::new()),
             execution_sessions: ExecutionSessionRegistry::default(),
             placement_scheduler,
             checkpoint_retention_policy,
@@ -471,6 +474,30 @@ impl RuntimeDaemon {
             self.state_store_path(),
             StateStorePragmas::daemon_defaults(),
         )
+    }
+
+    /// Return the process-wide finalizer lock for one stack.
+    ///
+    /// The durable reconcile claim fences other operations, while this lock
+    /// ensures only one in-process teardown request can hold and consume an
+    /// exact active teardown claim across its stack-wide finalizer effects.
+    pub(crate) fn teardown_finalizer_lock(
+        &self,
+        stack_name: &str,
+    ) -> Result<Arc<tokio::sync::Mutex<()>>, StackError> {
+        let mut locks = self
+            .teardown_finalizer_locks
+            .lock()
+            .map_err(|_| StackError::Machine {
+                code: MachineErrorCode::InternalError,
+                message: "teardown finalizer lock registry mutex poisoned".to_string(),
+            })?;
+        if let Some(lock) = locks.get(stack_name).and_then(Weak::upgrade) {
+            return Ok(lock);
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        locks.insert(stack_name.to_string(), Arc::downgrade(&lock));
+        Ok(lock)
     }
 
     pub(crate) fn checkpoint_retention_policy(&self) -> vz_stack::CheckpointRetentionPolicy {

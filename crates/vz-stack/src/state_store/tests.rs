@@ -1648,6 +1648,197 @@ fn reconcile_session_create_and_load_active() {
 }
 
 #[test]
+fn reconcile_session_exact_lookup_covers_missing_active_and_terminal_states() {
+    let store = StateStore::in_memory().unwrap();
+    assert!(store.load_reconcile_session("missing").unwrap().is_none());
+
+    let active = sample_session("rs-exact-active", "myapp");
+    store
+        .create_reconcile_session(&active, &sample_actions())
+        .unwrap();
+    let loaded = store
+        .load_reconcile_session("rs-exact-active")
+        .unwrap()
+        .unwrap();
+    assert_eq!(loaded.session_id, active.session_id);
+    assert_eq!(loaded.stack_name, active.stack_name);
+    assert_eq!(loaded.operation_id, active.operation_id);
+    assert_eq!(loaded.status, active.status);
+    assert_eq!(loaded.actions_hash, active.actions_hash);
+    assert_eq!(loaded.next_action_index, active.next_action_index);
+    assert_eq!(loaded.total_actions, active.total_actions);
+    assert_eq!(loaded.started_at, active.started_at);
+    assert_eq!(loaded.updated_at, active.updated_at);
+    assert_eq!(loaded.completed_at, active.completed_at);
+
+    store
+        .update_reconcile_session_progress("rs-exact-active", 2, &ReconcileSessionStatus::Active)
+        .unwrap();
+    store.complete_reconcile_session("rs-exact-active").unwrap();
+    let completed = store
+        .load_reconcile_session("rs-exact-active")
+        .unwrap()
+        .unwrap();
+    assert_eq!(completed.status, ReconcileSessionStatus::Completed);
+    assert_eq!(completed.next_action_index, completed.total_actions);
+    assert!(completed.completed_at.is_some());
+
+    let failed = sample_session("rs-exact-failed", "other");
+    store
+        .create_reconcile_session(&failed, &sample_actions_for_stack("other"))
+        .unwrap();
+    store.fail_reconcile_session("rs-exact-failed").unwrap();
+    let failed = store
+        .load_reconcile_session("rs-exact-failed")
+        .unwrap()
+        .unwrap();
+    assert_eq!(failed.status, ReconcileSessionStatus::Failed);
+    assert!(failed.completed_at.is_some());
+}
+
+#[test]
+fn reconcile_session_exact_lookup_rejects_malformed_action_metadata() {
+    let store = StateStore::in_memory().unwrap();
+    let session = sample_session("rs-exact-malformed", "myapp");
+    store
+        .create_reconcile_session(&session, &sample_actions())
+        .unwrap();
+    store
+        .conn
+        .execute("DROP TRIGGER reconcile_session_identity_immutable", [])
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_hash = 'tampered' WHERE session_id = ?1",
+            params![session.session_id],
+        )
+        .unwrap();
+
+    let error = store
+        .load_reconcile_session("rs-exact-malformed")
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("action metadata is inconsistent")
+    );
+}
+
+#[test]
+fn reconcile_session_exact_lookup_rejects_impossible_status_shapes() {
+    struct Case {
+        id: &'static str,
+        status: &'static str,
+        cursor: i64,
+        completed_at: Option<i64>,
+    }
+    let cases = [
+        Case {
+            id: "active-at-end",
+            status: "active",
+            cursor: 2,
+            completed_at: None,
+        },
+        Case {
+            id: "active-completed",
+            status: "active",
+            cursor: 0,
+            completed_at: Some(10),
+        },
+        Case {
+            id: "completed-partial",
+            status: "completed",
+            cursor: 1,
+            completed_at: Some(10),
+        },
+        Case {
+            id: "completed-without-time",
+            status: "completed",
+            cursor: 2,
+            completed_at: None,
+        },
+        Case {
+            id: "failed-without-time",
+            status: "failed",
+            cursor: 0,
+            completed_at: None,
+        },
+        Case {
+            id: "superseded-without-time",
+            status: "superseded",
+            cursor: 0,
+            completed_at: None,
+        },
+    ];
+
+    for case in cases {
+        let store = StateStore::in_memory().unwrap();
+        let session_id = format!("rs-shape-{}", case.id);
+        let session = sample_session(&session_id, "myapp");
+        store
+            .create_reconcile_session(&session, &sample_actions())
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = ON;")
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE reconcile_sessions
+                 SET status = ?1, next_action_index = ?2, completed_at = ?3
+                 WHERE session_id = ?4",
+                params![case.status, case.cursor, case.completed_at, session_id],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute_batch("PRAGMA ignore_check_constraints = OFF;")
+            .unwrap();
+
+        let error = store.load_reconcile_session(&session_id).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("status, cursor, and completion metadata are inconsistent"),
+            "unexpected error for {}: {error}",
+            case.id
+        );
+    }
+}
+
+#[test]
+fn reconcile_session_exact_lookup_rejects_blank_persisted_identity() {
+    for (column, value) in [("stack_name", "   "), ("operation_id", "")] {
+        let store = StateStore::in_memory().unwrap();
+        let session = sample_session("rs-blank-identity", "myapp");
+        store
+            .create_reconcile_session(&session, &sample_actions())
+            .unwrap();
+        store
+            .conn
+            .execute("DROP TRIGGER reconcile_session_identity_immutable", [])
+            .unwrap();
+        store
+            .conn
+            .execute(
+                &format!("UPDATE reconcile_sessions SET {column} = ?1 WHERE session_id = ?2"),
+                params![value, session.session_id],
+            )
+            .unwrap();
+
+        assert!(store.load_reconcile_session("rs-blank-identity").is_err());
+    }
+    assert!(
+        StateStore::in_memory()
+            .unwrap()
+            .load_reconcile_session("  ")
+            .is_err()
+    );
+}
+
+#[test]
 fn reconcile_session_update_progress() {
     let store = StateStore::in_memory().unwrap();
     let session = sample_session("rs-2", "myapp");
@@ -12816,7 +13007,10 @@ fn fresh_claim_kind_status_binding_matrix_is_complete_and_fail_closed() {
         for (status_index, status) in statuses.into_iter().enumerate() {
             for bound in [false, true] {
                 let binding_permitted = match action_index {
-                    0 => expected[action_index][status_index],
+                    0 => {
+                        expected[action_index][status_index]
+                            && (status != StackContainerCreateStatus::Blocked || bound)
+                    }
                     1 => expected[action_index][status_index],
                     2 => {
                         expected[action_index][status_index]
@@ -13255,6 +13449,137 @@ fn install_unstarted_batch(
     store.create_reconcile_batch(&session, actions).unwrap();
 }
 
+fn claimed_create_input(store: &StateStore, action: &Action, suffix: &str) -> ClaimedCreateInput {
+    let environment = store
+        .load_environment_instance(action.precondition().workload().environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    ClaimedCreateInput {
+        requested_container_id: format!("ctr-claimed-{suffix}"),
+        definition_digest: environment.definition_digest,
+        applied_config_digest: format!("vzsc1-sha256:claimed-{suffix}"),
+        activation_payload_sha256: "c".repeat(64),
+    }
+}
+
+fn empty_claimed_allocator_target() -> ClaimedAllocatorTarget {
+    ClaimedAllocatorTarget {
+        ports: Vec::new(),
+        service_ip: None,
+        service_network_ips: Vec::new(),
+        mount_tag_offset: None,
+    }
+}
+
+fn binding_for_claimed_intent(
+    intent: &StackContainerCreateIntent,
+    runtime_generation: u64,
+    bound_at: u64,
+) -> StackContainerGenerationBinding {
+    StackContainerGenerationBinding {
+        reservation_id: intent.scope.reservation_id.clone(),
+        service_name: intent.service_name.clone(),
+        ownership: ContainerGenerationOwnership {
+            container_id: intent.requested_container_id.clone(),
+            generation: runtime_generation,
+            stack_id: intent.scope.stack_id.clone(),
+            scope: Some(Box::new(intent.scope.clone())),
+        },
+        bound_at,
+    }
+}
+
+fn inject_journal_intent_for_test(store: &StateStore, intent: &StackContainerCreateIntent) {
+    intent.validate().unwrap();
+    let (persisted_status, observed) = match intent.status {
+        StackContainerCreateStatus::Intent => (
+            "intent",
+            ServiceObservedState {
+                replica: ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index)
+                    .unwrap(),
+                applied_config_digest: None,
+                phase: ServicePhase::Creating,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            },
+        ),
+        StackContainerCreateStatus::Failed => (
+            "failed",
+            ServiceObservedState {
+                replica: ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index)
+                    .unwrap(),
+                applied_config_digest: None,
+                phase: ServicePhase::Failed,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: intent.last_error.clone(),
+                ready: false,
+            },
+        ),
+        other => panic!("test journal injector cannot synthesize {other:?}"),
+    };
+    store
+        .conn
+        .execute(
+            "INSERT INTO stack_container_create_intents (
+                reservation_id, schema_version, project_id, environment_id, machine_id,
+                machine_incarnation_id, environment_generation, stack_id, service_name,
+                replica_index, service_generation, requested_container_id, definition_digest,
+                action_digest, applied_config_digest, status, intent_json, last_error, created_at, updated_at,
+                completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                       ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+            params![
+                intent.scope.reservation_id,
+                intent.schema_version,
+                intent.scope.project_id.as_str(),
+                intent.scope.environment_id.as_str(),
+                intent.scope.machine_id.as_str(),
+                intent
+                    .scope
+                    .machine_incarnation_id
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                i64::try_from(intent.environment_generation).unwrap(),
+                intent.scope.stack_id,
+                intent.service_name,
+                i64::from(intent.replica_index),
+                i64::try_from(intent.service_generation).unwrap(),
+                intent.requested_container_id,
+                intent.definition_digest,
+                intent.action_digest,
+                intent.applied_config_digest,
+                persisted_status,
+                serde_json::to_string(intent).unwrap(),
+                intent.last_error,
+                i64::try_from(intent.created_at).unwrap(),
+                i64::try_from(intent.updated_at).unwrap(),
+                intent
+                    .completed_at
+                    .map(|value| i64::try_from(value).unwrap()),
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO observed_state (stack_name, service_name, replica_index, state_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stack_name, service_name, replica_index) DO UPDATE SET
+                state_json = excluded.state_json",
+            params![
+                intent.scope.stack_id,
+                intent.service_name,
+                i64::from(intent.replica_index),
+                serde_json::to_string(&observed).unwrap(),
+            ],
+        )
+        .unwrap();
+}
+
 fn exact_outcomes(
     actions: &[Action],
     failed_index: Option<usize>,
@@ -13295,6 +13620,106 @@ fn assert_uncommitted_exact_batch(store: &StateStore, session_id: &str) {
     let audits = store.load_audit_log_for_session(session_id).unwrap();
     assert_eq!(audits.len(), 3);
     assert!(audits.iter().all(|entry| entry.status == "started"));
+}
+
+fn install_claimed_teardown_batch(
+    store: &StateStore,
+    session_id: &str,
+) -> (Vec<Action>, Vec<ReconcileActionClaim>, String) {
+    let source = exact_batch_actions_for_claim(store);
+    let actions = vec![
+        match &source[1] {
+            Action::ServiceRecreate {
+                precondition,
+                target,
+            } => Action::ServiceRemove {
+                precondition: precondition.clone(),
+                target: target.clone(),
+            },
+            other => panic!("expected recreate fixture, got {other:?}"),
+        },
+        source[2].clone(),
+    ];
+    let operation_id = format!("{CLAIMED_TEARDOWN_OPERATION_PREFIX}req-state-store-test");
+    let session = ReconcileSession {
+        session_id: session_id.to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: operation_id.clone(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1_700_000_000,
+        updated_at: 1_700_000_000,
+        completed_at: None,
+    };
+    store.create_reconcile_batch(&session, &actions).unwrap();
+    let claims = store
+        .start_reconcile_batch(session_id, "exact-batch", &operation_id, 0, &actions)
+        .unwrap();
+    (actions, claims, operation_id)
+}
+
+#[test]
+fn generic_commit_rejects_reserved_teardown_without_mutation() {
+    let store = StateStore::in_memory().unwrap();
+    let session_id = "rs-reserved-generic-denial";
+    let (actions, _claims, operation_id) = install_claimed_teardown_batch(&store, session_id);
+
+    let error = store
+        .commit_reconcile_batch(
+            session_id,
+            "exact-batch",
+            &operation_id,
+            0,
+            &actions,
+            &exact_outcomes(&actions, None),
+        )
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("claim-qualified teardown commit")
+    );
+    let active = store
+        .load_active_reconcile_session("exact-batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.session_id, session_id);
+    assert_eq!(active.next_action_index, 0);
+    let audits = store.load_audit_log_for_session(session_id).unwrap();
+    assert_eq!(audits.len(), 2);
+    assert!(audits.iter().all(|audit| audit.status == "started"));
+}
+
+#[test]
+fn claimed_teardown_commit_rejects_swapped_claims_without_mutation() {
+    let store = StateStore::in_memory().unwrap();
+    let session_id = "rs-swapped-teardown-claims";
+    let (actions, mut claims, operation_id) = install_claimed_teardown_batch(&store, session_id);
+    claims.swap(0, 1);
+
+    let error = store
+        .commit_claimed_teardown_batch(ClaimedTeardownCommit {
+            claims: &claims,
+            session_id,
+            stack_name: "exact-batch",
+            operation_id: &operation_id,
+            expected_cursor: 0,
+            actions: &actions,
+            outcomes: &exact_outcomes(&actions, None),
+        })
+        .unwrap_err();
+    assert!(error.to_string().contains("does not match exact action"));
+    let active = store
+        .load_active_reconcile_session("exact-batch")
+        .unwrap()
+        .unwrap();
+    assert_eq!(active.session_id, session_id);
+    assert_eq!(active.next_action_index, 0);
+    let audits = store.load_audit_log_for_session(session_id).unwrap();
+    assert_eq!(audits.len(), 2);
+    assert!(audits.iter().all(|audit| audit.status == "started"));
 }
 
 #[test]
@@ -14244,12 +14669,8 @@ fn started_claim_replay_accepts_own_cleanup_progression_and_rejects_foreign_sess
             &actions,
         )
         .unwrap();
-    let reservation_id = match actions[1].precondition().journal_head() {
-        crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => reservation_id,
-        crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
-    };
     store
-        .begin_stack_container_cleanup(reservation_id, 200)
+        .begin_claimed_predecessor_cleanup(&first_claims[1], 200)
         .unwrap();
 
     let replayed = store
@@ -14342,7 +14763,7 @@ fn started_create_claim_replays_exact_predecessor_cleanup_before_successor_inten
         .unwrap();
 
     store
-        .begin_stack_container_cleanup(&reservation_id, 201)
+        .begin_claimed_predecessor_cleanup(&first[0], 201)
         .unwrap();
     assert_eq!(
         store
@@ -14357,7 +14778,7 @@ fn started_create_claim_replays_exact_predecessor_cleanup_before_successor_inten
         first
     );
     store
-        .publish_stack_container_cleanup_success(&reservation_id, 202)
+        .complete_claimed_predecessor_cleanup(&first[0], 202)
         .unwrap();
     assert_eq!(
         store
@@ -14370,6 +14791,969 @@ fn started_create_claim_replays_exact_predecessor_cleanup_before_successor_inten
             )
             .unwrap(),
         first
+    );
+}
+
+#[test]
+fn started_recreate_claim_rejects_unowned_blocked_predecessor_progression() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[1].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-recreate-blocked-replay",
+        "op-recreate-blocked-replay",
+        &actions,
+    );
+    store
+        .start_reconcile_batch(
+            "rs-recreate-blocked-replay",
+            "exact-batch",
+            "op-recreate-blocked-replay",
+            0,
+            &actions,
+        )
+        .unwrap();
+    let (reservation_id, ownership) = match actions[0].precondition().journal_head() {
+        crate::reconcile::ExpectedJournalHead::Exact {
+            reservation_id,
+            ownership: Some(ownership),
+            ..
+        } => (reservation_id, ownership),
+        _ => unreachable!(),
+    };
+    let mut intent = store
+        .load_stack_container_create_intent(reservation_id)
+        .unwrap()
+        .unwrap();
+    intent.status = StackContainerCreateStatus::Blocked;
+    intent.last_error = Some("foreign blocked transition".to_string());
+    intent.updated_at += 1;
+    let observed = ServiceObservedState {
+        replica: actions[0].target().clone(),
+        applied_config_digest: None,
+        phase: ServicePhase::Failed,
+        container_id: Some(ownership.container_id.clone()),
+        failed_create_ownership: Some(ownership.clone()),
+        last_error: intent.last_error.clone(),
+        ready: false,
+    };
+    store
+        .conn
+        .execute(
+            "UPDATE stack_container_create_intents
+             SET status = 'blocked', intent_json = ?1, last_error = ?2, updated_at = ?3
+             WHERE reservation_id = ?4",
+            params![
+                serde_json::to_string(&intent).unwrap(),
+                intent.last_error,
+                i64::try_from(intent.updated_at).unwrap(),
+                reservation_id,
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE observed_state SET state_json = ?1
+             WHERE stack_name = 'exact-batch' AND service_name = 'api-2' AND replica_index = 1",
+            params![serde_json::to_string(&observed).unwrap()],
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .start_reconcile_batch(
+                "rs-recreate-blocked-replay",
+                "exact-batch",
+                "op-recreate-blocked-replay",
+                0,
+                &actions,
+            )
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+}
+
+#[test]
+fn claimed_exact_successor_lifecycle_replays_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claimed-successor-reopen.db");
+    let store = StateStore::open(&path).unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[1].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-claimed-successor",
+        "op-claimed-successor",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-claimed-successor",
+            "exact-batch",
+            "op-claimed-successor",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+
+    assert!(matches!(
+        store.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ExactBoundNeedsCleanup { .. }
+    ));
+    let stopping = store
+        .begin_claimed_predecessor_cleanup(&claim, 200)
+        .unwrap();
+    assert_eq!(stopping.phase, ServicePhase::Stopping);
+    assert_eq!(
+        store
+            .begin_claimed_predecessor_cleanup(&claim, 200)
+            .unwrap(),
+        stopping
+    );
+    assert!(matches!(
+        store.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ExactBoundCleanupPending { .. }
+    ));
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    let stopped = store
+        .complete_claimed_predecessor_cleanup(&claim, 201)
+        .unwrap();
+    assert_eq!(stopped.phase, ServicePhase::Stopped);
+    assert_eq!(
+        store
+            .complete_claimed_predecessor_cleanup(&claim, 201)
+            .unwrap(),
+        stopped
+    );
+    assert!(matches!(
+        store.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ExactBoundCleaned { .. }
+    ));
+
+    let input = claimed_create_input(&store, &actions[0], "successor-reopen");
+    let allocation = empty_claimed_allocator_target();
+    let successor = store
+        .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 202)
+        .unwrap();
+    assert_eq!(successor.service_generation, 2);
+    assert_eq!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 202)
+            .unwrap(),
+        successor
+    );
+    let binding = binding_for_claimed_intent(&successor, 41, 203);
+    assert_eq!(
+        store
+            .bind_claimed_successor_generation(&claim, &binding)
+            .unwrap(),
+        binding
+    );
+    assert_eq!(
+        store
+            .bind_claimed_successor_generation(&claim, &binding)
+            .unwrap(),
+        binding
+    );
+    let running = store
+        .publish_claimed_successor_success(&claim, &successor.scope.reservation_id, true, 204)
+        .unwrap();
+    assert_eq!(running.phase, ServicePhase::Running);
+    assert!(running.ready);
+    assert_eq!(
+        store
+            .publish_claimed_successor_blocked(
+                &claim,
+                &successor.scope.reservation_id,
+                "late health result",
+                205,
+            )
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(
+        store
+            .publish_claimed_successor_success(&claim, &successor.scope.reservation_id, true, 204,)
+            .unwrap(),
+        running
+    );
+}
+
+#[test]
+fn claimed_successor_failure_is_replayable_and_bound_cleanup_is_explicit() {
+    for bound in [false, true] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        let session_id = if bound {
+            "rs-claimed-bound-failure"
+        } else {
+            "rs-claimed-unbound-failure"
+        };
+        install_unstarted_batch(&store, session_id, "op-claimed-failure", &actions);
+        let claim = store
+            .start_reconcile_batch(session_id, "exact-batch", "op-claimed-failure", 0, &actions)
+            .unwrap()
+            .remove(0);
+        let input = claimed_create_input(
+            &store,
+            &actions[0],
+            if bound {
+                "bound-failure"
+            } else {
+                "unbound-failure"
+            },
+        );
+        let allocation = empty_claimed_allocator_target();
+        let successor = store
+            .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 210)
+            .unwrap();
+        if bound {
+            let binding = binding_for_claimed_intent(&successor, 61, 211);
+            store
+                .bind_claimed_successor_generation(&claim, &binding)
+                .unwrap();
+            assert_eq!(
+                store
+                    .begin_claimed_successor_cleanup(&claim, &successor.scope.reservation_id, 211,)
+                    .unwrap_err()
+                    .machine_code(),
+                MachineErrorCode::StateConflict
+            );
+            let blocked = store
+                .publish_claimed_successor_blocked(
+                    &claim,
+                    &successor.scope.reservation_id,
+                    "activation failed exactly",
+                    212,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .publish_claimed_successor_blocked(
+                        &claim,
+                        &successor.scope.reservation_id,
+                        "activation failed exactly",
+                        212,
+                    )
+                    .unwrap(),
+                blocked
+            );
+        } else {
+            let before = store
+                .load_stack_container_create_intent(&successor.scope.reservation_id)
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                store
+                    .publish_claimed_successor_blocked(
+                        &claim,
+                        &successor.scope.reservation_id,
+                        "unbound intent must remain bindable",
+                        212,
+                    )
+                    .unwrap_err()
+                    .machine_code(),
+                MachineErrorCode::StateConflict
+            );
+            assert_eq!(
+                store
+                    .load_stack_container_create_intent(&successor.scope.reservation_id)
+                    .unwrap()
+                    .unwrap(),
+                before
+            );
+        }
+        let failed = store
+            .publish_claimed_successor_failure(
+                &claim,
+                &successor.scope.reservation_id,
+                "activation failed exactly",
+                212,
+            )
+            .unwrap();
+        assert_eq!(failed.phase, ServicePhase::Failed);
+        assert_eq!(
+            store
+                .publish_claimed_successor_failure(
+                    &claim,
+                    &successor.scope.reservation_id,
+                    "activation failed exactly",
+                    212,
+                )
+                .unwrap(),
+            failed
+        );
+        assert_eq!(
+            store
+                .publish_claimed_successor_failure(
+                    &claim,
+                    &successor.scope.reservation_id,
+                    "different activation evidence",
+                    212,
+                )
+                .unwrap_err()
+                .machine_code(),
+            MachineErrorCode::StateConflict
+        );
+        let failed_intent = store
+            .load_stack_container_create_intent(&successor.scope.reservation_id)
+            .unwrap()
+            .unwrap();
+        if bound {
+            assert_eq!(failed_intent.status, StackContainerCreateStatus::Blocked);
+            assert_eq!(
+                store
+                    .publish_claimed_successor_blocked(
+                        &claim,
+                        &successor.scope.reservation_id,
+                        "activation failed exactly",
+                        212,
+                    )
+                    .unwrap(),
+                failed
+            );
+            assert_eq!(
+                store
+                    .publish_claimed_successor_blocked(
+                        &claim,
+                        &successor.scope.reservation_id,
+                        "different blocked evidence",
+                        212,
+                    )
+                    .unwrap_err()
+                    .machine_code(),
+                MachineErrorCode::StateConflict
+            );
+            let stopping = store
+                .begin_claimed_successor_cleanup(&claim, &successor.scope.reservation_id, 213)
+                .unwrap();
+            assert_eq!(stopping.phase, ServicePhase::Stopping);
+            assert_eq!(
+                store
+                    .begin_claimed_successor_cleanup(&claim, &successor.scope.reservation_id, 213,)
+                    .unwrap(),
+                stopping
+            );
+            let stopped = store
+                .complete_claimed_successor_cleanup(&claim, &successor.scope.reservation_id, 214)
+                .unwrap();
+            assert_eq!(stopped.phase, ServicePhase::Stopped);
+            assert_eq!(
+                store
+                    .complete_claimed_successor_cleanup(
+                        &claim,
+                        &successor.scope.reservation_id,
+                        214,
+                    )
+                    .unwrap(),
+                stopped
+            );
+        } else {
+            assert_eq!(failed_intent.status, StackContainerCreateStatus::Failed);
+        }
+    }
+}
+
+#[test]
+fn claimed_unbound_remove_requires_explicit_absent_or_discovered_cleanup_decision() {
+    for initial_status in [
+        StackContainerCreateStatus::Intent,
+        StackContainerCreateStatus::Blocked,
+    ] {
+        let status_label = match initial_status {
+            StackContainerCreateStatus::Intent => "intent",
+            StackContainerCreateStatus::Blocked => "blocked",
+            _ => unreachable!(),
+        };
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let create = &seeded[0];
+        let workload = create.precondition().workload();
+        let input = claimed_create_input(&store, create, status_label);
+        let selector = StackContainerCreateSelector {
+            project_id: workload.project_id.clone(),
+            environment_id: workload.environment_id.clone(),
+            machine_id: workload.machine_id.clone(),
+            machine_incarnation_id: workload.machine_incarnation_id.clone(),
+            environment_generation: create.precondition().environment_generation(),
+            stack_id: workload.stack_id.clone(),
+            service_name: create.target().service_name.clone(),
+            replica_index: create.target().index(),
+            requested_container_id: input.requested_container_id,
+            definition_digest: input.definition_digest,
+            action_digest: format!("sha256:unbound-{status_label}"),
+            applied_config_digest: input.applied_config_digest,
+        };
+        let intent = store
+            .resolve_or_begin_stack_container_create(&selector, 150)
+            .unwrap()
+            .0;
+        if initial_status == StackContainerCreateStatus::Blocked {
+            store
+                .publish_stack_container_blocked(
+                    &intent.scope.reservation_id,
+                    "runtime inspection required",
+                    151,
+                )
+                .unwrap();
+        }
+        let action = Action::ServiceRemove {
+            target: create.target().clone(),
+            precondition: crate::reconcile::ReplicaPrecondition::new(
+                workload.clone(),
+                create.precondition().environment_generation(),
+                crate::reconcile::ExpectedJournalHead::exact(
+                    &intent.scope.reservation_id,
+                    intent.service_generation,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+        };
+        let actions = vec![action];
+        let session_id = format!("rs-unbound-{status_label}");
+        install_unstarted_batch(&store, &session_id, "op-unbound-absent", &actions);
+        let claim = store
+            .start_reconcile_batch(&session_id, "exact-batch", "op-unbound-absent", 0, &actions)
+            .unwrap()
+            .remove(0);
+        let before = store
+            .load_stack_container_create_intent(&intent.scope.reservation_id)
+            .unwrap()
+            .unwrap();
+        assert!(matches!(
+            store.inspect_claimed_predecessor(&claim).unwrap(),
+            ClaimedPredecessorInspection::ExactUnboundNeedsInspection { .. }
+        ));
+        assert_eq!(
+            store
+                .load_stack_container_create_intent(&intent.scope.reservation_id)
+                .unwrap()
+                .unwrap(),
+            before,
+            "inspection must not infer runtime absence"
+        );
+        let failed = store
+            .publish_claimed_unbound_predecessor_failure(
+                &claim,
+                "executor confirmed runtime absence",
+                160,
+            )
+            .unwrap();
+        assert_eq!(failed.phase, ServicePhase::Failed);
+        assert!(matches!(
+            store.inspect_claimed_predecessor(&claim).unwrap(),
+            ClaimedPredecessorInspection::ExactUnboundFailed { .. }
+        ));
+        assert_eq!(
+            store
+                .publish_claimed_unbound_predecessor_failure(
+                    &claim,
+                    "executor confirmed runtime absence",
+                    160,
+                )
+                .unwrap(),
+            failed
+        );
+        store.release_claimed_allocator_target(&claim).unwrap();
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claimed-unbound-bind-reopen.db");
+    let store = StateStore::open(&path).unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let create = &seeded[0];
+    let workload = create.precondition().workload();
+    let input = claimed_create_input(&store, create, "unbound-bind-reopen");
+    let selector = StackContainerCreateSelector {
+        project_id: workload.project_id.clone(),
+        environment_id: workload.environment_id.clone(),
+        machine_id: workload.machine_id.clone(),
+        machine_incarnation_id: workload.machine_incarnation_id.clone(),
+        environment_generation: create.precondition().environment_generation(),
+        stack_id: workload.stack_id.clone(),
+        service_name: create.target().service_name.clone(),
+        replica_index: create.target().index(),
+        requested_container_id: input.requested_container_id,
+        definition_digest: input.definition_digest,
+        action_digest: "sha256:unbound-bind-reopen".to_string(),
+        applied_config_digest: input.applied_config_digest,
+    };
+    let intent = store
+        .resolve_or_begin_stack_container_create(&selector, 170)
+        .unwrap()
+        .0;
+    let actions = vec![Action::ServiceRemove {
+        target: create.target().clone(),
+        precondition: crate::reconcile::ReplicaPrecondition::new(
+            workload.clone(),
+            create.precondition().environment_generation(),
+            crate::reconcile::ExpectedJournalHead::exact(
+                &intent.scope.reservation_id,
+                intent.service_generation,
+                None,
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    }];
+    install_unstarted_batch(
+        &store,
+        "rs-unbound-bind-reopen",
+        "op-unbound-bind-reopen",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-unbound-bind-reopen",
+            "exact-batch",
+            "op-unbound-bind-reopen",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+    let binding = binding_for_claimed_intent(&intent, 52, 171);
+    store
+        .bind_claimed_predecessor_for_cleanup(&claim, &binding)
+        .unwrap();
+    assert!(matches!(
+        store.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ExactBoundCleanupPending { binding: actual, .. }
+            if actual == binding
+    ));
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    assert!(matches!(
+        store.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ExactBoundCleanupPending { binding: actual, .. }
+            if actual == binding
+    ));
+    let stopped = store
+        .complete_claimed_predecessor_cleanup(&claim, 172)
+        .unwrap();
+    assert_eq!(
+        store
+            .complete_claimed_predecessor_cleanup(&claim, 172)
+            .unwrap(),
+        stopped
+    );
+    store.release_claimed_allocator_target(&claim).unwrap();
+}
+
+#[test]
+fn raw_journal_mutators_cannot_bypass_a_started_claim_with_matching_authority() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[1].clone()];
+    install_unstarted_batch(&store, "rs-raw-fence", "op-raw-fence", &actions);
+    let claim = store
+        .start_reconcile_batch("rs-raw-fence", "exact-batch", "op-raw-fence", 0, &actions)
+        .unwrap()
+        .remove(0);
+    let reservation_id = match actions[0].precondition().journal_head() {
+        crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => reservation_id,
+        crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+    };
+    let before = store
+        .load_stack_container_create_intent(reservation_id)
+        .unwrap()
+        .unwrap();
+    let error = store
+        .begin_stack_container_cleanup(reservation_id, 200)
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(reservation_id)
+            .unwrap()
+            .unwrap(),
+        before
+    );
+    store
+        .begin_claimed_predecessor_cleanup(&claim, 200)
+        .unwrap();
+}
+
+#[test]
+fn claimed_successor_allocator_is_atomic_exact_and_fences_raw_saves() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let sibling = ServiceReplicaKey::new("api-2", 1).unwrap();
+    let initial = AllocatorSnapshot {
+        schema_version: 2,
+        ports: vec![AllocatorPortLease {
+            target: sibling.clone(),
+            ports: vec![PublishedPort {
+                protocol: "tcp".to_string(),
+                container_port: 80,
+                host_port: 18_080,
+            }],
+        }],
+        service_ips: vec![AllocatorIpLease {
+            target: sibling.clone(),
+            ip: "10.42.0.8".to_string(),
+        }],
+        service_network_ips: vec![AllocatorNetworkIpLease {
+            target: sibling.clone(),
+            network_name: "backend".to_string(),
+            ip: "10.43.0.8".to_string(),
+        }],
+        mount_tag_offsets: HashMap::from([("api-2".to_string(), 17), ("api".to_string(), 31)]),
+    };
+    store.save_allocator_state("exact-batch", &initial).unwrap();
+    let actions = vec![seeded[0].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-allocator-upsert",
+        "op-allocator-upsert",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-allocator-upsert",
+            "exact-batch",
+            "op-allocator-upsert",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+    store
+        .validate_reconcile_action_claim(
+            &claim,
+            "rs-allocator-upsert",
+            "op-allocator-upsert",
+            0,
+            &actions[0],
+        )
+        .unwrap();
+    for (session, operation, index, action) in [
+        ("foreign-session", "op-allocator-upsert", 0, &actions[0]),
+        ("rs-allocator-upsert", "foreign-operation", 0, &actions[0]),
+        ("rs-allocator-upsert", "op-allocator-upsert", 1, &actions[0]),
+        ("rs-allocator-upsert", "op-allocator-upsert", 0, &seeded[1]),
+    ] {
+        assert_eq!(
+            store
+                .validate_reconcile_action_claim(&claim, session, operation, index, action)
+                .unwrap_err()
+                .machine_code(),
+            MachineErrorCode::StateConflict
+        );
+    }
+
+    let allocation = ClaimedAllocatorTarget {
+        ports: vec![
+            PublishedPort {
+                protocol: "tcp".to_string(),
+                container_port: 8080,
+                host_port: 28_080,
+            },
+            PublishedPort {
+                protocol: "udp".to_string(),
+                container_port: 5353,
+                host_port: 25_353,
+            },
+        ],
+        service_ip: Some("10.42.0.9".to_string()),
+        service_network_ips: vec![
+            ClaimedAllocatorNetworkIp {
+                network_name: "backend".to_string(),
+                ip: "10.43.0.9".to_string(),
+            },
+            ClaimedAllocatorNetworkIp {
+                network_name: "frontend".to_string(),
+                ip: "10.46.0.9".to_string(),
+            },
+        ],
+        mount_tag_offset: Some(31),
+    };
+    let input = claimed_create_input(&store, &actions[0], "allocator-atomic");
+    assert!(
+        store
+            .resolve_or_begin_claimed_successor_after_allocator_failpoint(
+                &claim,
+                &input,
+                &allocation,
+                190,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store.load_allocator_state("exact-batch").unwrap().unwrap(),
+        initial
+    );
+    let intent = store
+        .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 190)
+        .unwrap();
+    let mut reordered = allocation.clone();
+    reordered.ports.reverse();
+    reordered.service_network_ips.reverse();
+    assert_eq!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &reordered, 190)
+            .unwrap(),
+        intent
+    );
+    let persisted = store.load_allocator_state("exact-batch").unwrap().unwrap();
+    assert_eq!(persisted.mount_tag_offsets.get("api-2"), Some(&17));
+    assert_eq!(persisted.mount_tag_offsets.get("api"), Some(&31));
+    assert!(persisted.ports.iter().any(|lease| lease.target == sibling));
+    assert!(
+        persisted
+            .service_ips
+            .iter()
+            .any(|lease| lease.target == sibling)
+    );
+    assert!(
+        persisted
+            .service_network_ips
+            .iter()
+            .any(|lease| lease.target == sibling)
+    );
+
+    let before_conflict = persisted.clone();
+    let conflict_allocation = ClaimedAllocatorTarget {
+        ports: vec![PublishedPort {
+            protocol: "tcp".to_string(),
+            container_port: 8080,
+            host_port: 18_080,
+        }],
+        service_ip: allocation.service_ip.clone(),
+        service_network_ips: allocation.service_network_ips.clone(),
+        mount_tag_offset: allocation.mount_tag_offset,
+    };
+    assert!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &conflict_allocation, 190)
+            .is_err()
+    );
+    assert_eq!(
+        store.load_allocator_state("exact-batch").unwrap().unwrap(),
+        before_conflict
+    );
+    let mut mount_conflict = allocation.clone();
+    mount_conflict.mount_tag_offset = Some(32);
+    assert_eq!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &mount_conflict, 190)
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(
+        store
+            .load_allocator_state("exact-batch")
+            .unwrap()
+            .unwrap()
+            .mount_tag_offsets
+            .get("api"),
+        Some(&31)
+    );
+    assert_eq!(
+        store
+            .save_allocator_state("exact-batch", &before_conflict)
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+}
+
+#[test]
+fn claimed_successor_does_not_mutate_allocator_before_exact_predecessor_is_terminal() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let initial = AllocatorSnapshot {
+        schema_version: 2,
+        ports: Vec::new(),
+        service_ips: Vec::new(),
+        service_network_ips: Vec::new(),
+        mount_tag_offsets: HashMap::from([("api-2".to_string(), 7)]),
+    };
+    store.save_allocator_state("exact-batch", &initial).unwrap();
+    let actions = vec![seeded[1].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-allocator-predecessor",
+        "op-allocator-predecessor",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-allocator-predecessor",
+            "exact-batch",
+            "op-allocator-predecessor",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+    let input = claimed_create_input(&store, &actions[0], "predecessor-running");
+    let allocation = ClaimedAllocatorTarget {
+        ports: vec![PublishedPort {
+            protocol: "tcp".to_string(),
+            container_port: 8080,
+            host_port: 30_080,
+        }],
+        service_ip: Some("10.50.0.2".to_string()),
+        service_network_ips: Vec::new(),
+        mount_tag_offset: Some(99),
+    };
+    assert_eq!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 400)
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(
+        store.load_allocator_state("exact-batch").unwrap().unwrap(),
+        initial
+    );
+}
+
+#[test]
+fn claimed_allocator_remove_releases_only_exact_target_and_replays_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claimed-allocator-release.db");
+    let store = StateStore::open(&path).unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let target = seeded[2].target().clone();
+    let sibling = ServiceReplicaKey::new("api-2", 1).unwrap();
+    let initial = AllocatorSnapshot {
+        schema_version: 2,
+        ports: vec![
+            AllocatorPortLease {
+                target: target.clone(),
+                ports: vec![PublishedPort {
+                    protocol: "tcp".to_string(),
+                    container_port: 9000,
+                    host_port: 19_000,
+                }],
+            },
+            AllocatorPortLease {
+                target: sibling.clone(),
+                ports: vec![PublishedPort {
+                    protocol: "tcp".to_string(),
+                    container_port: 9001,
+                    host_port: 19_001,
+                }],
+            },
+        ],
+        service_ips: vec![
+            AllocatorIpLease {
+                target: target.clone(),
+                ip: "10.44.0.10".to_string(),
+            },
+            AllocatorIpLease {
+                target: sibling.clone(),
+                ip: "10.44.0.11".to_string(),
+            },
+        ],
+        service_network_ips: vec![
+            AllocatorNetworkIpLease {
+                target: target.clone(),
+                network_name: "backend".to_string(),
+                ip: "10.45.0.10".to_string(),
+            },
+            AllocatorNetworkIpLease {
+                target: sibling.clone(),
+                network_name: "backend".to_string(),
+                ip: "10.45.0.11".to_string(),
+            },
+        ],
+        mount_tag_offsets: HashMap::from([("worker".to_string(), 23), ("api-2".to_string(), 29)]),
+    };
+    store.save_allocator_state("exact-batch", &initial).unwrap();
+    let actions = vec![seeded[2].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-allocator-release",
+        "op-allocator-release",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-allocator-release",
+            "exact-batch",
+            "op-allocator-release",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+    store
+        .begin_claimed_predecessor_cleanup(&claim, 300)
+        .unwrap();
+    store
+        .complete_claimed_predecessor_cleanup(&claim, 301)
+        .unwrap();
+    let release = store.release_claimed_allocator_target(&claim).unwrap();
+    assert_eq!(release.target, target);
+    assert!(!release.already_released);
+    assert_eq!(release.released.ports, initial.ports[0].ports);
+    assert_eq!(release.released.service_ip.as_deref(), Some("10.44.0.10"));
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    let before_replay: (String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT ports_json, service_ips_json, mount_tag_offsets_json
+             FROM allocator_state WHERE stack_name = 'exact-batch'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    let changes_before_replay = store.conn.total_changes();
+    let replay = store.release_claimed_allocator_target(&claim).unwrap();
+    assert!(replay.already_released);
+    assert_eq!(replay.target, target);
+    assert_eq!(store.conn.total_changes(), changes_before_replay);
+    let after_replay: (String, String, String) = store
+        .conn
+        .query_row(
+            "SELECT ports_json, service_ips_json, mount_tag_offsets_json
+             FROM allocator_state WHERE stack_name = 'exact-batch'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(after_replay, before_replay);
+    let persisted = store.load_allocator_state("exact-batch").unwrap().unwrap();
+    assert_eq!(persisted.mount_tag_offsets, initial.mount_tag_offsets);
+    assert_eq!(persisted.ports, vec![initial.ports[1].clone()]);
+    assert_eq!(persisted.service_ips, vec![initial.service_ips[1].clone()]);
+    assert_eq!(
+        persisted.service_network_ips,
+        vec![initial.service_network_ips[1].clone()]
+    );
+    store
+        .commit_reconcile_batch(
+            "rs-allocator-release",
+            "exact-batch",
+            "op-allocator-release",
+            0,
+            &actions,
+            &exact_outcomes(&actions, None),
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .release_claimed_allocator_target(&claim)
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
     );
 }
 
@@ -14449,7 +15833,7 @@ fn started_claim_replay_rejects_impossible_status_binding_shapes() {
                 .unwrap(),
             )
             .unwrap();
-            let action = if malformed_shape == "reserved-unbound" {
+            let action = if matches!(malformed_shape, "reserved-unbound" | "cleaned-unbound") {
                 Action::ServiceRemove {
                     target: seeded[0].target().clone(),
                     precondition,
@@ -14594,9 +15978,10 @@ fn started_create_claim_replay_requires_session_linked_successor_digest() {
         let actions = vec![seeded[0].clone()];
         let session_id = format!("rs-successor-{case}");
         install_unstarted_batch(&store, &session_id, "op-successor", &actions);
-        store
+        let claim = store
             .start_reconcile_batch(&session_id, "exact-batch", "op-successor", 0, &actions)
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         let workload = actions[0].precondition().workload();
         let project = store
@@ -14617,23 +16002,48 @@ fn started_create_claim_replay_requires_session_linked_successor_digest() {
         .unwrap()
         .activation_digest_prefix()
         .unwrap();
-        let selector = StackContainerCreateSelector {
-            project_id: workload.project_id.clone(),
-            environment_id: workload.environment_id.clone(),
-            machine_id: workload.machine_id.clone(),
-            machine_incarnation_id: workload.machine_incarnation_id.clone(),
-            environment_generation: environment.lifecycle_generation,
-            stack_id: workload.stack_id.clone(),
-            service_name: "api".to_string(),
-            replica_index: 2,
+        let input = ClaimedCreateInput {
             requested_container_id: format!("ctr-successor-{case}"),
             definition_digest: environment.definition_digest.clone(),
-            action_digest: format!("{prefix}{suffix}"),
             applied_config_digest: "vzsc1-sha256:successor".to_string(),
+            activation_payload_sha256: suffix.clone(),
         };
-        store
-            .resolve_or_begin_stack_container_create(&selector, 10)
-            .unwrap();
+        if linked {
+            store
+                .resolve_or_begin_claimed_successor(
+                    &claim,
+                    &input,
+                    &empty_claimed_allocator_target(),
+                    10,
+                )
+                .unwrap();
+        } else {
+            let intent = StackContainerCreateIntent {
+                schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
+                scope: vz_runtime_contract::ContainerGenerationScope {
+                    reservation_id: format!("reservation-malformed-{case}"),
+                    project_id: workload.project_id.clone(),
+                    environment_id: workload.environment_id.clone(),
+                    machine_id: workload.machine_id.clone(),
+                    machine_incarnation_id: Some(workload.machine_incarnation_id.clone()),
+                    stack_id: workload.stack_id.clone(),
+                },
+                environment_generation: environment.lifecycle_generation,
+                service_name: actions[0].target().service_name.clone(),
+                replica_index: actions[0].target().index(),
+                service_generation: 1,
+                requested_container_id: input.requested_container_id,
+                definition_digest: input.definition_digest,
+                action_digest: format!("{prefix}{suffix}"),
+                applied_config_digest: Some(input.applied_config_digest),
+                status: StackContainerCreateStatus::Intent,
+                last_error: None,
+                created_at: 10,
+                updated_at: 10,
+                completed_at: None,
+            };
+            inject_journal_intent_for_test(&store, &intent);
+        }
 
         let replay =
             store.start_reconcile_batch(&session_id, "exact-batch", "op-successor", 0, &actions);
@@ -14649,6 +16059,394 @@ fn started_create_claim_replay_requires_session_linked_successor_digest() {
 }
 
 #[test]
+fn inspect_claimed_predecessor_reopens_every_structurally_legal_linked_successor_state() {
+    for status in [
+        StackContainerCreateStatus::Intent,
+        StackContainerCreateStatus::Reserved,
+        StackContainerCreateStatus::Running,
+        StackContainerCreateStatus::Blocked,
+        StackContainerCreateStatus::CleanupPending,
+        StackContainerCreateStatus::Cleaned,
+        StackContainerCreateStatus::Failed,
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("linked-successor-{status:?}.db"));
+        let (claim, reservation_id, expected_binding) = {
+            let store = StateStore::open(&path).unwrap();
+            let seeded = exact_batch_actions_for_claim(&store);
+            let actions = vec![seeded[0].clone()];
+            let session_id = format!("inspect-linked-{status:?}");
+            install_unstarted_batch(&store, &session_id, "inspect-linked-op", &actions);
+            let claim = store
+                .start_reconcile_batch(&session_id, "exact-batch", "inspect-linked-op", 0, &actions)
+                .unwrap()
+                .remove(0);
+            let input = claimed_create_input(&store, &actions[0], &format!("{status:?}"));
+            let intent = store
+                .resolve_or_begin_claimed_successor(
+                    &claim,
+                    &input,
+                    &empty_claimed_allocator_target(),
+                    100,
+                )
+                .unwrap();
+            let reservation_id = intent.scope.reservation_id.clone();
+            let binding = binding_for_claimed_intent(&intent, 11, 101);
+
+            match status {
+                StackContainerCreateStatus::Intent => {}
+                StackContainerCreateStatus::Reserved => {
+                    store
+                        .bind_claimed_successor_generation(&claim, &binding)
+                        .unwrap();
+                }
+                StackContainerCreateStatus::Running => {
+                    store
+                        .bind_claimed_successor_generation(&claim, &binding)
+                        .unwrap();
+                    store
+                        .publish_claimed_successor_success(&claim, &reservation_id, true, 102)
+                        .unwrap();
+                }
+                StackContainerCreateStatus::Blocked => {
+                    store
+                        .bind_claimed_successor_generation(&claim, &binding)
+                        .unwrap();
+                    store
+                        .publish_claimed_successor_blocked(
+                            &claim,
+                            &reservation_id,
+                            "activation blocked",
+                            102,
+                        )
+                        .unwrap();
+                }
+                StackContainerCreateStatus::CleanupPending => {
+                    store
+                        .bind_claimed_successor_generation(&claim, &binding)
+                        .unwrap();
+                    store
+                        .publish_claimed_successor_blocked(
+                            &claim,
+                            &reservation_id,
+                            "activation blocked",
+                            102,
+                        )
+                        .unwrap();
+                    store
+                        .begin_claimed_successor_cleanup(&claim, &reservation_id, 103)
+                        .unwrap();
+                }
+                StackContainerCreateStatus::Cleaned => {
+                    store
+                        .bind_claimed_successor_generation(&claim, &binding)
+                        .unwrap();
+                    store
+                        .publish_claimed_successor_blocked(
+                            &claim,
+                            &reservation_id,
+                            "activation blocked",
+                            102,
+                        )
+                        .unwrap();
+                    store
+                        .begin_claimed_successor_cleanup(&claim, &reservation_id, 103)
+                        .unwrap();
+                    store
+                        .complete_claimed_successor_cleanup(&claim, &reservation_id, 104)
+                        .unwrap();
+                }
+                StackContainerCreateStatus::Failed => {
+                    store
+                        .publish_claimed_successor_failure(
+                            &claim,
+                            &reservation_id,
+                            "activation failed before bind",
+                            102,
+                        )
+                        .unwrap();
+                }
+            }
+            (
+                claim,
+                reservation_id,
+                !matches!(
+                    status,
+                    StackContainerCreateStatus::Intent | StackContainerCreateStatus::Failed
+                ),
+            )
+        };
+
+        let reopened = StateStore::open(&path).unwrap();
+        match reopened.inspect_claimed_predecessor(&claim).unwrap() {
+            ClaimedPredecessorInspection::ClaimLinkedSuccessor { intent, binding } => {
+                assert_eq!(intent.scope.reservation_id, reservation_id);
+                assert_eq!(intent.status, status);
+                assert_eq!(binding.is_some(), expected_binding);
+            }
+            other => panic!("expected linked successor after reopen, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn inspect_claimed_predecessor_rejects_foreign_and_ambiguous_successors_without_writes() {
+    for case in ["foreign", "ambiguous"] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        let session_id = format!("inspect-linked-negative-{case}");
+        install_unstarted_batch(&store, &session_id, "inspect-linked-negative-op", &actions);
+        let claim = store
+            .start_reconcile_batch(
+                &session_id,
+                "exact-batch",
+                "inspect-linked-negative-op",
+                0,
+                &actions,
+            )
+            .unwrap()
+            .remove(0);
+        let workload = actions[0].precondition().workload();
+        let environment = store
+            .load_environment_instance(workload.environment_id.as_str())
+            .unwrap()
+            .unwrap();
+
+        let linked = if case == "ambiguous" {
+            let intent = store
+                .resolve_or_begin_claimed_successor(
+                    &claim,
+                    &claimed_create_input(&store, &actions[0], case),
+                    &empty_claimed_allocator_target(),
+                    10,
+                )
+                .unwrap();
+            store
+                .publish_claimed_successor_failure(
+                    &claim,
+                    &intent.scope.reservation_id,
+                    "terminalize before ambiguity injection",
+                    11,
+                )
+                .unwrap();
+            Some(
+                store
+                    .load_stack_container_create_intent(&intent.scope.reservation_id)
+                    .unwrap()
+                    .unwrap(),
+            )
+        } else {
+            None
+        };
+        let mut foreign = linked.clone().unwrap_or(StackContainerCreateIntent {
+            schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
+            scope: vz_runtime_contract::ContainerGenerationScope {
+                reservation_id: "foreign-linked-successor".to_string(),
+                project_id: workload.project_id.clone(),
+                environment_id: workload.environment_id.clone(),
+                machine_id: workload.machine_id.clone(),
+                machine_incarnation_id: Some(workload.machine_incarnation_id.clone()),
+                stack_id: workload.stack_id.clone(),
+            },
+            environment_generation: environment.lifecycle_generation,
+            service_name: actions[0].target().service_name.clone(),
+            replica_index: actions[0].target().index(),
+            service_generation: 1,
+            requested_container_id: "ctr-foreign-linked-successor".to_string(),
+            definition_digest: environment.definition_digest,
+            action_digest: format!("vzsad3:{}:{}", "0".repeat(64), "a".repeat(64)),
+            applied_config_digest: Some("vzsc1-sha256:foreign-linked".to_string()),
+            status: StackContainerCreateStatus::Intent,
+            last_error: None,
+            created_at: 10,
+            updated_at: 10,
+            completed_at: None,
+        });
+        if case == "ambiguous" {
+            foreign.scope.reservation_id = "zz-ambiguous-linked-successor".to_string();
+            foreign.scope.machine_incarnation_id =
+                Some(MachineIncarnationId::new("inc_ambiguous_linked_successor").unwrap());
+            foreign.requested_container_id = "ctr-ambiguous-linked-successor".to_string();
+            foreign.action_digest = format!("vzsad3:{}:{}", "0".repeat(64), "b".repeat(64));
+            foreign.last_error = Some("foreign terminal failure".to_string());
+        }
+        inject_journal_intent_for_test(&store, &foreign);
+
+        let before = store.conn.total_changes();
+        let error = store.inspect_claimed_predecessor(&claim).unwrap_err();
+        assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+        assert_eq!(store.conn.total_changes(), before);
+    }
+}
+
+#[test]
+fn claimed_successor_reservation_preview_is_v2_stable_no_write_and_matches_resolve() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claimed-successor-preview.db");
+    let (claim, action, preview, linked) = {
+        let store = StateStore::open(&path).unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        install_unstarted_batch(&store, "preview-session", "preview-operation", &actions);
+        let claim = store
+            .start_reconcile_batch(
+                "preview-session",
+                "exact-batch",
+                "preview-operation",
+                0,
+                &actions,
+            )
+            .unwrap()
+            .remove(0);
+
+        let before = store.conn.total_changes();
+        let preview = store
+            .preview_claimed_successor_reservation(&claim, "ctr-preview")
+            .unwrap();
+        assert!(preview.reservation_id.starts_with("vzscr2-sha256:"));
+        assert_eq!(store.conn.total_changes(), before);
+        assert_eq!(
+            store
+                .preview_claimed_successor_reservation(&claim, "ctr-preview")
+                .unwrap(),
+            preview
+        );
+        let different_requested = store
+            .preview_claimed_successor_reservation(&claim, "ctr-preview-other")
+            .unwrap();
+        assert_ne!(different_requested.reservation_id, preview.reservation_id);
+        assert_eq!(store.conn.total_changes(), before);
+
+        let input = ClaimedCreateInput {
+            requested_container_id: "ctr-preview".to_string(),
+            ..claimed_create_input(&store, &actions[0], "preview")
+        };
+        let allocation = ClaimedAllocatorTarget {
+            ports: vec![PublishedPort {
+                protocol: "tcp".to_string(),
+                container_port: 8080,
+                host_port: 18080,
+            }],
+            service_ip: Some("10.55.0.2".to_string()),
+            service_network_ips: vec![ClaimedAllocatorNetworkIp {
+                network_name: "preview-net".to_string(),
+                ip: "10.56.0.2".to_string(),
+            }],
+            mount_tag_offset: Some(4),
+        };
+        let linked = store
+            .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 50)
+            .unwrap();
+        assert_eq!(linked.scope, preview);
+        let after_resolve = store.conn.total_changes();
+        assert_eq!(
+            store
+                .preview_claimed_successor_reservation(&claim, "ctr-preview")
+                .unwrap(),
+            preview
+        );
+        assert_eq!(store.conn.total_changes(), after_resolve);
+        (claim, actions[0].clone(), preview, linked)
+    };
+
+    let reopened = StateStore::open(&path).unwrap();
+    let before = reopened.conn.total_changes();
+    assert_eq!(
+        reopened
+            .preview_claimed_successor_reservation(&claim, "ctr-preview")
+            .unwrap(),
+        preview
+    );
+    assert_eq!(reopened.conn.total_changes(), before);
+    assert_eq!(
+        reopened.inspect_claimed_predecessor(&claim).unwrap(),
+        ClaimedPredecessorInspection::ClaimLinkedSuccessor {
+            intent: linked,
+            binding: None,
+        }
+    );
+    reopened
+        .validate_reconcile_action_claim(&claim, "preview-session", "preview-operation", 0, &action)
+        .unwrap();
+}
+
+#[test]
+fn claimed_successor_reservation_preview_fences_foreign_heads_and_derives_exact_generation() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let recreate = vec![seeded[1].clone()];
+    install_unstarted_batch(&store, "preview-exact", "preview-exact-op", &recreate);
+    let recreate_claim = store
+        .start_reconcile_batch(
+            "preview-exact",
+            "exact-batch",
+            "preview-exact-op",
+            0,
+            &recreate,
+        )
+        .unwrap()
+        .remove(0);
+    let before = store.conn.total_changes();
+    let exact_preview = store
+        .preview_claimed_successor_reservation(&recreate_claim, "ctr-preview-exact")
+        .unwrap();
+    assert!(exact_preview.reservation_id.starts_with("vzscr2-sha256:"));
+    assert_eq!(store.conn.total_changes(), before);
+
+    let separate = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&separate);
+    let create = vec![seeded[0].clone()];
+    install_unstarted_batch(&separate, "preview-foreign", "preview-foreign-op", &create);
+    let claim = separate
+        .start_reconcile_batch(
+            "preview-foreign",
+            "exact-batch",
+            "preview-foreign-op",
+            0,
+            &create,
+        )
+        .unwrap()
+        .remove(0);
+    let workload = create[0].precondition().workload();
+    let environment = separate
+        .load_environment_instance(workload.environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    let foreign = StackContainerCreateIntent {
+        schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
+        scope: vz_runtime_contract::ContainerGenerationScope {
+            reservation_id: "foreign-preview-successor".to_string(),
+            project_id: workload.project_id.clone(),
+            environment_id: workload.environment_id.clone(),
+            machine_id: workload.machine_id.clone(),
+            machine_incarnation_id: Some(workload.machine_incarnation_id.clone()),
+            stack_id: workload.stack_id.clone(),
+        },
+        environment_generation: environment.lifecycle_generation,
+        service_name: create[0].target().service_name.clone(),
+        replica_index: create[0].target().index(),
+        service_generation: 1,
+        requested_container_id: "ctr-preview-foreign".to_string(),
+        definition_digest: environment.definition_digest,
+        action_digest: format!("vzsad3:{}:{}", "0".repeat(64), "a".repeat(64)),
+        applied_config_digest: Some("vzsc1-sha256:preview-foreign".to_string()),
+        status: StackContainerCreateStatus::Intent,
+        last_error: None,
+        created_at: 10,
+        updated_at: 10,
+        completed_at: None,
+    };
+    inject_journal_intent_for_test(&separate, &foreign);
+    let before = separate.conn.total_changes();
+    let error = separate
+        .preview_claimed_successor_reservation(&claim, "ctr-preview-foreign")
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert_eq!(separate.conn.total_changes(), before);
+}
+
+#[test]
 fn started_claim_replay_rejects_linked_first_duplicate_latest_generation() {
     let store = StateStore::in_memory().unwrap();
     let seeded = exact_batch_actions_for_claim(&store);
@@ -14656,48 +16454,48 @@ fn started_claim_replay_rejects_linked_first_duplicate_latest_generation() {
     let session_id = "rs-duplicate-replay-head";
     let operation_id = "op-duplicate-replay-head";
     install_unstarted_batch(&store, session_id, operation_id, &actions);
-    store
+    let claim = store
         .start_reconcile_batch(session_id, "exact-batch", operation_id, 0, &actions)
-        .unwrap();
+        .unwrap()
+        .remove(0);
 
     let workload = actions[0].precondition().workload();
     let environment = store
         .load_environment_instance(workload.environment_id.as_str())
         .unwrap()
         .unwrap();
-    let action_digest = format!(
-        "{}{}",
-        crate::reconcile::ReconcileActionExecutionKey::new(
-            session_id,
-            operation_id,
-            0,
-            &actions[0],
-        )
-        .unwrap()
-        .activation_digest_prefix()
-        .unwrap(),
-        "c".repeat(64)
-    );
-    let selector = StackContainerCreateSelector {
-        project_id: workload.project_id.clone(),
-        environment_id: workload.environment_id.clone(),
-        machine_id: workload.machine_id.clone(),
-        machine_incarnation_id: workload.machine_incarnation_id.clone(),
-        environment_generation: environment.lifecycle_generation,
-        stack_id: workload.stack_id.clone(),
-        service_name: actions[0].target().service_name.clone(),
-        replica_index: actions[0].target().index(),
+    let execution_key = crate::reconcile::ReconcileActionExecutionKey::new(
+        session_id,
+        operation_id,
+        0,
+        &actions[0],
+    )
+    .unwrap();
+    let input = ClaimedCreateInput {
         requested_container_id: "ctr-linked-first".to_string(),
         definition_digest: environment.definition_digest,
-        action_digest,
         applied_config_digest: "vzsc1-sha256:linked-first".to_string(),
+        activation_payload_sha256: "c".repeat(64),
     };
     let linked = store
-        .resolve_or_begin_stack_container_create(&selector, 10)
-        .unwrap()
-        .0;
+        .resolve_or_begin_claimed_successor(&claim, &input, &empty_claimed_allocator_target(), 10)
+        .unwrap();
+    assert!(
+        execution_key
+            .matches_activation_digest(&linked.action_digest)
+            .unwrap()
+    );
+    assert_ne!(
+        linked.action_digest,
+        format!(
+            "{}{}",
+            execution_key.activation_digest_prefix().unwrap(),
+            input.activation_payload_sha256
+        )
+    );
     store
-        .publish_stack_container_create_failure(
+        .publish_claimed_successor_failure(
+            &claim,
             &linked.scope.reservation_id,
             "linked predecessor failed",
             11,
@@ -14787,7 +16585,7 @@ fn started_claim_replay_rejects_generation_gaps_and_remove_successors() {
         let actions = vec![action];
         let session_id = format!("rs-replay-{case}");
         install_unstarted_batch(&store, &session_id, "op-replay-generation", &actions);
-        store
+        let claim = store
             .start_reconcile_batch(
                 &session_id,
                 "exact-batch",
@@ -14795,7 +16593,8 @@ fn started_claim_replay_rejects_generation_gaps_and_remove_successors() {
                 0,
                 &actions,
             )
-            .unwrap();
+            .unwrap()
+            .remove(0);
 
         let workload = actions[0].precondition().workload();
         let environment = store
@@ -14817,52 +16616,87 @@ fn started_claim_replay_rejects_generation_gaps_and_remove_successors() {
         );
 
         if case == "remove-successor" {
-            let reservation_id = match actions[0].precondition().journal_head() {
-                crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => {
-                    reservation_id
-                }
-                crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
-            };
             store
-                .begin_stack_container_cleanup(reservation_id, 200)
+                .begin_claimed_predecessor_cleanup(&claim, 200)
                 .unwrap();
             store
-                .publish_stack_container_cleanup_success(reservation_id, 201)
+                .complete_claimed_predecessor_cleanup(&claim, 201)
                 .unwrap();
         }
 
-        let selector = StackContainerCreateSelector {
-            project_id: workload.project_id.clone(),
-            environment_id: workload.environment_id.clone(),
-            machine_id: workload.machine_id.clone(),
-            machine_incarnation_id: workload.machine_incarnation_id.clone(),
-            environment_generation: environment.lifecycle_generation,
-            stack_id: workload.stack_id.clone(),
-            service_name: actions[0].target().service_name.clone(),
-            replica_index: actions[0].target().index(),
+        let input = ClaimedCreateInput {
             requested_container_id: format!("ctr-replay-{case}"),
             definition_digest: environment.definition_digest.clone(),
-            action_digest,
             applied_config_digest: "vzsc1-sha256:replay-generation".to_string(),
+            activation_payload_sha256: "b".repeat(64),
         };
-        let first_successor = store
-            .resolve_or_begin_stack_container_create(&selector, 222)
-            .unwrap()
-            .0;
+        let first_successor = if case == "never-gap" {
+            store
+                .resolve_or_begin_claimed_successor(
+                    &claim,
+                    &input,
+                    &empty_claimed_allocator_target(),
+                    222,
+                )
+                .unwrap()
+        } else {
+            let predecessor_generation = match actions[0].precondition().journal_head() {
+                crate::reconcile::ExpectedJournalHead::Exact {
+                    service_generation, ..
+                } => *service_generation,
+                crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+            };
+            let intent = StackContainerCreateIntent {
+                schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
+                scope: vz_runtime_contract::ContainerGenerationScope {
+                    reservation_id: format!("reservation-remove-successor-{case}"),
+                    project_id: workload.project_id.clone(),
+                    environment_id: workload.environment_id.clone(),
+                    machine_id: workload.machine_id.clone(),
+                    machine_incarnation_id: Some(workload.machine_incarnation_id.clone()),
+                    stack_id: workload.stack_id.clone(),
+                },
+                environment_generation: environment.lifecycle_generation,
+                service_name: actions[0].target().service_name.clone(),
+                replica_index: actions[0].target().index(),
+                service_generation: predecessor_generation + 1,
+                requested_container_id: input.requested_container_id.clone(),
+                definition_digest: input.definition_digest.clone(),
+                action_digest: action_digest.clone(),
+                applied_config_digest: Some(input.applied_config_digest.clone()),
+                status: StackContainerCreateStatus::Intent,
+                last_error: None,
+                created_at: 222,
+                updated_at: 222,
+                completed_at: None,
+            };
+            inject_journal_intent_for_test(&store, &intent);
+            intent
+        };
         if case == "never-gap" {
             assert_eq!(first_successor.service_generation, 1);
             store
-                .publish_stack_container_create_failure(
+                .publish_claimed_successor_failure(
+                    &claim,
                     &first_successor.scope.reservation_id,
                     "force a generation gap",
                     223,
                 )
                 .unwrap();
+            let mut gap = first_successor.clone();
+            gap.scope.reservation_id = "reservation-never-gap-2".to_string();
+            gap.service_generation = 2;
+            gap.created_at = 224;
+            gap.updated_at = 224;
+            gap.status = StackContainerCreateStatus::Intent;
+            gap.last_error = None;
+            gap.completed_at = None;
+            inject_journal_intent_for_test(&store, &gap);
             assert_eq!(
                 store
-                    .resolve_or_begin_stack_container_create(&selector, 224)
+                    .load_stack_container_create_intent(&gap.scope.reservation_id)
                     .unwrap()
-                    .0
+                    .unwrap()
                     .service_generation,
                 2
             );

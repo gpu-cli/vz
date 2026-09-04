@@ -336,6 +336,20 @@ pub struct ReconcileSession {
     pub completed_at: Option<u64>,
 }
 
+/// Reserved operation namespace for remove batches whose stack-wide teardown
+/// finalizer must complete before their exact action claims are committed.
+pub(crate) const CLAIMED_TEARDOWN_OPERATION_PREFIX: &str = "vz:teardown-finalizing:v1:";
+
+pub(crate) struct ClaimedTeardownCommit<'a> {
+    pub(crate) claims: &'a [ReconcileActionClaim],
+    pub(crate) session_id: &'a str,
+    pub(crate) stack_name: &'a str,
+    pub(crate) operation_id: &'a str,
+    pub(crate) expected_cursor: usize,
+    pub(crate) actions: &'a [Action],
+    pub(crate) outcomes: &'a [crate::executor::IndexedActionOutcome],
+}
+
 /// A single audit entry from the reconcile audit log.
 ///
 /// Each action in a reconcile session produces one entry when started
@@ -673,6 +687,86 @@ pub struct ReconcileBatchCommit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReconcileActionClaim {
     key: crate::reconcile::ReconcileActionExecutionKey,
+}
+
+/// Exact predecessor state inspected under a durable Action-v3 claim.
+/// `ExactUnboundNeedsInspection` deliberately requires an executor/runtime decision;
+/// database absence alone never terminalizes that reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ClaimedPredecessorInspection {
+    NeverJournaled,
+    /// The claim's exact immediate successor already exists after a crash.
+    /// Its status and optional binding have been structurally and
+    /// observationally validated in the same transaction as the claim.
+    ClaimLinkedSuccessor {
+        intent: StackContainerCreateIntent,
+        binding: Option<StackContainerGenerationBinding>,
+    },
+    ExactUnboundNeedsInspection {
+        intent: StackContainerCreateIntent,
+    },
+    ExactUnboundFailed {
+        intent: StackContainerCreateIntent,
+    },
+    ExactBoundNeedsCleanup {
+        intent: StackContainerCreateIntent,
+        binding: StackContainerGenerationBinding,
+    },
+    ExactBoundCleanupPending {
+        intent: StackContainerCreateIntent,
+        binding: StackContainerGenerationBinding,
+    },
+    ExactBoundCleaned {
+        intent: StackContainerCreateIntent,
+        binding: StackContainerGenerationBinding,
+    },
+}
+
+/// Per-target allocator values accepted only under a durable Create/Recreate
+/// action claim. The target itself is derived from the opaque claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedAllocatorTarget {
+    pub ports: Vec<PublishedPort>,
+    pub service_ip: Option<String>,
+    pub service_network_ips: Vec<ClaimedAllocatorNetworkIp>,
+    /// Per-service VirtioFS tag offset. The service key is claim-derived.
+    pub mount_tag_offset: Option<usize>,
+}
+
+/// One network-specific address in a claim-derived allocator target update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedAllocatorNetworkIp {
+    pub network_name: String,
+    pub ip: String,
+}
+
+/// Result of atomically proving a remove and releasing only its exact target.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedAllocatorRelease {
+    pub target: ServiceReplicaKey,
+    pub released: ClaimedAllocatorResources,
+    pub already_released: bool,
+}
+
+/// Exact per-replica resources removed by a claimed allocator release. Shared
+/// per-service mount metadata is deliberately excluded and retained.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedAllocatorResources {
+    pub ports: Vec<PublishedPort>,
+    pub service_ip: Option<String>,
+    pub service_network_ips: Vec<ClaimedAllocatorNetworkIp>,
+}
+
+/// Runtime-specific inputs that are not part of predecessor identity. Scope,
+/// target, lifecycle generation, and action linkage are derived from the
+/// opaque claim rather than accepted from the caller.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClaimedCreateInput {
+    pub requested_container_id: String,
+    pub definition_digest: String,
+    pub applied_config_digest: String,
+    /// Lowercase hexadecimal SHA-256 of the immutable activation payload.
+    pub activation_payload_sha256: String,
 }
 
 #[cfg(test)]

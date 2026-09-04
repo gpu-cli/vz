@@ -1,10 +1,36 @@
 use super::*;
 
+struct ReconcileBatchCommitInput<'a> {
+    session_id: &'a str,
+    stack_name: &'a str,
+    operation_id: &'a str,
+    expected_cursor: usize,
+    actions: &'a [Action],
+    outcomes: &'a [crate::executor::IndexedActionOutcome],
+}
+
 #[derive(serde::Serialize, serde::Deserialize)]
 struct AllocatorIpSnapshotWire {
     schema_version: u32,
     primary: Vec<AllocatorIpLease>,
     networks: Vec<AllocatorNetworkIpLease>,
+}
+
+pub(super) fn normalized_claimed_allocator_target(
+    allocation: &ClaimedAllocatorTarget,
+) -> ClaimedAllocatorTarget {
+    let mut normalized = allocation.clone();
+    normalized.ports.sort_by(|left, right| {
+        (&left.protocol, left.container_port, left.host_port).cmp(&(
+            &right.protocol,
+            right.container_port,
+            right.host_port,
+        ))
+    });
+    normalized.service_network_ips.sort_by(|left, right| {
+        (&left.network_name, &left.ip).cmp(&(&right.network_name, &right.ip))
+    });
+    normalized
 }
 
 #[derive(PartialEq, Eq)]
@@ -345,6 +371,40 @@ impl StateStore {
         snapshot: &AllocatorSnapshot,
     ) -> Result<(), StackError> {
         snapshot.validate()?;
+        self.with_immediate_transaction(|store| {
+            store.reject_started_allocator_claim(stack_name)?;
+            store.save_allocator_state_inner(stack_name, snapshot)
+        })
+    }
+
+    fn reject_started_allocator_claim(&self, stack_name: &str) -> Result<(), StackError> {
+        if self.schema_version()? < 7 {
+            return Ok(());
+        }
+        let started = self
+            .conn
+            .query_row(
+                "SELECT session_id FROM reconcile_audit_log
+                 WHERE stack_name = ?1 AND status = 'started'
+                 ORDER BY session_id LIMIT 1",
+                params![stack_name],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(session_id) = started {
+            return claim_conflict(format!(
+                "raw allocator save for stack `{stack_name}` is fenced by started reconcile claim `{session_id}`"
+            ));
+        }
+        Ok(())
+    }
+
+    pub(super) fn save_allocator_state_inner(
+        &self,
+        stack_name: &str,
+        snapshot: &AllocatorSnapshot,
+    ) -> Result<(), StackError> {
+        snapshot.validate()?;
         let ports_json = serde_json::to_string(&snapshot.ports)?;
         let service_ips_json = serde_json::to_string(&AllocatorIpSnapshotWire {
             schema_version: snapshot.schema_version,
@@ -364,6 +424,207 @@ impl StateStore {
             params![stack_name, ports_json, service_ips_json, mount_tag_offsets_json],
         )?;
         Ok(())
+    }
+
+    pub(super) fn upsert_claimed_allocator_target_inner(
+        &self,
+        stack_name: &str,
+        target: &ServiceReplicaKey,
+        allocation: &ClaimedAllocatorTarget,
+    ) -> Result<(), StackError> {
+        let allocation = normalized_claimed_allocator_target(allocation);
+        let mut snapshot = self
+            .load_allocator_state(stack_name)?
+            .unwrap_or(AllocatorSnapshot {
+                schema_version: 2,
+                ports: Vec::new(),
+                service_ips: Vec::new(),
+                service_network_ips: Vec::new(),
+                mount_tag_offsets: HashMap::new(),
+            });
+        snapshot.ports.retain(|lease| &lease.target != target);
+        snapshot.service_ips.retain(|lease| &lease.target != target);
+        snapshot
+            .service_network_ips
+            .retain(|lease| &lease.target != target);
+        if !allocation.ports.is_empty() {
+            snapshot.ports.push(AllocatorPortLease {
+                target: target.clone(),
+                ports: allocation.ports.clone(),
+            });
+        }
+        if let Some(ip) = &allocation.service_ip {
+            snapshot.service_ips.push(AllocatorIpLease {
+                target: target.clone(),
+                ip: ip.clone(),
+            });
+        }
+        snapshot
+            .service_network_ips
+            .extend(
+                allocation
+                    .service_network_ips
+                    .iter()
+                    .map(|lease| AllocatorNetworkIpLease {
+                        target: target.clone(),
+                        network_name: lease.network_name.clone(),
+                        ip: lease.ip.clone(),
+                    }),
+            );
+        match (
+            snapshot
+                .mount_tag_offsets
+                .get(&target.service_name)
+                .copied(),
+            allocation.mount_tag_offset,
+        ) {
+            (Some(existing), Some(expected)) if existing == expected => {}
+            (Some(_), _) => {
+                return claim_conflict(
+                    "claimed allocator target cannot overwrite shared service mount offset",
+                );
+            }
+            (None, Some(offset)) => {
+                snapshot
+                    .mount_tag_offsets
+                    .insert(target.service_name.clone(), offset);
+            }
+            (None, None) => {}
+        }
+        snapshot.validate()?;
+        self.save_allocator_state_inner(stack_name, &snapshot)
+    }
+
+    pub(super) fn require_claimed_allocator_target_exact(
+        &self,
+        stack_name: &str,
+        target: &ServiceReplicaKey,
+        allocation: &ClaimedAllocatorTarget,
+    ) -> Result<(), StackError> {
+        let allocation = normalized_claimed_allocator_target(allocation);
+        let snapshot = self.load_allocator_state(stack_name)?.ok_or_else(|| {
+            claim_state_error("claimed successor lost its exact allocator snapshot")
+        })?;
+        let ports = snapshot
+            .ports
+            .iter()
+            .find(|lease| &lease.target == target)
+            .map(|lease| lease.ports.as_slice())
+            .unwrap_or_default();
+        let service_ip = snapshot
+            .service_ips
+            .iter()
+            .find(|lease| &lease.target == target)
+            .map(|lease| lease.ip.as_str());
+        let service_network_ips = snapshot
+            .service_network_ips
+            .iter()
+            .filter(|lease| &lease.target == target)
+            .map(|lease| ClaimedAllocatorNetworkIp {
+                network_name: lease.network_name.clone(),
+                ip: lease.ip.clone(),
+            })
+            .collect::<Vec<_>>();
+        let mut ports = ports.to_vec();
+        ports.sort_by(|left, right| {
+            (&left.protocol, left.container_port, left.host_port).cmp(&(
+                &right.protocol,
+                right.container_port,
+                right.host_port,
+            ))
+        });
+        let mut service_network_ips = service_network_ips;
+        service_network_ips.sort_by(|left, right| {
+            (&left.network_name, &left.ip).cmp(&(&right.network_name, &right.ip))
+        });
+        if ports != allocation.ports
+            || service_ip != allocation.service_ip.as_deref()
+            || service_network_ips != allocation.service_network_ips
+            || snapshot
+                .mount_tag_offsets
+                .get(&target.service_name)
+                .copied()
+                != allocation.mount_tag_offset
+        {
+            return claim_conflict(
+                "claimed successor allocator target differs from durable replay",
+            );
+        }
+        Ok(())
+    }
+
+    /// Atomically revalidate a terminal exact remove predecessor and release
+    /// only its claim-derived allocator target.
+    pub fn release_claimed_allocator_target(
+        &self,
+        claim: &ReconcileActionClaim,
+    ) -> Result<ClaimedAllocatorRelease, StackError> {
+        self.with_immediate_transaction(|store| {
+            let target = store.require_claimed_remove_release_target(claim)?;
+            let action = store.require_started_action_claim(claim)?;
+            let stack_name = &action.precondition().workload().stack_id;
+            let Some(mut snapshot) = store.load_allocator_state(stack_name)? else {
+                return Ok(ClaimedAllocatorRelease {
+                    target,
+                    released: ClaimedAllocatorResources {
+                        ports: Vec::new(),
+                        service_ip: None,
+                        service_network_ips: Vec::new(),
+                    },
+                    already_released: true,
+                });
+            };
+
+            let ports = snapshot
+                .ports
+                .iter()
+                .find(|lease| lease.target == target)
+                .map(|lease| lease.ports.clone())
+                .unwrap_or_default();
+            let service_ip = snapshot
+                .service_ips
+                .iter()
+                .find(|lease| lease.target == target)
+                .map(|lease| lease.ip.clone());
+            let service_network_ips = snapshot
+                .service_network_ips
+                .iter()
+                .filter(|lease| lease.target == target)
+                .map(|lease| ClaimedAllocatorNetworkIp {
+                    network_name: lease.network_name.clone(),
+                    ip: lease.ip.clone(),
+                })
+                .collect::<Vec<_>>();
+            let already_released =
+                ports.is_empty() && service_ip.is_none() && service_network_ips.is_empty();
+            if already_released {
+                return Ok(ClaimedAllocatorRelease {
+                    target,
+                    released: ClaimedAllocatorResources {
+                        ports,
+                        service_ip,
+                        service_network_ips,
+                    },
+                    already_released: true,
+                });
+            }
+            snapshot.ports.retain(|lease| lease.target != target);
+            snapshot.service_ips.retain(|lease| lease.target != target);
+            snapshot
+                .service_network_ips
+                .retain(|lease| lease.target != target);
+            snapshot.validate()?;
+            store.save_allocator_state_inner(stack_name, &snapshot)?;
+            Ok(ClaimedAllocatorRelease {
+                target,
+                released: ClaimedAllocatorResources {
+                    ports,
+                    service_ip,
+                    service_network_ips,
+                },
+                already_released,
+            })
+        })
     }
 
     /// Load allocator snapshot for a stack.
@@ -566,6 +827,107 @@ impl StateStore {
             #[cfg(test)]
             None,
         )
+    }
+
+    /// Reload and verify every durable identity component behind an opaque
+    /// started-action claim. Callers perform this inside the same immediate
+    /// transaction as the journal mutation it authorizes.
+    pub(super) fn require_started_action_claim(
+        &self,
+        claim: &ReconcileActionClaim,
+    ) -> Result<Action, StackError> {
+        let key = &claim.key;
+        let session_id = key.session_id();
+        let (operation_id, status, cursor_raw) = self
+            .conn
+            .query_row(
+                "SELECT operation_id, status, next_action_index
+                 FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                claim_state_error(format!(
+                    "started reconcile claim session `{session_id}` no longer exists"
+                ))
+            })?;
+        let cursor = persisted_usize(
+            "reconcile session",
+            session_id,
+            "next_action_index",
+            cursor_raw,
+        )?;
+        if operation_id != key.operation_id() || status != "active" {
+            return claim_conflict(format!(
+                "started reconcile claim session `{session_id}` is no longer active with its exact operation"
+            ));
+        }
+        let actions = self
+            .load_reconcile_session_actions(session_id)
+            .map_err(|error| {
+                claim_state_error(format!(
+                    "started reconcile claim session `{session_id}` is malformed: {error}"
+                ))
+            })?;
+        let action = actions
+            .get(key.absolute_action_index())
+            .ok_or_else(|| {
+                claim_state_error(format!(
+                    "started reconcile claim action {} is outside session `{session_id}`",
+                    key.absolute_action_index()
+                ))
+            })?
+            .clone();
+        if cursor > key.absolute_action_index() || !key.matches_action(&action)? {
+            return claim_conflict(format!(
+                "started reconcile claim action identity changed for session `{session_id}` index {}",
+                key.absolute_action_index()
+            ));
+        }
+        let progress = self
+            .load_reconcile_progress(action.precondition().workload().stack_id.as_str())?
+            .ok_or_else(|| {
+                claim_state_error(format!(
+                    "started reconcile claim session `{session_id}` has no exact progress"
+                ))
+            })?;
+        if progress.operation_id != operation_id
+            || progress.next_action_index != cursor
+            || progress.actions != actions
+        {
+            return claim_conflict(format!(
+                "started reconcile claim session `{session_id}` disagrees with exact progress"
+            ));
+        }
+        let audit = self
+            .load_audit_log_for_session(session_id)?
+            .into_iter()
+            .find(|entry| entry.action_index == key.absolute_action_index())
+            .ok_or_else(|| {
+                claim_state_error(format!(
+                    "started reconcile claim audit disappeared for session `{session_id}` index {}",
+                    key.absolute_action_index()
+                ))
+            })?;
+        if audit.status != "started"
+            || audit.stack_name != action.precondition().workload().stack_id
+            || audit.target != *action.target()
+            || audit.action_hash
+                != crate::reconcile::compute_actions_hash(std::slice::from_ref(&action))
+        {
+            return claim_conflict(format!(
+                "started reconcile claim audit identity changed for session `{session_id}` index {}",
+                key.absolute_action_index()
+            ));
+        }
+        Ok(action)
     }
 
     fn start_reconcile_batch_inner(
@@ -973,13 +1335,63 @@ impl StateStore {
         actions: &[Action],
         outcomes: &[crate::executor::IndexedActionOutcome],
     ) -> Result<ReconcileBatchCommit, StackError> {
+        if operation_id.starts_with(super::CLAIMED_TEARDOWN_OPERATION_PREFIX) {
+            return Err(StackError::InvalidSpec(
+                "reserved teardown-finalizer operation requires claim-qualified teardown commit"
+                    .to_string(),
+            ));
+        }
         self.commit_reconcile_batch_inner(
+            ReconcileBatchCommitInput {
+                session_id,
+                stack_name,
+                operation_id,
+                expected_cursor,
+                actions,
+                outcomes,
+            },
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    /// Commit a reserved teardown-finalizer batch under its exact started claims.
+    pub(crate) fn commit_claimed_teardown_batch(
+        &self,
+        request: ClaimedTeardownCommit<'_>,
+    ) -> Result<ReconcileBatchCommit, StackError> {
+        let ClaimedTeardownCommit {
+            claims,
             session_id,
             stack_name,
             operation_id,
             expected_cursor,
             actions,
             outcomes,
+        } = request;
+        if !operation_id.starts_with(super::CLAIMED_TEARDOWN_OPERATION_PREFIX)
+            || actions.is_empty()
+            || claims.len() != actions.len()
+            || actions
+                .iter()
+                .any(|action| !matches!(action, Action::ServiceRemove { .. }))
+        {
+            return Err(StackError::InvalidSpec(
+                "claim-qualified teardown commit requires a reserved operation and an exact non-empty Remove claim bijection"
+                    .to_string(),
+            ));
+        }
+        self.commit_reconcile_batch_inner(
+            ReconcileBatchCommitInput {
+                session_id,
+                stack_name,
+                operation_id,
+                expected_cursor,
+                actions,
+                outcomes,
+            },
+            Some(claims),
             #[cfg(test)]
             None,
         )
@@ -987,20 +1399,48 @@ impl StateStore {
 
     fn commit_reconcile_batch_inner(
         &self,
-        session_id: &str,
-        stack_name: &str,
-        operation_id: &str,
-        expected_cursor: usize,
-        actions: &[Action],
-        outcomes: &[crate::executor::IndexedActionOutcome],
+        input: ReconcileBatchCommitInput<'_>,
+        teardown_claims: Option<&[ReconcileActionClaim]>,
         #[cfg(test)] failpoint: Option<ReconcileBatchCommitFailpoint>,
     ) -> Result<ReconcileBatchCommit, StackError> {
+        let ReconcileBatchCommitInput {
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            outcomes,
+        } = input;
         if actions.is_empty() || outcomes.len() != actions.len() {
             return Err(StackError::InvalidSpec(
                 "reconcile outcomes must form a bijection over the dispatched actions".to_string(),
             ));
         }
         self.with_immediate_transaction(|store| {
+            if let Some(claims) = teardown_claims {
+                if claims.len() != actions.len() {
+                    return Err(StackError::InvalidSpec(
+                        "teardown commit claims do not cover every exact action".to_string(),
+                    ));
+                }
+                for (relative_index, (claim, action)) in claims.iter().zip(actions).enumerate() {
+                    let absolute_index =
+                        expected_cursor.checked_add(relative_index).ok_or_else(|| {
+                            StackError::InvalidSpec(
+                                "teardown claim action index overflow".to_string(),
+                            )
+                        })?;
+                    if claim.key.session_id() != session_id
+                        || claim.key.operation_id() != operation_id
+                        || claim.key.absolute_action_index() != absolute_index
+                        || store.require_claimed_action_state(claim)? != *action
+                    {
+                        return Err(StackError::InvalidSpec(format!(
+                            "teardown claim does not match exact action {absolute_index}"
+                        )));
+                    }
+                }
+            }
             let plan = store.load_reconcile_session_actions(session_id)?;
             let end = expected_cursor.checked_add(actions.len()).ok_or_else(|| {
                 StackError::InvalidSpec("reconcile action slice overflow".to_string())
@@ -1375,14 +1815,127 @@ impl StateStore {
         failpoint: ReconcileBatchCommitFailpoint,
     ) -> Result<ReconcileBatchCommit, StackError> {
         self.commit_reconcile_batch_inner(
-            session_id,
-            stack_name,
-            operation_id,
-            expected_cursor,
-            actions,
-            outcomes,
+            ReconcileBatchCommitInput {
+                session_id,
+                stack_name,
+                operation_id,
+                expected_cursor,
+                actions,
+                outcomes,
+            },
+            None,
             Some(failpoint),
         )
+    }
+
+    /// Load one exact reconcile session by its durable identity.
+    ///
+    /// The returned metadata is accepted only after the stored Action-v3 plan,
+    /// action hash, cursor, and action count all validate. Missing identity is
+    /// represented as `None`; malformed persisted identity fails closed.
+    pub fn load_reconcile_session(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<ReconcileSession>, StackError> {
+        let validate_identity = |field: &str, value: &str| {
+            if value.trim().is_empty() || value.trim().len() > 128 {
+                Err(StackError::InvalidSpec(format!(
+                    "reconcile session {field} must contain 1..=128 non-blank bytes"
+                )))
+            } else {
+                Ok(())
+            }
+        };
+        validate_identity("session_id", session_id)?;
+        let row = self
+            .conn
+            .query_row(
+                "SELECT stack_name, operation_id, status, actions_hash,
+                        next_action_index, total_actions, started_at, updated_at, completed_at
+                 FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            stack_name,
+            operation_id,
+            status,
+            actions_hash,
+            cursor_raw,
+            count_raw,
+            started_at,
+            updated_at,
+            completed_at,
+        )) = row
+        else {
+            return Ok(None);
+        };
+        validate_identity("stack_name", &stack_name)?;
+        validate_identity("operation_id", &operation_id)?;
+        let actions = self.load_reconcile_session_actions(session_id)?;
+        let next_action_index = persisted_usize(
+            "reconcile session",
+            session_id,
+            "next_action_index",
+            cursor_raw,
+        )?;
+        let total_actions =
+            persisted_usize("reconcile session", session_id, "total_actions", count_raw)?;
+        if total_actions != actions.len()
+            || next_action_index > total_actions
+            || actions_hash != crate::reconcile::compute_actions_hash(&actions)
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` action metadata is inconsistent"
+            )));
+        }
+        let status = ReconcileSessionStatus::from_str(&status)?;
+        let status_shape_valid = match status {
+            ReconcileSessionStatus::Active => {
+                completed_at.is_none() && next_action_index < total_actions
+            }
+            ReconcileSessionStatus::Completed => {
+                completed_at.is_some() && next_action_index == total_actions
+            }
+            ReconcileSessionStatus::Failed | ReconcileSessionStatus::Superseded => {
+                completed_at.is_some()
+            }
+        };
+        if !status_shape_valid {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` status, cursor, and completion metadata are inconsistent"
+            )));
+        }
+        Ok(Some(ReconcileSession {
+            session_id: session_id.to_string(),
+            stack_name,
+            operation_id,
+            status,
+            actions_hash,
+            next_action_index,
+            total_actions,
+            started_at: persisted_u64("reconcile session", session_id, "started_at", started_at)?,
+            updated_at: persisted_u64("reconcile session", session_id, "updated_at", updated_at)?,
+            completed_at: persisted_optional_u64(
+                "reconcile session",
+                session_id,
+                "completed_at",
+                completed_at,
+            )?,
+        }))
     }
 
     /// Load the active reconcile session for a stack, if any.

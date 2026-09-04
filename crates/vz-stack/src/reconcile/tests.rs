@@ -1640,3 +1640,78 @@ fn planner_rejects_cyclic_teardown_instead_of_returning_partial_actions() {
     .unwrap_err();
     assert!(error.to_string().contains("dependency cycle"));
 }
+
+#[test]
+fn targeted_action_planner_preserves_exact_replica_two_identity() {
+    let store = authoritative_store("targeted");
+    let target = ServiceReplicaKey::new("api", 2).unwrap();
+
+    let action = store
+        .plan_targeted_action("targeted", TargetedActionKind::Create, target.clone())
+        .unwrap();
+
+    assert!(matches!(
+        action,
+        Action::ServiceCreate {
+            target: planned,
+            precondition,
+        } if planned == target
+            && precondition.workload().stack_id == "targeted"
+            && precondition.journal_head() == &ExpectedJournalHead::NeverJournaled
+    ));
+    assert!(store.load_observed_state("targeted").unwrap().is_empty());
+}
+
+#[test]
+fn targeted_action_planner_rejects_missing_remove_and_recreate() {
+    let store = authoritative_store("targeted-missing");
+    let target = ServiceReplicaKey::first("api").unwrap();
+
+    for kind in [TargetedActionKind::Remove, TargetedActionKind::Recreate] {
+        let error = store
+            .plan_targeted_action("targeted-missing", kind, target.clone())
+            .unwrap_err();
+        assert!(error.to_string().contains("missing replica `api`"));
+    }
+    assert!(
+        store
+            .load_observed_state("targeted-missing")
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn targeted_action_planner_captures_exact_running_head_without_mutation() {
+    let store = authoritative_store("targeted-running");
+    let service = svc_with_replicas("api", "api:v1", 2);
+    let ownership = publish_running_generation(&store, "targeted-running", &service, 2);
+    let before = store.load_observed_state("targeted-running").unwrap();
+
+    let action = store
+        .plan_targeted_action(
+            "targeted-running",
+            TargetedActionKind::Remove,
+            ServiceReplicaKey::new("api", 2).unwrap(),
+        )
+        .unwrap();
+
+    assert!(matches!(
+        action,
+        Action::ServiceRemove {
+            target,
+            precondition,
+        } if target == ServiceReplicaKey::new("api", 2).unwrap()
+            && matches!(
+                precondition.journal_head(),
+                ExpectedJournalHead::Exact {
+                    ownership: Some(actual),
+                    ..
+                } if actual == &ownership
+            )
+    ));
+    assert_eq!(
+        store.load_observed_state("targeted-running").unwrap(),
+        before
+    );
+}

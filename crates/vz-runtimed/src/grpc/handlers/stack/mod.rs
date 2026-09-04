@@ -4,15 +4,16 @@
 //! `stack::rpc` endpoint implementations.
 
 use super::super::*;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vz_stack::{
-    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, ExecutionResult,
-    OrchestrationConfig, ServiceObservedState, ServicePhase, StackExecutor, StackOrchestrator,
-    StackSpec, VolumeManager, apply, collect_compose_build_specs_with_dir, parse_compose_with_dir,
-    plan_apply,
+    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, OrchestrationConfig,
+    ServiceObservedState, ServicePhase, ServiceReplicaKey, StackExecutor, StackOrchestrator,
+    StackSpec, TargetedActionKind, VolumeManager, collect_compose_build_specs_with_dir,
+    parse_compose_with_dir, plan_apply,
 };
 
 const STACK_BUILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1250,7 +1251,7 @@ fn stack_runtime_dir(daemon: &RuntimeDaemon, stack_name: &str) -> PathBuf {
 
 fn stack_status_from_observed(status: &ServiceObservedState) -> runtime_v2::StackServiceStatus {
     runtime_v2::StackServiceStatus {
-        service_name: status.service_name.clone(),
+        service_name: status.replica.service_name.clone(),
         phase: match status.phase {
             ServicePhase::Pending => "pending".to_string(),
             ServicePhase::Creating => "creating".to_string(),
@@ -1262,12 +1263,15 @@ fn stack_status_from_observed(status: &ServiceObservedState) -> runtime_v2::Stac
         ready: status.ready,
         container_id: status.container_id.clone().unwrap_or_default(),
         last_error: status.last_error.clone().unwrap_or_default(),
+        replica_index: status.replica.index(),
     }
 }
 
 fn default_stopped_service(service_name: &str) -> ServiceObservedState {
     ServiceObservedState {
-        service_name: service_name.to_string(),
+        replica: ServiceReplicaKey::first(service_name)
+            .unwrap_or_else(|error| unreachable!("validated service name is invalid: {error}")),
+        applied_config_digest: None,
         phase: ServicePhase::Stopped,
         container_id: None,
         failed_create_ownership: None,
@@ -1328,7 +1332,9 @@ fn load_stack_service_action_context(
 
     let observed_state = observed
         .iter()
-        .find(|service| service.service_name == service_name)
+        .find(|service| {
+            service.replica.service_name == service_name && service.replica.index() == 1
+        })
         .cloned()
         .unwrap_or_else(|| default_stopped_service(service_name));
 
@@ -1366,6 +1372,83 @@ fn stack_run_container_response(
 fn generated_stack_run_service_name(service_name: &str) -> String {
     let suffix = generate_request_id().replace("req_", "");
     format!("{service_name}-run-{suffix}")
+}
+
+fn targeted_reconcile_session_id(
+    stack_name: &str,
+    target: &ServiceReplicaKey,
+    action_kind: TargetedActionKind,
+    request_id: &str,
+) -> String {
+    let action_kind = match action_kind {
+        TargetedActionKind::Create => "create",
+        TargetedActionKind::Recreate => "recreate",
+        TargetedActionKind::Remove => "remove",
+    };
+    let mut hasher = Sha256::new();
+    for value in [
+        "vz-targeted-reconcile-session-v1",
+        stack_name,
+        target.service_name.as_str(),
+        action_kind,
+        request_id,
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    hasher.update(u64::from(target.index()).to_be_bytes());
+    format!("rs-targeted-{:x}", hasher.finalize())
+}
+
+fn teardown_request_digest(
+    stack_name: &str,
+    workload_scope: &vz_runtime_contract::MachineWorkloadScope,
+    request_id: &str,
+    dry_run: bool,
+    remove_volumes: bool,
+) -> String {
+    let mut hasher = Sha256::new();
+    for value in [
+        "vz-teardown-request-v2",
+        stack_name,
+        workload_scope.project_id.as_str(),
+        workload_scope.environment_id.as_str(),
+        workload_scope.machine_id.as_str(),
+        workload_scope.machine_incarnation_id.as_str(),
+        workload_scope.stack_id.as_str(),
+        request_id,
+        if dry_run { "dry-run" } else { "mutating" },
+        if remove_volumes {
+            "remove-volumes"
+        } else {
+            "retain-volumes"
+        },
+    ] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("vztr2-sha256:{:x}", hasher.finalize())
+}
+
+fn teardown_reconcile_session_id(request_digest: &str) -> String {
+    format!(
+        "rs-teardown-{}",
+        request_digest.trim_start_matches("vztr2-sha256:")
+    )
+}
+
+fn action_matches_targeted_intent(
+    action: &Action,
+    action_kind: TargetedActionKind,
+    target: &ServiceReplicaKey,
+) -> bool {
+    action.target() == target
+        && matches!(
+            (action_kind, action),
+            (TargetedActionKind::Create, Action::ServiceCreate { .. })
+                | (TargetedActionKind::Recreate, Action::ServiceRecreate { .. })
+                | (TargetedActionKind::Remove, Action::ServiceRemove { .. })
+        )
 }
 
 #[expect(
@@ -1432,7 +1515,9 @@ fn load_observed_stack_service(
             Ok(store
                 .load_observed_state(stack_name)?
                 .into_iter()
-                .find(|service| service.service_name == service_name)
+                .find(|service| {
+                    service.replica.service_name == service_name && service.replica.index() == 1
+                })
                 .unwrap_or_else(|| default_stopped_service(service_name)))
         })
         .map_err(|error| status_from_stack_error(error, request_id))
@@ -1445,46 +1530,131 @@ fn load_observed_stack_service(
 fn execute_stack_service_action(
     daemon: Arc<RuntimeDaemon>,
     spec: &StackSpec,
-    action: Action,
+    action_kind: TargetedActionKind,
+    target: ServiceReplicaKey,
     workload_scope: vz_runtime_contract::MachineWorkloadScope,
     request_id: &str,
     failure_code: MachineErrorCode,
 ) -> Result<(), Status> {
     let stack_dir = stack_runtime_dir(daemon.as_ref(), &spec.name);
-    std::fs::create_dir_all(&stack_dir).map_err(|error| {
-        status_from_machine_error(MachineError::new(
-            MachineErrorCode::InternalError,
-            format!(
-                "failed to create stack runtime directory {}: {error}",
-                stack_dir.display()
-            ),
-            Some(request_id.to_string()),
-            BTreeMap::new(),
-        ))
-    })?;
-
+    let session_id = targeted_reconcile_session_id(&spec.name, &target, action_kind, request_id);
     let exec_store = daemon
         .open_dedicated_state_store()
         .map_err(|error| status_from_stack_error(error, request_id))?;
+    let action = if let Some(existing) = exec_store
+        .load_reconcile_session(&session_id)
+        .map_err(|error| status_from_stack_error(error, request_id))?
+    {
+        if existing.stack_name != spec.name || existing.operation_id != request_id {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!(
+                    "targeted reconcile session `{session_id}` belongs to another stack or operation"
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        if let Some(active) = exec_store
+            .load_active_reconcile_session(&spec.name)
+            .map_err(|error| status_from_stack_error(error, request_id))?
+            && active.session_id != existing.session_id
+        {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!(
+                    "stack `{}` has active reconcile operation `{}`; resume that exact operation before replaying `{request_id}`",
+                    spec.name, active.operation_id
+                ),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        let persisted = exec_store
+            .load_reconcile_session_actions(&existing.session_id)
+            .map_err(|error| status_from_stack_error(error, request_id))?;
+        if persisted.len() != 1
+            || !action_matches_targeted_intent(&persisted[0], action_kind, &target)
+        {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                "active targeted reconcile session does not match the requested exact action"
+                    .to_string(),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            )));
+        }
+        persisted.into_iter().next().ok_or_else(|| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                "active targeted reconcile session has no persisted action".to_string(),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?
+    } else if let Some(active) = exec_store
+        .load_active_reconcile_session(&spec.name)
+        .map_err(|error| status_from_stack_error(error, request_id))?
+    {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::StateConflict,
+            format!(
+                "stack `{}` has active reconcile operation `{}`; resume that exact operation before starting `{request_id}`",
+                spec.name, active.operation_id
+            ),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    } else {
+        exec_store
+            .plan_targeted_action(&spec.name, action_kind, target)
+            .map_err(|error| status_from_stack_error(error, request_id))?
+    };
     let runtime = DaemonContainerRuntime::new(daemon);
-    let mut executor = if matches!(&action, Action::ServiceRemove { .. }) {
+    let mut executor = if action_kind == TargetedActionKind::Remove {
         StackExecutor::new_scoped_for_cleanup(runtime, exec_store, &stack_dir, workload_scope)
     } else {
         StackExecutor::new_scoped(runtime, exec_store, &stack_dir, workload_scope)
     }
     .map_err(|error| status_from_stack_error(error, request_id))?;
     let result = executor
-        .execute_with_operation(spec, &[action], request_id, 0)
+        .execute_claimed_batch(spec, &[action], &session_id, request_id, 0)
         .map_err(|error| status_from_stack_error(error, request_id))?;
-    if result.failed > 0 {
+    let complete_success = result.failed == 0
+        && result.outcomes.len() == 1
+        && result
+            .outcomes
+            .iter()
+            .all(|outcome| matches!(outcome.result, vz_stack::ActionOutcomeResult::Succeeded));
+    if !complete_success {
         let first_error = result
             .errors
             .first()
             .map(|(_, message)| message.as_str())
-            .unwrap_or("unknown stack service action failure");
+            .unwrap_or("claimed stack service action did not commit one successful outcome");
         return Err(status_from_machine_error(MachineError::new(
             failure_code,
             first_error.to_string(),
+            Some(request_id.to_string()),
+            BTreeMap::new(),
+        )));
+    }
+    let committed = executor
+        .store()
+        .load_reconcile_session(&session_id)
+        .map_err(|error| status_from_stack_error(error, request_id))?
+        .ok_or_else(|| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                "claimed targeted reconcile session disappeared after execution".to_string(),
+                Some(request_id.to_string()),
+                BTreeMap::new(),
+            ))
+        })?;
+    if committed.status != vz_stack::ReconcileSessionStatus::Completed {
+        return Err(status_from_machine_error(MachineError::new(
+            MachineErrorCode::StateConflict,
+            "claimed targeted action outcomes were not durably committed".to_string(),
             Some(request_id.to_string()),
             BTreeMap::new(),
         )));
@@ -1493,8 +1663,9 @@ fn execute_stack_service_action(
     Ok(())
 }
 
+#[cfg(test)]
 fn teardown_execution_failure_response(
-    result: &ExecutionResult,
+    result: &vz_stack::ExecutionResult,
     request_id: &str,
     events: &mut Vec<Result<runtime_v2::TeardownStackEvent, Status>>,
 ) -> Option<Response<TeardownStackEventStream>> {

@@ -34,8 +34,9 @@ pub use events::{
     emit_event_to_sink,
 };
 pub use executor::{
-    ActionOutcomeResult, ContainerLogs, ContainerRuntime, ExecutionResult, IndexedActionOutcome,
-    LogLine, LogStream, PortTracker, ReconcileActionKind, StackExecutor,
+    ActionOutcomeResult, ClaimedTeardownAdmission, ContainerLogs, ContainerRuntime,
+    ExecutionResult, IndexedActionOutcome, LogLine, LogStream, PendingClaimedTeardown, PortTracker,
+    ReconcileActionKind, StackExecutor, matches_claimed_teardown_operation,
 };
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
@@ -50,8 +51,8 @@ pub use network::{
 };
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
 pub use reconcile::{
-    Action, ApplyResult, DeferredService, ExpectedJournalHead, ReplicaPrecondition, apply,
-    compute_actions_hash, plan_apply, service_config_digest,
+    Action, ApplyResult, DeferredService, ExpectedJournalHead, ReplicaPrecondition,
+    TargetedActionKind, apply, compute_actions_hash, plan_apply, service_config_digest,
 };
 pub use restart::{RestartTracker, compute_restart_targets};
 pub use spec::{
@@ -61,12 +62,14 @@ pub use spec::{
 };
 pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
-    DriftFinding, DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
-    ImageRecord, Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState,
-    ReconcileActionClaim, ReconcileAuditEntry, ReconcileBatchCommit, ReconcileSession,
-    ReconcileSessionStatus, RetentionGcReason, ServiceObservedState, ServicePhase,
-    ServiceReplicaKey, StackContainerCreateIntent, StackContainerCreateSelector,
-    StackContainerCreateStatus, StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    ClaimedAllocatorNetworkIp, ClaimedAllocatorRelease, ClaimedAllocatorResources,
+    ClaimedAllocatorTarget, ClaimedCreateInput, ClaimedPredecessorInspection, DriftFinding,
+    DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord, ImageRecord,
+    Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState, ReconcileActionClaim,
+    ReconcileAuditEntry, ReconcileBatchCommit, ReconcileSession, ReconcileSessionStatus,
+    RetentionGcReason, ServiceObservedState, ServicePhase, ServiceReplicaKey,
+    StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
+    StackContainerGenerationBinding, StackContainerRecoveryDisposition,
     StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
 };
 pub use volume::{

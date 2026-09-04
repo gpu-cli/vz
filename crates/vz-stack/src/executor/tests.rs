@@ -9,7 +9,6 @@ use crate::spec::{
     PortSpec, ResourcesSpec, SecretDef, SecretSource, ServiceKind, ServiceSecretRef, StackSpec,
     VolumeSpec,
 };
-use crate::state_store::StackContainerCreateStatus;
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use vz_runtime_contract::types::{
@@ -111,6 +110,15 @@ fn test_create_action(stack_name: &str, service_name: &str) -> Action {
         precondition: crate::reconcile::test_replica_precondition_for_stack(stack_name),
         target: crate::state_store::ServiceReplicaKey::first(service_name.to_string()).unwrap(),
     }
+}
+
+fn planned_actions(
+    executor: &StackExecutor<MockContainerRuntime>,
+    spec: &StackSpec,
+) -> Vec<Action> {
+    plan_apply(spec, executor.store(), &HashMap::new())
+        .unwrap()
+        .actions
 }
 
 fn make_executor(runtime: MockContainerRuntime) -> StackExecutor<MockContainerRuntime> {
@@ -244,6 +252,9 @@ fn make_scoped_executor<'a>(
     dir: &'a Path,
     scope: vz_runtime_contract::MachineWorkloadScope,
 ) -> StackExecutor<MockContainerRuntime> {
+    if dir.exists() {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
     StackExecutor::new_scoped(runtime, store, dir, scope).unwrap()
 }
 
@@ -269,10 +280,7 @@ fn create_single_service() {
     let mut executor = make_executor(runtime);
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
-    let actions = vec![Action::ServiceCreate {
-        precondition: crate::reconcile::test_replica_precondition(),
-        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-    }];
+    let actions = planned_actions(&executor, &spec);
 
     let result = executor.execute(&spec, &actions).unwrap();
     assert!(result.all_succeeded());
@@ -1716,7 +1724,7 @@ fn default_owned_create_fails_before_mutating_an_ownership_blind_runtime() {
 }
 
 #[test]
-fn executor_port_conflict_emits_event() {
+fn executor_port_conflict_rejects_the_whole_batch_before_effects() {
     let runtime = MockContainerRuntime::with_ids(vec!["ctr-web", "ctr-api"]);
     let mut executor = make_executor(runtime);
 
@@ -1753,25 +1761,19 @@ fn executor_port_conflict_emits_event() {
         },
     ];
 
-    let result = executor.execute(&spec, &actions).unwrap();
-    assert_eq!(result.succeeded, 1); // web succeeds
-    assert_eq!(result.failed, 1); // api fails (port conflict)
-
-    // PortConflict event emitted.
-    let events = executor.store().load_events("myapp").unwrap();
+    let error = executor.execute(&spec, &actions).unwrap_err();
+    assert!(error.to_string().contains("port conflict"));
     assert!(
-        events
-            .iter()
-            .any(|e| matches!(e, StackEvent::PortConflict { .. }))
+        executor.runtime().call_log().is_empty(),
+        "whole-batch preflight must reject duplicate host ports before runtime effects"
     );
 
-    // api should be marked Failed.
+    // Preflight rejection is not a partially executed action and therefore
+    // emits no action event or observed-state mutation.
+    let events = executor.store().load_events("myapp").unwrap();
+    assert!(events.is_empty());
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let api = observed
-        .iter()
-        .find(|o| o.replica.service_name == "api")
-        .unwrap();
-    assert_eq!(api.phase, ServicePhase::Failed);
+    assert!(observed.is_empty());
 }
 
 // ── Docker Compose network conformance tests ──
@@ -3265,6 +3267,1081 @@ fn replica_scale_down_removes_excess_replicas() {
 // ── Topology-scoped two-phase create tests ──
 
 #[test]
+fn scoped_claimed_batch_success_replays_terminal_commit_without_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let bind_source = tmp.path().join("terminal-replay-bind");
+    std::fs::create_dir(&bind_source).unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.mounts.push(StackMountSpec::Bind {
+        source: bind_source.to_string_lossy().into_owned(),
+        target: "/workspace".to_string(),
+        read_only: false,
+    });
+    let spec = stack("scoped-coordinator-success", vec![service]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = planned_actions(&executor, &spec);
+
+    let first = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-success",
+            "operation-coordinator-success",
+            0,
+        )
+        .unwrap();
+    assert!(first.all_succeeded());
+    let session = executor
+        .store()
+        .load_reconcile_session("session-coordinator-success")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Completed
+    );
+    assert_eq!(session.next_action_index, actions.len());
+    let calls_before = executor.runtime().call_log();
+    let records_before = executor
+        .store()
+        .list_stack_container_recovery_records()
+        .unwrap();
+    std::fs::remove_dir(&bind_source).unwrap();
+
+    let replay = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-success",
+            "operation-coordinator-success",
+            0,
+        )
+        .unwrap();
+
+    assert!(replay.all_succeeded());
+    assert_eq!(replay.outcomes, first.outcomes);
+    assert_eq!(executor.runtime().call_log(), calls_before);
+    assert_eq!(
+        executor
+            .store()
+            .list_stack_container_recovery_records()
+            .unwrap(),
+        records_before
+    );
+
+    let mut changed = spec.clone();
+    changed.services[0].image = "nginx:changed".to_string();
+    let error = executor
+        .execute_claimed_batch(
+            &changed,
+            &actions,
+            "session-coordinator-success",
+            "operation-coordinator-success",
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("activation payload"));
+    assert_eq!(executor.runtime().call_log(), calls_before);
+}
+
+#[test]
+fn scoped_claimed_batch_failure_replays_terminal_commit_without_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-coordinator-failure",
+        vec![svc("web", "nginx:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_scoped_activation = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
+    let actions = planned_actions(&executor, &spec);
+
+    let first = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-failure",
+            "operation-coordinator-failure",
+            0,
+        )
+        .unwrap();
+    assert_eq!(first.failed, 1);
+    let session = executor
+        .store()
+        .load_reconcile_session("session-coordinator-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Failed
+    );
+    assert_eq!(session.next_action_index, 0);
+    let calls_before = executor.runtime().call_log();
+
+    let replay = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-failure",
+            "operation-coordinator-failure",
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(replay.failed, 1);
+    assert_eq!(replay.outcomes, first.outcomes);
+    assert_eq!(executor.runtime().call_log(), calls_before);
+}
+
+#[test]
+fn scoped_claimed_batch_outer_error_keeps_started_cursor_for_exact_retry() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-coordinator-retry", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_sandbox_create = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
+    let actions = planned_actions(&executor, &spec);
+
+    let error = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-retry",
+            "operation-coordinator-retry",
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("mock sandbox creation failure"));
+    let session = executor
+        .store()
+        .load_reconcile_session("session-coordinator-retry")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Active
+    );
+    assert_eq!(session.next_action_index, 0);
+    assert!(
+        executor
+            .store()
+            .load_audit_log_for_session(&session.session_id)
+            .unwrap()
+            .iter()
+            .all(|audit| audit.status == "started")
+    );
+
+    executor.runtime.fail_sandbox_create = false;
+    let result = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-retry",
+            "operation-coordinator-retry",
+            0,
+        )
+        .unwrap();
+    assert!(result.all_succeeded());
+    let session = executor
+        .store()
+        .load_reconcile_session("session-coordinator-retry")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Completed
+    );
+}
+
+#[test]
+fn scoped_claimed_batch_staging_failure_persists_no_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.secrets = vec![secret_ref("token")];
+    let mut spec = stack("scoped-coordinator-stage-failure", vec![service]);
+    spec.secrets = vec![SecretDef {
+        name: "token".to_string(),
+        source: SecretSource::File(
+            tmp.path()
+                .join("missing-secret")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    }];
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let actions = plan_apply(&spec, &store, &HashMap::new()).unwrap().actions;
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+
+    let error = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-coordinator-stage-failure",
+            "operation-coordinator-stage-failure",
+            0,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("failed to read secret"));
+    assert!(
+        executor
+            .store()
+            .load_reconcile_session("session-coordinator-stage-failure")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        executor
+            .store()
+            .load_reconcile_progress(&spec.name)
+            .unwrap()
+            .is_none()
+    );
+    assert!(executor.runtime().call_log().is_empty());
+}
+
+#[test]
+fn scoped_claimed_batch_establishes_missing_stack_dir_for_manifest_and_volumes() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp
+        .path()
+        .join("runtime")
+        .join("stacks")
+        .join("missing-stack-dir");
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.mounts.push(StackMountSpec::Named {
+        source: "workspace".to_string(),
+        target: "/workspace".to_string(),
+        read_only: false,
+    });
+    let mut spec = stack("scoped-missing-stack-dir", vec![service]);
+    spec.volumes.push(VolumeSpec {
+        name: "workspace".to_string(),
+        driver: "local".to_string(),
+        driver_opts: None,
+    });
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor =
+        StackExecutor::new_scoped(MockContainerRuntime::new(), store, &data_dir, scope).unwrap();
+    let actions = planned_actions(&executor, &spec);
+
+    assert!(!data_dir.exists());
+    let result = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-missing-stack-dir",
+            "operation-missing-stack-dir",
+            0,
+        )
+        .unwrap();
+
+    assert!(result.all_succeeded(), "errors: {:?}", result.errors);
+    assert!(data_dir.join("scoped-activation").is_dir());
+    assert!(data_dir.join("volumes/workspace").is_dir());
+}
+
+#[test]
+fn scoped_claimed_batch_rejects_public_manifest_data_directory() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("public-stack-dir");
+    std::fs::create_dir(&data_dir).unwrap();
+    std::fs::set_permissions(&data_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-public-stack-dir", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor =
+        StackExecutor::new_scoped(MockContainerRuntime::new(), store, &data_dir, scope).unwrap();
+    let actions = planned_actions(&executor, &spec);
+
+    let error = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-public-stack-dir",
+            "operation-public-stack-dir",
+            0,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("permissions are not 0700"));
+    assert!(
+        executor
+            .store()
+            .load_reconcile_session("session-public-stack-dir")
+            .unwrap()
+            .is_none()
+    );
+    assert!(!data_dir.join("scoped-activation").exists());
+    assert!(executor.runtime().call_log().is_empty());
+}
+
+#[test]
+fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-teardown-finalizer",
+        vec![svc("web", "nginx:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let initial = planned_actions(&executor, &spec);
+    assert!(
+        executor
+            .execute_with_test_session(&spec, &initial, "operation-teardown-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let observed = executor.store().load_observed_state(&spec.name).unwrap();
+    let remove_actions = crate::reconcile::attach_action_preconditions(
+        &spec.name,
+        executor.store(),
+        vec![crate::reconcile::ActionDraft::Remove {
+            target: observed[0].replica.clone(),
+            observed: observed[0].clone(),
+        }],
+    )
+    .unwrap();
+    let mut unrelated = svc("unrelated", "busybox:latest");
+    unrelated.mounts.push(StackMountSpec::Bind {
+        source: tmp
+            .path()
+            .join("missing-unrelated-bind")
+            .to_string_lossy()
+            .into_owned(),
+        target: "/irrelevant".to_string(),
+        read_only: true,
+    });
+    let teardown_spec = stack("scoped-teardown-finalizer", vec![unrelated]);
+    executor.scoped_cleanup_only = true;
+
+    let pending = match executor
+        .begin_claimed_teardown_batch(
+            &teardown_spec,
+            &remove_actions,
+            "session-teardown-finalizer",
+            "operation-teardown-finalizer",
+            0,
+        )
+        .unwrap()
+    {
+        ClaimedTeardownAdmission::Ready(pending) => pending,
+        ClaimedTeardownAdmission::Failed(result) => {
+            panic!("exact removes unexpectedly failed: {:?}", result.errors)
+        }
+    };
+    let session = executor
+        .store()
+        .load_reconcile_session("session-teardown-finalizer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Active
+    );
+    assert_eq!(session.next_action_index, 0);
+    assert_eq!(executor.runtime().scoped_generation_count(), 0);
+
+    let generic_commit_error = executor
+        .store()
+        .commit_reconcile_batch(
+            &pending.session_id,
+            &pending.stack_name,
+            &pending.operation_id,
+            pending.first_action_index,
+            &pending.actions,
+            &pending.result.outcomes,
+        )
+        .unwrap_err();
+    assert!(
+        generic_commit_error
+            .to_string()
+            .contains("claim-qualified teardown commit")
+    );
+
+    let generic_error = executor
+        .execute_claimed_batch(
+            &teardown_spec,
+            &remove_actions,
+            "session-teardown-finalizer",
+            &pending.operation_id,
+            0,
+        )
+        .unwrap_err();
+    assert!(generic_error.to_string().contains("typed teardown API"));
+    assert_eq!(
+        executor
+            .store()
+            .load_reconcile_session("session-teardown-finalizer")
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::state_store::ReconcileSessionStatus::Active
+    );
+
+    executor.scoped_authority.as_mut().unwrap().scope.stack_id = "wrong-stack".to_string();
+    let error = executor
+        .commit_claimed_teardown_batch(*pending)
+        .unwrap_err();
+    assert!(error.to_string().contains("exact stack"));
+    assert_eq!(
+        executor
+            .store()
+            .load_reconcile_session("session-teardown-finalizer")
+            .unwrap()
+            .unwrap()
+            .status,
+        crate::state_store::ReconcileSessionStatus::Active
+    );
+    executor.scoped_authority.as_mut().unwrap().scope.stack_id = teardown_spec.name.clone();
+    let replay = match executor
+        .begin_claimed_teardown_batch(
+            &teardown_spec,
+            &remove_actions,
+            "session-teardown-finalizer",
+            "operation-teardown-finalizer",
+            0,
+        )
+        .unwrap()
+    {
+        ClaimedTeardownAdmission::Ready(pending) => pending,
+        ClaimedTeardownAdmission::Failed(result) => {
+            panic!(
+                "exact remove replay unexpectedly failed: {:?}",
+                result.errors
+            )
+        }
+    };
+    let result = executor.commit_claimed_teardown_batch(*replay).unwrap();
+    assert!(result.all_succeeded());
+    let session = executor
+        .store()
+        .load_reconcile_session("session-teardown-finalizer")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Completed
+    );
+}
+
+#[test]
+fn scoped_claimed_teardown_failed_remove_is_not_ready_and_commits_failed() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-teardown-failure", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let initial = planned_actions(&executor, &spec);
+    assert!(
+        executor
+            .execute_with_test_session(&spec, &initial, "operation-teardown-failure-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let observed = executor.store().load_observed_state(&spec.name).unwrap();
+    let remove_actions = crate::reconcile::attach_action_preconditions(
+        &spec.name,
+        executor.store(),
+        vec![crate::reconcile::ActionDraft::Remove {
+            target: observed[0].replica.clone(),
+            observed: observed[0].clone(),
+        }],
+    )
+    .unwrap();
+    executor.scoped_cleanup_only = true;
+    executor.runtime.fail_generation_cleanup = true;
+
+    let admission = executor
+        .begin_claimed_teardown_batch(
+            &spec,
+            &remove_actions,
+            "session-teardown-failure",
+            "operation-teardown-failure",
+            0,
+        )
+        .unwrap();
+    let result = match admission {
+        ClaimedTeardownAdmission::Failed(result) => result,
+        ClaimedTeardownAdmission::Ready(_) => {
+            panic!("failed exact remove must not grant finalizer authority")
+        }
+    };
+    assert_eq!(result.failed, 1);
+    let session = executor
+        .store()
+        .load_reconcile_session("session-teardown-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        session.status,
+        crate::state_store::ReconcileSessionStatus::Failed
+    );
+    assert_eq!(session.next_action_index, 0);
+}
+
+fn assert_claimed_successor_crash_replay(reserve_before_replay: bool) {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-successor-replay", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let actions = plan_apply(&spec, &store, &HashMap::new()).unwrap().actions;
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let session_id = if reserve_before_replay {
+        "session-successor-reserved"
+    } else {
+        "session-successor-intent"
+    };
+    let operation_id = if reserve_before_replay {
+        "operation-successor-reserved"
+    } else {
+        "operation-successor-intent"
+    };
+    executor
+        .stage_scoped_batch_manifest(&spec, &actions, session_id, operation_id, 0)
+        .unwrap();
+    let session = crate::state_store::ReconcileSession {
+        session_id: session_id.to_string(),
+        stack_name: spec.name.clone(),
+        operation_id: operation_id.to_string(),
+        status: crate::state_store::ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    executor
+        .store()
+        .create_reconcile_batch(&session, &actions)
+        .unwrap();
+    let claims = executor
+        .store()
+        .start_reconcile_batch(session_id, &spec.name, operation_id, 0, &actions)
+        .unwrap();
+
+    let target = actions[0].target().clone();
+    executor
+        .service_ips
+        .insert(target.clone(), "172.20.0.2".to_string());
+    executor.service_network_ips.insert(
+        target.clone(),
+        HashMap::from([(spec.networks[0].name.clone(), "172.20.0.2".to_string())]),
+    );
+    executor.mount_tag_offsets.insert("web".to_string(), 0);
+    let service_map = HashMap::from([("web", &spec.services[0])]);
+    let prepared = executor
+        .prepare_create(&spec, &service_map, "web", 1)
+        .unwrap();
+    let payload = super::scoped::scoped_activation_payload_sha256(
+        &prepared,
+        &spec,
+        &executor.scoped_secret_digests,
+    )
+    .unwrap();
+    let input = crate::state_store::ClaimedCreateInput {
+        requested_container_id: prepared.requested_container_id.clone(),
+        definition_digest: executor
+            .scoped_authority
+            .as_ref()
+            .unwrap()
+            .definition_digest
+            .clone(),
+        applied_config_digest: crate::reconcile::service_config_digest(&spec.services[0]),
+        activation_payload_sha256: payload,
+    };
+    let allocation = crate::state_store::ClaimedAllocatorTarget {
+        ports: vec![],
+        service_ip: Some("172.20.0.2".to_string()),
+        service_network_ips: vec![crate::state_store::ClaimedAllocatorNetworkIp {
+            network_name: spec.networks[0].name.clone(),
+            ip: "172.20.0.2".to_string(),
+        }],
+        mount_tag_offset: Some(0),
+    };
+    let intent = executor
+        .store()
+        .resolve_or_begin_claimed_successor(&claims[0], &input, &allocation, 2)
+        .unwrap();
+    if reserve_before_replay {
+        let ownership = executor
+            .runtime()
+            .reserve_container_generation(&intent.scope, &intent.requested_container_id)
+            .unwrap();
+        executor
+            .store()
+            .bind_claimed_successor_generation(
+                &claims[0],
+                &crate::state_store::StackContainerGenerationBinding {
+                    reservation_id: intent.scope.reservation_id.clone(),
+                    service_name: intent.service_name.clone(),
+                    ownership,
+                    bound_at: 3,
+                },
+            )
+            .unwrap();
+    }
+
+    assert!(
+        executor
+            .preflight_scoped_claims(&spec, &actions, session_id, operation_id, 0, &claims)
+            .unwrap()
+            .is_none()
+    );
+    let result = executor
+        .execute_with_session(&spec, &actions, session_id, operation_id, 0, &claims)
+        .unwrap();
+    assert!(result.all_succeeded(), "{:?}", result.errors);
+    assert_eq!(executor.runtime.scoped_generation_count(), 1);
+}
+
+#[test]
+fn scoped_claimed_successor_intent_crash_replays() {
+    assert_claimed_successor_crash_replay(false);
+}
+
+#[test]
+fn scoped_claimed_successor_reserved_crash_replays() {
+    assert_claimed_successor_crash_replay(true);
+}
+
+#[test]
+fn scoped_claim_action_mismatch_fails_before_runtime_effects() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-claim-mismatch",
+        vec![svc("web", "nginx:latest"), svc("db", "postgres:16")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let actions = plan_apply(&spec, &store, &HashMap::new()).unwrap().actions;
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let session = crate::state_store::ReconcileSession {
+        session_id: "session-claim-mismatch".to_string(),
+        stack_name: spec.name.clone(),
+        operation_id: "operation-claim-mismatch".to_string(),
+        status: crate::state_store::ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    executor
+        .stage_scoped_batch_manifest(
+            &spec,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+        )
+        .unwrap();
+    executor
+        .store()
+        .create_reconcile_batch(&session, &actions)
+        .unwrap();
+    let mut claims = executor
+        .store()
+        .start_reconcile_batch(
+            &session.session_id,
+            &spec.name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap();
+    claims.swap(0, 1);
+
+    let error = executor
+        .execute_with_session(
+            &spec,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+            &claims,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("claim"));
+    assert!(executor.runtime().call_log().is_empty());
+    assert!(
+        executor
+            .store()
+            .load_observed_state(&spec.name)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn scoped_batch_preflight_is_zero_effect_when_later_replica_is_replaced() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-preflight-atomic",
+        vec![svc("web", "web:v1"), svc("db", "db:v1")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(
+        MockContainerRuntime::new(),
+        store,
+        tmp.path(),
+        scope.clone(),
+    );
+    let initial = planned_actions(&executor, &spec);
+    assert!(
+        executor
+            .execute_with_test_session(&spec, &initial, "operation-preflight-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+
+    let mut changed = spec.clone();
+    changed.services[0].image = "web:v2".to_string();
+    changed.services[1].image = "db:v2".to_string();
+    let actions = plan_apply(&changed, executor.store(), &HashMap::new())
+        .unwrap()
+        .actions;
+    executor
+        .store()
+        .save_desired_state(&changed.name, &changed)
+        .unwrap();
+    let session = crate::state_store::ReconcileSession {
+        session_id: "session-preflight-atomic".to_string(),
+        stack_name: changed.name.clone(),
+        operation_id: "operation-preflight-atomic".to_string(),
+        status: crate::state_store::ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 2,
+        updated_at: 2,
+        completed_at: None,
+    };
+    executor
+        .stage_scoped_batch_manifest(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+        )
+        .unwrap();
+    executor
+        .store()
+        .create_reconcile_batch(&session, &actions)
+        .unwrap();
+    let claims = executor
+        .store()
+        .start_reconcile_batch(
+            &session.session_id,
+            &changed.name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap();
+    let db_id = super::create::generated_runtime_container_id(&changed.name, "db", 1);
+    let mut replacement = executor.runtime().scoped_ownership(&db_id).unwrap();
+    replacement.generation += 1;
+    executor
+        .runtime()
+        .insert_scoped_generation(replacement, true);
+    let before = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    let runtime_calls = executor.runtime().call_log().len();
+
+    let result = executor
+        .preflight_scoped_claims(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+            &claims,
+        )
+        .unwrap()
+        .expect("replacement must fail batch preflight");
+    assert!(!result.all_succeeded());
+    let after = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(executor.runtime().call_log().len(), runtime_calls);
+    assert!(!executor.runtime().call_log().iter().any(|(operation, _)| {
+        matches!(
+            operation.as_str(),
+            "release_container_reservation" | "stop_and_remove_container_generation"
+        )
+    }));
+}
+
+#[test]
+fn scoped_recreate_invalid_effective_input_leaves_predecessor_untouched() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-invalid-recreate-input",
+        vec![svc("web", "nginx:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let initial = planned_actions(&executor, &spec);
+    assert!(
+        executor
+            .execute_with_test_session(&spec, &initial, "operation-valid-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+
+    let mut changed = spec.clone();
+    changed.services[0].mounts.push(StackMountSpec::Bind {
+        source: tmp
+            .path()
+            .join("missing-bind-source")
+            .to_string_lossy()
+            .into_owned(),
+        target: "/workspace".to_string(),
+        read_only: false,
+    });
+    let actions = plan_apply(&changed, executor.store(), &HashMap::new())
+        .unwrap()
+        .actions;
+    assert_eq!(actions.len(), 1);
+    assert!(matches!(actions[0], Action::ServiceRecreate { .. }));
+    executor
+        .store()
+        .save_desired_state(&changed.name, &changed)
+        .unwrap();
+    let session = crate::state_store::ReconcileSession {
+        session_id: "session-invalid-recreate-input".to_string(),
+        stack_name: changed.name.clone(),
+        operation_id: "operation-invalid-recreate-input".to_string(),
+        status: crate::state_store::ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 2,
+        updated_at: 2,
+        completed_at: None,
+    };
+    executor
+        .stage_scoped_batch_manifest(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+        )
+        .unwrap();
+    executor
+        .store()
+        .create_reconcile_batch(&session, &actions)
+        .unwrap();
+    let claims = executor
+        .store()
+        .start_reconcile_batch(
+            &session.session_id,
+            &changed.name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap();
+    let before = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(
+            &executor.scoped_authority.as_ref().unwrap().scope,
+        )
+        .unwrap();
+    let container_id = super::create::generated_runtime_container_id(&changed.name, "web", 1);
+    let ownership = executor.runtime().scoped_ownership(&container_id).unwrap();
+    let calls_before = executor.runtime().call_log().len();
+    let ports_before = executor.ports.in_use();
+
+    let error = executor
+        .preflight_scoped_claims(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+            &claims,
+        )
+        .unwrap_err();
+
+    assert!(
+        error
+            .to_string()
+            .contains("bind mount source does not exist"),
+        "unexpected preflight error: {}",
+        error
+    );
+    assert_eq!(
+        executor
+            .store()
+            .list_stack_container_recovery_records_for_machine_workload(
+                &executor.scoped_authority.as_ref().unwrap().scope,
+            )
+            .unwrap(),
+        before
+    );
+    assert_eq!(
+        executor.runtime().scoped_ownership(&container_id),
+        Some(ownership)
+    );
+    assert_eq!(executor.runtime().call_log().len(), calls_before);
+    assert_eq!(executor.ports.in_use(), ports_before);
+}
+
+#[test]
+fn scoped_replicated_fixed_port_recreate_is_rejected_before_cleanup() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.resources.replicas = 2;
+    let spec = stack("scoped-invalid-fixed-port-recreate", vec![service]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let initial = planned_actions(&executor, &spec);
+    assert!(
+        executor
+            .execute_with_test_session(&spec, &initial, "operation-fixed-port-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+
+    let mut changed = spec.clone();
+    changed.services[0].ports.push(PortSpec {
+        protocol: "tcp".to_string(),
+        container_port: 8080,
+        host_port: Some(18_080),
+    });
+    let actions = plan_apply(&changed, executor.store(), &HashMap::new())
+        .unwrap()
+        .actions;
+    assert_eq!(actions.len(), 2);
+    executor
+        .store()
+        .save_desired_state(&changed.name, &changed)
+        .unwrap();
+    let session = crate::state_store::ReconcileSession {
+        session_id: "session-invalid-fixed-port-recreate".to_string(),
+        stack_name: changed.name.clone(),
+        operation_id: "operation-invalid-fixed-port-recreate".to_string(),
+        status: crate::state_store::ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 2,
+        updated_at: 2,
+        completed_at: None,
+    };
+    executor
+        .stage_scoped_batch_manifest(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+        )
+        .unwrap();
+    executor
+        .store()
+        .create_reconcile_batch(&session, &actions)
+        .unwrap();
+    let claims = executor
+        .store()
+        .start_reconcile_batch(
+            &session.session_id,
+            &changed.name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap();
+    let before = executor
+        .store()
+        .list_stack_container_recovery_records()
+        .unwrap();
+    let calls_before = executor.runtime().call_log().len();
+
+    let error = executor
+        .preflight_scoped_claims(
+            &changed,
+            &actions,
+            &session.session_id,
+            &session.operation_id,
+            0,
+            &claims,
+        )
+        .unwrap_err();
+
+    assert!(error.to_string().contains("fixed host port"));
+    assert_eq!(
+        executor
+            .store()
+            .list_stack_container_recovery_records()
+            .unwrap(),
+        before
+    );
+    assert_eq!(executor.runtime().scoped_generation_count(), 2);
+    assert_eq!(executor.runtime().call_log().len(), calls_before);
+}
+
+#[test]
 fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
     let tmp = tempfile::tempdir().unwrap();
     let store = StateStore::in_memory().unwrap();
@@ -3292,12 +4369,6 @@ fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
         ));
     assert_eq!(first.as_ref().unwrap().generation, 1);
 
-    assert!(
-        executor
-            .execute_with_test_session(&spec, &actions, "operation-rejoin", 0)
-            .unwrap()
-            .all_succeeded()
-    );
     assert_eq!(executor.runtime.scoped_generation_count(), 1);
     assert_eq!(
         executor
@@ -3322,13 +4393,10 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
     let mut runtime = MockContainerRuntime::new();
     runtime.fail_scoped_activation = true;
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
-    let actions = vec![Action::ServiceCreate {
-        precondition: crate::reconcile::test_replica_precondition(),
-        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-    }];
+    let actions = planned_actions(&executor, &spec);
 
     let failed = executor
-        .execute_with_test_session(&spec, &actions, "operation-retry", 0)
+        .execute_with_test_session(&spec, &actions, "operation-retry-2", 0)
         .unwrap();
     assert_eq!(failed.failed, 1);
     assert_eq!(executor.runtime.scoped_generation_count(), 0);
@@ -3342,6 +4410,7 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
     );
 
     executor.runtime.fail_scoped_activation = false;
+    let actions = planned_actions(&executor, &spec);
     let retried = executor
         .execute_with_test_session(&spec, &actions, "operation-retry", 0)
         .unwrap();
@@ -3353,6 +4422,56 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].intent.service_generation, 2);
     assert_eq!(records[0].binding.as_ref().unwrap().ownership.generation, 2);
+}
+
+#[test]
+fn scoped_foreign_activation_cleanup_leaves_reserved_successor_unchanged() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-foreign-activation-cleanup",
+        vec![svc("web", "nginx:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_scoped_activation = true;
+    runtime.foreign_scoped_activation_cleanup = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
+    let actions = planned_actions(&executor, &spec);
+
+    let result = executor
+        .execute_with_test_session(&spec, &actions, "operation-foreign-cleanup", 0)
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    assert!(result.errors[0].1.contains("foreign cleanup ownership"));
+    let records = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].intent.status,
+        crate::state_store::StackContainerCreateStatus::Reserved
+    );
+    let binding = records[0].binding.as_ref().unwrap();
+    assert!(matches!(
+        executor
+            .runtime()
+            .inspect_container_generation(&binding.ownership)
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(found)
+            if found == binding.ownership
+    ));
+    assert!(!executor.runtime().call_log().iter().any(|(operation, _)| {
+        matches!(
+            operation.as_str(),
+            "release_container_reservation" | "stop_and_remove_container_generation"
+        )
+    }));
 }
 
 #[test]
@@ -3368,16 +4487,9 @@ fn scoped_pull_failure_releases_reserved_generation_and_clears_recovery_fence() 
     runtime.fail_pull = true;
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
 
+    let actions = planned_actions(&executor, &spec);
     let result = executor
-        .execute_with_test_session(
-            &spec,
-            &[Action::ServiceCreate {
-                precondition: crate::reconcile::test_replica_precondition(),
-                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-            }],
-            "operation-pull-failure",
-            0,
-        )
+        .execute_with_test_session(&spec, &actions, "operation-pull-failure", 0)
         .unwrap();
     assert_eq!(result.failed, 1);
     assert_eq!(executor.runtime.scoped_generation_count(), 0);
@@ -3391,7 +4503,7 @@ fn scoped_pull_failure_releases_reserved_generation_and_clears_recovery_fence() 
 }
 
 #[test]
-fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
+fn scoped_foreign_reservation_is_rejected_before_journal_or_runtime_mutation() {
     let tmp = tempfile::tempdir().unwrap();
     let store = StateStore::in_memory().unwrap();
     let spec = stack("scoped-foreign", vec![svc("web", "nginx:latest")]);
@@ -3403,16 +4515,9 @@ fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
     runtime.force_foreign_scoped_inspection = true;
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
 
+    let actions = planned_actions(&executor, &spec);
     let result = executor
-        .execute_with_test_session(
-            &spec,
-            &[Action::ServiceCreate {
-                precondition: crate::reconcile::test_replica_precondition(),
-                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-            }],
-            "operation-foreign",
-            0,
-        )
+        .execute_with_test_session(&spec, &actions, "operation-foreign", 0)
         .unwrap();
     assert_eq!(result.failed, 1);
     assert_eq!(executor.runtime.scoped_generation_count(), 0);
@@ -3427,11 +4532,7 @@ fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
         .store()
         .list_stack_container_recovery_records_for_machine_workload(&scope)
         .unwrap();
-    assert_eq!(records.len(), 1);
-    assert_eq!(
-        records[0].intent.status,
-        StackContainerCreateStatus::Blocked
-    );
+    assert!(records.is_empty());
 }
 
 #[test]
@@ -3732,20 +4833,16 @@ fn scoped_port_conflict_does_not_write_a_generic_replica_state() {
         target: ServiceReplicaKey::new("web", 2).unwrap(),
     };
 
-    let result = executor
+    let error = executor
         .execute_with_test_session(
             &spec,
             std::slice::from_ref(&action),
             "operation-port-conflict",
             0,
         )
-        .unwrap();
+        .unwrap_err();
 
-    assert_eq!(result.failed, 1);
-    assert!(matches!(
-        result.outcomes[0].result,
-        ActionOutcomeResult::Failed { .. }
-    ));
+    assert!(error.to_string().contains("port conflict"));
     assert!(
         executor
             .store()
@@ -3786,27 +4883,8 @@ fn scoped_outcomes_are_bijective_ordered_exact_and_offset_for_partial_failure() 
             target: ServiceReplicaKey::new("api-2", 1).unwrap(),
         },
     ];
-    // A non-zero cursor is a resume, so the durable manifest must already
-    // contain the complete original action plan.  Stage seven prefix actions
-    // without executing them, then execute only the exact suffix under test.
-    let mut full_plan = (0..7)
-        .map(|_| Action::ServiceCreate {
-            precondition: crate::reconcile::test_replica_precondition(),
-            target: ServiceReplicaKey::new("api", 1).unwrap(),
-        })
-        .collect::<Vec<_>>();
-    full_plan.extend(actions.clone());
-    executor
-        .prepare_scoped_batch_manifest(
-            &spec,
-            &full_plan,
-            "session-outcomes",
-            "operation-outcomes",
-            0,
-        )
-        .unwrap();
     let result = executor
-        .execute_with_session(&spec, &actions, "session-outcomes", "operation-outcomes", 7)
+        .execute_with_test_session(&spec, &actions, "operation-outcomes", 0)
         .unwrap();
     assert_eq!(result.outcomes.len(), actions.len());
     assert_eq!(
@@ -3815,7 +4893,7 @@ fn scoped_outcomes_are_bijective_ordered_exact_and_offset_for_partial_failure() 
             .iter()
             .map(|outcome| outcome.absolute_index)
             .collect::<Vec<_>>(),
-        vec![7, 8, 9]
+        vec![0, 1, 2]
     );
     assert_eq!(
         result
@@ -3896,10 +4974,6 @@ fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
     );
 
     std::fs::write(&staged, b"tampered").unwrap();
-    let error = executor
-        .execute_with_test_session(&spec, &actions, "operation-secret", 0)
-        .unwrap_err();
-    assert!(error.to_string().contains("digest validation"));
     assert_eq!(
         executor
             .runtime
@@ -3967,7 +5041,13 @@ fn scoped_interrupted_temp_staging_is_retryable_but_missing_final_manifest_is_no
         .path();
     std::fs::remove_file(owner.join("manifest.json")).unwrap();
     let error = executor
-        .execute_with_test_session(&spec, &actions, "operation-staging", 0)
+        .prepare_scoped_batch_manifest(
+            &spec,
+            &actions,
+            "test-session-operation-staging",
+            "operation-staging",
+            0,
+        )
         .unwrap_err();
     assert!(error.to_string().contains("manifest is missing"));
 }
@@ -3999,7 +5079,13 @@ fn scoped_manifest_rejects_config_change_before_new_reservation() {
     let mut changed = spec.clone();
     changed.services[0].command = Some(vec!["serve".to_string(), "--unsafe".to_string()]);
     let error = executor
-        .execute_with_test_session(&changed, &actions, "operation-config", 0)
+        .prepare_scoped_batch_manifest(
+            &changed,
+            &actions,
+            "test-session-operation-config",
+            "operation-config",
+            0,
+        )
         .unwrap_err();
     assert!(
         error
@@ -4170,11 +5256,16 @@ fn scoped_running_replacement_is_blocked_and_never_reactivated() {
         .iter()
         .filter(|(operation, _)| operation == "activate_scoped")
         .count();
-
-    let result = executor
-        .execute_with_test_session(&spec, &actions, "operation-replacement", 0)
+    let before = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(
+            &executor.scoped_authority.as_ref().unwrap().scope,
+        )
         .unwrap();
-    assert_eq!(result.failed, 1);
+
+    let _error = executor
+        .execute_with_test_session(&spec, &actions, "operation-replacement-2", 0)
+        .unwrap_err();
     assert_eq!(
         executor
             .runtime
@@ -4183,6 +5274,16 @@ fn scoped_running_replacement_is_blocked_and_never_reactivated() {
             .filter(|(operation, _)| operation == "activate_scoped")
             .count(),
         activations
+    );
+    let after = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(
+            &executor.scoped_authority.as_ref().unwrap().scope,
+        )
+        .unwrap();
+    assert_eq!(
+        after, before,
+        "foreign replacement must not mutate journal state"
     );
 }
 
@@ -4243,7 +5344,7 @@ fn scoped_remove_preserves_stop_signal_and_grace_policy() {
 }
 
 #[test]
-fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears() {
+fn scoped_manifest_resume_uses_staged_secret_after_source_disappears() {
     let tmp = tempfile::tempdir().unwrap();
     let source = tmp.path().join("resume-secret-source");
     std::fs::write(&source, b"staged-before-crash").unwrap();
@@ -4261,9 +5362,7 @@ fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears(
     store.save_project_state(&project).unwrap();
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
     store.save_desired_state(&spec.name, &spec).unwrap();
-    let mut runtime = MockContainerRuntime::new();
-    runtime.fail_scoped_activation = true;
-    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![
         Action::ServiceCreate {
             precondition: crate::reconcile::test_replica_precondition_for_stack(
@@ -4278,30 +5377,19 @@ fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears(
             target: crate::state_store::ServiceReplicaKey::first("worker".to_string()).unwrap(),
         },
     ];
-    let first = executor
-        .execute_with_test_session(&spec, &actions, "operation-cursor", 0)
+    executor
+        .prepare_scoped_batch_manifest(&spec, &actions, "session-cursor", "operation-cursor", 0)
         .unwrap();
-    assert_eq!(first.failed, 2);
     std::fs::remove_file(&source).unwrap();
-    executor.runtime.fail_scoped_activation = false;
-
-    let resumed = executor
-        .execute_with_test_session(&spec, &actions[1..], "operation-cursor", 1)
+    executor
+        .prepare_scoped_batch_manifest(&spec, &actions, "session-cursor", "operation-cursor", 0)
         .unwrap();
-    assert!(resumed.all_succeeded(), "{:?}", resumed.errors);
-    let captured = executor.runtime.captured_configs.lock().unwrap();
-    assert_eq!(captured.len(), 1);
-    let staged = std::fs::read(
-        captured[0]
-            .1
-            .mounts
-            .iter()
-            .find_map(|mount| mount.source.as_ref())
-            .unwrap()
-            .join("api_token"),
-    )
-    .unwrap();
-    assert_eq!(staged, b"staged-before-crash");
+    assert!(
+        executor
+            .scoped_secret_inputs
+            .values()
+            .all(|bytes| bytes == b"staged-before-crash")
+    );
 }
 
 #[test]

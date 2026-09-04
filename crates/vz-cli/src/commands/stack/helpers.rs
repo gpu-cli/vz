@@ -18,26 +18,53 @@ fn service_phase_from_stack_status(phase: &str) -> ServicePhase {
     }
 }
 
+pub(super) fn replica_from_stack_status(
+    service: &runtime_v2::StackServiceStatus,
+) -> anyhow::Result<ServiceReplicaKey> {
+    ServiceReplicaKey::new(service.service_name.clone(), service.replica_index)
+        .map_err(anyhow::Error::from)
+}
+
+pub(super) fn action_replica_from_stack_status(
+    service: &runtime_v2::StackServiceStatus,
+    requested_service: &str,
+) -> anyhow::Result<ServiceReplicaKey> {
+    let observed = replica_from_stack_status(service)?;
+    let requested = ServiceReplicaKey::first(requested_service)?;
+    if observed != requested {
+        bail!(
+            "stack service action response identified `{}` replica {}, expected `{}` replica 1",
+            observed.service_name,
+            observed.index(),
+            requested.service_name
+        );
+    }
+    Ok(observed)
+}
+
 pub(super) fn observed_from_stack_statuses(
     services: &[runtime_v2::StackServiceStatus],
-) -> Vec<ServiceObservedState> {
+) -> anyhow::Result<Vec<ServiceObservedState>> {
     services
         .iter()
-        .map(|service| ServiceObservedState {
-            service_name: service.service_name.clone(),
-            phase: service_phase_from_stack_status(&service.phase),
-            container_id: if service.container_id.trim().is_empty() {
-                None
-            } else {
-                Some(service.container_id.clone())
-            },
-            failed_create_ownership: None,
-            last_error: if service.last_error.trim().is_empty() {
-                None
-            } else {
-                Some(service.last_error.clone())
-            },
-            ready: service.ready,
+        .map(|service| {
+            Ok(ServiceObservedState {
+                replica: replica_from_stack_status(service)?,
+                applied_config_digest: None,
+                phase: service_phase_from_stack_status(&service.phase),
+                container_id: if service.container_id.trim().is_empty() {
+                    None
+                } else {
+                    Some(service.container_id.clone())
+                },
+                failed_create_ownership: None,
+                last_error: if service.last_error.trim().is_empty() {
+                    None
+                } else {
+                    Some(service.last_error.clone())
+                },
+                ready: service.ready,
+            })
         })
         .collect()
 }
@@ -49,10 +76,11 @@ pub(super) fn resolve_service_container_id(
 ) -> anyhow::Result<String> {
     let service = services
         .iter()
-        .find(|service| service.service_name == service_name)
+        .find(|service| service.service_name == service_name && service.replica_index == 1)
         .ok_or_else(|| {
             anyhow::anyhow!("service `{service_name}` not found in stack `{stack_name}`")
         })?;
+    replica_from_stack_status(service)?;
     let container_id = service.container_id.trim();
     if container_id.is_empty() {
         let phase = if service.phase.trim().is_empty() {

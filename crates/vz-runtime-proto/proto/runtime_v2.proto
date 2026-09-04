@@ -1630,6 +1630,7 @@ message StackServiceStatus {
   bool ready = 3;
   string container_id = 4;
   string last_error = 5;
+  uint32 replica_index = 6;
 }
 
 message ApplyStackResponse {

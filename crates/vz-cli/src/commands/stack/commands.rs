@@ -92,7 +92,7 @@ pub(super) async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
         }
     };
 
-    let observed = observed_from_stack_statuses(&response.services);
+    let observed = observed_from_stack_statuses(&response.services)?;
 
     if args.dry_run {
         println!(
@@ -269,6 +269,7 @@ pub(super) async fn cmd_service_action(
             stack_service_status_from_api(response.service)
         }
     };
+    let replica = action_replica_from_stack_status(&service, &args.service)?;
 
     let phase = if service.phase.trim().is_empty() {
         "unknown"
@@ -277,19 +278,21 @@ pub(super) async fn cmd_service_action(
     };
     println!(
         "Service `{}` in stack `{}` now reports phase `{}`.",
-        service.service_name, args.name, phase
+        replica.display_name(),
+        args.name,
+        phase
     );
     if phase.eq_ignore_ascii_case("failed") {
         if service.last_error.trim().is_empty() {
             bail!(
                 "service `{}` in stack `{}` entered failed state",
-                service.service_name,
+                replica.display_name(),
                 args.name
             );
         }
         bail!(
             "service `{}` in stack `{}` entered failed state: {}",
-            service.service_name,
+            replica.display_name(),
             args.name,
             service.last_error
         );
@@ -415,7 +418,7 @@ pub(super) async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
         }
     };
 
-    let observed = observed_from_stack_statuses(&response.services);
+    let observed = observed_from_stack_statuses(&response.services)?;
     if args.json {
         let json = serde_json::to_string_pretty(&observed)
             .with_context(|| "failed to serialize observed state")?;

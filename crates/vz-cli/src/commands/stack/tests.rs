@@ -1,9 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
+use super::api::{ApiStackServiceStatus, stack_service_status_from_api};
 use super::commands::{cmd_dashboard, event_service_name};
 use super::helpers::{
-    resolve_compose_file, resolve_service_container_id, resolve_stack_name,
-    resolve_stack_registry_auth, split_exec_command,
+    action_replica_from_stack_status, observed_from_stack_statuses, resolve_compose_file,
+    resolve_service_container_id, resolve_stack_name, resolve_stack_registry_auth,
+    split_exec_command,
 };
 use super::output::{format_event_summary, print_events_table, print_ps_table};
 use super::*;
@@ -75,13 +77,24 @@ fn split_exec_command_rejects_empty_input() {
 
 #[test]
 fn resolve_service_container_id_returns_container_for_service() {
-    let services = vec![runtime_v2::StackServiceStatus {
-        service_name: "web".to_string(),
-        phase: "running".to_string(),
-        ready: true,
-        container_id: "ctr-web-1".to_string(),
-        last_error: String::new(),
-    }];
+    let services = vec![
+        runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 2,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-2".to_string(),
+            last_error: String::new(),
+        },
+        runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 1,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-1".to_string(),
+            last_error: String::new(),
+        },
+    ];
 
     let container_id = resolve_service_container_id("demo", "web", &services).unwrap();
     assert_eq!(container_id, "ctr-web-1");
@@ -91,6 +104,7 @@ fn resolve_service_container_id_returns_container_for_service() {
 fn resolve_service_container_id_errors_when_service_not_running() {
     let services = vec![runtime_v2::StackServiceStatus {
         service_name: "web".to_string(),
+        replica_index: 1,
         phase: "creating".to_string(),
         ready: false,
         container_id: String::new(),
@@ -105,6 +119,7 @@ fn resolve_service_container_id_errors_when_service_not_running() {
 fn resolve_service_container_id_errors_when_service_missing() {
     let services = vec![runtime_v2::StackServiceStatus {
         service_name: "db".to_string(),
+        replica_index: 1,
         phase: "running".to_string(),
         ready: true,
         container_id: "ctr-db-1".to_string(),
@@ -113,6 +128,85 @@ fn resolve_service_container_id_errors_when_service_missing() {
 
     let error = resolve_service_container_id("demo", "web", &services).unwrap_err();
     assert!(error.to_string().contains("not found"));
+}
+
+#[test]
+fn observed_status_projection_preserves_exact_replica_identity() {
+    let services = vec![
+        runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 1,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-1".to_string(),
+            last_error: String::new(),
+        },
+        runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 2,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-2".to_string(),
+            last_error: String::new(),
+        },
+    ];
+
+    let observed = observed_from_stack_statuses(&services).unwrap();
+    assert_eq!(
+        observed[0].replica,
+        ServiceReplicaKey::new("web", 1).unwrap()
+    );
+    assert_eq!(
+        observed[1].replica,
+        ServiceReplicaKey::new("web", 2).unwrap()
+    );
+    assert_ne!(observed[0].replica, observed[1].replica);
+}
+
+#[test]
+fn observed_status_projection_rejects_missing_replica_identity() {
+    let services = vec![runtime_v2::StackServiceStatus {
+        service_name: "web".to_string(),
+        replica_index: 0,
+        phase: "running".to_string(),
+        ready: true,
+        container_id: "ctr-web".to_string(),
+        last_error: String::new(),
+    }];
+
+    assert!(observed_from_stack_statuses(&services).is_err());
+}
+
+#[test]
+fn api_action_status_with_zero_replica_is_rejected_by_exact_consumer() {
+    let payload: ApiStackServiceStatus = serde_json::from_value(serde_json::json!({
+        "service_name": "web",
+        "replica_index": 0,
+        "phase": "running",
+        "ready": true,
+        "container_id": "ctr-web",
+        "last_error": ""
+    }))
+    .unwrap();
+    let status = stack_service_status_from_api(payload);
+
+    assert!(action_replica_from_stack_status(&status, "web").is_err());
+}
+
+#[test]
+fn action_status_rejects_wrong_service_or_replica() {
+    for (service_name, replica_index) in [("other", 1), ("web", 2)] {
+        let status = runtime_v2::StackServiceStatus {
+            service_name: service_name.to_string(),
+            replica_index,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-response".to_string(),
+            last_error: String::new(),
+        };
+
+        assert!(action_replica_from_stack_status(&status, "web").is_err());
+    }
 }
 
 #[test]
@@ -262,7 +356,8 @@ fn print_ps_table_empty() {
 fn print_ps_table_with_services() {
     let observed = vec![
         ServiceObservedState {
-            service_name: "web".into(),
+            replica: ServiceReplicaKey::new("web", 2).unwrap(),
+            applied_config_digest: None,
             phase: ServicePhase::Running,
             container_id: Some("ctr-abc".into()),
             failed_create_ownership: None,
@@ -270,7 +365,8 @@ fn print_ps_table_with_services() {
             ready: true,
         },
         ServiceObservedState {
-            service_name: "db".into(),
+            replica: ServiceReplicaKey::first("db").unwrap(),
+            applied_config_digest: None,
             phase: ServicePhase::Pending,
             container_id: None,
             failed_create_ownership: None,

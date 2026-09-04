@@ -56,6 +56,7 @@ pub(crate) fn stack_service_status_from_runtime_proto(
 ) -> StackServiceStatusPayload {
     StackServiceStatusPayload {
         service_name: payload.service_name,
+        replica_index: payload.replica_index,
         phase: payload.phase,
         ready: payload.ready,
         container_id: payload.container_id,
@@ -331,6 +332,24 @@ pub(crate) fn daemon_request_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn stack_service_status_bridge_and_json_preserve_replica_index() {
+        let projected = stack_service_status_from_runtime_proto(runtime_v2::StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 2,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-2".to_string(),
+            last_error: String::new(),
+        });
+
+        assert_eq!(projected.service_name, "web");
+        assert_eq!(projected.replica_index, 2);
+        let json = serde_json::to_value(projected).unwrap();
+        assert_eq!(json["service_name"], "web");
+        assert_eq!(json["replica_index"], 2);
+    }
 
     #[test]
     fn daemon_request_metadata_preserves_request_id_and_idempotency_key() {

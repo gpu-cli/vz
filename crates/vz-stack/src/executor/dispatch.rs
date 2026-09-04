@@ -29,6 +29,36 @@ fn validate_failed_create_ownership(
     }
 }
 
+fn claimed_preflight_failure_result(
+    actions: &[Action],
+    first_action_index: usize,
+    failures: &HashMap<ServiceReplicaKey, String>,
+) -> Result<ExecutionResult, StackError> {
+    let mut result = ExecutionResult::default();
+    for (relative_index, action) in actions.iter().enumerate() {
+        let error = failures.get(action.target()).cloned().unwrap_or_else(|| {
+            "scoped batch stopped before effects because another claimed predecessor failed preflight"
+                .to_string()
+        });
+        result.failed += 1;
+        result
+            .errors
+            .push((action.target().display_name(), error.clone()));
+        result.outcomes.push(IndexedActionOutcome {
+            absolute_index: first_action_index
+                .checked_add(relative_index)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec("absolute action index overflow".to_string())
+                })?,
+            action_hash: crate::reconcile::compute_actions_hash(std::slice::from_ref(action)),
+            action_kind: ReconcileActionKind::from_action(action),
+            target: action.target().clone(),
+            result: ActionOutcomeResult::Failed { error },
+        });
+    }
+    Ok(result)
+}
+
 /// Group create/recreate actions into topological levels for parallel execution.
 ///
 /// Services at the same level have no dependency edges between them
@@ -109,6 +139,646 @@ pub(super) fn parse_subnet_prefix(subnet: &str) -> u8 {
 }
 
 impl<R: ContainerRuntime> StackExecutor<R> {
+    pub(crate) fn validate_scoped_batch_inputs(
+        &self,
+        spec: &StackSpec,
+        actions: &[Action],
+    ) -> Result<(), StackError> {
+        for action in actions {
+            action.validate()?;
+            if action.precondition().workload().stack_id != spec.name {
+                return Err(super::scope_state_conflict(format!(
+                    "action `{}` is scoped to stack `{}` instead of `{}`",
+                    action.target().display_name(),
+                    action.precondition().workload().stack_id,
+                    spec.name
+                )));
+            }
+        }
+        if let Some(authority) = &self.scoped_authority
+            && authority.scope.stack_id != spec.name
+        {
+            return Err(super::scope_state_conflict(format!(
+                "stack spec `{}` does not match scoped stack `{}`",
+                spec.name, authority.scope.stack_id
+            )));
+        }
+        if self.scoped_cleanup_only
+            && actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+                )
+            })
+        {
+            return Err(super::scope_state_conflict(
+                "cleanup-only scoped executor cannot reserve or activate containers",
+            ));
+        }
+        let has_creates = actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            )
+        });
+        if !has_creates && self.scoped_authority.is_some() {
+            return Ok(());
+        }
+        for service in &spec.services {
+            let replicas = service.resources.replicas.max(1);
+            if replicas > 1 && service.container_name.is_some() {
+                return Err(StackError::InvalidSpec(format!(
+                    "service `{}` cannot combine container_name with replicas > 1",
+                    service.name
+                )));
+            }
+            if replicas > 1 && service.ports.iter().any(|port| port.host_port.is_some()) {
+                return Err(StackError::InvalidSpec(format!(
+                    "service `{}` cannot publish a fixed host port with replicas > 1",
+                    service.name
+                )));
+            }
+            for replica_index in 1..=replicas {
+                ServiceReplicaKey::new(&service.name, replica_index)?;
+            }
+            let mut resolved_mounts = self
+                .volumes
+                .resolve_mounts(&service.mounts, &spec.volumes)?;
+            crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
+            for secret_ref in &service.secrets {
+                if !spec
+                    .secrets
+                    .iter()
+                    .any(|secret| secret.name == secret_ref.source)
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "secret '{}' referenced by service '{}' not defined at top level",
+                        secret_ref.source, service.name
+                    )));
+                }
+                if self.scoped_secret_dir.is_some()
+                    && !self.scoped_secret_inputs.contains_key(&secret_ref.source)
+                {
+                    return Err(super::scope_state_conflict(format!(
+                        "scoped staged secret '{}' is missing",
+                        secret_ref.source
+                    )));
+                }
+            }
+            let secret_mounts = self
+                .scoped_secret_dir
+                .as_ref()
+                .map(|directory| secrets_to_mounts(&service.secrets, directory))
+                .unwrap_or_default();
+            service_to_run_config(service, &resolved_mounts, &secret_mounts)?;
+        }
+        let mut port_preview = self.ports.clone();
+        for action in actions.iter().filter(|action| {
+            matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            )
+        }) {
+            let service = spec
+                .services
+                .iter()
+                .find(|service| service.name == action.target().service_name)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "action target references unknown service `{}`",
+                        action.target().service_name
+                    ))
+                })?;
+            port_preview.allocate_replica(action.target(), &service.ports)?;
+        }
+        if let Some(disk_size_mb) = spec.disk_size_mb {
+            disk_size_mb.checked_mul(1024 * 1024).ok_or_else(|| {
+                StackError::InvalidSpec("stack disk_size_mb overflows bytes".to_string())
+            })?;
+        }
+        spec.services
+            .iter()
+            .filter_map(|service| service.resources.memory_bytes)
+            .try_fold(0_u64, |total, bytes| {
+                total.checked_add(bytes).ok_or_else(|| {
+                    StackError::InvalidSpec("aggregate service memory overflows u64".to_string())
+                })
+            })?;
+        let total_mounts = spec.services.iter().try_fold(0_usize, |total, service| {
+            total
+                .checked_add(service.mounts.len())
+                .and_then(|value| value.checked_add(service.secrets.len()))
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "aggregate service mount count overflows usize".to_string(),
+                    )
+                })
+        })?;
+        for service in &spec.services {
+            total_mounts
+                .checked_add(service.secrets.len())
+                .ok_or_else(|| {
+                    StackError::InvalidSpec("service mount tag offset overflows usize".to_string())
+                })?;
+        }
+        Ok(())
+    }
+
+    /// Execute one exact, durable claimed action batch.
+    ///
+    /// Fresh batches stage their immutable activation manifest before the
+    /// reconcile session is persisted. Retrying the same active session
+    /// requires an exact operation, cursor, and action-slice match. Per-action
+    /// failures are committed as terminal outcomes; an outer error leaves the
+    /// session and started claims at their original cursor for exact replay.
+    pub fn execute_claimed_batch(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<ExecutionResult, StackError> {
+        let authority = self.scoped_authority.as_ref().ok_or_else(|| {
+            super::scope_state_conflict("claimed batch execution requires scoped authority")
+        })?;
+        if authority.scope.stack_id != spec.name {
+            return Err(super::scope_state_conflict(format!(
+                "stack spec `{}` does not match scoped stack `{}`",
+                spec.name, authority.scope.stack_id
+            )));
+        }
+        if actions.is_empty() || session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(StackError::InvalidSpec(
+                "claimed batch requires non-empty actions, session_id, and operation_id"
+                    .to_string(),
+            ));
+        }
+        if super::is_claimed_teardown_operation(operation_id) {
+            return Err(super::scope_state_conflict(
+                "reserved teardown-finalizing operation requires the typed teardown API",
+            ));
+        }
+        if let Some(persisted) = self.store.load_reconcile_session(session_id)? {
+            if persisted.stack_name != spec.name
+                || persisted.operation_id != operation_id
+                || persisted.actions_hash != crate::reconcile::compute_actions_hash(actions)
+                || persisted.total_actions != actions.len()
+                || self.store.load_reconcile_session_actions(session_id)? != actions
+            {
+                return Err(super::scope_state_conflict(
+                    "persisted reconcile session does not match claimed batch identity",
+                ));
+            }
+            match persisted.status {
+                ReconcileSessionStatus::Completed | ReconcileSessionStatus::Failed => {
+                    if first_action_index != 0 {
+                        return Err(super::scope_state_conflict(
+                            "terminal claimed batch replay must provide the full action plan",
+                        ));
+                    }
+                    self.require_scoped_batch_manifest(
+                        spec,
+                        actions,
+                        session_id,
+                        operation_id,
+                        first_action_index,
+                    )?;
+                    return self.reconstruct_terminal_claimed_result(&persisted, actions);
+                }
+                ReconcileSessionStatus::Superseded => {
+                    return Err(super::scope_state_conflict(
+                        "superseded reconcile session cannot be replayed",
+                    ));
+                }
+                ReconcileSessionStatus::Active => {}
+            }
+        }
+        self.validate_scoped_batch_inputs(spec, actions)?;
+
+        let active = self.store.load_active_reconcile_session(&spec.name)?;
+        if let Some(active) = active {
+            let persisted_actions = self
+                .store
+                .load_reconcile_session_actions(&active.session_id)?;
+            let end = first_action_index
+                .checked_add(actions.len())
+                .ok_or_else(|| StackError::InvalidSpec("action slice overflow".to_string()))?;
+            if active.session_id != session_id
+                || active.operation_id != operation_id
+                || active.next_action_index != first_action_index
+                || active.total_actions != persisted_actions.len()
+                || active.actions_hash != crate::reconcile::compute_actions_hash(&persisted_actions)
+                || persisted_actions.get(first_action_index..end) != Some(actions)
+                || end != persisted_actions.len()
+            {
+                return Err(super::scope_state_conflict(
+                    "active reconcile session does not match the exact claimed batch replay",
+                ));
+            }
+            self.require_scoped_batch_manifest(
+                spec,
+                actions,
+                session_id,
+                operation_id,
+                first_action_index,
+            )?;
+        } else {
+            if first_action_index != 0 {
+                return Err(super::scope_state_conflict(
+                    "fresh claimed batch must start at action index zero",
+                ));
+            }
+            self.stage_scoped_batch_manifest(
+                spec,
+                actions,
+                session_id,
+                operation_id,
+                first_action_index,
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let session = ReconcileSession {
+                session_id: session_id.to_string(),
+                stack_name: spec.name.clone(),
+                operation_id: operation_id.to_string(),
+                status: ReconcileSessionStatus::Active,
+                actions_hash: crate::reconcile::compute_actions_hash(actions),
+                next_action_index: 0,
+                total_actions: actions.len(),
+                started_at: now,
+                updated_at: now,
+                completed_at: None,
+            };
+            self.store.create_reconcile_batch(&session, actions)?;
+        }
+
+        let claims = self.store.start_reconcile_batch(
+            session_id,
+            &spec.name,
+            operation_id,
+            first_action_index,
+            actions,
+        )?;
+        if claims.len() != actions.len() {
+            return Err(super::scope_state_conflict(
+                "admitted claim count differs from exact action count",
+            ));
+        }
+        let result = match self.preflight_scoped_claims(
+            spec,
+            actions,
+            session_id,
+            operation_id,
+            first_action_index,
+            &claims,
+        )? {
+            Some(failed) => failed,
+            None => self.execute_with_session(
+                spec,
+                actions,
+                session_id,
+                operation_id,
+                first_action_index,
+                &claims,
+            )?,
+        };
+        let commit = self.store.commit_reconcile_batch(
+            session_id,
+            &spec.name,
+            operation_id,
+            first_action_index,
+            actions,
+            &result.outcomes,
+        )?;
+        let successful_prefix = result
+            .outcomes
+            .iter()
+            .take_while(|outcome| matches!(outcome.result, ActionOutcomeResult::Succeeded))
+            .count();
+        let expected_cursor = first_action_index
+            .checked_add(successful_prefix)
+            .ok_or_else(|| StackError::InvalidSpec("reconcile cursor overflow".to_string()))?;
+        let any_failure = result
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.result, ActionOutcomeResult::Failed { .. }));
+        let commit_is_exact = if any_failure {
+            commit.status == ReconcileSessionStatus::Failed
+                && commit.next_action_index == expected_cursor
+        } else {
+            commit.status == ReconcileSessionStatus::Completed
+                && commit.next_action_index == first_action_index + actions.len()
+        };
+        if !commit_is_exact {
+            return Err(super::scope_state_conflict(
+                "claimed batch commit did not prove its exact terminal result",
+            ));
+        }
+        Ok(result)
+    }
+
+    /// Execute an exact remove-only batch while deliberately retaining its
+    /// active claims for a broader teardown finalizer.
+    pub fn begin_claimed_teardown_batch(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<ClaimedTeardownAdmission, StackError> {
+        let durable_operation_id = super::claimed_teardown_operation_id(operation_id)?;
+        if !self.scoped_cleanup_only {
+            return Err(super::scope_state_conflict(
+                "claimed teardown batching requires cleanup-only authority",
+            ));
+        }
+        if actions.is_empty()
+            || actions
+                .iter()
+                .any(|action| !matches!(action, Action::ServiceRemove { .. }))
+        {
+            return Err(StackError::InvalidSpec(
+                "claimed teardown batch requires one or more exact Remove actions".to_string(),
+            ));
+        }
+        self.validate_scoped_batch_inputs(spec, actions)?;
+        if let Some(persisted) = self.store.load_reconcile_session(session_id)? {
+            if persisted.status != ReconcileSessionStatus::Active {
+                return Err(super::scope_state_conflict(
+                    "terminal teardown session cannot rerun its broad finalizer",
+                ));
+            }
+        }
+        let active = self.store.load_active_reconcile_session(&spec.name)?;
+        if let Some(active) = active {
+            let persisted_actions = self
+                .store
+                .load_reconcile_session_actions(&active.session_id)?;
+            let end = first_action_index
+                .checked_add(actions.len())
+                .ok_or_else(|| StackError::InvalidSpec("teardown action overflow".to_string()))?;
+            if active.session_id != session_id
+                || active.operation_id != durable_operation_id
+                || active.next_action_index != first_action_index
+                || active.total_actions != persisted_actions.len()
+                || active.actions_hash != crate::reconcile::compute_actions_hash(&persisted_actions)
+                || persisted_actions.get(first_action_index..end) != Some(actions)
+                || end != persisted_actions.len()
+            {
+                return Err(super::scope_state_conflict(
+                    "active reconcile session does not match exact teardown replay",
+                ));
+            }
+            self.require_scoped_batch_manifest(
+                spec,
+                actions,
+                session_id,
+                &durable_operation_id,
+                first_action_index,
+            )?;
+        } else {
+            if first_action_index != 0 {
+                return Err(super::scope_state_conflict(
+                    "fresh claimed teardown must start at action index zero",
+                ));
+            }
+            self.stage_scoped_batch_manifest(
+                spec,
+                actions,
+                session_id,
+                &durable_operation_id,
+                first_action_index,
+            )?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            self.store.create_reconcile_batch(
+                &ReconcileSession {
+                    session_id: session_id.to_string(),
+                    stack_name: spec.name.clone(),
+                    operation_id: durable_operation_id.clone(),
+                    status: ReconcileSessionStatus::Active,
+                    actions_hash: crate::reconcile::compute_actions_hash(actions),
+                    next_action_index: 0,
+                    total_actions: actions.len(),
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                },
+                actions,
+            )?;
+        }
+        let claims = self.store.start_reconcile_batch(
+            session_id,
+            &spec.name,
+            &durable_operation_id,
+            first_action_index,
+            actions,
+        )?;
+        if claims.len() != actions.len() {
+            return Err(super::scope_state_conflict(
+                "admitted teardown claim count differs from exact action count",
+            ));
+        }
+        let result = match self.preflight_scoped_claims(
+            spec,
+            actions,
+            session_id,
+            &durable_operation_id,
+            first_action_index,
+            &claims,
+        )? {
+            Some(failed) => failed,
+            None => self.execute_with_session(
+                spec,
+                actions,
+                session_id,
+                &durable_operation_id,
+                first_action_index,
+                &claims,
+            )?,
+        };
+        let pending = PendingClaimedTeardown {
+            stack_name: spec.name.clone(),
+            spec: spec.clone(),
+            session_id: session_id.to_string(),
+            operation_id: durable_operation_id,
+            first_action_index,
+            actions: actions.to_vec(),
+            claims,
+            result,
+        };
+        let all_removes_succeeded = pending.result.all_succeeded()
+            && pending.result.outcomes.len() == pending.actions.len()
+            && pending.result.outcomes.iter().all(|outcome| {
+                outcome.action_kind == ReconcileActionKind::Remove
+                    && matches!(outcome.result, ActionOutcomeResult::Succeeded)
+            });
+        if all_removes_succeeded {
+            Ok(ClaimedTeardownAdmission::Ready(Box::new(pending)))
+        } else {
+            Ok(ClaimedTeardownAdmission::Failed(
+                self.commit_claimed_teardown_batch(pending)?,
+            ))
+        }
+    }
+
+    /// Commit a previously executed teardown after its broad finalizer succeeds.
+    pub fn commit_claimed_teardown_batch(
+        &mut self,
+        pending: PendingClaimedTeardown,
+    ) -> Result<ExecutionResult, StackError> {
+        if !self.scoped_cleanup_only {
+            return Err(super::scope_state_conflict(
+                "claimed teardown commit requires cleanup-only authority",
+            ));
+        }
+        let authority = self.scoped_authority.as_ref().ok_or_else(|| {
+            super::scope_state_conflict("claimed teardown commit requires scoped authority")
+        })?;
+        if authority.scope.stack_id != pending.stack_name {
+            return Err(super::scope_state_conflict(
+                "claimed teardown commit authority does not match its exact stack",
+            ));
+        }
+        self.require_scoped_batch_manifest(
+            &pending.spec,
+            &pending.actions,
+            &pending.session_id,
+            &pending.operation_id,
+            pending.first_action_index,
+        )?;
+        let commit = self.store.commit_claimed_teardown_batch(
+            crate::state_store::ClaimedTeardownCommit {
+                claims: &pending.claims,
+                session_id: &pending.session_id,
+                stack_name: &pending.stack_name,
+                operation_id: &pending.operation_id,
+                expected_cursor: pending.first_action_index,
+                actions: &pending.actions,
+                outcomes: &pending.result.outcomes,
+            },
+        )?;
+        let successful_prefix = pending
+            .result
+            .outcomes
+            .iter()
+            .take_while(|outcome| matches!(outcome.result, ActionOutcomeResult::Succeeded))
+            .count();
+        let expected_cursor = pending
+            .first_action_index
+            .checked_add(successful_prefix)
+            .ok_or_else(|| StackError::InvalidSpec("teardown cursor overflow".to_string()))?;
+        let any_failure = pending
+            .result
+            .outcomes
+            .iter()
+            .any(|outcome| matches!(outcome.result, ActionOutcomeResult::Failed { .. }));
+        let exact = if any_failure {
+            commit.status == ReconcileSessionStatus::Failed
+                && commit.next_action_index == expected_cursor
+        } else {
+            commit.status == ReconcileSessionStatus::Completed
+                && commit.next_action_index
+                    == pending
+                        .first_action_index
+                        .checked_add(pending.actions.len())
+                        .ok_or_else(|| {
+                            StackError::InvalidSpec("teardown end cursor overflow".to_string())
+                        })?
+        };
+        if !exact {
+            return Err(super::scope_state_conflict(
+                "claimed teardown commit did not prove its exact terminal result",
+            ));
+        }
+        Ok(pending.result)
+    }
+
+    fn reconstruct_terminal_claimed_result(
+        &self,
+        session: &ReconcileSession,
+        actions: &[Action],
+    ) -> Result<ExecutionResult, StackError> {
+        let audits = self.store.load_audit_log_for_session(&session.session_id)?;
+        if audits.len() != actions.len() {
+            return Err(super::scope_state_conflict(
+                "terminal reconcile session audit is not bijective with its actions",
+            ));
+        }
+        let mut result = ExecutionResult::default();
+        for (index, (action, audit)) in actions.iter().zip(&audits).enumerate() {
+            if audit.session_id != session.session_id
+                || audit.stack_name != session.stack_name
+                || audit.action_index != index
+                || audit.action_kind != ReconcileActionKind::from_action(action).as_audit_str()
+                || audit.target != *action.target()
+                || audit.action_hash
+                    != crate::reconcile::compute_actions_hash(std::slice::from_ref(action))
+                || audit.completed_at.is_none()
+            {
+                return Err(super::scope_state_conflict(
+                    "terminal reconcile audit does not match exact action identity",
+                ));
+            }
+            let outcome = match audit.status.as_str() {
+                "completed" if audit.error_message.is_none() => {
+                    result.succeeded += 1;
+                    ActionOutcomeResult::Succeeded
+                }
+                "failed" => {
+                    let error = audit.error_message.clone().ok_or_else(|| {
+                        super::scope_state_conflict(
+                            "failed terminal reconcile audit is missing its error",
+                        )
+                    })?;
+                    result.failed += 1;
+                    result
+                        .errors
+                        .push((action.target().display_name(), error.clone()));
+                    ActionOutcomeResult::Failed { error }
+                }
+                _ => {
+                    return Err(super::scope_state_conflict(
+                        "terminal reconcile audit has a nonterminal or malformed outcome",
+                    ));
+                }
+            };
+            result.outcomes.push(IndexedActionOutcome {
+                absolute_index: index,
+                action_hash: audit.action_hash.clone(),
+                action_kind: ReconcileActionKind::from_action(action),
+                target: action.target().clone(),
+                result: outcome,
+            });
+        }
+        let successful_prefix = result
+            .outcomes
+            .iter()
+            .take_while(|outcome| matches!(outcome.result, ActionOutcomeResult::Succeeded))
+            .count();
+        let terminal_is_exact = match session.status {
+            ReconcileSessionStatus::Completed => {
+                result.failed == 0 && session.next_action_index == actions.len()
+            }
+            ReconcileSessionStatus::Failed => {
+                result.failed > 0 && session.next_action_index == successful_prefix
+            }
+            ReconcileSessionStatus::Active | ReconcileSessionStatus::Superseded => false,
+        };
+        if !terminal_is_exact {
+            return Err(super::scope_state_conflict(
+                "terminal reconcile session status/cursor disagrees with exact audits",
+            ));
+        }
+        Ok(result)
+    }
+
     /// Execute a batch of reconciler actions for the given stack spec.
     ///
     /// Services at the same topological level (no dependency edges
@@ -131,7 +801,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         actions: &[Action],
     ) -> Result<ExecutionResult, StackError> {
-        self.execute_internal(spec, actions, None)
+        self.execute_internal(spec, actions, None, None)
     }
 
     /// Execute a persisted action batch with stable operation identity.
@@ -156,7 +826,61 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             spec,
             actions,
             Some((operation_id, operation_id, first_action_index)),
+            None,
         )
+    }
+
+    /// Revalidate and clean exact predecessors before any sandbox or allocator effect.
+    pub(crate) fn preflight_scoped_claims(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+        claims: &[ReconcileActionClaim],
+    ) -> Result<Option<ExecutionResult>, StackError> {
+        if self.scoped_authority.is_none() {
+            return Ok(None);
+        }
+        self.validate_scoped_batch_inputs(spec, actions)?;
+        if claims.len() != actions.len() {
+            return Err(super::scope_state_conflict(
+                "scoped action and claim counts are not bijective",
+            ));
+        }
+        for (relative_index, (action, claim)) in actions.iter().zip(claims).enumerate() {
+            let absolute_index =
+                first_action_index
+                    .checked_add(relative_index)
+                    .ok_or_else(|| {
+                        StackError::InvalidSpec("absolute action index overflow".to_string())
+                    })?;
+            self.store.validate_reconcile_action_claim(
+                claim,
+                session_id,
+                operation_id,
+                absolute_index,
+                action,
+            )?;
+        }
+        self.require_scoped_batch_manifest(
+            spec,
+            actions,
+            session_id,
+            operation_id,
+            first_action_index,
+        )?;
+        let failures = self.preflight_claimed_predecessors(spec, actions, claims);
+        if failures.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(claimed_preflight_failure_result(
+                actions,
+                first_action_index,
+                &failures,
+            )?))
+        }
     }
 
     /// Execute a persisted scoped action batch with exact session and operation identity.
@@ -167,6 +891,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         session_id: &str,
         operation_id: &str,
         first_action_index: usize,
+        claims: &[ReconcileActionClaim],
     ) -> Result<ExecutionResult, StackError> {
         if session_id.trim().is_empty() || operation_id.trim().is_empty() {
             return Err(StackError::InvalidSpec(
@@ -177,6 +902,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             spec,
             actions,
             Some((session_id, operation_id, first_action_index)),
+            Some(claims),
         )
     }
 
@@ -188,8 +914,91 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         operation_id: &str,
         first_action_index: usize,
     ) -> Result<ExecutionResult, StackError> {
+        if first_action_index != 0 {
+            return Err(StackError::InvalidSpec(
+                "test claimed execution requires an explicit persisted resume fixture".to_string(),
+            ));
+        }
+        let observed = self.store.load_observed_state(&spec.name)?;
+        let drafts = actions
+            .iter()
+            .map(|action| {
+                let current = observed
+                    .iter()
+                    .find(|state| state.replica == *action.target())
+                    .cloned();
+                match action {
+                    Action::ServiceCreate { target, .. } => {
+                        Ok(crate::reconcile::ActionDraft::Create {
+                            target: target.clone(),
+                            observed: current,
+                        })
+                    }
+                    Action::ServiceRecreate { target, .. } => {
+                        Ok(crate::reconcile::ActionDraft::Recreate {
+                            target: target.clone(),
+                            observed: current.ok_or_else(|| {
+                                StackError::InvalidSpec(
+                                    "test recreate target has no observed predecessor".to_string(),
+                                )
+                            })?,
+                        })
+                    }
+                    Action::ServiceRemove { target, .. } => {
+                        Ok(crate::reconcile::ActionDraft::Remove {
+                            target: target.clone(),
+                            observed: current.ok_or_else(|| {
+                                StackError::InvalidSpec(
+                                    "test remove target has no observed predecessor".to_string(),
+                                )
+                            })?,
+                        })
+                    }
+                }
+            })
+            .collect::<Result<Vec<_>, StackError>>()?;
+        let actions =
+            crate::reconcile::attach_action_preconditions(&spec.name, &self.store, drafts)?;
+        self.validate_scoped_batch_inputs(spec, &actions)?;
         let session_id = format!("test-session-{operation_id}");
-        self.execute_with_session(spec, actions, &session_id, operation_id, first_action_index)
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        let session = crate::state_store::ReconcileSession {
+            session_id: session_id.clone(),
+            stack_name: spec.name.clone(),
+            operation_id: operation_id.to_string(),
+            status: crate::state_store::ReconcileSessionStatus::Active,
+            actions_hash: crate::reconcile::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: actions.len(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
+        if self.scoped_authority.is_some() {
+            self.stage_scoped_batch_manifest(spec, &actions, &session_id, operation_id, 0)?;
+        }
+        self.store.create_reconcile_batch(&session, &actions)?;
+        let claims =
+            self.store
+                .start_reconcile_batch(&session_id, &spec.name, operation_id, 0, &actions)?;
+        let result = self.execute_internal(
+            spec,
+            &actions,
+            Some((&session_id, operation_id, first_action_index)),
+            Some(&claims),
+        )?;
+        self.store.commit_reconcile_batch(
+            &session_id,
+            &spec.name,
+            operation_id,
+            0,
+            &actions,
+            &result.outcomes,
+        )?;
+        Ok(result)
     }
 
     fn execute_internal(
@@ -197,73 +1006,61 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         actions: &[Action],
         batch: Option<(&str, &str, usize)>,
+        claims: Option<&[ReconcileActionClaim]>,
     ) -> Result<ExecutionResult, StackError> {
-        for action in actions {
-            action.validate()?;
-            if action.precondition().workload().stack_id != spec.name {
-                return Err(super::scope_state_conflict(format!(
-                    "action `{}` is scoped to stack `{}` instead of `{}`",
-                    action.target().display_name(),
-                    action.precondition().workload().stack_id,
-                    spec.name
-                )));
-            }
-        }
-        for service in &spec.services {
-            let replicas = service.resources.replicas.max(1);
-            if replicas > 1 && service.container_name.is_some() {
-                return Err(StackError::InvalidSpec(format!(
-                    "service `{}` cannot combine container_name with replicas > 1",
-                    service.name
-                )));
-            }
-            if replicas > 1 && service.ports.iter().any(|port| port.host_port.is_some()) {
-                return Err(StackError::InvalidSpec(format!(
-                    "service `{}` cannot publish a fixed host port with replicas > 1",
-                    service.name
-                )));
-            }
-        }
-        if let Some(authority) = &self.scoped_authority
-            && authority.scope.stack_id != spec.name
-        {
-            return Err(super::scope_state_conflict(format!(
-                "stack spec `{}` does not match scoped stack `{}`",
-                spec.name, authority.scope.stack_id
-            )));
-        }
-        if self.scoped_cleanup_only
-            && actions.iter().any(|action| {
-                matches!(
-                    action,
-                    Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
-                )
-            })
-        {
-            return Err(super::scope_state_conflict(
-                "cleanup-only scoped executor cannot reserve or activate containers",
-            ));
-        }
+        self.validate_scoped_batch_inputs(spec, actions)?;
         if self.scoped_authority.is_some() {
             let (session_id, operation_id, first_action_index) = batch.ok_or_else(|| {
                 StackError::InvalidSpec(
                     "scoped executor requires persisted operation identity".to_string(),
                 )
             })?;
-            if !self.scoped_cleanup_only {
-                // Validate and durably stage every external input before any volume,
-                // sandbox, network, journal, or runtime mutation.
-                self.prepare_scoped_batch_manifest(
-                    spec,
-                    actions,
+            let claims = claims.ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "scoped executor requires exact admitted action claims".to_string(),
+                )
+            })?;
+            if claims.len() != actions.len() {
+                return Err(super::scope_state_conflict(
+                    "scoped action and claim counts are not bijective",
+                ));
+            }
+            for (relative_index, (action, claim)) in actions.iter().zip(claims).enumerate() {
+                let absolute_index =
+                    first_action_index
+                        .checked_add(relative_index)
+                        .ok_or_else(|| {
+                            StackError::InvalidSpec("absolute action index overflow".to_string())
+                        })?;
+                self.store.validate_reconcile_action_claim(
+                    claim,
                     session_id,
                     operation_id,
-                    first_action_index,
+                    absolute_index,
+                    action,
                 )?;
             }
+            self.require_scoped_batch_manifest(
+                spec,
+                actions,
+                session_id,
+                operation_id,
+                first_action_index,
+            )?;
+            let failures = self.preflight_claimed_predecessors(spec, actions, claims);
+            if !failures.is_empty() {
+                return claimed_preflight_failure_result(actions, first_action_index, &failures);
+            }
         }
-        // Ensure named volume directories exist before creating containers.
-        let created_volumes = if self.scoped_cleanup_only {
+        let has_creates = actions.iter().any(|action| {
+            matches!(
+                action,
+                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+            )
+        });
+        // Ensure named volume directories exist only for a batch that can
+        // actually reserve a successor. Remove-only batches never create.
+        let created_volumes = if self.scoped_cleanup_only || !has_creates {
             Vec::new()
         } else {
             self.volumes.ensure_volumes(&spec.volumes)?
@@ -281,13 +1078,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         // Boot shared VM and set up networking if there are create actions
         // and no shared VM is running yet.
         let mut all_skipped_mounts: Vec<crate::volume::SkippedMount> = Vec::new();
-        let has_creates = actions.iter().any(|a| {
-            matches!(
-                a,
-                Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
-            )
-        });
-
         if has_creates && !self.runtime.has_sandbox(&spec.name) {
             // ── Compute per-network subnets ─────────────────────────────
             //
@@ -581,8 +1371,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             self.service_ips = service_primary_ip;
             self.service_network_ips = service_network_ips;
 
-            // Persist allocator state after VM boot + network setup.
-            self.persist_allocator_state(&spec.name)?;
+            // Legacy execution persists the whole snapshot. Scoped execution
+            // persists each exact target atomically with its claimed successor.
+            if self.scoped_authority.is_none() {
+                self.persist_allocator_state(&spec.name)?;
+            }
         }
 
         let service_map: HashMap<&str, &ServiceSpec> =
@@ -594,9 +1387,15 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     "scoped executor lost its validated operation identity".to_string(),
                 )
             })?;
+            let claims = claims.ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "scoped executor lost its admitted action claims".to_string(),
+                )
+            })?;
             return self.execute_scoped_actions(
                 spec,
                 actions,
+                claims,
                 &service_map,
                 (session_id, operation_id, first_action_index),
                 all_skipped_mounts,

@@ -3139,6 +3139,17 @@ async fn apply_stack_dry_run_multiservice_round_trip() {
 
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
     let wire_scope = seed_stack_topology(daemon.as_ref(), "stack-multi");
+    let workload_scope =
+        vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope).unwrap();
+    daemon
+        .with_state_store(|store| {
+            store.reserve_stack_workload_owner(&workload_scope, current_unix_secs())
+        })
+        .expect("reserve stable dry-run workload owner");
+    let workload_owner = daemon
+        .with_state_store(|store| store.load_stack_workload_owner("stack-multi"))
+        .expect("load stable dry-run workload owner")
+        .expect("stable dry-run workload owner");
     let stack_dir = config.runtime_data_dir.join("stacks").join("stack-multi");
     assert!(!stack_dir.exists());
     std::fs::create_dir_all(&config.runtime_data_dir).expect("create runtime data directory");
@@ -3298,7 +3309,10 @@ services:
     );
     daemon
         .with_state_store(|store| {
-            assert!(store.load_stack_workload_owner("stack-multi")?.is_none());
+            assert_eq!(
+                store.load_stack_workload_owner("stack-multi")?,
+                Some(workload_owner.clone())
+            );
             assert!(store.load_desired_state("stack-multi")?.is_none());
             assert!(store.load_observed_state("stack-multi")?.is_empty());
             assert!(store.load_events("stack-multi")?.is_empty());
@@ -3320,7 +3334,7 @@ services:
     assert!(result.is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
@@ -3331,19 +3345,17 @@ async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
     let stack_name = "stack-dry-teardown";
     let compose_yaml = "services:\n  web:\n    image: nginx:latest\n";
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    daemon
+        .manager()
+        .backend()
+        .enable_exact_generation_lifecycle();
     let wire_scope = seed_stack_topology(daemon.as_ref(), stack_name);
     let scope = vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope).unwrap();
-    let spec = vz_stack::parse_compose(compose_yaml, stack_name).unwrap();
-    let event_count_before = daemon
-        .with_state_store(|store| {
-            store.reserve_stack_workload_owner(&scope, 1)?;
-            vz_stack::apply(&spec, store, &HashMap::new())?;
-            Ok(store.load_events(stack_name)?.len())
-        })
+    daemon
+        .with_state_store(|store| store.reserve_stack_workload_owner(&scope, 1))
         .unwrap();
     let stack_dir = config.runtime_data_dir.join("stacks").join(stack_name);
     assert!(!stack_dir.exists());
-    std::fs::create_dir_all(&config.runtime_data_dir).expect("create runtime data directory");
 
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_task = shutdown.clone();
@@ -3358,6 +3370,33 @@ async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
     wait_for_socket(&config.socket_path).await;
 
     let mut stack_client = connect_stack_client(&config.socket_path).await;
+    let seeded = read_apply_stack_completion_response(
+        stack_client
+            .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-seed-stack-dry-teardown".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                compose_yaml: compose_yaml.to_string(),
+                compose_dir: ".".to_string(),
+                detach: true,
+                dry_run: false,
+                scope: Some(wire_scope.clone()),
+            }))
+            .await
+            .expect("seed exact running stack"),
+    )
+    .await;
+    assert_eq!(seeded.changed_actions, 1);
+    assert_eq!(seeded.services_ready, 1);
+    let event_count_before = daemon
+        .with_state_store(|store| Ok(store.load_events(stack_name)?.len()))
+        .unwrap();
+    let volume_marker = stack_dir.join("volumes").join("data").join("marker");
+    std::fs::create_dir_all(volume_marker.parent().unwrap()).expect("create test volume");
+    std::fs::write(&volume_marker, b"preserve").expect("write test volume marker");
     let response = read_teardown_stack_completion_response(
         stack_client
             .teardown_stack(Request::new(runtime_v2::TeardownStackRequest {
@@ -3379,8 +3418,8 @@ async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
     assert_eq!(response.changed_actions, 1);
     assert_eq!(response.removed_volumes, 0);
     assert!(
-        !stack_dir.exists(),
-        "dry-run must not create a stack directory"
+        volume_marker.exists(),
+        "dry-run must preserve the existing stack filesystem and volumes"
     );
     daemon
         .with_state_store(|store| {
@@ -3390,7 +3429,7 @@ async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
             assert_eq!(desired.services.len(), 1);
             let observed = store.load_observed_state(stack_name)?;
             assert_eq!(observed.len(), 1);
-            assert_eq!(observed[0].phase, vz_stack::ServicePhase::Pending);
+            assert_eq!(observed[0].phase, vz_stack::ServicePhase::Running);
             assert_eq!(store.load_events(stack_name)?.len(), event_count_before);
             assert!(
                 !store
@@ -3411,7 +3450,7 @@ async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
     assert!(result.is_ok());
 }
 
-#[tokio::test]
+#[tokio::test(flavor = "multi_thread")]
 async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {
@@ -3421,7 +3460,11 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
     };
 
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
-    let wire_scope = seed_stack_topology(daemon.as_ref(), "stack-empty");
+    daemon
+        .manager()
+        .backend()
+        .enable_exact_generation_lifecycle();
+    let wire_scope = seed_stack_topology(daemon.as_ref(), "stack-receipts");
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_task = shutdown.clone();
     let daemon_task = daemon.clone();
@@ -3437,8 +3480,8 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
     wait_for_socket(&config.socket_path).await;
 
     let mut stack_client = connect_stack_client(&config.socket_path).await;
-    let stack_name = "stack-empty".to_string();
-    let compose_yaml = "services: {}\n".to_string();
+    let stack_name = "stack-receipts".to_string();
+    let compose_yaml = "services:\n  web:\n    image: nginx:latest\n".to_string();
 
     let applied = stack_client
         .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
@@ -3450,7 +3493,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
             stack_name: stack_name.clone(),
             compose_yaml,
             compose_dir: ".".to_string(),
-            detach: false,
+            detach: true,
             dry_run: false,
             scope: Some(wire_scope.clone()),
         }))
@@ -3458,6 +3501,8 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
         .expect("apply stack");
     assert!(applied.metadata().get("x-receipt-id").is_some());
     let applied = read_apply_stack_completion_response(applied).await;
+    assert_eq!(applied.changed_actions, 1);
+    assert_eq!(applied.services_ready, 1);
 
     let torn_down = stack_client
         .teardown_stack(Request::new(runtime_v2::TeardownStackRequest {
@@ -3475,6 +3520,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
         .expect("teardown stack");
     assert!(torn_down.metadata().get("x-receipt-id").is_some());
     let torn_down = read_teardown_stack_completion_response(torn_down).await;
+    assert_eq!(torn_down.changed_actions, 1);
 
     let stack_receipts = daemon
         .with_state_store(|store| store.list_receipts_for_entity("stack", &stack_name))
@@ -4197,7 +4243,8 @@ services:
             store.save_observed_state(
                 "tty-stack",
                 &vz_stack::ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first("web").unwrap(),
+                    applied_config_digest: None,
                     phase: vz_stack::ServicePhase::Running,
                     container_id: Some("ctr-tty-web".to_string()),
                     failed_create_ownership: None,
@@ -4277,7 +4324,8 @@ services:
             store.save_observed_state(
                 "tty-false-stack",
                 &vz_stack::ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first("web").unwrap(),
+                    applied_config_digest: None,
                     phase: vz_stack::ServicePhase::Running,
                     container_id: Some("ctr-tty-false-web".to_string()),
                     failed_create_ownership: None,
@@ -4358,7 +4406,8 @@ services:
             store.save_observed_state(
                 "stdin-stack",
                 &vz_stack::ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first("web").unwrap(),
+                    applied_config_digest: None,
                     phase: vz_stack::ServicePhase::Running,
                     container_id: Some("ctr-stdin-web".to_string()),
                     failed_create_ownership: None,
@@ -4438,7 +4487,8 @@ services:
             store.save_observed_state(
                 "tty-stack",
                 &vz_stack::ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first("web").unwrap(),
+                    applied_config_digest: None,
                     phase: vz_stack::ServicePhase::Running,
                     container_id: Some("ctr-tty-web".to_string()),
                     failed_create_ownership: None,

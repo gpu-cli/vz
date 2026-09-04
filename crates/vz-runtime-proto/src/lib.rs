@@ -426,9 +426,41 @@ mod tests {
                     ("scope", 5),
                 ],
             ),
+            (
+                "StackServiceStatus",
+                &[
+                    ("service_name", 1),
+                    ("phase", 2),
+                    ("ready", 3),
+                    ("container_id", 4),
+                    ("last_error", 5),
+                    ("replica_index", 6),
+                ],
+            ),
         ] {
             assert_proto_fields(proto, message, fields);
         }
+    }
+
+    #[test]
+    fn runtime_v2_stack_service_status_replica_round_trip_and_zero_default() {
+        use crate::runtime_v2::StackServiceStatus;
+
+        assert_eq!(StackServiceStatus::default().replica_index, 0);
+        let status = StackServiceStatus {
+            service_name: "web".to_string(),
+            replica_index: 2,
+            phase: "running".to_string(),
+            ready: true,
+            container_id: "ctr-web-2".to_string(),
+            last_error: String::new(),
+        };
+
+        let encoded = status.encode_to_vec();
+        let decoded = StackServiceStatus::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded, status);
+        assert_eq!(decoded.service_name, "web");
+        assert_eq!(decoded.replica_index, 2);
     }
 
     #[test]

@@ -17,6 +17,8 @@ pub struct MockContainerRuntime {
     pub fail_pull: bool,
     /// Whether create should fail.
     pub fail_create: bool,
+    /// Whether shared sandbox creation should fail before any container activation.
+    pub fail_sandbox_create: bool,
     /// Whether a failed create was admitted and owns a durable generation.
     pub claim_failed_create_ownership: bool,
     /// Whether a claimed failed-create proof should emulate legacy unscoped data.
@@ -62,6 +64,8 @@ pub struct MockContainerRuntime {
     pub fail_scoped_activation: bool,
     /// Exact runtime IDs whose scoped activation should fail.
     pub fail_scoped_activation_ids: Mutex<HashSet<String>>,
+    /// Return a deliberately foreign cleanup proof from failed scoped activation.
+    pub foreign_scoped_activation_cleanup: bool,
     /// Force reservation inspection to report a foreign owner.
     pub force_foreign_scoped_inspection: bool,
     /// Durable scoped generations, keyed by requested container ID.
@@ -82,6 +86,7 @@ impl MockContainerRuntime {
             container_ids: vec!["ctr-001".to_string()],
             fail_pull: false,
             fail_create: false,
+            fail_sandbox_create: false,
             claim_failed_create_ownership: false,
             omit_failed_create_ownership_scope: false,
             omit_successful_create_ownership: false,
@@ -104,6 +109,7 @@ impl MockContainerRuntime {
             mock_log_lines: Mutex::new(Vec::new()),
             fail_scoped_activation: false,
             fail_scoped_activation_ids: Mutex::new(HashSet::new()),
+            foreign_scoped_activation_cleanup: false,
             force_foreign_scoped_inspection: false,
             scoped_generations: Mutex::new(HashMap::new()),
             next_scoped_generation: AtomicU64::new(1),
@@ -299,6 +305,11 @@ impl ContainerRuntime for MockContainerRuntime {
                     .join(",")
             ),
         ));
+        if self.fail_sandbox_create {
+            return Err(StackError::Network(
+                "mock sandbox creation failure".to_string(),
+            ));
+        }
         self.sandboxes
             .lock()
             .unwrap()
@@ -496,9 +507,13 @@ impl ContainerRuntime for MockContainerRuntime {
                 .unwrap()
                 .contains(&ownership.container_id)
         {
+            let mut cleanup = ownership.clone();
+            if self.foreign_scoped_activation_cleanup {
+                cleanup.generation = cleanup.generation.saturating_add(1);
+            }
             return Err(vz_runtime_contract::OwnedCreateError {
                 error: StackError::InvalidSpec("mock scoped activation failure".to_string()),
-                cleanup: Some(ownership),
+                cleanup: Some(cleanup),
             });
         }
         generations

@@ -19,7 +19,10 @@ use crate::events::StackEvent;
 use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
 use crate::spec::{SecretDef, SecretSource, ServiceSpec, StackSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
+use crate::state_store::{
+    ReconcileActionClaim, ReconcileSession, ReconcileSessionStatus, ServiceObservedState,
+    ServicePhase, ServiceReplicaKey, StateStore,
+};
 use crate::volume::VolumeManager;
 
 fn scope_state_conflict(message: impl Into<String>) -> StackError {
@@ -27,6 +30,33 @@ fn scope_state_conflict(message: impl Into<String>) -> StackError {
         code: vz_runtime_contract::MachineErrorCode::StateConflict,
         message: message.into(),
     }
+}
+
+pub(crate) fn is_claimed_teardown_operation(operation_id: &str) -> bool {
+    operation_id.starts_with(crate::state_store::CLAIMED_TEARDOWN_OPERATION_PREFIX)
+}
+
+fn claimed_teardown_operation_id(operation_id: &str) -> Result<String, StackError> {
+    if operation_id.trim().is_empty() || is_claimed_teardown_operation(operation_id) {
+        return Err(StackError::InvalidSpec(
+            "teardown operation identity must be non-empty and caller-unqualified".to_string(),
+        ));
+    }
+    Ok(format!(
+        "{}{operation_id}",
+        crate::state_store::CLAIMED_TEARDOWN_OPERATION_PREFIX
+    ))
+}
+
+/// Match a durable teardown-finalizing operation to its caller-visible identity.
+///
+/// This preserves the reserved durable namespace without exposing its raw prefix.
+pub fn matches_claimed_teardown_operation(
+    durable_operation_id: &str,
+    caller_operation_id: &str,
+) -> bool {
+    claimed_teardown_operation_id(caller_operation_id)
+        .is_ok_and(|expected| expected == durable_operation_id)
 }
 
 fn load_secret_source_bytes(secret_def: &SecretDef) -> Result<Vec<u8>, StackError> {
@@ -339,6 +369,7 @@ pub type LogStream = std::sync::mpsc::Receiver<LogLine>;
 ///
 /// Ensures no two services bind to the same host port and supports
 /// explicit host-port publishing only.
+#[derive(Clone)]
 pub struct PortTracker {
     /// Allocated ports keyed by exact logical replica identity.
     allocated: HashMap<ServiceReplicaKey, Vec<PublishedPort>>,
@@ -413,6 +444,21 @@ impl PortTracker {
         self.allocated.remove(target);
     }
 
+    fn restore_replica_allocation(
+        &mut self,
+        target: &ServiceReplicaKey,
+        previous: Option<Vec<PublishedPort>>,
+    ) {
+        match previous {
+            Some(ports) => {
+                self.allocated.insert(target.clone(), ports);
+            }
+            None => {
+                self.allocated.remove(target);
+            }
+        }
+    }
+
     /// Snapshot of all allocated ports (for persistence).
     pub fn allocated_snapshot(&self) -> &HashMap<ServiceReplicaKey, Vec<PublishedPort>> {
         &self.allocated
@@ -485,7 +531,6 @@ pub struct StackExecutor<R: ContainerRuntime> {
 #[derive(Debug, Clone)]
 struct ScopedExecutionAuthority {
     scope: vz_runtime_contract::MachineWorkloadScope,
-    environment_generation: u64,
     definition_digest: String,
 }
 
@@ -559,6 +604,38 @@ pub struct ExecutionResult {
     pub outcomes: Vec<IndexedActionOutcome>,
     /// Bind mounts that were skipped during validation.
     pub skipped_mounts: Vec<crate::volume::SkippedMount>,
+}
+
+/// Opaque, uncommitted exact teardown result.
+///
+/// The owner may finish stack-wide teardown while the reconcile claims remain
+/// active, then consume this token with
+/// [`StackExecutor::commit_claimed_teardown_batch`].
+#[must_use = "an admitted teardown must be committed only after broad teardown succeeds"]
+pub struct PendingClaimedTeardown {
+    stack_name: String,
+    spec: StackSpec,
+    session_id: String,
+    operation_id: String,
+    first_action_index: usize,
+    actions: Vec<Action>,
+    claims: Vec<ReconcileActionClaim>,
+    result: ExecutionResult,
+}
+
+/// Result of executing the exact remove phase of a claimed teardown.
+pub enum ClaimedTeardownAdmission {
+    /// Every remove succeeded; broad teardown may run while this token keeps claims active.
+    Ready(Box<PendingClaimedTeardown>),
+    /// At least one remove failed and the failed outcomes were already committed.
+    Failed(ExecutionResult),
+}
+
+impl PendingClaimedTeardown {
+    /// Inspect exact remove outcomes before deciding whether broad teardown is safe.
+    pub fn execution_result(&self) -> &ExecutionResult {
+        &self.result
+    }
 }
 
 impl ExecutionResult {
@@ -690,7 +767,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
         let authority = ScopedExecutionAuthority {
             scope,
-            environment_generation: environment.lifecycle_generation,
             definition_digest: environment.definition_digest.clone(),
         };
         let mut executor = Self::new(runtime, store, data_dir);
@@ -755,7 +831,6 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
         let authority = ScopedExecutionAuthority {
             scope,
-            environment_generation: environment.lifecycle_generation,
             definition_digest: environment.definition_digest.clone(),
         };
         let mut executor = Self::new(runtime, store, data_dir);
