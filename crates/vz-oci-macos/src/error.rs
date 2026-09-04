@@ -53,6 +53,15 @@ pub enum MacosOciError {
         reason: String,
     },
 
+    /// The backend cannot perform the requested operation without degrading its semantics.
+    #[error("unsupported operation `{operation}`: {reason}")]
+    UnsupportedOperation {
+        /// Stable operation name from the runtime contract.
+        operation: String,
+        /// Actionable reason the operation is unsupported.
+        reason: String,
+    },
+
     /// The selected execution strategy is not yet implemented.
     #[error("execution mode '{mode}' is not yet supported")]
     UnsupportedExecutionMode {

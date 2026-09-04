@@ -9,6 +9,8 @@ use super::networking::{
 use super::resolve::{current_unix_secs, resolve_container_lifecycle, resolve_run_config};
 use super::*;
 
+pub(super) const SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
+
 /// Owned proof that one stack's complete guest activation transaction is
 /// serialized. The first overlay mutation requires this value, and its drop
 /// scope extends through OCI activation and post-start validation.
@@ -1844,79 +1846,40 @@ impl Runtime {
         self.stack_vms.lock().await.contains_key(stack_id)
     }
 
-    /// Save a shared stack VM snapshot to disk.
+    /// Reject raw shared-VM state snapshots.
     ///
-    /// The VM is paused, state is saved, then the VM is resumed and the guest
-    /// agent is revalidated before returning.
+    /// A shared VM depends on external VirtioFS and device state that a VZ
+    /// machine-state file does not capture atomically. Treating that file as a
+    /// full checkpoint would therefore violate the runtime contract.
     pub async fn save_shared_vm_snapshot(
         &self,
-        stack_id: &str,
-        state_path: impl AsRef<Path>,
+        _stack_id: &str,
+        _state_path: impl AsRef<Path>,
     ) -> Result<(), OciError> {
-        let _stack_lifecycle_guard = self
-            .stack_lifecycle_lock(stack_id)
-            .await
-            .write_owned()
-            .await;
-        self.ensure_stack_not_tearing_down(stack_id, "save a shared VM snapshot for")
-            .await?;
-        let vm = self
-            .stack_vms
-            .lock()
-            .await
-            .get(stack_id)
-            .cloned()
-            .ok_or_else(|| {
-                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
-            })?;
-
-        let state_path = state_path.as_ref();
-        if let Some(parent) = state_path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-
-        vm.save_state_snapshot(state_path).await?;
-        vm.wait_for_agent(self.config.agent_ready_timeout).await?;
-        Ok(())
+        Err(OciError::UnsupportedOperation {
+            operation: vz_runtime_contract::RuntimeOperation::CreateCheckpoint
+                .as_str()
+                .to_string(),
+            reason: SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON.to_string(),
+        })
     }
 
-    /// Restore a shared stack VM from a saved snapshot file.
+    /// Reject restore from a raw shared-VM state snapshot.
     ///
-    /// Existing shared VM instance is stopped, restored from `state_path`, then
-    /// resumed and reconnected to the guest agent.
+    /// This remains fail-closed even if the canonical capability matrix changes:
+    /// this primitive has no coordinated snapshot of external VirtioFS/device
+    /// state and cannot implement a full checkpoint by itself.
     pub async fn restore_shared_vm_snapshot(
         &self,
-        stack_id: &str,
-        state_path: impl AsRef<Path>,
+        _stack_id: &str,
+        _state_path: impl AsRef<Path>,
     ) -> Result<(), OciError> {
-        let _stack_lifecycle_guard = self
-            .stack_lifecycle_lock(stack_id)
-            .await
-            .write_owned()
-            .await;
-        self.ensure_stack_not_tearing_down(stack_id, "restore a shared VM snapshot for")
-            .await?;
-        let vm = self
-            .stack_vms
-            .lock()
-            .await
-            .get(stack_id)
-            .cloned()
-            .ok_or_else(|| {
-                OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
-            })?;
-
-        let state_path = state_path.as_ref();
-        if !state_path.exists() {
-            return Err(OciError::InvalidConfig(format!(
-                "shared VM snapshot path does not exist: {}",
-                state_path.display()
-            )));
-        }
-
-        vm.restore_state_snapshot(state_path, self.config.agent_ready_timeout)
-            .await?;
-        Ok(())
+        Err(OciError::UnsupportedOperation {
+            operation: vz_runtime_contract::RuntimeOperation::RestoreCheckpoint
+                .as_str()
+                .to_string(),
+            reason: SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON.to_string(),
+        })
     }
 
     /// Execute a raw command in the shared VM (not through the OCI runtime).

@@ -501,6 +501,9 @@ impl StateStorePragmas {
 }
 
 impl StateStore {
+    /// Current durable schema version produced and accepted by this state-store implementation.
+    pub const CURRENT_SCHEMA_VERSION: u32 = topology::STORE_SCHEMA_VERSION;
+
     /// Open or create a state store at the given path.
     pub fn open(path: &Path) -> Result<Self, StackError> {
         Self::open_with_pragmas(path, StateStorePragmas::default())

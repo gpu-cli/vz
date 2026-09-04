@@ -14,7 +14,7 @@
 #![cfg(target_os = "macos")]
 #![allow(clippy::unwrap_used)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use sha2::{Digest, Sha256};
 use vz_oci_macos::{
-    MacosRuntimeBackend, Runtime, RuntimeConfig, RuntimeLifecycleAdmissionKind,
+    MacosOciError, MacosRuntimeBackend, Runtime, RuntimeConfig, RuntimeLifecycleAdmissionKind,
     RuntimeLifecycleDiagnostics,
 };
 use vz_runtime_contract::{
@@ -44,6 +44,8 @@ use vz_stack::{
     StackEvent, StackExecutor, StackOrchestrator, StateStore, apply, parse_compose,
     parse_compose_with_dir,
 };
+
+const EXPECTED_VM_FULL_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
 
 fn has_virtualization_entitlement() -> bool {
     let Ok(test_binary) = std::env::current_exe() else {
@@ -153,15 +155,13 @@ impl OciContainerRuntime {
         &self,
         stack_id: &str,
         snapshot_path: &Path,
-    ) -> Result<(), StackError> {
+    ) -> Result<(), MacosOciError> {
         tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.backend
-                        .inner()
-                        .save_shared_vm_snapshot(stack_id, snapshot_path),
-                )
-                .map_err(|e| StackError::Network(format!("save_shared_vm_snapshot failed: {e}")))
+            self.handle.block_on(
+                self.backend
+                    .inner()
+                    .save_shared_vm_snapshot(stack_id, snapshot_path),
+            )
         })
     }
 
@@ -169,15 +169,27 @@ impl OciContainerRuntime {
         &self,
         stack_id: &str,
         snapshot_path: &Path,
-    ) -> Result<(), StackError> {
+    ) -> Result<(), MacosOciError> {
         tokio::task::block_in_place(|| {
-            self.handle
-                .block_on(
-                    self.backend
-                        .inner()
-                        .restore_shared_vm_snapshot(stack_id, snapshot_path),
-                )
-                .map_err(|e| StackError::Network(format!("restore_shared_vm_snapshot failed: {e}")))
+            self.handle.block_on(
+                self.backend
+                    .inner()
+                    .restore_shared_vm_snapshot(stack_id, snapshot_path),
+            )
+        })
+    }
+
+    fn try_stack_guest_generation_evidence(
+        &self,
+        stack_id: &str,
+        container_id: &str,
+    ) -> Result<serde_json::Value, String> {
+        tokio::task::block_in_place(|| {
+            self.handle.block_on(try_stack_guest_generation_evidence(
+                self.backend.inner(),
+                stack_id,
+                container_id,
+            ))
         })
     }
 
@@ -203,24 +215,34 @@ impl OciContainerRuntime {
     }
 
     fn lifecycle_diagnostics(&self) -> RuntimeLifecycleDiagnostics {
+        self.try_lifecycle_diagnostics()
+            .expect("lifecycle diagnostics should be available")
+    }
+
+    fn try_lifecycle_diagnostics(&self) -> Result<RuntimeLifecycleDiagnostics, String> {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.inner().lifecycle_diagnostics())
-                .expect("lifecycle diagnostics should be available")
+                .map_err(|error| error.to_string())
         })
     }
 
     fn tracked_container_ids(&self) -> Vec<String> {
+        self.try_tracked_container_ids()
+            .expect("container metadata should be readable")
+    }
+
+    fn try_tracked_container_ids(&self) -> Result<Vec<String>, String> {
         let mut ids = self
             .backend
             .inner()
             .list_containers()
-            .expect("container metadata should be readable")
+            .map_err(|error| error.to_string())?
             .into_iter()
             .map(|container| container.id)
             .collect::<Vec<_>>();
         ids.sort();
-        ids
+        Ok(ids)
     }
 }
 
@@ -474,11 +496,11 @@ fn ownership_json(ownership: &ContainerGenerationOwnership) -> serde_json::Value
     })
 }
 
-async fn stack_guest_generation_evidence(
+async fn try_stack_guest_generation_evidence(
     runtime: &Runtime,
     stack_id: &str,
     container_id: &str,
-) -> serde_json::Value {
+) -> Result<serde_json::Value, String> {
     let script = format!(
         r#"state=$(/run/vz-oci/bin/youki --root /run/vz-oci/state state {container_id}) || exit 1
 pid=$(printf '%s\n' "$state" | sed -n 's/.*"pid"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)
@@ -501,18 +523,29 @@ printf '{{"owner":"%s","boot_id":"%s","guest_init_pid":%s,"start_time":"%s","cgr
             Duration::from_secs(15),
         )
         .await
-        .unwrap_or_else(|error| panic!("guest generation probe failed: {error}"));
-    assert_eq!(
-        output.exit_code, 0,
-        "guest generation probe failed: {}",
-        output.stderr
-    );
-    serde_json::from_str(output.stdout.trim()).unwrap_or_else(|error| {
-        panic!(
+        .map_err(|error| format!("guest generation probe failed: {error}"))?;
+    if output.exit_code != 0 {
+        return Err(format!(
+            "guest generation probe exited {}: stdout={:?}, stderr={:?}",
+            output.exit_code, output.stdout, output.stderr
+        ));
+    }
+    serde_json::from_str(output.stdout.trim()).map_err(|error| {
+        format!(
             "guest generation probe was not JSON: {error}; stdout={}",
             output.stdout
         )
     })
+}
+
+async fn stack_guest_generation_evidence(
+    runtime: &Runtime,
+    stack_id: &str,
+    container_id: &str,
+) -> serde_json::Value {
+    try_stack_guest_generation_evidence(runtime, stack_id, container_id)
+        .await
+        .unwrap_or_else(|error| panic!("guest generation probe failed: {error}"))
 }
 
 #[derive(Debug, Default)]
@@ -2311,15 +2344,426 @@ services:
     drop(rebound_listener);
 }
 
-/// Use-case scenario:
-/// - Run a realistic multi-service stack (`api + postgres + redis`)
-/// - Initialize state in the shared VM
-/// - Save shared VM snapshot
-/// - Mutate state after snapshot
-/// - Restore snapshot and verify VM state rewinds + stack still converges
+fn snapshot_stack_service_ids(
+    observed: &[vz_stack::ServiceObservedState],
+) -> Result<BTreeMap<String, String>, String> {
+    let mut ids = BTreeMap::new();
+    let mut failures = Vec::new();
+    for service_name in ["api", "cache", "db"] {
+        match observed
+            .iter()
+            .find(|entry| entry.service_name == service_name)
+            .and_then(|entry| entry.container_id.as_ref())
+        {
+            Some(container_id) => {
+                ids.insert(service_name.to_string(), container_id.clone());
+            }
+            None => failures.push(format!(
+                "service '{service_name}' has no observed container ID"
+            )),
+        }
+    }
+    if failures.is_empty() {
+        Ok(ids)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn probe_snapshot_stack_services_once(
+    runtime: &OciContainerRuntime,
+    service_ids: &BTreeMap<String, String>,
+    phase: &str,
+) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let probes = [
+        (
+            "db",
+            vec![
+                "pg_isready".to_string(),
+                "-U".to_string(),
+                "app".to_string(),
+            ],
+        ),
+        ("cache", vec!["redis-cli".to_string(), "ping".to_string()]),
+        (
+            "api",
+            vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                "printf vz-api-snapshot-probe".to_string(),
+            ],
+        ),
+    ];
+    let mut outcomes = BTreeMap::new();
+    let mut failures = Vec::new();
+
+    // Deliberately collect every result before deciding whether the phase
+    // passed. A broken service must not prevent the other two one-shot probes.
+    for (service_name, command) in probes {
+        let Some(container_id) = service_ids.get(service_name) else {
+            failures.push(format!("{phase}/{service_name}: missing container ID"));
+            continue;
+        };
+        match runtime.try_exec_with_output(container_id, command.clone()) {
+            Ok((exit_code, stdout, stderr)) => {
+                let semantic_output_ok = match service_name {
+                    "db" => stdout.contains("accepting connections"),
+                    "cache" => stdout.trim().eq_ignore_ascii_case("PONG"),
+                    "api" => stdout == "vz-api-snapshot-probe",
+                    _ => false,
+                };
+                outcomes.insert(
+                    service_name.to_string(),
+                    serde_json::json!({
+                        "container_id": container_id,
+                        "command": command,
+                        "exit_code": exit_code,
+                        "stdout": stdout,
+                        "stderr": stderr,
+                        "semantic_output_ok": semantic_output_ok,
+                    }),
+                );
+                if exit_code != 0 || !semantic_output_ok {
+                    failures.push(format!(
+                        "{phase}/{service_name}: exit={exit_code}, stdout={stdout:?}, stderr={stderr:?}"
+                    ));
+                }
+            }
+            Err(error) => {
+                outcomes.insert(
+                    service_name.to_string(),
+                    serde_json::json!({
+                        "container_id": container_id,
+                        "command": command,
+                        "error": error,
+                    }),
+                );
+                failures.push(format!("{phase}/{service_name}: {error}"));
+            }
+        }
+    }
+
+    if outcomes.len() != 3 {
+        failures.push(format!(
+            "{phase}: expected exactly three one-shot probes, recorded {}",
+            outcomes.len()
+        ));
+    }
+    if failures.is_empty() {
+        Ok(outcomes)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn snapshot_stack_guest_identities_once(
+    runtime: &OciContainerRuntime,
+    service_ids: &BTreeMap<String, String>,
+    phase: &str,
+) -> Result<BTreeMap<String, serde_json::Value>, String> {
+    let mut identities = BTreeMap::new();
+    let mut failures = Vec::new();
+    for (service_name, container_id) in service_ids {
+        match runtime.try_stack_guest_generation_evidence("snapshot-stack", container_id) {
+            Ok(identity) => {
+                identities.insert(service_name.clone(), identity);
+            }
+            Err(error) => failures.push(format!("{phase}/{service_name}: {error}")),
+        }
+    }
+    if identities.len() != 3 {
+        failures.push(format!(
+            "{phase}: expected three guest identities, recorded {}",
+            identities.len()
+        ));
+    }
+    if failures.is_empty() {
+        Ok(identities)
+    } else {
+        Err(failures.join("; "))
+    }
+}
+
+fn vm_full_unsupported_result(
+    result: Result<(), MacosOciError>,
+    expected_operation: &str,
+) -> Result<String, String> {
+    match result {
+        Err(MacosOciError::UnsupportedOperation { operation, reason }) => {
+            if operation != expected_operation {
+                return Err(format!(
+                    "expected unsupported operation '{expected_operation}', got '{operation}'"
+                ));
+            }
+            if reason != EXPECTED_VM_FULL_UNSUPPORTED_REASON {
+                return Err(format!(
+                    "unsupported '{operation}' reason changed: expected {EXPECTED_VM_FULL_UNSUPPORTED_REASON:?}, got {reason:?}"
+                ));
+            }
+            Ok(reason)
+        }
+        Err(error) => Err(format!(
+            "expected typed UnsupportedOperation for '{expected_operation}', got {error:?}"
+        )),
+        Ok(()) => Err(format!(
+            "unsupported VM-full operation '{expected_operation}' unexpectedly succeeded"
+        )),
+    }
+}
+
+fn cleanup_snapshot_stack(
+    orchestrator: &mut StackOrchestrator<OciContainerRuntime>,
+    baseline_tracked: &BTreeSet<String>,
+    captured_owned: &BTreeSet<String>,
+) -> Result<serde_json::Value, String> {
+    const STACK_ID: &str = "snapshot-stack";
+    let mut failures = Vec::new();
+    let mut exact_owned = captured_owned.clone();
+
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator
+            .executor()
+            .store()
+            .load_observed_state(STACK_ID)
+    })) {
+        Ok(Ok(observed)) => exact_owned.extend(
+            observed
+                .into_iter()
+                .filter_map(|service| service.container_id),
+        ),
+        Ok(Err(error)) => failures.push(format!("cleanup could not load observed state: {error}")),
+        Err(payload) => failures.push(format!(
+            "cleanup observed-state inspection panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator
+            .executor()
+            .runtime()
+            .try_tracked_container_ids()
+    })) {
+        Ok(Ok(tracked)) => exact_owned.extend(
+            tracked
+                .into_iter()
+                .filter(|container_id| !baseline_tracked.contains(container_id)),
+        ),
+        Ok(Err(error)) => failures.push(format!(
+            "cleanup could not inspect tracked containers: {error}"
+        )),
+        Err(payload) => failures.push(format!(
+            "cleanup tracked-container inspection panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+
+    let down_spec = vz_stack::StackSpec {
+        name: STACK_ID.to_string(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator.run(&down_spec, None)
+    })) {
+        Ok(Ok(result)) if result.converged && result.services_failed == 0 => {}
+        Ok(Ok(result)) => failures.push(format!(
+            "stack down did not converge cleanly: converged={}, failed={}",
+            result.converged, result.services_failed
+        )),
+        Ok(Err(error)) => failures.push(format!("stack down failed: {error}")),
+        Err(payload) => failures.push(format!(
+            "stack down panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+
+    // Always execute physical shutdown, even if logical stack-down failed.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator.executor().runtime().shutdown_sandbox(STACK_ID)
+    })) {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => failures.push(format!("shared VM shutdown failed: {error}")),
+        Err(payload) => failures.push(format!(
+            "shared VM shutdown panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+
+    // Successful VM shutdown publishes every member as stopped. Remove only
+    // the exact containers owned by this scenario if logical down left durable
+    // metadata/rootfs behind.
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator
+            .executor()
+            .runtime()
+            .try_tracked_container_ids()
+    })) {
+        Ok(Ok(tracked)) => {
+            let tracked = tracked.into_iter().collect::<BTreeSet<_>>();
+            for container_id in exact_owned.intersection(&tracked) {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    orchestrator.executor().runtime().remove(container_id)
+                })) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => failures.push(format!(
+                        "residual exact-owner removal failed for '{container_id}': {error}"
+                    )),
+                    Err(payload) => failures.push(format!(
+                        "residual exact-owner removal panicked for '{container_id}': {}",
+                        panic_payload_description(payload.as_ref())
+                    )),
+                }
+            }
+        }
+        Ok(Err(error)) => failures.push(format!(
+            "residual tracked-container inspection failed: {error}"
+        )),
+        Err(payload) => failures.push(format!(
+            "residual tracked-container inspection panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+
+    let mut final_tracked_evidence = None;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator
+            .executor()
+            .runtime()
+            .try_tracked_container_ids()
+    })) {
+        Ok(Ok(final_tracked)) => {
+            let final_tracked = final_tracked.into_iter().collect::<BTreeSet<_>>();
+            final_tracked_evidence = Some(final_tracked.clone());
+            if &final_tracked != baseline_tracked {
+                failures.push(format!(
+                    "tracked-container inventory did not return to baseline: baseline={baseline_tracked:?}, final={final_tracked:?}"
+                ));
+            }
+            let leaked_owned = exact_owned
+                .intersection(&final_tracked)
+                .cloned()
+                .collect::<Vec<_>>();
+            if !leaked_owned.is_empty() {
+                failures.push(format!("owned container metadata leaked: {leaked_owned:?}"));
+            }
+        }
+        Ok(Err(error)) => failures.push(format!(
+            "final tracked-container inspection failed: {error}"
+        )),
+        Err(payload) => failures.push(format!(
+            "final tracked-container inspection panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+
+    let mut final_lifecycle_evidence = None;
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator
+            .executor()
+            .runtime()
+            .try_lifecycle_diagnostics()
+    })) {
+        Ok(Ok(diagnostics)) => {
+            let relevant_counts = [
+                ("vm_handles", diagnostics.vm_handles),
+                ("stack_vms", diagnostics.stack_vms),
+                ("container_routes", diagnostics.container_routes),
+                ("stack_port_forwards", diagnostics.stack_port_forwards),
+                ("exec_bindings", diagnostics.exec_bindings),
+                ("active_lifecycles", diagnostics.active_lifecycles),
+                ("exec_sessions", diagnostics.exec_sessions),
+                ("setup_restore_entries", diagnostics.setup_restore_entries),
+                (
+                    "overlay_cleanup_pending",
+                    diagnostics.overlay_cleanup_pending,
+                ),
+                ("rootfs_directories", diagnostics.rootfs_directories),
+            ];
+            let nonzero = relevant_counts
+                .into_iter()
+                .filter(|(_, count)| *count != 0)
+                .collect::<Vec<_>>();
+            if !nonzero.is_empty() {
+                failures.push(format!("nonzero final lifecycle diagnostics: {nonzero:?}"));
+            }
+            let reserved_owned = diagnostics
+                .generations
+                .iter()
+                .filter(|generation| {
+                    exact_owned.contains(&generation.container_id) && generation.reserved
+                })
+                .map(|generation| generation.container_id.clone())
+                .collect::<Vec<_>>();
+            if !reserved_owned.is_empty() {
+                failures.push(format!(
+                    "owned lifecycle generations remain reserved: {reserved_owned:?}"
+                ));
+            }
+            final_lifecycle_evidence = Some(lifecycle_inventory(&diagnostics));
+        }
+        Ok(Err(error)) => failures.push(format!("final lifecycle diagnostics failed: {error}")),
+        Err(payload) => failures.push(format!(
+            "final lifecycle diagnostics panicked: {}",
+            panic_payload_description(payload.as_ref())
+        )),
+    }
+    let sandbox_active = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        orchestrator.executor().runtime().has_sandbox(STACK_ID)
+    })) {
+        Ok(active) => {
+            if active {
+                failures.push("shared VM remains active after cleanup".to_string());
+            }
+            Some(active)
+        }
+        Err(payload) => {
+            failures.push(format!(
+                "final sandbox inspection panicked: {}",
+                panic_payload_description(payload.as_ref())
+            ));
+            None
+        }
+    };
+
+    let evidence = serde_json::json!({
+        "stack_id": STACK_ID,
+        "exact_owned_container_ids": exact_owned,
+        "baseline_tracked_container_ids": baseline_tracked,
+        "final_tracked_container_ids": final_tracked_evidence,
+        "final_lifecycle": final_lifecycle_evidence,
+        "sandbox_active": sandbox_active,
+        "zero_inventory": failures.is_empty(),
+    });
+
+    if failures.is_empty() {
+        Ok(evidence)
+    } else {
+        Err(format!("{}; evidence={evidence}", failures.join("; ")))
+    }
+}
+
+fn panic_payload_description(payload: &(dyn std::any::Any + Send)) -> String {
+    payload
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| {
+            payload
+                .downcast_ref::<&str>()
+                .map(|value| (*value).to_string())
+        })
+        .unwrap_or_else(|| "non-string panic payload".to_string())
+}
+
+/// VM-full snapshots are not supported for MacosVz shared-stack VMs because
+/// their container root filesystems and volumes are external VirtioFS state.
+/// Prove both raw entry points fail closed without touching a live stack.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
-async fn complex_stack_snapshot_restore_rewinds_shared_vm_state() {
+#[allow(clippy::print_stderr)]
+async fn complex_stack_vm_full_snapshot_fails_closed_without_mutation() {
     if !require_virtualization_entitlement() {
         return;
     }
@@ -2371,9 +2815,18 @@ services:
 
     let spec = parse_compose(yaml, "snapshot-stack").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
+    let baseline_tracked = bridge
+        .try_tracked_container_ids()
+        .expect("pre-start container inventory should be readable")
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    assert!(
+        baseline_tracked.is_empty(),
+        "snapshot scenario requires an empty per-run OCI store: {baseline_tracked:?}"
+    );
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = StackExecutor::new(bridge.clone(), exec_store, tmp.path());
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -2381,185 +2834,313 @@ services:
         image_policy: ImagePolicy::AllowAll,
     };
     let mut orchestrator = StackOrchestrator::new(executor, reconcile_store, orch_config);
-    let result = orchestrator.run(&spec, None).unwrap();
-    assert!(
-        result.converged,
-        "stack should converge: ready={}, failed={}, rounds={}",
-        result.services_ready, result.services_failed, result.rounds
-    );
-    assert_eq!(result.services_ready, 3, "all services should be ready");
-
-    let observed = orchestrator
-        .executor()
-        .store()
-        .load_observed_state("snapshot-stack")
-        .unwrap();
-    for service_name in ["db", "cache", "api"] {
-        let service = observed
-            .iter()
-            .find(|entry| entry.service_name == service_name)
-            .unwrap_or_else(|| panic!("{service_name} should be in observed state"));
-        assert!(
-            service.container_id.is_some(),
-            "{service_name} should have a container id"
-        );
-    }
-
-    let marker_cmd = |runtime: &OciContainerRuntime, value: &str| -> Result<(), String> {
-        let (exit_code, _stdout, stderr) = runtime
-            .exec_in_shared_vm(
-                "snapshot-stack",
-                "/bin/sh",
-                vec![
-                    "-c".to_string(),
-                    format!("printf '%s' {value:?} > /tmp/vz-snapshot-marker"),
-                ],
-                Duration::from_secs(15),
-            )
-            .map_err(|err| err.to_string())?;
-        if exit_code != 0 {
-            return Err(format!("marker write failed: {stderr}"));
-        }
-        Ok(())
+    let _physical_cleanup = EnvironmentLifecyclePhysicalCleanup {
+        runtime: bridge,
+        backend_keys: vec!["snapshot-stack".to_string()],
+        disk_paths: vec![],
     };
-    let read_marker = |runtime: &OciContainerRuntime| -> Result<String, String> {
-        let (exit_code, stdout, stderr) = runtime
-            .exec_in_shared_vm(
-                "snapshot-stack",
-                "/bin/sh",
-                vec!["-c".to_string(), "cat /tmp/vz-snapshot-marker".to_string()],
-                Duration::from_secs(15),
-            )
-            .map_err(|err| err.to_string())?;
-        if exit_code != 0 {
-            return Err(format!("marker read failed: {stderr}"));
-        }
-        Ok(stdout.trim().to_string())
-    };
+    let mut captured_owned = BTreeSet::new();
+    let mut scenario_evidence = None;
 
-    marker_cmd(orchestrator.executor().runtime(), "before-snapshot").unwrap();
-    assert_eq!(
-        read_marker(orchestrator.executor().runtime()).unwrap(),
-        "before-snapshot"
-    );
-
-    orchestrator
-        .executor()
-        .runtime()
-        .save_shared_vm_snapshot("snapshot-stack", &snapshot_path)
-        .unwrap();
-
-    marker_cmd(orchestrator.executor().runtime(), "after-snapshot").unwrap();
-    assert_eq!(
-        read_marker(orchestrator.executor().runtime()).unwrap(),
-        "after-snapshot"
-    );
-
-    orchestrator
-        .executor()
-        .runtime()
-        .restore_shared_vm_snapshot("snapshot-stack", &snapshot_path)
-        .unwrap();
-
-    let mut restored_marker: Option<String> = None;
-    for attempt in 1..=20 {
-        match read_marker(orchestrator.executor().runtime()) {
-            Ok(value) => {
-                restored_marker = Some(value);
-                break;
+    let scenario_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+        || -> Result<(), String> {
+            let result = orchestrator
+                .run(&spec, None)
+                .map_err(|error| format!("stack startup failed: {error}"))?;
+            if !result.converged || result.services_ready != 3 || result.services_failed != 0 {
+                return Err(format!(
+                    "stack did not converge cleanly: converged={}, ready={}, failed={}, rounds={}",
+                    result.converged, result.services_ready, result.services_failed, result.rounds
+                ));
             }
-            Err(err) => {
-                eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
-                eprintln!("restore marker read attempt {attempt}/20 failed: {err}; retrying...");
-            }
-        }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    let restored_marker =
-        restored_marker.unwrap_or_else(|| panic!("marker did not become readable after restore"));
-    assert_eq!(
-        restored_marker, "before-snapshot",
-        "snapshot restore should rewind marker to pre-snapshot value"
-    );
 
-    let converge_after_restore = orchestrator.run(&spec, None).unwrap();
-    assert!(
-        converge_after_restore.converged,
-        "stack should converge after restore: ready={}, failed={}, rounds={}",
-        converge_after_restore.services_ready,
-        converge_after_restore.services_failed,
-        converge_after_restore.rounds
-    );
-    assert_eq!(
-        converge_after_restore.services_failed, 0,
-        "no services should fail after restore reconciliation"
-    );
+            let observed_before = orchestrator
+                .executor()
+                .store()
+                .load_observed_state("snapshot-stack")
+                .map_err(|error| format!("pre-call observed-state load failed: {error}"))?;
+            let service_ids_before = snapshot_stack_service_ids(&observed_before)?;
+            captured_owned.extend(service_ids_before.values().cloned());
 
-    let mut marker_check_after_reconcile: Option<String> = None;
-    for attempt in 1..=10 {
-        match read_marker(orchestrator.executor().runtime()) {
-            Ok(value) => {
-                marker_check_after_reconcile = Some(value);
-                break;
+            let mut failures = Vec::new();
+            let probes_before = match probe_snapshot_stack_services_once(
+                orchestrator.executor().runtime(),
+                &service_ids_before,
+                "before",
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            let guest_before = match snapshot_stack_guest_identities_once(
+                orchestrator.executor().runtime(),
+                &service_ids_before,
+                "before",
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            let tracked_before = match orchestrator
+                .executor()
+                .runtime()
+                .try_tracked_container_ids()
+            {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(format!(
+                        "pre-call tracked-container inspection failed: {error}"
+                    ));
+                    None
+                }
+            };
+            let lifecycle_before = match orchestrator
+                .executor()
+                .runtime()
+                .try_lifecycle_diagnostics()
+            {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(format!("pre-call lifecycle diagnostics failed: {error}"));
+                    None
+                }
+            };
+            let absent_before = !snapshot_path.exists();
+            if !absent_before {
+                failures.push(format!(
+                    "snapshot destination existed before unsupported calls: {}",
+                    snapshot_path.display()
+                ));
             }
-            Err(err) => {
-                eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
-                eprintln!(
-                    "post-reconcile marker read attempt {attempt}/10 failed: {err}; retrying..."
+
+            // Each raw VM-full operation is invoked exactly once. Validate both
+            // only after both calls so one malformed result cannot hide the other.
+            let save_result = vm_full_unsupported_result(
+                orchestrator
+                    .executor()
+                    .runtime()
+                    .save_shared_vm_snapshot("snapshot-stack", &snapshot_path),
+                "create_checkpoint",
+            );
+            let absent_after_save = !snapshot_path.exists();
+            let restore_result = vm_full_unsupported_result(
+                orchestrator
+                    .executor()
+                    .runtime()
+                    .restore_shared_vm_snapshot("snapshot-stack", &snapshot_path),
+                "restore_checkpoint",
+            );
+            let absent_after_restore = !snapshot_path.exists();
+            let save_reason = match save_result {
+                Ok(reason) => Some(reason),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            let restore_reason = match restore_result {
+                Ok(reason) => Some(reason),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            if !absent_after_save || !absent_after_restore {
+                failures.push(format!(
+                    "unsupported snapshot calls mutated destination existence: after_save={absent_after_save}, after_restore={absent_after_restore}"
+                ));
+            }
+
+            let observed_after = orchestrator
+                .executor()
+                .store()
+                .load_observed_state("snapshot-stack")
+                .map_err(|error| format!("post-call observed-state load failed: {error}"))?;
+            let service_ids_after = snapshot_stack_service_ids(&observed_after)?;
+            captured_owned.extend(service_ids_after.values().cloned());
+            if service_ids_after != service_ids_before {
+                failures.push(format!(
+                    "service/container identity changed across unsupported calls: before={service_ids_before:?}, after={service_ids_after:?}"
+                ));
+            }
+            let probes_after = match probe_snapshot_stack_services_once(
+                orchestrator.executor().runtime(),
+                &service_ids_after,
+                "after",
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            let guest_after = match snapshot_stack_guest_identities_once(
+                orchestrator.executor().runtime(),
+                &service_ids_after,
+                "after",
+            ) {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    failures.push(error);
+                    None
+                }
+            };
+            if let (Some(before), Some(after)) = (&guest_before, &guest_after)
+                && before != after
+            {
+                failures.push(format!(
+                    "guest boot/PID/start/cgroup/namespace/root identity changed: before={before:?}, after={after:?}"
+                ));
+            }
+
+            let tracked_after = match orchestrator
+                .executor()
+                .runtime()
+                .try_tracked_container_ids()
+            {
+                Ok(after)
+                    if tracked_before
+                        .as_ref()
+                        .is_some_and(|before| before == &after) =>
+                {
+                    Some(after)
+                }
+                Ok(after) => {
+                    failures.push(format!(
+                        "tracked-container IDs changed: before={tracked_before:?}, after={after:?}"
+                    ));
+                    Some(after)
+                }
+                Err(error) => {
+                    failures.push(format!(
+                        "post-call tracked-container inspection failed: {error}"
+                    ));
+                    None
+                }
+            };
+            let lifecycle_after = match orchestrator
+                .executor()
+                .runtime()
+                .try_lifecycle_diagnostics()
+            {
+                Ok(after)
+                    if lifecycle_before
+                        .as_ref()
+                        .is_some_and(|before| before == &after) =>
+                {
+                    Some(after)
+                }
+                Ok(after) => {
+                    failures.push(format!(
+                        "runtime lifecycle identity changed: before={lifecycle_before:?}, after={after:?}"
+                    ));
+                    Some(after)
+                }
+                Err(error) => {
+                    failures.push(format!("post-call lifecycle diagnostics failed: {error}"));
+                    None
+                }
+            };
+
+            scenario_evidence = Some(serde_json::json!({
+                "schema_version": 1,
+                "scenario": "complex_stack_vm_full_snapshot_fails_closed_without_mutation",
+                "stack_id": "snapshot-stack",
+                "service_container_ids": {
+                    "before": service_ids_before,
+                    "after": service_ids_after,
+                },
+                "service_probes": {
+                    "before": probes_before,
+                    "after": probes_after,
+                },
+                "guest_generation_identities": {
+                    "before": guest_before,
+                    "after": guest_after,
+                },
+                "runtime": {
+                    "tracked_container_ids_before": tracked_before,
+                    "tracked_container_ids_after": tracked_after,
+                    "lifecycle_before": lifecycle_before.as_ref().map(lifecycle_inventory),
+                    "lifecycle_after": lifecycle_after.as_ref().map(lifecycle_inventory),
+                },
+                "vm_full_operations": {
+                    "save": {
+                        "invocations": 1,
+                        "error_variant": "UnsupportedOperation",
+                        "operation": "create_checkpoint",
+                        "reason": save_reason,
+                    },
+                    "restore": {
+                        "invocations": 1,
+                        "error_variant": "UnsupportedOperation",
+                        "operation": "restore_checkpoint",
+                        "reason": restore_reason,
+                    },
+                },
+                "snapshot_destination": {
+                    "path": snapshot_path,
+                    "absent_before": absent_before,
+                    "absent_after_save": absent_after_save,
+                    "absent_after_restore": absent_after_restore,
+                },
+            }));
+
+            if failures.is_empty() {
+                Ok(())
+            } else {
+                Err(failures.join("; "))
+            }
+        },
+    ));
+
+    let cleanup_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        cleanup_snapshot_stack(&mut orchestrator, &baseline_tracked, &captured_owned)
+    }));
+
+    match (scenario_outcome, cleanup_outcome) {
+        (Ok(Ok(())), Ok(Ok(cleanup_evidence))) => {
+            let absent_after_cleanup = !snapshot_path.exists();
+            if !absent_after_cleanup {
+                panic!(
+                    "snapshot destination appeared during cleanup: {}",
+                    snapshot_path.display()
                 );
             }
+            let evidence = serde_json::json!({
+                "scenario": scenario_evidence,
+                "cleanup": cleanup_evidence,
+                "snapshot_destination_absent_after_cleanup": absent_after_cleanup,
+            });
+            match serde_json::to_string(&evidence) {
+                Ok(line) => eprintln!("VZ_STACK_VM_FULL_UNSUPPORTED_EVIDENCE:{line}"),
+                Err(error) => panic!("could not serialize snapshot scenario evidence: {error}"),
+            }
         }
-        tokio::time::sleep(Duration::from_secs(1)).await;
-    }
-    assert_eq!(
-        marker_check_after_reconcile
-            .unwrap_or_else(|| panic!("marker not readable after post-restore reconcile")),
-        "before-snapshot",
-        "marker should remain rewound after reconcile"
-    );
-
-    let mut services_ready_count: Option<usize> = None;
-    for attempt in 1..=10 {
-        let current = orchestrator
-            .executor()
-            .store()
-            .load_observed_state("snapshot-stack")
-            .unwrap();
-        let ready = current
-            .iter()
-            .filter(|service| service.container_id.is_some())
-            .count();
-        if ready >= 3 {
-            services_ready_count = Some(ready);
-            break;
+        (Ok(Err(error)), Ok(Ok(_))) => panic!("snapshot scenario failed: {error}"),
+        (Err(payload), Ok(Ok(_))) => std::panic::resume_unwind(payload),
+        (Ok(Ok(())), Ok(Err(cleanup))) => panic!("snapshot cleanup failed: {cleanup}"),
+        (Ok(Err(error)), Ok(Err(cleanup))) => {
+            panic!("snapshot scenario failed: {error}; cleanup also failed: {cleanup}")
         }
-        eprintln!("VZ_STACK_TEARDOWN_VIOLATION:TEST_RETRY");
-        eprintln!(
-            "post-restore observed-state attempt {attempt}/10 has ready={ready}; retrying..."
-        );
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        (Err(payload), Ok(Err(cleanup))) => panic!(
+            "snapshot scenario panicked: {}; cleanup also failed: {cleanup}",
+            panic_payload_description(payload.as_ref())
+        ),
+        (Ok(result), Err(payload)) => panic!(
+            "snapshot outcome was {result:?}; cleanup panicked: {}",
+            panic_payload_description(payload.as_ref())
+        ),
+        (Err(scenario), Err(cleanup)) => panic!(
+            "snapshot scenario panicked: {}; cleanup panicked: {}",
+            panic_payload_description(scenario.as_ref()),
+            panic_payload_description(cleanup.as_ref())
+        ),
     }
-    assert_eq!(
-        services_ready_count.unwrap_or(0),
-        3,
-        "all services should remain represented after restore"
-    );
-
-    let down_spec = vz_stack::StackSpec {
-        name: "snapshot-stack".to_string(),
-        services: vec![],
-        networks: vec![],
-        volumes: vec![],
-        secrets: vec![],
-        disk_size_mb: None,
-    };
-    let down = orchestrator.run(&down_spec, None).unwrap();
-    assert!(down.converged, "snapshot-stack teardown should converge");
-    orchestrator
-        .executor()
-        .runtime()
-        .shutdown_sandbox("snapshot-stack")
-        .expect("snapshot-stack shared VM shutdown should succeed");
 }
 
 /// Verify sandbox lifecycle: create_sandbox → services up → shutdown_sandbox.

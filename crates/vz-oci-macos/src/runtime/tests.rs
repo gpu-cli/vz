@@ -14,6 +14,8 @@ use super::stack_vm::{
 use super::*;
 use vz_linux::KernelVersion;
 
+const EXPECTED_SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
+
 fn unique_temp_dir(name: &str) -> PathBuf {
     let mut base = env::temp_dir();
     let nanos = SystemTime::now()
@@ -1131,33 +1133,7 @@ async fn shared_infra_retry_skips_completed_guest_cleanup_and_vm_stop() {
             .await
             .contains_key("shared-stack")
     );
-    let snapshot_path = unique_temp_dir("shared-infra-retry-snapshot").join("state.vz");
-    let restore_error = runtime
-        .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
-        .await
-        .unwrap_err();
-    assert!(
-        restore_error
-            .to_string()
-            .contains("teardown cleanup is pending")
-    );
-    let save_error = runtime
-        .save_shared_vm_snapshot("shared-stack", &snapshot_path)
-        .await
-        .unwrap_err();
-    assert!(
-        save_error
-            .to_string()
-            .contains("teardown cleanup is pending")
-    );
     runtime.clear_stack_vm_stop_complete("shared-stack");
-    assert!(
-        runtime
-            .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
-            .await
-            .is_err_and(|error| error.to_string().contains("teardown cleanup is pending")),
-        "completed generation-scoped guest cleanup independently blocks restore"
-    );
     runtime.mark_stack_vm_stop_complete("shared-stack");
 
     let mock = MockOciLifecycleOps::new(ExecOutput {
@@ -1222,45 +1198,56 @@ async fn shared_infra_retry_skips_completed_guest_cleanup_and_vm_stop() {
     assert!(handles.lock().await.is_empty());
     assert!(stack_vms.lock().await.is_empty());
     assert!(runtime.stack_port_forwards.lock().await.is_empty());
-    let post_cleanup_restore = runtime
-        .restore_shared_vm_snapshot("shared-stack", &snapshot_path)
-        .await
-        .unwrap_err();
-    assert!(
-        post_cleanup_restore
-            .to_string()
-            .contains("no shared VM running")
-    );
-    assert!(
-        !post_cleanup_restore
-            .to_string()
-            .contains("teardown cleanup is pending")
-    );
 }
 
 #[tokio::test]
-async fn snapshot_restore_waits_for_stack_lifecycle_writer() {
+async fn shared_vm_snapshots_fail_closed_without_waiting_or_mutating_paths() {
     let runtime = Runtime::new(RuntimeConfig {
         data_dir: unique_temp_dir("snapshot-stack-lifecycle-lock"),
         ..RuntimeConfig::default()
     });
     let stack_lock = runtime.stack_lifecycle_lock("locked-stack").await;
-    let guard = stack_lock.write_owned().await;
-    let restore_runtime = runtime.clone();
-    let restore = tokio::spawn(async move {
-        restore_runtime
-            .restore_shared_vm_snapshot("locked-stack", Path::new("unused-snapshot"))
-            .await
-    });
-    tokio::task::yield_now().await;
-    assert!(
-        !restore.is_finished(),
-        "restore must wait behind the active stack lifecycle writer"
-    );
+    let _guard = stack_lock.write_owned().await;
+    let snapshot_parent = unique_temp_dir("snapshot-fail-closed").join("must-not-exist");
+    let snapshot_path = snapshot_parent.join("state.vz");
 
-    drop(guard);
-    let error = restore.await.unwrap().unwrap_err();
-    assert!(error.to_string().contains("no shared VM running"));
+    for (expected_operation, result) in [
+        (
+            "create_checkpoint",
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                runtime.save_shared_vm_snapshot("locked-stack", &snapshot_path),
+            )
+            .await,
+        ),
+        (
+            "restore_checkpoint",
+            tokio::time::timeout(
+                Duration::from_millis(100),
+                runtime.restore_shared_vm_snapshot("locked-stack", &snapshot_path),
+            )
+            .await,
+        ),
+    ] {
+        let error = result
+            .expect("unsupported snapshot operation must not wait for lifecycle writer")
+            .unwrap_err();
+        match error {
+            OciError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, expected_operation);
+                assert_eq!(
+                    reason,
+                    EXPECTED_SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON
+                );
+            }
+            other => panic!("expected unsupported operation, got {other}"),
+        }
+    }
+
+    assert!(
+        !snapshot_parent.exists(),
+        "fail-closed snapshot operations must not create or inspect snapshot storage"
+    );
 }
 
 #[test]
@@ -2318,8 +2305,13 @@ fn ensure_checkpoint_class_supported_rejects_vm_full_without_capability() {
             vz_runtime_contract::RuntimeOperation::CreateCheckpoint,
         )
         .unwrap_err();
-    let message = err.to_string();
-    assert!(message.contains("vm_full_checkpoint"));
+    match err {
+        OciError::UnsupportedOperation { operation, reason } => {
+            assert_eq!(operation, "create_checkpoint");
+            assert_eq!(reason, "missing vm_full_checkpoint capability");
+        }
+        other => panic!("expected unsupported operation, got {other}"),
+    }
 }
 
 #[test]

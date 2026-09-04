@@ -244,10 +244,10 @@ scenario_test_filter() {
             echo "stack_container_generation_ownership"
             ;;
         stack-snapshot-restore)
-            echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            echo "complex_stack_vm_full_snapshot_fails_closed_without_mutation"
             ;;
         stack-user-journey-checkpoint)
-            echo "complex_stack_snapshot_restore_rewinds_shared_vm_state"
+            echo "complex_stack_vm_full_snapshot_fails_closed_without_mutation"
             ;;
         environment-lifecycle-journal-linux-vm)
             echo "environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_cross_environment_damage"
@@ -455,6 +455,8 @@ STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
 STACK_CONTAINER_OWNERSHIP_EVIDENCE="$RUN_DIR/stack-container-ownership.json"
 STACK_CONTAINER_OWNERSHIP_SHA256="$RUN_DIR/stack-container-ownership.json.sha256"
+VM_FULL_UNSUPPORTED_EVIDENCE="$RUN_DIR/stack-vm-full-unsupported.json"
+VM_FULL_UNSUPPORTED_SHA256="$RUN_DIR/stack-vm-full-unsupported.json.sha256"
 ENVIRONMENT_LIFECYCLE_EVIDENCE="$RUN_DIR/environment-lifecycle-journal-linux-vm.json"
 ENVIRONMENT_LIFECYCLE_SHA256="$RUN_DIR/environment-lifecycle-journal-linux-vm.json.sha256"
 EXEC_SUPERVISION_EVIDENCE="$RUN_DIR/runtime-exec-supervision.json"
@@ -1428,6 +1430,229 @@ validate_stack_teardown_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_vm_full_unsupported_evidence() {
+    local evidence_file="$1"
+    local expected_reason='vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically'
+
+    jq -e --arg expected_reason "$expected_reason" '
+        def exact_keys($expected): (keys | sort) == ($expected | sort);
+        def nonnegative_integer:
+            type == "number" and . >= 0 and . == floor;
+        def positive_integer:
+            type == "number" and . > 0 and . == floor;
+        def service_ids:
+            (type == "object") and
+            exact_keys(["api", "cache", "db"]) and
+            (all(.[]; type == "string" and length > 0)) and
+            (([.[]] | unique | length) == 3);
+        def guest_identity:
+            (type == "object") and
+            exact_keys([
+                "boot_id", "cgroup_identity", "cgroup_path", "guest_init_pid",
+                "ipc_identity", "mnt_identity", "net_identity", "owner",
+                "pid_identity", "root_identity", "start_time", "uts_identity"
+            ]) and
+            ((.owner | type) == "string") and
+            ((.boot_id | type) == "string" and length > 0) and
+            (.guest_init_pid | positive_integer) and
+            (all([
+                .start_time, .cgroup_path, .cgroup_identity, .mnt_identity,
+                .net_identity, .pid_identity, .ipc_identity, .uts_identity,
+                .root_identity
+            ][]; type == "string" and length > 0));
+        def lifecycle:
+            (type == "object") and
+            exact_keys([
+                "active_lifecycles", "container_lock_slots", "container_route_pairs",
+                "container_routes", "exec_bindings", "exec_sessions", "generations",
+                "overlay_cleanup_pending", "rootfs_directories", "setup_restore_entries",
+                "stack_lock_slots", "stack_port_forward_ids", "stack_port_forwards",
+                "stack_vm_ids", "stack_vms", "vm_handle_ids", "vm_handles"
+            ]) and
+            (all([
+                .active_lifecycles, .container_lock_slots, .container_routes,
+                .exec_bindings, .exec_sessions, .overlay_cleanup_pending,
+                .rootfs_directories, .setup_restore_entries, .stack_lock_slots,
+                .stack_port_forwards, .stack_vms, .vm_handles
+            ][]; nonnegative_integer)) and
+            ((.container_route_pairs | type) == "array") and
+            ((.stack_port_forward_ids | type) == "array") and
+            ((.stack_vm_ids | type) == "array") and
+            ((.vm_handle_ids | type) == "array") and
+            (.container_routes == (.container_route_pairs | length)) and
+            (.stack_port_forwards == (.stack_port_forward_ids | length)) and
+            (.stack_vms == (.stack_vm_ids | length)) and
+            (.vm_handles == (.vm_handle_ids | length)) and
+            (all(.generations[];
+                (type == "object") and
+                exact_keys(["container_id", "generation", "owner_alive", "owner_pid", "reserved"]) and
+                ((.container_id | type) == "string" and length > 0) and
+                (.generation | positive_integer) and
+                ((.owner_alive | type) == "boolean") and
+                (.owner_pid | nonnegative_integer) and
+                ((.reserved | type) == "boolean")
+            ));
+        def probe($service; $container_id):
+            (type == "object") and
+            exact_keys(["command", "container_id", "exit_code", "semantic_output_ok", "stderr", "stdout"]) and
+            (.container_id == $container_id) and
+            (.exit_code == 0) and
+            (.semantic_output_ok == true) and
+            (.stderr == "") and
+            (if $service == "api" then
+                .command == ["/bin/sh", "-c", "printf vz-api-snapshot-probe"] and
+                .stdout == "vz-api-snapshot-probe"
+             elif $service == "cache" then
+                .command == ["redis-cli", "ping"] and .stdout == "PONG\n"
+             else
+                .command == ["pg_isready", "-U", "app"] and
+                (.stdout | contains("accepting connections"))
+             end);
+        def unsupported_operation($operation):
+            (type == "object") and
+            exact_keys(["error_variant", "invocations", "operation", "reason"]) and
+            (.error_variant == "UnsupportedOperation") and
+            (.invocations == 1) and
+            (.operation == $operation) and
+            (.reason == $expected_reason);
+
+        .scenario.service_container_ids.before as $ids |
+        ([ $ids[] ] | sort) as $container_ids |
+        (type == "object") and
+        exact_keys(["cleanup", "scenario", "snapshot_destination_absent_after_cleanup"]) and
+        (.snapshot_destination_absent_after_cleanup == true) and
+
+        (.scenario | exact_keys([
+            "guest_generation_identities", "runtime", "scenario", "schema_version",
+            "service_container_ids", "service_probes", "snapshot_destination",
+            "stack_id", "vm_full_operations"
+        ])) and
+        (.scenario.schema_version == 1) and
+        (.scenario.scenario == "complex_stack_vm_full_snapshot_fails_closed_without_mutation") and
+        (.scenario.stack_id == "snapshot-stack") and
+        (.scenario.service_container_ids | exact_keys(["after", "before"])) and
+        (.scenario.service_container_ids.before | service_ids) and
+        (.scenario.service_container_ids.after == $ids) and
+
+        (.scenario.service_probes | exact_keys(["after", "before"])) and
+        (all([.scenario.service_probes.before, .scenario.service_probes.after][];
+            exact_keys(["api", "cache", "db"]))) and
+        (.scenario.service_probes.before.api | probe("api"; $ids.api)) and
+        (.scenario.service_probes.before.cache | probe("cache"; $ids.cache)) and
+        (.scenario.service_probes.before.db | probe("db"; $ids.db)) and
+        (.scenario.service_probes.after.api | probe("api"; $ids.api)) and
+        (.scenario.service_probes.after.cache | probe("cache"; $ids.cache)) and
+        (.scenario.service_probes.after.db | probe("db"; $ids.db)) and
+
+        (.scenario.guest_generation_identities | exact_keys(["after", "before"])) and
+        (all([.scenario.guest_generation_identities.before, .scenario.guest_generation_identities.after][];
+            exact_keys(["api", "cache", "db"]) and all(.[]; guest_identity))) and
+        (.scenario.guest_generation_identities.after == .scenario.guest_generation_identities.before) and
+        ([.scenario.guest_generation_identities.before[].boot_id] | unique | length) == 1 and
+        (.scenario.guest_generation_identities.before.api.cgroup_path | contains($ids.api)) and
+        (.scenario.guest_generation_identities.before.cache.cgroup_path | contains($ids.cache)) and
+        (.scenario.guest_generation_identities.before.db.cgroup_path | contains($ids.db)) and
+
+        (.scenario.runtime | exact_keys([
+            "lifecycle_after", "lifecycle_before", "tracked_container_ids_after",
+            "tracked_container_ids_before"
+        ])) and
+        ((.scenario.runtime.tracked_container_ids_before | sort) == $container_ids) and
+        (.scenario.runtime.tracked_container_ids_after == .scenario.runtime.tracked_container_ids_before) and
+        (.scenario.runtime.lifecycle_before | lifecycle) and
+        (.scenario.runtime.lifecycle_after == .scenario.runtime.lifecycle_before) and
+        (.scenario.runtime.lifecycle_before.active_lifecycles == 3) and
+        (.scenario.runtime.lifecycle_before.container_routes == 3) and
+        (.scenario.runtime.lifecycle_before.exec_bindings == 3) and
+        (.scenario.runtime.lifecycle_before.exec_sessions == 0) and
+        (.scenario.runtime.lifecycle_before.overlay_cleanup_pending == 0) and
+        (.scenario.runtime.lifecycle_before.rootfs_directories == 3) and
+        (.scenario.runtime.lifecycle_before.setup_restore_entries == 0) and
+        (.scenario.runtime.lifecycle_before.stack_port_forwards == 0) and
+        (.scenario.runtime.lifecycle_before.stack_vms == 1) and
+        (.scenario.runtime.lifecycle_before.stack_vm_ids == ["snapshot-stack"]) and
+        (.scenario.runtime.lifecycle_before.vm_handles == 3) and
+        ((.scenario.runtime.lifecycle_before.vm_handle_ids | sort) == $container_ids) and
+        ((.scenario.runtime.lifecycle_before.generations | map(.container_id) | sort) == $container_ids) and
+        (all(.scenario.runtime.lifecycle_before.generations[]; .reserved == true and .owner_alive == true)) and
+        (all(.scenario.runtime.lifecycle_before.container_route_pairs[];
+            . as $route |
+            ($route | type) == "array" and ($route | length) == 2 and
+            $route[1] == "snapshot-stack" and
+            any($container_ids[]; . == $route[0]))) and
+
+        (.scenario.vm_full_operations | exact_keys(["restore", "save"])) and
+        (.scenario.vm_full_operations.save | unsupported_operation("create_checkpoint")) and
+        (.scenario.vm_full_operations.restore | unsupported_operation("restore_checkpoint")) and
+        (.scenario.snapshot_destination | exact_keys([
+            "absent_after_restore", "absent_after_save", "absent_before", "path"
+        ])) and
+        (.scenario.snapshot_destination.absent_before == true) and
+        (.scenario.snapshot_destination.absent_after_save == true) and
+        (.scenario.snapshot_destination.absent_after_restore == true) and
+        ((.scenario.snapshot_destination.path | type) == "string") and
+        (.scenario.snapshot_destination.path | endswith("/snapshot-stack.state")) and
+
+        (.cleanup | exact_keys([
+            "baseline_tracked_container_ids", "exact_owned_container_ids",
+            "final_lifecycle", "final_tracked_container_ids", "sandbox_active",
+            "stack_id", "zero_inventory"
+        ])) and
+        (.cleanup.stack_id == "snapshot-stack") and
+        (.cleanup.baseline_tracked_container_ids == []) and
+        ((.cleanup.exact_owned_container_ids | sort) == $container_ids) and
+        (.cleanup.final_tracked_container_ids == []) and
+        (.cleanup.sandbox_active == false) and
+        (.cleanup.zero_inventory == true) and
+        (.cleanup.final_lifecycle | lifecycle) and
+        ([
+            .cleanup.final_lifecycle.active_lifecycles,
+            .cleanup.final_lifecycle.container_routes,
+            .cleanup.final_lifecycle.exec_bindings,
+            .cleanup.final_lifecycle.exec_sessions,
+            .cleanup.final_lifecycle.overlay_cleanup_pending,
+            .cleanup.final_lifecycle.rootfs_directories,
+            .cleanup.final_lifecycle.setup_restore_entries,
+            .cleanup.final_lifecycle.stack_port_forwards,
+            .cleanup.final_lifecycle.stack_vms,
+            .cleanup.final_lifecycle.vm_handles
+        ] | all(. == 0)) and
+        (.cleanup.final_lifecycle.container_route_pairs == []) and
+        (.cleanup.final_lifecycle.stack_port_forward_ids == []) and
+        (.cleanup.final_lifecycle.stack_vm_ids == []) and
+        (.cleanup.final_lifecycle.vm_handle_ids == []) and
+        ((.cleanup.final_lifecycle.generations | map(.container_id) | sort) == $container_ids) and
+        (all(.cleanup.final_lifecycle.generations[]; .reserved == false and .owner_alive == false))
+    ' "$evidence_file" >/dev/null
+}
+
+extract_vm_full_unsupported_evidence() {
+    local log_file="$1"
+    local evidence_file="$2"
+    local marker='VZ_STACK_VM_FULL_UNSUPPORTED_EVIDENCE:'
+    local temporary="${evidence_file}.tmp"
+    local sentinel_count
+
+    rm -f "$temporary" "$evidence_file"
+    sentinel_count="$(grep -F -c "$marker" "$log_file" || true)"
+    if [[ "$sentinel_count" != "1" ]]; then
+        echo "expected exactly one VM-full unsupported evidence sentinel, found $sentinel_count" >&2
+        return 1
+    fi
+    awk -v marker="$marker" '
+        index($0, marker) {
+            print substr($0, index($0, marker) + length(marker))
+        }
+    ' "$log_file" > "$temporary"
+    if [[ "$(wc -l < "$temporary" | tr -d '[:space:]')" != "1" ]] \
+        || ! validate_vm_full_unsupported_evidence "$temporary"; then
+        echo "VM-full unsupported evidence is malformed or violates the strict schema" >&2
+        rm -f "$temporary"
+        return 1
+    fi
+    mv "$temporary" "$evidence_file"
+}
+
 validate_stack_container_ownership_evidence() {
     local evidence_file="$1"
 
@@ -1830,6 +2055,17 @@ write_and_validate_stack_container_ownership_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+write_and_validate_vm_full_unsupported_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 write_and_validate_environment_lifecycle_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -1850,6 +2086,7 @@ run_and_log() {
     local log_file="$RUN_DIR/${label}.log"
     local cmd_env=()
     local exec_supervision_test_binary_sha256=""
+    local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
     # Pin a per-run directory so CI/local harness executions are deterministic.
@@ -1878,6 +2115,12 @@ run_and_log() {
         local stack_oci_data_dir="$RUN_DIR/${label}-oci"
         mkdir -p "$stack_oci_data_dir"
         cmd_env+=("VZ_STACK_E2E_OCI_DATA_DIR=$stack_oci_data_dir")
+        if [[ "$label" == "stack" || "$label" == "stack-snapshot-restore" \
+            || "$label" == "stack-user-journey-checkpoint" ]]; then
+            emits_vm_full_unsupported_evidence=true
+            VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED=false
+            rm -f "$VM_FULL_UNSUPPORTED_EVIDENCE" "$VM_FULL_UNSUPPORTED_SHA256"
+        fi
         if [[ "$label" == "stack" || "$label" == "stack-port-forwarding" ]]; then
             rm -f "$STACK_TEARDOWN_EVIDENCE"
             rm -f "$STACK_TEARDOWN_SHA256"
@@ -1945,6 +2188,31 @@ run_and_log() {
         return 88
     fi
 
+    if [[ $status -eq 0 && "$suite" == "stack" ]]; then
+        local violation_artifact="$RUN_DIR/${label}-teardown-violations.txt"
+        local violation_marker='VZ_STACK_TEARDOWN_VIOLATION:[A-Z0-9_]+'
+        set +e
+        grep -n -E "$violation_marker" "$log_file" > "$violation_artifact"
+        local violation_scan_status=$?
+        set -e
+        case "$violation_scan_status" in
+            0)
+                echo "stack teardown emitted a code-owned failure or retry sentinel ($label/$suite)" >&2
+                sed -n '1,120p' "$violation_artifact" >&2
+                return 91
+                ;;
+            1)
+                rm -f "$violation_artifact"
+                ;;
+            *)
+                echo "stack teardown sentinel scan failed closed ($label/$suite, grep exit $violation_scan_status)" \
+                    > "$violation_artifact"
+                echo "stack teardown sentinel scan failed ($label/$suite)" >&2
+                return 95
+                ;;
+        esac
+    fi
+
     if [[ $status -eq 0 && "$PROFILE" == "release" \
         && "$suite" == "buildkit" && "$label" == "buildkit" ]] \
         && ! grep -Fqx \
@@ -1972,30 +2240,30 @@ run_and_log() {
         return 100
     fi
 
+    if [[ $status -eq 0 && "$label" != "$suite" ]] \
+        && ! grep -Eq \
+            '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished$' \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "focused scenario did not report exactly one passing physical test with zero ignored tests ($label/$suite)" >&2
+        return 106
+    fi
+
+    if [[ $status -eq 0 && "$emits_vm_full_unsupported_evidence" == "true" ]]; then
+        if ! extract_vm_full_unsupported_evidence \
+            "$log_file" "$VM_FULL_UNSUPPORTED_EVIDENCE"; then
+            echo "VM-full unsupported evidence is missing, duplicated, or invalid ($label/$suite)" >&2
+            return 107
+        fi
+        if ! write_and_validate_vm_full_unsupported_checksum \
+            "$VM_FULL_UNSUPPORTED_EVIDENCE" "$VM_FULL_UNSUPPORTED_SHA256"; then
+            echo "VM-full unsupported evidence checksum creation or verification failed" >&2
+            return 108
+        fi
+        VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED=true
+    fi
+
     if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
         && [[ "$label" == "stack" || "$label" == "stack-port-forwarding" ]]; then
-        local violation_artifact="$RUN_DIR/${label}-teardown-violations.txt"
-        local violation_marker='VZ_STACK_TEARDOWN_VIOLATION:[A-Z0-9_]+'
-        set +e
-        grep -n -E "$violation_marker" "$log_file" > "$violation_artifact"
-        local violation_scan_status=$?
-        set -e
-        case "$violation_scan_status" in
-            0)
-                echo "stack teardown emitted a code-owned failure or retry sentinel ($label/$suite)" >&2
-                sed -n '1,120p' "$violation_artifact" >&2
-                return 91
-                ;;
-            1)
-                rm -f "$violation_artifact"
-                ;;
-            *)
-                echo "stack teardown sentinel scan failed closed ($label/$suite, grep exit $violation_scan_status)" \
-                    > "$violation_artifact"
-                echo "stack teardown sentinel scan failed ($label/$suite)" >&2
-                return 95
-                ;;
-        esac
         if [[ ! -f "$STACK_TEARDOWN_EVIDENCE" ]] \
             || ! validate_stack_teardown_evidence "$STACK_TEARDOWN_EVIDENCE"; then
             echo "stack teardown evidence is missing, malformed, or violates cleanup ownership" >&2
@@ -2108,6 +2376,8 @@ echo "==> output directory: $RUN_DIR"
     echo "buildkit_artifact_verification=$BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE"
     echo "buildkit_artifact_evidence_checksums=$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS"
     echo "buildkit_builder_output_checksums=$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS"
+    echo "vm_full_unsupported_path=$VM_FULL_UNSUPPORTED_EVIDENCE"
+    echo "vm_full_unsupported_checksum=$VM_FULL_UNSUPPORTED_SHA256"
     echo "environment_lifecycle_evidence=$ENVIRONMENT_LIFECYCLE_EVIDENCE"
     echo "environment_lifecycle_checksum=$ENVIRONMENT_LIFECYCLE_SHA256"
 } > "$RUN_DIR/run-info.txt"
@@ -2138,6 +2408,8 @@ STACK_TEARDOWN_EVIDENCE_VALIDATED=false
 STACK_TEARDOWN_EVIDENCE_REQUIRED=false
 STACK_CONTAINER_OWNERSHIP_EVIDENCE_VALIDATED=false
 STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=false
+VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED=false
+VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED=false
 
@@ -2151,6 +2423,11 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
         || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-container-ownership "* ]]; }; then
         STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED=true
+    fi
+    if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
+        || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-snapshot-restore "* ]] \
+        || [[ " ${RESOLVED_SCENARIOS[*]} " == *" stack-user-journey-checkpoint "* ]]; }; then
+        VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED=true
     fi
     if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
         || [[ " ${RESOLVED_SCENARIOS[*]} " == *" environment-lifecycle-journal-linux-vm "* ]]; }; then
@@ -2248,6 +2525,12 @@ if [[ "$STACK_CONTAINER_OWNERSHIP_EVIDENCE_REQUIRED" == "true" \
     FAILED+=("stack-container-ownership-evidence:97")
 fi
 
+if [[ "$VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED" == "true" \
+    && "$VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required VM-full unsupported evidence was not validated" >&2
+    FAILED+=("vm-full-unsupported-evidence:107")
+fi
+
 if [[ "$ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED" == "true" \
     && "$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED" != "true" ]]; then
     echo "==> required Environment lifecycle evidence was not validated" >&2
@@ -2287,6 +2570,15 @@ action_summary="$RUN_DIR/summary.txt"
     echo "buildkit_artifact_verification=$BUILDKIT_ARTIFACT_VERIFICATION_EVIDENCE"
     echo "buildkit_artifact_evidence_checksums=$BUILDKIT_ARTIFACT_EVIDENCE_CHECKSUMS"
     echo "buildkit_builder_output_checksums=$BUILDKIT_BUILDER_OUTPUT_CHECKSUMS"
+    echo "vm_full_unsupported_required=$VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED"
+    echo "vm_full_unsupported_validated=$VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED"
+    if [[ "$VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "vm_full_unsupported_path=$VM_FULL_UNSUPPORTED_EVIDENCE"
+        echo "vm_full_unsupported_checksum=$VM_FULL_UNSUPPORTED_SHA256"
+    else
+        echo "vm_full_unsupported_path=none"
+        echo "vm_full_unsupported_checksum=none"
+    fi
     if [[ "$RUNTIME_ID_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "container_id_ownership=$CONTAINER_ID_OWNERSHIP_EVIDENCE"
         echo "container_id_ownership_sha256=$CONTAINER_ID_OWNERSHIP_SHA256"

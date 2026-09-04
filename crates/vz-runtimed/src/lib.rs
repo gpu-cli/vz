@@ -27,7 +27,9 @@ pub(crate) use execution_sessions::{ExecutionSessionRegistry, ExecutionSessionRe
 pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
 use placement_scheduler::{BackendPlacementCandidate, PlacementScheduler, PlacementSnapshot};
 
-const MAX_SUPPORTED_SCHEMA_VERSION: u32 = 2;
+// StateStore migrates every opened database to its current schema before returning it. Keep the
+// daemon ceiling coupled to that contract so a freshly created store is always accepted.
+const MAX_SUPPORTED_SCHEMA_VERSION: u32 = StateStore::CURRENT_SCHEMA_VERSION;
 const LEGACY_SANDBOX_BASE_IMAGE_REF: &str = "debian:bookworm";
 const SANDBOX_DEFAULT_BASE_IMAGE_ENV: &str = "VZ_SANDBOX_DEFAULT_BASE_IMAGE";
 const SANDBOX_DEFAULT_MAIN_CONTAINER_ENV: &str = "VZ_SANDBOX_DEFAULT_MAIN_CONTAINER";
@@ -1333,7 +1335,7 @@ mod tests {
     }
 
     #[test]
-    fn start_creates_required_directories() {
+    fn start_creates_required_directories_and_accepts_current_schema() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let cfg = RuntimedConfig {
             state_store_path: tmp.path().join("state").join("stack-state.db"),
@@ -1352,6 +1354,12 @@ mod tests {
         assert_eq!(
             daemon.startup_lock_path(),
             startup_lock_path(&cfg.state_store_path).as_path()
+        );
+        assert_eq!(
+            daemon
+                .with_state_store(|store| store.schema_version())
+                .expect("fresh store schema version"),
+            StateStore::CURRENT_SCHEMA_VERSION
         );
     }
 
@@ -1834,8 +1842,13 @@ mod tests {
         std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
             .expect("create state directory");
         let store = StateStore::open(&cfg.state_store_path).expect("state store");
+        assert_eq!(
+            store.schema_version().expect("current schema version"),
+            StateStore::CURRENT_SCHEMA_VERSION
+        );
+        let future_schema_version = StateStore::CURRENT_SCHEMA_VERSION + 1;
         store
-            .set_schema_version(MAX_SUPPORTED_SCHEMA_VERSION + 1)
+            .set_schema_version(future_schema_version)
             .expect("set schema version");
         drop(store);
 
@@ -1846,7 +1859,7 @@ mod tests {
                 source: StackError::InvalidSpec(message),
                 ..
             }) if message.contains("newer than supported version")
-                && message.contains(&(MAX_SUPPORTED_SCHEMA_VERSION + 1).to_string())
+                && message.contains(&future_schema_version.to_string())
         ));
     }
 
@@ -2195,7 +2208,10 @@ mod tests {
             Err(RuntimedError::OpenStateStore {
                 source: StackError::InvalidSpec(message),
                 ..
-            }) if message.contains("state schema v2 shape mismatch")
+            }) if message.contains(&format!(
+                "state schema v{} shape mismatch",
+                StateStore::CURRENT_SCHEMA_VERSION
+            ))
                 && message.contains("index:idx_environment_project")
         ));
 

@@ -5305,28 +5305,258 @@ async fn checkpoint_state_survives_daemon_restart() {
 }
 
 #[cfg(target_os = "linux")]
-#[tokio::test]
-#[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
-async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
-    use std::process::Command;
+fn run_btrfs(args: &[&str]) {
+    let output = Command::new("btrfs")
+        .args(args)
+        .output()
+        .expect("run btrfs");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        panic!("btrfs command failed ({args:?}): {stderr}");
+    }
+}
 
-    fn run_btrfs(args: &[&str]) {
+#[cfg(target_os = "linux")]
+struct BtrfsTestCleanup {
+    base: PathBuf,
+    prefix: &'static str,
+    root: PathBuf,
+    armed: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl BtrfsTestCleanup {
+    fn new_directory(base: PathBuf, prefix: &'static str) -> Self {
+        let cleanup = Self::new(base, prefix);
+        std::fs::create_dir(&cleanup.root).expect("create btrfs test root directory");
+        cleanup
+    }
+
+    fn new_subvolume(base: PathBuf, prefix: &'static str) -> Self {
+        let cleanup = Self::new(base, prefix);
         let output = Command::new("btrfs")
-            .args(args)
+            .args(["subvolume", "create"])
+            .arg(&cleanup.root)
             .output()
-            .expect("run btrfs");
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("btrfs command failed ({args:?}): {stderr}");
+            .expect("create btrfs test root subvolume");
+        assert!(
+            output.status.success(),
+            "create btrfs test root subvolume {}: {}",
+            cleanup.root.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        cleanup
+    }
+
+    fn new(base: PathBuf, prefix: &'static str) -> Self {
+        let pre_inventory = owned_btrfs_test_roots(&base, prefix)
+            .unwrap_or_else(|error| panic!("inventory {prefix} roots before test: {error}"));
+        eprintln!(
+            "btrfs test pre-inventory for {prefix}: {}",
+            display_paths(&pre_inventory)
+        );
+        assert!(
+            pre_inventory.is_empty(),
+            "btrfs test-owned roots remain before {prefix} test: {}",
+            display_paths(&pre_inventory)
+        );
+
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time should be after Unix epoch")
+            .as_nanos();
+        let root = base.join(format!("{prefix}-{}-{unique}", std::process::id()));
+        Self {
+            base,
+            prefix,
+            root,
+            armed: true,
         }
     }
 
+    fn root(&self) -> &Path {
+        &self.root
+    }
+
+    fn finish(mut self) {
+        let result = self.cleanup();
+        self.armed = false;
+        if let Err(error) = result {
+            panic!("btrfs test cleanup failed: {error}");
+        }
+    }
+
+    fn cleanup(&self) -> Result<(), String> {
+        let inventory = inventory_btrfs_test_tree(&self.root)?;
+        eprintln!(
+            "btrfs test cleanup inventory for {}: directories={} ({}), subvolumes={} ({})",
+            self.root.display(),
+            inventory.directories.len(),
+            display_paths(&inventory.directories),
+            inventory.subvolumes.len(),
+            display_paths(&inventory.subvolumes)
+        );
+
+        let mut errors = Vec::new();
+        for subvolume in inventory.subvolumes.iter().rev() {
+            match Command::new("btrfs")
+                .args(["subvolume", "delete"])
+                .arg(subvolume)
+                .output()
+            {
+                Ok(output) if output.status.success() => {}
+                Ok(output) => errors.push(format!(
+                    "delete subvolume {}: {}",
+                    subvolume.display(),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )),
+                Err(error) => errors.push(format!(
+                    "run btrfs subvolume delete for {}: {error}",
+                    subvolume.display()
+                )),
+            }
+        }
+
+        match std::fs::symlink_metadata(&self.root) {
+            Ok(_) => {
+                if let Err(error) = std::fs::remove_dir_all(&self.root) {
+                    errors.push(format!("remove {}: {error}", self.root.display()));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => errors.push(format!(
+                "inspect {} before removal: {error}",
+                self.root.display()
+            )),
+        }
+
+        match owned_btrfs_test_roots(&self.base, self.prefix) {
+            Ok(post_inventory) => {
+                eprintln!(
+                    "btrfs test post-inventory for {}: {}",
+                    self.prefix,
+                    display_paths(&post_inventory)
+                );
+                if !post_inventory.is_empty() {
+                    errors.push(format!(
+                        "test-owned roots remain: {}",
+                        display_paths(&post_inventory)
+                    ));
+                }
+            }
+            Err(error) => errors.push(format!(
+                "inventory {} roots after test: {error}",
+                self.prefix
+            )),
+        }
+
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(errors.join("; "))
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for BtrfsTestCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.armed = false;
+        if let Err(error) = self.cleanup() {
+            if std::thread::panicking() {
+                eprintln!("btrfs test cleanup failed while unwinding: {error}");
+            } else {
+                panic!("btrfs test cleanup failed: {error}");
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Default)]
+struct BtrfsTestTreeInventory {
+    directories: Vec<PathBuf>,
+    subvolumes: Vec<PathBuf>,
+}
+
+#[cfg(target_os = "linux")]
+fn inventory_btrfs_test_tree(root: &Path) -> Result<BtrfsTestTreeInventory, String> {
+    use std::os::unix::fs::MetadataExt;
+
+    fn visit(path: &Path, inventory: &mut BtrfsTestTreeInventory) -> Result<(), std::io::Error> {
+        let metadata = match std::fs::symlink_metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        if !metadata.file_type().is_dir() {
+            return Ok(());
+        }
+
+        if metadata.ino() == 256 {
+            inventory.subvolumes.push(path.to_path_buf());
+        } else {
+            inventory.directories.push(path.to_path_buf());
+        }
+        for entry in std::fs::read_dir(path)? {
+            visit(&entry?.path(), inventory)?;
+        }
+        Ok(())
+    }
+
+    let mut inventory = BtrfsTestTreeInventory::default();
+    visit(root, &mut inventory)
+        .map_err(|error| format!("inventory tree {}: {error}", root.display()))?;
+    inventory
+        .subvolumes
+        .sort_by_key(|path| path.components().count());
+    Ok(inventory)
+}
+
+#[cfg(target_os = "linux")]
+fn owned_btrfs_test_roots(base: &Path, prefix: &str) -> Result<Vec<PathBuf>, String> {
+    let owned_prefix = format!("{prefix}-");
+    let entries = std::fs::read_dir(base)
+        .map_err(|error| format!("read workspace root {}: {error}", base.display()))?;
+    let mut roots = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("read entry in {}: {error}", base.display()))?;
+        if entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(&owned_prefix)
+        {
+            roots.push(entry.path());
+        }
+    }
+    roots.sort();
+    Ok(roots)
+}
+
+#[cfg(target_os = "linux")]
+fn display_paths(paths: &[PathBuf]) -> String {
+    if paths.is_empty() {
+        return "none".to_string();
+    }
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
+async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let test_root =
-        PathBuf::from(workspace_root_base).join(format!("vz-space-{}", current_unix_secs()));
+    let cleanup = BtrfsTestCleanup::new_directory(PathBuf::from(workspace_root_base), "vz-space");
+    let test_root = cleanup.root().to_path_buf();
     let workspace_root = test_root.join("workspace");
-    std::fs::create_dir_all(&test_root).expect("create test root");
     run_btrfs(&[
         "subvolume",
         "create",
@@ -5441,18 +5671,7 @@ async fn spaces_btrfs_checkpoint_restore_and_fork_use_real_subvolumes() {
         .expect("server join should succeed");
     assert!(result.is_ok());
 
-    if workspace_root.exists() {
-        let _ = Command::new("btrfs")
-            .args([
-                "subvolume",
-                "delete",
-                workspace_root.to_string_lossy().as_ref(),
-            ])
-            .output();
-    }
-    let _ = std::fs::remove_dir_all(test_root.join("runtime"));
-    let _ = std::fs::remove_dir_all(test_root.join("state"));
-    let _ = std::fs::remove_dir_all(test_root);
+    cleanup.finish();
 }
 
 #[tokio::test]
@@ -5778,23 +5997,12 @@ async fn checkpoint_export_import_missing_entities_return_not_found() {
 #[tokio::test]
 #[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
 async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
-    fn run_btrfs(args: &[&str]) {
-        let output = Command::new("btrfs")
-            .args(args)
-            .output()
-            .expect("run btrfs");
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("btrfs command failed ({args:?}): {stderr}");
-        }
-    }
-
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let test_root =
-        PathBuf::from(workspace_root_base).join(format!("vz-portability-{}", current_unix_secs()));
+    let cleanup =
+        BtrfsTestCleanup::new_directory(PathBuf::from(workspace_root_base), "vz-portability");
+    let test_root = cleanup.root().to_path_buf();
     let workspace_root = test_root.join("workspace");
-    std::fs::create_dir_all(&test_root).expect("create test root");
     run_btrfs(&[
         "subvolume",
         "create",
@@ -5940,43 +6148,18 @@ async fn checkpoint_export_import_round_trip_preserves_workspace_snapshot() {
         .expect("server join should succeed");
     assert!(result.is_ok());
 
-    if workspace_root.exists() {
-        let _ = Command::new("btrfs")
-            .args([
-                "subvolume",
-                "delete",
-                workspace_root.to_string_lossy().as_ref(),
-            ])
-            .output();
-    }
-    let _ = std::fs::remove_dir_all(test_root.join("portable"));
-    let _ = std::fs::remove_dir_all(test_root.join("runtime"));
-    let _ = std::fs::remove_dir_all(test_root.join("state"));
-    let _ = std::fs::remove_dir_all(test_root);
+    cleanup.finish();
 }
 
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires VZ_TEST_BTRFS_WORKSPACE on a host btrfs filesystem"]
 async fn space_cache_export_import_round_trip_preserves_payload() {
-    fn run_btrfs(args: &[&str]) {
-        let output = Command::new("btrfs")
-            .args(args)
-            .output()
-            .expect("run btrfs");
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            panic!("btrfs command failed ({args:?}): {stderr}");
-        }
-    }
-
     let workspace_root_base = std::env::var("VZ_TEST_BTRFS_WORKSPACE")
         .expect("VZ_TEST_BTRFS_WORKSPACE must point at a btrfs path");
-    let test_root = PathBuf::from(workspace_root_base)
-        .join(format!("vz-cache-portability-{}", current_unix_secs()));
-    let parent = test_root.parent().expect("test root parent should exist");
-    std::fs::create_dir_all(parent).expect("create test root parent");
-    run_btrfs(&["subvolume", "create", test_root.to_string_lossy().as_ref()]);
+    let cleanup =
+        BtrfsTestCleanup::new_subvolume(PathBuf::from(workspace_root_base), "vz-cache-portability");
+    let test_root = cleanup.root().to_path_buf();
 
     let config = RuntimedConfig {
         state_store_path: test_root.join("state").join("stack-state.db"),
@@ -6069,16 +6252,7 @@ async fn space_cache_export_import_round_trip_preserves_payload() {
         .expect("server join should succeed");
     assert!(result.is_ok());
 
-    if test_root.exists() {
-        let _ = Command::new("btrfs")
-            .args([
-                "subvolume",
-                "delete",
-                "-R",
-                test_root.to_string_lossy().as_ref(),
-            ])
-            .output();
-    }
+    cleanup.finish();
 }
 
 #[tokio::test]

@@ -424,10 +424,9 @@ impl RuntimeBackend for TestRuntimeBackend {
                 .fail_next_shared_vm_shutdown
                 .swap(false, Ordering::SeqCst)
             {
-                return Err(RuntimeError::Backend {
-                    message: format!("injected shared VM shutdown failure for stack '{stack_id}'"),
-                    source: Box::new(std::io::Error::other("injected shared VM shutdown failure")),
-                });
+                return Err(RuntimeError::Io(std::io::Error::other(format!(
+                    "injected shared VM shutdown failure for stack '{stack_id}'"
+                ))));
             }
             let mut shared_vms = self
                 .shared_vms

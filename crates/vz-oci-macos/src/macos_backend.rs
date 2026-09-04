@@ -664,6 +664,9 @@ fn oci_err(e: crate::error::MacosOciError) -> RuntimeError {
         crate::error::MacosOciError::ExecutionControlUnsupported { operation, reason } => {
             RuntimeError::UnsupportedOperation { operation, reason }
         }
+        crate::error::MacosOciError::UnsupportedOperation { operation, reason } => {
+            RuntimeError::UnsupportedOperation { operation, reason }
+        }
         other => RuntimeError::Backend {
             message: other.to_string(),
             source: Box::new(other),
@@ -986,6 +989,26 @@ mod tests {
             missing.machine_code(),
             vz_runtime_contract::MachineErrorCode::NotFound
         );
+    }
+
+    #[test]
+    fn unsupported_operation_mapping_preserves_contract_fields() {
+        let mapped = oci_err(crate::error::MacosOciError::UnsupportedOperation {
+            operation: "restore_checkpoint".to_string(),
+            reason: "vm_full_checkpoint=false: external VirtioFS/device state is not captured"
+                .to_string(),
+        });
+
+        match mapped {
+            RuntimeError::UnsupportedOperation { operation, reason } => {
+                assert_eq!(operation, "restore_checkpoint");
+                assert_eq!(
+                    reason,
+                    "vm_full_checkpoint=false: external VirtioFS/device state is not captured"
+                );
+            }
+            other => panic!("expected unsupported operation, got {other}"),
+        }
     }
 
     #[test]

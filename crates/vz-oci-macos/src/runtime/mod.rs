@@ -1158,7 +1158,12 @@ impl Runtime {
             class,
             operation,
         )
-        .map_err(|err| OciError::InvalidConfig(err.to_string()))
+        .map_err(|err| match err {
+            vz_runtime_contract::RuntimeError::UnsupportedOperation { operation, reason } => {
+                OciError::UnsupportedOperation { operation, reason }
+            }
+            other => OciError::InvalidConfig(other.to_string()),
+        })
     }
 
     /// Create a [`MacosRuntimeBackend`] adapter for this runtime.

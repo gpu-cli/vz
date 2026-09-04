@@ -19,6 +19,7 @@ PROVISION_BTRFS=true
 BTRFS_IMAGE="/var/lib/vz-persist/vz-btrfs-workspace.img"
 BTRFS_SIZE_GB="128"
 RUN_BTRFS_PORTABILITY=false
+SKIP_LINUX_DAEMON_E2E=false
 
 usage() {
     cat <<'USAGE'
@@ -41,6 +42,7 @@ Options:
   --btrfs-image <path>         In-guest loopback btrfs image (default: /var/lib/vz-persist/vz-btrfs-workspace.img)
   --btrfs-size-gb <n>          In-guest btrfs image size GiB (default: 128)
   --run-btrfs-portability      Also run scripts/run-linux-btrfs-e2e.sh inside the guest
+  --skip-linux-daemon-e2e      Skip the Linux daemon suite; requires --run-btrfs-portability
   -h, --help                   Show help
 
 Env:
@@ -107,6 +109,10 @@ while [[ $# -gt 0 ]]; do
             RUN_BTRFS_PORTABILITY=true
             shift
             ;;
+        --skip-linux-daemon-e2e)
+            SKIP_LINUX_DAEMON_E2E=true
+            shift
+            ;;
         -h|--help)
             usage
             exit 0
@@ -118,6 +124,9 @@ while [[ $# -gt 0 ]]; do
 done
 
 [[ "$PROFILE" == "debug" || "$PROFILE" == "release" ]] || err "--profile must be debug|release"
+if [[ "$SKIP_LINUX_DAEMON_E2E" == "true" && "$RUN_BTRFS_PORTABILITY" != "true" ]]; then
+    err "--skip-linux-daemon-e2e requires --run-btrfs-portability"
+fi
 [[ "$(uname -s)" == "Darwin" ]] || err "host-boot Linux VM E2E requires macOS host"
 [[ "$DISK_SIZE_GB" =~ ^[0-9]+$ ]] || err "--disk-size-gb must be an integer"
 [[ "$BTRFS_SIZE_GB" =~ ^[0-9]+$ ]] || err "--btrfs-size-gb must be an integer"
@@ -136,6 +145,7 @@ fi
 pkg_setup=""
 skip_pkg_preflight=""
 if [[ "$SKIP_PKG_SETUP" != "true" ]]; then
+    # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.
     pkg_setup='
 apk_retry() {
   local attempts="${1:-5}";
@@ -171,8 +181,9 @@ if [ -f "$HOME/.cargo/env" ]; then . "$HOME/.cargo/env"; fi;
 if command -v rustup >/dev/null 2>&1; then rustup toolchain install stable >/dev/null 2>&1 || true; rustup default stable >/dev/null 2>&1 || true; fi;
 '
 else
+    # shellcheck disable=SC2016 # Expanded by the guest shell, not the host.
     skip_pkg_preflight='
-required_tools="bash curl git cargo rustup btrfs youki blkid findmnt mount mkfs.ext4";
+required_tools="bash curl git cargo rustup btrfs youki blkid findmnt mount umount losetup sync mkfs.ext4";
 for tool in $required_tools; do
   if ! command -v "$tool" >/dev/null 2>&1; then
     echo "missing required guest tool \"$tool\" while --skip-pkg-setup is set; rerun without --skip-pkg-setup" >&2;
@@ -183,7 +194,38 @@ done;
 fi
 
 provision_btrfs_cmd=""
+cleanup_btrfs_trap_cmd=""
 if [[ "$PROVISION_BTRFS" == "true" ]]; then
+    cleanup_btrfs_trap_cmd="
+cleanup_hostboot_btrfs_mounts() {
+  cleanup_status=\$?;
+  cleanup_failed=0;
+  trap - EXIT;
+  set +e;
+  sync || cleanup_failed=1;
+  cleanup_loop_device='';
+  if findmnt -n -M '${WORKSPACE_IN_GUEST}' >/dev/null 2>&1; then
+    cleanup_loop_device=\"\$(findmnt -n -M '${WORKSPACE_IN_GUEST}' -o SOURCE)\";
+    umount '${WORKSPACE_IN_GUEST}' || cleanup_failed=1;
+  fi;
+  case \"\$cleanup_loop_device\" in
+    /dev/loop*)
+      if losetup \"\$cleanup_loop_device\" >/dev/null 2>&1; then
+        losetup -d \"\$cleanup_loop_device\" || cleanup_failed=1;
+      fi
+      ;;
+  esac;
+  sync || cleanup_failed=1;
+  if findmnt -n -M /var/lib/vz-persist >/dev/null 2>&1; then
+    umount /var/lib/vz-persist || cleanup_failed=1;
+  fi;
+  if [ \"\$cleanup_status\" -eq 0 ] && [ \"\$cleanup_failed\" -ne 0 ]; then
+    cleanup_status=95;
+  fi;
+  exit \"\$cleanup_status\";
+};
+trap cleanup_hostboot_btrfs_mounts EXIT;
+"
     provision_btrfs_cmd="
 mkdir -p /var/lib/vz-persist;
 if [ -b /dev/vda ]; then
@@ -201,6 +243,14 @@ rm -rf '${WORKSPACE_IN_GUEST}/.vz-e2e';
 "
 fi
 
+linux_daemon_e2e_cmd=""
+if [[ "$SKIP_LINUX_DAEMON_E2E" != "true" ]]; then
+    linux_daemon_e2e_cmd="
+cd /mnt/repo;
+./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
+"
+fi
+
 guest_cmd="
 set -euo pipefail;
 export HOME=/root;
@@ -211,9 +261,10 @@ fi;
 export DOCKER_CONFIG=\"\$HOME/.docker\";
 mkdir -p /mnt/repo;
 mount -t virtiofs repo /mnt/repo;
-${skip_pkg_preflight}
-${pkg_setup}
-${provision_btrfs_cmd}
+	${skip_pkg_preflight}
+	${pkg_setup}
+	${cleanup_btrfs_trap_cmd}
+	${provision_btrfs_cmd}
 : \"\${VZ_GUEST_CARGO_TARGET_DIR:=${WORKSPACE_IN_GUEST}/.cargo-target}\";
 export CARGO_TARGET_DIR=\"\$VZ_GUEST_CARGO_TARGET_DIR\";
 rm -rf \"\$CARGO_TARGET_DIR\";
@@ -225,8 +276,7 @@ export CARGO_BUILD_JOBS=\"\$VZ_GUEST_CARGO_BUILD_JOBS\";
 export CARGO_PROFILE_DEV_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_DEV_DEBUG\";
 : \"\${VZ_GUEST_CARGO_PROFILE_TEST_DEBUG:=0}\";
 export CARGO_PROFILE_TEST_DEBUG=\"\$VZ_GUEST_CARGO_PROFILE_TEST_DEBUG\";
-cd /mnt/repo;
-./scripts/run-vz-linux-vm-e2e.sh --workspace '${WORKSPACE_IN_GUEST}' --profile '${PROFILE}'
+${linux_daemon_e2e_cmd}
 "
 
 if [[ "$RUN_BTRFS_PORTABILITY" == "true" ]]; then
