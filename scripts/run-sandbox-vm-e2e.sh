@@ -1280,6 +1280,22 @@ validate_stack_teardown_evidence() {
     local evidence_file="$1"
 
     jq -e '
+        def nonempty_string: type == "string" and length > 0;
+        def generation_scope:
+            (type == "object") and
+            (((keys | sort) == ([
+                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
+            ] | sort)) or ((keys | sort) == ([
+                "environment_id", "machine_id", "machine_incarnation_id", "project_id",
+                "reservation_id", "stack_id"
+            ] | sort))) and
+            (.reservation_id | nonempty_string) and
+            (.project_id | nonempty_string) and
+            (.environment_id | nonempty_string) and
+            (.machine_id | nonempty_string) and
+            (.stack_id | nonempty_string) and
+            ((has("machine_incarnation_id") | not) or
+                (.machine_incarnation_id | nonempty_string));
         .container_ids as $container_ids |
         (type == "object") and
         ((keys | sort) == ([
@@ -1287,7 +1303,7 @@ validate_stack_teardown_evidence() {
             "container_ids", "host_listener", "operations", "scenario",
             "schema_version", "stack_id"
         ] | sort)) and
-        (.schema_version == 1) and
+        (.schema_version == 2) and
         (.scenario == "stack-port-forwarding-teardown") and
         (.stack_id == "port-fwd") and
         ((.host_listener | keys | sort) == ([
@@ -1344,7 +1360,8 @@ validate_stack_teardown_evidence() {
             (.lifecycle.stack_port_forwards == (.lifecycle.stack_port_forward_ids | length)) and
             (all(.lifecycle.generations[];
                 ((keys | sort) == ([
-                    "container_id", "generation", "owner_alive", "owner_pid", "reserved"
+                    "container_id", "generation", "owner_alive", "owner_pid", "quarantined",
+                    "reserved", "scope"
                 ] | sort)) and
                 ((.container_id | type) == "string") and
                 ((.generation | type) == "number") and
@@ -1352,7 +1369,10 @@ validate_stack_teardown_evidence() {
                 ((.reserved | type) == "boolean") and
                 ((.owner_pid | type) == "number") and
                 (.owner_pid >= 0 and .owner_pid == (.owner_pid | floor)) and
-                ((.owner_alive | type) == "boolean")
+                ((.owner_alive | type) == "boolean") and
+                ((.quarantined | type) == "boolean") and
+                ((.scope == null) or (.scope | generation_scope)) and
+                (.quarantined == (.reserved and (.scope == null)))
             )) and
             ((.lifecycle.generations | map(.container_id) | unique | length) ==
                 (.lifecycle.generations | length))
@@ -1385,7 +1405,8 @@ validate_stack_teardown_evidence() {
         (.active.lifecycle.stack_port_forward_ids == ["port-fwd"]) and
         ([.container_ids[] as $container_id |
             any(.active.lifecycle.generations[];
-                .container_id == $container_id and .reserved == true and .generation > 0)
+                .container_id == $container_id and .reserved == true and .generation > 0 and
+                .scope.stack_id == "port-fwd" and .quarantined == false)
         ] | all) and
         (([.active.lifecycle.generations[] | select(.reserved) | .container_id] | sort) ==
             ($container_ids | sort)) and
@@ -1402,7 +1423,8 @@ validate_stack_teardown_evidence() {
         (.after_service_down.lifecycle.stack_port_forward_ids == ["port-fwd"]) and
         ([.container_ids[] as $container_id |
             any(.after_service_down.lifecycle.generations[];
-                .container_id == $container_id and .reserved == false and .generation > 0)
+                .container_id == $container_id and .reserved == false and .generation > 0 and
+                .scope.stack_id == "port-fwd" and .quarantined == false)
         ] | all) and
         (all(.after_service_down.lifecycle.generations[]; .reserved == false)) and
         (.after_vm_shutdown.tracked_container_ids == []) and
@@ -1426,7 +1448,8 @@ validate_stack_teardown_evidence() {
                 any($container_ids[]; . == $container_id)))) as $selected_generations |
             ($selected_generations | length) == 2 and
             all($selected_generations[];
-                .reserved == false and .owner_alive == false and .generation > 0))
+                .reserved == false and .owner_alive == false and .generation > 0 and
+                .scope.stack_id == "port-fwd" and .quarantined == false))
     ' "$evidence_file" >/dev/null
 }
 
@@ -1440,6 +1463,22 @@ validate_vm_full_unsupported_evidence() {
             type == "number" and . >= 0 and . == floor;
         def positive_integer:
             type == "number" and . > 0 and . == floor;
+        def nonempty_string: type == "string" and length > 0;
+        def generation_scope:
+            (type == "object") and
+            (exact_keys([
+                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
+            ]) or exact_keys([
+                "environment_id", "machine_id", "machine_incarnation_id", "project_id",
+                "reservation_id", "stack_id"
+            ])) and
+            (.reservation_id | nonempty_string) and
+            (.project_id | nonempty_string) and
+            (.environment_id | nonempty_string) and
+            (.machine_id | nonempty_string) and
+            (.stack_id | nonempty_string) and
+            ((has("machine_incarnation_id") | not) or
+                (.machine_incarnation_id | nonempty_string));
         def service_ids:
             (type == "object") and
             exact_keys(["api", "cache", "db"]) and
@@ -1485,12 +1524,18 @@ validate_vm_full_unsupported_evidence() {
             (.vm_handles == (.vm_handle_ids | length)) and
             (all(.generations[];
                 (type == "object") and
-                exact_keys(["container_id", "generation", "owner_alive", "owner_pid", "reserved"]) and
+                exact_keys([
+                    "container_id", "generation", "owner_alive", "owner_pid", "quarantined",
+                    "reserved", "scope"
+                ]) and
                 ((.container_id | type) == "string" and length > 0) and
                 (.generation | positive_integer) and
                 ((.owner_alive | type) == "boolean") and
                 (.owner_pid | nonnegative_integer) and
-                ((.reserved | type) == "boolean")
+                ((.reserved | type) == "boolean") and
+                ((.quarantined | type) == "boolean") and
+                ((.scope == null) or (.scope | generation_scope)) and
+                (.quarantined == (.reserved and (.scope == null)))
             ));
         def probe($service; $container_id):
             (type == "object") and
@@ -1527,7 +1572,7 @@ validate_vm_full_unsupported_evidence() {
             "service_container_ids", "service_probes", "snapshot_destination",
             "stack_id", "vm_full_operations"
         ])) and
-        (.scenario.schema_version == 1) and
+        (.scenario.schema_version == 2) and
         (.scenario.scenario == "complex_stack_vm_full_snapshot_fails_closed_without_mutation") and
         (.scenario.stack_id == "snapshot-stack") and
         (.scenario.service_container_ids | exact_keys(["after", "before"])) and
@@ -1574,7 +1619,9 @@ validate_vm_full_unsupported_evidence() {
         (.scenario.runtime.lifecycle_before.vm_handles == 3) and
         ((.scenario.runtime.lifecycle_before.vm_handle_ids | sort) == $container_ids) and
         ((.scenario.runtime.lifecycle_before.generations | map(.container_id) | sort) == $container_ids) and
-        (all(.scenario.runtime.lifecycle_before.generations[]; .reserved == true and .owner_alive == true)) and
+        (all(.scenario.runtime.lifecycle_before.generations[];
+            .reserved == true and .owner_alive == true and
+            .scope.stack_id == "snapshot-stack" and .quarantined == false)) and
         (all(.scenario.runtime.lifecycle_before.container_route_pairs[];
             . as $route |
             ($route | type) == "array" and ($route | length) == 2 and
@@ -1622,7 +1669,9 @@ validate_vm_full_unsupported_evidence() {
         (.cleanup.final_lifecycle.stack_vm_ids == []) and
         (.cleanup.final_lifecycle.vm_handle_ids == []) and
         ((.cleanup.final_lifecycle.generations | map(.container_id) | sort) == $container_ids) and
-        (all(.cleanup.final_lifecycle.generations[]; .reserved == false and .owner_alive == false))
+        (all(.cleanup.final_lifecycle.generations[];
+            .reserved == false and .owner_alive == false and
+            .scope.stack_id == "snapshot-stack" and .quarantined == false))
     ' "$evidence_file" >/dev/null
 }
 
@@ -1655,14 +1704,42 @@ extract_vm_full_unsupported_evidence() {
 
 validate_stack_container_ownership_evidence() {
     local evidence_file="$1"
+    local expected_profile="$2"
+    local expected_test_binary_sha256="$3"
 
-    jq -e '
+    jq -e \
+        --arg expected_profile "$expected_profile" \
+        --arg expected_test_binary_sha256 "$expected_test_binary_sha256" '
+        def nonempty_string: type == "string" and length > 0;
+        def sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def generation_scope:
+            (type == "object") and
+            (((keys | sort) == ([
+                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
+            ] | sort)) or ((keys | sort) == ([
+                "environment_id", "machine_id", "machine_incarnation_id", "project_id",
+                "reservation_id", "stack_id"
+            ] | sort))) and
+            (.reservation_id | nonempty_string) and
+            (.project_id | nonempty_string) and
+            (.environment_id | nonempty_string) and
+            (.machine_id | nonempty_string) and
+            (.stack_id | nonempty_string) and
+            ((has("machine_incarnation_id") | not) or
+                (.machine_incarnation_id | nonempty_string));
         def ownership:
-            ((keys | sort) == (["container_id", "generation", "stack_id"] | sort)) and
+            ((keys | sort) == (["container_id", "generation", "scope", "stack_id"] | sort)) and
             ((.container_id | type) == "string" and (.container_id | length) > 0) and
             ((.generation | type) == "number" and .generation > 0 and
                 .generation == (.generation | floor)) and
-            ((.stack_id | type) == "string" and (.stack_id | length) > 0);
+            ((.stack_id | type) == "string" and (.stack_id | length) > 0) and
+            (.scope | generation_scope) and
+            (.scope.stack_id == .stack_id) and
+            (.scope.project_id == "prj_synthetic_legacy_stack_compat") and
+            (.scope.environment_id == "env_synthetic_legacy_stack_compat") and
+            (.scope.machine_id == "mch_synthetic_legacy_stack_compat") and
+            (.scope | has("machine_incarnation_id") | not) and
+            (.scope.reservation_id | startswith("legacy-stack-compat-"));
         def guest:
             ((keys | sort) == ([
                 "boot_id", "cgroup_identity", "cgroup_path", "guest_init_pid",
@@ -1701,23 +1778,37 @@ validate_stack_container_ownership_evidence() {
                 all(.[]; type == "string" and length > 0))) and
             (all(.generations[];
                 ((keys | sort) == ([
-                    "container_id", "generation", "owner_alive", "owner_pid", "reserved"
+                    "container_id", "generation", "owner_alive", "owner_pid", "quarantined",
+                    "reserved", "scope"
                 ] | sort)) and
                 ((.container_id | type) == "string" and (.container_id | length) > 0) and
                 ((.generation | type) == "number" and .generation > 0 and
                     .generation == (.generation | floor)) and
                 ((.owner_pid | type) == "number" and .owner_pid >= 0 and
                     .owner_pid == (.owner_pid | floor)) and
-                ((.reserved | type) == "boolean") and ((.owner_alive | type) == "boolean"))) and
+                ((.reserved | type) == "boolean") and
+                ((.owner_alive | type) == "boolean") and
+                ((.quarantined | type) == "boolean") and
+                ((.scope == null) or (.scope | generation_scope)) and
+                (.quarantined == (.reserved and (.scope == null))))) and
             ((.generations | map(.container_id) | unique | length) == (.generations | length));
 
         (type == "object") and
         ((keys | sort) == ([
-            "concurrent_same_service", "final", "foreign_collision", "owned_failure",
-            "scenario", "schema_version"
+            "build_identity", "concurrent_same_service", "final", "foreign_collision",
+            "owned_failure", "scenario", "schema_version", "scope_identity"
         ] | sort)) and
-        (.schema_version == 1) and
+        (.schema_version == 3) and
         (.scenario == "stack-container-ownership") and
+        ((.build_identity | keys | sort) == (["profile", "test_binary_sha256"] | sort)) and
+        (.build_identity.profile == "release") and
+        (.build_identity.profile == $expected_profile) and
+        (.build_identity.test_binary_sha256 | sha256) and
+        (.build_identity.test_binary_sha256 == $expected_test_binary_sha256) and
+        (.scope_identity == {
+            "kind": "synthetic_legacy_compatibility",
+            "topology_authoritative": false
+        }) and
 
         (.concurrent_same_service as $same |
             (($same | keys | sort) == (["barrier", "lifecycle", "service_name", "stacks"] | sort)) and
@@ -1739,9 +1830,12 @@ validate_stack_container_ownership_evidence() {
                 (.guest.owner == (.stack_id + "-db")) and
                 (.container_id as $id | .stack_id as $stack |
                     any($same.lifecycle.container_route_pairs[]; . == [$id, $stack])) and
-                (.ownership.generation as $generation | .container_id as $id |
+                (.ownership as $token |
                     any($same.lifecycle.generations[];
-                        .container_id == $id and .generation == $generation and .reserved == true))))
+                        .container_id == $token.container_id and
+                        .generation == $token.generation and
+                        .scope == $token.scope and
+                        .reserved == true and .quarantined == false))))
         ) and
 
         (.owned_failure as $owned |
@@ -1763,7 +1857,9 @@ validate_stack_container_ownership_evidence() {
             ($owned.failure_token as $token |
                 any($owned.failed_lifecycle.generations[];
                     .container_id == $token.container_id and
-                    .generation == $token.generation and .reserved == true)) and
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == true and .quarantined == false)) and
             ($owned.failure_token as $token |
                 any($owned.failed_lifecycle.container_route_pairs[];
                     . == [$token.container_id, $token.stack_id])) and
@@ -1787,12 +1883,22 @@ validate_stack_container_ownership_evidence() {
                     (all($removed.lifecycle.container_route_pairs[]; .[0] != $token.container_id)) and
                     any($removed.lifecycle.generations[];
                         .container_id == $token.container_id and
-                        .generation == $token.generation and .reserved == false))) and
+                        .generation == $token.generation and
+                        .scope == $token.scope and
+                        .reserved == false and .quarantined == false))) and
             ($owned.replacement_token | ownership) and ($owned.replacement_guest | guest) and
             ($owned.replacement_lifecycle | lifecycle) and
             ($owned.replacement_token.container_id == $owned.failure_token.container_id) and
             ($owned.replacement_token.stack_id == $owned.failure_token.stack_id) and
             ($owned.replacement_token.generation > $owned.failure_token.generation) and
+            ($owned.replacement_token.scope.project_id == $owned.failure_token.scope.project_id) and
+            ($owned.replacement_token.scope.environment_id == $owned.failure_token.scope.environment_id) and
+            ($owned.replacement_token.scope.machine_id == $owned.failure_token.scope.machine_id) and
+            ($owned.replacement_token.scope.machine_incarnation_id ==
+                $owned.failure_token.scope.machine_incarnation_id) and
+            ($owned.replacement_token.scope.stack_id == $owned.failure_token.scope.stack_id) and
+            ($owned.replacement_token.scope.reservation_id !=
+                $owned.failure_token.scope.reservation_id) and
             ($owned.replacement_guest.owner == "owned-generation-b") and
             ($owned.replacement_guest != $owned.failed_guest) and
             ($owned.replacement_token as $token |
@@ -1800,7 +1906,9 @@ validate_stack_container_ownership_evidence() {
                     . == [$token.container_id, $token.stack_id]) and
                 any($owned.replacement_lifecycle.generations[];
                     .container_id == $token.container_id and
-                    .generation == $token.generation and .reserved == true))
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == true and .quarantined == false))
         ) and
 
         (.foreign_collision as $foreign |
@@ -1827,13 +1935,20 @@ validate_stack_container_ownership_evidence() {
             ($foreign.owner_token as $token |
                 any($foreign.before_lifecycle.container_route_pairs[];
                     . == [$token.container_id, $token.stack_id]) and
+                any($foreign.before_lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == true and .quarantined == false) and
                 any($foreign.after_lifecycle.container_route_pairs[];
                     . == [$token.container_id, $token.stack_id]) and
                 all($foreign.after_lifecycle.container_route_pairs[];
                     .[0] != $token.container_id or .[1] != $foreign.contender_stack_id) and
                 any($foreign.after_lifecycle.generations[];
                     .container_id == $token.container_id and
-                    .generation == $token.generation and .reserved == true))
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == true and .quarantined == false))
         ) and
 
         (.final as $final |
@@ -1852,7 +1967,26 @@ validate_stack_container_ownership_evidence() {
             ($final.lifecycle.overlay_cleanup_pending == 0) and ($final.lifecycle.rootfs_directories == 0) and
             ([$final.tested_container_ids[] as $id |
                 any($final.lifecycle.generations[];
-                    .container_id == $id and .reserved == false)] | all)
+                    .container_id == $id and .reserved == false and
+                    .scope != null and .quarantined == false)] | all) and
+            ([.concurrent_same_service.stacks[] as $stack |
+                any($final.lifecycle.generations[];
+                    .container_id == $stack.ownership.container_id and
+                    .generation == $stack.ownership.generation and
+                    .scope == $stack.ownership.scope and
+                    .reserved == false and .quarantined == false)] | all) and
+            (.owned_failure.replacement_token as $token |
+                any($final.lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == false and .quarantined == false)) and
+            (.foreign_collision.owner_token as $token |
+                any($final.lifecycle.generations[];
+                    .container_id == $token.container_id and
+                    .generation == $token.generation and
+                    .scope == $token.scope and
+                    .reserved == false and .quarantined == false))
         )
     ' "$evidence_file" >/dev/null
 }
@@ -2086,6 +2220,7 @@ run_and_log() {
     local log_file="$RUN_DIR/${label}.log"
     local cmd_env=()
     local exec_supervision_test_binary_sha256=""
+    local stack_ownership_test_binary_sha256=""
     local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
@@ -2127,9 +2262,16 @@ run_and_log() {
             cmd_env+=("VZ_STACK_TEARDOWN_EVIDENCE=$STACK_TEARDOWN_EVIDENCE")
         fi
         if [[ "$label" == "stack" || "$label" == "stack-container-ownership" ]]; then
+            if [[ "$PROFILE" != "release" ]]; then
+                echo "stack container-ownership evidence cannot run under profile '$PROFILE'" >&2
+                return 109
+            fi
+            stack_ownership_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
             rm -f "$STACK_CONTAINER_OWNERSHIP_EVIDENCE"
             rm -f "$STACK_CONTAINER_OWNERSHIP_SHA256"
             cmd_env+=("VZ_STACK_CONTAINER_OWNERSHIP_EVIDENCE=$STACK_CONTAINER_OWNERSHIP_EVIDENCE")
+            cmd_env+=("VZ_STACK_OWNERSHIP_BUILD_PROFILE=$PROFILE")
+            cmd_env+=("VZ_STACK_OWNERSHIP_TEST_BINARY_SHA256=$stack_ownership_test_binary_sha256")
         fi
         if [[ "$label" == "stack" || "$label" == "environment-lifecycle-journal-linux-vm" ]]; then
             rm -f "$ENVIRONMENT_LIFECYCLE_EVIDENCE"
@@ -2280,7 +2422,10 @@ run_and_log() {
     if [[ $status -eq 0 ]] && [[ "$suite" == "stack" ]] \
         && [[ "$label" == "stack" || "$label" == "stack-container-ownership" ]]; then
         if [[ ! -f "$STACK_CONTAINER_OWNERSHIP_EVIDENCE" ]] \
-            || ! validate_stack_container_ownership_evidence "$STACK_CONTAINER_OWNERSHIP_EVIDENCE"; then
+            || ! validate_stack_container_ownership_evidence \
+                "$STACK_CONTAINER_OWNERSHIP_EVIDENCE" \
+                "$PROFILE" \
+                "$stack_ownership_test_binary_sha256"; then
             echo "stack container-ownership evidence is missing, malformed, or violates generation ownership" >&2
             return 97
         fi

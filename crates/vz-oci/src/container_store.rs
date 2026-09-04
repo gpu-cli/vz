@@ -8,6 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use vz_runtime_contract::ContainerGenerationScope;
 
 /// Kernel-backed per-container lifecycle lease.
 ///
@@ -87,14 +88,23 @@ pub struct ContainerGenerationDiagnostic {
     pub owner_pid: u32,
     /// Best-effort current liveness of `owner_pid`.
     pub owner_alive: bool,
+    /// Exact topology reservation persisted with this generation.
+    ///
+    /// `None` identifies a legacy/unscoped generation. Such a record is
+    /// quarantined and must never authorize scoped cleanup or adoption.
+    pub scope: Option<ContainerGenerationScope>,
+    /// Whether this reserved generation lacks scope and is quarantined.
+    pub quarantined: bool,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GenerationRecord {
     generation: u64,
     reserved: bool,
     #[serde(default)]
     owner_pid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope: Option<ContainerGenerationScope>,
 }
 
 impl ContainerStore {
@@ -191,7 +201,7 @@ impl ContainerStore {
     /// A stopped record still owns its name until explicit removal. This preserves
     /// the stop + remove + same-name recreate contract while rejecting duplicates.
     pub fn reserve_generation(&self, id: &str) -> io::Result<ContainerGeneration> {
-        self.reserve_generation_inner(id, false)
+        self.reserve_generation_inner(id, None, false)
     }
 
     /// Reserve a generation while holding this ID's exclusive OS lifecycle lease.
@@ -210,12 +220,32 @@ impl ContainerStore {
                 format!("exclusive lifecycle lease does not belong to container '{id}'"),
             ));
         }
-        self.reserve_generation_inner(id, true)
+        self.reserve_generation_inner(id, None, true)
+    }
+
+    /// Reserve a generation and atomically bind its exact topology scope.
+    pub fn reserve_scoped_generation_with_write_lease(
+        &self,
+        id: &str,
+        scope: &ContainerGenerationScope,
+        lease: &ContainerIdLease,
+    ) -> io::Result<ContainerGeneration> {
+        scope
+            .validate()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        if !lease.exclusive || lease.lock_path != self.container_lease_path(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("exclusive lifecycle lease does not belong to container '{id}'"),
+            ));
+        }
+        self.reserve_generation_inner(id, Some(scope), true)
     }
 
     fn reserve_generation_inner(
         &self,
         id: &str,
+        scope: Option<&ContainerGenerationScope>,
         reclaim_unpublished: bool,
     ) -> io::Result<ContainerGeneration> {
         let _lock = self.lock()?;
@@ -227,15 +257,32 @@ impl ContainerStore {
         }
 
         let mut records = self.load_generations()?;
-        if !reclaim_unpublished
-            && records.get(id).is_some_and(|record| {
-                record.reserved && record.owner_pid != 0 && is_process_alive(record.owner_pid)
-            })
+        if let Some(record) = records.get_mut(id)
+            && record.reserved
         {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("container '{id}' already has an in-flight generation"),
-            ));
+            let same_scope = record.scope.as_ref() == scope;
+            if same_scope && scope.is_some() && reclaim_unpublished {
+                // The caller holds the stable per-ID OS lease, so no original
+                // writer remains. Replaying the exact reservation after a
+                // crash must recover its authority rather than silently mint
+                // a replacement generation for the same reservation ID.
+                let generation = ContainerGeneration(record.generation);
+                record.owner_pid = std::process::id();
+                self.write_generations(&records)?;
+                return Ok(generation);
+            }
+            let active_owner = record.owner_pid != 0 && is_process_alive(record.owner_pid);
+            if !same_scope || (!reclaim_unpublished && active_owner) {
+                let reason = if !same_scope {
+                    "owned by a different or legacy-unscoped reservation"
+                } else {
+                    "already has an in-flight generation"
+                };
+                return Err(io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("container '{id}' {reason}"),
+                ));
+            }
         }
         let generation = records
             .get(id)
@@ -246,6 +293,7 @@ impl ContainerStore {
                 generation,
                 reserved: true,
                 owner_pid: std::process::id(),
+                scope: scope.cloned(),
             },
         );
         self.write_generations(&records)?;
@@ -271,6 +319,7 @@ impl ContainerStore {
                 generation: 1,
                 reserved: true,
                 owner_pid: std::process::id(),
+                scope: None,
             },
         );
         self.write_generations(&records)?;
@@ -283,16 +332,22 @@ impl ContainerStore {
         let mut diagnostics: Vec<_> = self
             .load_generations()?
             .into_iter()
-            .map(|(container_id, record)| ContainerGenerationDiagnostic {
-                container_id,
-                generation: ContainerGeneration(record.generation),
-                reserved: record.reserved,
-                owner_pid: record.owner_pid,
-                owner_alive: record.owner_pid != 0 && is_process_alive(record.owner_pid),
-            })
-            .collect();
+            .map(|(container_id, record)| generation_diagnostic(container_id, record))
+            .collect::<io::Result<_>>()?;
         diagnostics.sort_by(|left, right| left.container_id.cmp(&right.container_id));
         Ok(diagnostics)
+    }
+
+    /// Load one durable generation record for ownership validation.
+    pub fn generation_diagnostic(
+        &self,
+        id: &str,
+    ) -> io::Result<Option<ContainerGenerationDiagnostic>> {
+        let _lock = self.lock()?;
+        self.load_generations()?
+            .remove(id)
+            .map(|record| generation_diagnostic(id.to_string(), record))
+            .transpose()
     }
 
     /// Update metadata only while `generation` still owns `container.id`.
@@ -363,7 +418,7 @@ impl ContainerStore {
     }
 
     fn require_generation(&self, id: &str, generation: ContainerGeneration) -> io::Result<()> {
-        let current = self.load_generations()?.get(id).copied();
+        let current = self.load_generations()?.get(id).cloned();
         if current.is_some_and(|record| record.reserved && record.generation == generation.0) {
             return Ok(());
         }
@@ -511,57 +566,57 @@ impl ContainerStore {
     }
 }
 
-/// RAII guard for an exclusive file lock.
+fn generation_diagnostic(
+    container_id: String,
+    record: GenerationRecord,
+) -> io::Result<ContainerGenerationDiagnostic> {
+    if let Some(scope) = &record.scope {
+        scope.validate().map_err(|reason| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "container '{container_id}' has invalid persisted generation scope: {reason}"
+                ),
+            )
+        })?;
+    }
+    let quarantined = record.reserved && record.scope.is_none();
+    Ok(ContainerGenerationDiagnostic {
+        container_id,
+        generation: ContainerGeneration(record.generation),
+        reserved: record.reserved,
+        owner_pid: record.owner_pid,
+        owner_alive: record.owner_pid != 0 && is_process_alive(record.owner_pid),
+        scope: record.scope,
+        quarantined,
+    })
+}
+
+/// RAII guard for the store-wide advisory lock.
 ///
-/// Uses `File::create_new` (O_EXCL) to atomically create a lock file. The
-/// lock is released by deleting the file when the guard is dropped.
+/// The lock file is persistent and never unlinked, keeping a stable inode so
+/// independent processes cannot split into different lock domains.
 struct FileLock {
-    path: PathBuf,
+    file: File,
 }
 
 impl FileLock {
-    /// Acquire an exclusive lock, spinning with backoff until available.
+    /// Acquire an exclusive advisory lock.
     fn acquire(path: &Path) -> io::Result<Self> {
-        let mut elapsed = std::time::Duration::ZERO;
-        let timeout = std::time::Duration::from_secs(30);
-        let poll = std::time::Duration::from_millis(10);
-
-        loop {
-            match File::create_new(path) {
-                Ok(_file) => {
-                    return Ok(Self {
-                        path: path.to_path_buf(),
-                    });
-                }
-                Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {
-                    if elapsed >= timeout {
-                        // Stale lock — force remove and retry once.
-                        let _ = fs::remove_file(path);
-                        if File::create_new(path).is_ok() {
-                            return Ok(Self {
-                                path: path.to_path_buf(),
-                            });
-                        }
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            format!(
-                                "timed out acquiring container store lock: {}",
-                                path.display()
-                            ),
-                        ));
-                    }
-                    std::thread::sleep(poll);
-                    elapsed += poll;
-                }
-                Err(e) => return Err(e),
-            }
-        }
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        fs2::FileExt::lock_exclusive(&file)?;
+        Ok(Self { file })
     }
 }
 
 impl Drop for FileLock {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let _ = fs2::FileExt::unlock(&self.file);
     }
 }
 
@@ -577,7 +632,17 @@ fn write_atomic(destination: &Path, bytes: &[u8]) -> io::Result<()> {
         file.sync_all()?;
     }
 
-    fs::rename(&tmp, destination)
+    fs::rename(&tmp, destination)?;
+
+    // Renaming an fsynced temporary file makes its contents atomic, but the
+    // directory entry itself is not durable across power loss until the parent
+    // directory is synced as well.
+    #[cfg(unix)]
+    if let Some(parent) = destination.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+
+    Ok(())
 }
 
 /// Check if a process with the given PID is alive.
@@ -879,6 +944,143 @@ mod tests {
             rootfs_path: None,
             host_pid: None,
         }
+    }
+
+    fn generation_scope(reservation_id: &str, stack_id: &str) -> ContainerGenerationScope {
+        ContainerGenerationScope {
+            reservation_id: reservation_id.to_string(),
+            project_id: vz_runtime_contract::ProjectId::new("prj_store").unwrap(),
+            environment_id: vz_runtime_contract::EnvironmentId::new("env_store").unwrap(),
+            machine_id: vz_runtime_contract::MachineId::new("mch_store").unwrap(),
+            machine_incarnation_id: Some(
+                vz_runtime_contract::MachineIncarnationId::new("inc_store").unwrap(),
+            ),
+            stack_id: stack_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn scoped_generation_round_trips_across_reopen_without_temp_file() {
+        let root = unique_temp_dir("generation-scoped-roundtrip");
+        let scope = generation_scope("reservation-a", "stack-a");
+        let generation = {
+            let store = ContainerStore::new(root.clone());
+            let lease = store.try_acquire_container_write_lease("scoped").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("scoped", &scope, &lease)
+                .unwrap()
+        };
+
+        let reopened = ContainerStore::new(root.clone());
+        let diagnostic = reopened.generation_diagnostic("scoped").unwrap().unwrap();
+        assert_eq!(diagnostic.generation, generation);
+        assert_eq!(diagnostic.scope, Some(scope));
+        assert!(diagnostic.reserved);
+        assert!(!diagnostic.quarantined);
+        assert!(
+            fs::read_dir(root)
+                .unwrap()
+                .filter_map(Result::ok)
+                .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
+        );
+    }
+
+    #[test]
+    fn diagnostics_reject_every_malformed_persisted_scoped_record() {
+        let root = unique_temp_dir("generation-malformed-scope");
+        let store = ContainerStore::new(root);
+        fs::write(
+            store.generations_path(),
+            br#"{
+                "malformed": {
+                    "generation": 7,
+                    "reserved": true,
+                    "owner_pid": 0,
+                    "scope": {
+                        "reservation_id": "reservation-malformed",
+                        "project_id": "not/valid",
+                        "environment_id": "env_store",
+                        "machine_id": "mch_store",
+                        "machine_incarnation_id": "inc_store",
+                        "stack_id": "stack-a"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        for error in [
+            store.generation_diagnostics().unwrap_err(),
+            store.generation_diagnostic("malformed").unwrap_err(),
+        ] {
+            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+            assert!(
+                error
+                    .to_string()
+                    .contains("invalid persisted generation scope")
+            );
+            assert!(error.to_string().contains("project_id"));
+        }
+    }
+
+    #[test]
+    fn legacy_unscoped_generation_is_quarantined_and_rejects_scoped_replacement() {
+        let root = unique_temp_dir("generation-legacy-quarantine");
+        let store = ContainerStore::new(root);
+        let generation = store.reserve_generation("legacy").unwrap();
+        let diagnostic = store.generation_diagnostic("legacy").unwrap().unwrap();
+        assert_eq!(diagnostic.generation, generation);
+        assert_eq!(diagnostic.scope, None);
+        assert!(diagnostic.quarantined);
+
+        let lease = store.try_acquire_container_write_lease("legacy").unwrap();
+        let error = store
+            .reserve_scoped_generation_with_write_lease(
+                "legacy",
+                &generation_scope("reservation-a", "stack-a"),
+                &lease,
+            )
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(
+            store.current_generation("legacy").unwrap(),
+            Some(generation)
+        );
+    }
+
+    #[test]
+    fn scoped_generation_rejects_foreign_replacement_and_allows_exact_recovery() {
+        let root = unique_temp_dir("generation-scoped-replacement");
+        let store = ContainerStore::new(root);
+        let scope = generation_scope("reservation-a", "stack-a");
+        let first = {
+            let lease = store.try_acquire_container_write_lease("scoped").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("scoped", &scope, &lease)
+                .unwrap()
+        };
+
+        let mut foreign = scope.clone();
+        foreign.environment_id = vz_runtime_contract::EnvironmentId::new("env_foreign").unwrap();
+        let lease = store.try_acquire_container_write_lease("scoped").unwrap();
+        let error = store
+            .reserve_scoped_generation_with_write_lease("scoped", &foreign, &lease)
+            .unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(store.current_generation("scoped").unwrap(), Some(first));
+
+        let recovered = store
+            .reserve_scoped_generation_with_write_lease("scoped", &scope, &lease)
+            .unwrap();
+        assert_eq!(recovered, first);
+        assert_eq!(
+            store
+                .generation_diagnostic("scoped")
+                .unwrap()
+                .unwrap()
+                .scope,
+            Some(scope)
+        );
     }
 
     #[test]

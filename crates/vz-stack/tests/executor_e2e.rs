@@ -93,6 +93,60 @@ impl ContainerRuntime for MockRuntime {
         Ok(())
     }
 
+    fn create_in_sandbox_owned(
+        &self,
+        sandbox_id: &str,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        self.create_in_sandbox(sandbox_id, image, config)
+            .map(|container_id| vz_runtime_contract::ContainerCreateReceipt {
+                ownership: Some(vz_runtime_contract::ContainerGenerationOwnership {
+                    container_id: container_id.clone(),
+                    generation: 1,
+                    stack_id: sandbox_id.to_string(),
+                    scope: Some(Box::new(
+                        vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack(
+                            sandbox_id,
+                        )
+                        .expect("test sandbox ID must form a valid legacy scope"),
+                    )),
+                }),
+                container_id,
+            })
+            .map_err(|error| vz_runtime_contract::OwnedCreateError {
+                error,
+                cleanup: None,
+            })
+    }
+
+    fn cleanup_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        self.calls.lock().unwrap().push((
+            "cleanup_container_generation".into(),
+            ownership.container_id,
+        ));
+        Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed)
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        _signal: Option<&str>,
+        _grace_period: Option<std::time::Duration>,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        self.calls.lock().unwrap().push((
+            "stop_and_remove_container_generation".into(),
+            ownership.container_id,
+        ));
+        Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed)
+    }
+
     fn exec(&self, container_id: &str, command: &[String]) -> Result<i32, StackError> {
         self.calls.lock().unwrap().push((
             "exec".into(),
@@ -256,12 +310,14 @@ fn full_pipeline_up_then_down() {
         "all services should be stopped: {observed:?}"
     );
 
-    // Verify runtime calls include stop + remove.
+    // Verify runtime calls use exact generation-qualified cleanup.
     let calls = executor.runtime().call_log();
-    let stop_count = calls.iter().filter(|(op, _)| op == "stop").count();
-    let remove_count = calls.iter().filter(|(op, _)| op == "remove").count();
-    assert_eq!(stop_count, 2);
-    assert_eq!(remove_count, 2);
+    let cleanup_count = calls
+        .iter()
+        .filter(|(op, _)| op == "stop_and_remove_container_generation")
+        .count();
+    assert_eq!(cleanup_count, 2);
+    assert!(!calls.iter().any(|(op, _)| op == "stop" || op == "remove"));
 }
 
 // ── Health check integration ────────────────────────────────────

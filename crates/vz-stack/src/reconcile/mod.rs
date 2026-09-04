@@ -200,9 +200,10 @@ pub fn apply(
                     .iter()
                     .find(|state| state.service_name == *service_name)
                     .and_then(|state| state.failed_create_ownership.clone());
-                let existing_cid = failed_create_ownership
-                    .as_ref()
-                    .map(|ownership| ownership.container_id.clone());
+                let existing_cid = observed
+                    .iter()
+                    .find(|state| state.service_name == *service_name)
+                    .and_then(|state| state.container_id.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {

@@ -1,6 +1,68 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
+
+use super::{EnvironmentId, MachineId, MachineIncarnationId, ProjectId};
+
+/// Exact topology and operation scope that admits one container generation.
+///
+/// `reservation_id` is allocated before the runtime call. It lets recovery
+/// distinguish a retried create from an older reservation even when every
+/// human-facing name is reused.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ContainerGenerationScope {
+    /// Unique, immutable identifier for this create reservation.
+    pub reservation_id: String,
+    /// Owning Project identity.
+    pub project_id: ProjectId,
+    /// Owning Developer Environment identity.
+    pub environment_id: EnvironmentId,
+    /// Owning Machine identity.
+    pub machine_id: MachineId,
+    /// Machine incarnation active when the generation was admitted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub machine_incarnation_id: Option<MachineIncarnationId>,
+    /// Stack identity within the owning Machine.
+    pub stack_id: String,
+}
+
+impl ContainerGenerationScope {
+    /// Mint an explicitly synthetic topology scope for the pre-topology stack API.
+    ///
+    /// This exists only to keep legacy stack-name callers on the exact scoped
+    /// generation path while topology identity is plumbed through those callers.
+    /// Every invocation receives a fresh reservation identity.
+    pub fn synthetic_legacy_stack(stack_id: &str) -> Result<Self, String> {
+        validate_text("stack_id", stack_id)?;
+        let scope = Self {
+            reservation_id: format!("legacy-stack-compat-{}", Uuid::new_v4().simple()),
+            project_id: ProjectId::new("prj_synthetic_legacy_stack_compat")
+                .map_err(|error| error.to_string())?,
+            environment_id: EnvironmentId::new("env_synthetic_legacy_stack_compat")
+                .map_err(|error| error.to_string())?,
+            machine_id: MachineId::new("mch_synthetic_legacy_stack_compat")
+                .map_err(|error| error.to_string())?,
+            machine_incarnation_id: None,
+            stack_id: stack_id.to_string(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+
+    /// Validate fields whose typed wrappers may have come from untrusted JSON.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_text("reservation_id", &self.reservation_id)?;
+        ProjectId::new(self.project_id.as_str()).map_err(|error| error.to_string())?;
+        EnvironmentId::new(self.environment_id.as_str()).map_err(|error| error.to_string())?;
+        MachineId::new(self.machine_id.as_str()).map_err(|error| error.to_string())?;
+        if let Some(incarnation_id) = &self.machine_incarnation_id {
+            MachineIncarnationId::new(incarnation_id.as_str())
+                .map_err(|error| error.to_string())?;
+        }
+        validate_text("stack_id", &self.stack_id)
+    }
+}
 
 /// Runtime-issued proof that one stack reserved a specific container-ID generation.
 ///
@@ -15,6 +77,42 @@ pub struct ContainerGenerationOwnership {
     pub generation: u64,
     /// Stack/sandbox scope that reserved the generation.
     pub stack_id: String,
+    /// Exact topology reservation that admitted this generation.
+    ///
+    /// Missing scope is accepted only while decoding legacy records. It never
+    /// authorizes cleanup or adoption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope: Option<Box<ContainerGenerationScope>>,
+}
+
+impl ContainerGenerationOwnership {
+    /// Validate that the ownership envelope names the exact durable scope.
+    pub fn validate(&self) -> Result<(), String> {
+        validate_text("container_id", &self.container_id)?;
+        if self.generation == 0 {
+            return Err(
+                "container generation ownership must name a non-zero generation".to_string(),
+            );
+        }
+        let scope = self.scope.as_ref().ok_or_else(|| {
+            "container generation ownership is legacy-unscoped and quarantined".to_string()
+        })?;
+        scope.validate()?;
+        if self.stack_id != scope.stack_id {
+            return Err(
+                "container generation ownership stack_id disagrees with durable scope".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+fn validate_text(field: &str, value: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.len() > 128 {
+        return Err(format!("{field} must contain 1..=128 non-blank bytes"));
+    }
+    Ok(())
 }
 
 /// Successful container creation result with optional generation ownership proof.

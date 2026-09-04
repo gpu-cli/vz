@@ -509,9 +509,17 @@ fn poller_pass_marks_service_ready() {
         }],
     );
 
-    store
-        .save_observed_state("app", &running_obs("web", "ctr-1"))
-        .unwrap();
+    let mut running = running_obs("web", "ctr-1");
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: "ctr-1".to_string(),
+        generation: 5,
+        stack_id: "app".to_string(),
+        scope: Some(Box::new(
+            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("app").unwrap(),
+        )),
+    };
+    running.failed_create_ownership = Some(ownership.clone());
+    store.save_observed_state("app", &running).unwrap();
 
     let mut poller = HealthPoller::new();
     let result = poller.poll_all(&runtime, &store, &spec).unwrap();
@@ -525,6 +533,7 @@ fn poller_pass_marks_service_ready() {
     let web = observed.iter().find(|o| o.service_name == "web").unwrap();
     assert!(web.ready);
     assert_eq!(web.phase, ServicePhase::Running);
+    assert_eq!(web.failed_create_ownership, Some(ownership));
 
     // Event emitted.
     let events = store.load_events("app").unwrap();

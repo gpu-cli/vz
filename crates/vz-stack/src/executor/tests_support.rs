@@ -19,6 +19,10 @@ pub struct MockContainerRuntime {
     pub fail_create: bool,
     /// Whether a failed create was admitted and owns a durable generation.
     pub claim_failed_create_ownership: bool,
+    /// Whether a claimed failed-create proof should emulate legacy unscoped data.
+    pub omit_failed_create_ownership_scope: bool,
+    /// Whether successful creates should emulate a legacy ownership-less runtime.
+    pub omit_successful_create_ownership: bool,
     /// Generation reported for admitted failed creates.
     pub failed_create_generation: u64,
     /// Runtime-ID substitutions used to exercise malformed ownership responses.
@@ -63,6 +67,8 @@ impl MockContainerRuntime {
             fail_pull: false,
             fail_create: false,
             claim_failed_create_ownership: false,
+            omit_failed_create_ownership_scope: false,
+            omit_successful_create_ownership: false,
             failed_create_generation: 41,
             failed_create_ownership_id_overrides: Mutex::new(HashMap::new()),
             fail_generation_cleanup: false,
@@ -282,9 +288,24 @@ impl ContainerRuntime for MockContainerRuntime {
     > {
         let requested_id = config.container_id.clone();
         self.create_in_sandbox(sandbox_id, image, config)
-            .map(|container_id| vz_runtime_contract::ContainerCreateReceipt {
-                container_id,
-                ownership: None,
+            .map(|container_id| {
+                let ownership = (!self.omit_successful_create_ownership).then(|| {
+                    vz_runtime_contract::ContainerGenerationOwnership {
+                        container_id: container_id.clone(),
+                        generation: 1,
+                        stack_id: sandbox_id.to_string(),
+                        scope: Some(Box::new(
+                            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack(
+                                sandbox_id,
+                            )
+                            .expect("test sandbox ID must form a valid legacy scope"),
+                        )),
+                    }
+                });
+                vz_runtime_contract::ContainerCreateReceipt {
+                    container_id,
+                    ownership,
+                }
             })
             .map_err(|error| vz_runtime_contract::OwnedCreateError {
                 error,
@@ -302,6 +323,14 @@ impl ContainerRuntime for MockContainerRuntime {
                         container_id,
                         generation: self.failed_create_generation,
                         stack_id: sandbox_id.to_string(),
+                        scope: (!self.omit_failed_create_ownership_scope).then(|| {
+                            Box::new(
+                                vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack(
+                                    sandbox_id,
+                                )
+                                .expect("test sandbox ID must form a valid legacy scope"),
+                            )
+                        }),
                     }
                 }),
             })
@@ -316,6 +345,35 @@ impl ContainerRuntime for MockContainerRuntime {
             format!(
                 "{}:{}:{}",
                 ownership.stack_id, ownership.container_id, ownership.generation
+            ),
+        ));
+        if self.fail_generation_cleanup {
+            return Err(StackError::InvalidSpec(
+                "mock generation cleanup failure".to_string(),
+            ));
+        }
+        if self.generation_cleanup_already_absent {
+            Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent)
+        } else {
+            Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed)
+        }
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        self.calls.lock().unwrap().push((
+            "stop_and_remove_container_generation".to_string(),
+            format!(
+                "{}:{}:{}:signal={}:grace_ms={}",
+                ownership.stack_id,
+                ownership.container_id,
+                ownership.generation,
+                signal.unwrap_or("<default>"),
+                grace_period.map_or(0, |duration| duration.as_millis())
             ),
         ));
         if self.fail_generation_cleanup {

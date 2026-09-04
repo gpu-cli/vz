@@ -306,6 +306,7 @@ impl ContainerRuntime for DaemonContainerRuntime {
         })
     }
 
+    #[allow(clippy::result_large_err)]
     fn create_in_sandbox_owned(
         &self,
         sandbox_id: &str,
@@ -320,7 +321,7 @@ impl ContainerRuntime for DaemonContainerRuntime {
                 .block_on(
                     self.daemon
                         .manager()
-                        .create_stack_container_owned(sandbox_id, image, config),
+                        .create_legacy_stack_container_owned(sandbox_id, image, config),
                 )
                 .map_err(|failure| {
                     failure.map_error(|error| map_runtime_error("create_in_sandbox", error))
@@ -340,6 +341,23 @@ impl ContainerRuntime for DaemonContainerRuntime {
                         .cleanup_container_generation(ownership),
                 )
                 .map_err(|error| map_runtime_error("cleanup_container_generation", error))
+        })
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        signal: Option<&str>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.daemon.manager().stop_and_remove_container_generation(
+                    ownership,
+                    signal.map(str::to_string),
+                    grace_period,
+                ))
+                .map_err(|error| map_runtime_error("stop_and_remove_container_generation", error))
         })
     }
 

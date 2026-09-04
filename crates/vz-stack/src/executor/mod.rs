@@ -152,24 +152,25 @@ pub trait ContainerRuntime: Send + Sync {
 
     /// Create a container while retaining runtime-issued generation ownership
     /// when the create fails after admission.
+    // Keep the structured StackError and ownership proof together across this
+    // public compatibility boundary; boxing here would infect every runtime
+    // adapter while the topology-native streaming API is being introduced.
+    #[allow(clippy::result_large_err)]
     fn create_in_sandbox_owned(
         &self,
-        sandbox_id: &str,
-        image: &str,
-        config: vz_runtime_contract::RunConfig,
+        _sandbox_id: &str,
+        _image: &str,
+        _config: vz_runtime_contract::RunConfig,
     ) -> Result<
         vz_runtime_contract::ContainerCreateReceipt,
         vz_runtime_contract::OwnedCreateError<StackError>,
     > {
-        self.create_in_sandbox(sandbox_id, image, config)
-            .map(|container_id| vz_runtime_contract::ContainerCreateReceipt {
-                container_id,
-                ownership: None,
-            })
-            .map_err(|error| vz_runtime_contract::OwnedCreateError {
-                error,
-                cleanup: None,
-            })
+        Err(vz_runtime_contract::OwnedCreateError::unowned(
+            StackError::Network(
+                "unsupported_operation: surface=stack; operation=create_in_sandbox_owned; reason=runtime cannot issue generation ownership"
+                    .to_string(),
+            ),
+        ))
     }
 
     /// Remove only the exact failed-create generation named by `ownership`.
@@ -179,6 +180,19 @@ pub trait ContainerRuntime: Send + Sync {
     ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
         Err(StackError::Network(
             "unsupported_operation: surface=stack; operation=cleanup_container_generation; reason=runtime did not issue generation ownership"
+                .to_string(),
+        ))
+    }
+
+    /// Gracefully stop and remove exactly the successful generation named by `ownership`.
+    fn stop_and_remove_container_generation(
+        &self,
+        _ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        _signal: Option<&str>,
+        _grace_period: Option<std::time::Duration>,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=stop_and_remove_container_generation; reason=runtime did not issue generation ownership"
                 .to_string(),
         ))
     }

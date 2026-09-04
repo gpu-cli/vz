@@ -256,6 +256,9 @@ fn lifecycle_inventory(diagnostics: &RuntimeLifecycleDiagnostics) -> serde_json:
                 "generation": generation.generation.0,
                 "reserved": generation.reserved,
                 "owner_pid": generation.owner_pid,
+                "scope": serde_json::to_value(&generation.scope)
+                    .expect("generation scope should serialize"),
+                "quarantined": generation.quarantined,
                 // An unreserved generation has no active owner even when its
                 // historical owner PID is this still-running test process.
                 "owner_alive": generation.reserved && generation.owner_alive,
@@ -493,6 +496,34 @@ fn ownership_json(ownership: &ContainerGenerationOwnership) -> serde_json::Value
         "container_id": ownership.container_id,
         "generation": ownership.generation,
         "stack_id": ownership.stack_id,
+        "scope": serde_json::to_value(&ownership.scope)
+            .expect("generation ownership scope should serialize"),
+    })
+}
+
+fn stack_ownership_build_identity() -> serde_json::Value {
+    let profile = std::env::var("VZ_STACK_OWNERSHIP_BUILD_PROFILE")
+        .expect("strict ownership harness must provide the build profile");
+    assert_eq!(
+        profile, "release",
+        "stack ownership evidence cannot be emitted by a non-release build"
+    );
+    let test_binary_sha256 = std::env::var("VZ_STACK_OWNERSHIP_TEST_BINARY_SHA256")
+        .expect("strict ownership harness must provide the test-binary digest");
+    assert_eq!(
+        test_binary_sha256.len(),
+        64,
+        "test-binary digest must be lowercase SHA-256"
+    );
+    assert!(
+        test_binary_sha256
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+        "test-binary digest must be lowercase SHA-256"
+    );
+    serde_json::json!({
+        "profile": profile,
+        "test_binary_sha256": test_binary_sha256,
     })
 }
 
@@ -727,7 +758,7 @@ impl ContainerRuntime for OciContainerRuntime {
             self.handle
                 .block_on(
                     self.backend
-                        .create_container_in_stack_owned(sandbox_id, image, config),
+                        .create_container_in_stack_owned_legacy(sandbox_id, image, config),
                 )
                 .map_err(|failure| failure.map_error(StackError::from))
         })
@@ -740,6 +771,23 @@ impl ContainerRuntime for OciContainerRuntime {
         tokio::task::block_in_place(|| {
             self.handle
                 .block_on(self.backend.cleanup_container_generation(ownership))
+                .map_err(StackError::from)
+        })
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+    ) -> Result<GenerationCleanupOutcome, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.stop_and_remove_container_generation(
+                    ownership,
+                    signal.map(str::to_string),
+                    grace_period,
+                ))
                 .map_err(StackError::from)
         })
     }
@@ -881,6 +929,12 @@ impl ContainerRuntime for StackOwnershipE2eRuntime {
         &self,
         ownership: ContainerGenerationOwnership,
     ) -> Result<GenerationCleanupOutcome, StackError> {
+        let is_injected_failure =
+            self.faults.lock().unwrap().injected_ownership.as_ref() == Some(&ownership);
+        if !is_injected_failure {
+            return self.inner.cleanup_container_generation(ownership);
+        }
+
         let outcome = self.inner.cleanup_container_generation(ownership.clone())?;
         let outcome_name = match outcome {
             GenerationCleanupOutcome::Removed => "removed",
@@ -939,6 +993,21 @@ impl ContainerRuntime for StackOwnershipE2eRuntime {
         }));
         faults.after_remove_before_recreate = Some(checkpoint);
         Ok(outcome)
+    }
+
+    fn stop_and_remove_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+    ) -> Result<GenerationCleanupOutcome, StackError> {
+        let is_injected_failure =
+            self.faults.lock().unwrap().injected_ownership.as_ref() == Some(&ownership);
+        if is_injected_failure {
+            return self.cleanup_container_generation(ownership);
+        }
+        self.inner
+            .stop_and_remove_container_generation(ownership, signal, grace_period)
     }
 
     fn setup_sandbox_network(
@@ -1067,8 +1136,13 @@ async fn stack_container_generation_ownership() {
     let tmp = tempfile::tempdir().unwrap();
 
     let mut evidence = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 3,
         "scenario": "stack-container-ownership",
+        "build_identity": stack_ownership_build_identity(),
+        "scope_identity": {
+            "kind": "synthetic_legacy_compatibility",
+            "topology_authoritative": false,
+        },
         "concurrent_same_service": serde_json::Value::Null,
         "owned_failure": serde_json::Value::Null,
         "foreign_collision": serde_json::Value::Null,
@@ -2135,7 +2209,7 @@ services:
     );
 
     let mut teardown_evidence = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": 2,
         "scenario": "stack-port-forwarding-teardown",
         "stack_id": STACK_ID,
         "host_listener": {
@@ -3047,7 +3121,7 @@ services:
             };
 
             scenario_evidence = Some(serde_json::json!({
-                "schema_version": 1,
+                "schema_version": 2,
                 "scenario": "complex_stack_vm_full_snapshot_fails_closed_without_mutation",
                 "stack_id": "snapshot-stack",
                 "service_container_ids": {

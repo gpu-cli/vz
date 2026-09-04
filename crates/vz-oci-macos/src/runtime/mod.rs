@@ -366,6 +366,7 @@ pub(crate) struct ContainerLifecycleTransaction {
 struct ContainerLifecycleLease {
     container_id: String,
     generation: ContainerGeneration,
+    scope: Option<vz_runtime_contract::ContainerGenerationScope>,
     container_store: ContainerStore,
     _os_guard: ContainerIdLease,
     _stack_guard: Option<OwnedRwLockReadGuard<()>>,
@@ -436,6 +437,10 @@ impl ContainerLifecycleTransaction {
         self.lease().generation
     }
 
+    pub(crate) fn scope(&self) -> Option<&vz_runtime_contract::ContainerGenerationScope> {
+        self.lease().scope.as_ref()
+    }
+
     fn lease(&self) -> &ContainerLifecycleLease {
         match self.lease.as_ref() {
             Some(lease) => lease,
@@ -480,6 +485,11 @@ pub struct Runtime {
     stack_activation_locks: Arc<Mutex<StackActivationLockMap>>,
     container_lifecycle_locks: Arc<Mutex<ContainerLifecycleLockMap>>,
     stack_lifecycle_locks: Arc<Mutex<StackLifecycleLockMap>>,
+    /// Startup ownership-recovery failure that disables every mutating lifecycle admission.
+    ///
+    /// Continuing with an unreadable generation index could reinterpret a shared-stack
+    /// container as standalone and mutate it without durable ownership proof.
+    ownership_mutation_quarantine: Arc<Option<String>>,
     /// Maps container IDs to the stack they belong to (if any).
     ///
     /// Used to determine whether a container's VM is shared and should
@@ -542,6 +552,28 @@ impl Runtime {
         let store = ImageStore::new(config.data_dir.clone());
         let container_store = ContainerStore::new(config.data_dir.clone());
         let puller = ImagePuller::new(store.clone());
+        let (recovered_container_routes, ownership_mutation_quarantine) = match container_store
+            .generation_diagnostics()
+        {
+            Ok(records) => (
+                records
+                    .into_iter()
+                    .filter(|record| record.reserved)
+                    .filter_map(|record| {
+                        record
+                            .scope
+                            .map(|scope| (record.container_id, scope.stack_id))
+                    })
+                    .collect::<HashMap<_, _>>(),
+                None,
+            ),
+            Err(error) => {
+                let reason =
+                    format!("durable container generation ownership is quarantined: {error}");
+                warn!(%error, "could not validate durable container generation ownership; mutating lifecycle operations are disabled");
+                (HashMap::new(), Some(reason))
+            }
+        };
 
         let runtime = Self {
             config,
@@ -553,7 +585,8 @@ impl Runtime {
             stack_activation_locks: Arc::new(Mutex::new(HashMap::new())),
             container_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
             stack_lifecycle_locks: Arc::new(Mutex::new(HashMap::new())),
-            container_stack: Arc::new(Mutex::new(HashMap::new())),
+            ownership_mutation_quarantine: Arc::new(ownership_mutation_quarantine),
+            container_stack: Arc::new(Mutex::new(recovered_container_routes)),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
@@ -569,10 +602,19 @@ impl Runtime {
             lifecycle_observer: Arc::new(std::sync::Mutex::new(None)),
         };
 
-        runtime.reconcile_stale_containers();
-        runtime.cleanup_orphaned_rootfs();
+        if runtime.ownership_mutation_quarantine.is_none() {
+            runtime.reconcile_stale_containers();
+            runtime.cleanup_orphaned_rootfs();
+        }
 
         runtime
+    }
+
+    fn ensure_ownership_mutation_allowed(&self) -> Result<(), OciError> {
+        match self.ownership_mutation_quarantine.as_ref() {
+            Some(reason) => Err(OciError::InvalidConfig(reason.clone())),
+            None => Ok(()),
+        }
     }
 
     async fn container_lifecycle_lock(&self, id: &str) -> Arc<RwLock<()>> {
@@ -661,6 +703,7 @@ impl Runtime {
         &self,
         container_ids: &[String],
     ) -> Result<Vec<ContainerWriteAdmission>, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
         let mut sorted = container_ids.to_vec();
         sorted.sort();
         sorted.dedup();
@@ -701,6 +744,27 @@ impl Runtime {
         run: &mut RunConfig,
         stack_id: Option<&str>,
     ) -> Result<ContainerLifecycleTransaction, OciError> {
+        self.begin_container_create_inner(run, stack_id, None).await
+    }
+
+    /// Reserve a generation with the exact durable topology scope.
+    pub(crate) async fn begin_scoped_container_create(
+        &self,
+        run: &mut RunConfig,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<ContainerLifecycleTransaction, OciError> {
+        scope.validate().map_err(OciError::InvalidConfig)?;
+        self.begin_container_create_inner(run, Some(&scope.stack_id), Some(scope))
+            .await
+    }
+
+    async fn begin_container_create_inner(
+        &self,
+        run: &mut RunConfig,
+        stack_id: Option<&str>,
+        scope: Option<&vz_runtime_contract::ContainerGenerationScope>,
+    ) -> Result<ContainerLifecycleTransaction, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
         let id = run.container_id.clone().unwrap_or_else(new_container_id);
         validate_container_id(&id)?;
         run.container_id = Some(id.clone());
@@ -726,10 +790,15 @@ impl Runtime {
             &id,
         )
         .await;
-        let generation = self
-            .container_store
-            .reserve_generation_with_write_lease(&id, &os_guard)
-            .map_err(|error| Self::map_container_store_error(&id, error))?;
+        let generation = match scope {
+            Some(scope) => self
+                .container_store
+                .reserve_scoped_generation_with_write_lease(&id, scope, &os_guard),
+            None => self
+                .container_store
+                .reserve_generation_with_write_lease(&id, &os_guard),
+        }
+        .map_err(|error| Self::map_container_store_error(&id, error))?;
         // Take cleanup ownership before the next await. If the caller drops
         // this future after the durable reservation, the lease releases that
         // exact unpublished generation instead of stranding the ID.
@@ -737,6 +806,7 @@ impl Runtime {
             lease: Some(ContainerLifecycleLease {
                 container_id: id.clone(),
                 generation,
+                scope: scope.cloned(),
                 container_store: self.container_store.clone(),
                 _os_guard: os_guard,
                 _stack_guard: stack_guard,
@@ -760,6 +830,7 @@ impl Runtime {
         &self,
         id: &str,
     ) -> Result<ContainerLifecycleTransaction, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
         loop {
             let routed_stack = self.container_stack.lock().await.get(id).cloned();
             let stack_guard = if let Some(stack_id) = routed_stack.as_deref() {
@@ -776,15 +847,68 @@ impl Runtime {
             }
             // Cross-process admission precedes durable generation lookup.
             let os_guard = self.acquire_container_os_write(id).await?;
-            let generation = self
+            let diagnostic = self
                 .container_store
-                .current_generation(id)
-                .map_err(|error| Self::map_container_store_error(id, error))?
-                .ok_or_else(|| OciError::ContainerNotFound { id: id.to_string() })?;
+                .generation_diagnostic(id)
+                .map_err(|error| Self::map_container_store_error(id, error))?;
+            let (generation, scope) = match diagnostic {
+                Some(current) if !current.reserved => {
+                    return Err(OciError::ContainerNotFound { id: id.to_string() });
+                }
+                Some(current) => match current.scope {
+                    Some(scope) => {
+                        if current_stack.as_deref() != Some(scope.stack_id.as_str()) {
+                            // The durable scope is authoritative, but this attempt currently
+                            // holds the stack lock selected by the stale cache. Repair only the
+                            // cache while ID+OS ownership is exclusive, then release and retry
+                            // so the returned transaction holds the durable stack's lock.
+                            self.container_stack
+                                .lock()
+                                .await
+                                .insert(id.to_string(), scope.stack_id);
+                            drop(os_guard);
+                            drop(container_guard);
+                            drop(stack_guard);
+                            continue;
+                        }
+                        (current.generation, Some(scope))
+                    }
+                    None => {
+                        if let Some(cached_stack) = current_stack {
+                            return Err(OciError::ContainerOwnershipMismatch {
+                                id: id.to_string(),
+                                reason: format!(
+                                    "cached route belongs to stack '{cached_stack}', but the durable generation is legacy-unscoped and quarantined"
+                                ),
+                            });
+                        }
+                        (current.generation, None)
+                    }
+                },
+                None => {
+                    if let Some(cached_stack) = current_stack {
+                        return Err(OciError::ContainerOwnershipMismatch {
+                            id: id.to_string(),
+                            reason: format!(
+                                "cached route belongs to stack '{cached_stack}', but no durable generation ownership exists"
+                            ),
+                        });
+                    }
+                    // Preserve compatibility for truly standalone metadata written by an older
+                    // runtime. Adoption remains forbidden whenever any stack route claims it.
+                    let generation = self
+                        .container_store
+                        .current_generation(id)
+                        .map_err(|error| Self::map_container_store_error(id, error))?
+                        .ok_or_else(|| OciError::ContainerNotFound { id: id.to_string() })?;
+                    (generation, None)
+                }
+            };
             return Ok(ContainerLifecycleTransaction {
                 lease: Some(ContainerLifecycleLease {
                     container_id: id.to_string(),
                     generation,
+                    scope,
                     container_store: self.container_store.clone(),
                     _os_guard: os_guard,
                     _stack_guard: stack_guard,
@@ -803,48 +927,73 @@ impl Runtime {
         &self,
         id: &str,
         generation: ContainerGeneration,
-        stack_id: &str,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
     ) -> Result<Option<ContainerLifecycleTransaction>, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
         validate_container_id(id)?;
-        let stack_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        scope.validate().map_err(OciError::InvalidConfig)?;
+        let stack_guard = self
+            .stack_lifecycle_lock(&scope.stack_id)
+            .await
+            .read_owned()
+            .await;
         let container_guard = self.container_lifecycle_lock(id).await.write_owned().await;
         let os_guard = self.acquire_container_os_write(id).await?;
-        let current_generation = self
+        let current = self
             .container_store
-            .current_generation(id)
+            .generation_diagnostic(id)
             .map_err(|error| Self::map_container_store_error(id, error))?;
 
-        let Some(current_generation) = current_generation else {
+        let Some(current) = current else {
             return Ok(None);
         };
-        if current_generation != generation {
+        if current.generation != generation {
             return Err(OciError::ContainerOwnershipMismatch {
                 id: id.to_string(),
                 reason: format!(
                     "proof names generation {}, but current generation is {}",
-                    generation.0, current_generation.0
+                    generation.0, current.generation.0
                 ),
             });
         }
+        let Some(current_scope) = current.scope else {
+            return Err(OciError::ContainerOwnershipMismatch {
+                id: id.to_string(),
+                reason: "current generation is legacy-unscoped and quarantined".to_string(),
+            });
+        };
+        if current_scope != *scope {
+            return Err(OciError::ContainerOwnershipMismatch {
+                id: id.to_string(),
+                reason: "proof scope does not match the durable generation scope".to_string(),
+            });
+        }
+        if !current.reserved {
+            return Ok(None);
+        }
 
-        let current_stack = self.container_stack.lock().await.get(id).cloned();
-        if current_stack
-            .as_deref()
-            .is_some_and(|current_stack| current_stack != stack_id)
+        // A process-local route is only a cache. Missing state is reconstructed
+        // from the durable scope; conflicting state is rejected without cleanup.
+        let mut routes = self.container_stack.lock().await;
+        if let Some(current_stack) = routes.get(id)
+            && current_stack != &scope.stack_id
         {
             return Err(OciError::ContainerOwnershipMismatch {
                 id: id.to_string(),
                 reason: format!(
-                    "proof names stack '{stack_id}', but the current route belongs to stack '{}'",
-                    current_stack.as_deref().unwrap_or_default()
+                    "cached route belongs to stack '{current_stack}', durable scope belongs to '{}'",
+                    scope.stack_id
                 ),
             });
         }
+        routes.insert(id.to_string(), scope.stack_id.clone());
+        drop(routes);
 
         Ok(Some(ContainerLifecycleTransaction {
             lease: Some(ContainerLifecycleLease {
                 container_id: id.to_string(),
                 generation,
+                scope: Some(current_scope),
                 container_store: self.container_store.clone(),
                 _os_guard: os_guard,
                 _stack_guard: Some(stack_guard),
@@ -858,10 +1007,36 @@ impl Runtime {
         &self,
         id: &str,
         generation: ContainerGeneration,
-        stack_id: &str,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, OciError> {
+        self.teardown_owned_container_generation(id, generation, scope, true, None, None)
+            .await
+    }
+
+    /// Gracefully stop and remove exactly one successful stack generation.
+    pub(crate) async fn stop_and_remove_owned_container_generation(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
+    ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, OciError> {
+        self.teardown_owned_container_generation(id, generation, scope, false, signal, grace_period)
+            .await
+    }
+
+    async fn teardown_owned_container_generation(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        force: bool,
+        signal: Option<&str>,
+        grace_period: Option<Duration>,
     ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, OciError> {
         let Some(transaction) = self
-            .begin_owned_container_generation(id, generation, stack_id)
+            .begin_owned_container_generation(id, generation, scope)
             .await?
         else {
             return Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent);
@@ -878,7 +1053,7 @@ impl Runtime {
         }
 
         let stop_error = self
-            .stop_container_in_transaction(id, true, None, None, &transaction)
+            .stop_container_in_transaction(id, force, signal, grace_period, &transaction)
             .await
             .err();
         let remove_error = match self.remove_container_in_transaction(id, &transaction).await {

@@ -176,17 +176,23 @@ impl MacosRuntimeBackend {
 
     async fn create_container_in_stack_with_ownership(
         &self,
-        stack_id: &str,
+        scope: &contract::ContainerGenerationScope,
         image: &str,
         config: contract::RunConfig,
     ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
+        if let Err(reason) = scope.validate() {
+            return Err(contract::OwnedCreateError::unowned(
+                RuntimeError::InvalidConfig(reason),
+            ));
+        }
+        let stack_id = scope.stack_id.as_str();
         let setup_commands = config.setup_commands.clone();
         let setup_env = config.env.clone();
         let setup_user = config.user.clone();
         let mut oci_config = run_config_from_contract(config);
         let mut transaction = match self
             .runtime
-            .begin_container_create(&mut oci_config, Some(stack_id))
+            .begin_scoped_container_create(&mut oci_config, scope)
             .await
         {
             Ok(transaction) => transaction,
@@ -196,6 +202,7 @@ impl MacosRuntimeBackend {
             container_id: transaction.container_id().to_string(),
             generation: transaction.generation().0,
             stack_id: stack_id.to_string(),
+            scope: Some(Box::new(scope.clone())),
         };
         let setup_commit_ref = (!setup_commands.is_empty())
             .then(|| crate::Runtime::setup_commit_reference(image, &setup_commands));
@@ -467,7 +474,7 @@ impl RuntimeBackend for MacosRuntimeBackend {
         image: &str,
         config: contract::RunConfig,
     ) -> Result<String, RuntimeError> {
-        self.create_container_in_stack_owned(stack_id, image, config)
+        self.create_container_in_stack_owned_legacy(stack_id, image, config)
             .await
             .map(|receipt| receipt.container_id)
             .map_err(|failure| failure.error)
@@ -475,16 +482,16 @@ impl RuntimeBackend for MacosRuntimeBackend {
 
     async fn create_container_in_stack_owned(
         &self,
-        stack_id: &str,
+        scope: &contract::ContainerGenerationScope,
         image: &str,
         config: contract::RunConfig,
     ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
         let backend = self.clone();
-        let stack_id = stack_id.to_string();
+        let scope = scope.clone();
         let image = image.to_string();
         match run_owned_create(move || async move {
             Ok(backend
-                .create_container_in_stack_with_ownership(&stack_id, &image, config)
+                .create_container_in_stack_with_ownership(&scope, &image, config)
                 .await)
         })
         .await
@@ -507,11 +514,46 @@ impl RuntimeBackend for MacosRuntimeBackend {
                     .to_string(),
             ));
         }
+        let scope = ownership.scope.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidConfig(
+                "container generation ownership is legacy-unscoped and quarantined".to_string(),
+            )
+        })?;
+        scope.validate().map_err(RuntimeError::InvalidConfig)?;
+        if ownership.stack_id != scope.stack_id {
+            return Err(RuntimeError::InvalidConfig(
+                "container generation ownership stack_id disagrees with durable scope".to_string(),
+            ));
+        }
         self.runtime
             .cleanup_owned_container_generation(
                 &ownership.container_id,
                 oci_container::ContainerGeneration(ownership.generation),
-                &ownership.stack_id,
+                scope,
+            )
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn stop_and_remove_container_generation(
+        &self,
+        ownership: contract::ContainerGenerationOwnership,
+        signal: Option<String>,
+        grace_period: Option<std::time::Duration>,
+    ) -> Result<contract::GenerationCleanupOutcome, RuntimeError> {
+        ownership.validate().map_err(RuntimeError::InvalidConfig)?;
+        let scope = ownership.scope.as_ref().ok_or_else(|| {
+            RuntimeError::InvalidConfig(
+                "container generation ownership is legacy-unscoped and quarantined".to_string(),
+            )
+        })?;
+        self.runtime
+            .stop_and_remove_owned_container_generation(
+                &ownership.container_id,
+                oci_container::ContainerGeneration(ownership.generation),
+                scope,
+                signal.as_deref(),
+                grace_period,
             )
             .await
             .map_err(oci_err)
@@ -847,6 +889,19 @@ mod tests {
 
     use super::*;
 
+    fn generation_scope(stack_id: &str) -> contract::ContainerGenerationScope {
+        contract::ContainerGenerationScope {
+            reservation_id: format!("reservation-{stack_id}"),
+            project_id: contract::ProjectId::new("prj_generation").unwrap(),
+            environment_id: contract::EnvironmentId::new("env_generation").unwrap(),
+            machine_id: contract::MachineId::new("mch_generation").unwrap(),
+            machine_incarnation_id: Some(
+                contract::MachineIncarnationId::new("inc_generation").unwrap(),
+            ),
+            stack_id: stack_id.to_string(),
+        }
+    }
+
     #[tokio::test]
     async fn owned_create_operation_survives_waiter_cancellation() {
         let started = Arc::new(Notify::new());
@@ -886,10 +941,11 @@ mod tests {
             ..oci_config::RuntimeConfig::default()
         });
         let backend = MacosRuntimeBackend::new(runtime);
+        let scope = generation_scope("missing-stack");
 
         let failure = backend
             .create_container_in_stack_owned(
-                "missing-stack",
+                &scope,
                 "alpine:latest",
                 contract::RunConfig {
                     container_id: Some("post-reservation-failure".to_string()),
@@ -928,10 +984,11 @@ mod tests {
             .await
             .unwrap();
         let backend = MacosRuntimeBackend::new(runtime);
+        let scope = generation_scope("contender-stack");
 
         let failure = backend
             .create_container_in_stack_owned(
-                "contender-stack",
+                &scope,
                 "alpine:latest",
                 contract::RunConfig {
                     container_id: Some("foreign-owner".to_string()),
@@ -963,6 +1020,7 @@ mod tests {
                 container_id: "container".to_string(),
                 generation: 0,
                 stack_id: "stack".to_string(),
+                scope: Some(Box::new(generation_scope("stack"))),
             })
             .await
             .unwrap_err();
@@ -971,6 +1029,32 @@ mod tests {
             error.machine_code(),
             vz_runtime_contract::MachineErrorCode::ValidationError
         );
+    }
+
+    #[tokio::test]
+    async fn generation_cleanup_rejects_outer_and_scoped_stack_disagreement() {
+        let temp = tempdir().unwrap();
+        let runtime = crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..oci_config::RuntimeConfig::default()
+        });
+        let backend = MacosRuntimeBackend::new(runtime);
+
+        let error = backend
+            .cleanup_container_generation(contract::ContainerGenerationOwnership {
+                container_id: "container".to_string(),
+                generation: 1,
+                stack_id: "outer-stack".to_string(),
+                scope: Some(Box::new(generation_scope("scoped-stack"))),
+            })
+            .await
+            .unwrap_err();
+
+        assert_eq!(
+            error.machine_code(),
+            vz_runtime_contract::MachineErrorCode::ValidationError
+        );
+        assert!(error.to_string().contains("disagrees"));
     }
 
     #[test]

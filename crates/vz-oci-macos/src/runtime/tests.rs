@@ -30,6 +30,19 @@ fn unique_temp_dir(name: &str) -> PathBuf {
     base
 }
 
+fn generation_scope(stack_id: &str) -> vz_runtime_contract::ContainerGenerationScope {
+    vz_runtime_contract::ContainerGenerationScope {
+        reservation_id: format!("reservation-{stack_id}"),
+        project_id: vz_runtime_contract::ProjectId::new("prj_generation").unwrap(),
+        environment_id: vz_runtime_contract::EnvironmentId::new("env_generation").unwrap(),
+        machine_id: vz_runtime_contract::MachineId::new("mch_generation").unwrap(),
+        machine_incarnation_id: Some(
+            vz_runtime_contract::MachineIncarnationId::new("inc_generation").unwrap(),
+        ),
+        stack_id: stack_id.to_string(),
+    }
+}
+
 #[test]
 fn checkpoint_capabilities_disable_vm_full_by_default() {
     let runtime = Runtime::new(RuntimeConfig {
@@ -1578,8 +1591,9 @@ async fn generation_owned_cleanup_removes_only_the_exact_stack_generation() {
         container_id: Some("owned-failure".to_string()),
         ..RunConfig::default()
     };
+    let scope = generation_scope("stack-a");
     let transaction = runtime
-        .begin_container_create(&mut run, Some("stack-a"))
+        .begin_scoped_container_create(&mut run, &scope)
         .await
         .unwrap();
     let generation = transaction.generation();
@@ -1607,7 +1621,7 @@ async fn generation_owned_cleanup_removes_only_the_exact_stack_generation() {
     drop(transaction);
 
     let outcome = runtime
-        .cleanup_owned_container_generation("owned-failure", generation, "stack-a")
+        .cleanup_owned_container_generation("owned-failure", generation, &scope)
         .await
         .unwrap();
 
@@ -1641,8 +1655,9 @@ async fn generation_owned_cleanup_rejects_stale_generation_without_removal() {
         container_id: Some("replacement".to_string()),
         ..RunConfig::default()
     };
+    let scope = generation_scope("stack-a");
     let transaction = runtime
-        .begin_container_create(&mut run, Some("stack-a"))
+        .begin_scoped_container_create(&mut run, &scope)
         .await
         .unwrap();
     let generation = transaction.generation();
@@ -1673,7 +1688,7 @@ async fn generation_owned_cleanup_rejects_stale_generation_without_removal() {
         .cleanup_owned_container_generation(
             "replacement",
             ContainerGeneration(generation.0.saturating_add(1)),
-            "stack-a",
+            &scope,
         )
         .await
         .unwrap_err();
@@ -1705,8 +1720,9 @@ async fn generation_owned_cleanup_rejects_foreign_stack_route_without_removal() 
         container_id: Some("foreign-route".to_string()),
         ..RunConfig::default()
     };
+    let owner_scope = generation_scope("stack-b");
     let transaction = runtime
-        .begin_container_create(&mut run, Some("stack-b"))
+        .begin_scoped_container_create(&mut run, &owner_scope)
         .await
         .unwrap();
     let generation = transaction.generation();
@@ -1733,8 +1749,9 @@ async fn generation_owned_cleanup_rejects_foreign_stack_route_without_removal() 
         .insert("foreign-route".to_string(), "stack-b".to_string());
     drop(transaction);
 
+    let contender_scope = generation_scope("stack-a");
     let error = runtime
-        .cleanup_owned_container_generation("foreign-route", generation, "stack-a")
+        .cleanup_owned_container_generation("foreign-route", generation, &contender_scope)
         .await
         .unwrap_err();
 
@@ -1767,8 +1784,9 @@ async fn generation_owned_cleanup_treats_released_unpublished_generation_as_abse
         container_id: Some("unpublished".to_string()),
         ..RunConfig::default()
     };
+    let scope = generation_scope("stack-a");
     let transaction = runtime
-        .begin_container_create(&mut run, Some("stack-a"))
+        .begin_scoped_container_create(&mut run, &scope)
         .await
         .unwrap();
     let generation = transaction.generation();
@@ -1776,10 +1794,527 @@ async fn generation_owned_cleanup_treats_released_unpublished_generation_as_abse
 
     assert_eq!(
         runtime
-            .cleanup_owned_container_generation("unpublished", generation, "stack-a")
+            .cleanup_owned_container_generation("unpublished", generation, &scope)
             .await
             .unwrap(),
         vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent
+    );
+}
+
+#[tokio::test]
+async fn scoped_stack_transaction_rejects_stack_mismatch_before_runtime_mutation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("scoped-stack-transaction-mismatch"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("scoped-stack-mismatch".to_string()),
+        ..RunConfig::default()
+    };
+    let scope = generation_scope("stack-owner");
+    let mut transaction = runtime
+        .begin_scoped_container_create(&mut run, &scope)
+        .await
+        .unwrap();
+
+    let error = runtime
+        .create_container_in_stack_transaction(
+            "stack-contender",
+            "alpine:latest",
+            run,
+            None,
+            &mut transaction,
+        )
+        .await
+        .unwrap_err();
+
+    assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    assert!(
+        runtime
+            .container_store
+            .find("scoped-stack-mismatch")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[tokio::test]
+async fn raw_stack_create_compatibility_reserves_a_synthetic_scoped_generation() {
+    let data_dir = unique_temp_dir("raw-stack-create-synthetic-scope");
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+
+    let error = runtime
+        .create_container_in_stack(
+            "actual-stack",
+            "alpine:latest",
+            RunConfig {
+                container_id: Some("raw-stack-scoped".to_string()),
+                ..RunConfig::default()
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(error, OciError::InvalidConfig(_)));
+
+    let diagnostic = runtime
+        .container_store
+        .generation_diagnostic("raw-stack-scoped")
+        .unwrap()
+        .unwrap();
+    let scope = diagnostic
+        .scope
+        .expect("raw compatibility create must never reserve an unscoped generation");
+    assert_eq!(scope.stack_id, "actual-stack");
+    assert_eq!(
+        scope.project_id.as_str(),
+        "prj_synthetic_legacy_stack_compat"
+    );
+    assert!(!diagnostic.reserved);
+}
+
+#[tokio::test]
+async fn generation_owned_cleanup_rejects_every_mismatched_scope_field() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-owned-scope-mismatch"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("scope-mismatch".to_string()),
+        ..RunConfig::default()
+    };
+    let owner_scope = generation_scope("stack-owner");
+    let transaction = runtime
+        .begin_scoped_container_create(&mut run, &owner_scope)
+        .await
+        .unwrap();
+    let generation = transaction.generation();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "scope-mismatch".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:scope".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(1),
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+
+    let mut mismatches = Vec::new();
+    let mut scope = owner_scope.clone();
+    scope.reservation_id = "reservation-foreign".to_string();
+    mismatches.push(scope);
+    let mut scope = owner_scope.clone();
+    scope.project_id = vz_runtime_contract::ProjectId::new("prj_foreign").unwrap();
+    mismatches.push(scope);
+    let mut scope = owner_scope.clone();
+    scope.environment_id = vz_runtime_contract::EnvironmentId::new("env_foreign").unwrap();
+    mismatches.push(scope);
+    let mut scope = owner_scope.clone();
+    scope.machine_id = vz_runtime_contract::MachineId::new("mch_foreign").unwrap();
+    mismatches.push(scope);
+    let mut scope = owner_scope.clone();
+    scope.machine_incarnation_id =
+        Some(vz_runtime_contract::MachineIncarnationId::new("inc_foreign").unwrap());
+    mismatches.push(scope);
+    let mut scope = owner_scope.clone();
+    scope.stack_id = "stack-foreign".to_string();
+    mismatches.push(scope);
+
+    for mismatch in mismatches {
+        let error = runtime
+            .cleanup_owned_container_generation("scope-mismatch", generation, &mismatch)
+            .await
+            .unwrap_err();
+        assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    }
+    assert!(
+        runtime
+            .container_store
+            .find("scope-mismatch")
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        runtime
+            .container_store
+            .current_generation("scope-mismatch")
+            .unwrap(),
+        Some(generation)
+    );
+}
+
+#[tokio::test]
+async fn runtime_restart_recovers_only_durable_scoped_routes() {
+    let data_dir = unique_temp_dir("generation-route-restart");
+    let scoped = generation_scope("stack-recovered");
+    {
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+        let mut run = RunConfig {
+            container_id: Some("scoped-route".to_string()),
+            ..RunConfig::default()
+        };
+        let transaction = runtime
+            .begin_scoped_container_create(&mut run, &scoped)
+            .await
+            .unwrap();
+        runtime
+            .persist_owned(
+                &transaction,
+                ContainerInfo {
+                    id: "scoped-route".to_string(),
+                    image: "alpine:latest".to_string(),
+                    image_id: "sha256:route".to_string(),
+                    status: ContainerStatus::Stopped { exit_code: 0 },
+                    created_unix_secs: 1,
+                    started_unix_secs: Some(1),
+                    stopped_unix_secs: Some(2),
+                    rootfs_path: None,
+                    host_pid: None,
+                },
+            )
+            .unwrap();
+        drop(transaction);
+    }
+
+    // Simulate a pre-scope durable reservation alongside the recoverable record.
+    let legacy_store = ContainerStore::new(data_dir.clone());
+    legacy_store.reserve_generation("legacy-route").unwrap();
+
+    let restarted = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    let routes = restarted.container_stack.lock().await;
+    assert_eq!(
+        routes.get("scoped-route").map(String::as_str),
+        Some("stack-recovered")
+    );
+    assert!(!routes.contains_key("legacy-route"));
+    drop(routes);
+    let legacy = restarted
+        .container_store
+        .generation_diagnostic("legacy-route")
+        .unwrap()
+        .unwrap();
+    assert!(legacy.quarantined);
+    assert_eq!(legacy.scope, None);
+}
+
+#[tokio::test]
+async fn corrupt_generation_index_quarantines_runtime_without_startup_or_lifecycle_mutation() {
+    let data_dir = unique_temp_dir("generation-corrupt-startup-quarantine");
+    let rootfs = data_dir.join("rootfs/quarantined/rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    let store = ContainerStore::new(data_dir.clone());
+    store
+        .upsert(ContainerInfo {
+            id: "quarantined".to_string(),
+            image: "alpine:latest".to_string(),
+            image_id: "sha256:quarantined".to_string(),
+            status: ContainerStatus::Running,
+            created_unix_secs: 1,
+            started_unix_secs: Some(1),
+            stopped_unix_secs: None,
+            rootfs_path: Some(rootfs.clone()),
+            host_pid: Some(u32::MAX),
+        })
+        .unwrap();
+    fs::write(
+        data_dir.join("container-generations.json"),
+        b"{ definitely-not-valid-json",
+    )
+    .unwrap();
+
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    assert!(runtime.ownership_mutation_quarantine.is_some());
+    let retained = runtime
+        .container_store
+        .find("quarantined")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.status, ContainerStatus::Running);
+    assert_eq!(retained.rootfs_path.as_deref(), Some(rootfs.as_path()));
+    assert!(
+        rootfs.exists(),
+        "startup quarantine must skip rootfs cleanup"
+    );
+
+    let mut new_run = RunConfig {
+        container_id: Some("new-container".to_string()),
+        ..RunConfig::default()
+    };
+    for error in [
+        runtime
+            .begin_container_create(&mut new_run, None)
+            .await
+            .err()
+            .expect("quarantine must reject create admission"),
+        runtime
+            .stop_container("quarantined", true, None, None)
+            .await
+            .unwrap_err(),
+        runtime.remove_container("quarantined").await.unwrap_err(),
+    ] {
+        assert!(error.to_string().contains("ownership is quarantined"));
+    }
+    let retained = runtime
+        .container_store
+        .find("quarantined")
+        .unwrap()
+        .unwrap();
+    assert_eq!(retained.status, ContainerStatus::Running);
+    assert!(rootfs.exists());
+}
+
+#[test]
+fn malformed_persisted_scope_quarantines_runtime_without_reconciliation() {
+    let data_dir = unique_temp_dir("generation-malformed-scope-startup-quarantine");
+    let rootfs = data_dir.join("rootfs/malformed/rootfs");
+    fs::create_dir_all(&rootfs).unwrap();
+    let store = ContainerStore::new(data_dir.clone());
+    store
+        .upsert(ContainerInfo {
+            id: "malformed".to_string(),
+            image: "alpine:latest".to_string(),
+            image_id: "sha256:malformed".to_string(),
+            status: ContainerStatus::Running,
+            created_unix_secs: 1,
+            started_unix_secs: Some(1),
+            stopped_unix_secs: None,
+            rootfs_path: Some(rootfs.clone()),
+            host_pid: Some(u32::MAX),
+        })
+        .unwrap();
+    fs::write(
+        data_dir.join("container-generations.json"),
+        br#"{
+            "malformed": {
+                "generation": 1,
+                "reserved": true,
+                "owner_pid": 0,
+                "scope": {
+                    "reservation_id": "reservation-malformed",
+                    "project_id": "not/valid",
+                    "environment_id": "env_generation",
+                    "machine_id": "mch_generation",
+                    "machine_incarnation_id": "inc_generation",
+                    "stack_id": "stack-malformed"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    let quarantine = runtime
+        .ownership_mutation_quarantine
+        .as_ref()
+        .as_ref()
+        .expect("malformed scope must quarantine startup");
+    assert!(quarantine.contains("invalid persisted generation scope"));
+    assert_eq!(
+        runtime
+            .container_store
+            .find("malformed")
+            .unwrap()
+            .unwrap()
+            .status,
+        ContainerStatus::Running
+    );
+    assert!(rootfs.exists());
+}
+
+#[tokio::test]
+async fn existing_admission_repairs_stale_cache_then_retries_under_durable_stack_lock() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-stale-route-repair"),
+        ..RuntimeConfig::default()
+    });
+    let scope = generation_scope("stack-durable");
+    let mut run = RunConfig {
+        container_id: Some("stale-route".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_scoped_container_create(&mut run, &scope)
+        .await
+        .unwrap();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "stale-route".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:route".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: Some(1),
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("stale-route".to_string(), "stack-stale".to_string());
+
+    let durable_writer = runtime
+        .stack_lifecycle_lock("stack-durable")
+        .await
+        .write_owned()
+        .await;
+    let contender = runtime.clone();
+    let mut admission =
+        tokio::spawn(async move { contender.begin_existing_container("stale-route").await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut admission)
+            .await
+            .is_err(),
+        "admission must retry and wait for the durable stack lock"
+    );
+    assert_eq!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .get("stale-route")
+            .map(String::as_str),
+        Some("stack-durable")
+    );
+    drop(durable_writer);
+    let transaction = admission.await.unwrap().unwrap();
+    assert_eq!(transaction.lease().scope.as_ref(), Some(&scope));
+    drop(transaction);
+    assert!(
+        runtime
+            .container_store
+            .find("stale-route")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn cached_stack_route_cannot_adopt_legacy_unscoped_generation() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-cached-route-legacy-quarantine"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("legacy-route".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "legacy-route".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:legacy".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert("legacy-route".to_string(), "stack-cached".to_string());
+
+    let error = runtime
+        .begin_existing_container("legacy-route")
+        .await
+        .err()
+        .expect("cached stack route must reject legacy generation adoption");
+    assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    assert!(error.to_string().contains("legacy-unscoped"));
+    assert!(
+        runtime
+            .container_store
+            .find("legacy-route")
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[tokio::test]
+async fn standalone_unscoped_generation_without_cached_route_remains_compatible() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("generation-standalone-unscoped-compatible"),
+        ..RuntimeConfig::default()
+    });
+    let mut run = RunConfig {
+        container_id: Some("standalone".to_string()),
+        ..RunConfig::default()
+    };
+    let transaction = runtime
+        .begin_container_create(&mut run, None)
+        .await
+        .unwrap();
+    runtime
+        .persist_owned(
+            &transaction,
+            ContainerInfo {
+                id: "standalone".to_string(),
+                image: "alpine:latest".to_string(),
+                image_id: "sha256:standalone".to_string(),
+                status: ContainerStatus::Stopped { exit_code: 0 },
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: Some(2),
+                rootfs_path: None,
+                host_pid: None,
+            },
+        )
+        .unwrap();
+    drop(transaction);
+
+    let admitted = runtime
+        .begin_existing_container("standalone")
+        .await
+        .unwrap();
+    assert!(admitted.lease().scope.is_none());
+    drop(admitted);
+    assert!(
+        runtime
+            .container_store
+            .find("standalone")
+            .unwrap()
+            .is_some()
     );
 }
 

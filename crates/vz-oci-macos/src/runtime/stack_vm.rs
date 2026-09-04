@@ -824,9 +824,9 @@ impl Runtime {
         mut run: RunConfig,
         setup_commit_tar_guest: Option<String>,
     ) -> Result<String, OciError> {
-        let mut transaction = self
-            .begin_container_create(&mut run, Some(stack_id))
-            .await?;
+        let scope = vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack(stack_id)
+            .map_err(OciError::InvalidConfig)?;
+        let mut transaction = self.begin_scoped_container_create(&mut run, &scope).await?;
         self.create_container_in_stack_transaction(
             stack_id,
             image,
@@ -845,6 +845,20 @@ impl Runtime {
         setup_commit_tar_guest: Option<String>,
         transaction: &mut ContainerLifecycleTransaction,
     ) -> Result<String, OciError> {
+        let effective_stack_id = match transaction.scope() {
+            Some(scope) if scope.stack_id != stack_id => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: transaction.container_id().to_string(),
+                    reason: format!(
+                        "create requested stack '{stack_id}', but the reserved scope belongs to '{}'",
+                        scope.stack_id
+                    ),
+                });
+            }
+            Some(scope) => scope.stack_id.clone(),
+            None => stack_id.to_string(),
+        };
+        let stack_id = effective_stack_id.as_str();
         let vm = self
             .stack_vms
             .lock()

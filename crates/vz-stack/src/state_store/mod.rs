@@ -85,10 +85,12 @@ pub struct ServiceObservedState {
     /// OCI container identifier, if assigned.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub container_id: Option<String>,
-    /// Exact runtime generation retained after an owned create failure.
+    /// Exact runtime generation that authorizes container cleanup.
     ///
-    /// This is the only authority reconciliation may use to clean up a failed
-    /// create. A caller-selected ID by itself never proves ownership.
+    /// The legacy field name is retained on the wire. For `Running`, this is
+    /// the successful create receipt's ownership; for `Failed`, it retains the
+    /// existing admitted-failure cleanup semantics. A container ID alone never
+    /// proves ownership.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failed_create_ownership: Option<ContainerGenerationOwnership>,
     /// Last error message, if any.

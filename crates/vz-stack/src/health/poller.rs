@@ -268,7 +268,7 @@ impl HealthPoller {
                             service_name: svc.name.clone(),
                             phase: ServicePhase::Running,
                             container_id: Some(container_id.clone()),
-                            failed_create_ownership: None,
+                            failed_create_ownership: obs.failed_create_ownership.clone(),
                             last_error: None,
                             ready: true,
                         },

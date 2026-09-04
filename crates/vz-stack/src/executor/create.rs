@@ -265,15 +265,34 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &self,
         spec: &StackSpec,
         service_name: &str,
-        container_id: &str,
+        receipt: &vz_runtime_contract::ContainerCreateReceipt,
     ) -> Result<(), StackError> {
+        let ownership = receipt
+            .ownership
+            .clone()
+            .map(|ownership| {
+                ownership.validate().map_err(|reason| {
+                    StackError::InvalidSpec(format!(
+                        "runtime returned invalid successful-create ownership for service '{service_name}': {reason}"
+                    ))
+                })?;
+                if ownership.stack_id != spec.name
+                    || ownership.container_id != receipt.container_id
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "runtime returned misattributed successful-create ownership for service '{service_name}'"
+                    )));
+                }
+                Ok(ownership)
+            })
+            .transpose()?;
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
                 service_name: service_name.to_string(),
                 phase: ServicePhase::Running,
-                container_id: Some(container_id.to_string()),
-                failed_create_ownership: None,
+                container_id: Some(receipt.container_id.clone()),
+                failed_create_ownership: ownership,
                 last_error: None,
                 ready: false, // Health checks set this to true later.
             },
@@ -284,7 +303,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             &StackEvent::ServiceReady {
                 stack_name: spec.name.clone(),
                 service_name: service_name.to_string(),
-                runtime_id: container_id.to_string(),
+                runtime_id: receipt.container_id.clone(),
             },
         )?;
 

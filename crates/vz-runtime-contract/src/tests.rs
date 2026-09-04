@@ -554,21 +554,113 @@ fn workspace_runtime_manager_routes_stack_create_with_shared_runtime() {
     assert_eq!(manager.backend().calls(), vec!["create_container_in_stack"]);
 }
 
+fn generation_scope(stack_id: &str) -> ContainerGenerationScope {
+    ContainerGenerationScope {
+        reservation_id: format!("reservation-{stack_id}"),
+        project_id: ProjectId::new("prj_generation").unwrap(),
+        environment_id: EnvironmentId::new("env_generation").unwrap(),
+        machine_id: MachineId::new("mch_generation").unwrap(),
+        machine_incarnation_id: Some(MachineIncarnationId::new("inc_generation").unwrap()),
+        stack_id: stack_id.to_string(),
+    }
+}
+
 #[test]
-fn compatibility_backend_owned_create_never_fabricates_ownership() {
+fn synthetic_legacy_stack_scope_is_labeled_valid_and_fresh() {
+    let first = ContainerGenerationScope::synthetic_legacy_stack("actual-stack").unwrap();
+    let second = ContainerGenerationScope::synthetic_legacy_stack("actual-stack").unwrap();
+
+    assert_eq!(first.stack_id, "actual-stack");
+    assert_eq!(
+        first.project_id.as_str(),
+        "prj_synthetic_legacy_stack_compat"
+    );
+    assert_eq!(
+        first.environment_id.as_str(),
+        "env_synthetic_legacy_stack_compat"
+    );
+    assert_eq!(
+        first.machine_id.as_str(),
+        "mch_synthetic_legacy_stack_compat"
+    );
+    assert_eq!(first.machine_incarnation_id, None);
+    assert!(first.reservation_id.starts_with("legacy-stack-compat-"));
+    assert_ne!(first.reservation_id, second.reservation_id);
+    first.validate().unwrap();
+    second.validate().unwrap();
+}
+
+#[test]
+fn synthetic_legacy_stack_scope_rejects_invalid_stack_identity() {
+    assert!(ContainerGenerationScope::synthetic_legacy_stack("  ").is_err());
+    assert!(ContainerGenerationScope::synthetic_legacy_stack(&"x".repeat(129)).is_err());
+}
+
+#[test]
+fn compatibility_backend_owned_create_fails_before_unowned_mutation() {
     let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
     let manager = WorkspaceRuntimeManager::new(backend);
+    let scope = generation_scope("stack-1");
 
-    let receipt = poll_immediate(manager.create_stack_container_owned(
-        "stack-1",
+    let failure = poll_immediate(manager.create_stack_container_owned(
+        &scope,
         "nginx:latest",
         RunConfig::default(),
     ))
-    .unwrap();
+    .unwrap_err();
 
-    assert_eq!(receipt.container_id, "ctr-stack");
-    assert!(receipt.ownership.is_none());
-    assert_eq!(manager.backend().calls(), vec!["create_container_in_stack"]);
+    assert!(failure.cleanup.is_none());
+    assert!(matches!(
+        failure.error,
+        RuntimeError::UnsupportedOperation { ref operation, .. }
+            if operation == "create_container_in_stack_owned"
+    ));
+    assert!(manager.backend().calls().is_empty());
+}
+
+#[test]
+fn non_shared_backend_owned_create_fails_before_plain_create_mutation() {
+    let mut caps = RuntimeCapabilities::stack_baseline();
+    caps.shared_vm = false;
+    let backend = ManagerRoutingBackend::new(caps);
+    let manager = WorkspaceRuntimeManager::new(backend);
+    let scope = generation_scope("stack-1");
+
+    let failure = poll_immediate(manager.create_stack_container_owned(
+        &scope,
+        "nginx:latest",
+        RunConfig::default(),
+    ))
+    .unwrap_err();
+
+    assert!(failure.cleanup.is_none());
+    assert!(matches!(
+        failure.error,
+        RuntimeError::UnsupportedOperation { ref operation, .. }
+            if operation == "create_container_in_stack_owned"
+    ));
+    assert!(manager.backend().calls().is_empty());
+}
+
+#[test]
+fn legacy_stack_owned_create_uses_the_compatibility_adapter() {
+    let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+    let manager = WorkspaceRuntimeManager::new(backend);
+
+    let failure = poll_immediate(manager.create_legacy_stack_container_owned(
+        "actual-stack",
+        "nginx:latest",
+        RunConfig::default(),
+    ))
+    .unwrap_err();
+
+    assert!(failure.cleanup.is_none());
+    assert!(matches!(
+        failure.error,
+        RuntimeError::UnsupportedOperation { ref operation, .. }
+            if operation == "create_container_in_stack_owned"
+    ));
+    assert!(manager.backend().calls().is_empty());
 }
 
 #[test]
@@ -579,6 +671,7 @@ fn compatibility_backend_generation_cleanup_fails_closed() {
         container_id: "ctr-stack".to_string(),
         generation: 7,
         stack_id: "stack-1".to_string(),
+        scope: Some(Box::new(generation_scope("stack-1"))),
     };
 
     let error = poll_immediate(manager.cleanup_container_generation(ownership)).unwrap_err();
@@ -592,11 +685,31 @@ fn compatibility_backend_generation_cleanup_fails_closed() {
 }
 
 #[test]
+fn generation_cleanup_rejects_outer_and_scoped_stack_disagreement_before_backend() {
+    let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+    let manager = WorkspaceRuntimeManager::new(backend);
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-stack".to_string(),
+        generation: 7,
+        stack_id: "outer-stack".to_string(),
+        scope: Some(Box::new(generation_scope("scoped-stack"))),
+    };
+
+    let error = poll_immediate(manager.cleanup_container_generation(ownership)).unwrap_err();
+
+    assert!(
+        matches!(error, RuntimeError::InvalidConfig(ref reason) if reason.contains("disagrees"))
+    );
+    assert!(manager.backend().calls().is_empty());
+}
+
+#[test]
 fn generation_ownership_and_cleanup_outcome_round_trip() {
     let ownership = ContainerGenerationOwnership {
         container_id: "ctr-stack".to_string(),
         generation: 11,
         stack_id: "stack-1".to_string(),
+        scope: Some(Box::new(generation_scope("stack-1"))),
     };
     let json = serde_json::to_string(&ownership).unwrap();
     assert_eq!(
@@ -610,6 +723,21 @@ fn generation_ownership_and_cleanup_outcome_round_trip() {
         serde_json::from_str::<GenerationCleanupOutcome>(&json).unwrap(),
         GenerationCleanupOutcome::AlreadyAbsent
     );
+}
+
+#[test]
+fn legacy_generation_ownership_deserializes_without_adopting_scope() {
+    let legacy = r#"{
+        "container_id": "ctr-legacy",
+        "generation": 3,
+        "stack_id": "stack-legacy"
+    }"#;
+
+    let ownership: ContainerGenerationOwnership = serde_json::from_str(legacy).unwrap();
+    assert_eq!(ownership.container_id, "ctr-legacy");
+    assert_eq!(ownership.generation, 3);
+    assert_eq!(ownership.stack_id, "stack-legacy");
+    assert_eq!(ownership.scope, None);
 }
 
 #[test]

@@ -540,6 +540,9 @@ fn observed_state_round_trip() {
         container_id: "ctr-abc".to_string(),
         generation: 17,
         stack_id: "myapp".to_string(),
+        scope: Some(Box::new(
+            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp").unwrap(),
+        )),
     };
 
     let state1 = ServiceObservedState {
@@ -571,6 +574,42 @@ fn observed_state_round_trip() {
 }
 
 #[test]
+fn running_container_ownership_survives_file_backed_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("state.db");
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-running".to_string(),
+        generation: 23,
+        stack_id: "myapp".to_string(),
+        scope: Some(Box::new(
+            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp").unwrap(),
+        )),
+    };
+    {
+        let store = StateStore::open(&path).unwrap();
+        store
+            .save_observed_state(
+                "myapp",
+                &ServiceObservedState {
+                    service_name: "web".to_string(),
+                    phase: ServicePhase::Running,
+                    container_id: Some(ownership.container_id.clone()),
+                    failed_create_ownership: Some(ownership.clone()),
+                    last_error: None,
+                    ready: true,
+                },
+            )
+            .unwrap();
+    }
+
+    let reopened = StateStore::open(&path).unwrap();
+    let states = reopened.load_observed_state("myapp").unwrap();
+    assert_eq!(states.len(), 1);
+    assert_eq!(states[0].phase, ServicePhase::Running);
+    assert_eq!(states[0].failed_create_ownership, Some(ownership));
+}
+
+#[test]
 fn observed_state_legacy_json_defaults_failed_create_ownership() {
     let legacy = r#"{
         "service_name":"web",
@@ -583,6 +622,26 @@ fn observed_state_legacy_json_defaults_failed_create_ownership() {
     let state: ServiceObservedState = serde_json::from_str(legacy).unwrap();
     assert_eq!(state.container_id.as_deref(), Some("ctr-abc"));
     assert!(state.failed_create_ownership.is_none());
+}
+
+#[test]
+fn observed_state_legacy_unscoped_ownership_remains_quarantined() {
+    let legacy = r#"{
+        "service_name":"web",
+        "phase":"Running",
+        "container_id":"ctr-abc",
+        "failed_create_ownership":{
+            "container_id":"ctr-abc",
+            "generation":3,
+            "stack_id":"myapp"
+        },
+        "ready":true
+    }"#;
+
+    let state: ServiceObservedState = serde_json::from_str(legacy).unwrap();
+    let ownership = state.failed_create_ownership.unwrap();
+    assert!(ownership.scope.is_none());
+    assert!(ownership.validate().is_err());
 }
 
 #[test]

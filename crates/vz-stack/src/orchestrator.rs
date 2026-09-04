@@ -969,24 +969,37 @@ mod tests {
     }
 
     #[test]
-    fn empty_down_spec_propagates_service_stop_failure_after_cleanup() {
+    fn empty_down_spec_propagates_exact_generation_cleanup_failure() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
         let up_spec = stack("app", vec![svc("web")]);
         assert!(orch.run(&up_spec, None).unwrap().converged);
 
-        orch.executor.runtime_mut().fail_stop = true;
+        orch.executor.runtime_mut().fail_generation_cleanup = true;
         let down_spec = stack("app", vec![]);
         let error = orch.run(&down_spec, None).unwrap_err();
 
         assert!(error.to_string().contains("service teardown failed"));
-        assert!(error.to_string().contains("mock stop failure"));
+        assert!(
+            error
+                .to_string()
+                .contains("mock generation cleanup failure")
+        );
         let calls = orch.executor.runtime().call_log();
-        assert!(calls.iter().any(|(operation, _)| operation == "stop"));
-        assert!(calls.iter().any(|(operation, _)| operation == "remove"));
+        assert!(
+            calls
+                .iter()
+                .any(|(operation, _)| operation == "stop_and_remove_container_generation")
+        );
+        assert!(
+            !calls
+                .iter()
+                .any(|(operation, _)| { matches!(operation.as_str(), "stop" | "remove") })
+        );
         let observed = orch.executor.store().load_observed_state("app").unwrap();
-        assert_eq!(observed[0].phase, ServicePhase::Stopped);
-        assert!(observed[0].container_id.is_none());
+        assert_eq!(observed[0].phase, ServicePhase::Failed);
+        assert!(observed[0].container_id.is_some());
+        assert!(observed[0].failed_create_ownership.is_some());
     }
 
     // ── Real-time event streaming tests ──

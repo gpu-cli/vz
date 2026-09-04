@@ -10,7 +10,7 @@ fn validate_failed_create_ownership(
         Some(ownership)
             if ownership.stack_id == stack_id
                 && ownership.container_id == requested_container_id
-                && ownership.generation > 0 =>
+                && ownership.validate().is_ok() =>
         {
             Some(ownership)
         }
@@ -571,7 +571,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     );
                     match create_result {
                         Ok(receipt) => {
-                            self.finalize_create(spec, &full_name, &receipt.container_id)?;
+                            self.finalize_create(spec, &full_name, &receipt)?;
                             result.succeeded += 1;
                         }
                         Err(failure) => {
@@ -651,7 +651,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 {
                     match outcome {
                         Ok(receipt) => {
-                            self.finalize_create(spec, service_name, &receipt.container_id)?;
+                            self.finalize_create(spec, service_name, &receipt)?;
                             result.succeeded += 1;
                         }
                         Err(failure) => {

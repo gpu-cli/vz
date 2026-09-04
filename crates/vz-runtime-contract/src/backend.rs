@@ -1,10 +1,12 @@
 use std::future::Future;
+use std::time::Duration;
 
 use crate::{
-    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationOwnership, ContainerInfo,
-    ContainerLogs, Event, ExecConfig, ExecOutput, GenerationCleanupOutcome, ImageInfo,
-    IsolationLevel, NetworkServiceConfig, OwnedCreateError, PortMapping, PruneResult, RunConfig,
-    RuntimeCapabilities, RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
+    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationOwnership,
+    ContainerGenerationScope, ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput,
+    GenerationCleanupOutcome, ImageInfo, IsolationLevel, NetworkServiceConfig, OwnedCreateError,
+    PortMapping, PruneResult, RunConfig, RuntimeCapabilities, RuntimeError, RuntimeOperation,
+    SandboxSpec, StackResourceHint,
 };
 
 /// Workspace-oriented runtime manager that routes stack operations
@@ -124,28 +126,44 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
 
     /// Create a stack service container and retain runtime-issued generation ownership.
     ///
-    /// Compatibility backends may return a receipt without ownership. Such a
-    /// receipt does not authorize generation-qualified failed-create cleanup.
+    /// Owned stack creation requires the shared-runtime path. Backends without
+    /// that capability fail before mutation because a successful unowned
+    /// receipt cannot authorize exact teardown.
     pub async fn create_stack_container_owned(
+        &self,
+        scope: &ContainerGenerationScope,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
+        if !self.capabilities().shared_vm {
+            return Err(OwnedCreateError::unowned(
+                RuntimeError::UnsupportedOperation {
+                    operation: "create_container_in_stack_owned".to_string(),
+                    reason: "owned stack creation requires shared runtime support".to_string(),
+                },
+            ));
+        }
+
+        self.backend
+            .create_container_in_stack_owned(scope, image, config)
+            .await
+    }
+
+    /// Compatibility adapter for callers that still identify a stack by name.
+    ///
+    /// The adapter never creates an unscoped generation: it mints a fresh,
+    /// explicitly synthetic legacy topology scope and delegates to the exact
+    /// scoped create path.
+    pub async fn create_legacy_stack_container_owned(
         &self,
         stack_id: &str,
         image: &str,
         config: RunConfig,
     ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
-        if self.capabilities().shared_vm {
-            self.backend
-                .create_container_in_stack_owned(stack_id, image, config)
-                .await
-        } else {
-            self.backend
-                .create_container(image, config)
-                .await
-                .map(|container_id| ContainerCreateReceipt {
-                    container_id,
-                    ownership: None,
-                })
-                .map_err(OwnedCreateError::unowned)
-        }
+        let scope = ContainerGenerationScope::synthetic_legacy_stack(stack_id)
+            .map_err(|reason| OwnedCreateError::unowned(RuntimeError::InvalidConfig(reason)))?;
+        self.create_stack_container_owned(&scope, image, config)
+            .await
     }
 
     /// Clean up exactly the generation named by a runtime-issued ownership proof.
@@ -153,7 +171,21 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         &self,
         ownership: ContainerGenerationOwnership,
     ) -> Result<GenerationCleanupOutcome, RuntimeError> {
+        ownership.validate().map_err(RuntimeError::InvalidConfig)?;
         self.backend.cleanup_container_generation(ownership).await
+    }
+
+    /// Gracefully stop and remove exactly the generation named by a runtime-issued proof.
+    pub async fn stop_and_remove_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        signal: Option<String>,
+        grace_period: Option<Duration>,
+    ) -> Result<GenerationCleanupOutcome, RuntimeError> {
+        ownership.validate().map_err(RuntimeError::InvalidConfig)?;
+        self.backend
+            .stop_and_remove_container_generation(ownership, signal, grace_period)
+            .await
     }
 
     /// Configure stack service networking when capability is available.
@@ -309,12 +341,12 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
     /// Create a container within a sandbox and retain generation ownership.
     pub async fn create_container_in_sandbox_owned(
         &self,
-        sandbox_id: &str,
+        scope: &ContainerGenerationScope,
         image: &str,
         config: RunConfig,
     ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
         self.backend
-            .create_container_in_stack_owned(sandbox_id, image, config)
+            .create_container_in_stack_owned(scope, image, config)
             .await
     }
 
@@ -638,18 +670,36 @@ pub trait RuntimeBackend: Send + Sync {
     /// only a backend that actually controls generation admission may mint it.
     fn create_container_in_stack_owned(
         &self,
+        _scope: &ContainerGenerationScope,
+        _image: &str,
+        _config: RunConfig,
+    ) -> impl Future<Output = Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>>> {
+        async {
+            Err(OwnedCreateError::unowned(
+                RuntimeError::UnsupportedOperation {
+                    operation: "create_container_in_stack_owned".to_string(),
+                    reason: "backend cannot issue generation ownership".to_string(),
+                },
+            ))
+        }
+    }
+
+    /// Compatibility adapter for legacy stack-name callers.
+    ///
+    /// A fresh synthetic scope is minted and then passed through the exact
+    /// scoped backend method, so compatible runtimes never reserve an unscoped
+    /// generation.
+    fn create_container_in_stack_owned_legacy(
+        &self,
         stack_id: &str,
         image: &str,
         config: RunConfig,
     ) -> impl Future<Output = Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>>> {
         async move {
-            self.create_container_in_stack(stack_id, image, config)
+            let scope = ContainerGenerationScope::synthetic_legacy_stack(stack_id)
+                .map_err(|reason| OwnedCreateError::unowned(RuntimeError::InvalidConfig(reason)))?;
+            self.create_container_in_stack_owned(&scope, image, config)
                 .await
-                .map(|container_id| ContainerCreateReceipt {
-                    container_id,
-                    ownership: None,
-                })
-                .map_err(OwnedCreateError::unowned)
         }
     }
 
@@ -665,6 +715,25 @@ pub trait RuntimeBackend: Send + Sync {
             Err(RuntimeError::UnsupportedOperation {
                 operation: "cleanup_container_generation".to_string(),
                 reason: "backend does not support generation-qualified container cleanup"
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Gracefully stop and remove one exact container-ID generation.
+    ///
+    /// This is distinct from forced failed-create cleanup so normal service
+    /// teardown preserves the configured stop signal and grace period.
+    fn stop_and_remove_container_generation(
+        &self,
+        _ownership: ContainerGenerationOwnership,
+        _signal: Option<String>,
+        _grace_period: Option<Duration>,
+    ) -> impl Future<Output = Result<GenerationCleanupOutcome, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "stop_and_remove_container_generation".to_string(),
+                reason: "backend does not support graceful generation-qualified container teardown"
                     .to_string(),
             })
         }

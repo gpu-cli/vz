@@ -586,7 +586,7 @@ fn apply_removes_deleted_services() {
 }
 
 #[test]
-fn apply_clears_all_unproven_failed_ids() {
+fn apply_preserves_unproven_failed_ids_for_cleanup_quarantine() {
     for container_name in [None, Some("global-explicit-id")] {
         let store = StateStore::in_memory().unwrap();
         let mut service = svc("web", "nginx:latest");
@@ -608,9 +608,54 @@ fn apply_clears_all_unproven_failed_ids() {
         let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
         assert_eq!(result.actions.len(), 1);
         let observed = store.load_observed_state("myapp").unwrap();
-        assert!(observed[0].container_id.is_none());
+        assert_eq!(observed[0].container_id.as_deref(), Some("unproven-id"));
         assert!(observed[0].failed_create_ownership.is_none());
     }
+}
+
+#[test]
+fn apply_preserves_successful_runtime_ownership_for_recreate() {
+    let store = StateStore::in_memory().unwrap();
+    store
+        .save_desired_state("myapp", &spec("myapp", vec![svc("web", "nginx:latest")]))
+        .unwrap();
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: "runtime-owned-id".to_string(),
+        generation: 31,
+        stack_id: "myapp".to_string(),
+        scope: Some(Box::new(
+            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp").unwrap(),
+        )),
+    };
+    store
+        .save_observed_state(
+            "myapp",
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Running,
+                container_id: Some(ownership.container_id.clone()),
+                failed_create_ownership: Some(ownership.clone()),
+                last_error: None,
+                ready: true,
+            },
+        )
+        .unwrap();
+
+    let result = apply(
+        &spec("myapp", vec![svc("web", "different:latest")]),
+        &store,
+        &no_health(),
+    )
+    .unwrap();
+
+    assert_eq!(result.actions.len(), 1);
+    assert!(matches!(result.actions[0], Action::ServiceRecreate { .. }));
+    let observed = store.load_observed_state("myapp").unwrap();
+    assert_eq!(
+        observed[0].container_id.as_deref(),
+        Some("runtime-owned-id")
+    );
+    assert_eq!(observed[0].failed_create_ownership, Some(ownership));
 }
 
 #[test]
@@ -623,6 +668,10 @@ fn apply_preserves_runtime_ownership_independent_of_container_name() {
             container_id: "runtime-owned-id".to_string(),
             generation: 29,
             stack_id: "myapp".to_string(),
+            scope: Some(Box::new(
+                vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp")
+                    .unwrap(),
+            )),
         };
         store
             .save_observed_state(
