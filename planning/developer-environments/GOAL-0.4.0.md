@@ -247,6 +247,10 @@ required E2E scenario and retained evidence:
     recreate, and remove additionally satisfies the exact-generation
     precondition, durable-claim, fail-closed migration, and race/crash contract
     in [`reconcile-generation-fencing.md`](reconcile-generation-fencing.md).
+    Desired planning and activation additionally consume the same immutable,
+    operation-owned effective-input snapshot, canonical service digests, and
+    fail-closed replay/tamper contract in
+    [`reconcile-effective-inputs.md`](reconcile-effective-inputs.md).
 
 ## Strict E2E release gate
 

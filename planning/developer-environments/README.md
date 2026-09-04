@@ -125,6 +125,8 @@ in `vz-356`.
 - `architecture.md` — aggregate object model, identities, APIs, and invariants
 - `reconcile-generation-fencing.md` — exact planned-generation preconditions,
   durable claims, mutation ordering, migration, and race/crash gates
+- `reconcile-effective-inputs.md` — immutable desired activation inputs,
+  canonical per-service digests, atomic capture, replay, and tamper gates
 - `00-product-contract.md` — language, profiles, compatibility, and audit
 - `01-environment-lifecycle.md` — aggregate and Machine identity/lifecycle
 - `02-developer-cli.md` — five-verb CLI and deterministic selectors
