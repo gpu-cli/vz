@@ -9,6 +9,7 @@ use vz_runtime_contract::{
 
 use super::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
 use crate::StackError;
+use crate::reconcile::{ActionDraft, ExpectedJournalHead, ReplicaPrecondition};
 
 pub(super) const STACK_JOURNAL_SCHEMA_V4_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS stack_workload_owners (
@@ -477,6 +478,158 @@ impl StackContainerGenerationBinding {
 }
 
 impl StateStore {
+    /// Capture exact predecessor state for a set of planned replica targets.
+    ///
+    /// The complete batch is read under one SQLite snapshot. This is planning
+    /// evidence only; execution must revalidate it while acquiring its durable
+    /// action claim.
+    pub(crate) fn capture_action_preconditions(
+        &self,
+        stack_id: &str,
+        drafts: &[ActionDraft],
+    ) -> Result<Vec<ReplicaPrecondition>, StackError> {
+        validate_text("stack_id", stack_id)?;
+        self.with_immediate_transaction(|store| {
+            let owner = store.load_stack_workload_owner(stack_id)?;
+            let owner = owner.ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "stack_id `{stack_id}` has no stable workload owner for exact planning"
+                ))
+            })?;
+            let environment = store
+                .load_environment_instance(owner.environment_id.as_str())?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "Environment `{}` was not found for stack `{stack_id}`",
+                        owner.environment_id
+                    ))
+                })?;
+            if environment.project_id != owner.project_id {
+                return conflict("stack workload Project does not own the Environment");
+            }
+            if environment.state != vz_runtime_contract::EnvironmentState::Ready {
+                return conflict(format!(
+                    "stack workload Environment `{}` is not runnable ({:?})",
+                    environment.environment_id, environment.state
+                ));
+            }
+            let machine = environment
+                .machines
+                .iter()
+                .find(|machine| machine.machine_id == owner.machine_id)
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "Machine `{}` was not found in Environment `{}`",
+                        owner.machine_id, owner.environment_id
+                    ))
+                })?;
+            if machine.environment_id != environment.environment_id {
+                return conflict("stack workload Environment does not own the Machine");
+            }
+            if machine.state != vz_runtime_contract::MachineState::Ready {
+                return conflict(format!(
+                    "stack workload Machine `{}` is not runnable ({:?})",
+                    machine.machine_id, machine.state
+                ));
+            }
+            let incarnation = machine.incarnation.as_ref().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Machine `{}` has no current incarnation",
+                    machine.machine_id
+                ))
+            })?;
+            let workload = MachineWorkloadScope {
+                schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+                project_id: owner.project_id.clone(),
+                environment_id: owner.environment_id.clone(),
+                machine_id: owner.machine_id.clone(),
+                machine_incarnation_id: incarnation.incarnation_id.clone(),
+                stack_id: stack_id.to_string(),
+            };
+            store.validate_stack_workload_owner(&workload)?;
+
+            let mut preconditions = Vec::with_capacity(drafts.len());
+            for draft in drafts {
+                let target = draft.target();
+                let current_observed =
+                    store.load_service_observed(stack_id, &target.service_name, target.index())?;
+                if current_observed.as_ref() != draft.observed() {
+                    return conflict(format!(
+                        "replica `{}` changed after action planning",
+                        target.display_name()
+                    ));
+                }
+                let reservation_id = store
+                    .conn
+                    .query_row(
+                        "SELECT reservation_id FROM stack_container_create_intents
+                         WHERE project_id = ?1 AND environment_id = ?2 AND machine_id = ?3
+                           AND stack_id = ?4 AND service_name = ?5 AND replica_index = ?6
+                         ORDER BY service_generation DESC LIMIT 1",
+                        params![
+                            owner.project_id.as_str(),
+                            owner.environment_id.as_str(),
+                            owner.machine_id.as_str(),
+                            stack_id,
+                            target.service_name,
+                            i64::from(target.index()),
+                        ],
+                        |row| row.get::<_, String>(0),
+                    )
+                    .optional()?;
+                let journal_head = match reservation_id {
+                    None => {
+                        if current_observed.is_some() {
+                            return conflict(format!(
+                                "replica `{}` has observed state without an exact journal head",
+                                target.display_name()
+                            ));
+                        }
+                        ExpectedJournalHead::NeverJournaled
+                    }
+                    Some(reservation_id) => {
+                        let intent =
+                            store.require_stack_container_create_intent(&reservation_id)?;
+                        if intent.service_name != target.service_name
+                            || intent.replica_index != target.index()
+                        {
+                            return conflict(format!(
+                                "replica `{}` latest journal head targets another replica",
+                                target.display_name()
+                            ));
+                        }
+                        store.validate_journal_workload_owner(&intent)?;
+                        if !matches!(
+                            intent.status,
+                            StackContainerCreateStatus::Cleaned
+                                | StackContainerCreateStatus::Failed
+                        ) {
+                            store.validate_intent_topology(&intent)?;
+                        }
+                        store.require_journal_observed_consistent(&intent)?;
+                        let binding =
+                            store.load_stack_container_generation_binding(&reservation_id)?;
+                        if let Some(binding) = &binding {
+                            store.validate_binding_against_intent(binding, &intent)?;
+                        }
+                        let ownership = binding.map(|binding| binding.ownership);
+                        ExpectedJournalHead::exact(
+                            reservation_id,
+                            intent.service_generation,
+                            ownership,
+                        )?
+                    }
+                };
+                preconditions.push(ReplicaPrecondition::new(
+                    workload.clone(),
+                    environment.lifecycle_generation,
+                    journal_head,
+                )?);
+            }
+            Ok(preconditions)
+        })
+    }
+
     pub(super) fn create_stack_journal_schema_v4(&self) -> Result<(), StackError> {
         let replica_qualified: bool = self.conn.query_row(
             "SELECT EXISTS(
@@ -571,15 +724,28 @@ impl StateStore {
             |row| row.get(0),
         )?;
         let quarantined = if self.schema_version()? >= 5 {
-            self.conn.query_row(
+            let legacy_v5: bool = self.conn.query_row(
                 "SELECT
                      EXISTS(SELECT 1 FROM legacy_observed_state_quarantine_v5 WHERE stack_name = ?1)
                   OR EXISTS(SELECT 1 FROM legacy_reconcile_progress_quarantine_v5 WHERE stack_name = ?1)
                   OR EXISTS(SELECT 1 FROM legacy_reconcile_sessions_quarantine_v5 WHERE stack_name = ?1)
                   OR EXISTS(SELECT 1 FROM legacy_reconcile_audit_quarantine_v5 WHERE stack_name = ?1)",
                 params![scope.stack_id],
-                |row| row.get::<_, bool>(0),
-            )?
+                |row| row.get(0),
+            )?;
+            let legacy_v6 = if self.schema_version()? >= 6 {
+                self.conn.query_row(
+                    "SELECT
+                         EXISTS(SELECT 1 FROM legacy_reconcile_sessions_quarantine_v6 WHERE stack_name = ?1)
+                      OR EXISTS(SELECT 1 FROM legacy_reconcile_progress_quarantine_v6 WHERE stack_name = ?1)
+                      OR EXISTS(SELECT 1 FROM legacy_reconcile_audit_quarantine_v6 WHERE stack_name = ?1)",
+                    params![scope.stack_id],
+                    |row| row.get::<_, bool>(0),
+                )?
+            } else {
+                false
+            };
+            legacy_v5 || legacy_v6
         } else {
             false
         };

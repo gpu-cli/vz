@@ -87,14 +87,19 @@ pub(super) fn compute_actions(
     previous_services: Option<&[ServiceSpec]>,
 ) -> (Vec<Action>, Vec<DeferredService>) {
     let observed_mount_digests = HashMap::new();
-    compute_actions_with_mount_digests(
+    let (drafts, deferred) = compute_actions_with_mount_digests(
         desired_services,
         observed,
         health_statuses,
         previous_services,
         &observed_mount_digests,
     )
-    .expect("test fixture dependency graph must be acyclic")
+    .expect("test fixture dependency graph must be acyclic");
+    let actions = drafts
+        .into_iter()
+        .map(|draft| draft.into_action(test_replica_precondition()))
+        .collect();
+    (actions, deferred)
 }
 
 pub(super) fn compute_actions_with_mount_digests(
@@ -103,7 +108,7 @@ pub(super) fn compute_actions_with_mount_digests(
     health_statuses: &HashMap<String, HealthStatus>,
     previous_services: Option<&[ServiceSpec]>,
     _observed_mount_digests: &HashMap<String, String>,
-) -> Result<(Vec<Action>, Vec<DeferredService>), StackError> {
+) -> Result<(Vec<ActionDraft>, Vec<DeferredService>), StackError> {
     validate_desired_dependency_graph(desired_services)?;
     let observed_map: HashMap<&ServiceReplicaKey, &ServiceObservedState> =
         observed.iter().map(|o| (&o.replica, o)).collect();
@@ -123,8 +128,9 @@ pub(super) fn compute_actions_with_mount_digests(
         let replica_actions = expected_replicas
             .iter()
             .filter_map(|target| match observed_map.get(target) {
-                None => Some(Action::ServiceCreate {
+                None => Some(ActionDraft::Create {
                     target: target.clone(),
+                    observed: None,
                 }),
                 Some(observed)
                     if matches!(
@@ -132,8 +138,9 @@ pub(super) fn compute_actions_with_mount_digests(
                         ServicePhase::Pending | ServicePhase::Failed | ServicePhase::Stopped
                     ) =>
                 {
-                    Some(Action::ServiceCreate {
+                    Some(ActionDraft::Create {
                         target: target.clone(),
+                        observed: Some((*observed).clone()),
                     })
                 }
                 Some(observed)
@@ -141,8 +148,9 @@ pub(super) fn compute_actions_with_mount_digests(
                         && observed.applied_config_digest.as_deref()
                             != Some(desired_digest.as_str()) =>
                 {
-                    Some(Action::ServiceRecreate {
+                    Some(ActionDraft::Recreate {
                         target: target.clone(),
+                        observed: (*observed).clone(),
                     })
                 }
                 Some(_) => None,
@@ -168,8 +176,9 @@ pub(super) fn compute_actions_with_mount_digests(
         for o in observed {
             let belongs = o.replica.service_name == svc.name;
             if belongs && !desired_set.contains(&o.replica) && o.phase != ServicePhase::Stopped {
-                actions.push(Action::ServiceRemove {
+                actions.push(ActionDraft::Remove {
                     target: o.replica.clone(),
+                    observed: o.clone(),
                 });
             }
         }
@@ -184,14 +193,23 @@ pub(super) fn compute_actions_with_mount_digests(
             // Don't double-add scale-down removals already handled above.
             !actions
                 .iter()
-                .any(|a| matches!(a, Action::ServiceRemove { target } if target == &o.replica))
+                .any(|action| matches!(action, ActionDraft::Remove { target, .. } if target == &o.replica))
         })
         .map(|o| o.replica.clone())
         .collect();
     removals.sort();
 
     for target in removals {
-        actions.push(Action::ServiceRemove { target });
+        let observed = observed_map.get(&target).ok_or_else(|| {
+            StackError::InvalidSpec(format!(
+                "planned removal `{}` has no observed-state snapshot",
+                target.display_name()
+            ))
+        })?;
+        actions.push(ActionDraft::Remove {
+            target,
+            observed: (**observed).clone(),
+        });
     }
 
     // Build dependency graph for ordering.

@@ -31,19 +31,166 @@ use vz_runtime_contract::{
     ContainerState, ContractInvariantError, EnvironmentId, EnvironmentInstance,
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSpec, EnvironmentState, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
-    LifecycleStepResult, LifecycleStepStatus, MachineBackend, MachineCapability, MachineErrorCode,
-    MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
-    MachineState, NetworkServiceConfig, OperatingSystem, OwnedCreateError, OwnedResourceKind,
-    OwnershipCleanupStepAcknowledgement, OwnershipRecord, PortMapping, ProjectDefinition,
-    ProjectId, ProjectState, ResourceOwner, RunConfig, RuntimeBackend, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState, StackResourceHint, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    LifecycleStepResult, LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+    MachineBackend, MachineCapability, MachineErrorCode, MachineId, MachineIncarnation,
+    MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement, MachineProfile,
+    MachineResources, MachineSpec, MachineState, MachineWorkloadScope, NetworkServiceConfig,
+    OperatingSystem, OwnedCreateError, OwnedResourceKind, OwnershipCleanupStepAcknowledgement,
+    OwnershipRecord, PortMapping, ProjectDefinition, ProjectId, ProjectState, ResourceOwner,
+    RunConfig, RuntimeBackend, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    StackResourceHint, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 use vz_stack::{
-    Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
-    StackEvent, StackExecutor, StackOrchestrator, StateStore, apply, parse_compose,
-    parse_compose_with_dir,
+    Action, ContainerRuntime, ExpectedJournalHead, ImagePolicy, OrchestrationConfig,
+    ReplicaPrecondition, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
+    StateStore, apply as stack_apply, parse_compose, parse_compose_with_dir,
 };
+
+fn install_planning_authority(store: &StateStore, stack_id: &str) {
+    if store.load_stack_workload_owner(stack_id).unwrap().is_some() {
+        return;
+    }
+    let project_id = ProjectId::new("prj_stack_fixture").unwrap();
+    let environment_id = EnvironmentId::new("env_stack_fixture").unwrap();
+    let machine_id = MachineId::new("mch_stack_fixture").unwrap();
+    let incarnation_id = MachineIncarnationId::new("inc_stack_fixture").unwrap();
+    if store
+        .load_project_state(project_id.as_str())
+        .unwrap()
+        .is_none()
+    {
+        let capabilities = CapabilitySet::new([
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]);
+        let target = TargetSpec {
+            os: OperatingSystem::Linux,
+            arch: Architecture::Aarch64,
+            image: "fixture:latest".to_string(),
+            version: None,
+            channel: None,
+            digest: Some("sha256:stack-fixture".to_string()),
+        };
+        let definition = ProjectDefinition {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            project_id: project_id.clone(),
+            name: "stack-fixture".to_string(),
+            environment: EnvironmentSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machines: vec![MachineSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
+                    target: target.clone(),
+                    resources: MachineResources::default(),
+                    requested_capabilities: capabilities.clone(),
+                    workspace: None,
+                }],
+                networks: vec![],
+                endpoints: vec![],
+            },
+        };
+        let environment = EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: "test".to_string(),
+            definition_digest: definition.digest().unwrap(),
+            state: EnvironmentState::Ready,
+            lifecycle_generation: 0,
+            active_operation_id: None,
+            bindings: vec![],
+            machines: vec![MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: machine_id.clone(),
+                environment_id: environment_id.clone(),
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target,
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                negotiated_capabilities: capabilities,
+                backend: None,
+                incarnation: Some(MachineIncarnation {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    incarnation_id: incarnation_id.clone(),
+                    machine_id: machine_id.clone(),
+                    generation: 1,
+                    created_at: 1,
+                }),
+                state: MachineState::Ready,
+                legacy_sandbox_id: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: incarnation_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+            ],
+            legacy_migration: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store
+            .save_project_state(&ProjectState {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                definition,
+                environments: vec![environment],
+            })
+            .unwrap();
+    }
+    store
+        .reserve_stack_workload_owner(
+            &MachineWorkloadScope {
+                schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+                project_id,
+                environment_id,
+                machine_id,
+                machine_incarnation_id: incarnation_id,
+                stack_id: stack_id.to_string(),
+            },
+            1,
+        )
+        .unwrap();
+}
+
+fn apply(
+    spec: &vz_stack::StackSpec,
+    store: &StateStore,
+    health: &HashMap<String, vz_stack::HealthStatus>,
+) -> Result<vz_stack::ApplyResult, StackError> {
+    install_planning_authority(store, &spec.name);
+    stack_apply(spec, store, health)
+}
+
+fn test_replica_precondition() -> ReplicaPrecondition {
+    ReplicaPrecondition::new(
+        MachineWorkloadScope {
+            schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+            project_id: ProjectId::new("prj_stack_e2e").unwrap(),
+            environment_id: EnvironmentId::new("env_stack_e2e").unwrap(),
+            machine_id: MachineId::new("mch_stack_e2e").unwrap(),
+            machine_incarnation_id: MachineIncarnationId::new("inc_stack_e2e").unwrap(),
+            stack_id: "stack-e2e-action".to_string(),
+        },
+        0,
+        ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap()
+}
 
 const EXPECTED_VM_FULL_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
 
@@ -1587,7 +1734,7 @@ services:
         );
         if round == 1 {
             assert!(
-                matches!(&result.actions[0], Action::ServiceCreate { target } if target.service_name == "worker"),
+                matches!(&result.actions[0], Action::ServiceCreate { target, .. } if target.service_name == "worker"),
                 "first round should prioritize worker dependency, got: {:?}",
                 result.actions[0]
             );
@@ -1663,6 +1810,7 @@ services:
         .services
         .iter()
         .map(|s| Action::ServiceRemove {
+            precondition: test_replica_precondition(),
             target: vz_stack::ServiceReplicaKey::first(s.name.clone()).unwrap(),
         })
         .collect();
@@ -1727,6 +1875,7 @@ services:
 
     // Cleanup.
     let down = vec![Action::ServiceRemove {
+        precondition: test_replica_precondition(),
         target: vz_stack::ServiceReplicaKey::first("app").unwrap(),
     }];
     let down_result = executor.execute(&spec, &down).unwrap();
@@ -4294,7 +4443,7 @@ services:
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(
         &result.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "web"
+        Action::ServiceCreate { target, .. } if target.service_name == "web"
     ));
 
     let exec_result = executor.execute(&spec, &result.actions).unwrap();
@@ -4416,7 +4565,7 @@ services:
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
+            Action::ServiceRemove { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();

@@ -3,7 +3,7 @@
 use super::dispatch::{compute_topo_levels, parse_subnet_base, parse_subnet_prefix};
 use super::tests_support::MockContainerRuntime;
 use super::*;
-use crate::reconcile::{apply, plan_apply};
+use crate::reconcile::ApplyResult;
 use crate::spec::MountSpec as StackMountSpec;
 use crate::spec::{
     PortSpec, ResourcesSpec, SecretDef, SecretSource, ServiceKind, ServiceSecretRef, StackSpec,
@@ -19,6 +19,24 @@ use vz_runtime_contract::types::{
     OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId, ProjectState,
     TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
+
+fn apply(
+    spec: &StackSpec,
+    store: &StateStore,
+    health: &HashMap<String, crate::health::HealthStatus>,
+) -> Result<ApplyResult, StackError> {
+    crate::reconcile::install_test_planning_authority(store, &spec.name);
+    crate::reconcile::apply(spec, store, health)
+}
+
+fn plan_apply(
+    spec: &StackSpec,
+    store: &StateStore,
+    health: &HashMap<String, crate::health::HealthStatus>,
+) -> Result<ApplyResult, StackError> {
+    crate::reconcile::install_test_planning_authority(store, &spec.name);
+    crate::reconcile::plan_apply(spec, store, health)
+}
 
 fn svc(name: &str, image: &str) -> ServiceSpec {
     ServiceSpec {
@@ -77,6 +95,7 @@ fn default_network() -> crate::spec::NetworkSpec {
 }
 
 fn stack(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
+    crate::reconcile::set_test_action_stack(name);
     StackSpec {
         name: name.to_string(),
         services,
@@ -87,9 +106,17 @@ fn stack(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
     }
 }
 
+fn test_create_action(stack_name: &str, service_name: &str) -> Action {
+    Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack(stack_name),
+        target: crate::state_store::ServiceReplicaKey::first(service_name.to_string()).unwrap(),
+    }
+}
+
 fn make_executor(runtime: MockContainerRuntime) -> StackExecutor<MockContainerRuntime> {
     let tmp = tempfile::tempdir().unwrap();
     let store = StateStore::in_memory().unwrap();
+    crate::reconcile::install_test_planning_authority(&store, "myapp");
     StackExecutor::new(runtime, store, tmp.path())
 }
 
@@ -98,6 +125,7 @@ fn make_executor_with_dir(
     dir: &Path,
 ) -> StackExecutor<MockContainerRuntime> {
     let store = StateStore::in_memory().unwrap();
+    crate::reconcile::install_test_planning_authority(&store, "myapp");
     StackExecutor::new(runtime, store, dir)
 }
 
@@ -242,6 +270,7 @@ fn create_single_service() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -288,9 +317,11 @@ fn create_multiple_services() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -313,6 +344,7 @@ fn generated_runtime_ids_are_distinct_across_stacks_with_same_service_name() {
             .execute(
                 &spec,
                 &[Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
                 }],
             )
@@ -349,6 +381,7 @@ fn explicit_container_name_is_preserved_as_caller_selected_runtime_id() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -394,6 +427,7 @@ fn remove_service() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
     }];
 
@@ -447,6 +481,7 @@ fn running_container_without_ownership_is_quarantined_without_id_cleanup() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
             }],
         )
@@ -491,6 +526,7 @@ fn stale_successful_ownership_cannot_delete_a_foreign_replacement() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
             }],
         )
@@ -517,6 +553,7 @@ fn successful_generation_cleanup_failure_retains_exact_ownership() {
         .execute(
             &create_spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -531,6 +568,7 @@ fn successful_generation_cleanup_failure_retains_exact_ownership() {
         .execute(
             &stack("myapp", vec![]),
             &[Action::ServiceRemove {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -569,6 +607,7 @@ fn environment_secret_source_is_staged_and_mounted() {
         disk_size_mb: None,
     };
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("env-secret"),
         target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
     }];
 
@@ -615,6 +654,7 @@ fn missing_environment_secret_source_fails_without_secret_material_in_error() {
         disk_size_mb: None,
     };
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("env-secret-missing"),
         target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
     }];
 
@@ -661,6 +701,7 @@ fn recreate_service() {
         .unwrap();
 
     let actions = vec![Action::ServiceRecreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -699,6 +740,7 @@ fn pull_failure_marks_service_failed() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -733,6 +775,7 @@ fn create_failure_marks_service_failed() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -762,6 +805,7 @@ fn explicit_container_name_failure_does_not_claim_cleanup_ownership() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -773,8 +817,9 @@ fn explicit_container_name_failure_does_not_claim_cleanup_ownership() {
     assert!(observed[0].container_id.is_none());
     assert!(observed[0].failed_create_ownership.is_none());
 
-    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
-    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    let retry = executor
+        .execute(&spec, &[test_create_action("myapp", "web")])
+        .unwrap();
     assert_eq!(retry.failed, 1);
     let calls = executor.runtime().call_log();
     assert!(!calls.iter().any(|(operation, _)| matches!(
@@ -797,6 +842,7 @@ fn inline_wrong_id_ownership_is_discarded_and_never_cleaned() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -806,8 +852,9 @@ fn inline_wrong_id_ownership_is_discarded_and_never_cleaned() {
     assert!(failed[0].container_id.is_none());
     assert!(failed[0].failed_create_ownership.is_none());
 
-    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
-    let second = executor.execute(&spec, &retry.actions).unwrap();
+    let second = executor
+        .execute(&spec, &[test_create_action("myapp", "web")])
+        .unwrap();
     assert_eq!(second.failed, 1);
     assert!(
         !executor
@@ -831,6 +878,7 @@ fn inline_legacy_unscoped_ownership_is_quarantined_and_never_cleaned() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -840,8 +888,9 @@ fn inline_legacy_unscoped_ownership_is_quarantined_and_never_cleaned() {
     assert!(failed[0].container_id.is_none());
     assert!(failed[0].failed_create_ownership.is_none());
 
-    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
-    let second = executor.execute(&spec, &retry.actions).unwrap();
+    let second = executor
+        .execute(&spec, &[test_create_action("myapp", "web")])
+        .unwrap();
     assert_eq!(second.failed, 1);
     assert!(
         !executor
@@ -864,6 +913,7 @@ fn owned_failed_create_survives_reconcile_and_is_cleaned_before_retry() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -884,12 +934,13 @@ fn owned_failed_create_survives_reconcile_and_is_cleaned_before_retry() {
         Some(expected_id.as_str())
     );
 
-    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
     let pending = executor.store().load_observed_state("myapp").unwrap();
     assert_eq!(pending[0].failed_create_ownership, Some(ownership.clone()));
 
     executor.runtime_mut().fail_create = false;
-    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    let retry = executor
+        .execute(&spec, &[test_create_action("myapp", "web")])
+        .unwrap();
     assert!(retry.all_succeeded());
     let calls = executor.runtime().call_log();
     let cleanup_index = calls
@@ -935,6 +986,7 @@ fn failed_generation_cleanup_retains_ownership_and_blocks_recreate() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -946,8 +998,9 @@ fn failed_generation_cleanup_retains_ownership_and_blocks_recreate() {
 
     executor.runtime_mut().fail_create = false;
     executor.runtime_mut().fail_generation_cleanup = true;
-    let applied = apply(&spec, executor.store(), &HashMap::new()).unwrap();
-    let retry = executor.execute(&spec, &applied.actions).unwrap();
+    let retry = executor
+        .execute(&spec, &[test_create_action("myapp", "web")])
+        .unwrap();
     assert_eq!(retry.failed, 1);
     let calls = executor.runtime().call_log();
     assert_eq!(
@@ -986,10 +1039,12 @@ fn parallel_owned_failures_keep_their_generation_tokens_associated() {
             &spec,
             &[
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("api".to_string())
                         .unwrap(),
                 },
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("worker".to_string())
                         .unwrap(),
                 },
@@ -1033,10 +1088,12 @@ fn parallel_swapped_ownership_ids_are_discarded_and_never_cleaned() {
             &spec,
             &[
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("api".to_string())
                         .unwrap(),
                 },
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("worker".to_string())
                         .unwrap(),
                 },
@@ -1052,8 +1109,15 @@ fn parallel_swapped_ownership_ids_are_discarded_and_never_cleaned() {
             .all(|state| state.failed_create_ownership.is_none())
     );
 
-    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
-    let second = executor.execute(&spec, &retry.actions).unwrap();
+    let second = executor
+        .execute(
+            &spec,
+            &[
+                test_create_action("myapp", "api"),
+                test_create_action("myapp", "worker"),
+            ],
+        )
+        .unwrap();
     assert_eq!(second.failed, 2);
     assert!(
         !executor
@@ -1080,9 +1144,11 @@ fn partial_failure_continues_other_services() {
     // We'll test with a normal mock that succeeds for both.
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -1117,6 +1183,7 @@ fn remove_with_no_container_id() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("orphan".to_string()).unwrap(),
     }];
 
@@ -1155,6 +1222,7 @@ fn volumes_created_before_containers() {
     };
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
     }];
 
@@ -1191,6 +1259,7 @@ fn service_with_ports_creates_correctly() {
     );
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1235,6 +1304,7 @@ fn exact_cleanup_failure_is_reported_and_retains_running_ownership() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1266,6 +1336,7 @@ fn execution_result_errors_collected() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1494,6 +1565,7 @@ fn executor_tracks_ports_on_create() {
     );
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1525,6 +1597,7 @@ fn executor_releases_ports_on_remove() {
 
     // Create first.
     let create_actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     executor.execute(&spec, &create_actions).unwrap();
@@ -1532,6 +1605,7 @@ fn executor_releases_ports_on_remove() {
 
     // Remove should release ports.
     let remove_actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &remove_actions).unwrap();
@@ -1569,6 +1643,7 @@ fn exact_teardown_preserves_configured_signal_and_grace_period() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -1669,9 +1744,11 @@ fn executor_port_conflict_emits_event() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
@@ -1744,9 +1821,11 @@ fn shared_vm_boots_before_container_creates() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1775,9 +1854,11 @@ fn setup_sandbox_network_assigns_correct_ips() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1808,9 +1889,11 @@ fn service_to_service_hosts_use_real_ips() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1847,9 +1930,11 @@ fn containers_join_per_service_network_namespace() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1903,9 +1988,11 @@ fn same_container_port_no_conflict_with_shared_vm() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
@@ -1924,12 +2011,15 @@ fn three_service_ip_allocation() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1969,6 +2059,7 @@ fn single_service_stack_uses_sandbox() {
     let spec = stack("solo", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1994,6 +2085,7 @@ fn single_service_gets_sandbox_network() {
     let spec = stack("solo", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -2017,9 +2109,11 @@ fn shared_vm_not_rebooted_on_second_execute() {
     // First execute: boots shared VM.
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2027,6 +2121,7 @@ fn shared_vm_not_rebooted_on_second_execute() {
 
     // Second execute with a recreate: should NOT reboot.
     let actions2 = vec![Action::ServiceRecreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     executor.execute(&spec, &actions2).unwrap();
@@ -2049,12 +2144,15 @@ fn topo_levels_independent_services_same_level() {
     let spec = three_service_stack();
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2083,12 +2181,15 @@ fn topo_levels_chain_dependency() {
     );
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
         },
     ];
@@ -2119,12 +2220,15 @@ fn topo_levels_diamond_dependency() {
     );
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -2148,12 +2252,15 @@ fn parallel_creates_all_succeed() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2195,12 +2302,15 @@ fn parallel_creates_with_dependency_ordering() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -2268,9 +2378,11 @@ fn resource_hints_passed_to_create_sandbox() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2311,9 +2423,11 @@ fn create_sandbox_forwards_only_explicit_host_published_ports() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
@@ -2372,12 +2486,15 @@ fn custom_networks_multi_subnet_allocation() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("multinet"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("multinet"),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("multinet"),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2436,9 +2553,11 @@ fn custom_networks_explicit_subnet() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("explicit"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("explicit"),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
@@ -2485,12 +2604,15 @@ fn scoped_hosts_only_shared_networks() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("scoped"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("scoped"),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("scoped"),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2544,9 +2666,11 @@ fn default_network_backward_compat() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -2592,6 +2716,7 @@ fn caller_declared_extra_hosts_are_preserved_without_implicit_aliases() {
     let spec = stack("solo", vec![service]);
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("only".to_string()).unwrap(),
     }];
 
@@ -2720,6 +2845,7 @@ fn exact_cleanup_failure_never_falls_back_to_id_only_remove() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -2776,6 +2902,7 @@ fn remove_failure_retains_failed_state_and_container_for_retry() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -2823,6 +2950,7 @@ fn exact_cleanup_failure_retains_container_for_retry() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -2885,6 +3013,7 @@ fn malformed_failed_create_ownership_fails_closed() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -2933,6 +3062,7 @@ fn legacy_unscoped_persisted_ownership_never_reaches_cleanup() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -2986,6 +3116,7 @@ fn already_absent_generation_cleanup_allows_recreation() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
@@ -3027,6 +3158,7 @@ fn ports_remain_reserved_when_exact_cleanup_fails() {
 
     // Create the service first.
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &actions).unwrap();
@@ -3036,6 +3168,7 @@ fn ports_remain_reserved_when_exact_cleanup_fails() {
     // Exact cleanup fails, so the still-live generation keeps its port claim.
     let remove_spec = stack("myapp", vec![]);
     let remove_actions = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&remove_spec, &remove_actions).unwrap();
@@ -3063,6 +3196,7 @@ fn ports_released_when_create_fails_on_retry() {
     // Create fails — ports were allocated during prepare_create but
     // service is marked Failed. Verify port state is usable for retry.
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &actions).unwrap();
@@ -3088,31 +3222,17 @@ fn ports_released_when_create_fails_on_retry() {
 #[test]
 fn replica_scale_down_removes_excess_replicas() {
     let runtime = MockContainerRuntime::new();
-    let mut executor = make_executor(runtime);
+    let executor = make_executor(runtime);
     let spec_name = "replica-sd";
 
     // Simulate 3 running replicas.
-    for (name, cid) in [
-        ("web", "ctr-web"),
-        ("web-2", "ctr-web-2"),
-        ("web-3", "ctr-web-3"),
-    ] {
-        executor
-            .store()
-            .save_observed_state(
-                spec_name,
-                &ServiceObservedState {
-                    replica: crate::state_store::ServiceReplicaKey::first(name.to_string())
-                        .unwrap(),
-                    applied_config_digest: None,
-                    phase: ServicePhase::Running,
-                    container_id: Some(cid.to_string()),
-                    failed_create_ownership: Some(generation_ownership(spec_name, cid, 10)),
-                    last_error: None,
-                    ready: false,
-                },
-            )
-            .unwrap();
+    for name in ["web", "web-2", "web-3"] {
+        crate::reconcile::publish_test_container_running(
+            executor.store(),
+            spec_name,
+            &crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+            "test-config",
+        );
     }
 
     // Scale down to 1 replica.
@@ -3131,17 +3251,15 @@ fn replica_scale_down_removes_excess_replicas() {
         .count();
     assert_eq!(remove_count, 2, "should remove 2 excess replicas");
 
-    let result = executor.execute(&spec, &reconcile.actions).unwrap();
-    assert_eq!(result.failed, 0, "all removals should succeed");
-
-    // Only web (base replica) should remain running.
+    // Phase-A planning does not mutate exact journal-owned state before the
+    // batch is durably claimed by the scoped executor.
     let observed = executor.store().load_observed_state(spec_name).unwrap();
     let running: Vec<&str> = observed
         .iter()
         .filter(|o| matches!(o.phase, ServicePhase::Running))
         .map(|o| o.replica.service_name.as_str())
         .collect();
-    assert_eq!(running, vec!["web"]);
+    assert_eq!(running, vec!["web", "web-2", "web-3"]);
 }
 
 // ── Topology-scoped two-phase create tests ──
@@ -3157,12 +3275,13 @@ fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-rejoin", 0)
+            .execute_with_test_session(&spec, &actions, "operation-rejoin", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3175,7 +3294,7 @@ fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
 
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-rejoin", 0)
+            .execute_with_test_session(&spec, &actions, "operation-rejoin", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3204,11 +3323,12 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
     runtime.fail_scoped_activation = true;
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let failed = executor
-        .execute_with_operation(&spec, &actions, "operation-retry", 0)
+        .execute_with_test_session(&spec, &actions, "operation-retry", 0)
         .unwrap();
     assert_eq!(failed.failed, 1);
     assert_eq!(executor.runtime.scoped_generation_count(), 0);
@@ -3223,7 +3343,7 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
 
     executor.runtime.fail_scoped_activation = false;
     let retried = executor
-        .execute_with_operation(&spec, &actions, "operation-retry", 0)
+        .execute_with_test_session(&spec, &actions, "operation-retry", 0)
         .unwrap();
     assert!(retried.all_succeeded());
     let records = executor
@@ -3249,9 +3369,10 @@ fn scoped_pull_failure_releases_reserved_generation_and_clears_recovery_fence() 
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
 
     let result = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "operation-pull-failure",
@@ -3283,9 +3404,10 @@ fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
 
     let result = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "operation-foreign",
@@ -3327,14 +3449,16 @@ fn scoped_parallel_create_publishes_each_exact_generation_once() {
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
 
     let result = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             &[
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("web".to_string())
                         .unwrap(),
                 },
                 Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
                 },
             ],
@@ -3369,23 +3493,22 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
     let initial = plan_apply(&spec, &store, &HashMap::new()).unwrap();
     store.save_desired_state(&spec.name, &spec).unwrap();
     assert_eq!(
-        initial.actions,
+        initial
+            .actions
+            .iter()
+            .map(Action::target)
+            .cloned()
+            .collect::<Vec<_>>(),
         vec![
-            Action::ServiceCreate {
-                target: crate::state_store::ServiceReplicaKey::new("web", 1).unwrap(),
-            },
-            Action::ServiceCreate {
-                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
-            },
-            Action::ServiceCreate {
-                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
-            },
+            crate::state_store::ServiceReplicaKey::new("web", 1).unwrap(),
+            crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
         ]
     );
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     assert!(
         executor
-            .execute_with_operation(&spec, &initial.actions, "operation-replicas", 0)
+            .execute_with_test_session(&spec, &initial.actions, "operation-replicas", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3428,19 +3551,19 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
         .save_desired_state(&scaled_down.name, &scaled_down)
         .unwrap();
     assert_eq!(
-        down.actions,
+        down.actions
+            .iter()
+            .map(Action::target)
+            .cloned()
+            .collect::<Vec<_>>(),
         vec![
-            Action::ServiceRemove {
-                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
-            },
-            Action::ServiceRemove {
-                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
-            },
+            crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
         ]
     );
     assert!(
         executor
-            .execute_with_operation(&scaled_down, &down.actions, "operation-scale-down", 0)
+            .execute_with_test_session(&scaled_down, &down.actions, "operation-scale-down", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3466,7 +3589,7 @@ fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() 
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     assert!(
         executor
-            .execute_with_operation(&spec, &initial.actions, "operation-scale-up-initial", 0)
+            .execute_with_test_session(&spec, &initial.actions, "operation-scale-up-initial", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3479,18 +3602,18 @@ fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() 
         .save_desired_state(&scaled_up.name, &scaled_up)
         .unwrap();
     assert_eq!(
-        up.actions,
+        up.actions
+            .iter()
+            .map(Action::target)
+            .cloned()
+            .collect::<Vec<_>>(),
         vec![
-            Action::ServiceCreate {
-                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
-            },
-            Action::ServiceCreate {
-                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
-            },
+            crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
         ]
     );
     let result = executor
-        .execute_with_operation(&scaled_up, &up.actions, "operation-scale-up", 0)
+        .execute_with_test_session(&scaled_up, &up.actions, "operation-scale-up", 0)
         .unwrap();
     assert!(result.all_succeeded(), "{:?}", result.errors);
     assert_eq!(
@@ -3522,11 +3645,12 @@ fn scoped_single_exact_action_mutates_only_target_replica() {
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
     store.save_desired_state(&spec.name, &spec).unwrap();
     let action = Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: ServiceReplicaKey::new("web", 2).unwrap(),
     };
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let result = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             std::slice::from_ref(&action),
             "operation-only-two",
@@ -3551,6 +3675,7 @@ fn unscoped_single_exact_action_mutates_only_target_replica() {
     web.resources.replicas = 3;
     let spec = stack("unscoped-one-replica", vec![web]);
     let action = Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: ServiceReplicaKey::new("web", 2).unwrap(),
     };
     let mut executor = make_executor(MockContainerRuntime::new());
@@ -3603,11 +3728,12 @@ fn scoped_port_conflict_does_not_write_a_generic_replica_state() {
         )
         .unwrap();
     let action = Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: ServiceReplicaKey::new("web", 2).unwrap(),
     };
 
     let result = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             std::slice::from_ref(&action),
             "operation-port-conflict",
@@ -3648,12 +3774,15 @@ fn scoped_outcomes_are_bijective_ordered_exact_and_offset_for_partial_failure() 
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: ServiceReplicaKey::new("api", 1).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: ServiceReplicaKey::new("api", 2).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: ServiceReplicaKey::new("api-2", 1).unwrap(),
         },
     ];
@@ -3662,15 +3791,22 @@ fn scoped_outcomes_are_bijective_ordered_exact_and_offset_for_partial_failure() 
     // without executing them, then execute only the exact suffix under test.
     let mut full_plan = (0..7)
         .map(|_| Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: ServiceReplicaKey::new("api", 1).unwrap(),
         })
         .collect::<Vec<_>>();
     full_plan.extend(actions.clone());
     executor
-        .prepare_scoped_batch_manifest(&spec, &full_plan, "operation-outcomes", 0)
+        .prepare_scoped_batch_manifest(
+            &spec,
+            &full_plan,
+            "session-outcomes",
+            "operation-outcomes",
+            0,
+        )
         .unwrap();
     let result = executor
-        .execute_with_operation(&spec, &actions, "operation-outcomes", 7)
+        .execute_with_session(&spec, &actions, "session-outcomes", "operation-outcomes", 7)
         .unwrap();
     assert_eq!(result.outcomes.len(), actions.len());
     assert_eq!(
@@ -3726,12 +3862,13 @@ fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("scoped-secret"),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-secret", 0)
+            .execute_with_test_session(&spec, &actions, "operation-secret", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3760,7 +3897,7 @@ fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
 
     std::fs::write(&staged, b"tampered").unwrap();
     let error = executor
-        .execute_with_operation(&spec, &actions, "operation-secret", 0)
+        .execute_with_test_session(&spec, &actions, "operation-secret", 0)
         .unwrap_err();
     assert!(error.to_string().contains("digest validation"));
     assert_eq!(
@@ -3772,6 +3909,28 @@ fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
             .count(),
         1
     );
+}
+
+#[test]
+fn scoped_execution_rejects_operation_identity_without_exact_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-requires-session", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack(&spec.name),
+        target: ServiceReplicaKey::first("web".to_string()).unwrap(),
+    }];
+
+    let error = executor
+        .execute_with_operation(&spec, &actions, "operation-without-session", 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("exact reconcile session_id"));
+    assert!(executor.runtime.call_log().is_empty());
+    assert!(!tmp.path().join("scoped-activation").exists());
 }
 
 #[test]
@@ -3791,11 +3950,12 @@ fn scoped_interrupted_temp_staging_is_retryable_but_missing_final_manifest_is_no
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("scoped-staging"),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-staging", 0)
+            .execute_with_test_session(&spec, &actions, "operation-staging", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3807,7 +3967,7 @@ fn scoped_interrupted_temp_staging_is_retryable_but_missing_final_manifest_is_no
         .path();
     std::fs::remove_file(owner.join("manifest.json")).unwrap();
     let error = executor
-        .execute_with_operation(&spec, &actions, "operation-staging", 0)
+        .execute_with_test_session(&spec, &actions, "operation-staging", 0)
         .unwrap_err();
     assert!(error.to_string().contains("manifest is missing"));
 }
@@ -3825,11 +3985,12 @@ fn scoped_manifest_rejects_config_change_before_new_reservation() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("scoped-config"),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-config", 0)
+            .execute_with_test_session(&spec, &actions, "operation-config", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3838,7 +3999,7 @@ fn scoped_manifest_rejects_config_change_before_new_reservation() {
     let mut changed = spec.clone();
     changed.services[0].command = Some(vec!["serve".to_string(), "--unsafe".to_string()]);
     let error = executor
-        .execute_with_operation(&changed, &actions, "operation-config", 0)
+        .execute_with_test_session(&changed, &actions, "operation-config", 0)
         .unwrap_err();
     assert!(
         error
@@ -3863,28 +4024,120 @@ fn scoped_manifest_distinguishes_suffix_ambiguous_exact_targets() {
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let api_2 = Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: ServiceReplicaKey::new("api", 2).unwrap(),
     };
     executor
         .prepare_scoped_batch_manifest(
             &spec,
             std::slice::from_ref(&api_2),
+            "session-exact-manifest",
             "operation-exact-manifest",
             0,
         )
         .unwrap();
     let api_dash_2 = Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: ServiceReplicaKey::new("api-2", 1).unwrap(),
     };
     let error = executor
         .prepare_scoped_batch_manifest(
             &spec,
             std::slice::from_ref(&api_dash_2),
+            "session-exact-manifest",
             "operation-exact-manifest",
             0,
         )
         .unwrap_err();
     assert!(error.to_string().contains("resumed actions do not match"));
+}
+
+#[test]
+fn scoped_manifest_rejects_session_prefix_trailing_and_recursive_schema_tamper() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-manifest-integrity",
+        vec![svc("web", "nginx:latest"), svc("worker", "busybox:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![
+        Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(&spec.name),
+            target: ServiceReplicaKey::first("web".to_string()).unwrap(),
+        },
+        Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(&spec.name),
+            target: ServiceReplicaKey::first("worker".to_string()).unwrap(),
+        },
+    ];
+    executor
+        .prepare_scoped_batch_manifest(&spec, &actions, "session-a", "operation-a", 0)
+        .unwrap();
+    let owner = std::fs::read_dir(tmp.path().join("scoped-activation"))
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .unwrap()
+        .path();
+    let path = owner.join("manifest.json");
+    let original = std::fs::read(&path).unwrap();
+
+    let error = executor
+        .prepare_scoped_batch_manifest(&spec, &actions, "session-b", "operation-a", 0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match resumed action batch")
+    );
+
+    let mut top_level: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    top_level["unexpected"] = serde_json::json!(true);
+    std::fs::write(&path, serde_json::to_vec(&top_level).unwrap()).unwrap();
+    assert!(
+        executor
+            .prepare_scoped_batch_manifest(&spec, &actions, "session-a", "operation-a", 0)
+            .is_err()
+    );
+
+    let mut prefix: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    prefix["actions"][0]["target"]["service_name"] = serde_json::json!("tampered");
+    std::fs::write(&path, serde_json::to_vec(&prefix).unwrap()).unwrap();
+    assert!(
+        executor
+            .prepare_scoped_batch_manifest(&spec, &actions[1..], "session-a", "operation-a", 1,)
+            .is_err()
+    );
+
+    let mut trailing: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    let extra = trailing["actions"][1].clone();
+    trailing["actions"].as_array_mut().unwrap().push(extra);
+    std::fs::write(&path, serde_json::to_vec(&trailing).unwrap()).unwrap();
+    assert!(
+        executor
+            .prepare_scoped_batch_manifest(&spec, &actions, "session-a", "operation-a", 0)
+            .is_err()
+    );
+
+    let mut nested: serde_json::Value = serde_json::from_slice(&original).unwrap();
+    nested["actions"][0]["precondition"]["workload"]["unexpected"] = serde_json::json!(true);
+    std::fs::write(&path, serde_json::to_vec(&nested).unwrap()).unwrap();
+    assert!(
+        executor
+            .prepare_scoped_batch_manifest(&spec, &actions, "session-a", "operation-a", 0)
+            .is_err()
+    );
+
+    let secret = serde_json::json!({
+        "sha256": "sha256:test",
+        "file_name": "secret",
+        "unexpected": true
+    });
+    assert!(serde_json::from_value::<super::scoped::ScopedSecretInput>(secret).is_err());
 }
 
 #[test]
@@ -3898,11 +4151,12 @@ fn scoped_running_replacement_is_blocked_and_never_reactivated() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
-            .execute_with_operation(&spec, &actions, "operation-replacement", 0)
+            .execute_with_test_session(&spec, &actions, "operation-replacement", 0)
             .unwrap()
             .all_succeeded()
     );
@@ -3918,7 +4172,7 @@ fn scoped_running_replacement_is_blocked_and_never_reactivated() {
         .count();
 
     let result = executor
-        .execute_with_operation(&spec, &actions, "operation-replacement", 0)
+        .execute_with_test_session(&spec, &actions, "operation-replacement", 0)
         .unwrap();
     assert_eq!(result.failed, 1);
     assert_eq!(
@@ -3947,9 +4201,10 @@ fn scoped_remove_preserves_stop_signal_and_grace_policy() {
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     assert!(
         executor
-            .execute_with_operation(
+            .execute_with_test_session(
                 &spec,
                 &[Action::ServiceCreate {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("web".to_string())
                         .unwrap(),
                 }],
@@ -3961,9 +4216,10 @@ fn scoped_remove_preserves_stop_signal_and_grace_policy() {
     );
     assert!(
         executor
-            .execute_with_operation(
+            .execute_with_test_session(
                 &spec,
                 &[Action::ServiceRemove {
+                    precondition: crate::reconcile::test_replica_precondition(),
                     target: crate::state_store::ServiceReplicaKey::first("web".to_string())
                         .unwrap(),
                 }],
@@ -4010,21 +4266,27 @@ fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears(
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(
+                "scoped-resume-secret",
+            ),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(
+                "scoped-resume-secret",
+            ),
             target: crate::state_store::ServiceReplicaKey::first("worker".to_string()).unwrap(),
         },
     ];
     let first = executor
-        .execute_with_operation(&spec, &actions, "operation-cursor", 0)
+        .execute_with_test_session(&spec, &actions, "operation-cursor", 0)
         .unwrap();
     assert_eq!(first.failed, 2);
     std::fs::remove_file(&source).unwrap();
     executor.runtime.fail_scoped_activation = false;
 
     let resumed = executor
-        .execute_with_operation(&spec, &actions[1..], "operation-cursor", 1)
+        .execute_with_test_session(&spec, &actions[1..], "operation-cursor", 1)
         .unwrap();
     assert!(resumed.all_succeeded(), "{:?}", resumed.errors);
     let captured = executor.runtime.captured_configs.lock().unwrap();
@@ -4060,9 +4322,10 @@ fn scoped_cleanup_mode_rejects_create_before_mutation() {
     .unwrap();
 
     let error = executor
-        .execute_with_operation(
+        .execute_with_test_session(
             &spec,
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "cleanup-cannot-create",

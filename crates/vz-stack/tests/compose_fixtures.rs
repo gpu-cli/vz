@@ -9,9 +9,147 @@
 
 use std::collections::HashMap;
 
+use vz_runtime_contract::{
+    Architecture, CapabilitySet, ContainerGenerationOwnership, EnvironmentId, EnvironmentInstance,
+    EnvironmentSpec, EnvironmentState, MachineCapability, MachineId, MachineIncarnation,
+    MachineIncarnationId, MachineInstance, MachineProfile, MachineResources, MachineSpec,
+    MachineState, MachineWorkloadScope, OperatingSystem, OwnedResourceKind, OwnershipRecord,
+    ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+};
+
+fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
+    if store.load_stack_workload_owner(stack_id).unwrap().is_some() {
+        return;
+    }
+    let project_id = ProjectId::new("prj_compose_fixture").unwrap();
+    let environment_id = EnvironmentId::new("env_compose_fixture").unwrap();
+    let machine_id = MachineId::new("mch_compose_fixture").unwrap();
+    let incarnation_id = MachineIncarnationId::new("inc_compose_fixture").unwrap();
+    if store
+        .load_project_state(project_id.as_str())
+        .unwrap()
+        .is_none()
+    {
+        let capabilities = CapabilitySet::new([
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]);
+        let target = TargetSpec {
+            os: OperatingSystem::Linux,
+            arch: Architecture::Aarch64,
+            image: "fixture:latest".to_string(),
+            version: None,
+            channel: None,
+            digest: Some("sha256:compose-fixture".to_string()),
+        };
+        let definition = ProjectDefinition {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            project_id: project_id.clone(),
+            name: "compose-fixture".to_string(),
+            environment: EnvironmentSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machines: vec![MachineSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
+                    target: target.clone(),
+                    resources: MachineResources::default(),
+                    requested_capabilities: capabilities.clone(),
+                    workspace: None,
+                }],
+                networks: vec![],
+                endpoints: vec![],
+            },
+        };
+        let environment = EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: "test".to_string(),
+            definition_digest: definition.digest().unwrap(),
+            state: EnvironmentState::Ready,
+            lifecycle_generation: 0,
+            active_operation_id: None,
+            bindings: vec![],
+            machines: vec![MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: machine_id.clone(),
+                environment_id: environment_id.clone(),
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target,
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                negotiated_capabilities: capabilities,
+                backend: None,
+                incarnation: Some(MachineIncarnation {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    incarnation_id: incarnation_id.clone(),
+                    machine_id: machine_id.clone(),
+                    generation: 1,
+                    created_at: 1,
+                }),
+                state: MachineState::Ready,
+                legacy_sandbox_id: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: incarnation_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+            ],
+            legacy_migration: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store
+            .save_project_state(&ProjectState {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                definition,
+                environments: vec![environment],
+            })
+            .unwrap();
+    }
+    store
+        .reserve_stack_workload_owner(
+            &MachineWorkloadScope {
+                schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+                project_id,
+                environment_id,
+                machine_id,
+                machine_incarnation_id: incarnation_id,
+                stack_id: stack_id.to_string(),
+            },
+            1,
+        )
+        .unwrap();
+}
+
+fn apply_test(
+    spec: &vz_stack::StackSpec,
+    store: &vz_stack::StateStore,
+    health: &HashMap<String, vz_stack::HealthStatus>,
+) -> Result<vz_stack::ApplyResult, vz_stack::StackError> {
+    install_planning_authority(store, &spec.name);
+    vz_stack::apply(spec, store, health)
+}
+
 use vz_stack::{
-    Action, HealthStatus, ServiceDependency, ServiceObservedState, ServicePhase, StackSpec,
-    StateStore, parse_compose,
+    Action, HealthStatus, ServiceDependency, StackContainerCreateSelector,
+    StackContainerGenerationBinding, StackSpec, StateStore, parse_compose,
 };
 
 // ── Fixture: web + redis ──────────────────────────────────────────
@@ -81,14 +219,14 @@ fn web_redis_initial_apply_creates_both_services() {
     let (store, _dir) = open_temp_store();
     let health = HashMap::new();
 
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     // Strict dependency gating: only redis is created in the first pass.
     let created: Vec<&str> = result
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
+            Action::ServiceCreate { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -109,7 +247,7 @@ fn web_redis_second_apply_is_idempotent_when_all_running() {
     let health = HashMap::new();
 
     // First apply.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
 
     // Simulate runtime: both services now running.
     simulate_running(&store, &spec, &["redis", "web"]);
@@ -121,7 +259,7 @@ fn web_redis_second_apply_is_idempotent_when_all_running() {
     health.insert("redis".to_string(), redis_health);
 
     // Second apply should be idempotent — no actions needed.
-    let second = vz_stack::apply(&spec, &store, &health).unwrap();
+    let second = apply_test(&spec, &store, &health).unwrap();
     assert!(
         second.actions.is_empty(),
         "second apply should be idempotent when all running: {:?}",
@@ -136,29 +274,16 @@ fn web_redis_redis_health_gates_web_when_redis_running_but_unhealthy() {
     let health = HashMap::new();
 
     // First apply creates both.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
 
-    // Simulate: redis running but health check failing, web not yet created.
-    store
-        .save_observed_state(
-            "web-redis",
-            &ServiceObservedState {
-                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-redis".to_string()),
-                failed_create_ownership: None,
-                last_error: None,
-                ready: false,
-            },
-        )
-        .unwrap();
+    // Publish redis through the exact create journal, but leave its health gate closed.
+    publish_running_generation(&store, &spec, "redis", false);
 
     // No health status for redis = health check hasn't passed.
     let health = HashMap::new();
 
     // Re-apply: web should be deferred because redis has a health check that hasn't passed.
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let deferred_names: Vec<&str> = result
         .deferred
@@ -179,23 +304,10 @@ fn web_redis_redis_health_unblocks_web_when_healthy() {
     let health = HashMap::new();
 
     // First apply.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
 
-    // Simulate: redis running and healthy.
-    store
-        .save_observed_state(
-            "web-redis",
-            &ServiceObservedState {
-                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-redis".to_string()),
-                failed_create_ownership: None,
-                last_error: None,
-                ready: true,
-            },
-        )
-        .unwrap();
+    // Publish redis through the exact create journal and open its health gate.
+    publish_running_generation(&store, &spec, "redis", true);
 
     let mut health = HashMap::new();
     let mut redis_health = HealthStatus::new("redis");
@@ -203,13 +315,13 @@ fn web_redis_redis_health_unblocks_web_when_healthy() {
     health.insert("redis".to_string(), redis_health);
 
     // Re-apply: web should now be created (not deferred).
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let created: Vec<&str> = result
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
+            Action::ServiceCreate { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -230,7 +342,7 @@ fn web_redis_teardown_removes_both_services() {
     let health = HashMap::new();
 
     // Apply to create services.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
     simulate_running(&store, &spec, &["redis", "web"]);
 
     // Teardown: apply empty spec.
@@ -242,13 +354,13 @@ fn web_redis_teardown_removes_both_services() {
         secrets: vec![],
         disk_size_mb: None,
     };
-    let result = vz_stack::apply(&empty, &store, &health).unwrap();
+    let result = apply_test(&empty, &store, &health).unwrap();
 
     let removed: Vec<&str> = result
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
+            Action::ServiceRemove { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -352,13 +464,13 @@ fn web_pg_redis_initial_apply_creates_all_three() {
     let (store, _dir) = open_temp_store();
     let health = HashMap::new();
 
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let created: Vec<&str> = result
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
+            Action::ServiceCreate { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -381,37 +493,11 @@ fn web_pg_redis_health_gates_web_on_both_deps() {
     let health = HashMap::new();
 
     // First apply.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
 
-    // Simulate: postgres running but unhealthy, redis running and healthy.
-    store
-        .save_observed_state(
-            "fullstack",
-            &ServiceObservedState {
-                replica: vz_stack::ServiceReplicaKey::first("postgres".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-pg".to_string()),
-                failed_create_ownership: None,
-                last_error: None,
-                ready: false,
-            },
-        )
-        .unwrap();
-    store
-        .save_observed_state(
-            "fullstack",
-            &ServiceObservedState {
-                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-redis".to_string()),
-                failed_create_ownership: None,
-                last_error: None,
-                ready: true,
-            },
-        )
-        .unwrap();
+    // Publish both dependencies through their exact create journals. Only redis is ready.
+    publish_running_generation(&store, &spec, "postgres", false);
+    publish_running_generation(&store, &spec, "redis", true);
 
     let mut health = HashMap::new();
     let mut redis_h = HealthStatus::new("redis");
@@ -419,7 +505,7 @@ fn web_pg_redis_health_gates_web_on_both_deps() {
     health.insert("redis".to_string(), redis_h);
     // postgres: no health status (check hasn't passed).
 
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let deferred_names: Vec<&str> = result
         .deferred
@@ -440,7 +526,7 @@ fn web_pg_redis_all_healthy_converges() {
     let health = HashMap::new();
 
     // First apply.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
 
     // Simulate all running and healthy.
     simulate_running(&store, &spec, &["postgres", "redis", "web"]);
@@ -452,7 +538,7 @@ fn web_pg_redis_all_healthy_converges() {
         health.insert(name.to_string(), h);
     }
 
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
     assert!(
         result.actions.is_empty(),
         "converged state should produce no actions: {:?}",
@@ -467,7 +553,7 @@ fn web_pg_redis_teardown_removes_all_three() {
     let (store, _dir) = open_temp_store();
     let health = HashMap::new();
 
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
     simulate_running(&store, &spec, &["postgres", "redis", "web"]);
 
     let empty = StackSpec {
@@ -478,13 +564,13 @@ fn web_pg_redis_teardown_removes_all_three() {
         secrets: vec![],
         disk_size_mb: None,
     };
-    let result = vz_stack::apply(&empty, &store, &health).unwrap();
+    let result = apply_test(&empty, &store, &health).unwrap();
 
     let removed: Vec<&str> = result
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
+            Action::ServiceRemove { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -503,7 +589,7 @@ fn web_redis_apply_emits_events() {
     let (store, _dir) = open_temp_store();
     let health = HashMap::new();
 
-    let _result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _result = apply_test(&spec, &store, &health).unwrap();
 
     let events = store.load_event_records("web-redis").unwrap();
     assert!(!events.is_empty(), "apply should emit events for fixture");
@@ -540,7 +626,7 @@ fn web_redis_event_streaming_since() {
     let health = HashMap::new();
 
     // First apply.
-    let _first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let _first = apply_test(&spec, &store, &health).unwrap();
     let events_after_first = store.load_event_records("web-redis").unwrap();
     let cursor = events_after_first.last().unwrap().id;
 
@@ -552,7 +638,7 @@ fn web_redis_event_streaming_since() {
     redis_h.record_pass();
     health2.insert("redis".to_string(), redis_h);
 
-    let _second = vz_stack::apply(&spec, &store, &health2).unwrap();
+    let _second = apply_test(&spec, &store, &health2).unwrap();
 
     // Events since cursor should only include second apply events.
     let new_events = store.load_events_since("web-redis", cursor).unwrap();
@@ -577,7 +663,7 @@ fn web_pg_redis_deterministic_across_runs() {
     for _ in 0..5 {
         let (store, _dir) = open_temp_store();
         let health = HashMap::new();
-        let result = vz_stack::apply(&spec, &store, &health).unwrap();
+        let result = apply_test(&spec, &store, &health).unwrap();
         let names: Vec<String> = result
             .actions
             .iter()
@@ -738,24 +824,80 @@ fn open_temp_store() -> (StateStore, tempfile::TempDir) {
 
 fn simulate_running(store: &StateStore, spec: &StackSpec, services: &[&str]) {
     for name in services {
-        let service = spec
-            .services
-            .iter()
-            .find(|service| service.name == *name)
-            .unwrap();
-        store
-            .save_observed_state(
-                &spec.name,
-                &ServiceObservedState {
-                    replica: vz_stack::ServiceReplicaKey::first(name.to_string()).unwrap(),
-                    applied_config_digest: Some(vz_stack::service_config_digest(service)),
-                    phase: ServicePhase::Running,
-                    container_id: Some(format!("ctr-{name}")),
-                    failed_create_ownership: None,
-                    last_error: None,
-                    ready: false,
-                },
-            )
-            .unwrap();
+        publish_running_generation(store, spec, name, false);
     }
+}
+
+/// Drive a fixture replica through the same durable journal transitions used by
+/// scoped execution. This deliberately does not synthesize `observed_state`:
+/// the Running predecessor and its ownership are published atomically by the
+/// journal APIs so a later plan can capture an exact, honest head.
+fn publish_running_generation(
+    store: &StateStore,
+    spec: &StackSpec,
+    service_name: &str,
+    ready: bool,
+) {
+    let service = spec
+        .services
+        .iter()
+        .find(|service| service.name == service_name)
+        .unwrap();
+    let owner = store
+        .load_stack_workload_owner(&spec.name)
+        .unwrap()
+        .unwrap();
+    let project = store
+        .load_project_state(owner.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    let environment = project
+        .environments
+        .iter()
+        .find(|environment| environment.environment_id == owner.environment_id)
+        .unwrap();
+    let machine = environment
+        .machines
+        .iter()
+        .find(|machine| machine.machine_id == owner.machine_id)
+        .unwrap();
+    let target = vz_stack::ServiceReplicaKey::first(service_name.to_string()).unwrap();
+    let selector = StackContainerCreateSelector {
+        project_id: owner.project_id,
+        environment_id: owner.environment_id,
+        machine_id: owner.machine_id,
+        machine_incarnation_id: machine.incarnation.as_ref().unwrap().incarnation_id.clone(),
+        environment_generation: environment.lifecycle_generation,
+        stack_id: spec.name.clone(),
+        service_name: service_name.to_string(),
+        replica_index: target.index(),
+        requested_container_id: format!("ctr-{}-{service_name}", spec.name),
+        definition_digest: environment.definition_digest.clone(),
+        action_digest: format!("fixture-action-{}-{service_name}", spec.name),
+        applied_config_digest: vz_stack::service_config_digest(service),
+    };
+    let (intent, existing_binding) = store
+        .resolve_or_begin_stack_container_create(&selector, 10)
+        .unwrap();
+    assert!(
+        existing_binding.is_none(),
+        "fixture generation unexpectedly already had a binding"
+    );
+    let ownership = ContainerGenerationOwnership {
+        container_id: selector.requested_container_id,
+        generation: intent.service_generation,
+        stack_id: spec.name.clone(),
+        scope: Some(Box::new(intent.scope.clone())),
+    };
+    store
+        .bind_stack_container_generation(&StackContainerGenerationBinding {
+            reservation_id: intent.scope.reservation_id.clone(),
+            service_name: service_name.to_string(),
+            ownership,
+            bound_at: 11,
+        })
+        .unwrap();
+    store
+        .publish_stack_container_create_success(&intent.scope.reservation_id, ready, 12)
+        .unwrap();
 }

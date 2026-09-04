@@ -142,20 +142,73 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         operation_id: &str,
         first_action_index: usize,
     ) -> Result<ExecutionResult, StackError> {
+        if self.scoped_authority.is_some() {
+            return Err(StackError::InvalidSpec(
+                "scoped stack execution requires an exact reconcile session_id".to_string(),
+            ));
+        }
         if operation_id.trim().is_empty() {
             return Err(StackError::InvalidSpec(
                 "scoped stack execution requires a non-empty operation_id".to_string(),
             ));
         }
-        self.execute_internal(spec, actions, Some((operation_id, first_action_index)))
+        self.execute_internal(
+            spec,
+            actions,
+            Some((operation_id, operation_id, first_action_index)),
+        )
+    }
+
+    /// Execute a persisted scoped action batch with exact session and operation identity.
+    pub(crate) fn execute_with_session(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        session_id: &str,
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<ExecutionResult, StackError> {
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(StackError::InvalidSpec(
+                "scoped stack execution requires non-empty session_id and operation_id".to_string(),
+            ));
+        }
+        self.execute_internal(
+            spec,
+            actions,
+            Some((session_id, operation_id, first_action_index)),
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn execute_with_test_session(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<ExecutionResult, StackError> {
+        let session_id = format!("test-session-{operation_id}");
+        self.execute_with_session(spec, actions, &session_id, operation_id, first_action_index)
     }
 
     fn execute_internal(
         &mut self,
         spec: &StackSpec,
         actions: &[Action],
-        batch: Option<(&str, usize)>,
+        batch: Option<(&str, &str, usize)>,
     ) -> Result<ExecutionResult, StackError> {
+        for action in actions {
+            action.validate()?;
+            if action.precondition().workload().stack_id != spec.name {
+                return Err(super::scope_state_conflict(format!(
+                    "action `{}` is scoped to stack `{}` instead of `{}`",
+                    action.target().display_name(),
+                    action.precondition().workload().stack_id,
+                    spec.name
+                )));
+            }
+        }
         for service in &spec.services {
             let replicas = service.resources.replicas.max(1);
             if replicas > 1 && service.container_name.is_some() {
@@ -192,7 +245,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             ));
         }
         if self.scoped_authority.is_some() {
-            let (operation_id, first_action_index) = batch.ok_or_else(|| {
+            let (session_id, operation_id, first_action_index) = batch.ok_or_else(|| {
                 StackError::InvalidSpec(
                     "scoped executor requires persisted operation identity".to_string(),
                 )
@@ -203,6 +256,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 self.prepare_scoped_batch_manifest(
                     spec,
                     actions,
+                    session_id,
                     operation_id,
                     first_action_index,
                 )?;
@@ -535,7 +589,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             spec.services.iter().map(|s| (s.name.as_str(), s)).collect();
 
         if self.scoped_authority.is_some() {
-            let (operation_id, first_action_index) = batch.ok_or_else(|| {
+            let (session_id, operation_id, first_action_index) = batch.ok_or_else(|| {
                 StackError::InvalidSpec(
                     "scoped executor lost its validated operation identity".to_string(),
                 )
@@ -544,8 +598,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 spec,
                 actions,
                 &service_map,
-                operation_id,
-                first_action_index,
+                (session_id, operation_id, first_action_index),
                 all_skipped_mounts,
             );
         }
@@ -579,7 +632,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             for action in level {
                 let should_remove = match action {
                     Action::ServiceRecreate { .. } => true,
-                    Action::ServiceCreate { target } => {
+                    Action::ServiceCreate { target, .. } => {
                         let observed = self
                             .store
                             .load_observed_state(&spec.name)
@@ -792,7 +845,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
 
         result.skipped_mounts = all_skipped_mounts;
-        let first_action_index = batch.map(|(_, index)| index).unwrap_or(0);
+        let first_action_index = batch.map(|(_, _, index)| index).unwrap_or(0);
         result.outcomes = actions
             .iter()
             .enumerate()

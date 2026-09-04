@@ -92,6 +92,14 @@ fn create_v4_store(path: &Path) -> StateStore {
     store
 }
 
+fn create_v5_store(path: &Path) -> StateStore {
+    let store = create_v4_store(path);
+    store
+        .migrate_replica_v4_to_v5()
+        .expect("create canonical v5 state database");
+    store
+}
+
 fn application_schema_snapshot(connection: &Connection) -> Vec<(String, String, String, String)> {
     let mut statement = connection
         .prepare(
@@ -534,9 +542,11 @@ fn reconcile_progress_round_trip_and_clear() {
     let store = StateStore::in_memory().unwrap();
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
@@ -1581,7 +1591,7 @@ fn allocator_state_rejects_duplicate_exact_targets_and_host_ports() {
 // ── Reconcile session tests ──
 
 fn sample_session(id: &str, stack: &str) -> ReconcileSession {
-    let actions = sample_actions();
+    let actions = sample_actions_for_stack(stack);
     ReconcileSession {
         session_id: id.to_string(),
         stack_name: stack.to_string(),
@@ -1597,11 +1607,17 @@ fn sample_session(id: &str, stack: &str) -> ReconcileSession {
 }
 
 fn sample_actions() -> Vec<Action> {
+    sample_actions_for_stack("myapp")
+}
+
+fn sample_actions_for_stack(stack: &str) -> Vec<Action> {
     vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(stack),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(stack),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ]
@@ -1761,10 +1777,10 @@ fn reconcile_session_stacks_are_isolated() {
     let s1 = sample_session("rs-a1", "app1");
     let s2 = sample_session("rs-b1", "app2");
     store
-        .create_reconcile_session(&s1, &sample_actions())
+        .create_reconcile_session(&s1, &sample_actions_for_stack("app1"))
         .unwrap();
     store
-        .create_reconcile_session(&s2, &sample_actions())
+        .create_reconcile_session(&s2, &sample_actions_for_stack("app2"))
         .unwrap();
 
     let active1 = store
@@ -2961,9 +2977,11 @@ fn phase1_validation_reconcile_session_lifecycle() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -3032,6 +3050,7 @@ fn phase1_validation_reconcile_session_supersession() {
         .as_secs();
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -3192,7 +3211,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 5);
+    assert_eq!(version, 6);
 }
 
 #[test]
@@ -3322,6 +3341,7 @@ fn phase3_drift_stale_reconcile_session() {
         - 600; // 10 minutes ago
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -3476,12 +3496,15 @@ fn make_audit_entry(
     let target = ServiceReplicaKey::first(service_name).unwrap();
     let action = match action_kind {
         "service_create" => Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack(stack_name),
             target: target.clone(),
         },
         "service_recreate" => Action::ServiceRecreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: target.clone(),
         },
         "service_remove" => Action::ServiceRemove {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: target.clone(),
         },
         other => panic!("unsupported audit test action kind {other}"),
@@ -3527,6 +3550,7 @@ fn audit_log_start_and_load() {
         "sess-1",
         "myapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: entry.target.clone(),
         }],
     );
@@ -3553,6 +3577,7 @@ fn audit_log_complete_success() {
         "sess-1",
         "myapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: entry.target.clone(),
         }],
     );
@@ -3576,6 +3601,7 @@ fn audit_log_complete_failure() {
         "sess-1",
         "myapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: entry.target.clone(),
         }],
     );
@@ -3608,12 +3634,15 @@ fn audit_log_multiple_entries_ordered_by_action_index() {
         "myapp",
         &[
             Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: e0.target.clone(),
             },
             Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: e1.target.clone(),
             },
             Action::ServiceRemove {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: e2.target.clone(),
             },
         ],
@@ -3642,6 +3671,7 @@ fn audit_log_scoped_by_session() {
         "sess-1",
         "myapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: e1.target.clone(),
         }],
     );
@@ -3650,6 +3680,7 @@ fn audit_log_scoped_by_session() {
         "sess-2",
         "myapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: e2.target.clone(),
         }],
     );
@@ -3683,6 +3714,7 @@ fn audit_log_recent_by_stack() {
             &format!("sess-{i}"),
             "myapp",
             &[Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: entry.target.clone(),
             }],
         );
@@ -3696,6 +3728,7 @@ fn audit_log_recent_by_stack() {
         "sess-other",
         "otherapp",
         &[Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("otherapp"),
             target: other.target.clone(),
         }],
     );
@@ -3724,12 +3757,15 @@ fn recovery_crash_during_apply_actions_partially_persisted() {
     // Create session with 3 actions
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
     ];
@@ -3791,12 +3827,15 @@ fn recovery_restart_with_partial_batch_resumes_from_cursor() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
     ];
@@ -4032,6 +4071,7 @@ fn recovery_superseded_session_cleanup() {
 
     // First session
     let actions1 = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let session1 = ReconcileSession {
@@ -4060,6 +4100,7 @@ fn recovery_superseded_session_cleanup() {
 
     // Create new session
     let actions2 = vec![Action::ServiceRecreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let session2 = ReconcileSession {
@@ -4113,12 +4154,15 @@ fn phase3_validation_full_recovery_lifecycle() {
     // 2. Create reconcile session with 3 actions
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceRemove {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("old-svc".to_string()).unwrap(),
         },
     ];
@@ -4185,6 +4229,7 @@ fn phase3_validation_full_recovery_lifecycle() {
     // 7. Create second session (simulating next apply)
     store.supersede_active_sessions("myapp").unwrap(); // no-op: already completed
     let actions2 = vec![Action::ServiceRecreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let session2 = ReconcileSession {
@@ -4254,13 +4299,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(5).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        store.set_schema_version(6).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 6);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
     }
 }
 
@@ -4801,7 +4846,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         let definition_json: String = store
             .conn
             .query_row(
@@ -6769,7 +6814,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 5);
+    assert_eq!(retried.schema_version().unwrap(), 6);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -6827,7 +6872,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         assert_eq!(
             store
                 .conn
@@ -7062,7 +7107,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 5);
+    assert_eq!(retried.schema_version().unwrap(), 6);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -7209,7 +7254,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v5 shape mismatch"));
+    assert!(error.contains("state schema v6 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -7238,7 +7283,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v5 shape mismatch"));
+    assert!(error.contains("state schema v6 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -7343,7 +7388,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v5 shape mismatch"),
+            error.contains("state schema v6 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -7704,20 +7749,20 @@ fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
     }
 }
 
-/// Verify that fresh state stores advertise the current v5 schema.
+/// Verify that fresh state stores advertise the current v6 schema.
 #[test]
 fn migration_v4_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "5" after initial init.
+    // Schema version must be present and equal to "6" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "5");
+    assert_eq!(version_str, "6");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
 
     // created_at must also be set.
     assert!(
@@ -7777,7 +7822,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -7835,6 +7880,7 @@ fn migration_new_tables_dont_break_old_queries() {
 
     // Reconcile progress
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("s1"),
         target: crate::state_store::ServiceReplicaKey::first("svc".to_string()).unwrap(),
     }];
     store
@@ -7858,7 +7904,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 5);
+    assert_eq!(store.schema_version().unwrap(), 6);
 }
 
 fn journal_fixture(
@@ -8025,6 +8071,177 @@ fn reserve_selector_owner(store: &StateStore, selector: &StackContainerCreateSel
 }
 
 #[test]
+fn action_precondition_capture_uses_exact_topology_and_never_journaled_head() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("capture-never");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    let drafts = vec![crate::reconcile::ActionDraft::Create {
+        target: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+        observed: None,
+    }];
+
+    let captured = store
+        .capture_action_preconditions(&intent.scope.stack_id, &drafts)
+        .unwrap();
+
+    assert_eq!(captured.len(), 1);
+    assert_eq!(
+        captured[0].workload(),
+        &workload_scope_for_journal_intent(&intent)
+    );
+    assert_eq!(
+        captured[0].environment_generation(),
+        intent.environment_generation
+    );
+    assert_eq!(
+        captured[0].journal_head(),
+        &crate::reconcile::ExpectedJournalHead::NeverJournaled
+    );
+}
+
+#[test]
+fn action_precondition_capture_rejects_observed_state_changed_after_draft() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("capture-stale");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    let drafts = vec![crate::reconcile::ActionDraft::Create {
+        target: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+        observed: None,
+    }];
+    store
+        .save_observed_state(
+            &intent.scope.stack_id,
+            &ServiceObservedState {
+                replica: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+                applied_config_digest: None,
+                phase: ServicePhase::Pending,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            },
+        )
+        .unwrap();
+
+    let error = store
+        .capture_action_preconditions(&intent.scope.stack_id, &drafts)
+        .unwrap_err();
+    assert!(error.to_string().contains("changed after action planning"));
+}
+
+#[test]
+fn action_precondition_capture_includes_exact_bound_journal_head() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("capture-bound");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+    let observed = store
+        .load_observed_state_for_replica(
+            &intent.scope.stack_id,
+            &intent.service_name,
+            intent.replica_index,
+        )
+        .unwrap()
+        .unwrap();
+    let drafts = vec![crate::reconcile::ActionDraft::Recreate {
+        target: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+        observed,
+    }];
+
+    let captured = store
+        .capture_action_preconditions(&intent.scope.stack_id, &drafts)
+        .unwrap();
+
+    assert_eq!(
+        captured[0].journal_head(),
+        &crate::reconcile::ExpectedJournalHead::Exact {
+            reservation_id: intent.scope.reservation_id.clone(),
+            service_generation: intent.service_generation,
+            ownership: Some(binding.ownership),
+        }
+    );
+}
+
+#[test]
+fn action_precondition_capture_preserves_cleaned_head_across_machine_incarnation() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("capture-cleaned-old-incarnation");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+    store
+        .begin_stack_container_cleanup(&intent.scope.reservation_id, 102)
+        .unwrap();
+    let stopped = store
+        .publish_stack_container_cleanup_success(&intent.scope.reservation_id, 103)
+        .unwrap();
+
+    let mut current_environment = project.environments[0].clone();
+    current_environment.lifecycle_generation += 1;
+    current_environment.updated_at += 1;
+    let current_machine = &mut current_environment.machines[0];
+    let current_incarnation_id = MachineIncarnationId::new("inc_journal_successor").unwrap();
+    current_machine.incarnation = Some(MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: current_incarnation_id.clone(),
+        machine_id: current_machine.machine_id.clone(),
+        generation: 2,
+        created_at: 200,
+    });
+    let incarnation_ownership = current_environment
+        .ownership
+        .iter_mut()
+        .find(|record| record.resource_kind == OwnedResourceKind::Incarnation)
+        .unwrap();
+    let previous_incarnation_id = incarnation_ownership.resource_id.clone();
+    incarnation_ownership.resource_id = current_incarnation_id.to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE topology_ownership SET resource_id = ?1, record_json = ?2
+             WHERE resource_kind = ?3 AND resource_id = ?4",
+            params![
+                incarnation_ownership.resource_id,
+                serde_json::to_string(incarnation_ownership).unwrap(),
+                serde_json::to_string(&OwnedResourceKind::Incarnation).unwrap(),
+                previous_incarnation_id,
+            ],
+        )
+        .unwrap();
+    overwrite_journal_fixture_environment(&store, &current_environment);
+    let drafts = vec![crate::reconcile::ActionDraft::Create {
+        target: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+        observed: Some(stopped),
+    }];
+
+    let captured = store
+        .capture_action_preconditions(&intent.scope.stack_id, &drafts)
+        .unwrap();
+
+    assert_eq!(
+        captured[0].workload().machine_incarnation_id.as_str(),
+        "inc_journal_successor"
+    );
+    assert_eq!(
+        captured[0].environment_generation(),
+        intent.environment_generation + 1
+    );
+    assert_eq!(
+        captured[0].journal_head(),
+        &crate::reconcile::ExpectedJournalHead::Exact {
+            reservation_id: intent.scope.reservation_id.clone(),
+            service_generation: intent.service_generation,
+            ownership: Some(binding.ownership),
+        }
+    );
+}
+
+#[test]
 fn v3_to_v4_stack_journal_migration_preserves_rows_without_backfilling_authority() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v3-to-v4.db");
@@ -8121,7 +8338,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 5);
+    assert_eq!(reopened.schema_version().unwrap(), 6);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -8164,7 +8381,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 5);
+    assert_eq!(reopened.schema_version().unwrap(), 6);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -8471,11 +8688,11 @@ fn v4_running_without_applied_digest_migrates_and_replans_conservatively() {
     desired.name = "stack-journal".to_string();
     desired.services.truncate(1);
     let plan = crate::reconcile::plan_apply(&desired, &store, &HashMap::new()).unwrap();
+    assert_eq!(plan.actions.len(), 1);
+    assert!(matches!(plan.actions[0], Action::ServiceRecreate { .. }));
     assert_eq!(
-        plan.actions,
-        vec![Action::ServiceRecreate {
-            target: ServiceReplicaKey::first("web").unwrap(),
-        }]
+        plan.actions[0].target(),
+        &ServiceReplicaKey::first("web").unwrap()
     );
 }
 
@@ -8564,9 +8781,11 @@ fn exact_action_storage_rejects_hash_cursor_and_legacy_corruption() {
     let store = StateStore::open(&path).unwrap();
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("exact"),
             target: ServiceReplicaKey::new("api", 2).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("exact"),
             target: ServiceReplicaKey::new("api-2", 1).unwrap(),
         },
     ];
@@ -8605,7 +8824,7 @@ fn exact_action_storage_rejects_hash_cursor_and_legacy_corruption() {
 
     let session = ReconcileSession {
         session_id: "exact-session".to_string(),
-        stack_name: "exact-session-stack".to_string(),
+        stack_name: "exact".to_string(),
         operation_id: "op-session".to_string(),
         status: ReconcileSessionStatus::Active,
         actions_hash: crate::reconcile::compute_actions_hash(&actions),
@@ -8625,7 +8844,7 @@ fn exact_action_storage_rejects_hash_cursor_and_legacy_corruption() {
     let audit = ReconcileAuditEntry {
         id: 0,
         session_id: "exact-session".to_string(),
-        stack_name: "exact-session-stack".to_string(),
+        stack_name: "exact".to_string(),
         action_index: 1,
         action_kind: "service_create".to_string(),
         target: ServiceReplicaKey::new("api-2", 1).unwrap(),
@@ -8814,6 +9033,466 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
             .unwrap(),
         0
     );
+}
+
+#[test]
+fn fresh_store_uses_v6_reconcile_action_schema_and_replica_claim_index() {
+    let store = StateStore::in_memory().unwrap();
+    assert_eq!(store.schema_version().unwrap(), 6);
+
+    for table in ["reconcile_sessions", "reconcile_progress"] {
+        let sql: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                params![table],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let normalized = sql.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(
+            normalized.contains("CHECK(action_schema_version = 3)"),
+            "unexpected {table} declaration: {normalized}"
+        );
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'reconcile_one_started_replica'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        1
+    );
+}
+
+#[test]
+fn v5_to_v6_archives_only_terminal_v2_history() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v5-terminal-reconcile.db");
+    let store = create_v5_store(&path);
+    let (project, mut scope_fixture, _) = journal_fixture("v6-archive-scope");
+    store.save_project_state(&project).unwrap();
+    let actions =
+        r#"[{"kind":"service_remove","target":{"service_name":"api","replica_index":2}}]"#;
+    store
+        .conn
+        .execute(
+            "INSERT INTO reconcile_sessions (
+                session_id, stack_name, operation_id, status, action_schema_version,
+                actions_json, actions_hash, next_action_index, total_actions,
+                started_at, updated_at, completed_at
+             ) VALUES ('terminal-v2', 'archive-stack', 'op-v2', 'completed', 2,
+                       ?1, 'hash-v2', 1, 1, 10, 11, 12)",
+            params![actions],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO reconcile_audit_log (
+                session_id, stack_name, action_index, action_kind, service_name,
+                replica_index, action_hash, status, started_at, completed_at, error_message
+             ) VALUES ('terminal-v2', 'archive-stack', 0, 'service_remove', 'api',
+                       2, 'action-hash-v2', 'completed', 10, 12, NULL)",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "INSERT INTO reconcile_progress (
+                stack_name, operation_id, action_schema_version, actions_json,
+                actions_hash, next_action_index
+             ) VALUES ('completed-marker', 'op-complete', 2, ?1, 'hash-v2', 1)",
+            params![actions],
+        )
+        .unwrap();
+
+    store.migrate_reconcile_v5_to_v6().unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), 6);
+    let archived_session: (String, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT status, action_schema_version, reason
+             FROM legacy_reconcile_sessions_quarantine_v6
+             WHERE session_id = 'terminal-v2'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(archived_session.0, "completed");
+    assert_eq!(archived_session.1, 2);
+    assert!(archived_session.2.contains("schema v2"));
+    let archived_audit: (String, i64, String) = store
+        .conn
+        .query_row(
+            "SELECT status, replica_index, reason
+             FROM legacy_reconcile_audit_quarantine_v6
+             WHERE session_id = 'terminal-v2'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap();
+    assert_eq!(archived_audit.0, "completed");
+    assert_eq!(archived_audit.1, 2);
+    assert!(archived_audit.2.contains("schema v2"));
+    let archived_progress: (i64, String) = store
+        .conn
+        .query_row(
+            "SELECT action_schema_version, reason
+             FROM legacy_reconcile_progress_quarantine_v6
+             WHERE stack_name = 'completed-marker'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(archived_progress.0, 2);
+    assert!(archived_progress.1.contains("terminal"));
+    for table in [
+        "reconcile_sessions",
+        "reconcile_progress",
+        "reconcile_audit_log",
+    ] {
+        assert_eq!(
+            store
+                .conn
+                .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap(),
+            0
+        );
+    }
+    for stack_id in ["archive-stack", "completed-marker"] {
+        scope_fixture.scope.stack_id = stack_id.to_string();
+        let error = store
+            .validate_stack_workload_owner_claim(&workload_scope_for_journal_intent(&scope_fixture))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("unowned legacy state"));
+    }
+}
+
+#[test]
+fn v5_to_v6_preflight_refuses_live_v2_state_without_writes() {
+    for case in ["active-session", "pending-progress", "started-audit"] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("v5-{case}.db"));
+        let store = create_v5_store(&path);
+        let actions =
+            r#"[{"kind":"service_create","target":{"service_name":"api","replica_index":1}}]"#;
+        match case {
+            "active-session" => {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO reconcile_sessions (
+                            session_id, stack_name, operation_id, status, action_schema_version,
+                            actions_json, actions_hash, next_action_index, total_actions,
+                            started_at, updated_at, completed_at
+                         ) VALUES ('active-v2', 'live-stack', 'op-v2', 'active', 2,
+                                   ?1, 'hash-v2', 0, 1, 10, 10, NULL)",
+                        params![actions],
+                    )
+                    .unwrap();
+            }
+            "pending-progress" => {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO reconcile_progress (
+                            stack_name, operation_id, action_schema_version, actions_json,
+                            actions_hash, next_action_index
+                         ) VALUES ('live-stack', 'op-v2', 2, ?1, 'hash-v2', 0)",
+                        params![actions],
+                    )
+                    .unwrap();
+            }
+            "started-audit" => {
+                store
+                    .conn
+                    .execute(
+                        "INSERT INTO reconcile_audit_log (
+                            session_id, stack_name, action_index, action_kind, service_name,
+                            replica_index, action_hash, status, started_at,
+                            completed_at, error_message
+                         ) VALUES ('claim-v2', 'live-stack', 0, 'service_create', 'api',
+                                   1, 'action-hash-v2', 'started', 10, NULL, NULL)",
+                        [],
+                    )
+                    .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let schema_before = application_schema_snapshot(&store.conn);
+
+        let error = store.migrate_reconcile_v5_to_v6().unwrap_err().to_string();
+
+        assert!(
+            error.contains(case.split('-').next().unwrap()),
+            "{case}: {error}"
+        );
+        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(application_schema_snapshot(&store.conn), schema_before);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT
+                         (SELECT COUNT(*) FROM reconcile_sessions) +
+                         (SELECT COUNT(*) FROM reconcile_progress) +
+                         (SELECT COUNT(*) FROM reconcile_audit_log)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master
+                     WHERE name IN (
+                        'legacy_reconcile_sessions_quarantine_v6',
+                        'legacy_reconcile_progress_quarantine_v6',
+                        'legacy_reconcile_audit_quarantine_v6',
+                        'reconcile_one_started_replica'
+                     )",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            0
+        );
+    }
+}
+
+#[test]
+fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
+    for (suffix, failpoint) in [
+        (
+            "archive",
+            topology::ReconcileV6MigrationFailpoint::AfterTerminalHistoryArchived,
+        ),
+        (
+            "tables",
+            topology::ReconcileV6MigrationFailpoint::AfterDurableActionsRebuilt,
+        ),
+        (
+            "index",
+            topology::ReconcileV6MigrationFailpoint::AfterReplicaClaimIndexCreated,
+        ),
+    ] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("v5-to-v6-{suffix}.db"));
+        let store = create_v5_store(&path);
+        store
+            .conn
+            .execute(
+                "INSERT INTO reconcile_sessions (
+                    session_id, stack_name, operation_id, status, action_schema_version,
+                    actions_json, actions_hash, next_action_index, total_actions,
+                    started_at, updated_at, completed_at
+                 ) VALUES ('terminal-v2', 'archive-stack', 'op-v2', 'failed', 2,
+                           '[]', 'hash-v2', 0, 0, 10, 11, 12)",
+                [],
+            )
+            .unwrap();
+        let before = application_schema_snapshot(&store.conn);
+
+        let error = store
+            .migrate_reconcile_v5_to_v6_with_failpoint(failpoint)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("injected v5-to-v6 migration failure"));
+        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(application_schema_snapshot(&store.conn), before);
+        assert_eq!(
+            store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM reconcile_sessions WHERE session_id = 'terminal-v2'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+        drop(store);
+
+        let reopened = StateStore::open(&path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 6);
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM legacy_reconcile_sessions_quarantine_v6
+                     WHERE session_id = 'terminal-v2'",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+}
+
+#[test]
+fn v6_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-reopen-v3.db");
+    let store = StateStore::open(&path).unwrap();
+    let (project, intent, _) = journal_fixture("v3-reopen-scope");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    let precondition = crate::reconcile::ReplicaPrecondition::new(
+        workload_scope_for_journal_intent(&intent),
+        intent.environment_generation,
+        crate::reconcile::ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap();
+    let actions = vec![Action::ServiceCreate {
+        target: ServiceReplicaKey::new("api", 1).unwrap(),
+        precondition,
+    }];
+    let session = ReconcileSession {
+        session_id: "session-v3".to_string(),
+        stack_name: intent.scope.stack_id.clone(),
+        operation_id: "op-v3".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 10,
+        updated_at: 10,
+        completed_at: None,
+    };
+    store.create_reconcile_batch(&session, &actions).unwrap();
+    store
+        .start_reconcile_batch(
+            &session.session_id,
+            &session.stack_name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap();
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(
+        reopened
+            .load_reconcile_session_actions(&session.session_id)
+            .unwrap(),
+        actions
+    );
+    assert_eq!(
+        reopened
+            .load_reconcile_progress(&session.stack_name)
+            .unwrap()
+            .unwrap()
+            .actions,
+        actions
+    );
+    let audits = reopened
+        .load_audit_log_for_session(&session.session_id)
+        .unwrap();
+    assert_eq!(audits.len(), 1);
+    assert_eq!(audits[0].target, actions[0].target().clone());
+    assert_eq!(audits[0].status, "started");
+
+    let (actions_json, actions_hash): (String, String) = reopened
+        .conn
+        .query_row(
+            "SELECT actions_json, actions_hash
+             FROM reconcile_sessions WHERE session_id = 'session-v3'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions
+             SET actions_json = ?1
+             WHERE session_id = 'session-v3'",
+            params![r#"[{"schema_version":3}]"#],
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .load_reconcile_session_actions(&session.session_id)
+            .is_err()
+    );
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_json = ?1
+             WHERE session_id = 'session-v3'",
+            params![actions_json],
+        )
+        .unwrap();
+
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_audit_log SET replica_index = 2
+             WHERE session_id = 'session-v3'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .load_audit_log_for_session(&session.session_id)
+            .is_err()
+    );
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_audit_log SET replica_index = 1
+             WHERE session_id = 'session-v3'",
+            [],
+        )
+        .unwrap();
+
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_hash = 'tampered'
+             WHERE session_id = 'session-v3'",
+            [],
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .load_reconcile_session_actions(&session.session_id)
+            .is_err()
+    );
+    reopened
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_hash = ?1
+             WHERE session_id = 'session-v3'",
+            params![actions_hash],
+        )
+        .unwrap();
+
+    let duplicate = reopened.conn.execute(
+        "INSERT INTO reconcile_audit_log (
+            session_id, stack_name, action_index, action_kind, service_name,
+            replica_index, action_hash, status, started_at, completed_at, error_message
+         ) VALUES ('foreign-v3', 'stack-journal', 0, 'service_create', 'api',
+                   1, 'foreign-action-v3', 'started', 12, NULL, NULL)",
+        [],
+    );
+    assert!(duplicate.is_err());
 }
 
 #[test]
@@ -10459,7 +11138,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v5_schema().unwrap();
+    store.validate_v6_schema().unwrap();
 }
 
 #[test]
@@ -11760,15 +12439,309 @@ fn two_worktree_three_environment_layout_resolves_and_persists_distinct_owned_re
 fn exact_batch_actions() -> Vec<Action> {
     vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("exact-batch"),
             target: ServiceReplicaKey::new("api", 2).unwrap(),
         },
         Action::ServiceRecreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("exact-batch"),
             target: ServiceReplicaKey::new("api-2", 1).unwrap(),
         },
         Action::ServiceRemove {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("exact-batch"),
             target: ServiceReplicaKey::new("worker", 1).unwrap(),
         },
     ]
+}
+
+#[test]
+fn impossible_action_kind_and_head_pairs_never_cross_persistence_boundary() {
+    let store = StateStore::in_memory().unwrap();
+    let workload = workload_scope_for_journal_intent(&journal_fixture("kind-head").1);
+    let target = ServiceReplicaKey::first("web".to_string()).unwrap();
+    let never = crate::reconcile::ReplicaPrecondition::new(
+        workload.clone(),
+        0,
+        crate::reconcile::ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap();
+    let exact_unbound = crate::reconcile::ReplicaPrecondition::new(
+        workload.clone(),
+        0,
+        crate::reconcile::ExpectedJournalHead::exact("kind-head", 1, None).unwrap(),
+    )
+    .unwrap();
+    let invalid_actions = [
+        Action::ServiceRecreate {
+            target: target.clone(),
+            precondition: never.clone(),
+        },
+        Action::ServiceRecreate {
+            target: target.clone(),
+            precondition: exact_unbound,
+        },
+        Action::ServiceRemove {
+            target,
+            precondition: never,
+        },
+    ];
+
+    for (index, action) in invalid_actions.into_iter().enumerate() {
+        let actions = vec![action];
+        assert!(actions[0].validate().is_err());
+        let session = ReconcileSession {
+            session_id: format!("rs-invalid-kind-head-{index}"),
+            stack_name: workload.stack_id.clone(),
+            operation_id: format!("op-invalid-kind-head-{index}"),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: crate::reconcile::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: 1,
+            updated_at: 1,
+            completed_at: None,
+        };
+        assert!(store.create_reconcile_session(&session, &actions).is_err());
+        assert!(
+            store
+                .save_reconcile_progress(&session.stack_name, &session.operation_id, &actions, 0)
+                .is_err()
+        );
+        assert!(store.create_reconcile_batch(&session, &actions).is_err());
+    }
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_progress", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn batch_rejects_valid_action_scoped_to_another_stack_without_writes() {
+    let store = StateStore::in_memory().unwrap();
+    let (_, intent, _) = journal_fixture("cross-stack-action");
+    let action = Action::ServiceCreate {
+        target: ServiceReplicaKey::first("web".to_string()).unwrap(),
+        precondition: crate::reconcile::ReplicaPrecondition::new(
+            workload_scope_for_journal_intent(&intent),
+            intent.environment_generation,
+            crate::reconcile::ExpectedJournalHead::NeverJournaled,
+        )
+        .unwrap(),
+    };
+    let actions = vec![action];
+    let session = ReconcileSession {
+        session_id: "rs-cross-stack".to_string(),
+        stack_name: "different-stack".to_string(),
+        operation_id: "op-cross-stack".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: 1,
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+
+    assert!(store.create_reconcile_batch(&session, &actions).is_err());
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_progress", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+}
+
+#[test]
+fn invalid_action_target_is_rejected_at_every_persistence_entrypoint() {
+    let store = StateStore::in_memory().unwrap();
+    let valid_actions = exact_batch_actions();
+    let mut invalid_target = ServiceReplicaKey::new("api", 2).unwrap();
+    invalid_target.service_name = " api".to_string();
+    let invalid_actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
+        target: invalid_target,
+    }];
+    let invalid_session = ReconcileSession {
+        session_id: "rs-invalid-target".to_string(),
+        stack_name: "invalid-target".to_string(),
+        operation_id: "invalid-target-operation".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&invalid_actions),
+        next_action_index: 0,
+        total_actions: invalid_actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+
+    assert!(
+        store
+            .save_reconcile_progress(
+                &invalid_session.stack_name,
+                &invalid_session.operation_id,
+                &invalid_actions,
+                0,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .create_reconcile_session(&invalid_session, &invalid_actions)
+            .is_err()
+    );
+    assert!(
+        store
+            .create_reconcile_batch(&invalid_session, &invalid_actions)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_progress", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row("SELECT COUNT(*) FROM reconcile_sessions", [], |row| row
+                .get::<_, i64>(0))
+            .unwrap(),
+        0
+    );
+
+    let valid_session = ReconcileSession {
+        session_id: "rs-valid-before-invalid-start".to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: "valid-operation".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&valid_actions),
+        next_action_index: 0,
+        total_actions: valid_actions.len(),
+        started_at: 2,
+        updated_at: 2,
+        completed_at: None,
+    };
+    store
+        .create_reconcile_batch(&valid_session, &valid_actions)
+        .unwrap();
+    assert!(
+        store
+            .start_reconcile_batch(
+                &valid_session.session_id,
+                &valid_session.stack_name,
+                &valid_session.operation_id,
+                0,
+                &invalid_actions,
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .load_audit_log_for_session(&valid_session.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
+    let store = StateStore::in_memory().unwrap();
+    let actions = exact_batch_actions();
+    let session = ReconcileSession {
+        session_id: "rs-nested-unknown".to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: "nested-unknown-operation".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    store.create_reconcile_session(&session, &actions).unwrap();
+    let actions_json: String = store
+        .conn
+        .query_row(
+            "SELECT actions_json FROM reconcile_sessions WHERE session_id = ?1",
+            params![session.session_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut target_tamper: serde_json::Value = serde_json::from_str(&actions_json).unwrap();
+    target_tamper[0]["target"]["unexpected"] = serde_json::json!(true);
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_json = ?1 WHERE session_id = ?2",
+            params![target_tamper.to_string(), session.session_id],
+        )
+        .unwrap();
+    assert!(
+        store
+            .load_reconcile_session_actions(&session.session_id)
+            .is_err()
+    );
+
+    let mut legacy_ownership: serde_json::Value = serde_json::from_str(&actions_json).unwrap();
+    legacy_ownership[0]["precondition"]["journal_head"]["ownership"]["scope"]["machine_incarnation_id"] =
+        serde_json::Value::Null;
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET actions_json = ?1 WHERE session_id = ?2",
+            params![legacy_ownership.to_string(), session.session_id],
+        )
+        .unwrap();
+    let error = store
+        .load_reconcile_session_actions(&session.session_id)
+        .unwrap_err();
+    assert!(error.to_string().contains("machine incarnation"));
+
+    store
+        .save_reconcile_progress("exact-batch", "op", &actions, 0)
+        .unwrap();
+    let progress_json: String = store
+        .conn
+        .query_row(
+            "SELECT actions_json FROM reconcile_progress WHERE stack_name = 'exact-batch'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let mut workload_tamper: serde_json::Value = serde_json::from_str(&progress_json).unwrap();
+    workload_tamper[0]["precondition"]["workload"]["unexpected"] = serde_json::json!(true);
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_progress SET actions_json = ?1 WHERE stack_name = 'exact-batch'",
+            params![workload_tamper.to_string()],
+        )
+        .unwrap();
+    assert!(store.load_reconcile_progress("exact-batch").is_err());
 }
 
 fn install_exact_batch(store: &StateStore, session_id: &str) -> Vec<Action> {
@@ -11832,6 +12805,40 @@ fn assert_uncommitted_exact_batch(store: &StateStore, session_id: &str) {
     let audits = store.load_audit_log_for_session(session_id).unwrap();
     assert_eq!(audits.len(), 3);
     assert!(audits.iter().all(|entry| entry.status == "started"));
+}
+
+#[test]
+fn audit_claim_prevents_session_payload_deletion_across_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("audit-session-fk.db");
+    let store = StateStore::open(&path).unwrap();
+    install_exact_batch(&store, "rs-audit-session-fk");
+    assert!(store.foreign_keys_enabled().unwrap());
+    let error = store
+        .conn
+        .execute(
+            "DELETE FROM reconcile_sessions WHERE session_id = 'rs-audit-session-fk'",
+            [],
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("FOREIGN KEY constraint failed"));
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert!(reopened.foreign_keys_enabled().unwrap());
+    assert_eq!(
+        reopened
+            .load_reconcile_session_actions("rs-audit-session-fk")
+            .unwrap(),
+        exact_batch_actions()
+    );
+    assert_eq!(
+        reopened
+            .load_audit_log_for_session("rs-audit-session-fk")
+            .unwrap()
+            .len(),
+        3
+    );
 }
 
 #[test]
@@ -11901,9 +12908,13 @@ fn duplicate_exact_target_plan_is_rejected_before_batch_mutation() {
     let target = ServiceReplicaKey::new("api", 2).unwrap();
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: target.clone(),
         },
-        Action::ServiceRecreate { target },
+        Action::ServiceRecreate {
+            precondition: crate::reconcile::test_replica_precondition(),
+            target,
+        },
     ];
     let session = ReconcileSession {
         session_id: "rs-exact-duplicate-target".to_string(),

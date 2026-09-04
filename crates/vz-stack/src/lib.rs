@@ -50,10 +50,10 @@ pub use network::{
 };
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
 pub use reconcile::{
-    Action, ApplyResult, DeferredService, apply, compute_actions_hash, plan_apply,
-    service_config_digest,
+    Action, ApplyResult, DeferredService, ExpectedJournalHead, ReplicaPrecondition, apply,
+    compute_actions_hash, plan_apply, service_config_digest,
 };
-pub use restart::{RestartTracker, compute_restarts};
+pub use restart::{RestartTracker, compute_restart_targets};
 pub use spec::{
     DependencyCondition, HealthCheckSpec, LoggingConfig, MountSpec, NetworkSpec, PortSpec,
     ResourcesSpec, RestartPolicy, SecretDef, SecretSource, ServiceDependency, ServiceKind,

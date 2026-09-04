@@ -2,8 +2,8 @@
 //!
 //! The [`RestartTracker`] monitors service lifecycle phases and
 //! decides whether a service should be restarted based on its
-//! [`RestartPolicy`]. Call [`compute_restarts`] in a monitoring
-//! loop to generate reconciler [`Action`]s for services that need
+//! [`RestartPolicy`]. Call [`compute_restart_drafts`] in a monitoring
+//! loop to generate fenced reconciler actions for services that need
 //! restarting.
 
 use std::collections::HashMap;
@@ -11,7 +11,9 @@ use std::collections::HashMap;
 use tracing::{debug, info};
 
 use crate::error::StackError;
+#[cfg(test)]
 use crate::reconcile::Action;
+use crate::reconcile::ActionDraft;
 use crate::spec::{RestartPolicy, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 
@@ -144,13 +146,13 @@ pub fn cleanup_orphaned_reconcile_progress(
 /// Evaluate all services and produce restart actions.
 ///
 /// Scans observed state for services that are `Stopped` or `Failed`
-/// and returns [`Action::ServiceCreate`] for those whose
+/// and returns create drafts for those whose
 /// [`RestartPolicy`] requires a restart.
-pub fn compute_restarts(
+pub(crate) fn compute_restart_drafts(
     spec: &StackSpec,
     observed: &[ServiceObservedState],
     tracker: &RestartTracker,
-) -> Vec<Action> {
+) -> Vec<ActionDraft> {
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
         .map(|o| (o.replica.service_name.as_str(), o))
@@ -170,8 +172,9 @@ pub fn compute_restarts(
                 policy = ?svc.restart_policy,
                 "scheduling restart"
             );
-            actions.push(Action::ServiceCreate {
+            actions.push(ActionDraft::Create {
                 target: obs.replica.clone(),
+                observed: Some((*obs).clone()),
             });
         } else {
             debug!(
@@ -183,6 +186,33 @@ pub fn compute_restarts(
     }
 
     actions
+}
+
+/// Evaluate restart policy without minting lifecycle mutation authority.
+///
+/// The orchestrator turns these candidates into exact Action v3 values through
+/// the authoritative StateStore precondition snapshot.
+pub fn compute_restart_targets(
+    spec: &StackSpec,
+    observed: &[ServiceObservedState],
+    tracker: &RestartTracker,
+) -> Vec<crate::state_store::ServiceReplicaKey> {
+    compute_restart_drafts(spec, observed, tracker)
+        .into_iter()
+        .map(|draft| draft.target().clone())
+        .collect()
+}
+
+#[cfg(test)]
+fn compute_restarts(
+    spec: &StackSpec,
+    observed: &[ServiceObservedState],
+    tracker: &RestartTracker,
+) -> Vec<Action> {
+    compute_restart_drafts(spec, observed, tracker)
+        .into_iter()
+        .map(|draft| draft.into_action(crate::reconcile::test_replica_precondition()))
+        .collect()
 }
 
 #[cfg(test)]
@@ -253,12 +283,29 @@ mod tests {
         }
     }
 
+    fn authoritative_create_action(
+        store: &StateStore,
+        stack_name: &str,
+        service_name: &str,
+    ) -> Action {
+        crate::reconcile::install_test_planning_authority(store, stack_name);
+        crate::reconcile::attach_action_preconditions(
+            stack_name,
+            store,
+            vec![ActionDraft::Create {
+                target: crate::state_store::ServiceReplicaKey::first(service_name).unwrap(),
+                observed: None,
+            }],
+        )
+        .unwrap()
+        .pop()
+        .unwrap()
+    }
+
     #[test]
     fn cleanup_orphaned_progress_clears_completed_marker() {
         let store = StateStore::in_memory().unwrap();
-        let actions = vec![Action::ServiceCreate {
-            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        }];
+        let actions = vec![authoritative_create_action(&store, "app", "web")];
         store
             .save_reconcile_progress("app", "op-1", &actions, 1)
             .unwrap();
@@ -271,9 +318,7 @@ mod tests {
     #[test]
     fn cleanup_orphaned_progress_keeps_inflight_marker() {
         let store = StateStore::in_memory().unwrap();
-        let actions = vec![Action::ServiceCreate {
-            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        }];
+        let actions = vec![authoritative_create_action(&store, "app", "web")];
         store
             .save_reconcile_progress("app", "op-1", &actions, 0)
             .unwrap();
@@ -286,9 +331,7 @@ mod tests {
     #[test]
     fn cleanup_terminal_progress_fails_closed_when_exact_session_is_active() {
         let store = StateStore::in_memory().unwrap();
-        let actions = vec![Action::ServiceCreate {
-            target: crate::state_store::ServiceReplicaKey::first("web").unwrap(),
-        }];
+        let actions = vec![authoritative_create_action(&store, "app", "web")];
         let session = crate::state_store::ReconcileSession {
             session_id: "rs-active-terminal".to_string(),
             stack_name: "app".to_string(),
@@ -431,7 +474,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::ServiceCreate { target } if target.service_name == "web"
+            Action::ServiceCreate { target, .. } if target.service_name == "web"
         ));
     }
 
@@ -480,7 +523,7 @@ mod tests {
         let names: Vec<&str> = actions
             .iter()
             .map(|a| match a {
-                Action::ServiceCreate { target } => target.service_name.as_str(),
+                Action::ServiceCreate { target, .. } => target.service_name.as_str(),
                 _ => "",
             })
             .collect();

@@ -297,6 +297,7 @@ impl StateStore {
         session: &ReconcileSession,
         actions: &[Action],
     ) -> Result<(), StackError> {
+        validate_actions_for_stack(&session.stack_name, actions)?;
         let computed_hash = crate::reconcile::compute_actions_hash(actions);
         if session.actions_hash != computed_hash
             || session.total_actions != actions.len()
@@ -316,7 +317,7 @@ impl StateStore {
                 session_id, stack_name, operation_id, status,
                 action_schema_version, actions_json, actions_hash, next_action_index,
                 total_actions, started_at, updated_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, 2, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, 3, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session.session_id,
                 session.stack_name,
@@ -540,6 +541,7 @@ impl StateStore {
         expected_cursor: usize,
         actions: &[Action],
     ) -> Result<Vec<Action>, StackError> {
+        validate_actions_for_stack(stack_name, actions)?;
         let (stored_stack, stored_operation, status, schema_version, actions_hash, cursor_raw) =
             self.conn
                 .query_row(
@@ -577,7 +579,7 @@ impl StateStore {
         if stored_stack != stack_name
             || stored_operation != operation_id
             || status != "active"
-            || schema_version != 2
+            || schema_version != 3
             || actions_hash != crate::reconcile::compute_actions_hash(&plan)
             || cursor != expected_cursor
             || end > plan.len()
@@ -714,7 +716,7 @@ impl StateStore {
             )?;
             if session_state.0 != stack_name
                 || session_state.1 != operation_id
-                || session_state.3 != 2
+                || session_state.3 != 3
                 || session_state.4 != crate::reconcile::compute_actions_hash(&plan)
             {
                 return Err(StackError::InvalidSpec(format!(
@@ -826,7 +828,7 @@ impl StateStore {
                  SET next_action_index = ?1, status = ?2, updated_at = ?3,
                      completed_at = ?4
                  WHERE session_id = ?5 AND stack_name = ?6 AND operation_id = ?7
-                   AND action_schema_version = 2 AND actions_hash = ?8
+                   AND action_schema_version = 3 AND actions_hash = ?8
                    AND status = 'active' AND next_action_index = ?9",
                 params![
                     sqlite_usize(
@@ -868,7 +870,7 @@ impl StateStore {
                     "UPDATE reconcile_progress SET next_action_index = ?1,
                             updated_at = datetime('now')
                      WHERE stack_name = ?2 AND operation_id = ?3
-                       AND action_schema_version = 2 AND actions_hash = ?4
+                       AND action_schema_version = 3 AND actions_hash = ?4
                        AND next_action_index = ?5",
                     params![
                         sqlite_usize(
@@ -892,7 +894,7 @@ impl StateStore {
                 store.conn.execute(
                     "DELETE FROM reconcile_progress
                      WHERE stack_name = ?1 AND operation_id = ?2
-                       AND action_schema_version = 2 AND actions_hash = ?3
+                       AND action_schema_version = 3 AND actions_hash = ?3
                        AND next_action_index = ?4",
                     params![
                         stack_name,
@@ -1048,7 +1050,7 @@ impl StateStore {
         let status_str: String = row.get(3)?;
         let session_id: String = row.get(0)?;
         let action_schema_version: i64 = row.get(4)?;
-        if action_schema_version != 2 {
+        if action_schema_version != 3 {
             return Err(StackError::InvalidSpec(format!(
                 "active reconcile session `{session_id}` uses legacy action identity"
             )));
@@ -1062,7 +1064,9 @@ impl StateStore {
         let actions = stored
             .into_iter()
             .map(StoredAction::into_action)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        let stack_name: String = row.get(1)?;
+        validate_actions_for_stack(&stack_name, &actions)?;
         let actions_hash: String = row.get(6)?;
         let next_action_index = persisted_usize(
             "reconcile session",
@@ -1088,7 +1092,7 @@ impl StateStore {
 
         Ok(Some(ReconcileSession {
             session_id: session_id.clone(),
-            stack_name: row.get(1)?,
+            stack_name,
             operation_id: row.get(2)?,
             status: ReconcileSessionStatus::from_str(&status_str)?,
             actions_hash,
@@ -1118,17 +1122,18 @@ impl StateStore {
         let row = self
             .conn
             .query_row(
-                "SELECT action_schema_version, actions_json, actions_hash,
+                "SELECT stack_name, action_schema_version, actions_json, actions_hash,
                         next_action_index, total_actions
                  FROM reconcile_sessions WHERE session_id = ?1",
                 params![session_id],
                 |row| {
                     Ok((
-                        row.get::<_, i64>(0)?,
-                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
-                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(3)?,
                         row.get::<_, i64>(4)?,
+                        row.get::<_, i64>(5)?,
                     ))
                 },
             )
@@ -1136,8 +1141,8 @@ impl StateStore {
             .ok_or_else(|| {
                 StackError::InvalidSpec(format!("reconcile session `{session_id}` was not found"))
             })?;
-        let (schema_version, actions_json, actions_hash, cursor_raw, count_raw) = row;
-        if schema_version != 2 {
+        let (stack_name, schema_version, actions_json, actions_hash, cursor_raw, count_raw) = row;
+        if schema_version != 3 {
             return Err(StackError::InvalidSpec(format!(
                 "reconcile session `{session_id}` uses legacy aggregate action identity"
             )));
@@ -1150,7 +1155,8 @@ impl StateStore {
         let actions = stored
             .into_iter()
             .map(StoredAction::into_action)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_actions_for_stack(&stack_name, &actions)?;
         let cursor = persisted_usize(
             "reconcile session",
             session_id,
@@ -1190,7 +1196,7 @@ impl StateStore {
         )?;
         let total: i64 = self.conn.query_row(
             "SELECT total_actions FROM reconcile_sessions
-             WHERE session_id = ?1 AND action_schema_version = 2",
+             WHERE session_id = ?1 AND action_schema_version = 3",
             params![session_id],
             |row| row.get(0),
         )?;

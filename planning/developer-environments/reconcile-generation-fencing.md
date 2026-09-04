@@ -71,6 +71,17 @@ including reservation, container ID, runtime generation, stack, and topology
 scope. Journal service generation and runtime generation are distinct values and
 both are fenced.
 
+`MachineWorkloadScope` and `environment_generation` name the current authority
+under which the successor action is admitted; an `Exact` predecessor preserves
+the authority under which that immutable journal head was created. Consequently,
+a `Cleaned` or `Failed` terminal predecessor may carry an older Machine
+incarnation in `ownership`, while project, Environment, Machine, and stack
+identity must remain equal to the current workload. Admission must prove the
+referenced head terminal before accepting that incarnation mismatch. A bound
+nonterminal predecessor must match the current Machine incarnation exactly.
+`NeverJournaled` remains absence across the stable workload target's complete
+journal history, not merely absence in the current incarnation.
+
 The full `ContainerGenerationOwnership` belongs in the action. A reservation
 token can currently be dereferenced through immutable journal tables, but it
 does not make persisted action/audit identity self-contained and does not bind

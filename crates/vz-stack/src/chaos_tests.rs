@@ -13,17 +13,27 @@
 use std::collections::HashMap;
 
 use crate::events::StackEvent;
-use crate::reconcile::{Action, apply, compute_actions_hash};
+use crate::reconcile::{Action, compute_actions_hash};
 use crate::spec::{ServiceKind, ServiceSpec, StackSpec};
 use crate::state_store::{
     ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus, ServiceObservedState,
     ServicePhase, StateStore,
 };
 
+fn apply(
+    spec: &StackSpec,
+    store: &StateStore,
+    health: &HashMap<String, crate::health::HealthStatus>,
+) -> Result<crate::reconcile::ApplyResult, crate::error::StackError> {
+    crate::reconcile::install_test_planning_authority(store, &spec.name);
+    crate::reconcile::apply(spec, store, health)
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────
 
 /// Build a minimal `StackSpec` with the given service names.
 fn stack_with_services(name: &str, service_names: &[&str]) -> StackSpec {
+    crate::reconcile::set_test_action_stack(name);
     StackSpec {
         name: name.to_string(),
         services: service_names
@@ -122,6 +132,26 @@ fn mark_service_running(store: &StateStore, stack_name: &str, service_name: &str
         .unwrap();
 }
 
+fn mark_service_generation_lost(store: &StateStore, stack_name: &str, service_name: &str) {
+    let observed = store
+        .load_observed_state_for_replica(stack_name, service_name, 1)
+        .unwrap()
+        .unwrap();
+    let reservation_id = observed
+        .failed_create_ownership
+        .as_ref()
+        .and_then(|ownership| ownership.scope.as_deref())
+        .unwrap()
+        .reservation_id
+        .clone();
+    store
+        .begin_stack_container_cleanup(&reservation_id, 13)
+        .unwrap();
+    store
+        .publish_stack_container_cleanup_success(&reservation_id, 14)
+        .unwrap();
+}
+
 // ── 1. Process crash during apply ────────────────────────────────────
 
 /// Simulate a crash after creating some containers but before completing
@@ -192,11 +222,24 @@ fn crash_recovery_reapply_creates_only_missing_services() {
 
     // Simulate: "db" completed, mark as Running.
     mark_service_running(&store, "crash-reapply", "db");
+    for service_name in ["api", "web"] {
+        let service = spec
+            .services
+            .iter()
+            .find(|candidate| candidate.name == service_name)
+            .unwrap();
+        crate::reconcile::publish_test_container_unbound_failure(
+            &store,
+            &spec.name,
+            &crate::state_store::ServiceReplicaKey::first(service_name.to_string()).unwrap(),
+            &crate::reconcile::service_config_digest(service),
+        );
+    }
 
     // Re-apply with same spec: the reconciler produces ServiceCreate for
     // services that are in Pending state (api, web).
     // db is already Running so the reconciler skips it.
-    let result2 = apply(&spec, &store, &health).unwrap();
+    let result2 = crate::reconcile::plan_apply(&spec, &store, &health).unwrap();
 
     // Verify db is NOT in the action list (already Running).
     let action_services: Vec<&str> = result2.actions.iter().map(|a| a.service_name()).collect();
@@ -252,42 +295,26 @@ fn vm_restart_clears_observed_state_reconciler_rebuilds() {
     let result_converged = apply(&spec, &store, &health).unwrap();
     assert!(result_converged.actions.is_empty());
 
-    // *** VM crash: wipe observed state by resetting to Pending ***
-    // In a real system, the state store persists but the runtime state is lost.
-    // We simulate this by saving observed state as Failed (VM died).
-    store
-        .save_observed_state(
-            "vm-restart",
-            &ServiceObservedState {
-                replica: crate::state_store::ServiceReplicaKey::first("redis".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Failed,
-                container_id: None,
-                failed_create_ownership: None,
-                last_error: Some("VM restarted - state lost".to_string()),
-                ready: false,
-            },
-        )
-        .unwrap();
-    store
-        .save_observed_state(
-            "vm-restart",
-            &ServiceObservedState {
-                replica: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Failed,
-                container_id: None,
-                failed_create_ownership: None,
-                last_error: Some("VM restarted - state lost".to_string()),
-                ready: false,
-            },
-        )
-        .unwrap();
+    // *** VM crash: record exact runtime generations as gone. ***
+    for service_name in ["redis", "app"] {
+        let service = spec
+            .services
+            .iter()
+            .find(|candidate| candidate.name == service_name)
+            .unwrap();
+        crate::reconcile::publish_test_container_running(
+            &store,
+            &spec.name,
+            &crate::state_store::ServiceReplicaKey::first(service_name.to_string()).unwrap(),
+            &crate::reconcile::service_config_digest(service),
+        );
+    }
+    mark_service_generation_lost(&store, "vm-restart", "redis");
+    mark_service_generation_lost(&store, "vm-restart", "app");
 
     // Re-apply: reconciler should detect Failed and rebuild.
-    let result_rebuild = apply(&spec, &store, &health).unwrap();
-    // Failed services trigger recreate (they exist in observed state but are not Running).
-    // The reconciler treats Failed -> desired as ServiceRecreate.
+    let result_rebuild = crate::reconcile::plan_apply(&spec, &store, &health).unwrap();
+    // Cleaned generations trigger fresh activation.
     assert!(
         !result_rebuild.actions.is_empty(),
         "reconciler should produce actions to recover from failed state"
@@ -519,15 +546,19 @@ fn partial_batch_resume_picks_up_remaining_actions() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("partial-app"),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("partial-app"),
             target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("partial-app"),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("partial-app"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -560,12 +591,15 @@ fn partial_batch_cursor_advances_correctly() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("cursor-app"),
             target: crate::state_store::ServiceReplicaKey::first("a".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("cursor-app"),
             target: crate::state_store::ServiceReplicaKey::first("b".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("cursor-app"),
             target: crate::state_store::ServiceReplicaKey::first("c".to_string()).unwrap(),
         },
     ];
@@ -626,9 +660,11 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("audit-app"),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("audit-app"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -703,25 +739,31 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
 fn duplicate_event_prevention_same_hash_detected() {
     let actions1 = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let actions2 = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let actions_different = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceRemove {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
     ];
@@ -826,6 +868,7 @@ fn concurrent_reconciliation_supersedes_old_active_session() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("concurrent-app"),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -882,13 +925,18 @@ fn concurrent_reconciliation_supersedes_old_active_session() {
 fn concurrent_reconciliation_supersede_is_stack_scoped() {
     let store = StateStore::in_memory().unwrap();
 
-    let actions = vec![Action::ServiceCreate {
+    let stack_1_actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("stack-1"),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+    }];
+    let stack_2_actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("stack-2"),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     // Create active sessions for two different stacks.
-    create_test_session(&store, "rs-s1", "stack-1", &actions);
-    create_test_session(&store, "rs-s2", "stack-2", &actions);
+    create_test_session(&store, "rs-s1", "stack-1", &stack_1_actions);
+    create_test_session(&store, "rs-s2", "stack-2", &stack_2_actions);
 
     // Supersede only stack-1.
     let count = store.supersede_active_sessions("stack-1").unwrap();
@@ -918,6 +966,7 @@ fn concurrent_reconciliation_multiple_active_all_superseded() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("race-app"),
         target: crate::state_store::ServiceReplicaKey::first("svc".to_string()).unwrap(),
     }];
 
@@ -964,6 +1013,7 @@ fn concurrent_reconciliation_completed_sessions_unaffected() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition_for_stack("done-app"),
         target: crate::state_store::ServiceReplicaKey::first("svc".to_string()).unwrap(),
     }];
 
@@ -1001,12 +1051,15 @@ fn recovery_progress_survives_store_reopen() {
 
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("reopen-app"),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("reopen-app"),
             target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition_for_stack("reopen-app"),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -1059,7 +1112,18 @@ fn full_crash_recovery_lifecycle_consistency() {
 
     // Step 5: Recovery -- supersede old session, re-apply.
     store.supersede_active_sessions("lifecycle").unwrap();
-    let result2 = apply(&spec, &store, &health).unwrap();
+    let web = spec
+        .services
+        .iter()
+        .find(|candidate| candidate.name == "web")
+        .unwrap();
+    crate::reconcile::publish_test_container_unbound_failure(
+        &store,
+        &spec.name,
+        &crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+        &crate::reconcile::service_config_digest(web),
+    );
+    let result2 = crate::reconcile::plan_apply(&spec, &store, &health).unwrap();
     // db and cache are already running. web was Pending so the reconciler
     // generates a ServiceCreate action to bring it up.
     let r2_services: Vec<&str> = result2.actions.iter().map(|a| a.service_name()).collect();

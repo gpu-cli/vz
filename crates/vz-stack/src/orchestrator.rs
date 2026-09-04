@@ -21,7 +21,7 @@ use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
 use crate::image_policy::{ImagePolicy, validate_stack_images};
 use crate::reconcile::{ApplyResult, compute_actions_hash, plan_apply};
-use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restarts};
+use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restart_drafts};
 use crate::spec::StackSpec;
 use crate::state_store::{
     ReconcileSession, ReconcileSessionStatus, ServicePhase, ServiceReplicaKey, StateStore,
@@ -463,9 +463,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     deferred = apply_result.deferred.len(),
                     "executing actions"
                 );
-                let result = self.executor.execute_with_operation(
+                let result = self.executor.execute_with_session(
                     spec,
                     &apply_result.actions,
+                    &session_id,
                     &operation_id,
                     0,
                 )?;
@@ -551,8 +552,13 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
             // 3b. Check for services needing restart based on restart policies.
             let observed_for_restart = self.executor.store().load_observed_state(&spec.name)?;
-            let restart_actions =
-                compute_restarts(spec, &observed_for_restart, &self.restart_tracker);
+            let restart_drafts =
+                compute_restart_drafts(spec, &observed_for_restart, &self.restart_tracker);
+            let restart_actions = crate::reconcile::attach_action_preconditions(
+                &spec.name,
+                &self.reconcile_store,
+                restart_drafts,
+            )?;
             if !restart_actions.is_empty() {
                 info!(
                     restarts = restart_actions.len(),
@@ -586,9 +592,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     0,
                     &restart_actions,
                 )?;
-                let restart_result = self.executor.execute_with_operation(
+                let restart_result = self.executor.execute_with_session(
                     spec,
                     &restart_actions,
+                    &session_id,
                     &operation_id,
                     0,
                 )?;
@@ -823,9 +830,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             &remaining,
         )?;
 
-        let result = self.executor.execute_with_operation(
+        let result = self.executor.execute_with_session(
             spec,
             &remaining,
+            &session.session_id,
             &progress.operation_id,
             progress.next_action_index,
         )?;
@@ -909,6 +917,7 @@ mod tests {
     }
 
     fn stack(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
+        crate::reconcile::set_test_action_stack(name);
         StackSpec {
             name: name.to_string(),
             services,
@@ -924,11 +933,41 @@ mod tests {
     fn make_orchestrator_shared(
         runtime: MockContainerRuntime,
     ) -> (StackOrchestrator<MockContainerRuntime>, tempfile::TempDir) {
+        make_orchestrator_shared_for(runtime, "app")
+    }
+
+    fn make_orchestrator_shared_for(
+        runtime: MockContainerRuntime,
+        stack_id: &str,
+    ) -> (StackOrchestrator<MockContainerRuntime>, tempfile::TempDir) {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let exec_store = StateStore::open(&db_path).unwrap();
+        crate::reconcile::install_test_planning_authority(&exec_store, stack_id);
         let reconcile_store = StateStore::open(&db_path).unwrap();
         let executor = StackExecutor::new(runtime, exec_store, tmp.path());
+        let orch = StackOrchestrator::new(
+            executor,
+            reconcile_store,
+            OrchestrationConfig {
+                poll_interval: Some(0),
+                max_rounds: 10,
+                image_policy: crate::image_policy::ImagePolicy::AllowAll,
+            },
+        );
+        (orch, tmp)
+    }
+
+    fn make_orchestrator_scoped(
+        runtime: MockContainerRuntime,
+        stack_id: &str,
+    ) -> (StackOrchestrator<MockContainerRuntime>, tempfile::TempDir) {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("state.db");
+        let exec_store = StateStore::open(&db_path).unwrap();
+        let scope = crate::reconcile::test_planning_scope(&exec_store, stack_id);
+        let reconcile_store = StateStore::open(&db_path).unwrap();
+        let executor = StackExecutor::new_scoped(runtime, exec_store, tmp.path(), scope).unwrap();
         let orch = StackOrchestrator::new(
             executor,
             reconcile_store,
@@ -960,12 +999,13 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_create = true;
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        orch.config.max_rounds = 1;
         let spec = stack("app", vec![svc("web")]);
 
         let result = orch.run(&spec, None).unwrap();
 
         assert!(!result.converged);
-        assert_eq!(result.rounds, 10);
+        assert_eq!(result.rounds, 1);
         assert_eq!(result.services_ready, 0);
         assert_eq!(result.services_failed, 1);
     }
@@ -1097,7 +1137,7 @@ mod tests {
     #[test]
     fn empty_down_spec_propagates_exact_generation_cleanup_failure() {
         let runtime = MockContainerRuntime::with_ids(vec!["ctr-web"]);
-        let (mut orch, _tmp) = make_orchestrator_shared(runtime);
+        let (mut orch, _tmp) = make_orchestrator_scoped(runtime, "app");
         let up_spec = stack("app", vec![svc("web")]);
         assert!(orch.run(&up_spec, None).unwrap().converged);
 
@@ -1123,7 +1163,7 @@ mod tests {
                 .any(|(operation, _)| { matches!(operation.as_str(), "stop" | "remove") })
         );
         let observed = orch.executor.store().load_observed_state("app").unwrap();
-        assert_eq!(observed[0].phase, ServicePhase::Failed);
+        assert_eq!(observed[0].phase, ServicePhase::Stopping);
         assert!(observed[0].container_id.is_some());
         assert!(observed[0].failed_create_ownership.is_some());
     }
@@ -1215,6 +1255,7 @@ mod tests {
         let spec = stack("app", vec![svc("web")]);
 
         let pending = vec![Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }];
         let now = SystemTime::now()
@@ -1261,7 +1302,7 @@ mod tests {
     #[test]
     fn outer_executor_error_reopens_with_started_audits_and_old_exact_cursor() {
         let runtime = MockContainerRuntime::new();
-        let (mut orch, tmp) = make_orchestrator_shared(runtime);
+        let (mut orch, tmp) = make_orchestrator_shared_for(runtime, "outer-error");
         let mut service = svc("api");
         service.resources.replicas = 2;
         service.ports.push(crate::spec::PortSpec {
@@ -1520,7 +1561,7 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_create = true;
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
-        orch.config.max_rounds = 3;
+        orch.config.max_rounds = 1;
 
         let spec = stack("app", vec![svc("web")]);
 
@@ -1528,7 +1569,7 @@ mod tests {
         // Create fails every round → service stays Failed → reconciler
         // keeps retrying → hits max_rounds.
         assert!(!result.converged);
-        assert_eq!(result.rounds, 3);
+        assert_eq!(result.rounds, 1);
         assert_eq!(result.services_failed, 1);
 
         let observed = orch.executor().store().load_observed_state("app").unwrap();

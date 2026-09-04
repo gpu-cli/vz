@@ -101,6 +101,7 @@ impl<'de> Deserialize<'de> for ServiceReplicaKey {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireKey {
             service_name: String,
             replica_index: NonZeroU32,
@@ -147,6 +148,16 @@ impl ServiceReplicaKey {
         } else {
             format!("{}-{}", self.service_name, self.index())
         }
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), StackError> {
+        let validated = Self::new(self.service_name.clone(), self.index())?;
+        if validated != *self {
+            return Err(StackError::InvalidSpec(
+                "service replica key contains non-canonical identity".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -601,6 +612,7 @@ struct StoredAction {
     schema_version: u32,
     kind: StoredActionKind,
     target: ServiceReplicaKey,
+    precondition: crate::reconcile::ReplicaPrecondition,
 }
 
 impl<'de> Deserialize<'de> for StoredAction {
@@ -609,14 +621,16 @@ impl<'de> Deserialize<'de> for StoredAction {
         D: serde::Deserializer<'de>,
     {
         #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
         struct WireAction {
             schema_version: u32,
             kind: StoredActionKind,
             target: ServiceReplicaKey,
+            precondition: crate::reconcile::ReplicaPrecondition,
         }
 
         let wire = WireAction::deserialize(deserializer)?;
-        if wire.schema_version != 2 {
+        if wire.schema_version != 3 {
             return Err(serde::de::Error::custom(format!(
                 "unsupported stored action schema version {}",
                 wire.schema_version
@@ -626,6 +640,7 @@ impl<'de> Deserialize<'de> for StoredAction {
             schema_version: wire.schema_version,
             kind: wire.kind,
             target: wire.target,
+            precondition: wire.precondition,
         })
     }
 }
@@ -659,37 +674,68 @@ pub(crate) enum ReconcileBatchCommitFailpoint {
 impl StoredAction {
     fn from_action(action: &Action) -> Self {
         match action {
-            Action::ServiceCreate { target } => Self {
-                schema_version: 2,
+            Action::ServiceCreate {
+                target,
+                precondition,
+            } => Self {
+                schema_version: 3,
                 kind: StoredActionKind::ServiceCreate,
                 target: target.clone(),
+                precondition: precondition.clone(),
             },
-            Action::ServiceRecreate { target } => Self {
-                schema_version: 2,
+            Action::ServiceRecreate {
+                target,
+                precondition,
+            } => Self {
+                schema_version: 3,
                 kind: StoredActionKind::ServiceRecreate,
                 target: target.clone(),
+                precondition: precondition.clone(),
             },
-            Action::ServiceRemove { target } => Self {
-                schema_version: 2,
+            Action::ServiceRemove {
+                target,
+                precondition,
+            } => Self {
+                schema_version: 3,
                 kind: StoredActionKind::ServiceRemove,
                 target: target.clone(),
+                precondition: precondition.clone(),
             },
         }
     }
 
-    fn into_action(self) -> Action {
-        match self.kind {
+    fn into_action(self) -> Result<Action, StackError> {
+        let action = match self.kind {
             StoredActionKind::ServiceCreate => Action::ServiceCreate {
                 target: self.target,
+                precondition: self.precondition,
             },
             StoredActionKind::ServiceRecreate => Action::ServiceRecreate {
                 target: self.target,
+                precondition: self.precondition,
             },
             StoredActionKind::ServiceRemove => Action::ServiceRemove {
                 target: self.target,
+                precondition: self.precondition,
             },
+        };
+        action.validate()?;
+        Ok(action)
+    }
+}
+
+fn validate_actions_for_stack(stack_name: &str, actions: &[Action]) -> Result<(), StackError> {
+    for action in actions {
+        action.validate()?;
+        if action.precondition().workload().stack_id != stack_name {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile action target `{}` is scoped to stack `{}` instead of batch stack `{stack_name}`",
+                action.target().display_name(),
+                action.precondition().workload().stack_id
+            )));
         }
     }
+    Ok(())
 }
 
 /// Durable state store backed by a single SQLite database file.
@@ -851,7 +897,8 @@ impl StateStore {
                 store.create_topology_schema_v3()?;
                 store.create_stack_journal_schema_v4()?;
                 store.create_replica_schema_v5()?;
-                store.validate_v5_schema()?;
+                store.create_reconcile_schema_v6()?;
+                store.validate_v6_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -876,19 +923,26 @@ impl StateStore {
                 self.migrate_legacy_v1_to_v2()?;
                 self.migrate_topology_v2_to_v3()?;
                 self.migrate_stack_journal_v3_to_v4()?;
-                self.migrate_replica_v4_to_v5()
+                self.migrate_replica_v4_to_v5()?;
+                self.migrate_reconcile_v5_to_v6()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
                 self.migrate_stack_journal_v3_to_v4()?;
-                self.migrate_replica_v4_to_v5()
+                self.migrate_replica_v4_to_v5()?;
+                self.migrate_reconcile_v5_to_v6()
             }
             3 => {
                 self.migrate_stack_journal_v3_to_v4()?;
-                self.migrate_replica_v4_to_v5()
+                self.migrate_replica_v4_to_v5()?;
+                self.migrate_reconcile_v5_to_v6()
             }
-            4 => self.migrate_replica_v4_to_v5(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v5_schema(),
+            4 => {
+                self.migrate_replica_v4_to_v5()?;
+                self.migrate_reconcile_v5_to_v6()
+            }
+            5 => self.migrate_reconcile_v5_to_v6(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v6_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",
@@ -1243,6 +1297,7 @@ impl StateStore {
         actions: &[Action],
         next_action_index: usize,
     ) -> Result<(), StackError> {
+        validate_actions_for_stack(stack_name, actions)?;
         if next_action_index > actions.len() {
             return Err(StackError::InvalidSpec(format!(
                 "reconcile progress cursor {next_action_index} exceeds {} actions",
@@ -1263,7 +1318,7 @@ impl StateStore {
             "INSERT INTO reconcile_progress (
                 stack_name, operation_id, action_schema_version, actions_json,
                 actions_hash, next_action_index
-             ) VALUES (?1, ?2, 2, ?3, ?4, ?5)
+             ) VALUES (?1, ?2, 3, ?3, ?4, ?5)
              ON CONFLICT(stack_name) DO UPDATE SET
                 operation_id = excluded.operation_id,
                 action_schema_version = excluded.action_schema_version,
@@ -1301,7 +1356,7 @@ impl StateStore {
 
         let operation_id: String = row.get(0)?;
         let action_schema_version: i64 = row.get(1)?;
-        if action_schema_version != 2 {
+        if action_schema_version != 3 {
             return Err(StackError::InvalidSpec(format!(
                 "reconcile progress for `{stack_name}` uses unsupported action schema {action_schema_version}"
             )));
@@ -1322,7 +1377,8 @@ impl StateStore {
         let actions = stored_actions
             .into_iter()
             .map(StoredAction::into_action)
-            .collect::<Vec<_>>();
+            .collect::<Result<Vec<_>, _>>()?;
+        validate_actions_for_stack(stack_name, &actions)?;
         if next_action_index > actions.len() {
             return Err(StackError::InvalidSpec(format!(
                 "reconcile progress for `{stack_name}` has cursor {next_action_index} beyond {} actions",

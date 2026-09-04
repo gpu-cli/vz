@@ -28,25 +28,31 @@ struct ScopedActivation {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScopedBatchManifest {
     schema_version: u32,
     scope: vz_runtime_contract::MachineWorkloadScope,
+    session_id: String,
     operation_id: String,
     first_action_index: usize,
+    actions_hash: String,
     spec: StackSpec,
     actions: Vec<ScopedManifestAction>,
     secret_inputs: BTreeMap<String, ScopedSecretInput>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct ScopedManifestAction {
     schema_version: u32,
     kind: String,
     target: ServiceReplicaKey,
+    precondition: crate::reconcile::ReplicaPrecondition,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct ScopedSecretInput {
+#[serde(deny_unknown_fields)]
+pub(super) struct ScopedSecretInput {
     sha256: String,
     file_name: String,
 }
@@ -58,6 +64,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         &mut self,
         spec: &StackSpec,
         actions: &[Action],
+        session_id: &str,
         operation_id: &str,
         first_action_index: usize,
     ) -> Result<(), StackError> {
@@ -76,9 +83,18 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             validate_private_file(&manifest_path, "scoped activation manifest")?;
             let bytes = std::fs::read(&manifest_path)?;
             let manifest: ScopedBatchManifest = serde_json::from_slice(&bytes)?;
-            if manifest.schema_version != 2
+            let persisted_actions = manifest
+                .actions
+                .iter()
+                .map(ScopedManifestAction::to_action)
+                .collect::<Result<Vec<_>, _>>()?;
+            if manifest.schema_version != 3
                 || manifest.scope != authority.scope
+                || manifest.session_id != session_id
                 || manifest.operation_id != operation_id
+                || manifest.first_action_index != 0
+                || manifest.actions_hash
+                    != crate::reconcile::compute_actions_hash(&persisted_actions)
                 || manifest.spec != *spec
             {
                 return Err(scope_state_conflict(
@@ -95,7 +111,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let end = offset.checked_add(manifest_actions.len()).ok_or_else(|| {
                 StackError::InvalidSpec("resumed action range overflow".to_string())
             })?;
-            if manifest.actions.get(offset..end) != Some(manifest_actions.as_slice()) {
+            if end != manifest.actions.len()
+                || manifest.actions.get(offset..end) != Some(manifest_actions.as_slice())
+            {
                 return Err(scope_state_conflict(
                     "resumed actions do not match persisted activation manifest",
                 ));
@@ -122,7 +140,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 "nonzero scoped resume cursor has no operation activation manifest",
             ));
         }
-        if self.batch_has_matching_active_journal(actions, operation_id, first_action_index)? {
+        if self.batch_has_matching_active_journal(
+            actions,
+            session_id,
+            operation_id,
+            first_action_index,
+        )? {
             return Err(scope_state_conflict(
                 "scoped activation manifest is missing for an active journal attempt",
             ));
@@ -183,10 +206,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             secret_digests.insert(name.clone(), digest);
         }
         let manifest = ScopedBatchManifest {
-            schema_version: 2,
+            schema_version: 3,
             scope: authority.scope.clone(),
+            session_id: session_id.to_string(),
             operation_id: operation_id.to_string(),
             first_action_index,
+            actions_hash: crate::reconcile::compute_actions_hash(actions),
             spec: spec.clone(),
             actions: manifest_actions,
             secret_inputs,
@@ -209,6 +234,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     fn batch_has_matching_active_journal(
         &self,
         actions: &[Action],
+        session_id: &str,
         operation_id: &str,
         first_action_index: usize,
     ) -> Result<bool, StackError> {
@@ -229,7 +255,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let absolute_index = first_action_index.checked_add(index).ok_or_else(|| {
                     StackError::InvalidSpec("absolute action index overflow".to_string())
                 })?;
-                let identity = scoped_action_identity_digest(operation_id, absolute_index, action)?;
+                let identity = scoped_action_identity_digest(
+                    session_id,
+                    operation_id,
+                    absolute_index,
+                    action,
+                )?;
                 if record
                     .intent
                     .action_digest
@@ -247,10 +278,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         actions: &[Action],
         service_map: &HashMap<&str, &ServiceSpec>,
-        operation_id: &str,
-        first_action_index: usize,
+        batch: (&str, &str, usize),
         skipped_mounts: Vec<crate::volume::SkippedMount>,
     ) -> Result<ExecutionResult, StackError> {
+        let (session_id, operation_id, first_action_index) = batch;
         let authority = self
             .scoped_authority
             .clone()
@@ -330,6 +361,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         }
                     };
                 let action_digest = scoped_action_digest(
+                    session_id,
                     operation_id,
                     absolute_action_index,
                     action,
@@ -1104,6 +1136,7 @@ fn unix_now() -> u64 {
 }
 
 fn scoped_action_digest(
+    session_id: &str,
     operation_id: &str,
     absolute_action_index: usize,
     action: &Action,
@@ -1116,7 +1149,8 @@ fn scoped_action_digest(
             "prepared activation target differs from the exact action target",
         ));
     }
-    let identity = scoped_action_identity_digest(operation_id, absolute_action_index, action)?;
+    let identity =
+        scoped_action_identity_digest(session_id, operation_id, absolute_action_index, action)?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"schema", b"vz.stack.activation-payload.v2");
     hash_field(&mut hasher, b"image", prepared.image.as_bytes());
@@ -1156,12 +1190,14 @@ fn scoped_action_digest(
 }
 
 fn scoped_action_identity_digest(
+    session_id: &str,
     operation_id: &str,
     absolute_action_index: usize,
     action: &Action,
 ) -> Result<String, StackError> {
     let mut hasher = Sha256::new();
-    hash_field(&mut hasher, b"schema", b"vz.stack.action-identity.v2");
+    hash_field(&mut hasher, b"schema", b"vz.stack.action-identity.v3");
+    hash_field(&mut hasher, b"session_id", session_id.as_bytes());
     hash_field(&mut hasher, b"operation_id", operation_id.as_bytes());
     hash_field(
         &mut hasher,
@@ -1181,6 +1217,11 @@ fn scoped_action_identity_digest(
         &mut hasher,
         b"replica_index",
         &action.target().replica_index.get().to_le_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"action_hash",
+        crate::reconcile::compute_actions_hash(std::slice::from_ref(action)).as_bytes(),
     );
     Ok(format!("{:x}", hasher.finalize()))
 }
@@ -1374,10 +1415,40 @@ impl ScopedManifestAction {
             Action::ServiceRemove { .. } => "remove",
         };
         Self {
-            schema_version: 1,
+            schema_version: 3,
             kind: kind.to_string(),
             target: action.target().clone(),
+            precondition: action.precondition().clone(),
         }
+    }
+
+    fn to_action(&self) -> Result<Action, StackError> {
+        if self.schema_version != 3 {
+            return Err(scope_state_conflict(
+                "scoped manifest action uses an unsupported schema",
+            ));
+        }
+        let action = match self.kind.as_str() {
+            "create" => Action::ServiceCreate {
+                target: self.target.clone(),
+                precondition: self.precondition.clone(),
+            },
+            "recreate" => Action::ServiceRecreate {
+                target: self.target.clone(),
+                precondition: self.precondition.clone(),
+            },
+            "remove" => Action::ServiceRemove {
+                target: self.target.clone(),
+                precondition: self.precondition.clone(),
+            },
+            _ => {
+                return Err(scope_state_conflict(
+                    "scoped manifest action has an unknown kind",
+                ));
+            }
+        };
+        action.validate()?;
+        Ok(action)
     }
 }
 

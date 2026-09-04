@@ -1,19 +1,19 @@
 use super::*;
 
 pub(super) fn topo_sort(
-    actions: &[Action],
+    actions: &[ActionDraft],
     deps: &HashMap<&str, &[String]>,
-) -> Result<Vec<Action>, StackError> {
+) -> Result<Vec<ActionDraft>, StackError> {
     // Partition into creates and removes.
-    let mut creates: Vec<&Action> = Vec::new();
-    let mut removes: Vec<&Action> = Vec::new();
+    let mut creates: Vec<&ActionDraft> = Vec::new();
+    let mut removes: Vec<&ActionDraft> = Vec::new();
 
     for action in actions {
         match action {
-            Action::ServiceCreate { .. } | Action::ServiceRecreate { .. } => {
+            ActionDraft::Create { .. } | ActionDraft::Recreate { .. } => {
                 creates.push(action);
             }
-            Action::ServiceRemove { .. } => {
+            ActionDraft::Remove { .. } => {
                 removes.push(action);
             }
         }
@@ -38,8 +38,11 @@ pub(super) fn topo_sort(
     Ok(result)
 }
 
-fn actions_for_service_order(actions: &[&Action], service_order: &[String]) -> Vec<Action> {
-    let mut grouped: HashMap<&str, Vec<&Action>> = HashMap::new();
+fn actions_for_service_order(
+    actions: &[&ActionDraft],
+    service_order: &[String],
+) -> Vec<ActionDraft> {
+    let mut grouped: HashMap<&str, Vec<&ActionDraft>> = HashMap::new();
     for action in actions {
         grouped
             .entry(action.service_name())

@@ -3,6 +3,103 @@
 use super::planning::{compute_actions, compute_actions_with_mount_digests, service_config_digest};
 use super::*;
 use crate::spec::{MountSpec, ServiceDependency, ServiceKind, StackSpec};
+use crate::state_store::{StackContainerCreateSelector, StackContainerGenerationBinding};
+
+fn authoritative_store(stack_id: &str) -> StateStore {
+    let store = StateStore::in_memory().unwrap();
+    crate::reconcile::install_test_planning_authority(&store, stack_id);
+    store
+}
+
+fn create_selector(
+    store: &StateStore,
+    stack_id: &str,
+    service: &ServiceSpec,
+    replica_index: u32,
+) -> StackContainerCreateSelector {
+    let project = store
+        .load_project_state("prj_stack_unit_fixture")
+        .unwrap()
+        .unwrap();
+    let environment = &project.environments[0];
+    let machine = &environment.machines[0];
+    StackContainerCreateSelector {
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        machine_id: machine.machine_id.clone(),
+        machine_incarnation_id: machine.incarnation.as_ref().unwrap().incarnation_id.clone(),
+        environment_generation: environment.lifecycle_generation,
+        stack_id: stack_id.to_string(),
+        service_name: service.name.clone(),
+        replica_index,
+        requested_container_id: format!("ctr-{stack_id}-{}-{replica_index}", service.name),
+        definition_digest: environment.definition_digest.clone(),
+        action_digest: format!("test-action-{stack_id}-{}-{replica_index}", service.name),
+        applied_config_digest: service_config_digest(service),
+    }
+}
+
+fn publish_running_generation(
+    store: &StateStore,
+    stack_id: &str,
+    service: &ServiceSpec,
+    replica_index: u32,
+) -> vz_runtime_contract::ContainerGenerationOwnership {
+    let selector = create_selector(store, stack_id, service, replica_index);
+    let (intent, existing) = store
+        .resolve_or_begin_stack_container_create(&selector, 10)
+        .unwrap();
+    assert!(existing.is_none());
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: selector.requested_container_id,
+        generation: u64::from(replica_index),
+        stack_id: stack_id.to_string(),
+        scope: Some(Box::new(intent.scope.clone())),
+    };
+    store
+        .bind_stack_container_generation(&StackContainerGenerationBinding {
+            reservation_id: intent.scope.reservation_id.clone(),
+            service_name: service.name.clone(),
+            ownership: ownership.clone(),
+            bound_at: 11,
+        })
+        .unwrap();
+    store
+        .publish_stack_container_create_success(&intent.scope.reservation_id, true, 12)
+        .unwrap();
+    ownership
+}
+
+fn publish_bound_create_failure(
+    store: &StateStore,
+    stack_id: &str,
+    service: &ServiceSpec,
+    replica_index: u32,
+) -> vz_runtime_contract::ContainerGenerationOwnership {
+    let selector = create_selector(store, stack_id, service, replica_index);
+    let (intent, existing) = store
+        .resolve_or_begin_stack_container_create(&selector, 10)
+        .unwrap();
+    assert!(existing.is_none());
+    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+        container_id: selector.requested_container_id,
+        generation: u64::from(replica_index),
+        stack_id: stack_id.to_string(),
+        scope: Some(Box::new(intent.scope.clone())),
+    };
+    store
+        .bind_stack_container_generation(&StackContainerGenerationBinding {
+            reservation_id: intent.scope.reservation_id.clone(),
+            service_name: service.name.clone(),
+            ownership: ownership.clone(),
+            bound_at: 11,
+        })
+        .unwrap();
+    store
+        .publish_stack_container_create_failure(&intent.scope.reservation_id, "create failed", 12)
+        .unwrap();
+    ownership
+}
 
 fn svc(name: &str, image: &str) -> ServiceSpec {
     ServiceSpec {
@@ -184,6 +281,7 @@ fn compute_actions_recreates_running_service_when_mounts_change() {
     assert_eq!(
         actions,
         vec![Action::ServiceRecreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }]
     );
@@ -222,9 +320,14 @@ fn compute_actions_recreates_running_service_when_persisted_digest_changes() {
         &observed_config_digests,
     )
     .unwrap();
+    let actions = actions
+        .into_iter()
+        .map(|draft| draft.into_action(crate::reconcile::test_replica_precondition()))
+        .collect::<Vec<_>>();
     assert_eq!(
         actions,
         vec![Action::ServiceRecreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }]
     );
@@ -267,6 +370,7 @@ fn compute_actions_removes_extra_services() {
     assert_eq!(
         actions[0],
         Action::ServiceRemove {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("old-svc".to_string()).unwrap(),
         }
     );
@@ -282,6 +386,7 @@ fn compute_actions_recreates_pending_services() {
     assert_eq!(
         actions[0],
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }
     );
@@ -300,6 +405,7 @@ fn compute_actions_recreates_failed_services() {
     assert_eq!(
         actions[0],
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }
     );
@@ -531,17 +637,18 @@ fn dep_gating_no_deps_always_proceeds() {
 
 #[test]
 fn apply_creates_new_services() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
     let result = apply(&s, &store, &no_health()).unwrap();
     assert_eq!(result.actions.len(), 1);
-    assert_eq!(
-        result.actions[0],
-        Action::ServiceCreate {
-            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        }
-    );
+    assert!(matches!(
+        &result.actions[0],
+        Action::ServiceCreate { target, precondition }
+            if target == &crate::state_store::ServiceReplicaKey::first("web").unwrap()
+                && matches!(precondition.journal_head(), ExpectedJournalHead::NeverJournaled)
+                && precondition.workload().stack_id == "myapp"
+    ));
 
     let observed = store.load_observed_state("myapp").unwrap();
     assert_eq!(observed.len(), 1);
@@ -550,27 +657,14 @@ fn apply_creates_new_services() {
 
 #[test]
 fn apply_is_idempotent_when_running() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
     // First apply creates the service.
     apply(&s, &store, &no_health()).unwrap();
 
-    // Simulate the service becoming Running.
-    store
-        .save_observed_state(
-            "myapp",
-            &ServiceObservedState {
-                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-                applied_config_digest: Some(service_config_digest(&s.services[0])),
-                phase: ServicePhase::Running,
-                container_id: Some("ctr-1".to_string()),
-                failed_create_ownership: None,
-                last_error: None,
-                ready: true,
-            },
-        )
-        .unwrap();
+    // Publish the service Running through exact journal/binding authority.
+    publish_running_generation(&store, "myapp", &s.services[0], 1);
 
     // Second apply should produce no actions.
     let result = apply(&s, &store, &no_health()).unwrap();
@@ -579,7 +673,7 @@ fn apply_is_idempotent_when_running() {
 
 #[test]
 fn apply_removes_deleted_services() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
 
     // Start with two services.
     let s1 = spec(
@@ -588,36 +682,40 @@ fn apply_removes_deleted_services() {
     );
     apply(&s1, &store, &no_health()).unwrap();
 
-    // Simulate both Running.
+    // Publish both Running through the exact journal/binding authority.
     for service in &s1.services {
-        store
-            .save_observed_state("myapp", &obs_running_for(service, 1))
-            .unwrap();
+        publish_running_generation(&store, "myapp", service, 1);
     }
+    let observed_before = store.load_observed_state("myapp").unwrap();
 
     // Remove db from the spec.
     let s2 = spec("myapp", vec![svc("web", "nginx:latest")]);
     let result = apply(&s2, &store, &no_health()).unwrap();
 
     assert_eq!(result.actions.len(), 1);
-    assert_eq!(
-        result.actions[0],
-        Action::ServiceRemove {
-            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
-        }
-    );
+    assert!(matches!(
+        &result.actions[0],
+        Action::ServiceRemove { target, precondition }
+            if target == &crate::state_store::ServiceReplicaKey::first("db").unwrap()
+                && matches!(
+                    precondition.journal_head(),
+                    ExpectedJournalHead::Exact { ownership: Some(_), .. }
+                )
+                && precondition.workload().stack_id == "myapp"
+    ));
     let observed = store.load_observed_state("myapp").unwrap();
+    assert_eq!(observed, observed_before);
     let db = observed
         .iter()
         .find(|state| state.replica.service_name == "db")
         .unwrap();
-    assert_eq!(db.container_id.as_deref(), Some("ctr-db-1"));
+    assert_eq!(db.container_id.as_deref(), Some("ctr-myapp-db-1"));
 }
 
 #[test]
 fn apply_preserves_unproven_failed_ids_for_cleanup_quarantine() {
     for container_name in [None, Some("global-explicit-id")] {
-        let store = StateStore::in_memory().unwrap();
+        let store = authoritative_store("myapp");
         let mut service = svc("web", "nginx:latest");
         service.container_name = container_name.map(str::to_string);
         store
@@ -636,8 +734,8 @@ fn apply_preserves_unproven_failed_ids_for_cleanup_quarantine() {
             )
             .unwrap();
 
-        let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
-        assert_eq!(result.actions.len(), 1);
+        let error = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap_err();
+        assert!(error.to_string().contains("without an exact journal head"));
         let observed = store.load_observed_state("myapp").unwrap();
         assert_eq!(observed[0].container_id.as_deref(), Some("unproven-id"));
         assert!(observed[0].failed_create_ownership.is_none());
@@ -646,32 +744,13 @@ fn apply_preserves_unproven_failed_ids_for_cleanup_quarantine() {
 
 #[test]
 fn apply_preserves_successful_runtime_ownership_for_recreate() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
+    let original = svc("web", "nginx:latest");
     store
-        .save_desired_state("myapp", &spec("myapp", vec![svc("web", "nginx:latest")]))
+        .save_desired_state("myapp", &spec("myapp", vec![original.clone()]))
         .unwrap();
-    let ownership = vz_runtime_contract::ContainerGenerationOwnership {
-        container_id: "runtime-owned-id".to_string(),
-        generation: 31,
-        stack_id: "myapp".to_string(),
-        scope: Some(Box::new(
-            vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp").unwrap(),
-        )),
-    };
-    store
-        .save_observed_state(
-            "myapp",
-            &ServiceObservedState {
-                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-                applied_config_digest: None,
-                phase: ServicePhase::Running,
-                container_id: Some(ownership.container_id.clone()),
-                failed_create_ownership: Some(ownership.clone()),
-                last_error: None,
-                ready: true,
-            },
-        )
-        .unwrap();
+    let ownership = publish_running_generation(&store, "myapp", &original, 1);
+    let observed_before = store.load_observed_state("myapp").unwrap();
 
     let result = apply(
         &spec("myapp", vec![svc("web", "different:latest")]),
@@ -683,9 +762,10 @@ fn apply_preserves_successful_runtime_ownership_for_recreate() {
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(result.actions[0], Action::ServiceRecreate { .. }));
     let observed = store.load_observed_state("myapp").unwrap();
+    assert_eq!(observed, observed_before);
     assert_eq!(
         observed[0].container_id.as_deref(),
-        Some("runtime-owned-id")
+        Some(ownership.container_id.as_str())
     );
     assert_eq!(observed[0].failed_create_ownership, Some(ownership));
 }
@@ -693,40 +773,19 @@ fn apply_preserves_successful_runtime_ownership_for_recreate() {
 #[test]
 fn apply_preserves_runtime_ownership_independent_of_container_name() {
     for container_name in [None, Some("global-explicit-id")] {
-        let store = StateStore::in_memory().unwrap();
+        let store = authoritative_store("myapp");
         let mut service = svc("web", "nginx:latest");
         service.container_name = container_name.map(str::to_string);
-        let ownership = vz_runtime_contract::ContainerGenerationOwnership {
-            container_id: "runtime-owned-id".to_string(),
-            generation: 29,
-            stack_id: "myapp".to_string(),
-            scope: Some(Box::new(
-                vz_runtime_contract::ContainerGenerationScope::synthetic_legacy_stack("myapp")
-                    .unwrap(),
-            )),
-        };
-        store
-            .save_observed_state(
-                "myapp",
-                &ServiceObservedState {
-                    replica: crate::state_store::ServiceReplicaKey::first("web".to_string())
-                        .unwrap(),
-                    applied_config_digest: None,
-                    phase: ServicePhase::Failed,
-                    container_id: Some(ownership.container_id.clone()),
-                    failed_create_ownership: Some(ownership.clone()),
-                    last_error: Some("create failed after admission".to_string()),
-                    ready: false,
-                },
-            )
-            .unwrap();
+        let ownership = publish_bound_create_failure(&store, "myapp", &service, 1);
+        let observed_before = store.load_observed_state("myapp").unwrap();
 
         let result = apply(&spec("myapp", vec![service]), &store, &no_health()).unwrap();
         assert_eq!(result.actions.len(), 1);
         let observed = store.load_observed_state("myapp").unwrap();
+        assert_eq!(observed, observed_before);
         assert_eq!(
             observed[0].container_id.as_deref(),
-            Some("runtime-owned-id")
+            Some(ownership.container_id.as_str())
         );
         assert_eq!(observed[0].failed_create_ownership, Some(ownership));
     }
@@ -734,7 +793,7 @@ fn apply_preserves_runtime_ownership_independent_of_container_name() {
 
 #[test]
 fn apply_emits_events_for_actions() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     let s = spec("myapp", vec![svc("web", "nginx:latest")]);
 
     apply(&s, &store, &no_health()).unwrap();
@@ -748,8 +807,8 @@ fn apply_emits_events_for_actions() {
 }
 
 #[test]
-fn apply_emits_mount_topology_recreate_required_before_service_creating() {
-    let store = StateStore::in_memory().unwrap();
+fn apply_exact_mount_recreate_preserves_observed_until_claimed_execution() {
+    let store = authoritative_store("myapp");
 
     let s1 = spec(
         "myapp",
@@ -763,9 +822,29 @@ fn apply_emits_mount_topology_recreate_required_before_service_creating() {
         }],
     );
     apply(&s1, &store, &no_health()).unwrap();
-    store
-        .save_observed_state("myapp", &obs_running("web"))
-        .unwrap();
+    publish_running_generation(&store, "myapp", &s1.services[0], 1);
+    let observed_before = store.load_observed_state("myapp").unwrap();
+    let events_before = store.load_events("myapp").unwrap();
+    let recreate_event_count_before = events_before
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                StackEvent::MountTopologyRecreateRequired { service_name, .. }
+                    if service_name == "web"
+            )
+        })
+        .count();
+    let creating_event_count_before = events_before
+        .iter()
+        .filter(|event| {
+            matches!(
+                event,
+                StackEvent::ServiceCreating { service_name, .. }
+                    if service_name == "web"
+            )
+        })
+        .count();
 
     let s2 = spec(
         "myapp",
@@ -779,42 +858,56 @@ fn apply_emits_mount_topology_recreate_required_before_service_creating() {
         }],
     );
     let result = apply(&s2, &store, &no_health()).unwrap();
-    assert_eq!(
-        result.actions,
-        vec![Action::ServiceRecreate {
-            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        }]
-    );
+    assert!(matches!(
+        result.actions.as_slice(),
+        [Action::ServiceRecreate { target, precondition }]
+            if target == &crate::state_store::ServiceReplicaKey::first("web").unwrap()
+                && matches!(
+                    precondition.journal_head(),
+                    ExpectedJournalHead::Exact { ownership: Some(_), .. }
+                )
+                && precondition.workload().stack_id == "myapp"
+    ));
 
+    assert_eq!(store.load_observed_state("myapp").unwrap(), observed_before);
     let events = store.load_events("myapp").unwrap();
-    let recreate_idx = events
-        .iter()
-        .position(|event| {
-            matches!(
-                event,
-                StackEvent::MountTopologyRecreateRequired { service_name, .. }
-                    if service_name == "web"
-            )
-        })
-        .unwrap();
-    let creating_idx = events
+    assert_eq!(
+        events
             .iter()
-            .rposition(
-                |event| matches!(event, StackEvent::ServiceCreating { service_name, .. } if service_name == "web"),
-            )
-            .unwrap();
-    assert!(recreate_idx < creating_idx);
+            .filter(|event| {
+                matches!(
+                    event,
+                    StackEvent::MountTopologyRecreateRequired { service_name, .. }
+                        if service_name == "web"
+                )
+            })
+            .count(),
+        recreate_event_count_before + 1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    StackEvent::ServiceCreating { service_name, .. }
+                        if service_name == "web"
+                )
+            })
+            .count(),
+        creating_event_count_before
+    );
 
     let digests = store.load_service_mount_digests("myapp").unwrap();
     assert_eq!(
         digests.get("web"),
-        Some(&service_config_digest(&s2.services[0]))
+        Some(&service_config_digest(&s1.services[0]))
     );
 }
 
 #[test]
 fn apply_with_healthcheck_gating_service_healthy() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     // db has a health check; web depends on db with service_healthy condition.
     let s = spec(
         "myapp",
@@ -831,10 +924,8 @@ fn apply_with_healthcheck_gating_service_healthy() {
     assert_eq!(r1.deferred.len(), 1);
     assert_eq!(r1.deferred[0].service_name, "web");
 
-    // Simulate db Running but health check NOT yet passing.
-    store
-        .save_observed_state("myapp", &obs_running_for(&s.services[0], 1))
-        .unwrap();
+    // Publish db Running but leave its health check NOT yet passing.
+    publish_running_generation(&store, "myapp", &s.services[0], 1);
 
     // With no health pass, web is still deferred.
     let r2 = apply(&s, &store, &no_health()).unwrap();
@@ -856,7 +947,7 @@ fn apply_with_healthcheck_gating_service_healthy() {
 
 #[test]
 fn apply_with_healthcheck_service_started_ignores_health() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     // db has a health check; web depends on db with default (service_started) condition.
     let s = spec(
         "myapp",
@@ -866,14 +957,8 @@ fn apply_with_healthcheck_service_started_ignores_health() {
         ],
     );
 
-    // Simulate db Running but health check NOT yet passing.
-    store
-        .save_observed_state("myapp", &obs_running_for(&s.services[0], 1))
-        .unwrap();
-    store
-        .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
-        .unwrap();
-
+    // Publish db Running but leave its health check NOT yet passing.
+    publish_running_generation(&store, "myapp", &s.services[0], 1);
     // Apply with no health status: web should NOT be deferred because
     // service_started doesn't care about health checks.
     let r = apply(&s, &store, &no_health()).unwrap();
@@ -884,12 +969,8 @@ fn apply_with_healthcheck_service_started_ignores_health() {
 
 #[test]
 fn apply_emits_dependency_blocked_events() {
-    let store = StateStore::in_memory().unwrap();
-    // db is Failed, web depends on db → web is deferred.
-    store
-        .save_observed_state("myapp", &obs("db", ServicePhase::Failed))
-        .unwrap();
-
+    let store = authoritative_store("myapp");
+    // db is absent, so web is deferred while db itself is planned for creation.
     let s = spec(
         "myapp",
         vec![
@@ -911,8 +992,8 @@ fn apply_emits_dependency_blocked_events() {
 
 #[test]
 fn apply_determinism_proof() {
-    let store1 = StateStore::in_memory().unwrap();
-    let store2 = StateStore::in_memory().unwrap();
+    let store1 = authoritative_store("myapp");
+    let store2 = authoritative_store("myapp");
     let s = spec(
         "myapp",
         vec![svc("db", "postgres:16"), svc("cache", "redis:7")],
@@ -925,7 +1006,7 @@ fn apply_determinism_proof() {
 
 #[test]
 fn apply_empty_spec_produces_no_actions() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
     let s = spec("myapp", vec![]);
 
     let result = apply(&s, &store, &no_health()).unwrap();
@@ -964,7 +1045,7 @@ fn teardown_removes_dependents_before_dependencies() {
 
 #[test]
 fn teardown_via_apply_uses_previous_spec_for_ordering() {
-    let store = StateStore::in_memory().unwrap();
+    let store = authoritative_store("myapp");
 
     // Set up a stack with A -> B -> C dependency chain.
     let a = svc("a", "img:1");
@@ -975,12 +1056,11 @@ fn teardown_via_apply_uses_previous_spec_for_ordering() {
     // First apply creates all three.
     apply(&s, &store, &no_health()).unwrap();
 
-    // Simulate all Running.
-    for name in &["a", "b", "c"] {
-        store
-            .save_observed_state("myapp", &obs_running(name))
-            .unwrap();
+    // Publish all Running through exact journal/binding authority.
+    for service in &s.services {
+        publish_running_generation(&store, "myapp", service, 1);
     }
+    let observed_before = store.load_observed_state("myapp").unwrap();
 
     // Teardown: empty spec.
     let empty = spec("myapp", vec![]);
@@ -990,6 +1070,7 @@ fn teardown_via_apply_uses_previous_spec_for_ordering() {
     let names: Vec<&str> = result.actions.iter().map(|a| a.service_name()).collect();
     // Dependents removed first: c, b, a.
     assert_eq!(names, vec!["c", "b", "a"]);
+    assert_eq!(store.load_observed_state("myapp").unwrap(), observed_before);
 }
 
 #[test]
@@ -1009,9 +1090,11 @@ fn teardown_without_previous_spec_falls_back_to_alphabetical() {
 fn actions_hash_deterministic_same_input() {
     let actions = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
@@ -1019,16 +1102,18 @@ fn actions_hash_deterministic_same_input() {
     let hash1 = compute_actions_hash(&actions);
     let hash2 = compute_actions_hash(&actions);
     assert_eq!(hash1, hash2);
-    assert!(hash1.starts_with("vzrah1-sha256:"));
-    assert_eq!(hash1.len(), "vzrah1-sha256:".len() + 64);
+    assert!(hash1.starts_with("vzrah2-sha256:"));
+    assert_eq!(hash1.len(), "vzrah2-sha256:".len() + 64);
 }
 
 #[test]
 fn actions_hash_differs_for_different_actions() {
     let a = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
     }];
     let b = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1038,12 +1123,15 @@ fn actions_hash_differs_for_different_actions() {
 #[test]
 fn actions_hash_differs_for_different_kinds() {
     let a = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let b = vec![Action::ServiceRecreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let c = vec![Action::ServiceRemove {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
@@ -1060,17 +1148,21 @@ fn actions_hash_differs_for_different_kinds() {
 fn actions_hash_order_matters() {
     let a = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let b = vec![
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
@@ -1081,17 +1173,220 @@ fn actions_hash_order_matters() {
 #[test]
 fn actions_hash_empty_list() {
     let hash = compute_actions_hash(&[]);
-    assert!(hash.starts_with("vzrah1-sha256:"));
-    assert_eq!(hash.len(), "vzrah1-sha256:".len() + 64);
+    assert!(hash.starts_with("vzrah2-sha256:"));
+    assert_eq!(hash.len(), "vzrah2-sha256:".len() + 64);
     // Empty list should still produce a valid hash.
+}
+
+fn action_hash_workload(
+    project_id: &str,
+    environment_id: &str,
+    machine_id: &str,
+    incarnation_id: &str,
+    stack_id: &str,
+) -> MachineWorkloadScope {
+    MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: vz_runtime_contract::ProjectId::new(project_id).unwrap(),
+        environment_id: vz_runtime_contract::EnvironmentId::new(environment_id).unwrap(),
+        machine_id: vz_runtime_contract::MachineId::new(machine_id).unwrap(),
+        machine_incarnation_id: vz_runtime_contract::MachineIncarnationId::new(incarnation_id)
+            .unwrap(),
+        stack_id: stack_id.to_string(),
+    }
+}
+
+fn action_hash_for_precondition(precondition: ReplicaPrecondition) -> String {
+    compute_actions_hash(&[Action::ServiceCreate {
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+        precondition,
+    }])
+}
+
+#[test]
+fn actions_hash_covers_topology_and_journal_precondition_identity() {
+    let base_workload = action_hash_workload(
+        "prj_hash_a",
+        "env_hash_a",
+        "mch_hash_a",
+        "inc_hash_a",
+        "hash-stack-a",
+    );
+    let base = ReplicaPrecondition::new(
+        base_workload.clone(),
+        7,
+        ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap();
+    let base_hash = action_hash_for_precondition(base);
+
+    for changed_workload in [
+        action_hash_workload(
+            "prj_hash_b",
+            "env_hash_a",
+            "mch_hash_a",
+            "inc_hash_a",
+            "hash-stack-a",
+        ),
+        action_hash_workload(
+            "prj_hash_a",
+            "env_hash_b",
+            "mch_hash_a",
+            "inc_hash_a",
+            "hash-stack-a",
+        ),
+        action_hash_workload(
+            "prj_hash_a",
+            "env_hash_a",
+            "mch_hash_b",
+            "inc_hash_a",
+            "hash-stack-a",
+        ),
+        action_hash_workload(
+            "prj_hash_a",
+            "env_hash_a",
+            "mch_hash_a",
+            "inc_hash_b",
+            "hash-stack-a",
+        ),
+        action_hash_workload(
+            "prj_hash_a",
+            "env_hash_a",
+            "mch_hash_a",
+            "inc_hash_a",
+            "hash-stack-b",
+        ),
+    ] {
+        let changed =
+            ReplicaPrecondition::new(changed_workload, 7, ExpectedJournalHead::NeverJournaled)
+                .unwrap();
+        assert_ne!(base_hash, action_hash_for_precondition(changed));
+    }
+
+    let changed_generation = ReplicaPrecondition::new(
+        base_workload.clone(),
+        8,
+        ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap();
+    assert_ne!(base_hash, action_hash_for_precondition(changed_generation));
+
+    let unbound = ReplicaPrecondition::new(
+        base_workload.clone(),
+        7,
+        ExpectedJournalHead::exact("reservation-a", 1, None).unwrap(),
+    )
+    .unwrap();
+    let changed_reservation = ReplicaPrecondition::new(
+        base_workload.clone(),
+        7,
+        ExpectedJournalHead::exact("reservation-b", 1, None).unwrap(),
+    )
+    .unwrap();
+    let changed_service_generation = ReplicaPrecondition::new(
+        base_workload.clone(),
+        7,
+        ExpectedJournalHead::exact("reservation-a", 2, None).unwrap(),
+    )
+    .unwrap();
+    assert_ne!(base_hash, action_hash_for_precondition(unbound.clone()));
+    assert_ne!(
+        action_hash_for_precondition(unbound.clone()),
+        action_hash_for_precondition(changed_reservation)
+    );
+    assert_ne!(
+        action_hash_for_precondition(unbound),
+        action_hash_for_precondition(changed_service_generation)
+    );
+
+    let scope = base_workload
+        .container_generation_scope("reservation-a")
+        .unwrap();
+    let ownership = ContainerGenerationOwnership {
+        container_id: "ctr-a".to_string(),
+        generation: 3,
+        stack_id: base_workload.stack_id.clone(),
+        scope: Some(Box::new(scope)),
+    };
+    let bound = ReplicaPrecondition::new(
+        base_workload.clone(),
+        7,
+        ExpectedJournalHead::exact("reservation-a", 1, Some(ownership.clone())).unwrap(),
+    )
+    .unwrap();
+    let mut changed_container = ownership.clone();
+    changed_container.container_id = "ctr-b".to_string();
+    let mut changed_runtime_generation = ownership;
+    changed_runtime_generation.generation = 4;
+    for changed_ownership in [changed_container, changed_runtime_generation] {
+        let changed = ReplicaPrecondition::new(
+            base_workload.clone(),
+            7,
+            ExpectedJournalHead::exact("reservation-a", 1, Some(changed_ownership)).unwrap(),
+        )
+        .unwrap();
+        assert_ne!(
+            action_hash_for_precondition(bound.clone()),
+            action_hash_for_precondition(changed)
+        );
+    }
+}
+
+#[test]
+fn replica_precondition_rejects_unsafe_journal_identity_and_unknown_fields() {
+    for reservation_id in [
+        " leading",
+        "trailing ",
+        "has space",
+        "line\nbreak",
+        "nul\0byte",
+        "unicode\u{2003}space",
+    ] {
+        assert!(ExpectedJournalHead::exact(reservation_id, 1, None).is_err());
+    }
+    assert!(ExpectedJournalHead::exact("reservation", 0, None).is_err());
+
+    let precondition = ReplicaPrecondition::new(
+        action_hash_workload(
+            "prj_serde",
+            "env_serde",
+            "mch_serde",
+            "inc_serde",
+            "serde-stack",
+        ),
+        0,
+        ExpectedJournalHead::NeverJournaled,
+    )
+    .unwrap();
+    let mut value = serde_json::to_value(&precondition).unwrap();
+    value
+        .as_object_mut()
+        .unwrap()
+        .insert("unexpected".to_string(), serde_json::json!(true));
+    assert!(serde_json::from_value::<ReplicaPrecondition>(value).is_err());
+
+    let mut head = serde_json::to_value(ExpectedJournalHead::NeverJournaled).unwrap();
+    head.as_object_mut()
+        .unwrap()
+        .insert("unexpected".to_string(), serde_json::json!(true));
+    assert!(serde_json::from_value::<ExpectedJournalHead>(head).is_err());
+
+    let bound = crate::reconcile::test_replica_precondition_for_stack("serde-stack");
+    let mut legacy_scope: serde_json::Value = serde_json::to_value(&bound).unwrap();
+    legacy_scope["journal_head"]["ownership"]["scope"]["machine_incarnation_id"] =
+        serde_json::Value::Null;
+    let error = serde_json::from_value::<ReplicaPrecondition>(legacy_scope).unwrap_err();
+    assert!(error.to_string().contains("machine incarnation"));
 }
 
 #[test]
 fn actions_hash_distinguishes_exact_replica_identity() {
     let second_api_replica = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::new("api", 2).unwrap(),
     }];
     let similarly_decorated_base = vec![Action::ServiceCreate {
+        precondition: crate::reconcile::test_replica_precondition(),
         target: crate::state_store::ServiceReplicaKey::new("api-2", 1).unwrap(),
     }];
 
@@ -1126,6 +1421,7 @@ fn compute_actions_creates_replicated_service() {
         actions,
         (1..=3)
             .map(|replica_index| Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::new("web", replica_index).unwrap(),
             })
             .collect::<Vec<_>>()
@@ -1172,9 +1468,11 @@ fn compute_actions_scale_up() {
         actions,
         vec![
             Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
             },
             Action::ServiceCreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
             },
         ]
@@ -1196,7 +1494,7 @@ fn compute_actions_scale_down() {
     let mut remove_indices: Vec<u32> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { target } => Some(target.index()),
+            Action::ServiceRemove { target, .. } => Some(target.index()),
             _ => None,
         })
         .collect();
@@ -1238,7 +1536,7 @@ fn compute_actions_does_not_remove_replicas_of_running_service() {
     let removes: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
+            Action::ServiceRemove { target, .. } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -1257,6 +1555,7 @@ fn compute_actions_creates_only_missing_middle_replica() {
     assert_eq!(
         actions,
         vec![Action::ServiceCreate {
+            precondition: crate::reconcile::test_replica_precondition(),
             target: ServiceReplicaKey::new("api", 2).unwrap(),
         }]
     );
@@ -1275,6 +1574,7 @@ fn compute_actions_recreates_each_stale_config_replica() {
         actions,
         (1..=3)
             .map(|index| Action::ServiceRecreate {
+                precondition: crate::reconcile::test_replica_precondition(),
                 target: ServiceReplicaKey::new("api", index).unwrap(),
             })
             .collect::<Vec<_>>()

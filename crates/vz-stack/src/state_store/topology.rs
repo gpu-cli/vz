@@ -17,8 +17,9 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 5;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 6;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
+const REPLICA_SCHEMA_VERSION: u32 = 5;
 
 const REPLICA_SCHEMA_V5_DDL: &str = r#"
 ALTER TABLE stack_container_create_intents
@@ -210,6 +211,158 @@ CREATE TABLE reconcile_audit_log (
 );
 CREATE INDEX idx_audit_session ON reconcile_audit_log(session_id);
 CREATE INDEX idx_audit_stack ON reconcile_audit_log(stack_name);
+"#;
+
+const RECONCILE_SCHEMA_V6_ARCHIVE_DDL: &str = r#"
+CREATE TABLE legacy_reconcile_sessions_quarantine_v6 (
+    session_id TEXT PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 2),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL,
+    total_actions INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE legacy_reconcile_progress_quarantine_v6 (
+    legacy_id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 2),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+CREATE TABLE legacy_reconcile_audit_quarantine_v6 (
+    legacy_id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    stack_name TEXT NOT NULL,
+    action_index INTEGER NOT NULL,
+    action_kind TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    replica_index INTEGER NOT NULL,
+    action_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER NOT NULL,
+    error_message TEXT,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+INSERT INTO legacy_reconcile_sessions_quarantine_v6 (
+    session_id, stack_name, operation_id, status, action_schema_version,
+    actions_json, actions_hash, next_action_index, total_actions, started_at,
+    updated_at, completed_at, reason
+)
+SELECT session_id, stack_name, operation_id, status, action_schema_version,
+       actions_json, actions_hash, next_action_index, total_actions, started_at,
+       updated_at, completed_at, 'terminal action schema v2 session'
+FROM reconcile_sessions;
+INSERT INTO legacy_reconcile_progress_quarantine_v6 (
+    legacy_id, stack_name, operation_id, action_schema_version, actions_json,
+    actions_hash, next_action_index, updated_at, reason
+)
+SELECT id, stack_name, operation_id, action_schema_version, actions_json,
+       actions_hash, next_action_index, updated_at,
+       'terminal action schema v2 progress marker'
+FROM reconcile_progress;
+INSERT INTO legacy_reconcile_audit_quarantine_v6 (
+    legacy_id, session_id, stack_name, action_index, action_kind, service_name,
+    replica_index, action_hash, status, started_at, completed_at, error_message,
+    reason
+)
+SELECT id, session_id, stack_name, action_index, action_kind, service_name,
+       replica_index, action_hash, status, started_at, completed_at, error_message,
+       'terminal action schema v2 audit'
+FROM reconcile_audit_log;
+DELETE FROM reconcile_audit_log;
+"#;
+
+const RECONCILE_SCHEMA_V6_ACTION_TABLES_DDL: &str = r#"
+DROP INDEX idx_audit_session;
+DROP INDEX idx_audit_stack;
+ALTER TABLE reconcile_audit_log RENAME TO reconcile_audit_log_v5;
+DROP INDEX idx_reconcile_session_stack;
+DROP INDEX idx_reconcile_session_status;
+ALTER TABLE reconcile_sessions RENAME TO reconcile_sessions_v5;
+CREATE TABLE reconcile_sessions (
+    session_id TEXT PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'completed', 'failed', 'superseded')),
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 3),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL CHECK(next_action_index >= 0),
+    total_actions INTEGER NOT NULL CHECK(total_actions >= 0),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
+    completed_at INTEGER,
+    CHECK(next_action_index <= total_actions),
+    CHECK(status <> 'completed' OR next_action_index = total_actions),
+    CHECK(
+        (status = 'active' AND completed_at IS NULL) OR
+        (status <> 'active' AND completed_at IS NOT NULL AND completed_at >= updated_at)
+    )
+);
+CREATE TABLE reconcile_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    stack_name TEXT NOT NULL,
+    action_index INTEGER NOT NULL CHECK(action_index >= 0),
+    action_kind TEXT NOT NULL
+        CHECK(action_kind IN ('service_create', 'service_recreate', 'service_remove')),
+    service_name TEXT NOT NULL CHECK(length(trim(service_name)) BETWEEN 1 AND 128),
+    replica_index INTEGER NOT NULL CHECK(replica_index > 0),
+    action_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('started', 'completed', 'failed')),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    error_message TEXT,
+    UNIQUE(session_id, action_index),
+    CHECK(
+        (status = 'started' AND completed_at IS NULL AND error_message IS NULL) OR
+        (status = 'completed' AND completed_at IS NOT NULL AND error_message IS NULL) OR
+        (status = 'failed' AND completed_at IS NOT NULL AND error_message IS NOT NULL)
+    ),
+    FOREIGN KEY(session_id) REFERENCES reconcile_sessions(session_id) ON DELETE RESTRICT
+);
+DROP TABLE reconcile_audit_log_v5;
+DROP TABLE reconcile_sessions_v5;
+CREATE INDEX idx_reconcile_session_stack ON reconcile_sessions(stack_name);
+CREATE INDEX idx_reconcile_session_status ON reconcile_sessions(status);
+CREATE INDEX idx_audit_session ON reconcile_audit_log(session_id);
+CREATE INDEX idx_audit_stack ON reconcile_audit_log(stack_name);
+
+ALTER TABLE reconcile_progress RENAME TO reconcile_progress_v5;
+CREATE TABLE reconcile_progress (
+    id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 3),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL CHECK(next_action_index >= 0),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+DROP TABLE reconcile_progress_v5;
+"#;
+
+const RECONCILE_SCHEMA_V6_CLAIM_INDEX_DDL: &str = r#"
+CREATE UNIQUE INDEX reconcile_one_started_replica
+ON reconcile_audit_log(stack_name, service_name, replica_index)
+WHERE status = 'started';
 "#;
 
 /// Result of atomically selecting or reserving an Environment for `up`.
@@ -511,6 +664,13 @@ enum ReplicaV5MigrationStage {
     ObservedStateRebuilt,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileV6MigrationStage {
+    TerminalHistoryArchived,
+    DurableActionsRebuilt,
+    ReplicaClaimIndexCreated,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -534,6 +694,14 @@ pub(super) enum StackJournalV4MigrationFailpoint {
 pub(super) enum ReplicaV5MigrationFailpoint {
     AfterDurableActionsRebuilt,
     AfterObservedStateRebuilt,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReconcileV6MigrationFailpoint {
+    AfterTerminalHistoryArchived,
+    AfterDurableActionsRebuilt,
+    AfterReplicaClaimIndexCreated,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -814,6 +982,29 @@ impl StateStore {
         reference.create_replica_schema_v5()?;
 
         self.validate_schema_against(5, &reference.conn)
+    }
+
+    pub(super) fn validate_v6_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+
+        self.validate_schema_against(6, &reference.conn)
+    }
+
+    pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
+        self.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
+        self.conn
+            .execute_batch(RECONCILE_SCHEMA_V6_ACTION_TABLES_DDL)?;
+        self.conn
+            .execute_batch(RECONCILE_SCHEMA_V6_CLAIM_INDEX_DDL)?;
+        Ok(())
     }
 
     pub(super) fn create_replica_schema_v5(&self) -> Result<(), StackError> {
@@ -3540,6 +3731,180 @@ impl StateStore {
         self.migrate_replica_v4_to_v5_with_hook(|_| Ok(()))
     }
 
+    pub(super) fn migrate_reconcile_v5_to_v6(&self) -> Result<(), StackError> {
+        self.migrate_reconcile_v5_to_v6_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_reconcile_v5_to_v6_with_hook(
+        &self,
+        mut hook: impl FnMut(ReconcileV6MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != REPLICA_SCHEMA_VERSION {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile action migration requires state schema version 5, found {schema_version}"
+                )));
+            }
+            store.validate_v5_schema()?;
+
+            let mut progress_statement = store.conn.prepare(
+                "SELECT stack_name, action_schema_version, actions_json, next_action_index
+                 FROM reconcile_progress ORDER BY id",
+            )?;
+            let progress_rows = progress_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                ))
+            })?;
+            for row in progress_rows {
+                let (stack_name, action_schema_version, actions_json, cursor_raw) = row?;
+                if action_schema_version != 2 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "reconcile progress for `{stack_name}` uses unexpected action schema {action_schema_version}"
+                    )));
+                }
+                let action_count = serde_json::from_str::<serde_json::Value>(&actions_json)
+                    .ok()
+                    .and_then(|value| value.as_array().map(Vec::len))
+                    .ok_or_else(|| {
+                        StackError::InvalidSpec(format!(
+                            "action schema v2 reconcile progress for `{stack_name}` is not an action array"
+                        ))
+                    })?;
+                let cursor = usize::try_from(cursor_raw).map_err(|_| {
+                    StackError::InvalidSpec(format!(
+                        "action schema v2 reconcile progress for `{stack_name}` has invalid cursor {cursor_raw}"
+                    ))
+                })?;
+                if cursor > action_count {
+                    return Err(StackError::InvalidSpec(format!(
+                        "action schema v2 reconcile progress for `{stack_name}` has cursor {cursor} beyond {action_count} actions"
+                    )));
+                }
+                if cursor < action_count {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v5 contains pending action schema v2 reconcile progress for `{stack_name}`; explicit recovery or quarantine is required before reconcile action migration"
+                    )));
+                }
+            }
+            drop(progress_statement);
+
+            let mut session_statement = store.conn.prepare(
+                "SELECT session_id, status, action_schema_version, actions_json,
+                        next_action_index, total_actions, started_at, updated_at, completed_at
+                 FROM reconcile_sessions ORDER BY session_id",
+            )?;
+            let session_rows = session_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, i64>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                ))
+            })?;
+            for row in session_rows {
+                let (id, status, action_schema_version, actions_json, cursor, total, started, updated, completed) = row?;
+                if action_schema_version != 2 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "reconcile session `{id}` uses unexpected action schema {action_schema_version}"
+                    )));
+                }
+                if status == "active" {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v5 contains active action schema v2 reconcile session `{id}`; explicit recovery or quarantine is required before reconcile action migration"
+                    )));
+                }
+                let action_count = serde_json::from_str::<serde_json::Value>(&actions_json)
+                    .ok()
+                    .and_then(|value| value.as_array().map(Vec::len))
+                    .ok_or_else(|| {
+                        StackError::InvalidSpec(format!(
+                            "action schema v2 reconcile session `{id}` is not an action array"
+                        ))
+                    })?;
+                let valid = matches!(status.as_str(), "completed" | "failed" | "superseded")
+                    && cursor >= 0
+                    && total >= 0
+                    && usize::try_from(total).ok() == Some(action_count)
+                    && cursor <= total
+                    && (status != "completed" || cursor == total)
+                    && started >= 0
+                    && updated >= started
+                    && completed.is_some_and(|value| value >= updated);
+                if !valid {
+                    return Err(StackError::InvalidSpec(format!(
+                        "action schema v2 reconcile session `{id}` has inconsistent terminal metadata"
+                    )));
+                }
+            }
+            drop(session_statement);
+
+            let mut audit_statement = store.conn.prepare(
+                "SELECT id, status, action_index, action_kind, service_name,
+                        replica_index, started_at, completed_at, error_message
+                 FROM reconcile_audit_log ORDER BY id",
+            )?;
+            let audit_rows = audit_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<String>>(8)?,
+                ))
+            })?;
+            for row in audit_rows {
+                let (id, status, index, kind, service, replica, started, completed, error) = row?;
+                if status == "started" {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v5 contains started action schema v2 reconcile audit row {id}; explicit recovery or quarantine is required before reconcile action migration"
+                    )));
+                }
+                let valid = index >= 0
+                    && matches!(kind.as_str(), "service_create" | "service_recreate" | "service_remove")
+                    && !service.trim().is_empty()
+                    && replica > 0
+                    && started >= 0
+                    && completed.is_some_and(|value| value >= started)
+                    && ((status == "completed" && error.is_none())
+                        || (status == "failed" && error.is_some()));
+                if !valid {
+                    return Err(StackError::InvalidSpec(format!(
+                        "action schema v2 reconcile audit row {id} has inconsistent terminal metadata"
+                    )));
+                }
+            }
+            drop(audit_statement);
+
+            store.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
+            hook(ReconcileV6MigrationStage::TerminalHistoryArchived)?;
+            store
+                .conn
+                .execute_batch(RECONCILE_SCHEMA_V6_ACTION_TABLES_DDL)?;
+            hook(ReconcileV6MigrationStage::DurableActionsRebuilt)?;
+            store
+                .conn
+                .execute_batch(RECONCILE_SCHEMA_V6_CLAIM_INDEX_DDL)?;
+            hook(ReconcileV6MigrationStage::ReplicaClaimIndexCreated)?;
+            store.validate_v6_schema()?;
+            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
     fn migrate_replica_v4_to_v5_with_hook(
         &self,
         mut hook: impl FnMut(ReplicaV5MigrationStage) -> Result<(), StackError>,
@@ -3687,7 +4052,7 @@ impl StateStore {
             })?;
             hook(ReplicaV5MigrationStage::ObservedStateRebuilt)?;
             store.validate_v5_schema()?;
-            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            store.set_schema_version(REPLICA_SCHEMA_VERSION)?;
             Ok(())
         })
     }
@@ -3819,6 +4184,33 @@ impl StateStore {
             ) {
                 return Err(StackError::InvalidSpec(format!(
                     "injected v4-to-v5 migration failure at {stage:?}"
+                )));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_reconcile_v5_to_v6_with_failpoint(
+        &self,
+        failpoint: ReconcileV6MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_reconcile_v5_to_v6_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    ReconcileV6MigrationFailpoint::AfterTerminalHistoryArchived,
+                    ReconcileV6MigrationStage::TerminalHistoryArchived
+                ) | (
+                    ReconcileV6MigrationFailpoint::AfterDurableActionsRebuilt,
+                    ReconcileV6MigrationStage::DurableActionsRebuilt
+                ) | (
+                    ReconcileV6MigrationFailpoint::AfterReplicaClaimIndexCreated,
+                    ReconcileV6MigrationStage::ReplicaClaimIndexCreated
+                )
+            ) {
+                return Err(StackError::InvalidSpec(format!(
+                    "injected v5-to-v6 migration failure at {stage:?}"
                 )));
             }
             Ok(())

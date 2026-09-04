@@ -8,12 +8,154 @@
 
 use std::collections::HashMap;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, AtomicUsize, Ordering};
 
-use vz_stack::{
-    Action, ContainerRuntime, HealthPoller, RestartTracker, ServiceObservedState, ServicePhase,
-    StackError, StackEvent, StackExecutor, StackSpec, StateStore, compute_restarts, parse_compose,
+use vz_runtime_contract::{
+    Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EnvironmentState, MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId,
+    MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState,
+    MachineWorkloadScope, OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition,
+    ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
+use vz_stack::{
+    Action, ContainerRuntime, HealthPoller, OrchestrationConfig, RestartTracker,
+    ServiceObservedState, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
+    StackSpec, StateStore, compute_restart_targets, parse_compose,
+};
+
+fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope {
+    let project_id = ProjectId::new("prj_executor_fixture").unwrap();
+    let environment_id = EnvironmentId::new("env_executor_fixture").unwrap();
+    let machine_id = MachineId::new("mch_executor_fixture").unwrap();
+    let incarnation_id = MachineIncarnationId::new("inc_executor_fixture").unwrap();
+    if store.load_stack_workload_owner(stack_id).unwrap().is_some() {
+        return MachineWorkloadScope {
+            schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+            project_id,
+            environment_id,
+            machine_id,
+            machine_incarnation_id: incarnation_id,
+            stack_id: stack_id.to_string(),
+        };
+    }
+    if store
+        .load_project_state(project_id.as_str())
+        .unwrap()
+        .is_none()
+    {
+        let capabilities = CapabilitySet::new([
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]);
+        let target = TargetSpec {
+            os: OperatingSystem::Linux,
+            arch: Architecture::Aarch64,
+            image: "fixture:latest".to_string(),
+            version: None,
+            channel: None,
+            digest: Some("sha256:executor-fixture".to_string()),
+        };
+        let definition = ProjectDefinition {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            project_id: project_id.clone(),
+            name: "executor-fixture".to_string(),
+            environment: EnvironmentSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machines: vec![MachineSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
+                    target: target.clone(),
+                    resources: MachineResources::default(),
+                    requested_capabilities: capabilities.clone(),
+                    workspace: None,
+                }],
+                networks: vec![],
+                endpoints: vec![],
+            },
+        };
+        let environment = EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: "test".to_string(),
+            definition_digest: definition.digest().unwrap(),
+            state: EnvironmentState::Ready,
+            lifecycle_generation: 0,
+            active_operation_id: None,
+            bindings: vec![],
+            machines: vec![MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: machine_id.clone(),
+                environment_id: environment_id.clone(),
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target,
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                negotiated_capabilities: capabilities,
+                backend: None,
+                incarnation: Some(MachineIncarnation {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    incarnation_id: incarnation_id.clone(),
+                    machine_id: machine_id.clone(),
+                    generation: 1,
+                    created_at: 1,
+                }),
+                state: MachineState::Ready,
+                legacy_sandbox_id: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: incarnation_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+            ],
+            legacy_migration: None,
+            created_at: 1,
+            updated_at: 1,
+        };
+        store
+            .save_project_state(&ProjectState {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                definition,
+                environments: vec![environment],
+            })
+            .unwrap();
+    }
+    let scope = MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id,
+        environment_id,
+        machine_id,
+        machine_incarnation_id: incarnation_id,
+        stack_id: stack_id.to_string(),
+    };
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    scope
+}
+
+fn apply_test(
+    spec: &StackSpec,
+    store: &StateStore,
+    health: &HashMap<String, vz_stack::HealthStatus>,
+) -> Result<vz_stack::ApplyResult, StackError> {
+    install_planning_authority(store, &spec.name);
+    vz_stack::apply(spec, store, health)
+}
 
 // ── Mock runtime for integration tests ───────────────────────────
 
@@ -22,6 +164,9 @@ struct MockRuntime {
     exec_exit_code: AtomicI32,
     calls: Mutex<Vec<(String, String)>>,
     create_counter: AtomicUsize,
+    scoped_generations:
+        Mutex<HashMap<String, (vz_runtime_contract::ContainerGenerationOwnership, bool)>>,
+    next_scoped_generation: AtomicU64,
 }
 
 impl MockRuntime {
@@ -31,6 +176,8 @@ impl MockRuntime {
             exec_exit_code: AtomicI32::new(0),
             calls: Mutex::new(Vec::new()),
             create_counter: AtomicUsize::new(0),
+            scoped_generations: Mutex::new(HashMap::new()),
+            next_scoped_generation: AtomicU64::new(1),
         }
     }
 
@@ -123,6 +270,130 @@ impl ContainerRuntime for MockRuntime {
             })
     }
 
+    fn reserve_container_generation(
+        &self,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationOwnership, StackError> {
+        let mut generations = self.scoped_generations.lock().unwrap();
+        if let Some((ownership, _)) = generations.get(container_id) {
+            if ownership.scope.as_deref() == Some(scope) {
+                return Ok(ownership.clone());
+            }
+            return Err(StackError::InvalidSpec(
+                "mock container ID has foreign ownership".to_string(),
+            ));
+        }
+        let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: container_id.to_string(),
+            generation: self.next_scoped_generation.fetch_add(1, Ordering::SeqCst),
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope.clone())),
+        };
+        generations.insert(container_id.to_string(), (ownership.clone(), false));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("reserve_scoped".into(), container_id.to_string()));
+        Ok(ownership)
+    }
+
+    fn inspect_container_reservation(
+        &self,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        let generations = self.scoped_generations.lock().unwrap();
+        let Some((ownership, published)) = generations.get(container_id) else {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Absent);
+        };
+        if ownership.scope.as_deref() != Some(scope) {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Foreign);
+        }
+        Ok(if *published {
+            vz_runtime_contract::ContainerGenerationInspection::Published(ownership.clone())
+        } else {
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(
+                ownership.clone(),
+            )
+        })
+    }
+
+    fn inspect_container_generation(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        let generations = self.scoped_generations.lock().unwrap();
+        let Some((found, published)) = generations.get(&ownership.container_id) else {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Absent);
+        };
+        if found.scope != ownership.scope {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Foreign);
+        }
+        if found.generation != ownership.generation {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Replacement);
+        }
+        Ok(if *published {
+            vz_runtime_contract::ContainerGenerationInspection::Published(found.clone())
+        } else {
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(found.clone())
+        })
+    }
+
+    fn activate_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        image: &str,
+        _config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        let mut generations = self.scoped_generations.lock().unwrap();
+        let Some((found, published)) = generations.get_mut(&ownership.container_id) else {
+            return Err(vz_runtime_contract::OwnedCreateError {
+                error: StackError::InvalidSpec(
+                    "mock activation lacks exact reservation".to_string(),
+                ),
+                cleanup: None,
+            });
+        };
+        if found != &ownership || *published {
+            return Err(vz_runtime_contract::OwnedCreateError {
+                error: StackError::InvalidSpec(
+                    "mock activation lacks exact unpublished reservation".to_string(),
+                ),
+                cleanup: None,
+            });
+        }
+        *published = true;
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("activate_scoped".into(), image.to_string()));
+        Ok(vz_runtime_contract::ContainerCreateReceipt {
+            container_id: ownership.container_id.clone(),
+            ownership: Some(ownership),
+        })
+    }
+
+    fn release_container_reservation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationReleaseOutcome, StackError> {
+        let mut generations = self.scoped_generations.lock().unwrap();
+        match generations.get(&ownership.container_id) {
+            None => Ok(vz_runtime_contract::ContainerGenerationReleaseOutcome::AlreadyAbsent),
+            Some((found, false)) if found == &ownership => {
+                generations.remove(&ownership.container_id);
+                Ok(vz_runtime_contract::ContainerGenerationReleaseOutcome::Released)
+            }
+            _ => Err(StackError::InvalidSpec(
+                "mock release lacks exact unpublished ownership".to_string(),
+            )),
+        }
+    }
+
     fn cleanup_container_generation(
         &self,
         ownership: vz_runtime_contract::ContainerGenerationOwnership,
@@ -140,6 +411,10 @@ impl ContainerRuntime for MockRuntime {
         _signal: Option<&str>,
         _grace_period: Option<std::time::Duration>,
     ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, StackError> {
+        self.scoped_generations
+            .lock()
+            .unwrap()
+            .remove(&ownership.container_id);
         self.calls.lock().unwrap().push((
             "stop_and_remove_container_generation".into(),
             ownership.container_id,
@@ -183,11 +458,11 @@ fn full_pipeline_parse_apply_execute() {
 
     // Step 1: Reconcile first round (strict dependency gating starts roots first).
     let health = HashMap::new();
-    let first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let first = apply_test(&spec, &store, &health).unwrap();
     assert_eq!(first.actions.len(), 1);
     assert!(matches!(
         &first.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "web"
+        Action::ServiceCreate { target, .. } if target.service_name == "web"
     ));
 
     // Step 2: Execute first round through mock runtime.
@@ -200,11 +475,11 @@ fn full_pipeline_parse_apply_execute() {
     assert_eq!(first_exec.succeeded, 1);
 
     // Step 3: Reconcile + execute second round (api unblocked once web is running).
-    let second = vz_stack::apply(&spec, &store, &health).unwrap();
+    let second = apply_test(&spec, &store, &health).unwrap();
     assert_eq!(second.actions.len(), 1);
     assert!(matches!(
         &second.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "api"
+        Action::ServiceCreate { target, .. } if target.service_name == "api"
     ));
     let second_exec = executor.execute(&spec, &second.actions).unwrap();
     assert!(second_exec.all_succeeded());
@@ -258,37 +533,34 @@ fn full_pipeline_up_then_down() {
     let spec = parse_compose(SIMPLE_COMPOSE, "myapp").unwrap();
     let dir = tempfile::tempdir().unwrap();
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
-
-    // UP round 1: start dependency roots.
-    let health = HashMap::new();
-    let up_result_1 = vz_stack::apply(&spec, &store, &health).unwrap();
-    assert_eq!(up_result_1.actions.len(), 1);
-    assert!(matches!(
-        &up_result_1.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "web"
-    ));
-
+    let scope = install_planning_authority(&store, &spec.name);
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
-    let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
-    executor.execute(&spec, &up_result_1.actions).unwrap();
-
-    // UP round 2: dependent service can now start.
-    let up_result_2 = vz_stack::apply(&spec, &store, &health).unwrap();
-    assert_eq!(up_result_2.actions.len(), 1);
-    assert!(matches!(
-        &up_result_2.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "api"
-    ));
-    executor.execute(&spec, &up_result_2.actions).unwrap();
+    let executor = StackExecutor::new_scoped(runtime, exec_store, dir.path(), scope).unwrap();
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 4,
+            ..OrchestrationConfig::default()
+        },
+    );
+    let up = orchestrator.run(&spec, None).unwrap();
+    assert!(up.converged);
+    assert_eq!(up.rounds, 2);
 
     // Verify running.
-    let observed = executor.store().load_observed_state("myapp").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("myapp")
+        .unwrap();
     assert_eq!(observed.len(), 2);
     assert!(observed.iter().all(|o| o.phase == ServicePhase::Running));
 
-    // DOWN: construct remove actions directly (bypassing apply, which
-    // would clear container_ids before the executor can call stop/remove).
+    // DOWN: the orchestrator captures the exact journal predecessors and
+    // executes cleanup under the persisted reconcile session.
     let empty = StackSpec {
         name: "myapp".to_string(),
         services: vec![],
@@ -297,27 +569,22 @@ fn full_pipeline_up_then_down() {
         secrets: vec![],
         disk_size_mb: None,
     };
-    let down_actions = vec![
-        Action::ServiceRemove {
-            target: vz_stack::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        },
-        Action::ServiceRemove {
-            target: vz_stack::ServiceReplicaKey::first("api".to_string()).unwrap(),
-        },
-    ];
-
-    let exec_result = executor.execute(&empty, &down_actions).unwrap();
-    assert!(exec_result.all_succeeded());
+    let down = orchestrator.run(&empty, None).unwrap();
+    assert!(down.converged);
 
     // Verify stopped.
-    let observed = executor.store().load_observed_state("myapp").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("myapp")
+        .unwrap();
     assert!(
         observed.iter().all(|o| o.phase == ServicePhase::Stopped),
         "all services should be stopped: {observed:?}"
     );
 
     // Verify runtime calls use exact generation-qualified cleanup.
-    let calls = executor.runtime().call_log();
+    let calls = orchestrator.executor().runtime().call_log();
     let cleanup_count = calls
         .iter()
         .filter(|(op, _)| op == "stop_and_remove_container_generation")
@@ -352,11 +619,11 @@ fn health_check_gates_dependent_service() {
     // Initial apply creates only db; app is gated on db health.
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let health = HashMap::new();
-    let first = vz_stack::apply(&spec, &store, &health).unwrap();
+    let first = apply_test(&spec, &store, &health).unwrap();
     assert_eq!(first.actions.len(), 1);
     assert!(matches!(
         &first.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "db"
+        Action::ServiceCreate { target, .. } if target.service_name == "db"
     ));
 
     // Execute first round: db starts running.
@@ -381,11 +648,11 @@ fn health_check_gates_dependent_service() {
     assert!(db.ready);
 
     // Reconcile again: app is now unblocked by healthy db.
-    let second = vz_stack::apply(&spec, &store, poller.statuses()).unwrap();
+    let second = apply_test(&spec, &store, poller.statuses()).unwrap();
     assert_eq!(second.actions.len(), 1);
     assert!(matches!(
         &second.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "app"
+        Action::ServiceCreate { target, .. } if target.service_name == "app"
     ));
     executor.execute(&spec, &second.actions).unwrap();
 }
@@ -397,7 +664,7 @@ fn health_check_failure_marks_service_failed() {
 
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let runtime = MockRuntime::new(vec!["ctr-db", "ctr-app"]);
     runtime.set_exec_exit_code(1); // Health checks will fail.
@@ -451,7 +718,7 @@ fn restart_policy_generates_actions_for_failed_services() {
 
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let runtime = MockRuntime::new(vec!["ctr-worker", "ctr-cron"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
@@ -489,14 +756,11 @@ fn restart_policy_generates_actions_for_failed_services() {
 
     // Compute restarts.
     let tracker = RestartTracker::new();
-    let restart_actions = compute_restarts(&spec, &observed_states, &tracker);
+    let restart_targets = compute_restart_targets(&spec, &observed_states, &tracker);
 
     // Only worker should restart (policy=always). cron has policy=no.
-    assert_eq!(restart_actions.len(), 1);
-    assert!(matches!(
-        &restart_actions[0],
-        Action::ServiceCreate { target } if target.service_name == "worker"
-    ));
+    assert_eq!(restart_targets.len(), 1);
+    assert_eq!(restart_targets[0].service_name, "worker");
 }
 
 #[test]
@@ -523,17 +787,17 @@ services:
     let mut tracker = RestartTracker::new();
 
     // First restart: ok.
-    let r1 = compute_restarts(&spec, &observed, &tracker);
+    let r1 = compute_restart_targets(&spec, &observed, &tracker);
     assert_eq!(r1.len(), 1);
     tracker.record_restart("worker");
 
     // Second restart: ok.
-    let r2 = compute_restarts(&spec, &observed, &tracker);
+    let r2 = compute_restart_targets(&spec, &observed, &tracker);
     assert_eq!(r2.len(), 1);
     tracker.record_restart("worker");
 
     // Third restart: blocked (max_retries=2).
-    let r3 = compute_restarts(&spec, &observed, &tracker);
+    let r3 = compute_restart_targets(&spec, &observed, &tracker);
     assert!(r3.is_empty());
 }
 
@@ -558,21 +822,28 @@ fn port_allocation_tracked_through_lifecycle() {
     let dir = tempfile::tempdir().unwrap();
 
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
-    let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
-
+    let scope = install_planning_authority(&store, &spec.name);
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
-    let mut executor = StackExecutor::new(runtime, exec_store, dir.path());
-    executor.execute(&spec, &result.actions).unwrap();
+    let executor = StackExecutor::new_scoped(runtime, exec_store, dir.path(), scope).unwrap();
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 2,
+            ..OrchestrationConfig::default()
+        },
+    );
+    assert!(orchestrator.run(&spec, None).unwrap().converged);
 
     // Verify ports are tracked.
-    let web_ports = executor.ports().ports_for("web").unwrap();
+    let web_ports = orchestrator.executor().ports().ports_for("web").unwrap();
     assert_eq!(web_ports.len(), 1);
     assert_eq!(web_ports[0].host_port, 8080);
     assert_eq!(web_ports[0].container_port, 80);
 
-    let api_ports = executor.ports().ports_for("api").unwrap();
+    let api_ports = orchestrator.executor().ports().ports_for("api").unwrap();
     assert_eq!(api_ports.len(), 1);
     assert_eq!(api_ports[0].host_port, 3000);
 
@@ -585,12 +856,11 @@ fn port_allocation_tracked_through_lifecycle() {
         secrets: vec![],
         disk_size_mb: None,
     };
-    let down = vz_stack::apply(&empty, &store, &health).unwrap();
-    executor.execute(&empty, &down.actions).unwrap();
+    assert!(orchestrator.run(&empty, None).unwrap().converged);
 
-    assert!(executor.ports().ports_for("web").is_none());
-    assert!(executor.ports().ports_for("api").is_none());
-    assert!(executor.ports().in_use().is_empty());
+    assert!(orchestrator.executor().ports().ports_for("web").is_none());
+    assert!(orchestrator.executor().ports().ports_for("api").is_none());
+    assert!(orchestrator.executor().ports().in_use().is_empty());
 }
 
 // ── Volume lifecycle ────────────────────────────────────────────
@@ -613,7 +883,7 @@ fn volumes_created_and_used_in_full_pipeline() {
 
     let store = StateStore::open(&dir.path().join("state.db")).unwrap();
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
 
     let runtime = MockRuntime::new(vec!["ctr-db"]);
     let exec_store = StateStore::open(&dir.path().join("state.db")).unwrap();
@@ -643,11 +913,11 @@ fn re_apply_after_execution_is_idempotent() {
 
     // First apply + execute (starts dependency root only).
     let health = HashMap::new();
-    let result = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result = apply_test(&spec, &store, &health).unwrap();
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(
         &result.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "web"
+        Action::ServiceCreate { target, .. } if target.service_name == "web"
     ));
 
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
@@ -656,16 +926,16 @@ fn re_apply_after_execution_is_idempotent() {
     executor.execute(&spec, &result.actions).unwrap();
 
     // Second apply + execute starts dependent service.
-    let result2 = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result2 = apply_test(&spec, &store, &health).unwrap();
     assert_eq!(result2.actions.len(), 1);
     assert!(matches!(
         &result2.actions[0],
-        Action::ServiceCreate { target } if target.service_name == "api"
+        Action::ServiceCreate { target, .. } if target.service_name == "api"
     ));
     executor.execute(&spec, &result2.actions).unwrap();
 
     // Third apply: should be idempotent after both services are running.
-    let result3 = vz_stack::apply(&spec, &store, &health).unwrap();
+    let result3 = apply_test(&spec, &store, &health).unwrap();
     assert!(
         result3.actions.is_empty(),
         "third apply should be idempotent after staged execution: {:?}",
