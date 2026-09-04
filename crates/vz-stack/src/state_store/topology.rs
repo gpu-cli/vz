@@ -17,7 +17,7 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 6;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 7;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
 const REPLICA_SCHEMA_VERSION: u32 = 5;
 
@@ -365,6 +365,52 @@ ON reconcile_audit_log(stack_name, service_name, replica_index)
 WHERE status = 'started';
 "#;
 
+const CLAIM_SCHEMA_V7_DDL: &str = r#"
+CREATE TRIGGER reconcile_session_identity_immutable
+BEFORE UPDATE OF
+    session_id, stack_name, operation_id, action_schema_version, actions_json,
+    actions_hash, total_actions, started_at
+ON reconcile_sessions
+WHEN
+    NEW.session_id IS NOT OLD.session_id OR
+    NEW.stack_name IS NOT OLD.stack_name OR
+    NEW.operation_id IS NOT OLD.operation_id OR
+    NEW.action_schema_version IS NOT OLD.action_schema_version OR
+    NEW.actions_json IS NOT OLD.actions_json OR
+    NEW.actions_hash IS NOT OLD.actions_hash OR
+    NEW.total_actions IS NOT OLD.total_actions OR
+    NEW.started_at IS NOT OLD.started_at
+BEGIN
+    SELECT RAISE(ABORT, 'reconcile session action identity is immutable');
+END;
+
+CREATE TRIGGER reconcile_audit_identity_immutable
+BEFORE UPDATE OF
+    id, session_id, stack_name, action_index, action_kind, service_name,
+    replica_index, action_hash, started_at
+ON reconcile_audit_log
+WHEN
+    NEW.id IS NOT OLD.id OR
+    NEW.session_id IS NOT OLD.session_id OR
+    NEW.stack_name IS NOT OLD.stack_name OR
+    NEW.action_index IS NOT OLD.action_index OR
+    NEW.action_kind IS NOT OLD.action_kind OR
+    NEW.service_name IS NOT OLD.service_name OR
+    NEW.replica_index IS NOT OLD.replica_index OR
+    NEW.action_hash IS NOT OLD.action_hash OR
+    NEW.started_at IS NOT OLD.started_at
+BEGIN
+    SELECT RAISE(ABORT, 'reconcile audit claim identity is immutable');
+END;
+
+CREATE TRIGGER reconcile_started_audit_delete_restricted
+BEFORE DELETE ON reconcile_audit_log
+WHEN OLD.status = 'started'
+BEGIN
+    SELECT RAISE(ABORT, 'started reconcile claim cannot be deleted');
+END;
+"#;
+
 /// Result of atomically selecting or reserving an Environment for `up`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentUpReservation {
@@ -671,6 +717,11 @@ enum ReconcileV6MigrationStage {
     ReplicaClaimIndexCreated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaimV7MigrationStage {
+    ImmutabilityGuardsCreated,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -702,6 +753,12 @@ pub(super) enum ReconcileV6MigrationFailpoint {
     AfterTerminalHistoryArchived,
     AfterDurableActionsRebuilt,
     AfterReplicaClaimIndexCreated,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClaimV7MigrationFailpoint {
+    AfterImmutabilityGuardsCreated,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -998,12 +1055,32 @@ impl StateStore {
         self.validate_schema_against(6, &reference.conn)
     }
 
+    pub(super) fn validate_v7_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+
+        self.validate_schema_against(7, &reference.conn)
+    }
+
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
         self.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
         self.conn
             .execute_batch(RECONCILE_SCHEMA_V6_ACTION_TABLES_DDL)?;
         self.conn
             .execute_batch(RECONCILE_SCHEMA_V6_CLAIM_INDEX_DDL)?;
+        Ok(())
+    }
+
+    pub(super) fn create_claim_schema_v7(&self) -> Result<(), StackError> {
+        self.conn.execute_batch(CLAIM_SCHEMA_V7_DDL)?;
         Ok(())
     }
 
@@ -3735,6 +3812,31 @@ impl StateStore {
         self.migrate_reconcile_v5_to_v6_with_hook(|_| Ok(()))
     }
 
+    pub(super) fn migrate_claim_v6_to_v7(&self) -> Result<(), StackError> {
+        self.migrate_claim_v6_to_v7_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_claim_v6_to_v7_with_hook(
+        &self,
+        mut hook: impl FnMut(ClaimV7MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 6 {
+                return Err(StackError::InvalidSpec(format!(
+                    "started-claim migration requires state schema version 6, found {schema_version}"
+                )));
+            }
+            store.validate_v6_schema()?;
+            store.validate_v6_reconcile_claim_migration()?;
+            store.create_claim_schema_v7()?;
+            hook(ClaimV7MigrationStage::ImmutabilityGuardsCreated)?;
+            store.validate_v7_schema()?;
+            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
     fn migrate_reconcile_v5_to_v6_with_hook(
         &self,
         mut hook: impl FnMut(ReconcileV6MigrationStage) -> Result<(), StackError>,
@@ -3900,7 +4002,7 @@ impl StateStore {
                 .execute_batch(RECONCILE_SCHEMA_V6_CLAIM_INDEX_DDL)?;
             hook(ReconcileV6MigrationStage::ReplicaClaimIndexCreated)?;
             store.validate_v6_schema()?;
-            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            store.set_schema_version(6)?;
             Ok(())
         })
     }
@@ -4212,6 +4314,27 @@ impl StateStore {
                 return Err(StackError::InvalidSpec(format!(
                     "injected v5-to-v6 migration failure at {stage:?}"
                 )));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_claim_v6_to_v7_with_failpoint(
+        &self,
+        failpoint: ClaimV7MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_claim_v6_to_v7_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    ClaimV7MigrationFailpoint::AfterImmutabilityGuardsCreated,
+                    ClaimV7MigrationStage::ImmutabilityGuardsCreated
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v6-to-v7 migration failure after immutability guards".to_string(),
+                ));
             }
             Ok(())
         })

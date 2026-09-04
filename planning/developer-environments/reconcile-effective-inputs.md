@@ -221,16 +221,16 @@ rereads inputs. A terminal `Converged` snapshot cannot admit another round.
 Snapshot finalization and any nonempty reconcile-session creation are therefore
 one database transaction, not today's separate precondition-capture and
 batch-create calls.
-Action-v3 and store schema v6 land first and retain their published semantics.
-This input work is store schema v7: it adds immutable snapshot/staging records,
+Action-v3/store-v6 and claim-authority store schema v7 land first and retain
+their published semantics. This input work is store schema v8: it adds immutable snapshot/staging records,
 `manifest_id`, `manifest_digest`, and a `plan_hash` to the session/progress/audit
 projections. `StoredAction` remains schema 3 because its predecessor identity is
 unchanged. A new session/batch envelope schema 4 and domain-separated plan hash
-bind the v3 action hash plus the complete manifest identity. The v6-to-v7
+bind the v3 action hash plus the complete manifest identity. The v7-to-v8
 migration refuses active schema-v3 sessions because no trustworthy input
 snapshot can be reconstructed; terminal sessions are archived before creating
-v7 tables. No implementation may retrofit these fields while continuing to
-call the result v6 or silently reinterpret Action v3.
+v8 tables. No implementation may retrofit these fields while continuing to
+call the result v7 or silently reinterpret Action v3.
 
 ## Planning and execution
 

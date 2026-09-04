@@ -63,10 +63,10 @@ pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
     DriftFinding, DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
     ImageRecord, Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState,
-    ReconcileAuditEntry, ReconcileBatchCommit, ReconcileSession, ReconcileSessionStatus,
-    RetentionGcReason, ServiceObservedState, ServicePhase, ServiceReplicaKey,
-    StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
-    StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    ReconcileActionClaim, ReconcileAuditEntry, ReconcileBatchCommit, ReconcileSession,
+    ReconcileSessionStatus, RetentionGcReason, ServiceObservedState, ServicePhase,
+    ServiceReplicaKey, StackContainerCreateIntent, StackContainerCreateSelector,
+    StackContainerCreateStatus, StackContainerGenerationBinding, StackContainerRecoveryDisposition,
     StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
 };
 pub use volume::{

@@ -9,7 +9,7 @@ use vz_runtime_contract::{
 
 use super::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
 use crate::StackError;
-use crate::reconcile::{ActionDraft, ExpectedJournalHead, ReplicaPrecondition};
+use crate::reconcile::{Action, ActionDraft, ExpectedJournalHead, ReplicaPrecondition};
 
 pub(super) const STACK_JOURNAL_SCHEMA_V4_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS stack_workload_owners (
@@ -478,6 +478,356 @@ impl StackContainerGenerationBinding {
 }
 
 impl StateStore {
+    /// Revalidate one persisted Action-v3 fence immediately before its started
+    /// claim is made durable.
+    ///
+    /// Callers must hold the same `BEGIN IMMEDIATE` transaction used to insert
+    /// the audit claim. This method is deliberately read-only: a failed fence
+    /// never repairs topology, journal, or observed projections.
+    pub(super) fn validate_reconcile_action_claim_precondition(
+        &self,
+        action: &Action,
+    ) -> Result<(), StackError> {
+        self.validate_reconcile_action_claim_precondition_inner(action)
+            .map_err(|error| match error {
+                StackError::Machine {
+                    code: MachineErrorCode::StateConflict,
+                    ..
+                } => error,
+                other => StackError::Machine {
+                    code: MachineErrorCode::StateConflict,
+                    message: format!(
+                        "reconcile claim precondition for `{}` is malformed or stale: {other}",
+                        action.target().display_name()
+                    ),
+                },
+            })
+    }
+
+    fn validate_reconcile_action_claim_precondition_inner(
+        &self,
+        action: &Action,
+    ) -> Result<(), StackError> {
+        action.validate()?;
+        let precondition = action.precondition();
+        let workload = precondition.workload();
+
+        self.validate_stack_workload_owner(workload)?;
+        self.validate_current_runnable_workload_scope(workload)?;
+        let environment = self
+            .load_environment_instance(workload.environment_id.as_str())?
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Environment `{}` was not found",
+                    workload.environment_id
+                ))
+            })?;
+        if environment.lifecycle_generation != precondition.environment_generation() {
+            return conflict(format!(
+                "reconcile claim for `{}` has stale Environment generation",
+                action.target().display_name()
+            ));
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT reservation_id, service_generation
+             FROM stack_container_create_intents
+             WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+             ORDER BY service_generation DESC, reservation_id ASC
+             LIMIT 2",
+        )?;
+        let rows = statement.query_map(
+            params![
+                workload.stack_id,
+                action.target().service_name,
+                i64::from(action.target().index()),
+            ],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+        )?;
+        let mut heads = Vec::new();
+        for row in rows {
+            let (reservation_id, service_generation) = row?;
+            heads.push((
+                reservation_id,
+                persisted_u64("service_generation", service_generation)?,
+            ));
+        }
+
+        match precondition.journal_head() {
+            ExpectedJournalHead::NeverJournaled => {
+                if !heads.is_empty() {
+                    return conflict(format!(
+                        "reconcile claim for `{}` expected no journal predecessor",
+                        action.target().display_name()
+                    ));
+                }
+                if self
+                    .load_service_observed(
+                        &workload.stack_id,
+                        &action.target().service_name,
+                        action.target().index(),
+                    )?
+                    .is_some()
+                {
+                    return conflict(format!(
+                        "reconcile claim for `{}` found observed state without a journal predecessor",
+                        action.target().display_name()
+                    ));
+                }
+            }
+            ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership,
+            } => {
+                let Some((latest_reservation, latest_generation)) = heads.first() else {
+                    return conflict(format!(
+                        "reconcile claim for `{}` is missing exact journal predecessor `{reservation_id}`",
+                        action.target().display_name()
+                    ));
+                };
+                if latest_reservation != reservation_id
+                    || latest_generation != service_generation
+                    || heads
+                        .get(1)
+                        .is_some_and(|(_, generation)| generation == service_generation)
+                {
+                    return conflict(format!(
+                        "reconcile claim for `{}` no longer names the unique latest journal predecessor",
+                        action.target().display_name()
+                    ));
+                }
+
+                let intent = self.require_stack_container_create_intent(reservation_id)?;
+                if intent.scope.project_id != workload.project_id
+                    || intent.scope.environment_id != workload.environment_id
+                    || intent.scope.machine_id != workload.machine_id
+                    || intent.scope.stack_id != workload.stack_id
+                    || intent.service_name != action.target().service_name
+                    || intent.replica_index != action.target().index()
+                    || intent.service_generation != *service_generation
+                {
+                    return conflict(format!(
+                        "reconcile claim for `{}` journal predecessor has foreign identity",
+                        action.target().display_name()
+                    ));
+                }
+                self.validate_journal_workload_owner(&intent)?;
+                if !intent.status.is_terminal() {
+                    self.validate_intent_topology(&intent)?;
+                    if intent.scope.machine_incarnation_id.as_ref()
+                        != Some(&workload.machine_incarnation_id)
+                    {
+                        return conflict(format!(
+                            "reconcile claim for `{}` has a nonterminal predecessor from a stale Machine incarnation",
+                            action.target().display_name()
+                        ));
+                    }
+                }
+                let binding = self.load_stack_container_generation_binding(reservation_id)?;
+                if let Some(binding) = &binding {
+                    self.validate_binding_against_intent(binding, &intent)?;
+                }
+                if binding.as_ref().map(|binding| &binding.ownership) != ownership.as_ref() {
+                    return conflict(format!(
+                        "reconcile claim for `{}` runtime generation binding changed",
+                        action.target().display_name()
+                    ));
+                }
+                let legal_pre_effect_status =
+                    legal_fresh_claim_predecessor(action, intent.status, binding.is_some());
+                if !legal_pre_effect_status {
+                    return conflict(format!(
+                        "reconcile claim for `{}` found journal status `{}` after action effects had already begun",
+                        action.target().display_name(),
+                        intent.status.as_str()
+                    ));
+                }
+                self.require_journal_observed_consistent(&intent)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate replay of an already durable exact claim. Replay may observe
+    /// effects owned by that claim, but never arbitrary topology drift or an
+    /// unrelated successor journal generation.
+    pub(super) fn validate_reconcile_action_claim_replay(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        absolute_action_index: usize,
+        action: &Action,
+    ) -> Result<(), StackError> {
+        if self
+            .validate_reconcile_action_claim_precondition_inner(action)
+            .is_ok()
+        {
+            return Ok(());
+        }
+        self.validate_reconcile_action_claim_replay_inner(
+            session_id,
+            operation_id,
+            absolute_action_index,
+            action,
+        )
+        .map_err(|error| match error {
+            StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                ..
+            } => error,
+            other => StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                message: format!(
+                    "reconcile claim replay for `{}` is malformed or stale: {other}",
+                    action.target().display_name()
+                ),
+            },
+        })
+    }
+
+    fn validate_reconcile_action_claim_replay_inner(
+        &self,
+        session_id: &str,
+        operation_id: &str,
+        absolute_action_index: usize,
+        action: &Action,
+    ) -> Result<(), StackError> {
+        action.validate()?;
+        let precondition = action.precondition();
+        let workload = precondition.workload();
+        self.validate_stack_workload_owner(workload)?;
+        self.validate_current_runnable_workload_scope(workload)?;
+        let environment = self
+            .load_environment_instance(workload.environment_id.as_str())?
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Environment `{}` was not found",
+                    workload.environment_id
+                ))
+            })?;
+        if environment.lifecycle_generation != precondition.environment_generation() {
+            return conflict("reconcile claim replay has stale Environment generation");
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT reservation_id, service_generation
+             FROM stack_container_create_intents
+             WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+             ORDER BY service_generation DESC, reservation_id ASC LIMIT 2",
+        )?;
+        let mut rows = statement.query(params![
+            workload.stack_id,
+            action.target().service_name,
+            i64::from(action.target().index()),
+        ])?;
+        let Some(first) = rows.next()? else {
+            return conflict("claimed action journal predecessor disappeared");
+        };
+        let latest_reservation = first.get::<_, String>(0)?;
+        let latest_generation = persisted_u64("service_generation", first.get::<_, i64>(1)?)?;
+        if let Some(second) = rows.next()? {
+            let second_generation = persisted_u64("service_generation", second.get::<_, i64>(1)?)?;
+            if second_generation == latest_generation {
+                return conflict(
+                    "claimed action replay found an ambiguous latest journal generation",
+                );
+            }
+        }
+        drop(rows);
+        drop(statement);
+        let intent = self.require_stack_container_create_intent(&latest_reservation)?;
+        if intent.scope.project_id != workload.project_id
+            || intent.scope.environment_id != workload.environment_id
+            || intent.scope.machine_id != workload.machine_id
+            || intent.scope.stack_id != workload.stack_id
+            || intent.service_name != action.target().service_name
+            || intent.replica_index != action.target().index()
+        {
+            return conflict("claimed action replay found a foreign journal head");
+        }
+        self.validate_journal_workload_owner(&intent)?;
+        let current_binding =
+            self.load_stack_container_generation_binding(&intent.scope.reservation_id)?;
+        if let Some(binding) = &current_binding {
+            self.validate_binding_against_intent(binding, &intent)?;
+        }
+        if !status_binding_is_structurally_valid(intent.status, current_binding.is_some()) {
+            return conflict(
+                "claimed action replay found an impossible journal status/binding shape",
+            );
+        }
+
+        let linked_successor = crate::reconcile::ReconcileActionExecutionKey::new(
+            session_id,
+            operation_id,
+            absolute_action_index,
+            action,
+        )?
+        .matches_activation_digest(&intent.action_digest)?;
+        let expected_progression = match precondition.journal_head() {
+            ExpectedJournalHead::NeverJournaled => {
+                matches!(action, Action::ServiceCreate { .. })
+                    && intent.service_generation == 1
+                    && linked_successor
+            }
+            ExpectedJournalHead::Exact {
+                reservation_id,
+                service_generation,
+                ownership,
+            } if intent.scope.reservation_id == *reservation_id
+                && intent.service_generation == *service_generation =>
+            {
+                if current_binding.as_ref().map(|binding| &binding.ownership) != ownership.as_ref()
+                {
+                    return conflict(
+                        "claimed action replay predecessor binding no longer matches its fence",
+                    );
+                }
+                matches!(
+                    action,
+                    Action::ServiceCreate { .. }
+                        | Action::ServiceRecreate { .. }
+                        | Action::ServiceRemove { .. }
+                ) && matches!(
+                    intent.status,
+                    StackContainerCreateStatus::CleanupPending
+                        | StackContainerCreateStatus::Cleaned
+                        | StackContainerCreateStatus::Blocked
+                )
+            }
+            ExpectedJournalHead::Exact {
+                service_generation, ..
+            } => {
+                matches!(
+                    action,
+                    Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+                ) && service_generation
+                    .checked_add(1)
+                    .is_some_and(|generation| intent.service_generation == generation)
+                    && linked_successor
+            }
+        };
+        if !expected_progression {
+            return conflict("claimed action replay found unlinked journal progression");
+        }
+
+        if linked_successor {
+            if intent.scope.machine_incarnation_id.as_ref()
+                != Some(&workload.machine_incarnation_id)
+                || intent.environment_generation != precondition.environment_generation()
+            {
+                return conflict(
+                    "claimed action replay successor is outside the current topology generation",
+                );
+            }
+            if !intent.status.is_terminal() {
+                self.validate_intent_topology(&intent)?;
+            }
+        }
+        self.require_journal_observed_consistent(&intent)
+    }
+
     /// Capture exact predecessor state for a set of planned replica targets.
     ///
     /// The complete batch is read under one SQLite snapshot. This is planning
@@ -2694,6 +3044,55 @@ impl StateStore {
                 },
             ),
         }
+    }
+}
+
+/// The complete admission table for a fresh Action-v3 claim. A durable binding
+/// is historical proof after `Cleaned`, so a create successor must preserve it;
+/// `Failed` and `Intent` are strictly unbound, while `Reserved` and later
+/// ownership-bearing states remain bound.
+pub(super) fn legal_fresh_claim_predecessor(
+    action: &Action,
+    status: StackContainerCreateStatus,
+    bound: bool,
+) -> bool {
+    if !status_binding_is_structurally_valid(status, bound) {
+        return false;
+    }
+    match action {
+        Action::ServiceCreate { .. } => match status {
+            StackContainerCreateStatus::Blocked => true,
+            StackContainerCreateStatus::Cleaned | StackContainerCreateStatus::Failed => true,
+            StackContainerCreateStatus::Intent
+            | StackContainerCreateStatus::Reserved
+            | StackContainerCreateStatus::Running
+            | StackContainerCreateStatus::CleanupPending => false,
+        },
+        Action::ServiceRecreate { .. } => status == StackContainerCreateStatus::Running,
+        Action::ServiceRemove { .. } => match status {
+            StackContainerCreateStatus::Intent
+            | StackContainerCreateStatus::Reserved
+            | StackContainerCreateStatus::Running => true,
+            StackContainerCreateStatus::Blocked => true,
+            StackContainerCreateStatus::Failed => true,
+            StackContainerCreateStatus::CleanupPending | StackContainerCreateStatus::Cleaned => {
+                false
+            }
+        },
+    }
+}
+
+pub(super) fn status_binding_is_structurally_valid(
+    status: StackContainerCreateStatus,
+    bound: bool,
+) -> bool {
+    match status {
+        StackContainerCreateStatus::Intent | StackContainerCreateStatus::Failed => !bound,
+        StackContainerCreateStatus::Reserved
+        | StackContainerCreateStatus::Running
+        | StackContainerCreateStatus::CleanupPending
+        | StackContainerCreateStatus::Cleaned => bound,
+        StackContainerCreateStatus::Blocked => true,
     }
 }
 

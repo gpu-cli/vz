@@ -72,13 +72,15 @@ scope. Journal service generation and runtime generation are distinct values and
 both are fenced.
 
 `MachineWorkloadScope` and `environment_generation` name the current authority
-under which the successor action is admitted; an `Exact` predecessor preserves
-the authority under which that immutable journal head was created. Consequently,
-a `Cleaned` or `Failed` terminal predecessor may carry an older Machine
-incarnation in `ownership`, while project, Environment, Machine, and stack
-identity must remain equal to the current workload. Admission must prove the
-referenced head terminal before accepting that incarnation mismatch. A bound
-nonterminal predecessor must match the current Machine incarnation exactly.
+under which the successor action is admitted; the persisted `Exact` predecessor
+intent retains the authority under which that immutable journal head was
+created. Consequently, a `Cleaned` or `Failed` terminal predecessor intent may
+name an older Machine incarnation, while project, Environment, Machine, and
+stack identity must remain equal to the current workload. In the v4 journal
+model `Failed` is strictly unbound, while `Cleaned` retains its immutable
+historical binding and `ownership`; admission must prove terminality before
+accepting that intent/ownership incarnation mismatch. Any bound nonterminal
+predecessor must match the current Machine incarnation exactly.
 `NeverJournaled` remains absence across the stable workload target's complete
 journal history, not merely absence in the current incarnation.
 
@@ -94,10 +96,20 @@ must be resumable while its exact intent moves through states such as `Running`,
 `CleanupPending`, and `Cleaned`. State changes are instead authorized by the
 durable action claim and exact journal CAS operations.
 
-A recreate requires an exact bound predecessor. A remove of an exact unbound
-failed or incomplete intent performs only the applicable journal CAS and makes
-no runtime call. A create following an exact bound failed generation cleans only
-that generation before reserving its successor.
+A recreate requires an exact bound predecessor. A terminal `Failed` intent is
+strictly unbound, and removing that exact failed intent performs only the
+applicable journal CAS with no runtime call. An unbound nonterminal `Intent`
+row is not proof that the runtime has no reservation: claimed
+execution first inspects the exact reservation. `Absent` permits an exact
+journal CAS; an exact reserved generation is bound and cleaned under the claim;
+foreign, replacement, legacy, or malformed results fail without mutation. A
+persisted `Reserved` row is necessarily bound because binding and the
+`Intent`-to-`Reserved` transition are atomic; an unbound `Reserved` row is
+malformed and fails closed. A
+bound activation failure is represented by the nonterminal `Blocked` state. A
+create following an exact bound `Blocked` generation cleans only that generation
+before reserving its successor. It must not reinterpret `Failed` as bound or use
+the historical-incarnation exception for a nonterminal `Blocked` predecessor.
 
 ## Authoritative planning snapshot
 
@@ -235,6 +247,25 @@ Legacy scoped action manifests are never interpreted as unconstrained actions.
 Resume rejects them and requires a new plan. Migration failpoints must roll back
 the entire schema/data change, and reopen must preserve and revalidate the same
 v3 action and claim.
+
+## Store v6 to v7 claim-authority migration
+
+Store v6 is the published Action-v3 persistence foundation. Claim-authority
+hardening therefore advances the store to schema v7 rather than silently
+changing canonical v6 DDL. V7 makes immutable session identity, action JSON/hash,
+plan length, and start time non-updateable; it likewise makes every audit claim's
+session, action index/kind/target/hash, and start time non-updateable and retains
+claim rows. Only session cursor/status/completion fields and audit
+status/completion/error fields may follow their validated state machines.
+
+Migration validates every v6 session, progress record, and audit against its
+strict Action-v3 payload and hashes before installing the guards. A v6 `started`
+audit is not trusted as a v7 claim because it predates atomic claim-time
+revalidation; its presence makes migration fail with zero writes until explicit
+recovery resolves it. Effect-free active sessions may migrate and must acquire a
+fresh v7 claim before mutation. Terminal history is preserved under the new
+retention rules. Migration failpoints roll back triggers, version, and all rows,
+and reopen validates the exact canonical v7 trigger definitions.
 
 ## Required acceptance tests
 

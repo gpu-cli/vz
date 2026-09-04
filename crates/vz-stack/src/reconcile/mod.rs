@@ -730,6 +730,96 @@ impl Action {
     }
 }
 
+/// Canonical identity shared by durable started claims and scoped execution
+/// payloads. This is an identity value, not mutation authority; only an opaque
+/// [`crate::state_store::ReconcileActionClaim`] proves admission.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReconcileActionExecutionKey {
+    session_id: String,
+    operation_id: String,
+    absolute_action_index: usize,
+    action_hash: String,
+    action_kind: &'static str,
+    target: ServiceReplicaKey,
+}
+
+impl ReconcileActionExecutionKey {
+    pub(crate) fn new(
+        session_id: &str,
+        operation_id: &str,
+        absolute_action_index: usize,
+        action: &Action,
+    ) -> Result<Self, StackError> {
+        action.validate()?;
+        if session_id.trim().is_empty() || operation_id.trim().is_empty() {
+            return Err(StackError::InvalidSpec(
+                "reconcile action execution identity requires non-blank session and operation IDs"
+                    .to_string(),
+            ));
+        }
+        let action_kind = match action {
+            Action::ServiceCreate { .. } => "create",
+            Action::ServiceRecreate { .. } => "recreate",
+            Action::ServiceRemove { .. } => "remove",
+        };
+        Ok(Self {
+            session_id: session_id.to_string(),
+            operation_id: operation_id.to_string(),
+            absolute_action_index,
+            action_hash: compute_actions_hash(std::slice::from_ref(action)),
+            action_kind,
+            target: action.target().clone(),
+        })
+    }
+
+    pub(crate) fn activation_digest_prefix(&self) -> Result<String, StackError> {
+        fn hash_field(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
+            hasher.update((name.len() as u64).to_le_bytes());
+            hasher.update(name);
+            hasher.update((value.len() as u64).to_le_bytes());
+            hasher.update(value);
+        }
+
+        let action_index = u64::try_from(self.absolute_action_index)
+            .map_err(|_| StackError::InvalidSpec("action index exceeds u64".to_string()))?;
+        let mut hasher = Sha256::new();
+        hash_field(&mut hasher, b"schema", b"vz.stack.action-identity.v3");
+        hash_field(&mut hasher, b"session_id", self.session_id.as_bytes());
+        hash_field(&mut hasher, b"operation_id", self.operation_id.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"absolute_action_index",
+            &action_index.to_le_bytes(),
+        );
+        hash_field(&mut hasher, b"action_kind", self.action_kind.as_bytes());
+        hash_field(
+            &mut hasher,
+            b"service_name",
+            self.target.service_name.as_bytes(),
+        );
+        hash_field(
+            &mut hasher,
+            b"replica_index",
+            &self.target.index().to_le_bytes(),
+        );
+        hash_field(&mut hasher, b"action_hash", self.action_hash.as_bytes());
+        Ok(format!("vzsad3:{:x}:", hasher.finalize()))
+    }
+
+    /// Match the complete persisted activation digest, including exactly one
+    /// canonical lowercase SHA-256 payload component and no trailing bytes.
+    pub(crate) fn matches_activation_digest(&self, candidate: &str) -> Result<bool, StackError> {
+        let prefix = self.activation_digest_prefix()?;
+        let Some(payload) = candidate.strip_prefix(&prefix) else {
+            return Ok(false);
+        };
+        Ok(payload.len() == 64
+            && payload
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)))
+    }
+}
+
 /// Compute a deterministic hash of an action list for identity tracking.
 ///
 /// The versioned, length-framed digest covers action order, kind, exact target,

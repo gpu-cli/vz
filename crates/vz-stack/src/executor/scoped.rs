@@ -255,17 +255,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let absolute_index = first_action_index.checked_add(index).ok_or_else(|| {
                     StackError::InvalidSpec("absolute action index overflow".to_string())
                 })?;
-                let identity = scoped_action_identity_digest(
+                let execution_key = crate::reconcile::ReconcileActionExecutionKey::new(
                     session_id,
                     operation_id,
                     absolute_index,
                     action,
                 )?;
-                if record
-                    .intent
-                    .action_digest
-                    .starts_with(&format!("vzsad3:{identity}:"))
-                {
+                if execution_key.matches_activation_digest(&record.intent.action_digest)? {
                     return Ok(true);
                 }
             }
@@ -1149,8 +1145,13 @@ fn scoped_action_digest(
             "prepared activation target differs from the exact action target",
         ));
     }
-    let identity =
-        scoped_action_identity_digest(session_id, operation_id, absolute_action_index, action)?;
+    let identity_prefix = crate::reconcile::ReconcileActionExecutionKey::new(
+        session_id,
+        operation_id,
+        absolute_action_index,
+        action,
+    )?
+    .activation_digest_prefix()?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"schema", b"vz.stack.activation-payload.v2");
     hash_field(&mut hasher, b"image", prepared.image.as_bytes());
@@ -1186,44 +1187,7 @@ fn scoped_action_digest(
         })?;
         hash_field(&mut hasher, b"secret_sha256", digest.as_bytes());
     }
-    Ok(format!("vzsad3:{identity}:{:x}", hasher.finalize()))
-}
-
-fn scoped_action_identity_digest(
-    session_id: &str,
-    operation_id: &str,
-    absolute_action_index: usize,
-    action: &Action,
-) -> Result<String, StackError> {
-    let mut hasher = Sha256::new();
-    hash_field(&mut hasher, b"schema", b"vz.stack.action-identity.v3");
-    hash_field(&mut hasher, b"session_id", session_id.as_bytes());
-    hash_field(&mut hasher, b"operation_id", operation_id.as_bytes());
-    hash_field(
-        &mut hasher,
-        b"absolute_action_index",
-        &u64::try_from(absolute_action_index)
-            .map_err(|_| StackError::InvalidSpec("action index exceeds u64".to_string()))?
-            .to_le_bytes(),
-    );
-    let manifest_action = ScopedManifestAction::from_action(action);
-    hash_field(&mut hasher, b"action_kind", manifest_action.kind.as_bytes());
-    hash_field(
-        &mut hasher,
-        b"service_name",
-        action.target().service_name.as_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        b"replica_index",
-        &action.target().replica_index.get().to_le_bytes(),
-    );
-    hash_field(
-        &mut hasher,
-        b"action_hash",
-        crate::reconcile::compute_actions_hash(std::slice::from_ref(action)).as_bytes(),
-    );
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(format!("{identity_prefix}{:x}", hasher.finalize()))
 }
 
 fn hash_run_config(

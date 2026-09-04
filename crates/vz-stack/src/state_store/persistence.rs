@@ -61,7 +61,121 @@ fn sqlite_timestamp(entity: &str, id: &str, field: &str, value: u64) -> Result<i
     })
 }
 
+fn claim_conflict<T>(message: impl Into<String>) -> Result<T, StackError> {
+    Err(claim_state_error(message))
+}
+
+fn claim_state_error(message: impl Into<String>) -> StackError {
+    StackError::Machine {
+        code: MachineErrorCode::StateConflict,
+        message: message.into(),
+    }
+}
+
 impl StateStore {
+    /// Validate all v6 reconcile identities before v7 makes them immutable.
+    /// Started rows predate atomic Action-v3 admission and cannot be adopted.
+    pub(super) fn validate_v6_reconcile_claim_migration(&self) -> Result<(), StackError> {
+        let started_count: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reconcile_audit_log WHERE status = 'started'",
+            [],
+            |row| row.get(0),
+        )?;
+        if started_count != 0 {
+            return Err(StackError::InvalidSpec(
+                "state schema v6 contains untrusted started reconcile claims; v7 migration refuses to adopt them"
+                    .to_string(),
+            ));
+        }
+
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, stack_name, operation_id, status, next_action_index
+             FROM reconcile_sessions ORDER BY session_id",
+        )?;
+        let sessions = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        for (session_id, stack_name, operation_id, status, cursor_raw) in &sessions {
+            let actions = self.load_reconcile_session_actions(session_id)?;
+            let cursor = persisted_usize(
+                "reconcile session",
+                session_id,
+                "next_action_index",
+                *cursor_raw,
+            )?;
+            let progress = self.load_reconcile_progress(stack_name)?;
+            if status == "active" {
+                if cursor != 0 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "active v6 reconcile session `{session_id}` has a nonzero cursor and is not effect-free"
+                    )));
+                }
+                let Some(progress) = progress else {
+                    return Err(StackError::InvalidSpec(format!(
+                        "active v6 reconcile session `{session_id}` has no exact progress record"
+                    )));
+                };
+                if progress.operation_id != *operation_id
+                    || progress.next_action_index != cursor
+                    || progress.actions != actions
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "active v6 reconcile session `{session_id}` disagrees with exact progress"
+                    )));
+                }
+            }
+            let audits = self.load_audit_log_for_session(session_id)?;
+            if status == "active" && !audits.is_empty() {
+                return Err(StackError::InvalidSpec(format!(
+                    "active v6 reconcile session `{session_id}` is not effect-free"
+                )));
+            }
+        }
+
+        let mut statement = self
+            .conn
+            .prepare("SELECT stack_name FROM reconcile_progress ORDER BY stack_name")?;
+        let progress_stacks = statement
+            .query_map([], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+        for stack_name in progress_stacks {
+            let active_count = sessions
+                .iter()
+                .filter(|(_, stack, _, status, _)| stack == &stack_name && status == "active")
+                .count();
+            if active_count != 1 {
+                return Err(StackError::InvalidSpec(format!(
+                    "v6 reconcile progress for stack `{stack_name}` does not have exactly one active session"
+                )));
+            }
+        }
+
+        let orphan_audits: i64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM reconcile_audit_log audit
+             LEFT JOIN reconcile_sessions session ON session.session_id = audit.session_id
+             WHERE session.session_id IS NULL",
+            [],
+            |row| row.get(0),
+        )?;
+        if orphan_audits != 0 {
+            return Err(StackError::InvalidSpec(
+                "state schema v6 contains orphan reconcile audit history".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     // ── Sandbox persistence ──
 
     /// Persist a sandbox, upserting on `sandbox_id`.
@@ -440,40 +554,211 @@ impl StateStore {
         operation_id: &str,
         expected_cursor: usize,
         actions: &[Action],
-    ) -> Result<(), StackError> {
+    ) -> Result<Vec<ReconcileActionClaim>, StackError> {
+        self.start_reconcile_batch_inner(
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            #[cfg(test)]
+            None,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn start_reconcile_batch_inner(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        #[cfg(test)] failpoint: Option<ReconcileBatchStartFailpoint>,
+        #[cfg(test)] after_validation: Option<Box<dyn FnOnce() + Send>>,
+    ) -> Result<Vec<ReconcileActionClaim>, StackError> {
         if actions.is_empty() {
             return Err(StackError::InvalidSpec(
                 "cannot start an empty reconcile action batch".to_string(),
             ));
         }
         self.with_immediate_transaction(|store| {
-            store.validate_active_reconcile_batch(
-                session_id,
-                stack_name,
-                operation_id,
-                expected_cursor,
-                actions,
-            )?;
+            store
+                .validate_active_reconcile_batch(
+                    session_id,
+                    stack_name,
+                    operation_id,
+                    expected_cursor,
+                    actions,
+                )
+                .map_err(|error| {
+                    claim_state_error(format!(
+                        "reconcile claim session identity is stale or malformed: {error}"
+                    ))
+                })?;
+            let mut exact_targets = std::collections::BTreeSet::new();
+            if actions
+                .iter()
+                .any(|action| !exact_targets.insert(action.target().clone()))
+            {
+                return claim_conflict(
+                    "reconcile claim slice contains a duplicate exact replica target",
+                );
+            }
+
+            let expected_claims = actions
+                .iter()
+                .enumerate()
+                .map(|(relative_index, action)| {
+                    let absolute_index =
+                        expected_cursor.checked_add(relative_index).ok_or_else(|| {
+                            StackError::InvalidSpec("reconcile action index overflow".to_string())
+                        })?;
+                    Ok((
+                        absolute_index,
+                        crate::executor::ReconcileActionKind::from_action(action).as_audit_str(),
+                        crate::reconcile::compute_actions_hash(std::slice::from_ref(action)),
+                    ))
+                })
+                .collect::<Result<Vec<_>, StackError>>()?;
+
+            let mut replayed = 0usize;
+            for ((absolute_index, action_kind, action_hash), action) in
+                expected_claims.iter().zip(actions)
+            {
+                let action_index = sqlite_usize(
+                    "reconcile audit",
+                    session_id,
+                    "action_index",
+                    *absolute_index,
+                )?;
+                let existing = store
+                    .conn
+                    .query_row(
+                        "SELECT stack_name, action_kind, service_name, replica_index,
+                                action_hash, status, completed_at, error_message
+                         FROM reconcile_audit_log
+                         WHERE session_id = ?1 AND action_index = ?2",
+                        params![session_id, action_index],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                                row.get::<_, String>(2)?,
+                                row.get::<_, i64>(3)?,
+                                row.get::<_, String>(4)?,
+                                row.get::<_, String>(5)?,
+                                row.get::<_, Option<i64>>(6)?,
+                                row.get::<_, Option<String>>(7)?,
+                            ))
+                        },
+                    )
+                    .optional()?;
+                if let Some(existing) = existing {
+                    if existing
+                        != (
+                            stack_name.to_string(),
+                            (*action_kind).to_string(),
+                            action.target().service_name.clone(),
+                            i64::from(action.target().index()),
+                            action_hash.clone(),
+                            "started".to_string(),
+                            None,
+                            None,
+                        )
+                    {
+                        return claim_conflict(format!(
+                            "reconcile audit identity conflict for session `{session_id}` action {absolute_index}"
+                        ));
+                    }
+                    replayed += 1;
+                    continue;
+                }
+
+                let foreign_claim = store
+                    .conn
+                    .query_row(
+                        "SELECT session_id, action_index FROM reconcile_audit_log
+                         WHERE stack_name = ?1 AND service_name = ?2
+                           AND replica_index = ?3 AND status = 'started'
+                         LIMIT 1",
+                        params![
+                            stack_name,
+                            action.target().service_name,
+                            i64::from(action.target().index()),
+                        ],
+                        |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+                    )
+                    .optional()?;
+                if let Some((foreign_session, foreign_index)) = foreign_claim {
+                    return claim_conflict(format!(
+                        "reconcile replica `{}` is already claimed by session `{foreign_session}` action {foreign_index}",
+                        action.target().display_name()
+                    ));
+                }
+            }
+            if replayed == actions.len() {
+                for ((absolute_index, _, action_hash), action) in
+                    expected_claims.iter().zip(actions)
+                {
+                    store.validate_reconcile_action_claim_replay(
+                        session_id,
+                        operation_id,
+                        *absolute_index,
+                        action,
+                    )?;
+                    debug_assert_eq!(
+                        action_hash,
+                        &crate::reconcile::compute_actions_hash(std::slice::from_ref(action))
+                    );
+                }
+                return expected_claims
+                    .into_iter()
+                    .zip(actions)
+                    .map(|((action_index, _, _), action)| {
+                        Ok(ReconcileActionClaim {
+                            key: crate::reconcile::ReconcileActionExecutionKey::new(
+                                session_id,
+                                operation_id,
+                                action_index,
+                                action,
+                            )?,
+                        })
+                    })
+                    .collect::<Result<Vec<_>, StackError>>();
+            }
+            if replayed != 0 {
+                return claim_conflict(format!(
+                    "reconcile session `{session_id}` has a partial started-claim slice"
+                ));
+            }
+
+            for action in actions {
+                store.validate_reconcile_action_claim_precondition(action)?;
+            }
+
+            #[cfg(test)]
+            if let Some(after_validation) = after_validation {
+                after_validation();
+            }
 
             let now = SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .unwrap_or_default()
                 .as_secs();
             let now = sqlite_timestamp("reconcile session", session_id, "started_at", now)?;
-            for (relative_index, action) in actions.iter().enumerate() {
-                let absolute_index = expected_cursor.checked_add(relative_index).ok_or_else(|| {
-                    StackError::InvalidSpec("reconcile action index overflow".to_string())
-                })?;
+            #[cfg(test)]
+            let mut inserted_count = 0usize;
+            for (action, (absolute_index, action_kind, action_hash)) in
+                actions.iter().zip(expected_claims.iter())
+            {
                 let action_index = sqlite_usize(
                     "reconcile audit",
                     session_id,
                     "action_index",
-                    absolute_index,
+                    *absolute_index,
                 )?;
-                let action_hash =
-                    crate::reconcile::compute_actions_hash(std::slice::from_ref(action));
-                let action_kind = crate::executor::ReconcileActionKind::from_action(action)
-                    .as_audit_str();
                 store.conn.execute(
                     "INSERT INTO reconcile_audit_log (
                         session_id, stack_name, action_index, action_kind,
@@ -485,13 +770,31 @@ impl StateStore {
                         session_id,
                         stack_name,
                         action_index,
-                        action_kind,
+                        *action_kind,
                         action.target().service_name,
                         i64::from(action.target().index()),
                         action_hash,
                         now,
                     ],
-                )?;
+                ).map_err(|error| {
+                    claim_state_error(format!(
+                        "reconcile replica claim collided while inserting session `{session_id}` action {absolute_index}: {error}"
+                    ))
+                })?;
+
+                #[cfg(test)]
+                if inserted_count == 0
+                    && failpoint == Some(ReconcileBatchStartFailpoint::AfterFirstAuditInsert)
+                {
+                    return Err(StackError::InvalidSpec(
+                        "injected reconcile batch start failure after first audit insert"
+                            .to_string(),
+                    ));
+                }
+                #[cfg(test)]
+                {
+                    inserted_count += 1;
+                }
 
                 let persisted = store.conn.query_row(
                     "SELECT stack_name, action_kind, service_name, replica_index,
@@ -515,10 +818,10 @@ impl StateStore {
                 if persisted
                     != (
                         stack_name.to_string(),
-                        action_kind.to_string(),
+                        (*action_kind).to_string(),
                         action.target().service_name.clone(),
                         i64::from(action.target().index()),
-                        crate::reconcile::compute_actions_hash(std::slice::from_ref(action)),
+                        action_hash.clone(),
                         "started".to_string(),
                         None,
                         None,
@@ -529,8 +832,63 @@ impl StateStore {
                     )));
                 }
             }
-            Ok(())
+            expected_claims
+                .into_iter()
+                .zip(actions)
+                .map(|((action_index, _, _), action)| {
+                    Ok(ReconcileActionClaim {
+                        key: crate::reconcile::ReconcileActionExecutionKey::new(
+                            session_id,
+                            operation_id,
+                            action_index,
+                            action,
+                        )?,
+                    })
+                })
+                .collect::<Result<Vec<_>, StackError>>()
         })
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_reconcile_batch_with_failpoint(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        failpoint: ReconcileBatchStartFailpoint,
+    ) -> Result<Vec<ReconcileActionClaim>, StackError> {
+        self.start_reconcile_batch_inner(
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            Some(failpoint),
+            None,
+        )
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start_reconcile_batch_after_validation(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        after_validation: Box<dyn FnOnce() + Send>,
+    ) -> Result<Vec<ReconcileActionClaim>, StackError> {
+        self.start_reconcile_batch_inner(
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            None,
+            Some(after_validation),
+        )
     }
 
     fn validate_active_reconcile_batch(
@@ -1291,7 +1649,12 @@ impl StateStore {
         let count = self.conn.execute(
             "UPDATE reconcile_sessions
              SET status = 'superseded', updated_at = ?1, completed_at = ?1
-             WHERE stack_name = ?2 AND status = 'active'",
+             WHERE stack_name = ?2 AND status = 'active'
+               AND NOT EXISTS (
+                   SELECT 1 FROM reconcile_audit_log audit
+                   WHERE audit.session_id = reconcile_sessions.session_id
+                     AND audit.status = 'started'
+               )",
             params![now as i64, stack_name],
         )?;
         Ok(count)

@@ -855,7 +855,6 @@ mod tests {
 
     use super::*;
     use crate::executor::tests_support::MockContainerRuntime;
-    use crate::reconcile::Action;
     use crate::spec::{HealthCheckSpec, ServiceDependency, ServiceKind, ServiceSpec, StackSpec};
 
     fn svc(name: &str) -> ServiceSpec {
@@ -1254,10 +1253,15 @@ mod tests {
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
         let spec = stack("app", vec![svc("web")]);
 
-        let pending = vec![Action::ServiceCreate {
-            precondition: crate::reconcile::test_replica_precondition(),
-            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
-        }];
+        let pending = crate::reconcile::attach_action_preconditions(
+            "app",
+            orch.executor().store(),
+            vec![crate::reconcile::ActionDraft::Create {
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                observed: None,
+            }],
+        )
+        .unwrap();
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap()

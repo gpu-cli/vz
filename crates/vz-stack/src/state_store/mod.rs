@@ -664,11 +664,28 @@ pub struct ReconcileBatchCommit {
     pub status: ReconcileSessionStatus,
 }
 
+/// Opaque proof that one exact persisted Action-v3 entry owns its durable
+/// started claim.
+///
+/// The fields are intentionally private. Callers can only obtain this handle
+/// from atomic StateStore admission; later journal mutations revalidate its
+/// durable session, operation, index, and action identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileActionClaim {
+    key: crate::reconcile::ReconcileActionExecutionKey,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ReconcileBatchCommitFailpoint {
     AfterAuditTerminalization,
     AfterSessionCas,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileBatchStartFailpoint {
+    AfterFirstAuditInsert,
 }
 
 impl StoredAction {
@@ -898,7 +915,8 @@ impl StateStore {
                 store.create_stack_journal_schema_v4()?;
                 store.create_replica_schema_v5()?;
                 store.create_reconcile_schema_v6()?;
-                store.validate_v6_schema()?;
+                store.create_claim_schema_v7()?;
+                store.validate_v7_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -924,25 +942,33 @@ impl StateStore {
                 self.migrate_topology_v2_to_v3()?;
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
-                self.migrate_reconcile_v5_to_v6()
+                self.migrate_reconcile_v5_to_v6()?;
+                self.migrate_claim_v6_to_v7()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
-                self.migrate_reconcile_v5_to_v6()
+                self.migrate_reconcile_v5_to_v6()?;
+                self.migrate_claim_v6_to_v7()
             }
             3 => {
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
-                self.migrate_reconcile_v5_to_v6()
+                self.migrate_reconcile_v5_to_v6()?;
+                self.migrate_claim_v6_to_v7()
             }
             4 => {
                 self.migrate_replica_v4_to_v5()?;
-                self.migrate_reconcile_v5_to_v6()
+                self.migrate_reconcile_v5_to_v6()?;
+                self.migrate_claim_v6_to_v7()
             }
-            5 => self.migrate_reconcile_v5_to_v6(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v6_schema(),
+            5 => {
+                self.migrate_reconcile_v5_to_v6()?;
+                self.migrate_claim_v6_to_v7()
+            }
+            6 => self.migrate_claim_v6_to_v7(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v7_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",

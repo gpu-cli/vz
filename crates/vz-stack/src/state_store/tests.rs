@@ -1,5 +1,6 @@
 #![allow(clippy::unwrap_used)]
 
+use super::topology::ClaimV7MigrationFailpoint;
 use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
 use sha2::{Digest, Sha256};
@@ -3211,7 +3212,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 6);
+    assert_eq!(version, 7);
 }
 
 #[test]
@@ -4092,9 +4093,16 @@ fn recovery_superseded_session_cleanup() {
 
     // Audit entries for old session
     let e_old = make_audit_entry("rs-old-1", "myapp", 0, "service_create", "web");
-    store.log_reconcile_action_start(&e_old).unwrap();
+    let old_audit_id = store.log_reconcile_action_start(&e_old).unwrap();
 
-    // Supersede the old session
+    // A durable started claim prevents unsafe supersession.
+    let superseded_count = store.supersede_active_sessions("myapp").unwrap();
+    assert_eq!(superseded_count, 0);
+    store
+        .log_reconcile_action_complete(old_audit_id, None)
+        .unwrap();
+
+    // Once no started claim remains, the legacy cleanup helper may supersede.
     let superseded_count = store.supersede_active_sessions("myapp").unwrap();
     assert_eq!(superseded_count, 1);
 
@@ -4299,13 +4307,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(6).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        store.set_schema_version(7).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 7);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
     }
 }
 
@@ -4846,7 +4854,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         let definition_json: String = store
             .conn
             .query_row(
@@ -6814,7 +6822,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 6);
+    assert_eq!(retried.schema_version().unwrap(), 7);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -6872,7 +6880,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 6);
+        assert_eq!(store.schema_version().unwrap(), 7);
         assert_eq!(
             store
                 .conn
@@ -7107,7 +7115,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 6);
+    assert_eq!(retried.schema_version().unwrap(), 7);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -7254,7 +7262,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v6 shape mismatch"));
+    assert!(error.contains("state schema v7 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -7283,7 +7291,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v6 shape mismatch"));
+    assert!(error.contains("state schema v7 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -7388,7 +7396,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v6 shape mismatch"),
+            error.contains("state schema v7 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -7754,15 +7762,15 @@ fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
 fn migration_v4_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "6" after initial init.
+    // Schema version must be present and equal to "7" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "6");
+    assert_eq!(version_str, "7");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
 
     // created_at must also be set.
     assert!(
@@ -7822,7 +7830,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -7904,7 +7912,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
 }
 
 fn journal_fixture(
@@ -8239,6 +8247,29 @@ fn action_precondition_capture_preserves_cleaned_head_across_machine_incarnation
             ownership: Some(binding.ownership),
         }
     );
+    let actions = vec![Action::ServiceCreate {
+        target: ServiceReplicaKey::first(intent.service_name.clone()).unwrap(),
+        precondition: captured[0].clone(),
+    }];
+    install_unstarted_batch(
+        &store,
+        "rs-old-terminal-new-incarnation",
+        "op-old-terminal-new-incarnation",
+        &actions,
+    );
+    assert_eq!(
+        store
+            .start_reconcile_batch(
+                "rs-old-terminal-new-incarnation",
+                &intent.scope.stack_id,
+                "op-old-terminal-new-incarnation",
+                0,
+                &actions,
+            )
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[test]
@@ -8338,7 +8369,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 7);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -8381,7 +8412,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 7);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -9036,9 +9067,9 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
 }
 
 #[test]
-fn fresh_store_uses_v6_reconcile_action_schema_and_replica_claim_index() {
+fn fresh_store_uses_v7_reconcile_claim_schema_and_replica_claim_index() {
     let store = StateStore::in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(store.schema_version().unwrap(), 7);
 
     for table in ["reconcile_sessions", "reconcile_progress"] {
         let sql: String = store
@@ -9327,7 +9358,7 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 6);
+        assert_eq!(reopened.schema_version().unwrap(), 7);
         assert_eq!(
             reopened
                 .conn
@@ -9343,8 +9374,347 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
     }
 }
 
+fn downgrade_claim_fixture_to_v6(store: &StateStore) {
+    store
+        .conn
+        .execute_batch(
+            "DROP TRIGGER reconcile_session_identity_immutable;
+             DROP TRIGGER reconcile_audit_identity_immutable;
+             DROP TRIGGER reconcile_started_audit_delete_restricted;",
+        )
+        .unwrap();
+    store.set_schema_version(6).unwrap();
+    store.validate_v6_schema().unwrap();
+}
+
 #[test]
-fn v6_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
+fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-to-v7-claims.db");
+    let store = StateStore::open(&path).unwrap();
+    downgrade_claim_fixture_to_v6(&store);
+    let before = application_schema_snapshot(&store.conn);
+
+    let error = store
+        .migrate_claim_v6_to_v7_with_failpoint(
+            ClaimV7MigrationFailpoint::AfterImmutabilityGuardsCreated,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected v6-to-v7 migration failure"));
+    assert_eq!(store.schema_version().unwrap(), 6);
+    assert_eq!(application_schema_snapshot(&store.conn), before);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 7);
+    for trigger in [
+        "reconcile_session_identity_immutable",
+        "reconcile_audit_identity_immutable",
+        "reconcile_started_audit_delete_restricted",
+    ] {
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE type = 'trigger' AND name = ?1",
+                    params![trigger],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+    reopened.validate_v7_schema().unwrap();
+}
+
+#[test]
+fn v6_to_v7_refuses_untrusted_started_claims_without_writes_across_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-started-claim-refused.db");
+    let store = StateStore::open(&path).unwrap();
+    install_exact_batch(&store, "rs-v6-started-refused");
+    downgrade_claim_fixture_to_v6(&store);
+    let before = application_schema_snapshot(&store.conn);
+    drop(store);
+
+    let error = match StateStore::open(&path) {
+        Ok(_) => panic!("v7 migration must refuse untrusted v6 started claims"),
+        Err(error) => error,
+    };
+    assert!(
+        error
+            .to_string()
+            .contains("untrusted started reconcile claims")
+    );
+
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "6"
+    );
+    assert_eq!(application_schema_snapshot(&raw), before);
+    assert_eq!(
+        raw.query_row(
+            "SELECT COUNT(*) FROM reconcile_audit_log WHERE status = 'started'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap(),
+        3
+    );
+}
+
+#[test]
+fn v6_to_v7_preserves_effect_free_active_session_and_terminal_history() {
+    for terminal in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(format!("v6-valid-{terminal}.db"));
+        let store = StateStore::open(&path).unwrap();
+        let actions = exact_batch_actions_for_claim(&store);
+        let session_id = format!("rs-v6-valid-{terminal}");
+        install_unstarted_batch(&store, &session_id, "op-v6-valid", &actions);
+        if terminal {
+            store
+                .start_reconcile_batch(&session_id, "exact-batch", "op-v6-valid", 0, &actions)
+                .unwrap();
+            store
+                .commit_reconcile_batch(
+                    &session_id,
+                    "exact-batch",
+                    "op-v6-valid",
+                    0,
+                    &actions,
+                    &exact_outcomes(&actions, None),
+                )
+                .unwrap();
+        }
+        downgrade_claim_fixture_to_v6(&store);
+        drop(store);
+
+        let reopened = StateStore::open(&path).unwrap();
+        assert_eq!(reopened.schema_version().unwrap(), 7);
+        assert_eq!(
+            reopened
+                .load_reconcile_session_actions(&session_id)
+                .unwrap(),
+            actions
+        );
+        if terminal {
+            assert_eq!(
+                reopened
+                    .load_audit_log_for_session(&session_id)
+                    .unwrap()
+                    .len(),
+                3
+            );
+            assert!(
+                reopened
+                    .load_reconcile_progress("exact-batch")
+                    .unwrap()
+                    .is_none()
+            );
+        } else {
+            assert!(
+                reopened
+                    .load_audit_log_for_session(&session_id)
+                    .unwrap()
+                    .is_empty()
+            );
+            assert_eq!(
+                reopened
+                    .load_reconcile_progress("exact-batch")
+                    .unwrap()
+                    .unwrap()
+                    .actions,
+                actions
+            );
+        }
+    }
+}
+
+#[test]
+fn v6_to_v7_preserves_terminal_history_beside_one_effect_free_active_session() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-mixed-history-active.db");
+    let store = StateStore::open(&path).unwrap();
+    let actions = exact_batch_actions_for_claim(&store);
+    install_unstarted_batch(&store, "rs-v6-terminal", "op-v6-terminal", &actions);
+    store
+        .start_reconcile_batch(
+            "rs-v6-terminal",
+            "exact-batch",
+            "op-v6-terminal",
+            0,
+            &actions,
+        )
+        .unwrap();
+    store
+        .commit_reconcile_batch(
+            "rs-v6-terminal",
+            "exact-batch",
+            "op-v6-terminal",
+            0,
+            &actions,
+            &exact_outcomes(&actions, None),
+        )
+        .unwrap();
+    install_unstarted_batch(&store, "rs-v6-active", "op-v6-active", &actions);
+    downgrade_claim_fixture_to_v6(&store);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 7);
+    assert_eq!(
+        reopened
+            .load_audit_log_for_session("rs-v6-terminal")
+            .unwrap()
+            .len(),
+        actions.len()
+    );
+    assert!(
+        reopened
+            .load_audit_log_for_session("rs-v6-active")
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        reopened
+            .load_reconcile_progress("exact-batch")
+            .unwrap()
+            .unwrap()
+            .operation_id,
+        "op-v6-active"
+    );
+}
+
+#[test]
+fn v6_to_v7_refuses_active_session_with_terminal_audit_without_writes() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-active-with-effects.db");
+    let store = StateStore::open(&path).unwrap();
+    let actions = exact_batch_actions_for_claim(&store);
+    install_unstarted_batch(&store, "rs-v6-active-effects", "op-v6-effects", &actions);
+    store
+        .start_reconcile_batch(
+            "rs-v6-active-effects",
+            "exact-batch",
+            "op-v6-effects",
+            0,
+            &actions,
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_audit_log
+             SET status = 'completed', completed_at = started_at
+             WHERE session_id = 'rs-v6-active-effects'",
+            [],
+        )
+        .unwrap();
+    downgrade_claim_fixture_to_v6(&store);
+    let before = application_schema_snapshot(&store.conn);
+    drop(store);
+
+    let error = match StateStore::open(&path) {
+        Ok(_) => panic!("v7 migration must refuse an active session with effects"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("is not effect-free"));
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(application_schema_snapshot(&raw), before);
+}
+
+#[test]
+fn v6_to_v7_refuses_active_nonzero_cursor_without_audit_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-active-hidden-effects.db");
+    let store = StateStore::open(&path).unwrap();
+    let actions = exact_batch_actions_for_claim(&store);
+    install_unstarted_batch(&store, "rs-v6-hidden-effects", "op-v6-hidden", &actions);
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_sessions SET next_action_index = 1
+             WHERE session_id = 'rs-v6-hidden-effects'",
+            [],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE reconcile_progress SET next_action_index = 1
+             WHERE stack_name = 'exact-batch'",
+            [],
+        )
+        .unwrap();
+    downgrade_claim_fixture_to_v6(&store);
+    let before = application_schema_snapshot(&store.conn);
+    drop(store);
+
+    let error = match StateStore::open(&path) {
+        Ok(_) => panic!("v7 migration must refuse hidden active effects"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("nonzero cursor"));
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(application_schema_snapshot(&raw), before);
+}
+
+#[test]
+fn v6_to_v7_preserves_length_framed_whitespace_ids_for_atomic_claim() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v6-whitespace-identities.db");
+    let session_id = "rs v6 whitespace";
+    let operation_id = "op v6 whitespace";
+    let (actions, digest_before) = {
+        let store = StateStore::open(&path).unwrap();
+        let actions = exact_batch_actions_for_claim(&store);
+        install_unstarted_batch(&store, session_id, operation_id, &actions);
+        let digest = crate::reconcile::ReconcileActionExecutionKey::new(
+            session_id,
+            operation_id,
+            0,
+            &actions[0],
+        )
+        .unwrap()
+        .activation_digest_prefix()
+        .unwrap();
+        downgrade_claim_fixture_to_v6(&store);
+        (actions, digest)
+    };
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 7);
+    assert_eq!(
+        crate::reconcile::ReconcileActionExecutionKey::new(
+            session_id,
+            operation_id,
+            0,
+            &actions[0],
+        )
+        .unwrap()
+        .activation_digest_prefix()
+        .unwrap(),
+        digest_before
+    );
+    assert_eq!(
+        reopened
+            .start_reconcile_batch(session_id, "exact-batch", operation_id, 0, &actions,)
+            .unwrap()
+            .len(),
+        actions.len()
+    );
+}
+
+#[test]
+fn v7_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("v6-reopen-v3.db");
     let store = StateStore::open(&path).unwrap();
@@ -9386,7 +9756,7 @@ fn v6_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 6);
+    assert_eq!(reopened.schema_version().unwrap(), 7);
     assert_eq!(
         reopened
             .load_reconcile_session_actions(&session.session_id)
@@ -9408,81 +9778,43 @@ fn v6_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     assert_eq!(audits[0].target, actions[0].target().clone());
     assert_eq!(audits[0].status, "started");
 
-    let (actions_json, actions_hash): (String, String) = reopened
-        .conn
-        .query_row(
-            "SELECT actions_json, actions_hash
-             FROM reconcile_sessions WHERE session_id = 'session-v3'",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )
-        .unwrap();
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_sessions
+    let session_tamper = reopened.conn.execute(
+        "UPDATE reconcile_sessions
              SET actions_json = ?1
              WHERE session_id = 'session-v3'",
-            params![r#"[{"schema_version":3}]"#],
-        )
-        .unwrap();
-    assert!(
-        reopened
-            .load_reconcile_session_actions(&session.session_id)
-            .is_err()
+        params![r#"[{"schema_version":3}]"#],
     );
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_sessions SET actions_json = ?1
-             WHERE session_id = 'session-v3'",
-            params![actions_json],
-        )
-        .unwrap();
+    assert!(
+        session_tamper
+            .unwrap_err()
+            .to_string()
+            .contains("immutable")
+    );
 
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_audit_log SET replica_index = 2
+    let audit_tamper = reopened.conn.execute(
+        "UPDATE reconcile_audit_log SET replica_index = 2
              WHERE session_id = 'session-v3'",
-            [],
-        )
-        .unwrap();
-    assert!(
-        reopened
-            .load_audit_log_for_session(&session.session_id)
-            .is_err()
+        [],
     );
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_audit_log SET replica_index = 1
-             WHERE session_id = 'session-v3'",
-            [],
-        )
-        .unwrap();
+    assert!(audit_tamper.unwrap_err().to_string().contains("immutable"));
 
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_sessions SET actions_hash = 'tampered'
+    let hash_tamper = reopened.conn.execute(
+        "UPDATE reconcile_sessions SET actions_hash = 'tampered'
              WHERE session_id = 'session-v3'",
-            [],
-        )
-        .unwrap();
-    assert!(
-        reopened
-            .load_reconcile_session_actions(&session.session_id)
-            .is_err()
+        [],
     );
-    reopened
-        .conn
-        .execute(
-            "UPDATE reconcile_sessions SET actions_hash = ?1
-             WHERE session_id = 'session-v3'",
-            params![actions_hash],
-        )
-        .unwrap();
+    assert!(hash_tamper.unwrap_err().to_string().contains("immutable"));
+
+    let delete_claim = reopened.conn.execute(
+        "DELETE FROM reconcile_audit_log WHERE session_id = 'session-v3'",
+        [],
+    );
+    assert!(
+        delete_claim
+            .unwrap_err()
+            .to_string()
+            .contains("cannot be deleted")
+    );
 
     let duplicate = reopened.conn.execute(
         "INSERT INTO reconcile_audit_log (
@@ -11138,7 +11470,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v6_schema().unwrap();
+    store.validate_v7_schema().unwrap();
 }
 
 #[test]
@@ -12454,6 +12786,80 @@ fn exact_batch_actions() -> Vec<Action> {
 }
 
 #[test]
+fn fresh_claim_kind_status_binding_matrix_is_complete_and_fail_closed() {
+    use super::stack_journal::{
+        legal_fresh_claim_predecessor, status_binding_is_structurally_valid,
+    };
+
+    let actions = exact_batch_actions();
+    let statuses = [
+        StackContainerCreateStatus::Intent,
+        StackContainerCreateStatus::Reserved,
+        StackContainerCreateStatus::Running,
+        StackContainerCreateStatus::CleanupPending,
+        StackContainerCreateStatus::Blocked,
+        StackContainerCreateStatus::Cleaned,
+        StackContainerCreateStatus::Failed,
+    ];
+    let expected = [
+        // Create: only retryable blocked or terminal predecessors.
+        [false, false, false, false, true, true, true],
+        // Recreate: exactly a running, bound predecessor.
+        [false, false, true, false, false, false, false],
+        // Remove: incomplete unbound, running bound, blocked either way, or
+        // terminal unbound failure. Cleanup progression is replay-only.
+        [true, true, true, false, true, false, true],
+    ];
+
+    let mut checked = 0;
+    for (action_index, action) in actions.iter().enumerate() {
+        for (status_index, status) in statuses.into_iter().enumerate() {
+            for bound in [false, true] {
+                let binding_permitted = match action_index {
+                    0 => expected[action_index][status_index],
+                    1 => expected[action_index][status_index],
+                    2 => {
+                        expected[action_index][status_index]
+                            && match status {
+                                StackContainerCreateStatus::Intent
+                                | StackContainerCreateStatus::Failed => !bound,
+                                StackContainerCreateStatus::Reserved
+                                | StackContainerCreateStatus::Running => bound,
+                                StackContainerCreateStatus::Blocked => true,
+                                StackContainerCreateStatus::CleanupPending
+                                | StackContainerCreateStatus::Cleaned => false,
+                            }
+                    }
+                    _ => unreachable!(),
+                };
+                let structurally_valid = match status {
+                    StackContainerCreateStatus::Intent | StackContainerCreateStatus::Failed => {
+                        !bound
+                    }
+                    StackContainerCreateStatus::Reserved
+                    | StackContainerCreateStatus::Running
+                    | StackContainerCreateStatus::CleanupPending
+                    | StackContainerCreateStatus::Cleaned => bound,
+                    StackContainerCreateStatus::Blocked => true,
+                };
+                assert_eq!(
+                    status_binding_is_structurally_valid(status, bound),
+                    structurally_valid,
+                    "unexpected structural shape result for status={status:?}, bound={bound}"
+                );
+                assert_eq!(
+                    legal_fresh_claim_predecessor(action, status, bound),
+                    binding_permitted && structurally_valid,
+                    "unexpected fresh-claim admission for action={action:?}, status={status:?}, bound={bound}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 42);
+}
+
+#[test]
 fn impossible_action_kind_and_head_pairs_never_cross_persistence_boundary() {
     let store = StateStore::in_memory().unwrap();
     let workload = workload_scope_for_journal_intent(&journal_fixture("kind-head").1);
@@ -12670,24 +13076,14 @@ fn invalid_action_target_is_rejected_at_every_persistence_entrypoint() {
 fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
     let store = StateStore::in_memory().unwrap();
     let actions = exact_batch_actions();
-    let session = ReconcileSession {
-        session_id: "rs-nested-unknown".to_string(),
-        stack_name: "exact-batch".to_string(),
-        operation_id: "nested-unknown-operation".to_string(),
-        status: ReconcileSessionStatus::Active,
-        actions_hash: crate::reconcile::compute_actions_hash(&actions),
-        next_action_index: 0,
-        total_actions: actions.len(),
-        started_at: 1,
-        updated_at: 1,
-        completed_at: None,
-    };
-    store.create_reconcile_session(&session, &actions).unwrap();
+    store
+        .save_reconcile_progress("exact-batch", "nested-unknown-operation", &actions, 0)
+        .unwrap();
     let actions_json: String = store
         .conn
         .query_row(
-            "SELECT actions_json FROM reconcile_sessions WHERE session_id = ?1",
-            params![session.session_id],
+            "SELECT actions_json FROM reconcile_progress WHERE stack_name = 'exact-batch'",
+            [],
             |row| row.get(0),
         )
         .unwrap();
@@ -12696,15 +13092,11 @@ fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
     store
         .conn
         .execute(
-            "UPDATE reconcile_sessions SET actions_json = ?1 WHERE session_id = ?2",
-            params![target_tamper.to_string(), session.session_id],
+            "UPDATE reconcile_progress SET actions_json = ?1 WHERE stack_name = 'exact-batch'",
+            params![target_tamper.to_string()],
         )
         .unwrap();
-    assert!(
-        store
-            .load_reconcile_session_actions(&session.session_id)
-            .is_err()
-    );
+    assert!(store.load_reconcile_progress("exact-batch").is_err());
 
     let mut legacy_ownership: serde_json::Value = serde_json::from_str(&actions_json).unwrap();
     legacy_ownership[0]["precondition"]["journal_head"]["ownership"]["scope"]["machine_incarnation_id"] =
@@ -12712,13 +13104,11 @@ fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
     store
         .conn
         .execute(
-            "UPDATE reconcile_sessions SET actions_json = ?1 WHERE session_id = ?2",
-            params![legacy_ownership.to_string(), session.session_id],
+            "UPDATE reconcile_progress SET actions_json = ?1 WHERE stack_name = 'exact-batch'",
+            params![legacy_ownership.to_string()],
         )
         .unwrap();
-    let error = store
-        .load_reconcile_session_actions(&session.session_id)
-        .unwrap_err();
+    let error = store.load_reconcile_progress("exact-batch").unwrap_err();
     assert!(error.to_string().contains("machine incarnation"));
 
     store
@@ -12744,8 +13134,87 @@ fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
     assert!(store.load_reconcile_progress("exact-batch").is_err());
 }
 
+fn exact_batch_actions_for_claim(store: &StateStore) -> Vec<Action> {
+    let project = topology_project_state("prj_exact_batch", &["machine"], "/checkout");
+    let (mut recreate_intent, mut recreate_binding) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-exact-recreate",
+        "exact-batch",
+        "api-2",
+        "ctr-exact-recreate",
+    );
+    let (mut remove_intent, mut remove_binding) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-exact-remove",
+        "exact-batch",
+        "worker",
+        "ctr-exact-remove",
+    );
+    recreate_intent.action_digest = "sha256:exact-recreate".to_string();
+    recreate_binding.ownership.scope = Some(Box::new(recreate_intent.scope.clone()));
+    remove_intent.action_digest = "sha256:exact-remove".to_string();
+    remove_binding.ownership.scope = Some(Box::new(remove_intent.scope.clone()));
+
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(store, &recreate_intent);
+    for (intent, binding) in [
+        (&recreate_intent, &recreate_binding),
+        (&remove_intent, &remove_binding),
+    ] {
+        store.begin_stack_container_create(intent).unwrap();
+        store.bind_stack_container_generation(binding).unwrap();
+        store
+            .publish_stack_container_create_success(&intent.scope.reservation_id, true, 102)
+            .unwrap();
+    }
+
+    let workload = workload_scope_for_journal_intent(&recreate_intent);
+    let environment_generation = recreate_intent.environment_generation;
+    vec![
+        Action::ServiceCreate {
+            precondition: crate::reconcile::ReplicaPrecondition::new(
+                workload.clone(),
+                environment_generation,
+                crate::reconcile::ExpectedJournalHead::NeverJournaled,
+            )
+            .unwrap(),
+            target: ServiceReplicaKey::new("api", 2).unwrap(),
+        },
+        Action::ServiceRecreate {
+            precondition: crate::reconcile::ReplicaPrecondition::new(
+                workload.clone(),
+                environment_generation,
+                crate::reconcile::ExpectedJournalHead::exact(
+                    &recreate_intent.scope.reservation_id,
+                    recreate_intent.service_generation,
+                    Some(recreate_binding.ownership.clone()),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            target: ServiceReplicaKey::new("api-2", 1).unwrap(),
+        },
+        Action::ServiceRemove {
+            precondition: crate::reconcile::ReplicaPrecondition::new(
+                workload,
+                environment_generation,
+                crate::reconcile::ExpectedJournalHead::exact(
+                    &remove_intent.scope.reservation_id,
+                    remove_intent.service_generation,
+                    Some(remove_binding.ownership.clone()),
+                )
+                .unwrap(),
+            )
+            .unwrap(),
+            target: ServiceReplicaKey::new("worker", 1).unwrap(),
+        },
+    ]
+}
+
 fn install_exact_batch(store: &StateStore, session_id: &str) -> Vec<Action> {
-    let actions = exact_batch_actions();
+    let actions = exact_batch_actions_for_claim(store);
     let session = ReconcileSession {
         session_id: session_id.to_string(),
         stack_name: "exact-batch".to_string(),
@@ -12763,6 +13232,27 @@ fn install_exact_batch(store: &StateStore, session_id: &str) -> Vec<Action> {
         .start_reconcile_batch(session_id, "exact-batch", "exact-operation", 0, &actions)
         .unwrap();
     actions
+}
+
+fn install_unstarted_batch(
+    store: &StateStore,
+    session_id: &str,
+    operation_id: &str,
+    actions: &[Action],
+) {
+    let session = ReconcileSession {
+        session_id: session_id.to_string(),
+        stack_name: actions[0].precondition().workload().stack_id.clone(),
+        operation_id: operation_id.to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    store.create_reconcile_batch(&session, actions).unwrap();
 }
 
 fn exact_outcomes(
@@ -12812,7 +13302,7 @@ fn audit_claim_prevents_session_payload_deletion_across_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("audit-session-fk.db");
     let store = StateStore::open(&path).unwrap();
-    install_exact_batch(&store, "rs-audit-session-fk");
+    let actions = install_exact_batch(&store, "rs-audit-session-fk");
     assert!(store.foreign_keys_enabled().unwrap());
     let error = store
         .conn
@@ -12830,7 +13320,7 @@ fn audit_claim_prevents_session_payload_deletion_across_reopen() {
         reopened
             .load_reconcile_session_actions("rs-audit-session-fk")
             .unwrap(),
-        exact_batch_actions()
+        actions
     );
     assert_eq!(
         reopened
@@ -13206,7 +13696,7 @@ fn exact_batch_commit_cas_is_idempotent_only_for_identical_outcomes() {
 }
 
 #[test]
-fn exact_batch_rejects_audit_stack_misattribution_on_load_and_idempotent_replay() {
+fn exact_batch_prevents_audit_stack_misattribution_and_preserves_idempotent_replay() {
     let store = StateStore::in_memory().unwrap();
     let actions = install_exact_batch(&store, "rs-exact-audit-stack");
     let outcomes = exact_outcomes(&actions, None);
@@ -13220,21 +13710,13 @@ fn exact_batch_rejects_audit_stack_misattribution_on_load_and_idempotent_replay(
             &outcomes,
         )
         .unwrap();
-    store
-        .conn
-        .execute(
-            "UPDATE reconcile_audit_log SET stack_name = 'misattributed-stack'
+    let tamper = store.conn.execute(
+        "UPDATE reconcile_audit_log SET stack_name = 'misattributed-stack'
              WHERE session_id = 'rs-exact-audit-stack' AND action_index = 1",
-            [],
-        )
-        .unwrap();
-
-    let load_error = store
-        .load_audit_log_for_session("rs-exact-audit-stack")
-        .unwrap_err()
-        .to_string();
-    assert!(load_error.contains("identity does not match"));
-    let replay_error = store
+        [],
+    );
+    assert!(tamper.unwrap_err().to_string().contains("immutable"));
+    store
         .commit_reconcile_batch(
             "rs-exact-audit-stack",
             "exact-batch",
@@ -13243,9 +13725,7 @@ fn exact_batch_rejects_audit_stack_misattribution_on_load_and_idempotent_replay(
             &actions,
             &outcomes,
         )
-        .unwrap_err()
-        .to_string();
-    assert!(replay_error.contains("compare-and-swap lost"));
+        .unwrap();
 }
 
 #[test]
@@ -13327,9 +13807,1181 @@ fn exact_batch_start_mismatch_rolls_back_without_audit_rows() {
 }
 
 #[test]
+fn exact_batch_start_failpoint_rolls_back_all_started_claims() {
+    let store = StateStore::in_memory().unwrap();
+    let actions = exact_batch_actions_for_claim(&store);
+    let session = ReconcileSession {
+        session_id: "rs-start-rollback".to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: "exact-operation".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    store.create_reconcile_batch(&session, &actions).unwrap();
+
+    let error = store
+        .start_reconcile_batch_with_failpoint(
+            &session.session_id,
+            &session.stack_name,
+            &session.operation_id,
+            0,
+            &actions,
+            ReconcileBatchStartFailpoint::AfterFirstAuditInsert,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("injected reconcile batch start"));
+    assert!(
+        store
+            .load_audit_log_for_session(&session.session_id)
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(
+        store
+            .load_reconcile_progress(&session.stack_name)
+            .unwrap()
+            .unwrap()
+            .next_action_index,
+        0
+    );
+}
+
+#[test]
+fn exact_batch_later_stale_precondition_claims_nothing() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let stale = Action::ServiceRecreate {
+        target: seeded[1].target().clone(),
+        precondition: crate::reconcile::ReplicaPrecondition::new(
+            seeded[1].precondition().workload().clone(),
+            seeded[1].precondition().environment_generation() + 1,
+            seeded[1].precondition().journal_head().clone(),
+        )
+        .unwrap(),
+    };
+    let actions = vec![seeded[0].clone(), stale];
+    let session = ReconcileSession {
+        session_id: "rs-start-later-stale".to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: "exact-operation".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    };
+    store.create_reconcile_batch(&session, &actions).unwrap();
+
+    let error = store
+        .start_reconcile_batch(
+            &session.session_id,
+            &session.stack_name,
+            &session.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert!(
+        store
+            .load_audit_log_for_session(&session.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn claim_admission_rejects_every_stale_precondition_dimension_without_mutation() {
+    for dimension in [
+        "project",
+        "environment",
+        "machine",
+        "machine_incarnation",
+        "stack",
+        "environment_generation",
+        "reservation",
+        "service_generation",
+        "binding_absent",
+        "binding_present_for_unbound",
+        "container_id",
+        "runtime_generation",
+        "ownership_incarnation",
+        "target_service",
+        "target_replica",
+        "never_for_journaled",
+        "exact_for_never",
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let mut target = seeded[1].target().clone();
+        let mut workload = seeded[1].precondition().workload().clone();
+        let mut environment_generation = seeded[1].precondition().environment_generation();
+        let (mut reservation_id, mut service_generation, mut ownership) =
+            match seeded[1].precondition().journal_head() {
+                crate::reconcile::ExpectedJournalHead::Exact {
+                    reservation_id,
+                    service_generation,
+                    ownership,
+                } => (
+                    reservation_id.clone(),
+                    *service_generation,
+                    ownership.clone(),
+                ),
+                crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+            };
+        let mut kind = "recreate";
+
+        match dimension {
+            "project" => {
+                workload.project_id = ProjectId::new("prj_foreign_claim").unwrap();
+                ownership
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .project_id = workload.project_id.clone();
+            }
+            "environment" => {
+                workload.environment_id = EnvironmentId::new("env_foreign_claim").unwrap();
+                ownership
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .environment_id = workload.environment_id.clone();
+            }
+            "machine" => {
+                workload.machine_id = MachineId::new("mch_foreign_claim").unwrap();
+                ownership
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .machine_id = workload.machine_id.clone();
+            }
+            "machine_incarnation" => {
+                workload.machine_incarnation_id =
+                    MachineIncarnationId::new("inc_foreign_claim").unwrap();
+            }
+            "stack" => {
+                workload.stack_id = "foreign-claim-stack".to_string();
+                let ownership = ownership.as_mut().unwrap();
+                ownership.stack_id = workload.stack_id.clone();
+                ownership.scope.as_mut().unwrap().stack_id = workload.stack_id.clone();
+            }
+            "environment_generation" => environment_generation += 1,
+            "reservation" => {
+                reservation_id = "reservation-foreign-claim".to_string();
+                ownership
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .reservation_id = reservation_id.clone();
+            }
+            "service_generation" => service_generation += 1,
+            "binding_absent" => {
+                ownership = None;
+                kind = "remove";
+            }
+            "binding_present_for_unbound" => {
+                target = seeded[0].target().clone();
+                let project = store
+                    .load_project_state(workload.project_id.as_str())
+                    .unwrap()
+                    .unwrap();
+                let environment = project
+                    .environments
+                    .iter()
+                    .find(|environment| environment.environment_id == workload.environment_id)
+                    .unwrap();
+                let selector = StackContainerCreateSelector {
+                    project_id: workload.project_id.clone(),
+                    environment_id: workload.environment_id.clone(),
+                    machine_id: workload.machine_id.clone(),
+                    machine_incarnation_id: workload.machine_incarnation_id.clone(),
+                    environment_generation,
+                    stack_id: workload.stack_id.clone(),
+                    service_name: target.service_name.clone(),
+                    replica_index: target.index(),
+                    requested_container_id: "ctr-unbound-claim".to_string(),
+                    definition_digest: environment.definition_digest.clone(),
+                    action_digest: "sha256:unbound-claim".to_string(),
+                    applied_config_digest: "vzsc1-sha256:unbound-claim".to_string(),
+                };
+                let intent = store
+                    .resolve_or_begin_stack_container_create(&selector, 10)
+                    .unwrap()
+                    .0;
+                reservation_id = intent.scope.reservation_id.clone();
+                service_generation = intent.service_generation;
+                ownership = Some(ContainerGenerationOwnership {
+                    container_id: intent.requested_container_id,
+                    generation: 99,
+                    stack_id: intent.scope.stack_id.clone(),
+                    scope: Some(Box::new(intent.scope)),
+                });
+                kind = "remove";
+            }
+            "container_id" => {
+                ownership.as_mut().unwrap().container_id = "ctr-foreign-claim".to_string()
+            }
+            "runtime_generation" => ownership.as_mut().unwrap().generation += 1,
+            "ownership_incarnation" => {
+                ownership
+                    .as_mut()
+                    .unwrap()
+                    .scope
+                    .as_mut()
+                    .unwrap()
+                    .machine_incarnation_id =
+                    Some(MachineIncarnationId::new("inc_ownership_foreign").unwrap());
+            }
+            "target_service" => target = ServiceReplicaKey::new("api-foreign", 1).unwrap(),
+            "target_replica" => target = ServiceReplicaKey::new("api-2", 2).unwrap(),
+            "never_for_journaled" => {
+                kind = "create-never";
+            }
+            "exact_for_never" => {
+                target = seeded[0].target().clone();
+                reservation_id = "reservation-missing-claim".to_string();
+                service_generation = 1;
+                ownership = None;
+                kind = "create";
+            }
+            _ => unreachable!(),
+        }
+
+        let journal_head = if kind == "create-never" {
+            crate::reconcile::ExpectedJournalHead::NeverJournaled
+        } else {
+            crate::reconcile::ExpectedJournalHead::exact(
+                &reservation_id,
+                service_generation,
+                ownership,
+            )
+            .unwrap()
+        };
+        let precondition = crate::reconcile::ReplicaPrecondition::new(
+            workload,
+            environment_generation,
+            journal_head,
+        )
+        .unwrap();
+        let action = match kind {
+            "recreate" => Action::ServiceRecreate {
+                target,
+                precondition,
+            },
+            "remove" => Action::ServiceRemove {
+                target,
+                precondition,
+            },
+            "create" | "create-never" => Action::ServiceCreate {
+                target,
+                precondition,
+            },
+            _ => unreachable!(),
+        };
+        let actions = vec![action];
+        let session_id = format!("rs-claim-dimension-{dimension}");
+        install_unstarted_batch(&store, &session_id, "op-claim-dimension", &actions);
+
+        let workload = seeded[1].precondition().workload();
+        let project_before = store
+            .load_project_state(workload.project_id.as_str())
+            .unwrap();
+        let observed_before = store.load_observed_state("exact-batch").unwrap();
+        let journal_before = store.list_resumable_stack_container_creates().unwrap();
+        let error = store
+            .start_reconcile_batch(
+                &session_id,
+                actions[0].precondition().workload().stack_id.as_str(),
+                "op-claim-dimension",
+                0,
+                &actions,
+            )
+            .unwrap_err();
+        assert_eq!(
+            error.machine_code(),
+            MachineErrorCode::StateConflict,
+            "dimension {dimension} returned {error}"
+        );
+        assert!(
+            store
+                .load_audit_log_for_session(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            store
+                .load_project_state(workload.project_id.as_str())
+                .unwrap(),
+            project_before
+        );
+        assert_eq!(
+            store.load_observed_state("exact-batch").unwrap(),
+            observed_before
+        );
+        assert_eq!(
+            store.list_resumable_stack_container_creates().unwrap(),
+            journal_before
+        );
+        assert_eq!(
+            store.load_reconcile_session_actions(&session_id).unwrap(),
+            actions,
+            "session action/hash identity must remain self-consistent for {dimension}"
+        );
+    }
+}
+
+#[test]
+fn claim_admission_rejects_never_journaled_after_failed_or_cleaned_aba() {
+    for terminal in ["failed", "cleaned"] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        let session_id = format!("rs-never-aba-{terminal}");
+        install_unstarted_batch(&store, &session_id, "op-never-aba", &actions);
+
+        let workload = actions[0].precondition().workload();
+        let project = store
+            .load_project_state(workload.project_id.as_str())
+            .unwrap()
+            .unwrap();
+        let environment = project
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == workload.environment_id)
+            .unwrap();
+        let selector = StackContainerCreateSelector {
+            project_id: workload.project_id.clone(),
+            environment_id: workload.environment_id.clone(),
+            machine_id: workload.machine_id.clone(),
+            machine_incarnation_id: workload.machine_incarnation_id.clone(),
+            environment_generation: environment.lifecycle_generation,
+            stack_id: workload.stack_id.clone(),
+            service_name: "api".to_string(),
+            replica_index: 2,
+            requested_container_id: format!("ctr-never-aba-{terminal}"),
+            definition_digest: environment.definition_digest.clone(),
+            action_digest: format!("sha256:never-aba-{terminal}"),
+            applied_config_digest: "vzsc1-sha256:never-aba".to_string(),
+        };
+        let intent = store
+            .resolve_or_begin_stack_container_create(&selector, 10)
+            .unwrap()
+            .0;
+        if terminal == "failed" {
+            store
+                .publish_stack_container_create_failure(
+                    &intent.scope.reservation_id,
+                    "failed before stale claim",
+                    11,
+                )
+                .unwrap();
+        } else {
+            let ownership = ContainerGenerationOwnership {
+                container_id: intent.requested_container_id.clone(),
+                generation: 19,
+                stack_id: intent.scope.stack_id.clone(),
+                scope: Some(Box::new(intent.scope.clone())),
+            };
+            store
+                .bind_stack_container_generation(&StackContainerGenerationBinding {
+                    reservation_id: intent.scope.reservation_id.clone(),
+                    service_name: intent.service_name.clone(),
+                    ownership,
+                    bound_at: 11,
+                })
+                .unwrap();
+            store
+                .publish_stack_container_create_success(&intent.scope.reservation_id, true, 12)
+                .unwrap();
+            store
+                .begin_stack_container_cleanup(&intent.scope.reservation_id, 13)
+                .unwrap();
+            store
+                .publish_stack_container_cleanup_success(&intent.scope.reservation_id, 14)
+                .unwrap();
+        }
+
+        let error = store
+            .start_reconcile_batch(&session_id, &workload.stack_id, "op-never-aba", 0, &actions)
+            .unwrap_err();
+        assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+        assert!(
+            store
+                .load_audit_log_for_session(&session_id)
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn started_claim_replay_accepts_own_cleanup_progression_and_rejects_foreign_session() {
+    let store = StateStore::in_memory().unwrap();
+    let actions = exact_batch_actions_for_claim(&store);
+    install_unstarted_batch(&store, "rs-claim-owner", "op-claim-owner", &actions);
+    let first_claims = store
+        .start_reconcile_batch(
+            "rs-claim-owner",
+            "exact-batch",
+            "op-claim-owner",
+            0,
+            &actions,
+        )
+        .unwrap();
+    let reservation_id = match actions[1].precondition().journal_head() {
+        crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => reservation_id,
+        crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+    };
+    store
+        .begin_stack_container_cleanup(reservation_id, 200)
+        .unwrap();
+
+    let replayed = store
+        .start_reconcile_batch(
+            "rs-claim-owner",
+            "exact-batch",
+            "op-claim-owner",
+            0,
+            &actions,
+        )
+        .unwrap();
+    assert_eq!(replayed, first_claims);
+    assert_eq!(
+        store
+            .load_audit_log_for_session("rs-claim-owner")
+            .unwrap()
+            .len(),
+        actions.len()
+    );
+
+    let foreign = ReconcileSession {
+        session_id: "rs-claim-foreign".to_string(),
+        stack_name: "exact-batch".to_string(),
+        operation_id: "op-claim-foreign".to_string(),
+        status: ReconcileSessionStatus::Active,
+        actions_hash: crate::reconcile::compute_actions_hash(&actions),
+        next_action_index: 0,
+        total_actions: actions.len(),
+        started_at: 2,
+        updated_at: 2,
+        completed_at: None,
+    };
+    store.create_reconcile_session(&foreign, &actions).unwrap();
+    store
+        .save_reconcile_progress("exact-batch", "op-claim-foreign", &actions, 0)
+        .unwrap();
+    let error = store
+        .start_reconcile_batch(
+            &foreign.session_id,
+            &foreign.stack_name,
+            &foreign.operation_id,
+            0,
+            &actions,
+        )
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert!(
+        store
+            .load_audit_log_for_session(&foreign.session_id)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn started_create_claim_replays_exact_predecessor_cleanup_before_successor_intent() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let reservation_id = match seeded[1].precondition().journal_head() {
+        crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => {
+            reservation_id.clone()
+        }
+        crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+    };
+    store
+        .publish_stack_container_blocked(
+            &reservation_id,
+            "claimed create must clean exact predecessor",
+            200,
+        )
+        .unwrap();
+    let actions = vec![Action::ServiceCreate {
+        target: seeded[1].target().clone(),
+        precondition: seeded[1].precondition().clone(),
+    }];
+    install_unstarted_batch(
+        &store,
+        "rs-create-cleanup-replay",
+        "op-create-cleanup",
+        &actions,
+    );
+    let first = store
+        .start_reconcile_batch(
+            "rs-create-cleanup-replay",
+            "exact-batch",
+            "op-create-cleanup",
+            0,
+            &actions,
+        )
+        .unwrap();
+
+    store
+        .begin_stack_container_cleanup(&reservation_id, 201)
+        .unwrap();
+    assert_eq!(
+        store
+            .start_reconcile_batch(
+                "rs-create-cleanup-replay",
+                "exact-batch",
+                "op-create-cleanup",
+                0,
+                &actions,
+            )
+            .unwrap(),
+        first
+    );
+    store
+        .publish_stack_container_cleanup_success(&reservation_id, 202)
+        .unwrap();
+    assert_eq!(
+        store
+            .start_reconcile_batch(
+                "rs-create-cleanup-replay",
+                "exact-batch",
+                "op-create-cleanup",
+                0,
+                &actions,
+            )
+            .unwrap(),
+        first
+    );
+}
+
+#[test]
+fn started_claim_replay_rejects_impossible_status_binding_shapes() {
+    for malformed_shape in ["reserved-unbound", "cleaned-unbound", "failed-bound"] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+
+        let (actions, reservation_id) = if malformed_shape == "failed-bound" {
+            let reservation_id = match seeded[1].precondition().journal_head() {
+                crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => {
+                    reservation_id.clone()
+                }
+                crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+            };
+            store
+                .publish_stack_container_blocked(
+                    &reservation_id,
+                    "bound predecessor awaits cleanup",
+                    200,
+                )
+                .unwrap();
+            (
+                vec![Action::ServiceCreate {
+                    target: seeded[1].target().clone(),
+                    precondition: seeded[1].precondition().clone(),
+                }],
+                reservation_id,
+            )
+        } else {
+            let workload = seeded[0].precondition().workload();
+            let environment = store
+                .load_environment_instance(workload.environment_id.as_str())
+                .unwrap()
+                .unwrap();
+            let environment_generation = environment.lifecycle_generation;
+            let selector = StackContainerCreateSelector {
+                project_id: workload.project_id.clone(),
+                environment_id: workload.environment_id.clone(),
+                machine_id: workload.machine_id.clone(),
+                machine_incarnation_id: workload.machine_incarnation_id.clone(),
+                environment_generation: environment.lifecycle_generation,
+                stack_id: workload.stack_id.clone(),
+                service_name: seeded[0].target().service_name.clone(),
+                replica_index: seeded[0].target().index(),
+                requested_container_id: format!("ctr-{malformed_shape}"),
+                definition_digest: environment.definition_digest.clone(),
+                action_digest: format!("sha256:{malformed_shape}"),
+                applied_config_digest: "vzsc1-sha256:malformed-replay".to_string(),
+            };
+            let mut intent = store
+                .resolve_or_begin_stack_container_create(&selector, 200)
+                .unwrap()
+                .0;
+            if malformed_shape == "cleaned-unbound" {
+                store
+                    .publish_stack_container_blocked(
+                        &intent.scope.reservation_id,
+                        "unbound predecessor is retryable",
+                        201,
+                    )
+                    .unwrap();
+                intent = store
+                    .load_stack_container_create_intent(&intent.scope.reservation_id)
+                    .unwrap()
+                    .unwrap();
+            }
+            let precondition = crate::reconcile::ReplicaPrecondition::new(
+                workload.clone(),
+                environment_generation,
+                crate::reconcile::ExpectedJournalHead::exact(
+                    &intent.scope.reservation_id,
+                    intent.service_generation,
+                    None,
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let action = if malformed_shape == "reserved-unbound" {
+                Action::ServiceRemove {
+                    target: seeded[0].target().clone(),
+                    precondition,
+                }
+            } else {
+                Action::ServiceCreate {
+                    target: seeded[0].target().clone(),
+                    precondition,
+                }
+            };
+            (vec![action], intent.scope.reservation_id)
+        };
+
+        let session_id = format!("rs-malformed-replay-{malformed_shape}");
+        install_unstarted_batch(&store, &session_id, "op-malformed-replay", &actions);
+        store
+            .start_reconcile_batch(
+                &session_id,
+                "exact-batch",
+                "op-malformed-replay",
+                0,
+                &actions,
+            )
+            .unwrap();
+
+        let mut intent = store
+            .load_stack_container_create_intent(&reservation_id)
+            .unwrap()
+            .unwrap();
+        let (status, observed) = match malformed_shape {
+            "reserved-unbound" => (
+                StackContainerCreateStatus::Reserved,
+                store
+                    .load_observed_state_for_replica(
+                        &intent.scope.stack_id,
+                        &intent.service_name,
+                        intent.replica_index,
+                    )
+                    .unwrap()
+                    .unwrap(),
+            ),
+            "cleaned-unbound" => (
+                StackContainerCreateStatus::Cleaned,
+                ServiceObservedState {
+                    replica: actions[0].target().clone(),
+                    applied_config_digest: None,
+                    phase: ServicePhase::Stopped,
+                    container_id: None,
+                    failed_create_ownership: None,
+                    last_error: None,
+                    ready: false,
+                },
+            ),
+            "failed-bound" => (
+                StackContainerCreateStatus::Failed,
+                ServiceObservedState {
+                    replica: actions[0].target().clone(),
+                    applied_config_digest: None,
+                    phase: ServicePhase::Failed,
+                    container_id: None,
+                    failed_create_ownership: None,
+                    last_error: Some("malformed bound failure".to_string()),
+                    ready: false,
+                },
+            ),
+            _ => unreachable!(),
+        };
+        intent.status = status;
+        intent.updated_at = 300;
+        intent.completed_at = matches!(
+            status,
+            StackContainerCreateStatus::Cleaned | StackContainerCreateStatus::Failed
+        )
+        .then_some(300);
+        intent.last_error = observed.last_error.clone();
+        store
+            .conn
+            .execute(
+                "UPDATE stack_container_create_intents
+                 SET status = ?1, intent_json = ?2, last_error = ?3,
+                     updated_at = ?4, completed_at = ?5
+                 WHERE reservation_id = ?6",
+                params![
+                    malformed_shape.split('-').next().unwrap(),
+                    serde_json::to_string(&intent).unwrap(),
+                    intent.last_error,
+                    i64::try_from(intent.updated_at).unwrap(),
+                    intent
+                        .completed_at
+                        .map(|value| i64::try_from(value).unwrap()),
+                    reservation_id,
+                ],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "UPDATE observed_state SET state_json = ?1
+                 WHERE stack_name = ?2 AND service_name = ?3 AND replica_index = ?4",
+                params![
+                    serde_json::to_string(&observed).unwrap(),
+                    intent.scope.stack_id,
+                    intent.service_name,
+                    i64::from(intent.replica_index),
+                ],
+            )
+            .unwrap();
+
+        let error = store
+            .start_reconcile_batch(
+                &session_id,
+                "exact-batch",
+                "op-malformed-replay",
+                0,
+                &actions,
+            )
+            .unwrap_err();
+        assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+        assert!(
+            error
+                .to_string()
+                .contains("impossible journal status/binding shape")
+        );
+        assert_eq!(
+            store.load_audit_log_for_session(&session_id).unwrap().len(),
+            1
+        );
+    }
+}
+
+#[test]
+fn started_create_claim_replay_requires_session_linked_successor_digest() {
+    for (case, suffix, linked) in [
+        ("valid", "a".repeat(64), true),
+        ("short", "a".repeat(63), false),
+        ("uppercase", "A".repeat(64), false),
+        ("nonhex", format!("{}g", "a".repeat(63)), false),
+        ("trailing", format!("{}0", "a".repeat(64)), false),
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        let session_id = format!("rs-successor-{case}");
+        install_unstarted_batch(&store, &session_id, "op-successor", &actions);
+        store
+            .start_reconcile_batch(&session_id, "exact-batch", "op-successor", 0, &actions)
+            .unwrap();
+
+        let workload = actions[0].precondition().workload();
+        let project = store
+            .load_project_state(workload.project_id.as_str())
+            .unwrap()
+            .unwrap();
+        let environment = project
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == workload.environment_id)
+            .unwrap();
+        let prefix = crate::reconcile::ReconcileActionExecutionKey::new(
+            &session_id,
+            "op-successor",
+            0,
+            &actions[0],
+        )
+        .unwrap()
+        .activation_digest_prefix()
+        .unwrap();
+        let selector = StackContainerCreateSelector {
+            project_id: workload.project_id.clone(),
+            environment_id: workload.environment_id.clone(),
+            machine_id: workload.machine_id.clone(),
+            machine_incarnation_id: workload.machine_incarnation_id.clone(),
+            environment_generation: environment.lifecycle_generation,
+            stack_id: workload.stack_id.clone(),
+            service_name: "api".to_string(),
+            replica_index: 2,
+            requested_container_id: format!("ctr-successor-{case}"),
+            definition_digest: environment.definition_digest.clone(),
+            action_digest: format!("{prefix}{suffix}"),
+            applied_config_digest: "vzsc1-sha256:successor".to_string(),
+        };
+        store
+            .resolve_or_begin_stack_container_create(&selector, 10)
+            .unwrap();
+
+        let replay =
+            store.start_reconcile_batch(&session_id, "exact-batch", "op-successor", 0, &actions);
+        if linked {
+            assert_eq!(replay.unwrap().len(), 1);
+        } else {
+            assert_eq!(
+                replay.unwrap_err().machine_code(),
+                MachineErrorCode::StateConflict
+            );
+        }
+    }
+}
+
+#[test]
+fn started_claim_replay_rejects_linked_first_duplicate_latest_generation() {
+    let store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[0].clone()];
+    let session_id = "rs-duplicate-replay-head";
+    let operation_id = "op-duplicate-replay-head";
+    install_unstarted_batch(&store, session_id, operation_id, &actions);
+    store
+        .start_reconcile_batch(session_id, "exact-batch", operation_id, 0, &actions)
+        .unwrap();
+
+    let workload = actions[0].precondition().workload();
+    let environment = store
+        .load_environment_instance(workload.environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    let action_digest = format!(
+        "{}{}",
+        crate::reconcile::ReconcileActionExecutionKey::new(
+            session_id,
+            operation_id,
+            0,
+            &actions[0],
+        )
+        .unwrap()
+        .activation_digest_prefix()
+        .unwrap(),
+        "c".repeat(64)
+    );
+    let selector = StackContainerCreateSelector {
+        project_id: workload.project_id.clone(),
+        environment_id: workload.environment_id.clone(),
+        machine_id: workload.machine_id.clone(),
+        machine_incarnation_id: workload.machine_incarnation_id.clone(),
+        environment_generation: environment.lifecycle_generation,
+        stack_id: workload.stack_id.clone(),
+        service_name: actions[0].target().service_name.clone(),
+        replica_index: actions[0].target().index(),
+        requested_container_id: "ctr-linked-first".to_string(),
+        definition_digest: environment.definition_digest,
+        action_digest,
+        applied_config_digest: "vzsc1-sha256:linked-first".to_string(),
+    };
+    let linked = store
+        .resolve_or_begin_stack_container_create(&selector, 10)
+        .unwrap()
+        .0;
+    store
+        .publish_stack_container_create_failure(
+            &linked.scope.reservation_id,
+            "linked predecessor failed",
+            11,
+        )
+        .unwrap();
+    let linked = store
+        .load_stack_container_create_intent(&linked.scope.reservation_id)
+        .unwrap()
+        .unwrap();
+
+    let mut foreign = linked.clone();
+    foreign.scope.reservation_id = "zz-foreign-duplicate-head".to_string();
+    foreign.scope.machine_incarnation_id =
+        Some(MachineIncarnationId::new("inc_duplicate_replay_head").unwrap());
+    foreign.requested_container_id = "ctr-foreign-duplicate".to_string();
+    foreign.action_digest = "sha256:foreign-duplicate-head".to_string();
+    foreign.created_at = 12;
+    foreign.updated_at = 13;
+    foreign.completed_at = Some(13);
+    assert!(linked.scope.reservation_id < foreign.scope.reservation_id);
+    store
+        .conn
+        .execute(
+            "INSERT INTO stack_container_create_intents (
+                reservation_id, schema_version, project_id, environment_id, machine_id,
+                machine_incarnation_id, environment_generation, stack_id, service_name,
+                replica_index, service_generation, requested_container_id, definition_digest,
+                action_digest, status, intent_json, last_error, created_at, updated_at,
+                completed_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                       ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+            params![
+                foreign.scope.reservation_id,
+                foreign.schema_version,
+                foreign.scope.project_id.as_str(),
+                foreign.scope.environment_id.as_str(),
+                foreign.scope.machine_id.as_str(),
+                foreign
+                    .scope
+                    .machine_incarnation_id
+                    .as_ref()
+                    .unwrap()
+                    .as_str(),
+                i64::try_from(foreign.environment_generation).unwrap(),
+                foreign.scope.stack_id,
+                foreign.service_name,
+                i64::from(foreign.replica_index),
+                i64::try_from(foreign.service_generation).unwrap(),
+                foreign.requested_container_id,
+                foreign.definition_digest,
+                foreign.action_digest,
+                "failed",
+                serde_json::to_string(&foreign).unwrap(),
+                foreign.last_error,
+                i64::try_from(foreign.created_at).unwrap(),
+                i64::try_from(foreign.updated_at).unwrap(),
+                i64::try_from(foreign.completed_at.unwrap()).unwrap(),
+            ],
+        )
+        .unwrap();
+
+    let error = store
+        .start_reconcile_batch(session_id, "exact-batch", operation_id, 0, &actions)
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert!(
+        error
+            .to_string()
+            .contains("ambiguous latest journal generation")
+    );
+    assert_eq!(
+        store.load_audit_log_for_session(session_id).unwrap().len(),
+        1
+    );
+}
+
+#[test]
+fn started_claim_replay_rejects_generation_gaps_and_remove_successors() {
+    for case in ["never-gap", "remove-successor"] {
+        let store = StateStore::in_memory().unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let action = if case == "never-gap" {
+            seeded[0].clone()
+        } else {
+            seeded[2].clone()
+        };
+        let actions = vec![action];
+        let session_id = format!("rs-replay-{case}");
+        install_unstarted_batch(&store, &session_id, "op-replay-generation", &actions);
+        store
+            .start_reconcile_batch(
+                &session_id,
+                "exact-batch",
+                "op-replay-generation",
+                0,
+                &actions,
+            )
+            .unwrap();
+
+        let workload = actions[0].precondition().workload();
+        let environment = store
+            .load_environment_instance(workload.environment_id.as_str())
+            .unwrap()
+            .unwrap();
+        let action_digest = format!(
+            "{}{}",
+            crate::reconcile::ReconcileActionExecutionKey::new(
+                &session_id,
+                "op-replay-generation",
+                0,
+                &actions[0],
+            )
+            .unwrap()
+            .activation_digest_prefix()
+            .unwrap(),
+            "b".repeat(64)
+        );
+
+        if case == "remove-successor" {
+            let reservation_id = match actions[0].precondition().journal_head() {
+                crate::reconcile::ExpectedJournalHead::Exact { reservation_id, .. } => {
+                    reservation_id
+                }
+                crate::reconcile::ExpectedJournalHead::NeverJournaled => unreachable!(),
+            };
+            store
+                .begin_stack_container_cleanup(reservation_id, 200)
+                .unwrap();
+            store
+                .publish_stack_container_cleanup_success(reservation_id, 201)
+                .unwrap();
+        }
+
+        let selector = StackContainerCreateSelector {
+            project_id: workload.project_id.clone(),
+            environment_id: workload.environment_id.clone(),
+            machine_id: workload.machine_id.clone(),
+            machine_incarnation_id: workload.machine_incarnation_id.clone(),
+            environment_generation: environment.lifecycle_generation,
+            stack_id: workload.stack_id.clone(),
+            service_name: actions[0].target().service_name.clone(),
+            replica_index: actions[0].target().index(),
+            requested_container_id: format!("ctr-replay-{case}"),
+            definition_digest: environment.definition_digest.clone(),
+            action_digest,
+            applied_config_digest: "vzsc1-sha256:replay-generation".to_string(),
+        };
+        let first_successor = store
+            .resolve_or_begin_stack_container_create(&selector, 222)
+            .unwrap()
+            .0;
+        if case == "never-gap" {
+            assert_eq!(first_successor.service_generation, 1);
+            store
+                .publish_stack_container_create_failure(
+                    &first_successor.scope.reservation_id,
+                    "force a generation gap",
+                    223,
+                )
+                .unwrap();
+            assert_eq!(
+                store
+                    .resolve_or_begin_stack_container_create(&selector, 224)
+                    .unwrap()
+                    .0
+                    .service_generation,
+                2
+            );
+        } else {
+            assert_eq!(first_successor.service_generation, 2);
+        }
+
+        let error = store
+            .start_reconcile_batch(
+                &session_id,
+                "exact-batch",
+                "op-replay-generation",
+                0,
+                &actions,
+            )
+            .unwrap_err();
+        assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    }
+}
+
+#[test]
+fn claim_admission_holds_atomic_snapshot_against_concurrent_topology_change() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claim-topology-race.db");
+    let store = StateStore::open_with_pragmas(&path, StateStorePragmas::daemon_defaults()).unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[0].clone()];
+    install_unstarted_batch(&store, "rs-claim-race", "op-claim-race", &actions);
+
+    let workload = actions[0].precondition().workload().clone();
+    let mut changed_environment = store
+        .load_project_state(workload.project_id.as_str())
+        .unwrap()
+        .unwrap()
+        .environments
+        .into_iter()
+        .find(|environment| environment.environment_id == workload.environment_id)
+        .unwrap();
+    changed_environment.lifecycle_generation += 1;
+    changed_environment.updated_at += 1;
+
+    let validation_barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let claim_barrier = validation_barrier.clone();
+    let (release_tx, release_rx) = std::sync::mpsc::channel();
+    let claim_path = path.clone();
+    let claim_actions = actions.clone();
+    let claim = std::thread::spawn(move || {
+        let claim_store =
+            StateStore::open_with_pragmas(&claim_path, StateStorePragmas::daemon_defaults())
+                .unwrap();
+        claim_store.start_reconcile_batch_after_validation(
+            "rs-claim-race",
+            "exact-batch",
+            "op-claim-race",
+            0,
+            &claim_actions,
+            Box::new(move || {
+                claim_barrier.wait();
+                release_rx.recv().unwrap();
+            }),
+        )
+    });
+    validation_barrier.wait();
+
+    let mutation_path = path.clone();
+    let (attempted_tx, attempted_rx) = std::sync::mpsc::channel();
+    let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+    let mutation = std::thread::spawn(move || {
+        let mutation_store =
+            StateStore::open_with_pragmas(&mutation_path, StateStorePragmas::daemon_defaults())
+                .unwrap();
+        attempted_tx.send(()).unwrap();
+        let result = mutation_store.conn.execute(
+            "UPDATE environment_instances
+             SET lifecycle_generation = ?1, updated_at = ?2, instance_json = ?3
+             WHERE environment_id = ?4",
+            params![
+                i64::try_from(changed_environment.lifecycle_generation).unwrap(),
+                i64::try_from(changed_environment.updated_at).unwrap(),
+                serde_json::to_string(&changed_environment).unwrap(),
+                changed_environment.environment_id.as_str(),
+            ],
+        );
+        finished_tx.send(()).unwrap();
+        result.map(|affected| assert_eq!(affected, 1))
+    });
+    attempted_rx.recv().unwrap();
+    assert!(
+        finished_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .is_err(),
+        "topology writer must wait behind the claim transaction"
+    );
+    release_tx.send(()).unwrap();
+    assert_eq!(claim.join().unwrap().unwrap().len(), 1);
+    mutation.join().unwrap().unwrap();
+    finished_rx.recv().unwrap();
+
+    assert_eq!(
+        store
+            .load_audit_log_for_session("rs-claim-race")
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        store
+            .load_environment_instance(workload.environment_id.as_str())
+            .unwrap()
+            .unwrap()
+            .lifecycle_generation,
+        actions[0].precondition().environment_generation() + 1
+    );
+}
+
+#[test]
 fn exact_batch_successful_subsets_advance_monotonically_until_completion() {
     let store = StateStore::in_memory().unwrap();
-    let actions = exact_batch_actions();
+    let actions = exact_batch_actions_for_claim(&store);
     let session = ReconcileSession {
         session_id: "rs-exact-subsets".to_string(),
         stack_name: "exact-batch".to_string(),
