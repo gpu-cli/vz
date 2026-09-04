@@ -1,6 +1,9 @@
 use super::*;
 
-pub(super) fn topo_sort(actions: &[Action], deps: &HashMap<&str, &[String]>) -> Vec<Action> {
+pub(super) fn topo_sort(
+    actions: &[Action],
+    deps: &HashMap<&str, &[String]>,
+) -> Result<Vec<Action>, StackError> {
     // Partition into creates and removes.
     let mut creates: Vec<&Action> = Vec::new();
     let mut removes: Vec<&Action> = Vec::new();
@@ -18,29 +21,40 @@ pub(super) fn topo_sort(actions: &[Action], deps: &HashMap<&str, &[String]>) -> 
 
     // Topological sort for creates: dependencies first.
     let create_names: HashSet<&str> = creates.iter().map(|a| a.service_name()).collect();
-    let sorted_creates = topo_sort_names(&creates, deps, &create_names, false);
+    let sorted_creates = topo_sort_names(deps, &create_names, false)?;
 
     // Topological sort for removes: dependents first (reverse dependency order).
     let remove_names: HashSet<&str> = removes.iter().map(|a| a.service_name()).collect();
-    let sorted_removes = topo_sort_names(&removes, deps, &remove_names, true);
+    let sorted_removes = topo_sort_names(deps, &remove_names, true)?;
 
-    // Creates first, then removes.
-    let action_map: HashMap<&str, &Action> =
-        actions.iter().map(|a| (a.service_name(), a)).collect();
+    let mut result = actions_for_service_order(&creates, &sorted_creates);
+    result.extend(actions_for_service_order(&removes, &sorted_removes));
 
-    let mut result = Vec::new();
-    for name in sorted_creates {
-        if let Some(action) = action_map.get(name.as_str()) {
-            result.push((*action).clone());
-        }
+    if result.len() != actions.len() {
+        return Err(StackError::InvalidSpec(
+            "topological ordering lost exact replica actions".to_string(),
+        ));
     }
-    for name in sorted_removes {
-        if let Some(action) = action_map.get(name.as_str()) {
-            result.push((*action).clone());
-        }
+    Ok(result)
+}
+
+fn actions_for_service_order(actions: &[&Action], service_order: &[String]) -> Vec<Action> {
+    let mut grouped: HashMap<&str, Vec<&Action>> = HashMap::new();
+    for action in actions {
+        grouped
+            .entry(action.service_name())
+            .or_default()
+            .push(action);
+    }
+    for service_actions in grouped.values_mut() {
+        service_actions.sort_by(|left, right| left.target().cmp(right.target()));
     }
 
-    result
+    service_order
+        .iter()
+        .flat_map(|service_name| grouped.remove(service_name.as_str()).unwrap_or_default())
+        .cloned()
+        .collect()
 }
 
 /// Kahn's algorithm for topological sort with name-based tie-breaking.
@@ -48,12 +62,12 @@ pub(super) fn topo_sort(actions: &[Action], deps: &HashMap<&str, &[String]>) -> 
 /// When `reverse` is true, returns dependents before dependencies
 /// (useful for teardown ordering).
 fn topo_sort_names(
-    actions: &[&Action],
     deps: &HashMap<&str, &[String]>,
     action_set: &HashSet<&str>,
     reverse: bool,
-) -> Vec<String> {
-    let names: Vec<&str> = actions.iter().map(|a| a.service_name()).collect();
+) -> Result<Vec<String>, StackError> {
+    let mut names: Vec<&str> = action_set.iter().copied().collect();
+    names.sort_unstable();
 
     // Build in-degree map considering only actions in our set.
     let mut in_degree: HashMap<&str, usize> = HashMap::new();
@@ -111,5 +125,17 @@ fn topo_sort_names(
         queue.extend(newly_ready);
     }
 
-    result
+    if result.len() != names.len() {
+        let mut cyclic = names
+            .into_iter()
+            .filter(|name| !result.iter().any(|ordered| ordered == name))
+            .collect::<Vec<_>>();
+        cyclic.sort_unstable();
+        return Err(StackError::InvalidSpec(format!(
+            "dependency cycle among planned services: {}",
+            cyclic.join(", ")
+        )));
+    }
+
+    Ok(result)
 }

@@ -87,7 +87,8 @@ fn no_health() -> HashMap<String, HealthStatus> {
 
 fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
     ServiceObservedState {
-        service_name: name.to_string(),
+        replica: crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+        applied_config_digest: None,
         phase,
         container_id: None,
         failed_create_ownership: None,
@@ -98,9 +99,34 @@ fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
 
 fn obs_running(name: &str) -> ServiceObservedState {
     ServiceObservedState {
-        service_name: name.to_string(),
+        replica: crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+        applied_config_digest: None,
         phase: ServicePhase::Running,
         container_id: Some(format!("ctr-{name}")),
+        failed_create_ownership: None,
+        last_error: None,
+        ready: true,
+    }
+}
+
+fn obs_running_replica(name: &str, replica_index: u32) -> ServiceObservedState {
+    ServiceObservedState {
+        replica: crate::state_store::ServiceReplicaKey::new(name, replica_index).unwrap(),
+        applied_config_digest: None,
+        phase: ServicePhase::Running,
+        container_id: Some(format!("ctr-{name}-{replica_index}")),
+        failed_create_ownership: None,
+        last_error: None,
+        ready: true,
+    }
+}
+
+fn obs_running_for(service: &ServiceSpec, replica_index: u32) -> ServiceObservedState {
+    ServiceObservedState {
+        replica: crate::state_store::ServiceReplicaKey::new(&service.name, replica_index).unwrap(),
+        applied_config_digest: Some(service_config_digest(service)),
+        phase: ServicePhase::Running,
+        container_id: Some(format!("ctr-{}-{replica_index}", service.name)),
         failed_create_ownership: None,
         last_error: None,
         ready: true,
@@ -127,7 +153,7 @@ fn compute_actions_creates_new_services() {
 #[test]
 fn compute_actions_noop_when_converged() {
     let desired = vec![svc("web", "nginx:latest")];
-    let observed = vec![obs_running("web")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
     assert!(actions.is_empty());
@@ -151,14 +177,14 @@ fn compute_actions_recreates_running_service_when_mounts_change() {
         }],
         ..svc("web", "nginx:latest")
     }];
-    let observed = vec![obs_running("web")];
+    let observed = vec![obs_running_for(&previous[0], 1)];
 
     let (actions, deferred) =
         compute_actions(&desired, &observed, &no_health(), Some(previous.as_slice()));
     assert_eq!(
         actions,
         vec![Action::ServiceRecreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }]
     );
     assert!(deferred.is_empty());
@@ -174,7 +200,7 @@ fn compute_actions_recreates_running_service_when_persisted_digest_changes() {
         }],
         ..svc("web", "nginx:latest")
     }];
-    let observed = vec![obs_running("web")];
+    let mut observed = vec![obs_running("web")];
     // The stored digest is the full config digest of the old service.
     let old_service = ServiceSpec {
         mounts: vec![MountSpec::Bind {
@@ -184,6 +210,7 @@ fn compute_actions_recreates_running_service_when_persisted_digest_changes() {
         }],
         ..svc("web", "nginx:latest")
     };
+    observed[0].applied_config_digest = Some(service_config_digest(&old_service));
     let mut observed_config_digests = HashMap::new();
     observed_config_digests.insert("web".to_string(), service_config_digest(&old_service));
 
@@ -193,11 +220,12 @@ fn compute_actions_recreates_running_service_when_persisted_digest_changes() {
         &no_health(),
         None,
         &observed_config_digests,
-    );
+    )
+    .unwrap();
     assert_eq!(
         actions,
         vec![Action::ServiceRecreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }]
     );
     assert!(deferred.is_empty());
@@ -221,7 +249,7 @@ fn compute_actions_keeps_running_service_when_mounts_match_previous_spec() {
         }],
         ..svc("web", "nginx:latest")
     }];
-    let observed = vec![obs_running("web")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     let (actions, deferred) =
         compute_actions(&desired, &observed, &no_health(), Some(previous.as_slice()));
@@ -232,14 +260,14 @@ fn compute_actions_keeps_running_service_when_mounts_match_previous_spec() {
 #[test]
 fn compute_actions_removes_extra_services() {
     let desired = vec![svc("web", "nginx:latest")];
-    let observed = vec![obs_running("web"), obs_running("old-svc")];
+    let observed = vec![obs_running_for(&desired[0], 1), obs_running("old-svc")];
 
     let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
     assert_eq!(actions.len(), 1);
     assert_eq!(
         actions[0],
         Action::ServiceRemove {
-            service_name: "old-svc".to_string()
+            target: crate::state_store::ServiceReplicaKey::first("old-svc".to_string()).unwrap(),
         }
     );
 }
@@ -254,7 +282,7 @@ fn compute_actions_recreates_pending_services() {
     assert_eq!(
         actions[0],
         Action::ServiceCreate {
-            service_name: "web".to_string()
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }
     );
 }
@@ -272,7 +300,7 @@ fn compute_actions_recreates_failed_services() {
     assert_eq!(
         actions[0],
         Action::ServiceCreate {
-            service_name: "web".to_string()
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }
     );
 }
@@ -417,7 +445,7 @@ fn dep_gating_service_started_ignores_healthcheck() {
         svc_with_healthcheck("db", "postgres:16"),
         svc_with_deps("web", "nginx:latest", vec!["db"]),
     ];
-    let observed = vec![obs_running("db")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     // No health status — but condition is service_started, so web is unblocked.
     // db is Running (no action), web is not yet created → ServiceCreate.
@@ -436,7 +464,7 @@ fn dep_gating_service_healthy_blocks_until_healthy() {
         svc_with_healthcheck("db", "postgres:16"),
         svc_with_healthy_deps("web", "nginx:latest", vec!["db"]),
     ];
-    let observed = vec![obs_running("db")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     // No health status → health check hasn't passed → web is deferred.
     let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
@@ -454,7 +482,7 @@ fn dep_gating_service_healthy_unblocks_when_healthy() {
         svc_with_healthcheck("db", "postgres:16"),
         svc_with_healthy_deps("web", "nginx:latest", vec!["db"]),
     ];
-    let observed = vec![obs_running("db")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     let mut health = HashMap::new();
     let mut db_health = HealthStatus::new("db");
@@ -511,7 +539,7 @@ fn apply_creates_new_services() {
     assert_eq!(
         result.actions[0],
         Action::ServiceCreate {
-            service_name: "web".to_string()
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }
     );
 
@@ -533,7 +561,8 @@ fn apply_is_idempotent_when_running() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: Some(service_config_digest(&s.services[0])),
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
                 failed_create_ownership: None,
@@ -560,9 +589,9 @@ fn apply_removes_deleted_services() {
     apply(&s1, &store, &no_health()).unwrap();
 
     // Simulate both Running.
-    for name in &["web", "db"] {
+    for service in &s1.services {
         store
-            .save_observed_state("myapp", &obs_running(name))
+            .save_observed_state("myapp", &obs_running_for(service, 1))
             .unwrap();
     }
 
@@ -574,15 +603,15 @@ fn apply_removes_deleted_services() {
     assert_eq!(
         result.actions[0],
         Action::ServiceRemove {
-            service_name: "db".to_string()
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         }
     );
     let observed = store.load_observed_state("myapp").unwrap();
     let db = observed
         .iter()
-        .find(|state| state.service_name == "db")
+        .find(|state| state.replica.service_name == "db")
         .unwrap();
-    assert_eq!(db.container_id.as_deref(), Some("ctr-db"));
+    assert_eq!(db.container_id.as_deref(), Some("ctr-db-1"));
 }
 
 #[test]
@@ -595,7 +624,9 @@ fn apply_preserves_unproven_failed_ids_for_cleanup_quarantine() {
             .save_observed_state(
                 "myapp",
                 &ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: crate::state_store::ServiceReplicaKey::first("web".to_string())
+                        .unwrap(),
+                    applied_config_digest: None,
                     phase: ServicePhase::Failed,
                     container_id: Some("unproven-id".to_string()),
                     failed_create_ownership: None,
@@ -631,7 +662,8 @@ fn apply_preserves_successful_runtime_ownership_for_recreate() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some(ownership.container_id.clone()),
                 failed_create_ownership: Some(ownership.clone()),
@@ -677,7 +709,9 @@ fn apply_preserves_runtime_ownership_independent_of_container_name() {
             .save_observed_state(
                 "myapp",
                 &ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: crate::state_store::ServiceReplicaKey::first("web".to_string())
+                        .unwrap(),
+                    applied_config_digest: None,
                     phase: ServicePhase::Failed,
                     container_id: Some(ownership.container_id.clone()),
                     failed_create_ownership: Some(ownership.clone()),
@@ -748,7 +782,7 @@ fn apply_emits_mount_topology_recreate_required_before_service_creating() {
     assert_eq!(
         result.actions,
         vec![Action::ServiceRecreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }]
     );
 
@@ -799,7 +833,7 @@ fn apply_with_healthcheck_gating_service_healthy() {
 
     // Simulate db Running but health check NOT yet passing.
     store
-        .save_observed_state("myapp", &obs_running("db"))
+        .save_observed_state("myapp", &obs_running_for(&s.services[0], 1))
         .unwrap();
 
     // With no health pass, web is still deferred.
@@ -834,7 +868,7 @@ fn apply_with_healthcheck_service_started_ignores_health() {
 
     // Simulate db Running but health check NOT yet passing.
     store
-        .save_observed_state("myapp", &obs_running("db"))
+        .save_observed_state("myapp", &obs_running_for(&s.services[0], 1))
         .unwrap();
     store
         .save_observed_state("myapp", &obs("web", ServicePhase::Stopped))
@@ -975,26 +1009,27 @@ fn teardown_without_previous_spec_falls_back_to_alphabetical() {
 fn actions_hash_deterministic_same_input() {
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
     let hash1 = compute_actions_hash(&actions);
     let hash2 = compute_actions_hash(&actions);
     assert_eq!(hash1, hash2);
-    assert_eq!(hash1.len(), 16, "hash should be 16 hex characters");
+    assert!(hash1.starts_with("vzrah1-sha256:"));
+    assert_eq!(hash1.len(), "vzrah1-sha256:".len() + 64);
 }
 
 #[test]
 fn actions_hash_differs_for_different_actions() {
     let a = vec![Action::ServiceCreate {
-        service_name: "db".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
     }];
     let b = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     assert_ne!(compute_actions_hash(&a), compute_actions_hash(&b));
@@ -1003,13 +1038,13 @@ fn actions_hash_differs_for_different_actions() {
 #[test]
 fn actions_hash_differs_for_different_kinds() {
     let a = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let b = vec![Action::ServiceRecreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let c = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let hash_a = compute_actions_hash(&a);
@@ -1025,18 +1060,18 @@ fn actions_hash_differs_for_different_kinds() {
 fn actions_hash_order_matters() {
     let a = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let b = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1046,8 +1081,24 @@ fn actions_hash_order_matters() {
 #[test]
 fn actions_hash_empty_list() {
     let hash = compute_actions_hash(&[]);
-    assert_eq!(hash.len(), 16);
+    assert!(hash.starts_with("vzrah1-sha256:"));
+    assert_eq!(hash.len(), "vzrah1-sha256:".len() + 64);
     // Empty list should still produce a valid hash.
+}
+
+#[test]
+fn actions_hash_distinguishes_exact_replica_identity() {
+    let second_api_replica = vec![Action::ServiceCreate {
+        target: crate::state_store::ServiceReplicaKey::new("api", 2).unwrap(),
+    }];
+    let similarly_decorated_base = vec![Action::ServiceCreate {
+        target: crate::state_store::ServiceReplicaKey::new("api-2", 1).unwrap(),
+    }];
+
+    assert_ne!(
+        compute_actions_hash(&second_api_replica),
+        compute_actions_hash(&similarly_decorated_base)
+    );
 }
 
 // ── Replica-aware reconciliation tests ──
@@ -1065,17 +1116,19 @@ fn svc_with_replicas(name: &str, image: &str, replicas: u32) -> ServiceSpec {
 
 #[test]
 fn compute_actions_creates_replicated_service() {
-    // replicas=3, no observed → ServiceCreate for the base name.
+    // replicas=3, no observed → one exact create per replica.
     let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
     let observed = vec![];
 
     let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
-    assert_eq!(actions.len(), 1);
+    assert_eq!(actions.len(), 3);
     assert_eq!(
-        actions[0],
-        Action::ServiceCreate {
-            service_name: "web".to_string()
-        }
+        actions,
+        (1..=3)
+            .map(|replica_index| Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", replica_index).unwrap(),
+            })
+            .collect::<Vec<_>>()
     );
     assert!(deferred.is_empty());
 }
@@ -1085,9 +1138,9 @@ fn compute_actions_noop_for_converged_replicas() {
     // replicas=3, all 3 Running → no actions.
     let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
     let observed = vec![
-        obs_running("web"),
-        obs_running("web-2"),
-        obs_running("web-3"),
+        obs_running_for(&desired[0], 1),
+        obs_running_for(&desired[0], 2),
+        obs_running_for(&desired[0], 3),
     ];
 
     let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
@@ -1099,7 +1152,7 @@ fn compute_actions_noop_for_converged_replicas() {
 fn explicit_container_name_does_not_replace_observed_service_identity() {
     let mut service = svc_with_replicas("web", "nginx:latest", 2);
     service.container_name = Some("globally-explicit-web".to_string());
-    let observed = vec![obs_running("web"), obs_running("web-2")];
+    let observed = vec![obs_running_for(&service, 1), obs_running_for(&service, 2)];
 
     let (actions, deferred) = compute_actions(&[service], &observed, &no_health(), None);
 
@@ -1111,15 +1164,20 @@ fn explicit_container_name_does_not_replace_observed_service_identity() {
 fn compute_actions_scale_up() {
     // observed has only "web" Running, desired replicas=3 → ServiceCreate.
     let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
-    let observed = vec![obs_running("web")];
+    let observed = vec![obs_running_for(&desired[0], 1)];
 
     let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
-    assert_eq!(actions.len(), 1);
+    assert_eq!(actions.len(), 2);
     assert_eq!(
-        actions[0],
-        Action::ServiceCreate {
-            service_name: "web".to_string()
-        }
+        actions,
+        vec![
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            },
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
+            },
+        ]
     );
     assert!(deferred.is_empty());
 }
@@ -1130,20 +1188,20 @@ fn compute_actions_scale_down() {
     let desired = vec![svc_with_replicas("web", "nginx:latest", 1)];
     let observed = vec![
         obs_running("web"),
-        obs_running("web-2"),
-        obs_running("web-3"),
+        obs_running_replica("web", 2),
+        obs_running_replica("web", 3),
     ];
 
     let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
-    let mut remove_names: Vec<&str> = actions
+    let mut remove_indices: Vec<u32> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+            Action::ServiceRemove { target } => Some(target.index()),
             _ => None,
         })
         .collect();
-    remove_names.sort();
-    assert_eq!(remove_names, vec!["web-2", "web-3"]);
+    remove_indices.sort_unstable();
+    assert_eq!(remove_indices, vec![2, 3]);
 }
 
 #[test]
@@ -1152,8 +1210,8 @@ fn compute_actions_removes_all_replicas() {
     let desired: Vec<ServiceSpec> = vec![];
     let observed = vec![
         obs_running("web"),
-        obs_running("web-2"),
-        obs_running("web-3"),
+        obs_running_replica("web", 2),
+        obs_running_replica("web", 3),
     ];
 
     let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
@@ -1171,18 +1229,114 @@ fn compute_actions_does_not_remove_replicas_of_running_service() {
     // specifies replicas >= 2. This was the original bug.
     let desired = vec![svc_with_replicas("web", "nginx:latest", 3)];
     let observed = vec![
-        obs_running("web"),
-        obs_running("web-2"),
-        obs_running("web-3"),
+        obs_running_for(&desired[0], 1),
+        obs_running_for(&desired[0], 2),
+        obs_running_for(&desired[0], 3),
     ];
 
     let (actions, _) = compute_actions(&desired, &observed, &no_health(), None);
     let removes: Vec<&str> = actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
     assert!(removes.is_empty(), "should not remove any running replicas");
+    assert!(actions.is_empty());
+}
+
+#[test]
+fn compute_actions_creates_only_missing_middle_replica() {
+    let desired = vec![svc_with_replicas("api", "api:v1", 3)];
+    let observed = vec![
+        obs_running_for(&desired[0], 1),
+        obs_running_for(&desired[0], 3),
+    ];
+    let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), None);
+    assert_eq!(
+        actions,
+        vec![Action::ServiceCreate {
+            target: ServiceReplicaKey::new("api", 2).unwrap(),
+        }]
+    );
+    assert!(deferred.is_empty());
+}
+
+#[test]
+fn compute_actions_recreates_each_stale_config_replica() {
+    let old = svc_with_replicas("api", "api:v1", 3);
+    let desired = vec![svc_with_replicas("api", "api:v2", 3)];
+    let observed = (1..=3)
+        .map(|index| obs_running_for(&old, index))
+        .collect::<Vec<_>>();
+    let (actions, deferred) = compute_actions(&desired, &observed, &no_health(), Some(&[old]));
+    assert_eq!(
+        actions,
+        (1..=3)
+            .map(|index| Action::ServiceRecreate {
+                target: ServiceReplicaKey::new("api", index).unwrap(),
+            })
+            .collect::<Vec<_>>()
+    );
+    assert!(deferred.is_empty());
+}
+
+#[test]
+fn planner_keeps_suffix_ambiguous_exact_targets_distinct() {
+    let desired = vec![
+        svc_with_replicas("api", "api:v1", 2),
+        svc("api-2", "worker:v1"),
+    ];
+    let (actions, _) = compute_actions(&desired, &[], &no_health(), None);
+    assert!(
+        actions
+            .iter()
+            .any(|action| { action.target() == &ServiceReplicaKey::new("api", 2).unwrap() })
+    );
+    assert!(
+        actions
+            .iter()
+            .any(|action| { action.target() == &ServiceReplicaKey::new("api-2", 1).unwrap() })
+    );
+    assert_eq!(actions.len(), 3);
+}
+
+#[test]
+fn planner_rejects_cycle_even_when_all_replicas_are_running() {
+    let desired = vec![
+        svc_with_deps("a", "a:v1", vec!["b"]),
+        svc_with_deps("b", "b:v1", vec!["a"]),
+    ];
+    let observed = vec![
+        obs_running_for(&desired[0], 1),
+        obs_running_for(&desired[1], 1),
+    ];
+    let error = compute_actions_with_mount_digests(
+        &desired,
+        &observed,
+        &no_health(),
+        None,
+        &HashMap::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("dependency cycle"));
+}
+
+#[test]
+fn planner_rejects_cyclic_teardown_instead_of_returning_partial_actions() {
+    let previous = vec![
+        svc_with_deps("a", "a:v1", vec!["b"]),
+        svc_with_deps("b", "b:v1", vec!["a"]),
+    ];
+    let observed = vec![obs_running("a"), obs_running("b")];
+    let error = compute_actions_with_mount_digests(
+        &[],
+        &observed,
+        &no_health(),
+        Some(&previous),
+        &HashMap::new(),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("dependency cycle"));
 }

@@ -89,7 +89,8 @@ fn svc_with_healthcheck(name: &str) -> ServiceSpec {
 
 fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
     ServiceObservedState {
-        service_name: name.to_string(),
+        replica: crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+        applied_config_digest: None,
         phase,
         container_id: None,
         failed_create_ownership: None,
@@ -442,7 +443,7 @@ fn dep_stopped_is_blocked() {
 
 #[test]
 fn observed_state_ready_field_defaults_false() {
-    let json = r#"{"service_name":"web","phase":"Running"}"#;
+    let json = r#"{"replica":{"service_name":"web","replica_index":1},"phase":"Running"}"#;
     let state: ServiceObservedState = serde_json::from_str(json).unwrap();
     assert!(!state.ready);
 }
@@ -488,7 +489,8 @@ fn stack_with_hc(name: &str, services: Vec<ServiceSpec>) -> StackSpec {
 
 fn running_obs(name: &str, container_id: &str) -> ServiceObservedState {
     ServiceObservedState {
-        service_name: name.to_string(),
+        replica: crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+        applied_config_digest: None,
         phase: ServicePhase::Running,
         container_id: Some(container_id.to_string()),
         failed_create_ownership: None,
@@ -530,7 +532,10 @@ fn poller_pass_marks_service_ready() {
 
     // Observed state should have ready=true.
     let observed = store.load_observed_state("app").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert!(web.ready);
     assert_eq!(web.phase, ServicePhase::Running);
     assert_eq!(web.failed_create_ownership, Some(ownership));
@@ -578,7 +583,10 @@ fn poller_failure_emits_event_without_failing_service() {
 
     // Service still Running.
     let observed = store.load_observed_state("app").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Running);
 }
 
@@ -611,7 +619,10 @@ fn poller_retries_exhausted_marks_unhealthy_but_keeps_running() {
 
     // Service stays Running (Docker semantics: unhealthy != killed).
     let observed = store.load_observed_state("app").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Running);
 
     // Counter is reset so health checks continue.
@@ -640,7 +651,8 @@ fn poller_skips_non_running_services() {
         .save_observed_state(
             "app",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Pending,
                 container_id: None,
                 failed_create_ownership: None,

@@ -140,7 +140,7 @@ impl HealthPoller {
         let observed = store.load_observed_state(&spec.name)?;
         let observed_map: HashMap<&str, &ServiceObservedState> = observed
             .iter()
-            .map(|o| (o.service_name.as_str(), o))
+            .map(|o| (o.replica.service_name.as_str(), o))
             .collect();
 
         let mut result = HealthPollResult::default();
@@ -265,7 +265,8 @@ impl HealthPoller {
                     store.save_observed_state(
                         &spec.name,
                         &ServiceObservedState {
-                            service_name: svc.name.clone(),
+                            replica: obs.replica.clone(),
+                            applied_config_digest: obs.applied_config_digest.clone(),
                             phase: ServicePhase::Running,
                             container_id: Some(container_id.clone()),
                             failed_create_ownership: obs.failed_create_ownership.clone(),

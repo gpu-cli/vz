@@ -13,11 +13,204 @@ use vz_runtime_contract::types::{
     migrate_legacy_developer_sandbox,
 };
 
-use super::StateStore;
+use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 4;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 5;
+const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
+
+const REPLICA_SCHEMA_V5_DDL: &str = r#"
+ALTER TABLE stack_container_create_intents
+    ADD COLUMN applied_config_digest TEXT
+        CHECK(applied_config_digest IS NULL OR length(trim(applied_config_digest)) > 0);
+UPDATE stack_container_create_intents
+SET applied_config_digest = json_extract(intent_json, '$.applied_config_digest')
+WHERE json_type(intent_json, '$.applied_config_digest') IS 'text';
+DROP TRIGGER stack_container_create_intent_immutable;
+CREATE TRIGGER stack_container_create_intent_immutable
+BEFORE UPDATE OF
+    reservation_id, schema_version, project_id, environment_id, machine_id,
+    machine_incarnation_id, environment_generation, stack_id, service_name,
+    replica_index, service_generation, requested_container_id, definition_digest,
+    action_digest, applied_config_digest, created_at
+ON stack_container_create_intents
+WHEN
+    NEW.reservation_id <> OLD.reservation_id OR
+    NEW.schema_version <> OLD.schema_version OR
+    NEW.project_id <> OLD.project_id OR
+    NEW.environment_id <> OLD.environment_id OR
+    NEW.machine_id <> OLD.machine_id OR
+    NEW.machine_incarnation_id <> OLD.machine_incarnation_id OR
+    NEW.environment_generation <> OLD.environment_generation OR
+    NEW.stack_id <> OLD.stack_id OR
+    NEW.service_name <> OLD.service_name OR
+    NEW.replica_index <> OLD.replica_index OR
+    NEW.service_generation <> OLD.service_generation OR
+    NEW.requested_container_id <> OLD.requested_container_id OR
+    NEW.definition_digest <> OLD.definition_digest OR
+    NEW.action_digest <> OLD.action_digest OR
+    NEW.applied_config_digest IS NOT OLD.applied_config_digest OR
+    NEW.created_at <> OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'stack container create intent projections are immutable');
+END;
+
+ALTER TABLE observed_state RENAME TO observed_state_v4;
+CREATE TABLE observed_state (
+    id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    service_name TEXT NOT NULL CHECK(length(trim(service_name)) BETWEEN 1 AND 128),
+    replica_index INTEGER NOT NULL CHECK(replica_index > 0),
+    state_json TEXT NOT NULL CHECK(json_valid(state_json)),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(stack_name, service_name, replica_index),
+    CHECK(json_type(state_json, '$.replica.service_name') IS 'text'),
+    CHECK(json_type(state_json, '$.replica.replica_index') IS 'integer'),
+    CHECK(json_extract(state_json, '$.replica.service_name') IS service_name),
+    CHECK(json_extract(state_json, '$.replica.replica_index') IS replica_index)
+);
+CREATE TABLE legacy_observed_state_quarantine_v5 (
+    legacy_id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    replica_index INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    quarantined_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+DROP INDEX idx_reconcile_session_stack;
+DROP INDEX idx_reconcile_session_status;
+ALTER TABLE reconcile_sessions RENAME TO reconcile_sessions_v4;
+CREATE TABLE legacy_reconcile_sessions_quarantine_v5 (
+    session_id TEXT PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    status TEXT NOT NULL,
+    actions_json TEXT NOT NULL,
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL,
+    total_actions INTEGER NOT NULL,
+    started_at INTEGER NOT NULL,
+    updated_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    reason TEXT NOT NULL
+);
+INSERT INTO legacy_reconcile_sessions_quarantine_v5 (
+    session_id, stack_name, operation_id, status, actions_json, actions_hash,
+    next_action_index, total_actions, started_at, updated_at, completed_at, reason
+)
+SELECT session_id, stack_name, operation_id, status, actions_json, actions_hash,
+       next_action_index, total_actions, started_at, updated_at, completed_at,
+       'terminal legacy aggregate action session'
+FROM reconcile_sessions_v4;
+CREATE TABLE reconcile_sessions (
+    session_id TEXT PRIMARY KEY,
+    stack_name TEXT NOT NULL,
+    operation_id TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active', 'completed', 'failed', 'superseded')),
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 2),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL CHECK(next_action_index >= 0),
+    total_actions INTEGER NOT NULL CHECK(total_actions >= 0),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= started_at),
+    completed_at INTEGER,
+    CHECK(next_action_index <= total_actions),
+    CHECK(status <> 'completed' OR next_action_index = total_actions),
+    CHECK(
+        (status = 'active' AND completed_at IS NULL) OR
+        (status <> 'active' AND completed_at IS NOT NULL AND completed_at >= updated_at)
+    )
+);
+DROP TABLE reconcile_sessions_v4;
+CREATE INDEX idx_reconcile_session_stack ON reconcile_sessions(stack_name);
+CREATE INDEX idx_reconcile_session_status ON reconcile_sessions(status);
+
+ALTER TABLE reconcile_progress RENAME TO reconcile_progress_v4;
+CREATE TABLE legacy_reconcile_progress_quarantine_v5 (
+    legacy_id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    actions_json TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL,
+    updated_at TEXT NOT NULL,
+    reason TEXT NOT NULL
+);
+INSERT INTO legacy_reconcile_progress_quarantine_v5 (
+    legacy_id, stack_name, operation_id, actions_json,
+    next_action_index, updated_at, reason
+)
+SELECT id, stack_name, operation_id, actions_json,
+       next_action_index, updated_at, 'completed legacy aggregate progress marker'
+FROM reconcile_progress_v4;
+CREATE TABLE reconcile_progress (
+    id INTEGER PRIMARY KEY,
+    stack_name TEXT NOT NULL UNIQUE,
+    operation_id TEXT NOT NULL,
+    action_schema_version INTEGER NOT NULL CHECK(action_schema_version = 2),
+    actions_json TEXT NOT NULL CHECK(json_valid(actions_json)),
+    actions_hash TEXT NOT NULL,
+    next_action_index INTEGER NOT NULL CHECK(next_action_index >= 0),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+DROP TABLE reconcile_progress_v4;
+
+DROP INDEX idx_audit_session;
+DROP INDEX idx_audit_stack;
+ALTER TABLE reconcile_audit_log RENAME TO reconcile_audit_log_v4;
+CREATE TABLE legacy_reconcile_audit_quarantine_v5 (
+    legacy_id INTEGER PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    stack_name TEXT NOT NULL,
+    action_index INTEGER NOT NULL,
+    action_kind TEXT NOT NULL,
+    service_name TEXT NOT NULL,
+    action_hash TEXT NOT NULL,
+    status TEXT NOT NULL,
+    started_at INTEGER NOT NULL,
+    completed_at INTEGER,
+    error_message TEXT,
+    reason TEXT NOT NULL
+);
+INSERT INTO legacy_reconcile_audit_quarantine_v5 (
+    legacy_id, session_id, stack_name, action_index, action_kind,
+    service_name, action_hash, status, started_at, completed_at,
+    error_message, reason
+)
+SELECT id, session_id, stack_name, action_index, action_kind,
+       service_name, action_hash, status, started_at, completed_at,
+       error_message, 'legacy aggregate action identity'
+FROM reconcile_audit_log_v4;
+DROP TABLE reconcile_audit_log_v4;
+CREATE TABLE reconcile_audit_log (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    stack_name TEXT NOT NULL,
+    action_index INTEGER NOT NULL CHECK(action_index >= 0),
+    action_kind TEXT NOT NULL
+        CHECK(action_kind IN ('service_create', 'service_recreate', 'service_remove')),
+    service_name TEXT NOT NULL CHECK(length(trim(service_name)) BETWEEN 1 AND 128),
+    replica_index INTEGER NOT NULL CHECK(replica_index > 0),
+    action_hash TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('started', 'completed', 'failed')),
+    started_at INTEGER NOT NULL CHECK(started_at >= 0),
+    completed_at INTEGER CHECK(completed_at IS NULL OR completed_at >= started_at),
+    error_message TEXT,
+    UNIQUE(session_id, action_index),
+    CHECK(
+        (status = 'started' AND completed_at IS NULL AND error_message IS NULL) OR
+        (status = 'completed' AND completed_at IS NOT NULL AND error_message IS NULL) OR
+        (status = 'failed' AND completed_at IS NOT NULL AND error_message IS NOT NULL)
+    )
+);
+CREATE INDEX idx_audit_session ON reconcile_audit_log(session_id);
+CREATE INDEX idx_audit_stack ON reconcile_audit_log(stack_name);
+"#;
 
 /// Result of atomically selecting or reserving an Environment for `up`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -312,6 +505,12 @@ enum StackJournalV4MigrationStage {
     JournalSchemaCreated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplicaV5MigrationStage {
+    DurableActionsRebuilt,
+    ObservedStateRebuilt,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -328,6 +527,13 @@ pub(super) enum TopologyV3MigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum StackJournalV4MigrationFailpoint {
     AfterJournalSchemaCreated,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ReplicaV5MigrationFailpoint {
+    AfterDurableActionsRebuilt,
+    AfterObservedStateRebuilt,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -595,6 +801,163 @@ impl StateStore {
         reference.create_stack_journal_schema_v4()?;
 
         self.validate_schema_against(4, &reference.conn)
+    }
+
+    pub(super) fn validate_v5_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+
+        self.validate_schema_against(5, &reference.conn)
+    }
+
+    pub(super) fn create_replica_schema_v5(&self) -> Result<(), StackError> {
+        self.create_replica_schema_v5_with_hook(|| Ok(()))
+    }
+
+    fn create_replica_schema_v5_with_hook(
+        &self,
+        mut after_durable_actions: impl FnMut() -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        let mut statement = self.conn.prepare(
+            "SELECT id, stack_name, service_name, replica_index, state_json, updated_at
+             FROM observed_state ORDER BY id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, i64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, String>(5)?,
+            ))
+        })?;
+        let legacy_rows = rows.collect::<Result<Vec<_>, _>>()?;
+        drop(statement);
+
+        self.conn.execute_batch(REPLICA_SCHEMA_V5_DDL)?;
+        after_durable_actions()?;
+
+        for (id, stack_name, service_name, replica_index, state_json, updated_at) in legacy_rows {
+            let replica_index_u32 = u32::try_from(replica_index).ok();
+            let authoritative_reservation =
+                if let Some(index) = replica_index_u32.filter(|index| *index > 0) {
+                    self.conn
+                        .query_row(
+                            "SELECT reservation_id
+                     FROM stack_container_create_intents
+                     WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+                     ORDER BY
+                        CASE status
+                          WHEN 'intent' THEN 0 WHEN 'reserved' THEN 0
+                          WHEN 'running' THEN 0 WHEN 'cleanup_pending' THEN 0
+                          WHEN 'blocked' THEN 0 ELSE 1
+                        END,
+                        service_generation DESC
+                     LIMIT 1",
+                            params![stack_name, service_name, index],
+                            |row| row.get::<_, String>(0),
+                        )
+                        .optional()?
+                } else {
+                    None
+                };
+
+            let Some(reservation_id) = authoritative_reservation else {
+                let reason = if replica_index == 0 {
+                    "legacy replica-zero identity"
+                } else {
+                    "replica row lacks exact journal authority"
+                };
+                self.conn.execute(
+                    "INSERT INTO legacy_observed_state_quarantine_v5 (
+                        legacy_id, stack_name, service_name, replica_index,
+                        state_json, updated_at, reason
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        id,
+                        stack_name,
+                        service_name,
+                        replica_index,
+                        state_json,
+                        updated_at,
+                        reason
+                    ],
+                )?;
+                continue;
+            };
+
+            let index = replica_index_u32.ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "journal-backed v4 observed row {id} has invalid replica index {replica_index}"
+                ))
+            })?;
+            let expected_legacy_name = if index == 1 {
+                service_name.clone()
+            } else {
+                format!("{service_name}-{index}")
+            };
+            let mut value: serde_json::Value = serde_json::from_str(&state_json).map_err(|error| {
+                StackError::InvalidSpec(format!(
+                    "v4 observed row {id} for `{stack_name}/{service_name}/{index}` has invalid JSON: {error}"
+                ))
+            })?;
+            let object = value.as_object_mut().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "v4 observed row {id} for `{stack_name}/{service_name}/{index}` is not an object"
+                ))
+            })?;
+            let legacy_name = object
+                .remove("service_name")
+                .and_then(|value| value.as_str().map(str::to_owned))
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "v4 observed row {id} for `{stack_name}/{service_name}/{index}` lacks its legacy service name"
+                    ))
+                })?;
+            if legacy_name != expected_legacy_name {
+                return Err(StackError::InvalidSpec(format!(
+                    "v4 observed row {id} identity mismatch: SQL `{service_name}/{index}` but JSON `{legacy_name}`"
+                )));
+            }
+            let replica = ServiceReplicaKey::new(service_name.clone(), index)?;
+            object.insert("replica".to_string(), serde_json::to_value(&replica)?);
+            let observed: ServiceObservedState = serde_json::from_value(value).map_err(|error| {
+                StackError::InvalidSpec(format!(
+                    "v4 observed row {id} for `{stack_name}/{service_name}/{index}` is corrupt: {error}"
+                ))
+            })?;
+            let canonical_json = serde_json::to_string(&observed)?;
+            self.conn.execute(
+                "INSERT INTO observed_state (
+                    id, stack_name, service_name, replica_index, state_json, updated_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    id,
+                    stack_name,
+                    service_name,
+                    index,
+                    canonical_json,
+                    updated_at
+                ],
+            )?;
+            let intent = self
+                .load_stack_container_create_intent(&reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "authoritative reservation `{reservation_id}` disappeared during replica migration"
+                    ))
+                })?;
+            self.require_journal_observed_consistent(&intent)?;
+        }
+        self.conn.execute_batch("DROP TABLE observed_state_v4")?;
+        Ok(())
     }
 
     fn validate_schema_against(
@@ -3173,6 +3536,162 @@ impl StateStore {
         self.migrate_stack_journal_v3_to_v4_with_hook(|_| Ok(()))
     }
 
+    pub(super) fn migrate_replica_v4_to_v5(&self) -> Result<(), StackError> {
+        self.migrate_replica_v4_to_v5_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_replica_v4_to_v5_with_hook(
+        &self,
+        mut hook: impl FnMut(ReplicaV5MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != STACK_JOURNAL_SCHEMA_VERSION {
+                return Err(StackError::InvalidSpec(format!(
+                    "replica identity migration requires state schema version 4, found {schema_version}"
+                )));
+            }
+            store.validate_v4_schema()?;
+
+            let mut progress_statement = store.conn.prepare(
+                "SELECT stack_name, actions_json, next_action_index FROM reconcile_progress",
+            )?;
+            let progress_rows = progress_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?,
+                ))
+            })?;
+            for row in progress_rows {
+                let (stack_name, actions_json, cursor_raw) = row?;
+                let actions = serde_json::from_str::<serde_json::Value>(&actions_json)
+                    .map_err(|error| {
+                        StackError::InvalidSpec(format!(
+                            "legacy reconcile progress for `{stack_name}` is malformed: {error}"
+                        ))
+                    })?;
+                let action_count = actions.as_array().map(Vec::len).ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "legacy reconcile progress for `{stack_name}` is not an action array"
+                    ))
+                })?;
+                let cursor = usize::try_from(cursor_raw).map_err(|_| {
+                    StackError::InvalidSpec(format!(
+                        "legacy reconcile progress for `{stack_name}` has invalid cursor {cursor_raw}"
+                    ))
+                })?;
+                if cursor > action_count {
+                    return Err(StackError::InvalidSpec(format!(
+                        "legacy reconcile progress for `{stack_name}` has cursor {cursor} beyond {action_count} actions"
+                    )));
+                }
+                if cursor < action_count {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v4 contains pending aggregate reconcile progress for `{stack_name}`; explicit recovery or quarantine is required before replica identity migration"
+                    )));
+                }
+            }
+            drop(progress_statement);
+            let mut session_statement = store.conn.prepare(
+                "SELECT session_id, status, actions_json, next_action_index, total_actions,
+                        started_at, updated_at, completed_at
+                 FROM reconcile_sessions",
+            )?;
+            let session_rows = session_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?, row.get::<_, i64>(3)?,
+                    row.get::<_, i64>(4)?, row.get::<_, i64>(5)?,
+                    row.get::<_, i64>(6)?, row.get::<_, Option<i64>>(7)?,
+                ))
+            })?;
+            for row in session_rows {
+                let (id, status, actions_json, cursor, total, started, updated, completed) = row?;
+                if !matches!(status.as_str(), "active" | "completed" | "failed" | "superseded") {
+                    return Err(StackError::InvalidSpec(format!(
+                        "legacy reconcile session `{id}` has invalid status `{status}`"
+                    )));
+                }
+                let action_count = serde_json::from_str::<serde_json::Value>(&actions_json)
+                    .ok()
+                    .and_then(|value| value.as_array().map(Vec::len))
+                    .ok_or_else(|| StackError::InvalidSpec(format!(
+                        "legacy reconcile session `{id}` has malformed actions"
+                    )))?;
+                let valid_numbers = cursor >= 0
+                    && total >= 0
+                    && usize::try_from(total).ok() == Some(action_count)
+                    && cursor <= total
+                    && started >= 0
+                    && updated >= started
+                    && (status != "completed" || cursor == total);
+                let valid_completion = if status == "active" {
+                    completed.is_none()
+                } else {
+                    completed.is_some_and(|value| value >= updated)
+                };
+                if !valid_numbers || !valid_completion {
+                    return Err(StackError::InvalidSpec(format!(
+                        "legacy reconcile session `{id}` has inconsistent metadata"
+                    )));
+                }
+                if status == "active" {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v4 contains active aggregate reconcile session `{id}`; explicit recovery or quarantine is required before replica identity migration"
+                    )));
+                }
+            }
+            drop(session_statement);
+
+            let mut audit_statement = store.conn.prepare(
+                "SELECT id, status, action_index, action_kind, service_name,
+                        started_at, completed_at, error_message
+                 FROM reconcile_audit_log",
+            )?;
+            let audit_rows = audit_statement.query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
+                    row.get::<_, i64>(2)?, row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?, row.get::<_, i64>(5)?,
+                    row.get::<_, Option<i64>>(6)?, row.get::<_, Option<String>>(7)?,
+                ))
+            })?;
+            for row in audit_rows {
+                let (id, status, index, kind, service, started, completed, error) = row?;
+                if status == "started" {
+                    return Err(StackError::InvalidSpec(format!(
+                        "legacy reconcile audit row {id} is an in-flight aggregate action"
+                    )));
+                }
+                let valid = index >= 0
+                    && matches!(
+                        kind.as_str(),
+                        "service_create" | "service_recreate" | "service_remove"
+                    )
+                    && !service.trim().is_empty()
+                    && started >= 0
+                    && completed.is_some_and(|value| value >= started)
+                    && ((status == "completed" && error.is_none())
+                        || (status == "failed" && error.is_some()));
+                if !valid {
+                    return Err(StackError::InvalidSpec(format!(
+                        "legacy reconcile audit row {id} has inconsistent metadata"
+                    )));
+                }
+            }
+            drop(audit_statement);
+
+            store.create_replica_schema_v5_with_hook(|| {
+                hook(ReplicaV5MigrationStage::DurableActionsRebuilt)
+            })?;
+            hook(ReplicaV5MigrationStage::ObservedStateRebuilt)?;
+            store.validate_v5_schema()?;
+            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
     fn migrate_stack_journal_v3_to_v4_with_hook(
         &self,
         mut hook: impl FnMut(StackJournalV4MigrationStage) -> Result<(), StackError>,
@@ -3188,7 +3707,7 @@ impl StateStore {
             store.create_stack_journal_schema_v4()?;
             hook(StackJournalV4MigrationStage::JournalSchemaCreated)?;
             store.validate_v4_schema()?;
-            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            store.set_schema_version(STACK_JOURNAL_SCHEMA_VERSION)?;
             Ok(())
         })
     }
@@ -3277,6 +3796,30 @@ impl StateStore {
                 return Err(StackError::InvalidSpec(
                     "injected v3-to-v4 migration failure after journal schema creation".to_string(),
                 ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_replica_v4_to_v5_with_failpoint(
+        &self,
+        failpoint: ReplicaV5MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_replica_v4_to_v5_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    ReplicaV5MigrationFailpoint::AfterDurableActionsRebuilt,
+                    ReplicaV5MigrationStage::DurableActionsRebuilt
+                ) | (
+                    ReplicaV5MigrationFailpoint::AfterObservedStateRebuilt,
+                    ReplicaV5MigrationStage::ObservedStateRebuilt
+                )
+            ) {
+                return Err(StackError::InvalidSpec(format!(
+                    "injected v4-to-v5 migration failure at {stage:?}"
+                )));
             }
             Ok(())
         })

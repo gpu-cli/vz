@@ -129,6 +129,11 @@ pub fn cleanup_orphaned_reconcile_progress(
     };
 
     if progress.next_action_index >= progress.actions.len() {
+        if store.load_active_reconcile_session(stack_name)?.is_some() {
+            return Err(StackError::InvalidSpec(format!(
+                "active reconcile session for `{stack_name}` has a terminal progress marker without an atomic commit"
+            )));
+        }
         store.clear_reconcile_progress(stack_name)?;
         return Ok(true);
     }
@@ -148,7 +153,7 @@ pub fn compute_restarts(
 ) -> Vec<Action> {
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
-        .map(|o| (o.service_name.as_str(), o))
+        .map(|o| (o.replica.service_name.as_str(), o))
         .collect();
 
     let mut actions = Vec::new();
@@ -166,7 +171,7 @@ pub fn compute_restarts(
                 "scheduling restart"
             );
             actions.push(Action::ServiceCreate {
-                service_name: svc.name.clone(),
+                target: obs.replica.clone(),
             });
         } else {
             debug!(
@@ -227,7 +232,8 @@ mod tests {
 
     fn obs(name: &str, phase: ServicePhase) -> ServiceObservedState {
         ServiceObservedState {
-            service_name: name.to_string(),
+            replica: crate::state_store::ServiceReplicaKey::first(name.to_string()).unwrap(),
+            applied_config_digest: None,
             phase,
             container_id: None,
             failed_create_ownership: None,
@@ -251,7 +257,7 @@ mod tests {
     fn cleanup_orphaned_progress_clears_completed_marker() {
         let store = StateStore::in_memory().unwrap();
         let actions = vec![Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }];
         store
             .save_reconcile_progress("app", "op-1", &actions, 1)
@@ -266,7 +272,7 @@ mod tests {
     fn cleanup_orphaned_progress_keeps_inflight_marker() {
         let store = StateStore::in_memory().unwrap();
         let actions = vec![Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }];
         store
             .save_reconcile_progress("app", "op-1", &actions, 0)
@@ -275,6 +281,48 @@ mod tests {
         let cleaned = cleanup_orphaned_reconcile_progress(&store, "app").unwrap();
         assert!(!cleaned);
         assert!(store.load_reconcile_progress("app").unwrap().is_some());
+    }
+
+    #[test]
+    fn cleanup_terminal_progress_fails_closed_when_exact_session_is_active() {
+        let store = StateStore::in_memory().unwrap();
+        let actions = vec![Action::ServiceCreate {
+            target: crate::state_store::ServiceReplicaKey::first("web").unwrap(),
+        }];
+        let session = crate::state_store::ReconcileSession {
+            session_id: "rs-active-terminal".to_string(),
+            stack_name: "app".to_string(),
+            operation_id: "op-active-terminal".to_string(),
+            status: crate::state_store::ReconcileSessionStatus::Active,
+            actions_hash: crate::reconcile::compute_actions_hash(&actions),
+            next_action_index: 0,
+            total_actions: 1,
+            started_at: 1_700_000_000,
+            updated_at: 1_700_000_000,
+            completed_at: None,
+        };
+        store.create_reconcile_batch(&session, &actions).unwrap();
+        store
+            .update_reconcile_session_progress(
+                &session.session_id,
+                1,
+                &crate::state_store::ReconcileSessionStatus::Active,
+            )
+            .unwrap();
+        store
+            .save_reconcile_progress("app", &session.operation_id, &actions, 1)
+            .unwrap();
+
+        assert!(cleanup_orphaned_reconcile_progress(&store, "app").is_err());
+        assert!(store.load_reconcile_progress("app").unwrap().is_some());
+        assert_eq!(
+            store
+                .load_active_reconcile_session("app")
+                .unwrap()
+                .unwrap()
+                .next_action_index,
+            1
+        );
     }
 
     // ── should_restart ──
@@ -383,7 +431,7 @@ mod tests {
         assert_eq!(actions.len(), 1);
         assert!(matches!(
             &actions[0],
-            Action::ServiceCreate { service_name } if service_name == "web"
+            Action::ServiceCreate { target } if target.service_name == "web"
         ));
     }
 
@@ -432,7 +480,7 @@ mod tests {
         let names: Vec<&str> = actions
             .iter()
             .map(|a| match a {
-                Action::ServiceCreate { service_name } => service_name.as_str(),
+                Action::ServiceCreate { target } => target.service_name.as_str(),
                 _ => "",
             })
             .collect();

@@ -34,8 +34,8 @@ pub use events::{
     emit_event_to_sink,
 };
 pub use executor::{
-    ContainerLogs, ContainerRuntime, ExecutionResult, LogLine, LogStream, PortTracker,
-    StackExecutor,
+    ActionOutcomeResult, ContainerLogs, ContainerRuntime, ExecutionResult, IndexedActionOutcome,
+    LogLine, LogStream, PortTracker, ReconcileActionKind, StackExecutor,
 };
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
@@ -51,6 +51,7 @@ pub use network::{
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
 pub use reconcile::{
     Action, ApplyResult, DeferredService, apply, compute_actions_hash, plan_apply,
+    service_config_digest,
 };
 pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
@@ -62,9 +63,10 @@ pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
     DriftFinding, DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
     ImageRecord, Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState,
-    ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus, RetentionGcReason,
-    ServiceObservedState, ServicePhase, StackContainerCreateIntent, StackContainerCreateSelector,
-    StackContainerCreateStatus, StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    ReconcileAuditEntry, ReconcileBatchCommit, ReconcileSession, ReconcileSessionStatus,
+    RetentionGcReason, ServiceObservedState, ServicePhase, ServiceReplicaKey,
+    StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
+    StackContainerGenerationBinding, StackContainerRecoveryDisposition,
     StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
 };
 pub use volume::{

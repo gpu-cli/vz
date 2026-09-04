@@ -20,10 +20,12 @@ use crate::events::StackEvent;
 use crate::executor::{ContainerRuntime, ExecutionResult, StackExecutor};
 use crate::health::{HealthPollResult, HealthPoller};
 use crate::image_policy::{ImagePolicy, validate_stack_images};
-use crate::reconcile::{Action, ApplyResult, apply, compute_actions_hash};
+use crate::reconcile::{ApplyResult, compute_actions_hash, plan_apply};
 use crate::restart::{RestartTracker, cleanup_orphaned_reconcile_progress, compute_restarts};
 use crate::spec::StackSpec;
-use crate::state_store::{ReconcileSession, ReconcileSessionStatus, ServicePhase, StateStore};
+use crate::state_store::{
+    ReconcileSession, ReconcileSessionStatus, ServicePhase, ServiceReplicaKey, StateStore,
+};
 
 /// Default poll interval when no health checks are defined (seconds).
 const DEFAULT_POLL_INTERVAL_SECS: u64 = 2;
@@ -58,7 +60,7 @@ impl Default for OrchestrationConfig {
 /// Result of running the orchestration loop.
 #[derive(Debug, Clone)]
 pub struct OrchestrationResult {
-    /// Whether the stack converged (all services ready or permanently failed).
+    /// Whether every exact desired replica is running and ready.
     pub converged: bool,
     /// Number of reconciliation rounds executed.
     pub rounds: usize,
@@ -379,10 +381,10 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
         let has_health_checks = spec.services.iter().any(|s| s.healthcheck.is_some());
 
-        // Best-effort cleanup for stale completed markers from prior crashes.
-        let _ = cleanup_orphaned_reconcile_progress(&self.reconcile_store, &spec.name)?;
+        // Clean up only legacy completed markers; persistence failures are fatal.
+        cleanup_orphaned_reconcile_progress(&self.reconcile_store, &spec.name)?;
         // Resume any incomplete action batch before starting new planning rounds.
-        let _ = self.resume_incomplete_apply(spec)?;
+        self.resume_incomplete_apply(spec)?;
         // Rehydrate persisted health poll state so restart recovery preserves debounce context.
         self.health_poller
             .restore_from_store(&self.reconcile_store, &spec.name)?;
@@ -400,28 +402,39 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
             // 1. Reconcile with current health statuses.
             let health_statuses = self.health_poller.statuses().clone();
-            let apply_result = apply(spec, &self.reconcile_store, &health_statuses)?;
+            // Scoped orchestration plans without mutating observed lifecycle,
+            // allocator digests, or success events. Desired intent is durable,
+            // while journal/runtime transitions remain the sole observed-state
+            // authority for each exact replica.
+            let apply_result = plan_apply(spec, &self.reconcile_store, &health_statuses)?;
+            self.reconcile_store.save_desired_state(&spec.name, spec)?;
+            self.reconcile_store.emit_event(
+                &spec.name,
+                &StackEvent::StackApplyStarted {
+                    stack_name: spec.name.clone(),
+                    services_count: spec.services.len(),
+                },
+            )?;
+            for deferred in &apply_result.deferred {
+                self.reconcile_store.emit_event(
+                    &spec.name,
+                    &StackEvent::DependencyBlocked {
+                        stack_name: spec.name.clone(),
+                        service_name: deferred.service_name.clone(),
+                        waiting_on: deferred.waiting_on.clone(),
+                    },
+                )?;
+            }
 
             // 2. Execute any new actions.
             let exec_result = if !apply_result.actions.is_empty() {
                 let operation_id = Self::next_operation_id(&spec.name, round);
-                self.reconcile_store.save_reconcile_progress(
-                    &spec.name,
-                    &operation_id,
-                    &apply_result.actions,
-                    0,
-                )?;
-
-                // Create a reconcile session for this action batch.
                 let session_id = Self::next_session_id(&spec.name, round);
                 let now = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
                     .as_secs();
                 let actions_hash = compute_actions_hash(&apply_result.actions);
-
-                // Supersede any prior active sessions for this stack.
-                let _ = self.reconcile_store.supersede_active_sessions(&spec.name);
 
                 let session = ReconcileSession {
                     session_id: session_id.clone(),
@@ -435,9 +448,15 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     updated_at: now,
                     completed_at: None,
                 };
-                let _ = self
-                    .reconcile_store
-                    .create_reconcile_session(&session, &apply_result.actions);
+                self.reconcile_store
+                    .create_reconcile_batch(&session, &apply_result.actions)?;
+                self.reconcile_store.start_reconcile_batch(
+                    &session_id,
+                    &spec.name,
+                    &operation_id,
+                    0,
+                    &apply_result.actions,
+                )?;
 
                 info!(
                     actions = apply_result.actions.len(),
@@ -450,25 +469,20 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     &operation_id,
                     0,
                 )?;
-                self.reconcile_store.save_reconcile_progress(
+                let commit = self.reconcile_store.commit_reconcile_batch(
+                    &session_id,
                     &spec.name,
                     &operation_id,
+                    0,
                     &apply_result.actions,
-                    apply_result.actions.len(),
+                    &result.outcomes,
                 )?;
-                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
-
-                // Update session after execution.
-                if result.failed > 0 {
-                    debug!(failed = result.failed, "some actions failed");
-                    let _ = self.reconcile_store.fail_reconcile_session(&session_id);
-                } else {
-                    let _ = self.reconcile_store.update_reconcile_session_progress(
-                        &session_id,
-                        apply_result.actions.len(),
-                        &ReconcileSessionStatus::Active,
+                if commit.status == ReconcileSessionStatus::Failed {
+                    debug!(
+                        cursor = commit.next_action_index,
+                        total = apply_result.actions.len(),
+                        "exact reconcile batch failed and will be replanned"
                     );
-                    let _ = self.reconcile_store.complete_reconcile_session(&session_id);
                 }
 
                 // A failed removal cannot be represented by convergence over
@@ -477,19 +491,23 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 // Surface teardown failures immediately instead of returning a
                 // false successful `converged=true` result.
                 let removal_failures = result
-                    .errors
+                    .outcomes
                     .iter()
-                    .filter(|(service_name, _)| {
-                        apply_result.actions.iter().any(|action| {
-                            matches!(
-                                action,
-                                Action::ServiceRemove {
-                                    service_name: removed
-                                } if removed == service_name
-                            )
-                        })
+                    .filter_map(|outcome| {
+                        if outcome.action_kind != crate::executor::ReconcileActionKind::Remove {
+                            return None;
+                        }
+                        match &outcome.result {
+                            crate::executor::ActionOutcomeResult::Succeeded => None,
+                            crate::executor::ActionOutcomeResult::Failed { error } => {
+                                Some(format!(
+                                    "{}#{}: {error}",
+                                    outcome.target.service_name,
+                                    outcome.target.index()
+                                ))
+                            }
+                        }
                     })
-                    .map(|(service_name, error)| format!("{service_name}: {error}"))
                     .collect::<Vec<_>>();
                 if !removal_failures.is_empty() {
                     return Err(StackError::Network(format!(
@@ -500,7 +518,6 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
                 Some(result)
             } else {
-                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
                 None
             };
 
@@ -543,29 +560,54 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                 );
                 let operation_id =
                     Self::next_operation_id(&format!("{}-restart", spec.name), round);
-                self.reconcile_store.save_reconcile_progress(
+                let session_id = Self::next_session_id(&format!("{}-restart", spec.name), round);
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let session = ReconcileSession {
+                    session_id: session_id.clone(),
+                    stack_name: spec.name.clone(),
+                    operation_id: operation_id.clone(),
+                    status: ReconcileSessionStatus::Active,
+                    actions_hash: compute_actions_hash(&restart_actions),
+                    next_action_index: 0,
+                    total_actions: restart_actions.len(),
+                    started_at: now,
+                    updated_at: now,
+                    completed_at: None,
+                };
+                self.reconcile_store
+                    .create_reconcile_batch(&session, &restart_actions)?;
+                self.reconcile_store.start_reconcile_batch(
+                    &session_id,
                     &spec.name,
                     &operation_id,
-                    &restart_actions,
                     0,
+                    &restart_actions,
                 )?;
-                let _restart_result = self.executor.execute_with_operation(
+                let restart_result = self.executor.execute_with_operation(
                     spec,
                     &restart_actions,
                     &operation_id,
                     0,
                 )?;
-                self.reconcile_store.save_reconcile_progress(
+                self.reconcile_store.commit_reconcile_batch(
+                    &session_id,
                     &spec.name,
                     &operation_id,
+                    0,
                     &restart_actions,
-                    restart_actions.len(),
+                    &restart_result.outcomes,
                 )?;
-                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
-                for action in &restart_actions {
-                    if let Action::ServiceCreate { service_name } = action {
-                        self.restart_tracker.record_restart(service_name);
-                    }
+                for outcome in restart_result.outcomes.iter().filter(|outcome| {
+                    matches!(
+                        outcome.result,
+                        crate::executor::ActionOutcomeResult::Succeeded
+                    )
+                }) {
+                    self.restart_tracker
+                        .record_restart(&outcome.target.service_name);
                 }
             }
 
@@ -597,7 +639,12 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             // Convergence is reconciler-owned: only declare converged when
             // observed state has no pending services and reconcile reports no
             // deferred dependency work for this round.
-            if Self::reconciler_reports_converged(pending, &apply_result) {
+            if Self::reconciler_reports_converged(
+                failed,
+                pending,
+                &apply_result,
+                exec_result.as_ref(),
+            ) {
                 info!(rounds = round, ready, failed, "stack converged");
                 self.compact_events(&spec.name);
                 return Ok(OrchestrationResult {
@@ -632,9 +679,9 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
     /// Check how many services are ready, failed, or still pending.
     fn check_convergence(&self, spec: &StackSpec) -> Result<(usize, usize, usize), StackError> {
         let observed = self.executor.store().load_observed_state(&spec.name)?;
-        let observed_map: HashMap<&str, _> = observed
+        let observed_map: HashMap<&ServiceReplicaKey, _> = observed
             .iter()
-            .map(|o| (o.service_name.as_str(), o))
+            .map(|state| (&state.replica, state))
             .collect();
 
         let mut ready = 0;
@@ -642,35 +689,52 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
         let mut pending = 0;
 
         for svc in &spec.services {
-            match observed_map.get(svc.name.as_str()) {
-                Some(obs) => match obs.phase {
-                    ServicePhase::Running => {
-                        let health_passed = match &svc.healthcheck {
-                            None => true,
-                            Some(_) => self
-                                .health_poller
-                                .statuses()
-                                .get(&svc.name)
-                                .is_some_and(|s| s.consecutive_passes >= 1),
-                        };
-                        if health_passed {
-                            ready += 1;
-                        } else {
-                            pending += 1;
+            for replica_index in 1..=svc.resources.replicas.max(1) {
+                let target = ServiceReplicaKey::new(&svc.name, replica_index)?;
+                match observed_map.get(&target) {
+                    Some(obs) => match obs.phase {
+                        ServicePhase::Running => {
+                            let health_passed = match &svc.healthcheck {
+                                None => true,
+                                Some(_) => self
+                                    .health_poller
+                                    .statuses()
+                                    .get(&svc.name)
+                                    .is_some_and(|s| s.consecutive_passes >= 1),
+                            };
+                            if health_passed {
+                                ready += 1;
+                            } else {
+                                pending += 1;
+                            }
                         }
-                    }
-                    ServicePhase::Failed => failed += 1,
-                    _ => pending += 1,
-                },
-                None => pending += 1,
+                        ServicePhase::Failed => failed += 1,
+                        _ => pending += 1,
+                    },
+                    None => pending += 1,
+                }
             }
         }
 
         Ok((ready, failed, pending))
     }
 
-    fn reconciler_reports_converged(pending: usize, apply_result: &ApplyResult) -> bool {
-        pending == 0 && apply_result.deferred.is_empty()
+    fn reconciler_reports_converged(
+        failed: usize,
+        pending: usize,
+        apply_result: &ApplyResult,
+        exec_result: Option<&ExecutionResult>,
+    ) -> bool {
+        let execution_succeeded = exec_result.is_none_or(|result| {
+            result.failed == 0
+                && result.outcomes.iter().all(|outcome| {
+                    matches!(
+                        outcome.result,
+                        crate::executor::ActionOutcomeResult::Succeeded
+                    )
+                })
+        });
+        failed == 0 && pending == 0 && apply_result.deferred.is_empty() && execution_succeeded
     }
 
     fn next_operation_id(stack_name: &str, round: usize) -> String {
@@ -716,8 +780,30 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
         let total = progress.actions.len();
         if progress.next_action_index >= total {
-            self.reconcile_store.clear_reconcile_progress(&spec.name)?;
-            return Ok(None);
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress for `{}` survived at terminal cursor {}",
+                spec.name, progress.next_action_index
+            )));
+        }
+
+        let session = self
+            .reconcile_store
+            .load_active_reconcile_session(&spec.name)?
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "reconcile progress for `{}` has no active exact session",
+                    spec.name
+                ))
+            })?;
+        if session.operation_id != progress.operation_id
+            || session.next_action_index != progress.next_action_index
+            || session.total_actions != total
+            || session.actions_hash != compute_actions_hash(&progress.actions)
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress for `{}` does not match its active exact session",
+                spec.name
+            )));
         }
 
         let remaining = progress.actions[progress.next_action_index..].to_vec();
@@ -729,19 +815,28 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             "resuming incomplete apply operation"
         );
 
+        self.reconcile_store.start_reconcile_batch(
+            &session.session_id,
+            &spec.name,
+            &progress.operation_id,
+            progress.next_action_index,
+            &remaining,
+        )?;
+
         let result = self.executor.execute_with_operation(
             spec,
             &remaining,
             &progress.operation_id,
             progress.next_action_index,
         )?;
-        self.reconcile_store.save_reconcile_progress(
+        self.reconcile_store.commit_reconcile_batch(
+            &session.session_id,
             &spec.name,
             &progress.operation_id,
-            &progress.actions,
-            total,
+            progress.next_action_index,
+            &remaining,
+            &result.outcomes,
         )?;
-        self.reconcile_store.clear_reconcile_progress(&spec.name)?;
         Ok(Some(result))
     }
 }
@@ -861,7 +956,7 @@ mod tests {
     }
 
     #[test]
-    fn reports_failed_services() {
+    fn reports_failed_services_without_false_convergence() {
         let mut runtime = MockContainerRuntime::new();
         runtime.fail_create = true;
         let (mut orch, _tmp) = make_orchestrator_shared(runtime);
@@ -869,7 +964,8 @@ mod tests {
 
         let result = orch.run(&spec, None).unwrap();
 
-        assert!(result.converged);
+        assert!(!result.converged);
+        assert_eq!(result.rounds, 10);
         assert_eq!(result.services_ready, 0);
         assert_eq!(result.services_failed, 1);
     }
@@ -1119,11 +1215,27 @@ mod tests {
         let spec = stack("app", vec![svc("web")]);
 
         let pending = vec![Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         }];
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let session = ReconcileSession {
+            session_id: "resume-session-1".to_string(),
+            stack_name: "app".to_string(),
+            operation_id: "resume-op-1".to_string(),
+            status: ReconcileSessionStatus::Active,
+            actions_hash: compute_actions_hash(&pending),
+            next_action_index: 0,
+            total_actions: pending.len(),
+            started_at: now,
+            updated_at: now,
+            completed_at: None,
+        };
         orch.executor()
             .store()
-            .save_reconcile_progress("app", "resume-op-1", &pending, 0)
+            .create_reconcile_batch(&session, &pending)
             .unwrap();
 
         let result = orch.run(&spec, None).unwrap();
@@ -1144,6 +1256,67 @@ mod tests {
             .filter(|(op, _)| op == "create" || op == "create_in_sandbox")
             .count();
         assert_eq!(create_calls, 1);
+    }
+
+    #[test]
+    fn outer_executor_error_reopens_with_started_audits_and_old_exact_cursor() {
+        let runtime = MockContainerRuntime::new();
+        let (mut orch, tmp) = make_orchestrator_shared(runtime);
+        let mut service = svc("api");
+        service.resources.replicas = 2;
+        service.ports.push(crate::spec::PortSpec {
+            protocol: "tcp".to_string(),
+            container_port: 8080,
+            host_port: Some(18_080),
+        });
+        let spec = stack("outer-error", vec![service]);
+
+        let error = orch
+            .run(&spec, None)
+            .expect_err("executor must reject fixed host ports for replicated services");
+        assert!(error.to_string().contains("fixed host port"));
+        let session = orch
+            .reconcile_store
+            .load_active_reconcile_session("outer-error")
+            .unwrap()
+            .unwrap();
+        assert_eq!(session.next_action_index, 0);
+        let actions = orch
+            .reconcile_store
+            .load_reconcile_session_actions(&session.session_id)
+            .unwrap();
+        assert_eq!(actions.len(), 2);
+        assert!(
+            orch.reconcile_store
+                .load_audit_log_for_session(&session.session_id)
+                .unwrap()
+                .iter()
+                .all(|entry| entry.status == "started")
+        );
+        drop(orch);
+
+        let reopened = StateStore::open(&tmp.path().join("state.db")).unwrap();
+        let reopened_session = reopened
+            .load_active_reconcile_session("outer-error")
+            .unwrap()
+            .unwrap();
+        assert_eq!(reopened_session.session_id, session.session_id);
+        assert_eq!(reopened_session.next_action_index, 0);
+        let progress = reopened
+            .load_reconcile_progress("outer-error")
+            .unwrap()
+            .unwrap();
+        assert_eq!(progress.next_action_index, 0);
+        assert_eq!(progress.actions, actions);
+        reopened
+            .start_reconcile_batch(
+                &session.session_id,
+                "outer-error",
+                &session.operation_id,
+                0,
+                &actions,
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1327,7 +1500,10 @@ mod tests {
 
         // Service phase in state store should be Running (not Creating or Stopping).
         let observed = orch.executor().store().load_observed_state("app").unwrap();
-        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        let web = observed
+            .iter()
+            .find(|o| o.replica.service_name == "web")
+            .unwrap();
         assert_eq!(
             web.phase,
             ServicePhase::Running,
@@ -1351,14 +1527,88 @@ mod tests {
         let result = orch.run(&spec, None).unwrap();
         // Create fails every round → service stays Failed → reconciler
         // keeps retrying → hits max_rounds.
+        assert!(!result.converged);
+        assert_eq!(result.rounds, 3);
         assert_eq!(result.services_failed, 1);
 
         let observed = orch.executor().store().load_observed_state("app").unwrap();
-        let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+        let web = observed
+            .iter()
+            .find(|o| o.replica.service_name == "web")
+            .unwrap();
         assert_eq!(
             web.phase,
             ServicePhase::Failed,
             "service should be Failed, not stuck in Creating"
+        );
+        assert!(
+            orch.reconcile_store
+                .load_reconcile_progress("app")
+                .unwrap()
+                .is_none(),
+            "failed exact batches must be replanned, never falsely resumed as complete"
+        );
+        let sessions = orch
+            .reconcile_store
+            .list_reconcile_sessions("app", 10)
+            .unwrap();
+        assert!(!sessions.is_empty());
+        assert!(sessions.iter().all(|session| {
+            session.status == ReconcileSessionStatus::Failed && session.next_action_index == 0
+        }));
+        for session in sessions {
+            let audits = orch
+                .reconcile_store
+                .load_audit_log_for_session(&session.session_id)
+                .unwrap();
+            assert_eq!(audits.len(), 1);
+            assert_eq!(audits[0].status, "failed");
+            assert_eq!(
+                audits[0].target,
+                crate::state_store::ServiceReplicaKey::first("web").unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn convergence_counts_every_exact_replica_and_rejects_mixed_failure() {
+        let runtime = MockContainerRuntime::new();
+        let (orch, _tmp) = make_orchestrator_shared(runtime);
+        let mut service = svc("web");
+        service.resources.replicas = 3;
+        let spec = stack("app", vec![service]);
+
+        for (replica_index, phase) in [
+            (1, ServicePhase::Running),
+            (2, ServicePhase::Failed),
+            (3, ServicePhase::Running),
+        ] {
+            orch.executor()
+                .store()
+                .save_observed_state(
+                    "app",
+                    &crate::state_store::ServiceObservedState {
+                        replica: ServiceReplicaKey::new("web", replica_index).unwrap(),
+                        applied_config_digest: Some("sha256:fixture".to_string()),
+                        phase,
+                        container_id: Some(format!("ctr-web-{replica_index}")),
+                        failed_create_ownership: None,
+                        last_error: (replica_index == 2).then(|| "boom".to_string()),
+                        ready: replica_index != 2,
+                    },
+                )
+                .unwrap();
+        }
+
+        let (ready, failed, pending) = orch.check_convergence(&spec).unwrap();
+        assert_eq!((ready, failed, pending), (2, 1, 0));
+        assert!(
+            !StackOrchestrator::<MockContainerRuntime>::reconciler_reports_converged(
+                failed,
+                pending,
+                &ApplyResult::default(),
+                None,
+            )
         );
     }
 

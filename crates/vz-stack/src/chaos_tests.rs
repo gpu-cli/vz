@@ -96,11 +96,22 @@ fn create_test_session(
 
 /// Mark service as running in the observed state.
 fn mark_service_running(store: &StateStore, stack_name: &str, service_name: &str) {
+    let applied_config_digest = store
+        .load_desired_state(stack_name)
+        .unwrap()
+        .and_then(|spec| {
+            spec.services
+                .iter()
+                .find(|service| service.name == service_name)
+                .map(crate::reconcile::service_config_digest)
+        });
     store
         .save_observed_state(
             stack_name,
             &ServiceObservedState {
-                service_name: service_name.to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first(service_name.to_string())
+                    .unwrap(),
+                applied_config_digest,
                 phase: ServicePhase::Running,
                 container_id: Some(format!("ctr-{service_name}")),
                 failed_create_ownership: None,
@@ -248,7 +259,8 @@ fn vm_restart_clears_observed_state_reconciler_rebuilds() {
         .save_observed_state(
             "vm-restart",
             &ServiceObservedState {
-                service_name: "redis".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("redis".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: None,
                 failed_create_ownership: None,
@@ -261,7 +273,8 @@ fn vm_restart_clears_observed_state_reconciler_rebuilds() {
         .save_observed_state(
             "vm-restart",
             &ServiceObservedState {
-                service_name: "app".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: None,
                 failed_create_ownership: None,
@@ -319,7 +332,8 @@ fn agent_timeout_degrades_service_and_preserves_error() {
         .save_observed_state(
             stack_name,
             &ServiceObservedState {
-                service_name: "api".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-api-1".to_string()),
                 failed_create_ownership: None,
@@ -368,7 +382,8 @@ fn agent_timeout_recovery_marks_service_ready() {
         .save_observed_state(
             stack_name,
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
                 failed_create_ownership: None,
@@ -383,7 +398,8 @@ fn agent_timeout_recovery_marks_service_ready() {
         .save_observed_state(
             stack_name,
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
                 failed_create_ownership: None,
@@ -444,7 +460,7 @@ fn storage_failure_isolation_between_stacks() {
     // Verify stack-a has the expected state.
     let observed_a = store.load_observed_state("stack-a").unwrap();
     assert_eq!(observed_a.len(), 1);
-    assert_eq!(observed_a[0].service_name, "svc-a1");
+    assert_eq!(observed_a[0].replica.service_name, "svc-a1");
 }
 
 /// Verify that upserting observed state is atomic: the old row is fully
@@ -458,7 +474,8 @@ fn storage_upsert_is_atomic_full_replacement() {
         .save_observed_state(
             "upsert-stack",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: Some("old-ctr".to_string()),
                 failed_create_ownership: None,
@@ -473,7 +490,8 @@ fn storage_upsert_is_atomic_full_replacement() {
         .save_observed_state(
             "upsert-stack",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("new-ctr".to_string()),
                 failed_create_ownership: None,
@@ -501,16 +519,16 @@ fn partial_batch_resume_picks_up_remaining_actions() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "cache".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
@@ -542,13 +560,13 @@ fn partial_batch_cursor_advances_correctly() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "a".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("a".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "b".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("b".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "c".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("c".to_string()).unwrap(),
         },
     ];
 
@@ -608,10 +626,10 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
@@ -624,8 +642,8 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
         stack_name: "audit-app".to_string(),
         action_index: 0,
         action_kind: "service_create".to_string(),
-        service_name: "db".to_string(),
-        action_hash: "hash-db".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
+        action_hash: compute_actions_hash(&[actions[0].clone()]),
         status: "started".to_string(),
         started_at: 1_700_000_001,
         completed_at: None,
@@ -643,8 +661,8 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
         stack_name: "audit-app".to_string(),
         action_index: 1,
         action_kind: "service_create".to_string(),
-        service_name: "web".to_string(),
-        action_hash: "hash-web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+        action_hash: compute_actions_hash(&[actions[1].clone()]),
         status: "started".to_string(),
         started_at: 1_700_000_002,
         completed_at: None,
@@ -685,26 +703,26 @@ fn partial_batch_audit_log_tracks_action_outcomes() {
 fn duplicate_event_prevention_same_hash_detected() {
     let actions1 = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let actions2 = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let actions_different = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceRemove {
-            service_name: "cache".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("cache".to_string()).unwrap(),
         },
     ];
 
@@ -808,7 +826,7 @@ fn concurrent_reconciliation_supersedes_old_active_session() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     // Session 1: create and leave active.
@@ -865,7 +883,7 @@ fn concurrent_reconciliation_supersede_is_stack_scoped() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     // Create active sessions for two different stacks.
@@ -900,7 +918,7 @@ fn concurrent_reconciliation_multiple_active_all_superseded() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "svc".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("svc".to_string()).unwrap(),
     }];
 
     // Create 3 active sessions for the same stack (simulating race condition).
@@ -946,11 +964,18 @@ fn concurrent_reconciliation_completed_sessions_unaffected() {
     let store = StateStore::in_memory().unwrap();
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "svc".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("svc".to_string()).unwrap(),
     }];
 
     // Create session and complete it.
     create_test_session(&store, "rs-done", "done-app", &actions);
+    store
+        .update_reconcile_session_progress(
+            "rs-done",
+            actions.len(),
+            &ReconcileSessionStatus::Active,
+        )
+        .unwrap();
     store.complete_reconcile_session("rs-done").unwrap();
 
     // Create another active session.
@@ -976,13 +1001,13 @@ fn recovery_progress_survives_store_reopen() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 

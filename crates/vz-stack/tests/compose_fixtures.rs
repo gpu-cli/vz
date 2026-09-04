@@ -88,7 +88,7 @@ fn web_redis_initial_apply_creates_both_services() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { service_name } => Some(service_name.as_str()),
+            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -112,7 +112,7 @@ fn web_redis_second_apply_is_idempotent_when_all_running() {
     let _first = vz_stack::apply(&spec, &store, &health).unwrap();
 
     // Simulate runtime: both services now running.
-    simulate_running(&store, "web-redis", &["redis", "web"]);
+    simulate_running(&store, &spec, &["redis", "web"]);
 
     // Redis health check passes.
     let mut health = HashMap::new();
@@ -143,7 +143,8 @@ fn web_redis_redis_health_gates_web_when_redis_running_but_unhealthy() {
         .save_observed_state(
             "web-redis",
             &ServiceObservedState {
-                service_name: "redis".to_string(),
+                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-redis".to_string()),
                 failed_create_ownership: None,
@@ -185,7 +186,8 @@ fn web_redis_redis_health_unblocks_web_when_healthy() {
         .save_observed_state(
             "web-redis",
             &ServiceObservedState {
-                service_name: "redis".to_string(),
+                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-redis".to_string()),
                 failed_create_ownership: None,
@@ -207,7 +209,7 @@ fn web_redis_redis_health_unblocks_web_when_healthy() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { service_name } => Some(service_name.as_str()),
+            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -229,7 +231,7 @@ fn web_redis_teardown_removes_both_services() {
 
     // Apply to create services.
     let _first = vz_stack::apply(&spec, &store, &health).unwrap();
-    simulate_running(&store, "web-redis", &["redis", "web"]);
+    simulate_running(&store, &spec, &["redis", "web"]);
 
     // Teardown: apply empty spec.
     let empty = StackSpec {
@@ -246,7 +248,7 @@ fn web_redis_teardown_removes_both_services() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -356,7 +358,7 @@ fn web_pg_redis_initial_apply_creates_all_three() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceCreate { service_name } => Some(service_name.as_str()),
+            Action::ServiceCreate { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -386,7 +388,8 @@ fn web_pg_redis_health_gates_web_on_both_deps() {
         .save_observed_state(
             "fullstack",
             &ServiceObservedState {
-                service_name: "postgres".to_string(),
+                replica: vz_stack::ServiceReplicaKey::first("postgres".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-pg".to_string()),
                 failed_create_ownership: None,
@@ -399,7 +402,8 @@ fn web_pg_redis_health_gates_web_on_both_deps() {
         .save_observed_state(
             "fullstack",
             &ServiceObservedState {
-                service_name: "redis".to_string(),
+                replica: vz_stack::ServiceReplicaKey::first("redis".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-redis".to_string()),
                 failed_create_ownership: None,
@@ -439,7 +443,7 @@ fn web_pg_redis_all_healthy_converges() {
     let _first = vz_stack::apply(&spec, &store, &health).unwrap();
 
     // Simulate all running and healthy.
-    simulate_running(&store, "fullstack", &["postgres", "redis", "web"]);
+    simulate_running(&store, &spec, &["postgres", "redis", "web"]);
 
     let mut health = HashMap::new();
     for name in &["postgres", "redis"] {
@@ -464,7 +468,7 @@ fn web_pg_redis_teardown_removes_all_three() {
     let health = HashMap::new();
 
     let _first = vz_stack::apply(&spec, &store, &health).unwrap();
-    simulate_running(&store, "fullstack", &["postgres", "redis", "web"]);
+    simulate_running(&store, &spec, &["postgres", "redis", "web"]);
 
     let empty = StackSpec {
         name: "fullstack".to_string(),
@@ -480,7 +484,7 @@ fn web_pg_redis_teardown_removes_all_three() {
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -541,7 +545,7 @@ fn web_redis_event_streaming_since() {
     let cursor = events_after_first.last().unwrap().id;
 
     // Simulate running, then re-apply.
-    simulate_running(&store, "web-redis", &["redis", "web"]);
+    simulate_running(&store, &spec, &["redis", "web"]);
 
     let mut health2 = HashMap::new();
     let mut redis_h = HealthStatus::new("redis");
@@ -732,13 +736,19 @@ fn open_temp_store() -> (StateStore, tempfile::TempDir) {
     (store, dir)
 }
 
-fn simulate_running(store: &StateStore, stack_name: &str, services: &[&str]) {
+fn simulate_running(store: &StateStore, spec: &StackSpec, services: &[&str]) {
     for name in services {
+        let service = spec
+            .services
+            .iter()
+            .find(|service| service.name == *name)
+            .unwrap();
         store
             .save_observed_state(
-                stack_name,
+                &spec.name,
                 &ServiceObservedState {
-                    service_name: name.to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first(name.to_string()).unwrap(),
+                    applied_config_digest: Some(vz_stack::service_config_digest(service)),
                     phase: ServicePhase::Running,
                     container_id: Some(format!("ctr-{name}")),
                     failed_create_ownership: None,

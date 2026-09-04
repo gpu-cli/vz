@@ -1291,7 +1291,7 @@ async fn stack_container_generation_ownership() {
         .unwrap();
     let observed_token = failed_state
         .iter()
-        .find(|state| state.service_name == "worker")
+        .find(|state| state.replica.service_name == "worker")
         .and_then(|state| state.failed_create_ownership.clone())
         .expect("owned post-publication failure lost its cleanup proof");
     assert_eq!(observed_token, failure_token);
@@ -1371,7 +1371,7 @@ async fn stack_container_generation_ownership() {
         .unwrap();
     let contender_cleanup = contender_state
         .iter()
-        .find(|state| state.service_name == "contender")
+        .find(|state| state.replica.service_name == "contender")
         .and_then(|state| state.failed_create_ownership.clone());
     assert!(contender_cleanup.is_none());
     assert_eq!(
@@ -1587,7 +1587,7 @@ services:
         );
         if round == 1 {
             assert!(
-                matches!(&result.actions[0], Action::ServiceCreate { service_name } if service_name == "worker"),
+                matches!(&result.actions[0], Action::ServiceCreate { target } if target.service_name == "worker"),
                 "first round should prioritize worker dependency, got: {:?}",
                 result.actions[0]
             );
@@ -1620,7 +1620,7 @@ services:
     for name in &["worker", "web"] {
         let svc = observed
             .iter()
-            .find(|o| o.service_name == *name)
+            .find(|o| o.replica.service_name == *name)
             .unwrap_or_else(|| panic!("service '{name}' should be in observed state"));
         assert!(
             svc.container_id.is_some(),
@@ -1647,7 +1647,7 @@ services:
     // Exec a command inside the worker container to prove it's alive.
     let worker_id = observed
         .iter()
-        .find(|o| o.service_name == "worker")
+        .find(|o| o.replica.service_name == "worker")
         .unwrap()
         .container_id
         .as_ref()
@@ -1663,7 +1663,7 @@ services:
         .services
         .iter()
         .map(|s| Action::ServiceRemove {
-            service_name: s.name.clone(),
+            target: vz_stack::ServiceReplicaKey::first(s.name.clone()).unwrap(),
         })
         .collect();
     let down_result = executor.execute(&spec, &down_actions).unwrap();
@@ -1713,7 +1713,10 @@ services:
 
     // Exec into the container.
     let observed = executor.store().load_observed_state("exec-test").unwrap();
-    let app = observed.iter().find(|o| o.service_name == "app").unwrap();
+    let app = observed
+        .iter()
+        .find(|o| o.replica.service_name == "app")
+        .unwrap();
     let container_id = app.container_id.as_ref().unwrap();
 
     let exit_code = executor
@@ -1724,7 +1727,7 @@ services:
 
     // Cleanup.
     let down = vec![Action::ServiceRemove {
-        service_name: "app".into(),
+        target: vz_stack::ServiceReplicaKey::first("app").unwrap(),
     }];
     let down_result = executor.execute(&spec, &down).unwrap();
     assert_eq!(
@@ -1796,7 +1799,7 @@ services:
     for name in &["db", "api"] {
         let svc = observed
             .iter()
-            .find(|o| o.service_name == *name)
+            .find(|o| o.replica.service_name == *name)
             .unwrap_or_else(|| panic!("service '{name}' should be in observed state"));
         assert!(
             svc.container_id.is_some(),
@@ -1906,14 +1909,14 @@ services:
 
     let db_container_id = observed
         .iter()
-        .find(|o| o.service_name == "db")
+        .find(|o| o.replica.service_name == "db")
         .unwrap_or_else(|| panic!("db should be in observed state"))
         .container_id
         .as_ref()
         .unwrap();
     let cache_container_id = observed
         .iter()
-        .find(|o| o.service_name == "cache")
+        .find(|o| o.replica.service_name == "cache")
         .unwrap_or_else(|| panic!("cache should be in observed state"))
         .container_id
         .as_ref()
@@ -2080,7 +2083,7 @@ services:
         .unwrap();
     let svc = observed
         .iter()
-        .find(|o| o.service_name == req.service)
+        .find(|o| o.replica.service_name == req.service)
         .unwrap();
     let container_id = svc.container_id.as_ref().unwrap();
 
@@ -2426,7 +2429,7 @@ fn snapshot_stack_service_ids(
     for service_name in ["api", "cache", "db"] {
         match observed
             .iter()
-            .find(|entry| entry.service_name == service_name)
+            .find(|entry| entry.replica.service_name == service_name)
             .and_then(|entry| entry.container_id.as_ref())
         {
             Some(container_id) => {
@@ -3291,7 +3294,7 @@ services:
     for name in &["worker", "api"] {
         let svc = observed
             .iter()
-            .find(|o| o.service_name == *name)
+            .find(|o| o.replica.service_name == *name)
             .unwrap_or_else(|| panic!("{name} should be in observed state"));
         let cid = svc.container_id.as_ref().unwrap();
         let (exit_code, stdout, _) = orchestrator
@@ -3384,7 +3387,7 @@ services:
         .unwrap();
     let tracker = observed
         .iter()
-        .find(|o| o.service_name == "tracker")
+        .find(|o| o.replica.service_name == "tracker")
         .unwrap();
     assert!(tracker.container_id.is_some());
     assert_eq!(tracker.phase, ServicePhase::Running);
@@ -3633,7 +3636,7 @@ services:
         .unwrap();
     let db_cid = observed
         .iter()
-        .find(|o| o.service_name == "db")
+        .find(|o| o.replica.service_name == "db")
         .unwrap()
         .container_id
         .as_ref()
@@ -3828,7 +3831,7 @@ services:
 
     let client_cid = observed
         .iter()
-        .find(|o| o.service_name == "client")
+        .find(|o| o.replica.service_name == "client")
         .unwrap()
         .container_id
         .as_ref()
@@ -4082,7 +4085,7 @@ services:
     for name in &["db", "api", "frontend"] {
         let svc = observed
             .iter()
-            .find(|o| o.service_name == *name)
+            .find(|o| o.replica.service_name == *name)
             .unwrap_or_else(|| panic!("{name} should exist"));
         assert!(
             svc.container_id.is_some(),
@@ -4291,7 +4294,7 @@ services:
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(
         &result.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "web"
+        Action::ServiceCreate { target } if target.service_name == "web"
     ));
 
     let exec_result = executor.execute(&spec, &result.actions).unwrap();
@@ -4306,7 +4309,7 @@ services:
     let running: Vec<&str> = observed
         .iter()
         .filter(|o| o.container_id.is_some() && matches!(o.phase, ServicePhase::Running))
-        .map(|o| o.service_name.as_str())
+        .map(|o| o.replica.service_name.as_str())
         .collect();
     assert_eq!(
         running.len(),
@@ -4413,7 +4416,7 @@ services:
         .actions
         .iter()
         .filter_map(|a| match a {
-            Action::ServiceRemove { service_name } => Some(service_name.as_str()),
+            Action::ServiceRemove { target } => Some(target.service_name.as_str()),
             _ => None,
         })
         .collect();
@@ -4431,7 +4434,7 @@ services:
     let still_running: Vec<&str> = observed2
         .iter()
         .filter(|o| matches!(o.phase, ServicePhase::Running))
-        .map(|o| o.service_name.as_str())
+        .map(|o| o.replica.service_name.as_str())
         .collect();
     assert_eq!(
         still_running,
@@ -4541,14 +4544,14 @@ volumes:
 
     let writer_cid = observed
         .iter()
-        .find(|o| o.service_name == "writer")
+        .find(|o| o.replica.service_name == "writer")
         .unwrap()
         .container_id
         .as_ref()
         .unwrap();
     let reader_cid = observed
         .iter()
-        .find(|o| o.service_name == "reader")
+        .find(|o| o.replica.service_name == "reader")
         .unwrap()
         .container_id
         .as_ref()
@@ -4680,7 +4683,7 @@ secrets:
 
     let app_cid = observed
         .iter()
-        .find(|o| o.service_name == "app")
+        .find(|o| o.replica.service_name == "app")
         .unwrap()
         .container_id
         .as_ref()
@@ -4805,7 +4808,7 @@ services:
 
     let app_cid = observed
         .iter()
-        .find(|o| o.service_name == "app")
+        .find(|o| o.replica.service_name == "app")
         .unwrap()
         .container_id
         .as_ref()
@@ -4939,7 +4942,7 @@ networks:
     let cid_of = |name: &str| -> String {
         observed
             .iter()
-            .find(|o| o.service_name == name)
+            .find(|o| o.replica.service_name == name)
             .unwrap()
             .container_id
             .clone()

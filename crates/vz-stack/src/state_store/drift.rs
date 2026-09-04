@@ -31,12 +31,12 @@ impl StateStore {
             let desired_names: std::collections::HashSet<&str> =
                 spec.services.iter().map(|s| s.name.as_str()).collect();
             for obs in &observed {
-                if !desired_names.contains(obs.service_name.as_str()) {
+                if !desired_names.contains(obs.replica.service_name.as_str()) {
                     findings.push(DriftFinding {
                         category: "observed_state".to_string(),
                         description: format!(
                             "orphaned observed state for service '{}'",
-                            obs.service_name
+                            obs.replica.display_name()
                         ),
                         severity: DriftSeverity::Warning,
                     });

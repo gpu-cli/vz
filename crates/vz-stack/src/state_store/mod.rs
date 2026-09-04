@@ -5,7 +5,8 @@
 //! - **Observed state**: per-service runtime state from the reconciler
 //! - **Events**: structured lifecycle events for observability
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU32;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -82,11 +83,81 @@ pub enum ServicePhase {
     Failed,
 }
 
-/// Per-service observed state as recorded by the reconciler.
+/// Immutable logical identity of one service replica.
+///
+/// The service name is always the exact base name from the stack specification.
+/// Numeric suffixes are presentation only and are never parsed as authority.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct ServiceReplicaKey {
+    /// Exact base service name from the stack specification.
+    pub service_name: String,
+    /// One-based replica index. Replica zero is not a valid identity.
+    pub replica_index: NonZeroU32,
+}
+
+impl<'de> Deserialize<'de> for ServiceReplicaKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireKey {
+            service_name: String,
+            replica_index: NonZeroU32,
+        }
+
+        let wire = WireKey::deserialize(deserializer)?;
+        Self::new(wire.service_name, wire.replica_index.get()).map_err(serde::de::Error::custom)
+    }
+}
+
+impl ServiceReplicaKey {
+    /// Construct and validate an exact service-replica identity.
+    pub fn new(service_name: impl Into<String>, replica_index: u32) -> Result<Self, StackError> {
+        let service_name = service_name.into();
+        let trimmed = service_name.trim();
+        if trimmed.is_empty() || trimmed.len() > 128 || trimmed != service_name {
+            return Err(StackError::InvalidSpec(
+                "service replica name must contain 1..=128 non-blank bytes".to_string(),
+            ));
+        }
+        let replica_index = NonZeroU32::new(replica_index).ok_or_else(|| {
+            StackError::InvalidSpec("service replica index must be non-zero".to_string())
+        })?;
+        Ok(Self {
+            service_name,
+            replica_index,
+        })
+    }
+
+    /// Construct the first replica of a service.
+    pub fn first(service_name: impl Into<String>) -> Result<Self, StackError> {
+        Self::new(service_name, 1)
+    }
+
+    /// Return the one-based replica index as a primitive value.
+    pub fn index(&self) -> u32 {
+        self.replica_index.get()
+    }
+
+    /// Produce a human-readable label without making it an identity key.
+    pub fn display_name(&self) -> String {
+        if self.index() == 1 {
+            self.service_name.clone()
+        } else {
+            format!("{}-{}", self.service_name, self.index())
+        }
+    }
+}
+
+/// Per-replica observed state as recorded by the reconciler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ServiceObservedState {
-    /// Service name within the stack.
-    pub service_name: String,
+    /// Exact logical replica identity.
+    pub replica: ServiceReplicaKey,
+    /// Full configuration digest atomically applied to this exact Running replica.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_digest: Option<String>,
     /// Current lifecycle phase.
     pub phase: ServicePhase,
     /// OCI container identifier, if assigned.
@@ -124,12 +195,106 @@ pub(crate) struct HealthPollState {
 /// be restored after a daemon restart.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AllocatorSnapshot {
-    /// Per-service allocated ports.
-    pub ports: HashMap<String, Vec<PublishedPort>>,
-    /// Per-service IP addresses within the stack network.
-    pub service_ips: HashMap<String, String>,
+    /// Version of the exact-replica allocator wire format.
+    pub schema_version: u32,
+    /// Per-replica allocated ports.
+    pub ports: Vec<AllocatorPortLease>,
+    /// Per-replica primary IP addresses within the stack network.
+    pub service_ips: Vec<AllocatorIpLease>,
+    /// Per-replica, per-network IP addresses.
+    pub service_network_ips: Vec<AllocatorNetworkIpLease>,
     /// Per-service VirtioFS mount tag offsets.
     pub mount_tag_offsets: HashMap<String, usize>,
+}
+
+/// Exact replica port lease persisted in an allocator snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AllocatorPortLease {
+    /// Replica that owns these published ports.
+    pub target: ServiceReplicaKey,
+    /// Published host ports owned by the replica.
+    pub ports: Vec<PublishedPort>,
+}
+
+/// Exact replica primary-IP lease persisted in an allocator snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllocatorIpLease {
+    /// Replica that owns the address.
+    pub target: ServiceReplicaKey,
+    /// Address without a CIDR prefix.
+    pub ip: String,
+}
+
+/// Exact replica network-specific IP lease persisted in an allocator snapshot.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AllocatorNetworkIpLease {
+    /// Replica that owns the address.
+    pub target: ServiceReplicaKey,
+    /// Declared network name.
+    pub network_name: String,
+    /// Address without a CIDR prefix.
+    pub ip: String,
+}
+
+impl AllocatorSnapshot {
+    fn validate(&self) -> Result<(), StackError> {
+        if self.schema_version != 2 {
+            return Err(StackError::InvalidSpec(format!(
+                "unsupported allocator snapshot schema {}",
+                self.schema_version
+            )));
+        }
+        let mut port_targets = HashSet::new();
+        let mut host_ports = HashSet::new();
+        for lease in &self.ports {
+            if !port_targets.insert(&lease.target) {
+                return Err(StackError::InvalidSpec(format!(
+                    "duplicate allocator port target `{}`",
+                    lease.target.display_name()
+                )));
+            }
+            for port in &lease.ports {
+                if !host_ports.insert(port.host_port) {
+                    return Err(StackError::InvalidSpec(format!(
+                        "allocator host port {} has multiple owners",
+                        port.host_port
+                    )));
+                }
+            }
+        }
+        let mut primary_targets = HashSet::new();
+        let mut primary_ips = HashSet::new();
+        for lease in &self.service_ips {
+            if !primary_targets.insert(&lease.target) || !primary_ips.insert(lease.ip.as_str()) {
+                return Err(StackError::InvalidSpec(
+                    "allocator primary IP lease is duplicated".to_string(),
+                ));
+            }
+            lease.ip.parse::<std::net::IpAddr>().map_err(|_| {
+                StackError::InvalidSpec(format!("allocator IP `{}` is invalid", lease.ip))
+            })?;
+        }
+        let mut network_targets = HashSet::new();
+        let mut network_ips = HashSet::new();
+        for lease in &self.service_network_ips {
+            if lease.network_name.trim().is_empty()
+                || lease.network_name.trim() != lease.network_name
+                || !network_targets.insert((&lease.target, lease.network_name.as_str()))
+                || !network_ips.insert((lease.network_name.as_str(), lease.ip.as_str()))
+            {
+                return Err(StackError::InvalidSpec(
+                    "allocator network IP lease is invalid or duplicated".to_string(),
+                ));
+            }
+            lease.ip.parse::<std::net::IpAddr>().map_err(|_| {
+                StackError::InvalidSpec(format!("allocator IP `{}` is invalid", lease.ip))
+            })?;
+        }
+        for service_name in self.mount_tag_offsets.keys() {
+            ServiceReplicaKey::first(service_name)?;
+        }
+        Ok(())
+    }
 }
 
 /// Metadata for a reconciliation session, enabling deterministic resume.
@@ -178,8 +343,8 @@ pub struct ReconcileAuditEntry {
     pub action_index: usize,
     /// Kind of action (e.g. `"service_create"`, `"service_recreate"`, `"service_remove"`).
     pub action_kind: String,
-    /// Target service name.
-    pub service_name: String,
+    /// Exact target replica.
+    pub target: ServiceReplicaKey,
     /// Deterministic hash of the action for identity tracking.
     pub action_hash: String,
     /// Lifecycle status: `"started"`, `"completed"`, or `"failed"`.
@@ -431,10 +596,38 @@ enum StoredActionKind {
     ServiceRemove,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 struct StoredAction {
+    schema_version: u32,
     kind: StoredActionKind,
-    service_name: String,
+    target: ServiceReplicaKey,
+}
+
+impl<'de> Deserialize<'de> for StoredAction {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct WireAction {
+            schema_version: u32,
+            kind: StoredActionKind,
+            target: ServiceReplicaKey,
+        }
+
+        let wire = WireAction::deserialize(deserializer)?;
+        if wire.schema_version != 2 {
+            return Err(serde::de::Error::custom(format!(
+                "unsupported stored action schema version {}",
+                wire.schema_version
+            )));
+        }
+        Ok(Self {
+            schema_version: wire.schema_version,
+            kind: wire.kind,
+            target: wire.target,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -447,20 +640,39 @@ pub struct ReconcileProgress {
     pub actions: Vec<Action>,
 }
 
+/// Durable result of committing one exact reconcile action batch.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReconcileBatchCommit {
+    /// First action index not known to have succeeded contiguously.
+    pub next_action_index: usize,
+    /// Session state after the atomic commit.
+    pub status: ReconcileSessionStatus,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReconcileBatchCommitFailpoint {
+    AfterAuditTerminalization,
+    AfterSessionCas,
+}
+
 impl StoredAction {
     fn from_action(action: &Action) -> Self {
         match action {
-            Action::ServiceCreate { service_name } => Self {
+            Action::ServiceCreate { target } => Self {
+                schema_version: 2,
                 kind: StoredActionKind::ServiceCreate,
-                service_name: service_name.clone(),
+                target: target.clone(),
             },
-            Action::ServiceRecreate { service_name } => Self {
+            Action::ServiceRecreate { target } => Self {
+                schema_version: 2,
                 kind: StoredActionKind::ServiceRecreate,
-                service_name: service_name.clone(),
+                target: target.clone(),
             },
-            Action::ServiceRemove { service_name } => Self {
+            Action::ServiceRemove { target } => Self {
+                schema_version: 2,
                 kind: StoredActionKind::ServiceRemove,
-                service_name: service_name.clone(),
+                target: target.clone(),
             },
         }
     }
@@ -468,13 +680,13 @@ impl StoredAction {
     fn into_action(self) -> Action {
         match self.kind {
             StoredActionKind::ServiceCreate => Action::ServiceCreate {
-                service_name: self.service_name,
+                target: self.target,
             },
             StoredActionKind::ServiceRecreate => Action::ServiceRecreate {
-                service_name: self.service_name,
+                target: self.target,
             },
             StoredActionKind::ServiceRemove => Action::ServiceRemove {
-                service_name: self.service_name,
+                target: self.target,
             },
         }
     }
@@ -590,12 +802,15 @@ impl StateStore {
     ) -> Result<T, StackError> {
         self.conn.execute_batch("BEGIN IMMEDIATE TRANSACTION")?;
         match f(self) {
-            Ok(value) => {
-                self.conn.execute_batch("COMMIT")?;
-                Ok(value)
-            }
+            Ok(value) => match self.conn.execute_batch("COMMIT") {
+                Ok(()) => Ok(value),
+                Err(error) => {
+                    self.conn.execute_batch("ROLLBACK")?;
+                    Err(error.into())
+                }
+            },
             Err(error) => {
-                let _ = self.conn.execute_batch("ROLLBACK");
+                self.conn.execute_batch("ROLLBACK")?;
                 Err(error)
             }
         }
@@ -635,7 +850,8 @@ impl StateStore {
                 store.create_legacy_schema()?;
                 store.create_topology_schema_v3()?;
                 store.create_stack_journal_schema_v4()?;
-                store.validate_v4_schema()?;
+                store.create_replica_schema_v5()?;
+                store.validate_v5_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -659,14 +875,20 @@ impl StateStore {
             1 => {
                 self.migrate_legacy_v1_to_v2()?;
                 self.migrate_topology_v2_to_v3()?;
-                self.migrate_stack_journal_v3_to_v4()
+                self.migrate_stack_journal_v3_to_v4()?;
+                self.migrate_replica_v4_to_v5()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
-                self.migrate_stack_journal_v3_to_v4()
+                self.migrate_stack_journal_v3_to_v4()?;
+                self.migrate_replica_v4_to_v5()
             }
-            3 => self.migrate_stack_journal_v3_to_v4(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v4_schema(),
+            3 => {
+                self.migrate_stack_journal_v3_to_v4()?;
+                self.migrate_replica_v4_to_v5()
+            }
+            4 => self.migrate_replica_v4_to_v5(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v5_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",
@@ -1014,30 +1236,47 @@ impl StateStore {
     }
 
     /// Persist progress for an in-flight reconcile operation.
-    pub fn save_reconcile_progress(
+    pub(crate) fn save_reconcile_progress(
         &self,
         stack_name: &str,
         operation_id: &str,
         actions: &[Action],
         next_action_index: usize,
     ) -> Result<(), StackError> {
+        if next_action_index > actions.len() {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress cursor {next_action_index} exceeds {} actions",
+                actions.len()
+            )));
+        }
         let stored_actions: Vec<StoredAction> =
             actions.iter().map(StoredAction::from_action).collect();
         let actions_json = serde_json::to_string(&stored_actions)?;
+        let actions_hash = crate::reconcile::compute_actions_hash(actions);
+        let next_action_index = i64::try_from(next_action_index).map_err(|_| {
+            StackError::InvalidSpec(
+                "reconcile progress cursor is too large for durable storage".to_string(),
+            )
+        })?;
 
         self.conn.execute(
-            "INSERT INTO reconcile_progress (stack_name, operation_id, actions_json, next_action_index)
-             VALUES (?1, ?2, ?3, ?4)
+            "INSERT INTO reconcile_progress (
+                stack_name, operation_id, action_schema_version, actions_json,
+                actions_hash, next_action_index
+             ) VALUES (?1, ?2, 2, ?3, ?4, ?5)
              ON CONFLICT(stack_name) DO UPDATE SET
                 operation_id = excluded.operation_id,
+                action_schema_version = excluded.action_schema_version,
                 actions_json = excluded.actions_json,
+                actions_hash = excluded.actions_hash,
                 next_action_index = excluded.next_action_index,
                 updated_at = datetime('now')",
             params![
                 stack_name,
                 operation_id,
                 actions_json,
-                next_action_index as i64
+                actions_hash,
+                next_action_index
             ],
         )?;
         Ok(())
@@ -1049,7 +1288,8 @@ impl StateStore {
         stack_name: &str,
     ) -> Result<Option<ReconcileProgress>, StackError> {
         let mut stmt = self.conn.prepare(
-            "SELECT operation_id, actions_json, next_action_index
+            "SELECT operation_id, action_schema_version, actions_json, actions_hash,
+                    next_action_index
              FROM reconcile_progress
              WHERE stack_name = ?1",
         )?;
@@ -1060,23 +1300,51 @@ impl StateStore {
         };
 
         let operation_id: String = row.get(0)?;
-        let actions_json: String = row.get(1)?;
-        let next_action_index: i64 = row.get(2)?;
-        let stored_actions: Vec<StoredAction> = serde_json::from_str(&actions_json)?;
+        let action_schema_version: i64 = row.get(1)?;
+        if action_schema_version != 2 {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress for `{stack_name}` uses unsupported action schema {action_schema_version}"
+            )));
+        }
+        let actions_json: String = row.get(2)?;
+        let stored_hash: String = row.get(3)?;
+        let next_action_index_raw: i64 = row.get(4)?;
+        let next_action_index = usize::try_from(next_action_index_raw).map_err(|_| {
+            StackError::InvalidSpec(format!(
+                "reconcile progress for `{stack_name}` has invalid cursor {next_action_index_raw}"
+            ))
+        })?;
+        let stored_actions: Vec<StoredAction> = serde_json::from_str(&actions_json).map_err(|error| {
+            StackError::InvalidSpec(format!(
+                "reconcile progress for `{stack_name}` contains malformed exact actions: {error}"
+            ))
+        })?;
         let actions = stored_actions
             .into_iter()
             .map(StoredAction::into_action)
-            .collect();
+            .collect::<Vec<_>>();
+        if next_action_index > actions.len() {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress for `{stack_name}` has cursor {next_action_index} beyond {} actions",
+                actions.len()
+            )));
+        }
+        let computed_hash = crate::reconcile::compute_actions_hash(&actions);
+        if stored_hash != computed_hash {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress for `{stack_name}` action hash mismatch"
+            )));
+        }
 
         Ok(Some(ReconcileProgress {
             operation_id,
-            next_action_index: next_action_index.max(0) as usize,
+            next_action_index,
             actions,
         }))
     }
 
     /// Clear any persisted reconcile progress for a stack.
-    pub fn clear_reconcile_progress(&self, stack_name: &str) -> Result<(), StackError> {
+    pub(crate) fn clear_reconcile_progress(&self, stack_name: &str) -> Result<(), StackError> {
         self.conn.execute(
             "DELETE FROM reconcile_progress WHERE stack_name = ?1",
             params![stack_name],
@@ -1090,7 +1358,7 @@ impl StateStore {
         stack_name: &str,
         state: &ServiceObservedState,
     ) -> Result<(), StackError> {
-        self.save_observed_state_for_replica(stack_name, 0, state)
+        self.save_observed_state_for_replica(stack_name, state.replica.index(), state)
     }
 
     pub fn save_observed_state_for_replica(
@@ -1099,16 +1367,38 @@ impl StateStore {
         replica_index: u32,
         state: &ServiceObservedState,
     ) -> Result<(), StackError> {
+        if replica_index == 0 || replica_index != state.replica.index() {
+            return Err(StackError::InvalidSpec(format!(
+                "observed state replica index {replica_index} does not match exact key {}",
+                state.replica.index()
+            )));
+        }
         let json = serde_json::to_string(state)?;
-        self.conn.execute(
-            "INSERT INTO observed_state (stack_name, service_name, replica_index, state_json)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(stack_name, service_name, replica_index) DO UPDATE SET
-                state_json = excluded.state_json,
-                updated_at = datetime('now')",
-            params![stack_name, state.service_name, replica_index, json],
-        )?;
-        Ok(())
+        self.with_immediate_transaction(|store| {
+            let journal_owned: bool = store.conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM stack_container_create_intents
+                    WHERE stack_id = ?1 AND service_name = ?2 AND replica_index = ?3
+                 )",
+                params![stack_name, state.replica.service_name, replica_index],
+                |row| row.get(0),
+            )?;
+            if journal_owned {
+                return Err(StackError::InvalidSpec(format!(
+                    "observed replica `{stack_name}/{}/{replica_index}` is journal-owned; generic writes are forbidden",
+                    state.replica.service_name
+                )));
+            }
+            store.conn.execute(
+                "INSERT INTO observed_state (stack_name, service_name, replica_index, state_json)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(stack_name, service_name, replica_index) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = datetime('now')",
+                params![stack_name, state.replica.service_name, replica_index, json],
+            )?;
+            Ok(())
+        })
     }
 
     pub fn load_observed_state_for_replica(
@@ -1117,17 +1407,31 @@ impl StateStore {
         service_name: &str,
         replica_index: u32,
     ) -> Result<Option<ServiceObservedState>, StackError> {
-        let json = self
+        let row = self
             .conn
             .query_row(
-                "SELECT state_json FROM observed_state
+                "SELECT service_name, replica_index, state_json FROM observed_state
                  WHERE stack_name = ?1 AND service_name = ?2 AND replica_index = ?3",
                 params![stack_name, service_name, replica_index],
-                |row| row.get::<_, String>(0),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
             )
             .optional()?;
-        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
-            .transpose()
+        let Some((sql_name, sql_index, json)) = row else {
+            return Ok(None);
+        };
+        let state: ServiceObservedState = serde_json::from_str(&json)?;
+        if state.replica.service_name != sql_name || i64::from(state.replica.index()) != sql_index {
+            return Err(StackError::InvalidSpec(format!(
+                "observed state SQL/JSON identity mismatch for `{stack_name}/{service_name}/{replica_index}`"
+            )));
+        }
+        Ok(Some(state))
     }
 
     /// Load all observed service states for a stack.
@@ -1136,15 +1440,29 @@ impl StateStore {
         stack_name: &str,
     ) -> Result<Vec<ServiceObservedState>, StackError> {
         let mut stmt = self.conn.prepare(
-            "SELECT state_json FROM observed_state WHERE stack_name = ?1
+            "SELECT service_name, replica_index, state_json
+             FROM observed_state WHERE stack_name = ?1
                  ORDER BY service_name, replica_index",
         )?;
-        let rows = stmt.query_map(params![stack_name], |row| row.get::<_, String>(0))?;
+        let rows = stmt.query_map(params![stack_name], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, i64>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
 
         let mut states = Vec::new();
-        for json_result in rows {
-            let json = json_result?;
+        for row in rows {
+            let (sql_name, sql_index, json) = row?;
             let state: ServiceObservedState = serde_json::from_str(&json)?;
+            if state.replica.service_name != sql_name
+                || i64::from(state.replica.index()) != sql_index
+            {
+                return Err(StackError::InvalidSpec(format!(
+                    "observed state SQL/JSON identity mismatch for `{stack_name}/{sql_name}/{sql_index}`"
+                )));
+            }
             states.push(state);
         }
         Ok(states)
@@ -1183,7 +1501,7 @@ impl StateStore {
             let Some(service) = desired
                 .services
                 .iter()
-                .find(|service| service.name == observed.service_name)
+                .find(|service| service.name == observed.replica.service_name)
             else {
                 continue;
             };
@@ -1227,7 +1545,7 @@ impl StateStore {
             let Some(service) = desired
                 .services
                 .iter()
-                .find(|service| service.name == observed.service_name)
+                .find(|service| service.name == observed.replica.service_name)
             else {
                 continue;
             };

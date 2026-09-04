@@ -20,7 +20,7 @@ use vz_runtime_contract::{
 };
 
 struct ScopedActivation {
-    name: String,
+    target: ServiceReplicaKey,
     intent: StackContainerCreateIntent,
     ownership: ContainerGenerationOwnership,
     image: String,
@@ -34,8 +34,15 @@ struct ScopedBatchManifest {
     operation_id: String,
     first_action_index: usize,
     spec: StackSpec,
-    actions: Vec<String>,
+    actions: Vec<ScopedManifestAction>,
     secret_inputs: BTreeMap<String, ScopedSecretInput>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ScopedManifestAction {
+    schema_version: u32,
+    kind: String,
+    target: ServiceReplicaKey,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -58,7 +65,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .scoped_authority
             .as_ref()
             .ok_or_else(|| scope_state_conflict("scoped manifest requires authority"))?;
-        let action_labels = actions.iter().map(action_label).collect::<Vec<_>>();
+        let manifest_actions = actions
+            .iter()
+            .map(ScopedManifestAction::from_action)
+            .collect::<Vec<_>>();
         let owner_dir = scoped_manifest_owner_dir(&self.data_dir, &authority.scope, operation_id);
         let manifest_path = owner_dir.join("manifest.json");
         if manifest_path.exists() {
@@ -66,7 +76,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             validate_private_file(&manifest_path, "scoped activation manifest")?;
             let bytes = std::fs::read(&manifest_path)?;
             let manifest: ScopedBatchManifest = serde_json::from_slice(&bytes)?;
-            if manifest.schema_version != 1
+            if manifest.schema_version != 2
                 || manifest.scope != authority.scope
                 || manifest.operation_id != operation_id
                 || manifest.spec != *spec
@@ -82,10 +92,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         "resumed action cursor precedes persisted activation manifest",
                     )
                 })?;
-            let end = offset.checked_add(action_labels.len()).ok_or_else(|| {
+            let end = offset.checked_add(manifest_actions.len()).ok_or_else(|| {
                 StackError::InvalidSpec("resumed action range overflow".to_string())
             })?;
-            if manifest.actions.get(offset..end) != Some(action_labels.as_slice()) {
+            if manifest.actions.get(offset..end) != Some(manifest_actions.as_slice()) {
                 return Err(scope_state_conflict(
                     "resumed actions do not match persisted activation manifest",
                 ));
@@ -173,12 +183,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             secret_digests.insert(name.clone(), digest);
         }
         let manifest = ScopedBatchManifest {
-            schema_version: 1,
+            schema_version: 2,
             scope: authority.scope.clone(),
             operation_id: operation_id.to_string(),
             first_action_index,
             spec: spec.clone(),
-            actions: action_labels,
+            actions: manifest_actions,
             secret_inputs,
         };
         atomic_write_private(
@@ -211,22 +221,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
         for record in records {
             for (index, action) in actions.iter().enumerate() {
-                if record.intent.service_name != action.service_name() {
+                if record.intent.service_name != action.target().service_name
+                    || record.intent.replica_index != action.target().replica_index.get()
+                {
                     continue;
                 }
                 let absolute_index = first_action_index.checked_add(index).ok_or_else(|| {
                     StackError::InvalidSpec("absolute action index overflow".to_string())
                 })?;
-                let identity = scoped_action_identity_digest(
-                    operation_id,
-                    absolute_index,
-                    action,
-                    record.intent.replica_index,
-                )?;
+                let identity = scoped_action_identity_digest(operation_id, absolute_index, action)?;
                 if record
                     .intent
                     .action_digest
-                    .starts_with(&format!("vzsad2:{identity}:"))
+                    .starts_with(&format!("vzsad3:{identity}:"))
                 {
                     return Ok(true);
                 }
@@ -269,13 +276,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             skipped_mounts,
             ..ExecutionResult::default()
         };
+        let mut outcome_failures: HashMap<ServiceReplicaKey, String> = HashMap::new();
 
         for level in compute_topo_levels(&creates, spec) {
             let mut activations = Vec::new();
             for action in level {
-                let service_name = action.service_name();
-                if let Err(error) = self.recover_stale_scoped_service(service_name) {
-                    record_error(&mut result, service_name, error);
+                let target = action.target();
+                let service_name = target.service_name.as_str();
+                let replica_index = target.replica_index.get();
+                if let Err(error) = self.recover_stale_scoped_replica(target) {
+                    record_action_error(&mut result, &mut outcome_failures, target, error);
                     continue;
                 }
                 let action_index = actions
@@ -287,88 +297,88 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     .ok_or_else(|| {
                         StackError::InvalidSpec("absolute action index overflow".to_string())
                     })?;
-                let replicas = service_map
-                    .get(service_name)
-                    .map(|service| service.resources.replicas.max(1))
-                    .unwrap_or(1);
-                for replica_index in 1..=replicas {
-                    if matches!(action, Action::ServiceCreate { .. }) {
-                        match self.admit_existing_running_replica(service_name, replica_index) {
-                            Ok(true) => {
-                                result.succeeded += 1;
-                                continue;
-                            }
-                            Ok(false) => {}
-                            Err(error) => {
-                                record_error(
-                                    &mut result,
-                                    &scoped_replica_name(service_name, replica_index),
-                                    error,
-                                );
-                                continue;
-                            }
+                let Some(service) = service_map.get(service_name).copied() else {
+                    record_action_error(
+                        &mut result,
+                        &mut outcome_failures,
+                        target,
+                        StackError::InvalidSpec(format!(
+                            "service `{service_name}` is missing from the desired stack"
+                        )),
+                    );
+                    continue;
+                };
+                if matches!(action, Action::ServiceCreate { .. }) {
+                    match self.admit_existing_running_replica(target) {
+                        Ok(true) => {
+                            result.succeeded += 1;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            record_action_error(&mut result, &mut outcome_failures, target, error);
+                            continue;
                         }
                     }
-                    let prepared =
-                        match self.prepare_create(spec, service_map, service_name, replica_index) {
-                            Ok(prepared) => prepared,
-                            Err(error) => {
-                                record_error(&mut result, service_name, error);
-                                continue;
-                            }
-                        };
-                    let name = prepared.full_name();
-                    let action_digest = scoped_action_digest(
-                        operation_id,
-                        absolute_action_index,
-                        action,
-                        &prepared,
-                        spec,
-                        &self.scoped_secret_digests,
-                    )?;
-                    let selector = StackContainerCreateSelector {
-                        project_id: authority.scope.project_id.clone(),
-                        environment_id: authority.scope.environment_id.clone(),
-                        machine_id: authority.scope.machine_id.clone(),
-                        machine_incarnation_id: authority.scope.machine_incarnation_id.clone(),
-                        environment_generation: authority.environment_generation,
-                        stack_id: authority.scope.stack_id.clone(),
-                        service_name: service_name.to_string(),
-                        replica_index,
-                        requested_container_id: prepared.requested_container_id.clone(),
-                        definition_digest: authority.definition_digest.clone(),
-                        action_digest,
-                    };
-                    if matches!(action, Action::ServiceRecreate { .. })
-                        && let Err(error) = self.cleanup_recreate_predecessor(
-                            service_name,
-                            replica_index,
-                            &selector.action_digest,
-                        )
-                    {
-                        record_error(&mut result, &name, error);
-                        continue;
-                    }
-                    let (intent, binding) = match self
-                        .store
-                        .resolve_or_begin_stack_container_create(&selector, unix_now())
-                    {
-                        Ok(resolution) => resolution,
+                }
+                let prepared =
+                    match self.prepare_create(spec, service_map, service_name, replica_index) {
+                        Ok(prepared) => prepared,
                         Err(error) => {
-                            record_error(&mut result, &name, error);
+                            record_action_error(&mut result, &mut outcome_failures, target, error);
                             continue;
                         }
                     };
-                    match self.admit_scoped_activation(&intent, binding) {
-                        Ok(Some(ownership)) => activations.push(ScopedActivation {
-                            name,
-                            intent,
-                            ownership,
-                            image: prepared.image,
-                            config: prepared.run_config,
-                        }),
-                        Ok(None) => result.succeeded += 1,
-                        Err(error) => record_error(&mut result, &name, error),
+                let action_digest = scoped_action_digest(
+                    operation_id,
+                    absolute_action_index,
+                    action,
+                    &prepared,
+                    spec,
+                    &self.scoped_secret_digests,
+                )?;
+                let selector = StackContainerCreateSelector {
+                    project_id: authority.scope.project_id.clone(),
+                    environment_id: authority.scope.environment_id.clone(),
+                    machine_id: authority.scope.machine_id.clone(),
+                    machine_incarnation_id: authority.scope.machine_incarnation_id.clone(),
+                    environment_generation: authority.environment_generation,
+                    stack_id: authority.scope.stack_id.clone(),
+                    service_name: service_name.to_string(),
+                    replica_index,
+                    requested_container_id: prepared.requested_container_id.clone(),
+                    definition_digest: authority.definition_digest.clone(),
+                    action_digest,
+                    applied_config_digest: crate::reconcile::service_config_digest(service),
+                };
+                if matches!(action, Action::ServiceRecreate { .. })
+                    && let Err(error) =
+                        self.cleanup_recreate_predecessor(target, &selector.action_digest)
+                {
+                    record_action_error(&mut result, &mut outcome_failures, target, error);
+                    continue;
+                }
+                let (intent, binding) = match self
+                    .store
+                    .resolve_or_begin_stack_container_create(&selector, unix_now())
+                {
+                    Ok(resolution) => resolution,
+                    Err(error) => {
+                        record_action_error(&mut result, &mut outcome_failures, target, error);
+                        continue;
+                    }
+                };
+                match self.admit_scoped_activation(&intent, binding) {
+                    Ok(Some(ownership)) => activations.push(ScopedActivation {
+                        target: target.clone(),
+                        intent,
+                        ownership,
+                        image: prepared.image,
+                        config: prepared.run_config,
+                    }),
+                    Ok(None) => result.succeeded += 1,
+                    Err(error) => {
+                        record_action_error(&mut result, &mut outcome_failures, target, error)
                     }
                 }
             }
@@ -380,10 +390,18 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     if let Err(error) = self.runtime.pull(&activation.image) {
                         let message = format!("image pull failed: {error}");
                         match self.fail_and_cleanup_scoped(&activation.intent, &message) {
-                            Ok(()) => record_error(&mut result, &activation.name, error),
-                            Err(cleanup_error) => {
-                                record_error(&mut result, &activation.name, cleanup_error)
-                            }
+                            Ok(()) => record_action_error(
+                                &mut result,
+                                &mut outcome_failures,
+                                &activation.target,
+                                error,
+                            ),
+                            Err(cleanup_error) => record_action_error(
+                                &mut result,
+                                &mut outcome_failures,
+                                &activation.target,
+                                cleanup_error,
+                            ),
                         }
                         continue;
                     }
@@ -397,29 +415,29 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 ready
                     .into_iter()
                     .map(|activation| {
-                        scope.spawn(move || {
+                        let target = activation.target.clone();
+                        let handle = scope.spawn(move || {
                             let outcome = runtime.activate_container_generation(
                                 activation.ownership.clone(),
                                 &activation.image,
                                 activation.config.clone(),
                             );
                             (activation, outcome)
-                        })
+                        });
+                        (target, handle)
                     })
                     .collect::<Vec<_>>()
                     .into_iter()
-                    .map(|handle| handle.join())
+                    .map(|(target, handle)| (target, handle.join()))
                     .collect::<Vec<_>>()
             });
-            for outcome in outcomes {
+            for (target, outcome) in outcomes {
                 let (activation, outcome) = match outcome {
                     Ok(outcome) => outcome,
                     Err(_) => {
-                        result.failed += 1;
-                        result.errors.push((
-                            "scoped-create".to_string(),
-                            "container activation thread panicked".to_string(),
-                        ));
+                        let error =
+                            StackError::Network("container activation thread panicked".to_string());
+                        record_action_error(&mut result, &mut outcome_failures, &target, error);
                         continue;
                     }
                 };
@@ -429,10 +447,18 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         {
                             let message = error.to_string();
                             match self.fail_and_cleanup_scoped(&activation.intent, &message) {
-                                Ok(()) => record_error(&mut result, &activation.name, error),
-                                Err(cleanup_error) => {
-                                    record_error(&mut result, &activation.name, cleanup_error)
-                                }
+                                Ok(()) => record_action_error(
+                                    &mut result,
+                                    &mut outcome_failures,
+                                    &activation.target,
+                                    error,
+                                ),
+                                Err(cleanup_error) => record_action_error(
+                                    &mut result,
+                                    &mut outcome_failures,
+                                    &activation.target,
+                                    cleanup_error,
+                                ),
                             }
                             continue;
                         }
@@ -447,10 +473,18 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                     "runtime activation completed but journal publication failed: {error}"
                                 );
                                 match self.fail_and_cleanup_scoped(&activation.intent, &reason) {
-                                    Ok(()) => record_error(&mut result, &activation.name, error),
-                                    Err(cleanup_error) => {
-                                        record_error(&mut result, &activation.name, cleanup_error)
-                                    }
+                                    Ok(()) => record_action_error(
+                                        &mut result,
+                                        &mut outcome_failures,
+                                        &activation.target,
+                                        error,
+                                    ),
+                                    Err(cleanup_error) => record_action_error(
+                                        &mut result,
+                                        &mut outcome_failures,
+                                        &activation.target,
+                                        cleanup_error,
+                                    ),
                                 }
                             }
                         }
@@ -466,14 +500,27 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 &activation.intent,
                                 "activation returned foreign cleanup ownership",
                             );
-                            record_error(&mut result, &activation.name, error);
+                            record_action_error(
+                                &mut result,
+                                &mut outcome_failures,
+                                &activation.target,
+                                error,
+                            );
                             continue;
                         }
                         match self.fail_and_cleanup_scoped(&activation.intent, &message) {
-                            Ok(()) => record_error(&mut result, &activation.name, failure.error),
-                            Err(cleanup_error) => {
-                                record_error(&mut result, &activation.name, cleanup_error)
-                            }
+                            Ok(()) => record_action_error(
+                                &mut result,
+                                &mut outcome_failures,
+                                &activation.target,
+                                failure.error,
+                            ),
+                            Err(cleanup_error) => record_action_error(
+                                &mut result,
+                                &mut outcome_failures,
+                                &activation.target,
+                                cleanup_error,
+                            ),
                         }
                     }
                 }
@@ -481,11 +528,36 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
 
         for action in removes {
-            match self.execute_scoped_remove(spec, action.service_name()) {
+            match self.execute_scoped_remove(spec, action.target()) {
                 Ok(()) => result.succeeded += 1,
-                Err(error) => record_error(&mut result, action.service_name(), error),
+                Err(error) => {
+                    record_action_error(&mut result, &mut outcome_failures, action.target(), error)
+                }
             }
         }
+        result.outcomes = actions
+            .iter()
+            .enumerate()
+            .map(|(relative_index, action)| {
+                let result = outcome_failures
+                    .get(action.target())
+                    .map(|error| ActionOutcomeResult::Failed {
+                        error: error.clone(),
+                    })
+                    .unwrap_or(ActionOutcomeResult::Succeeded);
+                Ok(IndexedActionOutcome {
+                    absolute_index: first_action_index.checked_add(relative_index).ok_or_else(
+                        || StackError::InvalidSpec("absolute action index overflow".to_string()),
+                    )?,
+                    action_hash: crate::reconcile::compute_actions_hash(std::slice::from_ref(
+                        action,
+                    )),
+                    action_kind: ReconcileActionKind::from_action(action),
+                    target: action.target().clone(),
+                    result,
+                })
+            })
+            .collect::<Result<Vec<_>, StackError>>()?;
         Ok(result)
     }
 
@@ -619,8 +691,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
     fn admit_existing_running_replica(
         &mut self,
-        service_name: &str,
-        replica_index: u32,
+        target: &ServiceReplicaKey,
     ) -> Result<bool, StackError> {
         let authority = self.scoped_authority.as_ref().ok_or_else(|| {
             scope_state_conflict("scoped running-replica admission requires authority")
@@ -630,8 +701,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?
             .into_iter()
             .filter(|record| {
-                record.intent.service_name == service_name
-                    && record.intent.replica_index == replica_index
+                record.intent.service_name == target.service_name
+                    && record.intent.replica_index == target.replica_index.get()
                     && record.intent.scope.machine_incarnation_id.as_ref()
                         == Some(&authority.scope.machine_incarnation_id)
                     && record.intent.status == StackContainerCreateStatus::Running
@@ -641,7 +712,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         };
         if matches.next().is_some() {
             return Err(scope_state_conflict(format!(
-                "service `{service_name}` replica {replica_index} has multiple Running reservations"
+                "replica `{}` has multiple Running reservations",
+                exact_target_label(target)
             )));
         }
         match self.admit_scoped_activation(&record.intent, record.binding)? {
@@ -652,7 +724,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
     }
 
-    fn recover_stale_scoped_service(&mut self, service_name: &str) -> Result<(), StackError> {
+    fn recover_stale_scoped_replica(
+        &mut self,
+        target: &ServiceReplicaKey,
+    ) -> Result<(), StackError> {
         let authority = self
             .scoped_authority
             .as_ref()
@@ -660,10 +735,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let records = self
             .store
             .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
-        for record in records
-            .into_iter()
-            .filter(|record| record.intent.service_name == service_name)
-        {
+        for record in records.into_iter().filter(|record| {
+            record.intent.service_name == target.service_name
+                && record.intent.replica_index == target.replica_index.get()
+        }) {
             match record.disposition {
                 StackContainerRecoveryDisposition::Activatable => {}
                 StackContainerRecoveryDisposition::CleanupOnly { .. } => {
@@ -715,8 +790,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
     fn cleanup_recreate_predecessor(
         &mut self,
-        service_name: &str,
-        replica_index: u32,
+        target: &ServiceReplicaKey,
         action_digest: &str,
     ) -> Result<(), StackError> {
         let authority = self
@@ -727,8 +801,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .store
             .list_stack_container_recovery_records_for_machine_workload(&authority.scope)?;
         let Some(record) = records.into_iter().find(|record| {
-            record.intent.service_name == service_name
-                && record.intent.replica_index == replica_index
+            record.intent.service_name == target.service_name
+                && record.intent.replica_index == target.replica_index.get()
         }) else {
             return Ok(());
         };
@@ -871,7 +945,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     fn execute_scoped_remove(
         &mut self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
     ) -> Result<(), StackError> {
         let authority = self
             .scoped_authority
@@ -883,15 +957,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let matching: Vec<_> = records
             .into_iter()
             .filter(|record| {
-                scoped_replica_name(&record.intent.service_name, record.intent.replica_index)
-                    == service_name
+                record.intent.service_name == target.service_name
+                    && record.intent.replica_index == target.replica_index.get()
                     && record.intent.scope.machine_incarnation_id.as_ref()
                         == Some(&authority.scope.machine_incarnation_id)
             })
             .collect();
         if matching.len() > 1 {
             return Err(scope_state_conflict(format!(
-                "service `{service_name}` maps to multiple scoped replica reservations"
+                "replica `{}` maps to multiple scoped replica reservations",
+                exact_target_label(target)
             )));
         }
         if matching.is_empty() {
@@ -900,15 +975,16 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 .load_observed_state(&spec.name)?
                 .into_iter()
                 .any(|state| {
-                    state.service_name == service_name
+                    state.replica == *target
                         && (state.container_id.is_some() || state.failed_create_ownership.is_some())
                 });
             if legacy {
                 return Err(scope_state_conflict(format!(
-                    "service `{service_name}` has no scoped journal cleanup authority"
+                    "replica `{}` has no scoped journal cleanup authority",
+                    exact_target_label(target)
                 )));
             }
-            self.ports.release(service_name);
+            self.ports.release_replica(target);
             return Ok(());
         }
         for record in matching {
@@ -959,7 +1035,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
                 (StackContainerCreateStatus::Blocked, _) => {
                     return Err(scope_state_conflict(format!(
-                        "service `{service_name}` has a blocked reservation"
+                        "replica `{}` has a blocked reservation",
+                        exact_target_label(target)
                     )));
                 }
                 (_, Some(binding)) => self.cleanup_scoped_binding(&record.intent, &binding)?,
@@ -971,7 +1048,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             }
         }
-        self.ports.release(service_name);
+        self.ports.release_replica(target);
         Ok(())
     }
 
@@ -987,12 +1064,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     }
 }
 
-fn scoped_replica_name(service_name: &str, replica_index: u32) -> String {
-    if replica_index <= 1 {
-        service_name.to_string()
-    } else {
-        format!("{service_name}-{replica_index}")
-    }
+fn exact_target_label(target: &ServiceReplicaKey) -> String {
+    format!("{}#{}", target.service_name, target.replica_index)
 }
 
 fn validate_exact_receipt(
@@ -1009,9 +1082,18 @@ fn validate_exact_receipt(
     Ok(())
 }
 
-fn record_error(result: &mut ExecutionResult, name: &str, error: StackError) {
+fn record_action_error(
+    result: &mut ExecutionResult,
+    outcome_failures: &mut HashMap<ServiceReplicaKey, String>,
+    target: &ServiceReplicaKey,
+    error: StackError,
+) {
+    let message = error.to_string();
     result.failed += 1;
-    result.errors.push((name.to_string(), error.to_string()));
+    result
+        .errors
+        .push((exact_target_label(target), message.clone()));
+    outcome_failures.entry(target.clone()).or_insert(message);
 }
 
 fn unix_now() -> u64 {
@@ -1029,12 +1111,12 @@ fn scoped_action_digest(
     spec: &StackSpec,
     secret_digests: &BTreeMap<String, String>,
 ) -> Result<String, StackError> {
-    let identity = scoped_action_identity_digest(
-        operation_id,
-        absolute_action_index,
-        action,
-        prepared.replica_index,
-    )?;
+    if prepared.target != *action.target() {
+        return Err(scope_state_conflict(
+            "prepared activation target differs from the exact action target",
+        ));
+    }
+    let identity = scoped_action_identity_digest(operation_id, absolute_action_index, action)?;
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"schema", b"vz.stack.activation-payload.v2");
     hash_field(&mut hasher, b"image", prepared.image.as_bytes());
@@ -1047,7 +1129,7 @@ fn scoped_action_digest(
     let service = spec
         .services
         .iter()
-        .find(|service| service.name == prepared.service_name)
+        .find(|service| service.name == prepared.target.service_name)
         .ok_or_else(|| StackError::InvalidSpec("prepared service disappeared".to_string()))?;
     hash_field(
         &mut hasher,
@@ -1070,14 +1152,13 @@ fn scoped_action_digest(
         })?;
         hash_field(&mut hasher, b"secret_sha256", digest.as_bytes());
     }
-    Ok(format!("vzsad2:{identity}:{:x}", hasher.finalize()))
+    Ok(format!("vzsad3:{identity}:{:x}", hasher.finalize()))
 }
 
 fn scoped_action_identity_digest(
     operation_id: &str,
     absolute_action_index: usize,
     action: &Action,
-    replica_index: u32,
 ) -> Result<String, StackError> {
     let mut hasher = Sha256::new();
     hash_field(&mut hasher, b"schema", b"vz.stack.action-identity.v2");
@@ -1089,8 +1170,18 @@ fn scoped_action_identity_digest(
             .map_err(|_| StackError::InvalidSpec("action index exceeds u64".to_string()))?
             .to_le_bytes(),
     );
-    hash_field(&mut hasher, b"action", action_label(action).as_bytes());
-    hash_field(&mut hasher, b"replica", &replica_index.to_le_bytes());
+    let manifest_action = ScopedManifestAction::from_action(action);
+    hash_field(&mut hasher, b"action_kind", manifest_action.kind.as_bytes());
+    hash_field(
+        &mut hasher,
+        b"service_name",
+        action.target().service_name.as_bytes(),
+    );
+    hash_field(
+        &mut hasher,
+        b"replica_index",
+        &action.target().replica_index.get().to_le_bytes(),
+    );
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -1275,11 +1366,18 @@ fn hash_field(hasher: &mut Sha256, name: &[u8], value: &[u8]) {
     hasher.update(value);
 }
 
-fn action_label(action: &Action) -> String {
-    match action {
-        Action::ServiceCreate { service_name } => format!("create:{service_name}"),
-        Action::ServiceRecreate { service_name } => format!("recreate:{service_name}"),
-        Action::ServiceRemove { service_name } => format!("remove:{service_name}"),
+impl ScopedManifestAction {
+    fn from_action(action: &Action) -> Self {
+        let kind = match action {
+            Action::ServiceCreate { .. } => "create",
+            Action::ServiceRecreate { .. } => "recreate",
+            Action::ServiceRemove { .. } => "remove",
+        };
+        Self {
+            schema_version: 1,
+            kind: kind.to_string(),
+            target: action.target().clone(),
+        }
     }
 }
 

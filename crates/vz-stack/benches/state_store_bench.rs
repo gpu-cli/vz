@@ -116,7 +116,8 @@ fn bench_save_observed_state(c: &mut Criterion) {
             || StateStore::in_memory().expect("in_memory store"),
             |store| {
                 let state = ServiceObservedState {
-                    service_name: "web".to_string(),
+                    replica: vz_stack::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                    applied_config_digest: None,
                     phase: ServicePhase::Running,
                     container_id: Some("ctr-abc".to_string()),
                     failed_create_ownership: None,
@@ -139,7 +140,8 @@ fn bench_load_observed_state(c: &mut Criterion) {
                 let store = StateStore::in_memory().expect("in_memory store");
                 for i in 0..10 {
                     let state = ServiceObservedState {
-                        service_name: format!("svc-{i}"),
+                        replica: vz_stack::ServiceReplicaKey::first(format!("svc-{i}")).unwrap(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Running,
                         container_id: Some(format!("ctr-{i}")),
                         failed_create_ownership: None,

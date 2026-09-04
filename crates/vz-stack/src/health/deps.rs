@@ -52,7 +52,7 @@ pub fn check_dependencies(
 
     let observed_map: HashMap<&str, &ServiceObservedState> = observed
         .iter()
-        .map(|o| (o.service_name.as_str(), o))
+        .map(|o| (o.replica.service_name.as_str(), o))
         .collect();
 
     let spec_map: HashMap<&str, &ServiceSpec> =

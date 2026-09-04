@@ -5,13 +5,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     pub(super) fn execute_remove(
         &mut self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
     ) -> Result<(), StackError> {
+        let service_name = target.service_name.as_str();
         // Find current container_id from observed state.
         let observed = self.store.load_observed_state(&spec.name)?;
-        let service_state = observed
-            .iter()
-            .find(|state| state.service_name == service_name);
+        let service_state = observed.iter().find(|state| state.replica == *target);
         let container_id = service_state.and_then(|state| state.container_id.clone());
         let container_ownership =
             service_state.and_then(|state| state.failed_create_ownership.clone());
@@ -35,7 +34,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 ));
                 self.mark_failed_with_container_and_ownership(
                     spec,
-                    service_name,
+                    target,
                     &error.to_string(),
                     container_id.as_deref(),
                     container_ownership,
@@ -58,7 +57,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             if let Err(error) = cleanup_result {
                 self.mark_failed_with_ownership(
                     spec,
-                    service_name,
+                    target,
                     &error.to_string(),
                     container_ownership,
                 )?;
@@ -68,18 +67,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let error = StackError::InvalidSpec(format!(
                 "container ownership is missing for service '{service_name}'; refusing ID-only cleanup"
             ));
-            self.mark_failed_with_container(spec, service_name, &error.to_string(), Some(cid))?;
+            self.mark_failed_with_container(spec, target, &error.to_string(), Some(cid))?;
             return Err(error);
         }
 
         // Release allocated ports.
-        self.ports.release(service_name);
+        self.ports.release_replica(target);
 
         // Update state to Stopped.
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
-                service_name: service_name.to_string(),
+                replica: target.clone(),
+                applied_config_digest: None,
                 phase: ServicePhase::Stopped,
                 container_id: None,
                 failed_create_ownership: None,
@@ -104,10 +104,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     pub(super) fn mark_failed(
         &self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
         error_msg: &str,
     ) -> Result<(), StackError> {
-        self.mark_failed_with_container(spec, service_name, error_msg, None)
+        self.mark_failed_with_container(spec, target, error_msg, None)
     }
 
     /// Mark a service as failed while retaining a runtime container identifier
@@ -115,14 +115,15 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     pub(super) fn mark_failed_with_container(
         &self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
         error_msg: &str,
         container_id: Option<&str>,
     ) -> Result<(), StackError> {
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
-                service_name: service_name.to_string(),
+                replica: target.clone(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: container_id.map(str::to_string),
                 failed_create_ownership: None,
@@ -135,7 +136,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             &spec.name,
             &StackEvent::ServiceFailed {
                 stack_name: spec.name.clone(),
-                service_name: service_name.to_string(),
+                service_name: target.service_name.clone(),
                 error: error_msg.to_string(),
             },
         )?;
@@ -149,7 +150,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     pub(super) fn mark_failed_with_ownership(
         &self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
         error_msg: &str,
         ownership: Option<vz_runtime_contract::ContainerGenerationOwnership>,
     ) -> Result<(), StackError> {
@@ -158,7 +159,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             .map(|ownership| ownership.container_id.clone());
         self.mark_failed_with_container_and_ownership(
             spec,
-            service_name,
+            target,
             error_msg,
             container_id.as_deref(),
             ownership,
@@ -168,7 +169,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     fn mark_failed_with_container_and_ownership(
         &self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
         error_msg: &str,
         container_id: Option<&str>,
         ownership: Option<vz_runtime_contract::ContainerGenerationOwnership>,
@@ -176,7 +177,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
-                service_name: service_name.to_string(),
+                replica: target.clone(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: container_id.map(str::to_string),
                 failed_create_ownership: ownership,
@@ -189,7 +191,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             &spec.name,
             &StackEvent::ServiceFailed {
                 stack_name: spec.name.clone(),
-                service_name: service_name.to_string(),
+                service_name: target.service_name.clone(),
                 error: error_msg.to_string(),
             },
         )?;

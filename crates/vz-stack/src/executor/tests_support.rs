@@ -60,6 +60,8 @@ pub struct MockContainerRuntime {
     pub mock_log_lines: Mutex<Vec<LogLine>>,
     /// Whether exact scoped activation should fail after reservation admission.
     pub fail_scoped_activation: bool,
+    /// Exact runtime IDs whose scoped activation should fail.
+    pub fail_scoped_activation_ids: Mutex<HashSet<String>>,
     /// Force reservation inspection to report a foreign owner.
     pub force_foreign_scoped_inspection: bool,
     /// Durable scoped generations, keyed by requested container ID.
@@ -101,6 +103,7 @@ impl MockContainerRuntime {
             listed_containers: Mutex::new(Vec::new()),
             mock_log_lines: Mutex::new(Vec::new()),
             fail_scoped_activation: false,
+            fail_scoped_activation_ids: Mutex::new(HashSet::new()),
             force_foreign_scoped_inspection: false,
             scoped_generations: Mutex::new(HashMap::new()),
             next_scoped_generation: AtomicU64::new(1),
@@ -486,7 +489,13 @@ impl ContainerRuntime for MockContainerRuntime {
                 scope_state_conflict("mock activation lacks exact unpublished reservation"),
             ));
         }
-        if self.fail_scoped_activation {
+        if self.fail_scoped_activation
+            || self
+                .fail_scoped_activation_ids
+                .lock()
+                .unwrap()
+                .contains(&ownership.container_id)
+        {
             return Err(vz_runtime_contract::OwnedCreateError {
                 error: StackError::InvalidSpec("mock scoped activation failure".to_string()),
                 cleanup: Some(ownership),

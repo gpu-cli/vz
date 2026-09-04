@@ -1,5 +1,23 @@
 use super::*;
 
+#[derive(serde::Serialize, serde::Deserialize)]
+struct AllocatorIpSnapshotWire {
+    schema_version: u32,
+    primary: Vec<AllocatorIpLease>,
+    networks: Vec<AllocatorNetworkIpLease>,
+}
+
+#[derive(PartialEq, Eq)]
+struct PersistedAuditIdentity {
+    stack_name: String,
+    action_kind: String,
+    service_name: String,
+    replica_index: i64,
+    action_hash: String,
+    status: String,
+    error_message: Option<String>,
+}
+
 fn persisted_u64(entity: &str, id: &str, field: &str, value: i64) -> Result<u64, StackError> {
     u64::try_from(value).map_err(|_| {
         StackError::InvalidSpec(format!(
@@ -17,6 +35,30 @@ fn persisted_optional_u64(
     value
         .map(|value| persisted_u64(entity, id, field, value))
         .transpose()
+}
+
+fn persisted_usize(entity: &str, id: &str, field: &str, value: i64) -> Result<usize, StackError> {
+    usize::try_from(value).map_err(|_| {
+        StackError::InvalidSpec(format!(
+            "persisted {entity} `{id}` has invalid `{field}` value {value}"
+        ))
+    })
+}
+
+fn sqlite_usize(entity: &str, id: &str, field: &str, value: usize) -> Result<i64, StackError> {
+    i64::try_from(value).map_err(|_| {
+        StackError::InvalidSpec(format!(
+            "{entity} `{id}` has `{field}` too large for durable storage"
+        ))
+    })
+}
+
+fn sqlite_timestamp(entity: &str, id: &str, field: &str, value: u64) -> Result<i64, StackError> {
+    i64::try_from(value).map_err(|_| {
+        StackError::InvalidSpec(format!(
+            "{entity} `{id}` has `{field}` too large for durable storage"
+        ))
+    })
 }
 
 impl StateStore {
@@ -188,8 +230,13 @@ impl StateStore {
         stack_name: &str,
         snapshot: &AllocatorSnapshot,
     ) -> Result<(), StackError> {
+        snapshot.validate()?;
         let ports_json = serde_json::to_string(&snapshot.ports)?;
-        let service_ips_json = serde_json::to_string(&snapshot.service_ips)?;
+        let service_ips_json = serde_json::to_string(&AllocatorIpSnapshotWire {
+            schema_version: snapshot.schema_version,
+            primary: snapshot.service_ips.clone(),
+            networks: snapshot.service_network_ips.clone(),
+        })?;
         let mount_tag_offsets_json = serde_json::to_string(&snapshot.mount_tag_offsets)?;
 
         self.conn.execute(
@@ -224,16 +271,19 @@ impl StateStore {
         let service_ips_json: String = row.get(1)?;
         let mount_tag_offsets_json: String = row.get(2)?;
 
-        let ports: HashMap<String, Vec<PublishedPort>> = serde_json::from_str(&ports_json)?;
-        let service_ips: HashMap<String, String> = serde_json::from_str(&service_ips_json)?;
+        let ports: Vec<AllocatorPortLease> = serde_json::from_str(&ports_json)?;
+        let ip_wire: AllocatorIpSnapshotWire = serde_json::from_str(&service_ips_json)?;
         let mount_tag_offsets: HashMap<String, usize> =
             serde_json::from_str(&mount_tag_offsets_json)?;
-
-        Ok(Some(AllocatorSnapshot {
+        let snapshot = AllocatorSnapshot {
+            schema_version: ip_wire.schema_version,
             ports,
-            service_ips,
+            service_ips: ip_wire.primary,
+            service_network_ips: ip_wire.networks,
             mount_tag_offsets,
-        }))
+        };
+        snapshot.validate()?;
+        Ok(Some(snapshot))
     }
 
     // ── Reconcile session tracking ──
@@ -242,11 +292,21 @@ impl StateStore {
     ///
     /// The `actions` slice is serialized into the `actions_json` column
     /// for auditability. The session struct carries the hash and cursor.
-    pub fn create_reconcile_session(
+    pub(crate) fn create_reconcile_session(
         &self,
         session: &ReconcileSession,
         actions: &[Action],
     ) -> Result<(), StackError> {
+        let computed_hash = crate::reconcile::compute_actions_hash(actions);
+        if session.actions_hash != computed_hash
+            || session.total_actions != actions.len()
+            || session.next_action_index > actions.len()
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{}` metadata does not match its exact action plan",
+                session.session_id
+            )));
+        }
         let stored_actions: Vec<StoredAction> =
             actions.iter().map(StoredAction::from_action).collect();
         let actions_json = serde_json::to_string(&stored_actions)?;
@@ -254,9 +314,9 @@ impl StateStore {
         self.conn.execute(
             "INSERT INTO reconcile_sessions (
                 session_id, stack_name, operation_id, status,
-                actions_json, actions_hash, next_action_index,
+                action_schema_version, actions_json, actions_hash, next_action_index,
                 total_actions, started_at, updated_at, completed_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+            ) VALUES (?1, ?2, ?3, ?4, 2, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 session.session_id,
                 session.stack_name,
@@ -264,14 +324,705 @@ impl StateStore {
                 session.status.as_str(),
                 actions_json,
                 session.actions_hash,
-                session.next_action_index as i64,
-                session.total_actions as i64,
-                session.started_at as i64,
-                session.updated_at as i64,
-                session.completed_at.map(|t| t as i64),
+                sqlite_usize(
+                    "reconcile session",
+                    &session.session_id,
+                    "next_action_index",
+                    session.next_action_index
+                )?,
+                sqlite_usize(
+                    "reconcile session",
+                    &session.session_id,
+                    "total_actions",
+                    session.total_actions
+                )?,
+                sqlite_timestamp(
+                    "reconcile session",
+                    &session.session_id,
+                    "started_at",
+                    session.started_at
+                )?,
+                sqlite_timestamp(
+                    "reconcile session",
+                    &session.session_id,
+                    "updated_at",
+                    session.updated_at
+                )?,
+                session
+                    .completed_at
+                    .map(|t| sqlite_timestamp(
+                        "reconcile session",
+                        &session.session_id,
+                        "completed_at",
+                        t
+                    ))
+                    .transpose()?,
             ],
         )?;
         Ok(())
+    }
+
+    /// Atomically install an exact action plan as the active reconcile operation.
+    pub fn create_reconcile_batch(
+        &self,
+        session: &ReconcileSession,
+        actions: &[Action],
+    ) -> Result<(), StackError> {
+        if session.operation_id.trim().is_empty()
+            || actions.is_empty()
+            || session.status != ReconcileSessionStatus::Active
+            || session.next_action_index != 0
+            || session.completed_at.is_some()
+        {
+            return Err(StackError::InvalidSpec(
+                "new reconcile batch requires an active zero-cursor session, non-empty operation, and non-empty action plan"
+                    .to_string(),
+            ));
+        }
+        let mut exact_targets = std::collections::BTreeSet::new();
+        if actions
+            .iter()
+            .any(|action| !exact_targets.insert(action.target().clone()))
+        {
+            return Err(StackError::InvalidSpec(
+                "reconcile action plan contains a duplicate exact replica target".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            let active_session = store
+                .conn
+                .query_row(
+                    "SELECT session_id FROM reconcile_sessions
+                     WHERE stack_name = ?1 AND status = 'active' LIMIT 1",
+                    params![session.stack_name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(active_session) = active_session {
+                return Err(StackError::InvalidSpec(format!(
+                    "stack `{}` already has active reconcile session `{active_session}`",
+                    session.stack_name
+                )));
+            }
+            let existing_progress = store
+                .conn
+                .query_row(
+                    "SELECT operation_id FROM reconcile_progress WHERE stack_name = ?1",
+                    params![session.stack_name],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(operation_id) = existing_progress {
+                return Err(StackError::InvalidSpec(format!(
+                    "stack `{}` already has reconcile progress for operation `{operation_id}`",
+                    session.stack_name
+                )));
+            }
+            store.save_reconcile_progress(
+                &session.stack_name,
+                &session.operation_id,
+                actions,
+                session.next_action_index,
+            )?;
+            store.create_reconcile_session(session, actions)
+        })
+    }
+
+    /// Atomically validate and mark a contiguous exact action slice as started.
+    ///
+    /// Replaying the same start is idempotent while the session cursor remains
+    /// unchanged. Any mismatch is rejected before the transaction writes.
+    pub fn start_reconcile_batch(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+    ) -> Result<(), StackError> {
+        if actions.is_empty() {
+            return Err(StackError::InvalidSpec(
+                "cannot start an empty reconcile action batch".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            store.validate_active_reconcile_batch(
+                session_id,
+                stack_name,
+                operation_id,
+                expected_cursor,
+                actions,
+            )?;
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now = sqlite_timestamp("reconcile session", session_id, "started_at", now)?;
+            for (relative_index, action) in actions.iter().enumerate() {
+                let absolute_index = expected_cursor.checked_add(relative_index).ok_or_else(|| {
+                    StackError::InvalidSpec("reconcile action index overflow".to_string())
+                })?;
+                let action_index = sqlite_usize(
+                    "reconcile audit",
+                    session_id,
+                    "action_index",
+                    absolute_index,
+                )?;
+                let action_hash =
+                    crate::reconcile::compute_actions_hash(std::slice::from_ref(action));
+                let action_kind = crate::executor::ReconcileActionKind::from_action(action)
+                    .as_audit_str();
+                store.conn.execute(
+                    "INSERT INTO reconcile_audit_log (
+                        session_id, stack_name, action_index, action_kind,
+                        service_name, replica_index, action_hash, status,
+                        started_at, completed_at, error_message
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'started', ?8, NULL, NULL)
+                     ON CONFLICT(session_id, action_index) DO NOTHING",
+                    params![
+                        session_id,
+                        stack_name,
+                        action_index,
+                        action_kind,
+                        action.target().service_name,
+                        i64::from(action.target().index()),
+                        action_hash,
+                        now,
+                    ],
+                )?;
+
+                let persisted = store.conn.query_row(
+                    "SELECT stack_name, action_kind, service_name, replica_index,
+                            action_hash, status, completed_at, error_message
+                     FROM reconcile_audit_log
+                     WHERE session_id = ?1 AND action_index = ?2",
+                    params![session_id, action_index],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, Option<i64>>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )?;
+                if persisted
+                    != (
+                        stack_name.to_string(),
+                        action_kind.to_string(),
+                        action.target().service_name.clone(),
+                        i64::from(action.target().index()),
+                        crate::reconcile::compute_actions_hash(std::slice::from_ref(action)),
+                        "started".to_string(),
+                        None,
+                        None,
+                    )
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "reconcile audit identity conflict for session `{session_id}` action {absolute_index}"
+                    )));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn validate_active_reconcile_batch(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+    ) -> Result<Vec<Action>, StackError> {
+        let (stored_stack, stored_operation, status, schema_version, actions_hash, cursor_raw) =
+            self.conn
+                .query_row(
+                    "SELECT stack_name, operation_id, status, action_schema_version,
+                            actions_hash, next_action_index
+                     FROM reconcile_sessions WHERE session_id = ?1",
+                    params![session_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, i64>(3)?,
+                            row.get::<_, String>(4)?,
+                            row.get::<_, i64>(5)?,
+                        ))
+                    },
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "reconcile session `{session_id}` was not found"
+                    ))
+                })?;
+        let cursor = persisted_usize(
+            "reconcile session",
+            session_id,
+            "next_action_index",
+            cursor_raw,
+        )?;
+        let plan = self.load_reconcile_session_actions(session_id)?;
+        let end = expected_cursor.checked_add(actions.len()).ok_or_else(|| {
+            StackError::InvalidSpec("reconcile action slice overflow".to_string())
+        })?;
+        if stored_stack != stack_name
+            || stored_operation != operation_id
+            || status != "active"
+            || schema_version != 2
+            || actions_hash != crate::reconcile::compute_actions_hash(&plan)
+            || cursor != expected_cursor
+            || end > plan.len()
+            || plan[expected_cursor..end] != *actions
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile batch does not match active session `{session_id}`"
+            )));
+        }
+        let progress = self.load_reconcile_progress(stack_name)?.ok_or_else(|| {
+            StackError::InvalidSpec(format!(
+                "active reconcile session `{session_id}` has no progress record"
+            ))
+        })?;
+        if progress.operation_id != operation_id
+            || progress.next_action_index != expected_cursor
+            || progress.actions != plan
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile progress does not match active session `{session_id}`"
+            )));
+        }
+        Ok(plan)
+    }
+
+    /// Atomically terminalize exact action audits and compare-and-swap progress.
+    pub fn commit_reconcile_batch(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        outcomes: &[crate::executor::IndexedActionOutcome],
+    ) -> Result<ReconcileBatchCommit, StackError> {
+        self.commit_reconcile_batch_inner(
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            outcomes,
+            #[cfg(test)]
+            None,
+        )
+    }
+
+    fn commit_reconcile_batch_inner(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        outcomes: &[crate::executor::IndexedActionOutcome],
+        #[cfg(test)] failpoint: Option<ReconcileBatchCommitFailpoint>,
+    ) -> Result<ReconcileBatchCommit, StackError> {
+        if actions.is_empty() || outcomes.len() != actions.len() {
+            return Err(StackError::InvalidSpec(
+                "reconcile outcomes must form a bijection over the dispatched actions".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            let plan = store.load_reconcile_session_actions(session_id)?;
+            let end = expected_cursor.checked_add(actions.len()).ok_or_else(|| {
+                StackError::InvalidSpec("reconcile action slice overflow".to_string())
+            })?;
+            if end > plan.len() || plan[expected_cursor..end] != *actions {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile commit does not match session `{session_id}` plan"
+                )));
+            }
+            for (relative_index, (action, outcome)) in
+                actions.iter().zip(outcomes.iter()).enumerate()
+            {
+                let absolute_index =
+                    expected_cursor.checked_add(relative_index).ok_or_else(|| {
+                        StackError::InvalidSpec("reconcile action index overflow".to_string())
+                    })?;
+                if outcome.absolute_index != absolute_index
+                    || outcome.action_kind
+                        != crate::executor::ReconcileActionKind::from_action(action)
+                    || outcome.target != *action.target()
+                    || outcome.action_hash
+                        != crate::reconcile::compute_actions_hash(std::slice::from_ref(action))
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "reconcile outcome does not match exact action {absolute_index}"
+                    )));
+                }
+            }
+
+            let successful_prefix = outcomes
+                .iter()
+                .take_while(|outcome| {
+                    matches!(
+                        outcome.result,
+                        crate::executor::ActionOutcomeResult::Succeeded
+                    )
+                })
+                .count();
+            let next_action_index = expected_cursor
+                .checked_add(successful_prefix)
+                .ok_or_else(|| StackError::InvalidSpec("reconcile cursor overflow".to_string()))?;
+            let any_failure = outcomes.iter().any(|outcome| {
+                matches!(
+                    outcome.result,
+                    crate::executor::ActionOutcomeResult::Failed { .. }
+                )
+            });
+            let status = if !any_failure && next_action_index == plan.len() {
+                ReconcileSessionStatus::Completed
+            } else if any_failure {
+                ReconcileSessionStatus::Failed
+            } else {
+                ReconcileSessionStatus::Active
+            };
+
+            let session_state = store.conn.query_row(
+                "SELECT stack_name, operation_id, status, action_schema_version,
+                        actions_hash, next_action_index
+                 FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )?;
+            if session_state.0 != stack_name
+                || session_state.1 != operation_id
+                || session_state.3 != 2
+                || session_state.4 != crate::reconcile::compute_actions_hash(&plan)
+            {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile commit identity mismatch for session `{session_id}`"
+                )));
+            }
+            let persisted_cursor = persisted_usize(
+                "reconcile session",
+                session_id,
+                "next_action_index",
+                session_state.5,
+            )?;
+
+            if session_state.2 != "active" || persisted_cursor != expected_cursor {
+                if persisted_cursor == next_action_index
+                    && session_state.2 == status.as_str()
+                    && store.reconcile_commit_is_identical(
+                        session_id,
+                        stack_name,
+                        next_action_index,
+                        &status,
+                        actions,
+                        outcomes,
+                    )?
+                {
+                    return Ok(ReconcileBatchCommit {
+                        next_action_index,
+                        status,
+                    });
+                }
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile session `{session_id}` cursor compare-and-swap lost"
+                )));
+            }
+
+            let progress = store.load_reconcile_progress(stack_name)?.ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "active reconcile session `{session_id}` has no progress record"
+                ))
+            })?;
+            if progress.operation_id != operation_id
+                || progress.next_action_index != expected_cursor
+                || progress.actions != plan
+            {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile progress compare-and-swap lost for session `{session_id}`"
+                )));
+            }
+
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs();
+            let now = sqlite_timestamp("reconcile session", session_id, "completed_at", now)?;
+            for outcome in outcomes {
+                let (audit_status, error_message) = match &outcome.result {
+                    crate::executor::ActionOutcomeResult::Succeeded => ("completed", None),
+                    crate::executor::ActionOutcomeResult::Failed { error } => {
+                        ("failed", Some(error.as_str()))
+                    }
+                };
+                let changed = store.conn.execute(
+                    "UPDATE reconcile_audit_log
+                     SET status = ?1, completed_at = ?2, error_message = ?3
+                     WHERE session_id = ?4 AND action_index = ?5
+                       AND action_kind = ?6 AND service_name = ?7
+                       AND replica_index = ?8 AND action_hash = ?9
+                       AND status = 'started' AND completed_at IS NULL
+                       AND error_message IS NULL",
+                    params![
+                        audit_status,
+                        now,
+                        error_message,
+                        session_id,
+                        sqlite_usize(
+                            "reconcile audit",
+                            session_id,
+                            "action_index",
+                            outcome.absolute_index
+                        )?,
+                        outcome.action_kind.as_audit_str(),
+                        outcome.target.service_name,
+                        i64::from(outcome.target.index()),
+                        outcome.action_hash,
+                    ],
+                )?;
+                if changed != 1 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "reconcile action {} has no matching started audit",
+                        outcome.absolute_index
+                    )));
+                }
+            }
+
+            #[cfg(test)]
+            if failpoint == Some(ReconcileBatchCommitFailpoint::AfterAuditTerminalization) {
+                return Err(StackError::InvalidSpec(
+                    "injected reconcile commit failure after audit terminalization".to_string(),
+                ));
+            }
+
+            let completed_at = if status == ReconcileSessionStatus::Active {
+                None
+            } else {
+                Some(now)
+            };
+            let changed = store.conn.execute(
+                "UPDATE reconcile_sessions
+                 SET next_action_index = ?1, status = ?2, updated_at = ?3,
+                     completed_at = ?4
+                 WHERE session_id = ?5 AND stack_name = ?6 AND operation_id = ?7
+                   AND action_schema_version = 2 AND actions_hash = ?8
+                   AND status = 'active' AND next_action_index = ?9",
+                params![
+                    sqlite_usize(
+                        "reconcile session",
+                        session_id,
+                        "next_action_index",
+                        next_action_index
+                    )?,
+                    status.as_str(),
+                    now,
+                    completed_at,
+                    session_id,
+                    stack_name,
+                    operation_id,
+                    crate::reconcile::compute_actions_hash(&plan),
+                    sqlite_usize(
+                        "reconcile session",
+                        session_id,
+                        "expected_cursor",
+                        expected_cursor
+                    )?,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile session `{session_id}` cursor compare-and-swap lost"
+                )));
+            }
+
+            #[cfg(test)]
+            if failpoint == Some(ReconcileBatchCommitFailpoint::AfterSessionCas) {
+                return Err(StackError::InvalidSpec(
+                    "injected reconcile commit failure after session CAS".to_string(),
+                ));
+            }
+
+            let progress_changed = if status == ReconcileSessionStatus::Active {
+                store.conn.execute(
+                    "UPDATE reconcile_progress SET next_action_index = ?1,
+                            updated_at = datetime('now')
+                     WHERE stack_name = ?2 AND operation_id = ?3
+                       AND action_schema_version = 2 AND actions_hash = ?4
+                       AND next_action_index = ?5",
+                    params![
+                        sqlite_usize(
+                            "reconcile progress",
+                            stack_name,
+                            "next_action_index",
+                            next_action_index
+                        )?,
+                        stack_name,
+                        operation_id,
+                        crate::reconcile::compute_actions_hash(&plan),
+                        sqlite_usize(
+                            "reconcile progress",
+                            stack_name,
+                            "expected_cursor",
+                            expected_cursor
+                        )?,
+                    ],
+                )?
+            } else {
+                store.conn.execute(
+                    "DELETE FROM reconcile_progress
+                     WHERE stack_name = ?1 AND operation_id = ?2
+                       AND action_schema_version = 2 AND actions_hash = ?3
+                       AND next_action_index = ?4",
+                    params![
+                        stack_name,
+                        operation_id,
+                        crate::reconcile::compute_actions_hash(&plan),
+                        sqlite_usize(
+                            "reconcile progress",
+                            stack_name,
+                            "expected_cursor",
+                            expected_cursor
+                        )?,
+                    ],
+                )?
+            };
+            if progress_changed != 1 {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile progress compare-and-swap lost for session `{session_id}`"
+                )));
+            }
+
+            Ok(ReconcileBatchCommit {
+                next_action_index,
+                status,
+            })
+        })
+    }
+
+    fn reconcile_commit_is_identical(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        next_action_index: usize,
+        status: &ReconcileSessionStatus,
+        actions: &[Action],
+        outcomes: &[crate::executor::IndexedActionOutcome],
+    ) -> Result<bool, StackError> {
+        for (action, outcome) in actions.iter().zip(outcomes) {
+            let expected_status = match outcome.result {
+                crate::executor::ActionOutcomeResult::Succeeded => "completed",
+                crate::executor::ActionOutcomeResult::Failed { .. } => "failed",
+            };
+            let expected_error = match &outcome.result {
+                crate::executor::ActionOutcomeResult::Succeeded => None,
+                crate::executor::ActionOutcomeResult::Failed { error } => Some(error.as_str()),
+            };
+            let audit = self
+                .conn
+                .query_row(
+                    "SELECT stack_name, action_kind, service_name, replica_index, action_hash,
+                            status, error_message
+                     FROM reconcile_audit_log
+                     WHERE session_id = ?1 AND action_index = ?2",
+                    params![
+                        session_id,
+                        sqlite_usize(
+                            "reconcile audit",
+                            session_id,
+                            "action_index",
+                            outcome.absolute_index
+                        )?,
+                    ],
+                    |row| {
+                        Ok(PersistedAuditIdentity {
+                            stack_name: row.get(0)?,
+                            action_kind: row.get(1)?,
+                            service_name: row.get(2)?,
+                            replica_index: row.get(3)?,
+                            action_hash: row.get(4)?,
+                            status: row.get(5)?,
+                            error_message: row.get(6)?,
+                        })
+                    },
+                )
+                .optional()?;
+            if audit
+                != Some(PersistedAuditIdentity {
+                    stack_name: stack_name.to_string(),
+                    action_kind: crate::executor::ReconcileActionKind::from_action(action)
+                        .as_audit_str()
+                        .to_string(),
+                    service_name: action.target().service_name.clone(),
+                    replica_index: i64::from(action.target().index()),
+                    action_hash: crate::reconcile::compute_actions_hash(std::slice::from_ref(
+                        action,
+                    )),
+                    status: expected_status.to_string(),
+                    error_message: expected_error.map(ToString::to_string),
+                })
+            {
+                return Ok(false);
+            }
+        }
+        let progress = self.load_reconcile_progress(stack_name)?;
+        if *status == ReconcileSessionStatus::Active {
+            let session_operation: String = self.conn.query_row(
+                "SELECT operation_id FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            let plan = self.load_reconcile_session_actions(session_id)?;
+            Ok(progress.is_some_and(|progress| {
+                progress.operation_id == session_operation
+                    && progress.next_action_index == next_action_index
+                    && progress.actions == plan
+            }))
+        } else {
+            Ok(progress.is_none())
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn commit_reconcile_batch_with_failpoint(
+        &self,
+        session_id: &str,
+        stack_name: &str,
+        operation_id: &str,
+        expected_cursor: usize,
+        actions: &[Action],
+        outcomes: &[crate::executor::IndexedActionOutcome],
+        failpoint: ReconcileBatchCommitFailpoint,
+    ) -> Result<ReconcileBatchCommit, StackError> {
+        self.commit_reconcile_batch_inner(
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            outcomes,
+            Some(failpoint),
+        )
     }
 
     /// Load the active reconcile session for a stack, if any.
@@ -281,8 +1032,8 @@ impl StateStore {
     ) -> Result<Option<ReconcileSession>, StackError> {
         let mut stmt = self.conn.prepare(
             "SELECT session_id, stack_name, operation_id, status,
-                    actions_hash, next_action_index, total_actions,
-                    started_at, updated_at, completed_at
+                    action_schema_version, actions_json, actions_hash,
+                    next_action_index, total_actions, started_at, updated_at, completed_at
              FROM reconcile_sessions
              WHERE stack_name = ?1 AND status = 'active'
              ORDER BY started_at DESC
@@ -295,24 +1046,132 @@ impl StateStore {
         };
 
         let status_str: String = row.get(3)?;
-        let completed_at: Option<i64> = row.get(9)?;
+        let session_id: String = row.get(0)?;
+        let action_schema_version: i64 = row.get(4)?;
+        if action_schema_version != 2 {
+            return Err(StackError::InvalidSpec(format!(
+                "active reconcile session `{session_id}` uses legacy action identity"
+            )));
+        }
+        let actions_json: String = row.get(5)?;
+        let stored: Vec<StoredAction> = serde_json::from_str(&actions_json).map_err(|error| {
+            StackError::InvalidSpec(format!(
+                "active reconcile session `{session_id}` has malformed exact actions: {error}"
+            ))
+        })?;
+        let actions = stored
+            .into_iter()
+            .map(StoredAction::into_action)
+            .collect::<Vec<_>>();
+        let actions_hash: String = row.get(6)?;
+        let next_action_index = persisted_usize(
+            "reconcile session",
+            &session_id,
+            "next_action_index",
+            row.get(7)?,
+        )?;
+        let total_actions = persisted_usize(
+            "reconcile session",
+            &session_id,
+            "total_actions",
+            row.get(8)?,
+        )?;
+        if total_actions != actions.len()
+            || next_action_index > total_actions
+            || actions_hash != crate::reconcile::compute_actions_hash(&actions)
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "active reconcile session `{session_id}` action metadata is inconsistent"
+            )));
+        }
+        let completed_at: Option<i64> = row.get(11)?;
 
         Ok(Some(ReconcileSession {
-            session_id: row.get(0)?,
+            session_id: session_id.clone(),
             stack_name: row.get(1)?,
             operation_id: row.get(2)?,
             status: ReconcileSessionStatus::from_str(&status_str)?,
-            actions_hash: row.get(4)?,
-            next_action_index: row.get::<_, i64>(5)?.max(0) as usize,
-            total_actions: row.get::<_, i64>(6)?.max(0) as usize,
-            started_at: row.get::<_, i64>(7)?.max(0) as u64,
-            updated_at: row.get::<_, i64>(8)?.max(0) as u64,
-            completed_at: completed_at.map(|t| t.max(0) as u64),
+            actions_hash,
+            next_action_index,
+            total_actions,
+            started_at: persisted_u64("reconcile session", &session_id, "started_at", row.get(9)?)?,
+            updated_at: persisted_u64(
+                "reconcile session",
+                &session_id,
+                "updated_at",
+                row.get(10)?,
+            )?,
+            completed_at: persisted_optional_u64(
+                "reconcile session",
+                &session_id,
+                "completed_at",
+                completed_at,
+            )?,
         }))
     }
 
+    /// Load the exact replica-qualified action plan stored for a session.
+    pub fn load_reconcile_session_actions(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<Action>, StackError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT action_schema_version, actions_json, actions_hash,
+                        next_action_index, total_actions
+                 FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!("reconcile session `{session_id}` was not found"))
+            })?;
+        let (schema_version, actions_json, actions_hash, cursor_raw, count_raw) = row;
+        if schema_version != 2 {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` uses legacy aggregate action identity"
+            )));
+        }
+        let stored: Vec<StoredAction> = serde_json::from_str(&actions_json).map_err(|error| {
+            StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` contains legacy or malformed replica-unqualified actions: {error}"
+            ))
+        })?;
+        let actions = stored
+            .into_iter()
+            .map(StoredAction::into_action)
+            .collect::<Vec<_>>();
+        let cursor = persisted_usize(
+            "reconcile session",
+            session_id,
+            "next_action_index",
+            cursor_raw,
+        )?;
+        let count = persisted_usize("reconcile session", session_id, "total_actions", count_raw)?;
+        if count != actions.len()
+            || cursor > count
+            || actions_hash != crate::reconcile::compute_actions_hash(&actions)
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` action metadata is inconsistent"
+            )));
+        }
+        Ok(actions)
+    }
+
     /// Update session progress (next_action_index, status).
-    pub fn update_reconcile_session_progress(
+    #[cfg(test)]
+    pub(crate) fn update_reconcile_session_progress(
         &self,
         session_id: &str,
         next_action_index: usize,
@@ -323,14 +1182,47 @@ impl StateStore {
             .unwrap_or_default()
             .as_secs();
 
+        let cursor = sqlite_usize(
+            "reconcile session",
+            session_id,
+            "next_action_index",
+            next_action_index,
+        )?;
+        let total: i64 = self.conn.query_row(
+            "SELECT total_actions FROM reconcile_sessions
+             WHERE session_id = ?1 AND action_schema_version = 2",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if cursor > total {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` cursor {cursor} exceeds action count {total}"
+            )));
+        }
+        if matches!(status, ReconcileSessionStatus::Completed) && cursor != total {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` cannot complete at cursor {cursor} of {total}"
+            )));
+        }
+        let completed_at = if matches!(status, ReconcileSessionStatus::Active) {
+            None
+        } else {
+            Some(sqlite_timestamp(
+                "reconcile session",
+                session_id,
+                "completed_at",
+                now,
+            )?)
+        };
         self.conn.execute(
             "UPDATE reconcile_sessions
-             SET next_action_index = ?1, status = ?2, updated_at = ?3
-             WHERE session_id = ?4",
+             SET next_action_index = ?1, status = ?2, updated_at = ?3, completed_at = ?4
+             WHERE session_id = ?5",
             params![
-                next_action_index as i64,
+                cursor,
                 status.as_str(),
-                now as i64,
+                sqlite_timestamp("reconcile session", session_id, "updated_at", now)?,
+                completed_at,
                 session_id
             ],
         )?;
@@ -338,12 +1230,24 @@ impl StateStore {
     }
 
     /// Mark a session as completed.
-    pub fn complete_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
+    #[cfg(test)]
+    pub(crate) fn complete_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
 
+        let actions = self.load_reconcile_session_actions(session_id)?;
+        let cursor: i64 = self.conn.query_row(
+            "SELECT next_action_index FROM reconcile_sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        if usize::try_from(cursor).ok() != Some(actions.len()) {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` cannot complete before all exact actions finish"
+            )));
+        }
         self.conn.execute(
             "UPDATE reconcile_sessions
              SET status = 'completed', updated_at = ?1, completed_at = ?1
@@ -354,7 +1258,8 @@ impl StateStore {
     }
 
     /// Mark a session as failed.
-    pub fn fail_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
+    #[cfg(test)]
+    pub(crate) fn fail_reconcile_session(&self, session_id: &str) -> Result<(), StackError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -369,10 +1274,9 @@ impl StateStore {
         Ok(())
     }
 
-    /// Supersede all active sessions for a stack (called when new apply starts).
-    ///
-    /// Returns the number of sessions superseded.
-    pub fn supersede_active_sessions(&self, stack_name: &str) -> Result<usize, StackError> {
+    /// Supersede all active sessions for a stack in legacy persistence tests.
+    #[cfg(test)]
+    pub(crate) fn supersede_active_sessions(&self, stack_name: &str) -> Result<usize, StackError> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -407,18 +1311,52 @@ impl StateStore {
         let mut sessions = Vec::new();
         while let Some(row) = rows.next()? {
             let status_str: String = row.get(3)?;
+            let session_id: String = row.get(0)?;
             let completed_at: Option<i64> = row.get(9)?;
+            let next_action_index = persisted_usize(
+                "reconcile session",
+                &session_id,
+                "next_action_index",
+                row.get(5)?,
+            )?;
+            let total_actions = persisted_usize(
+                "reconcile session",
+                &session_id,
+                "total_actions",
+                row.get(6)?,
+            )?;
+            let actions = self.load_reconcile_session_actions(&session_id)?;
+            if total_actions != actions.len() || next_action_index > total_actions {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile session `{session_id}` action metadata is inconsistent"
+                )));
+            }
             sessions.push(ReconcileSession {
-                session_id: row.get(0)?,
+                session_id: session_id.clone(),
                 stack_name: row.get(1)?,
                 operation_id: row.get(2)?,
                 status: ReconcileSessionStatus::from_str(&status_str)?,
                 actions_hash: row.get(4)?,
-                next_action_index: row.get::<_, i64>(5)?.max(0) as usize,
-                total_actions: row.get::<_, i64>(6)?.max(0) as usize,
-                started_at: row.get::<_, i64>(7)?.max(0) as u64,
-                updated_at: row.get::<_, i64>(8)?.max(0) as u64,
-                completed_at: completed_at.map(|t| t.max(0) as u64),
+                next_action_index,
+                total_actions,
+                started_at: persisted_u64(
+                    "reconcile session",
+                    &session_id,
+                    "started_at",
+                    row.get(7)?,
+                )?,
+                updated_at: persisted_u64(
+                    "reconcile session",
+                    &session_id,
+                    "updated_at",
+                    row.get(8)?,
+                )?,
+                completed_at: persisted_optional_u64(
+                    "reconcile session",
+                    &session_id,
+                    "completed_at",
+                    completed_at,
+                )?,
             });
         }
         Ok(sessions)
@@ -431,26 +1369,74 @@ impl StateStore {
     /// Returns the auto-generated row ID which should be passed to
     /// [`log_reconcile_action_complete`](Self::log_reconcile_action_complete)
     /// when the action finishes.
-    pub fn log_reconcile_action_start(
+    #[cfg(test)]
+    pub(crate) fn log_reconcile_action_start(
         &self,
         entry: &ReconcileAuditEntry,
     ) -> Result<i64, StackError> {
+        let actions = self.load_reconcile_session_actions(&entry.session_id)?;
+        let expected = actions.get(entry.action_index).ok_or_else(|| {
+            StackError::InvalidSpec(format!(
+                "reconcile audit index {} is outside session `{}` action plan",
+                entry.action_index, entry.session_id
+            ))
+        })?;
+        let expected_kind = match expected {
+            Action::ServiceCreate { .. } => "service_create",
+            Action::ServiceRecreate { .. } => "service_recreate",
+            Action::ServiceRemove { .. } => "service_remove",
+        };
+        let expected_hash = crate::reconcile::compute_actions_hash(std::slice::from_ref(expected));
+        let session_stack: String = self.conn.query_row(
+            "SELECT stack_name FROM reconcile_sessions WHERE session_id = ?1",
+            params![entry.session_id],
+            |row| row.get(0),
+        )?;
+        if entry.stack_name != session_stack
+            || entry.action_kind != expected_kind
+            || &entry.target != expected.target()
+            || entry.action_hash != expected_hash
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "reconcile audit identity does not match session `{}` action {}",
+                entry.session_id, entry.action_index
+            )));
+        }
+        let action_index = sqlite_usize(
+            "reconcile audit",
+            &entry.session_id,
+            "action_index",
+            entry.action_index,
+        )?;
+        let started_at = sqlite_timestamp(
+            "reconcile audit",
+            &entry.session_id,
+            "started_at",
+            entry.started_at,
+        )?;
+        let completed_at = entry
+            .completed_at
+            .map(|value| {
+                sqlite_timestamp("reconcile audit", &entry.session_id, "completed_at", value)
+            })
+            .transpose()?;
         self.conn.execute(
             "INSERT INTO reconcile_audit_log (
                 session_id, stack_name, action_index, action_kind,
-                service_name, action_hash, status, started_at,
+                service_name, replica_index, action_hash, status, started_at,
                 completed_at, error_message
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 entry.session_id,
                 entry.stack_name,
-                entry.action_index as i64,
+                action_index,
                 entry.action_kind,
-                entry.service_name,
+                entry.target.service_name,
+                i64::from(entry.target.index()),
                 entry.action_hash,
                 entry.status,
-                entry.started_at as i64,
-                entry.completed_at.map(|t| t as i64),
+                started_at,
+                completed_at,
                 entry.error_message,
             ],
         )?;
@@ -462,7 +1448,8 @@ impl StateStore {
     /// Sets `status` to `"completed"` on success or `"failed"` when an
     /// error message is provided, and records `completed_at` as the
     /// current Unix epoch second.
-    pub fn log_reconcile_action_complete(
+    #[cfg(test)]
+    pub(crate) fn log_reconcile_action_complete(
         &self,
         id: i64,
         error: Option<&str>,
@@ -494,13 +1481,13 @@ impl StateStore {
     ) -> Result<Vec<ReconcileAuditEntry>, StackError> {
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, stack_name, action_index, action_kind,
-                    service_name, action_hash, status, started_at,
+                    service_name, replica_index, action_hash, status, started_at,
                     completed_at, error_message
              FROM reconcile_audit_log
              WHERE session_id = ?1
              ORDER BY action_index ASC",
         )?;
-        Self::collect_audit_entries(&mut stmt, params![session_id])
+        self.collect_audit_entries(&mut stmt, params![session_id])
     }
 
     /// Load the most recent audit log entries for a stack, ordered newest-first.
@@ -514,17 +1501,18 @@ impl StateStore {
         let clamped = limit.clamp(1, 1000) as i64;
         let mut stmt = self.conn.prepare(
             "SELECT id, session_id, stack_name, action_index, action_kind,
-                    service_name, action_hash, status, started_at,
+                    service_name, replica_index, action_hash, status, started_at,
                     completed_at, error_message
              FROM reconcile_audit_log
              WHERE stack_name = ?1
              ORDER BY id DESC
              LIMIT ?2",
         )?;
-        Self::collect_audit_entries(&mut stmt, params![stack_name, clamped])
+        self.collect_audit_entries(&mut stmt, params![stack_name, clamped])
     }
 
     fn collect_audit_entries(
+        &self,
         stmt: &mut rusqlite::Statement<'_>,
         params: impl rusqlite::Params,
     ) -> Result<Vec<ReconcileAuditEntry>, StackError> {
@@ -536,11 +1524,12 @@ impl StateStore {
                 row.get::<_, i64>(3)?,
                 row.get::<_, String>(4)?,
                 row.get::<_, String>(5)?,
-                row.get::<_, String>(6)?,
+                row.get::<_, i64>(6)?,
                 row.get::<_, String>(7)?,
-                row.get::<_, i64>(8)?,
-                row.get::<_, Option<i64>>(9)?,
-                row.get::<_, Option<String>>(10)?,
+                row.get::<_, String>(8)?,
+                row.get::<_, i64>(9)?,
+                row.get::<_, Option<i64>>(10)?,
+                row.get::<_, Option<String>>(11)?,
             ))
         })?;
 
@@ -553,25 +1542,77 @@ impl StateStore {
                 action_index,
                 action_kind,
                 service_name,
+                replica_index,
                 action_hash,
                 status,
                 started_at,
                 completed_at,
                 error_message,
             ) = row_result?;
-            entries.push(ReconcileAuditEntry {
-                id,
-                session_id,
-                stack_name,
-                action_index: action_index.max(0) as usize,
-                action_kind,
+            let action_index = persisted_usize(
+                "reconcile audit",
+                &id.to_string(),
+                "action_index",
+                action_index,
+            )?;
+            let target = ServiceReplicaKey::new(
                 service_name,
+                u32::try_from(replica_index).map_err(|_| {
+                    StackError::InvalidSpec(format!(
+                        "reconcile audit row {id} has invalid replica index {replica_index}"
+                    ))
+                })?,
+            )?;
+            let entry = ReconcileAuditEntry {
+                id,
+                session_id: session_id.clone(),
+                stack_name,
+                action_index,
+                action_kind,
+                target,
                 action_hash,
                 status,
-                started_at: started_at.max(0) as u64,
-                completed_at: completed_at.map(|t| t.max(0) as u64),
+                started_at: persisted_u64(
+                    "reconcile audit",
+                    &id.to_string(),
+                    "started_at",
+                    started_at,
+                )?,
+                completed_at: persisted_optional_u64(
+                    "reconcile audit",
+                    &id.to_string(),
+                    "completed_at",
+                    completed_at,
+                )?,
                 error_message,
-            });
+            };
+            let actions = self.load_reconcile_session_actions(&session_id)?;
+            let session_stack: String = self.conn.query_row(
+                "SELECT stack_name FROM reconcile_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )?;
+            let expected = actions.get(action_index).ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "reconcile audit row {id} is outside its exact session action plan"
+                ))
+            })?;
+            let expected_kind = match expected {
+                Action::ServiceCreate { .. } => "service_create",
+                Action::ServiceRecreate { .. } => "service_recreate",
+                Action::ServiceRemove { .. } => "service_remove",
+            };
+            if entry.stack_name != session_stack
+                || entry.action_kind != expected_kind
+                || &entry.target != expected.target()
+                || entry.action_hash
+                    != crate::reconcile::compute_actions_hash(std::slice::from_ref(expected))
+            {
+                return Err(StackError::InvalidSpec(format!(
+                    "reconcile audit row {id} identity does not match its exact session action"
+                )));
+            }
+            entries.push(entry);
         }
         Ok(entries)
     }

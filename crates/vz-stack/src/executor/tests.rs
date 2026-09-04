@@ -3,7 +3,7 @@
 use super::dispatch::{compute_topo_levels, parse_subnet_base, parse_subnet_prefix};
 use super::tests_support::MockContainerRuntime;
 use super::*;
-use crate::reconcile::apply;
+use crate::reconcile::{apply, plan_apply};
 use crate::spec::MountSpec as StackMountSpec;
 use crate::spec::{
     PortSpec, ResourcesSpec, SecretDef, SecretSource, ServiceKind, ServiceSecretRef, StackSpec,
@@ -242,7 +242,7 @@ fn create_single_service() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -288,10 +288,10 @@ fn create_multiple_services() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
@@ -313,7 +313,7 @@ fn generated_runtime_ids_are_distinct_across_stacks_with_same_service_name() {
             .execute(
                 &spec,
                 &[Action::ServiceCreate {
-                    service_name: "db".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
                 }],
             )
             .unwrap();
@@ -349,7 +349,7 @@ fn explicit_container_name_is_preserved_as_caller_selected_runtime_id() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -382,7 +382,8 @@ fn remove_service() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "old".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-old".to_string()),
                 failed_create_ownership: Some(ownership.clone()),
@@ -393,7 +394,7 @@ fn remove_service() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "old".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -412,7 +413,10 @@ fn remove_service() {
 
     // Verify state is Stopped.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let old = observed.iter().find(|o| o.service_name == "old").unwrap();
+    let old = observed
+        .iter()
+        .find(|o| o.replica.service_name == "old")
+        .unwrap();
     assert_eq!(old.phase, ServicePhase::Stopped);
     assert!(old.container_id.is_none());
     assert!(old.failed_create_ownership.is_none());
@@ -428,7 +432,8 @@ fn running_container_without_ownership_is_quarantined_without_id_cleanup() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "old".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-old".to_string()),
                 failed_create_ownership: None,
@@ -442,7 +447,7 @@ fn running_container_without_ownership_is_quarantined_without_id_cleanup() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
-                service_name: "old".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -471,7 +476,8 @@ fn stale_successful_ownership_cannot_delete_a_foreign_replacement() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "old".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-replacement".to_string()),
                 failed_create_ownership: Some(stale.clone()),
@@ -485,7 +491,7 @@ fn stale_successful_ownership_cannot_delete_a_foreign_replacement() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
-                service_name: "old".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("old".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -511,7 +517,7 @@ fn successful_generation_cleanup_failure_retains_exact_ownership() {
         .execute(
             &create_spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -525,7 +531,7 @@ fn successful_generation_cleanup_failure_retains_exact_ownership() {
         .execute(
             &stack("myapp", vec![]),
             &[Action::ServiceRemove {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -563,7 +569,7 @@ fn environment_secret_source_is_staged_and_mounted() {
         disk_size_mb: None,
     };
     let actions = vec![Action::ServiceCreate {
-        service_name: "app".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -609,7 +615,7 @@ fn missing_environment_secret_source_fails_without_secret_material_in_error() {
         disk_size_mb: None,
     };
     let actions = vec![Action::ServiceCreate {
-        service_name: "app".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
     }];
 
     let error = executor
@@ -643,7 +649,8 @@ fn recreate_service() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-old".to_string()),
                 failed_create_ownership: Some(ownership),
@@ -654,7 +661,7 @@ fn recreate_service() {
         .unwrap();
 
     let actions = vec![Action::ServiceRecreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -676,7 +683,10 @@ fn recreate_service() {
 
     // New container.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Running);
     assert_eq!(web.container_id, Some("ctr-web".to_string()));
 }
@@ -689,7 +699,7 @@ fn pull_failure_marks_service_failed() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -698,7 +708,10 @@ fn pull_failure_marks_service_failed() {
 
     // Service should be marked Failed.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert!(web.container_id.is_none());
     assert!(web.last_error.is_some());
@@ -720,14 +733,17 @@ fn create_failure_marks_service_failed() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
     assert_eq!(result.failed, 1);
 
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert!(web.container_id.is_none());
     assert!(web.failed_create_ownership.is_none());
@@ -746,7 +762,7 @@ fn explicit_container_name_failure_does_not_claim_cleanup_ownership() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -781,7 +797,7 @@ fn inline_wrong_id_ownership_is_discarded_and_never_cleaned() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -815,7 +831,7 @@ fn inline_legacy_unscoped_ownership_is_quarantined_and_never_cleaned() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -848,7 +864,7 @@ fn owned_failed_create_survives_reconcile_and_is_cleaned_before_retry() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -919,7 +935,7 @@ fn failed_generation_cleanup_retains_ownership_and_blocks_recreate() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -970,10 +986,12 @@ fn parallel_owned_failures_keep_their_generation_tokens_associated() {
             &spec,
             &[
                 Action::ServiceCreate {
-                    service_name: "api".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("api".to_string())
+                        .unwrap(),
                 },
                 Action::ServiceCreate {
-                    service_name: "worker".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("worker".to_string())
+                        .unwrap(),
                 },
             ],
         )
@@ -984,7 +1002,7 @@ fn parallel_owned_failures_keep_their_generation_tokens_associated() {
     for service_name in ["api", "worker"] {
         let service = observed
             .iter()
-            .find(|state| state.service_name == service_name)
+            .find(|state| state.replica.service_name == service_name)
             .unwrap();
         let ownership = service.failed_create_ownership.as_ref().unwrap();
         let expected_id = super::create::generated_runtime_container_id("myapp", service_name, 1);
@@ -1015,10 +1033,12 @@ fn parallel_swapped_ownership_ids_are_discarded_and_never_cleaned() {
             &spec,
             &[
                 Action::ServiceCreate {
-                    service_name: "api".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("api".to_string())
+                        .unwrap(),
                 },
                 Action::ServiceCreate {
-                    service_name: "worker".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("worker".to_string())
+                        .unwrap(),
                 },
             ],
         )
@@ -1060,10 +1080,10 @@ fn partial_failure_continues_other_services() {
     // We'll test with a normal mock that succeeds for both.
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
@@ -1084,7 +1104,9 @@ fn remove_with_no_container_id() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "orphan".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("orphan".to_string())
+                    .unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Pending,
                 container_id: None,
                 failed_create_ownership: None,
@@ -1095,7 +1117,7 @@ fn remove_with_no_container_id() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "orphan".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("orphan".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1133,7 +1155,7 @@ fn volumes_created_before_containers() {
     };
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "db".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1169,7 +1191,7 @@ fn service_with_ports_creates_correctly() {
     );
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1201,7 +1223,8 @@ fn exact_cleanup_failure_is_reported_and_retains_running_ownership() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-1".to_string()),
                 failed_create_ownership: Some(generation_ownership("myapp", "ctr-1", 4)),
@@ -1212,7 +1235,7 @@ fn exact_cleanup_failure_is_reported_and_retains_running_ownership() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1226,7 +1249,10 @@ fn exact_cleanup_failure_is_reported_and_retains_running_ownership() {
 
     // Failed cleanup retains the exact proof for retry.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert!(web.failed_create_ownership.is_some());
 }
@@ -1240,7 +1266,7 @@ fn execution_result_errors_collected() {
     let spec = stack("myapp", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1405,6 +1431,49 @@ fn port_tracker_reallocate_does_not_conflict_with_other_services() {
         }],
     );
     assert!(result.is_err());
+    assert_eq!(
+        tracker.ports_for("postgres").unwrap()[0].host_port,
+        5432,
+        "failed replacement must retain the prior exact lease"
+    );
+}
+
+#[test]
+fn port_tracker_distinguishes_suffix_ambiguous_exact_replicas() {
+    let mut tracker = PortTracker::new();
+    let api_2 = crate::state_store::ServiceReplicaKey::new("api", 2).unwrap();
+    let api_dash_2 = crate::state_store::ServiceReplicaKey::new("api-2", 1).unwrap();
+    tracker
+        .allocate_replica(
+            &api_2,
+            &[PortSpec {
+                protocol: "tcp".to_string(),
+                container_port: 80,
+                host_port: Some(8080),
+            }],
+        )
+        .unwrap();
+    tracker
+        .allocate_replica(
+            &api_dash_2,
+            &[PortSpec {
+                protocol: "tcp".to_string(),
+                container_port: 80,
+                host_port: Some(8081),
+            }],
+        )
+        .unwrap();
+    assert_eq!(
+        tracker.ports_for_replica(&api_2).unwrap()[0].host_port,
+        8080
+    );
+    assert_eq!(
+        tracker.ports_for_replica(&api_dash_2).unwrap()[0].host_port,
+        8081
+    );
+    tracker.release_replica(&api_2);
+    assert!(tracker.ports_for_replica(&api_2).is_none());
+    assert!(tracker.ports_for_replica(&api_dash_2).is_some());
 }
 
 #[test]
@@ -1425,7 +1494,7 @@ fn executor_tracks_ports_on_create() {
     );
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1456,14 +1525,14 @@ fn executor_releases_ports_on_remove() {
 
     // Create first.
     let create_actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     executor.execute(&spec, &create_actions).unwrap();
     assert!(executor.ports().ports_for("web").is_some());
 
     // Remove should release ports.
     let remove_actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &remove_actions).unwrap();
     assert!(result.all_succeeded());
@@ -1485,7 +1554,8 @@ fn exact_teardown_preserves_configured_signal_and_grace_period() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some(ownership.container_id.clone()),
                 failed_create_ownership: Some(ownership),
@@ -1499,7 +1569,7 @@ fn exact_teardown_preserves_configured_signal_and_grace_period() {
         .execute(
             &spec,
             &[Action::ServiceRemove {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -1599,10 +1669,10 @@ fn executor_port_conflict_emits_event() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
 
@@ -1620,7 +1690,10 @@ fn executor_port_conflict_emits_event() {
 
     // api should be marked Failed.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let api = observed.iter().find(|o| o.service_name == "api").unwrap();
+    let api = observed
+        .iter()
+        .find(|o| o.replica.service_name == "api")
+        .unwrap();
     assert_eq!(api.phase, ServicePhase::Failed);
 }
 
@@ -1671,10 +1744,10 @@ fn shared_vm_boots_before_container_creates() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1702,10 +1775,10 @@ fn setup_sandbox_network_assigns_correct_ips() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1735,10 +1808,10 @@ fn service_to_service_hosts_use_real_ips() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1774,10 +1847,10 @@ fn containers_join_per_service_network_namespace() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1830,10 +1903,10 @@ fn same_container_port_no_conflict_with_shared_vm() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
 
@@ -1851,13 +1924,13 @@ fn three_service_ip_allocation() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -1896,7 +1969,7 @@ fn single_service_stack_uses_sandbox() {
     let spec = stack("solo", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -1921,7 +1994,7 @@ fn single_service_gets_sandbox_network() {
     let spec = stack("solo", vec![svc("web", "nginx:latest")]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     executor.execute(&spec, &actions).unwrap();
@@ -1944,17 +2017,17 @@ fn shared_vm_not_rebooted_on_second_execute() {
     // First execute: boots shared VM.
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
     executor.execute(&spec, &actions).unwrap();
 
     // Second execute with a recreate: should NOT reboot.
     let actions2 = vec![Action::ServiceRecreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     executor.execute(&spec, &actions2).unwrap();
 
@@ -1976,13 +2049,13 @@ fn topo_levels_independent_services_same_level() {
     let spec = three_service_stack();
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
     let refs: Vec<&Action> = actions.iter().collect();
@@ -2010,13 +2083,13 @@ fn topo_levels_chain_dependency() {
     );
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "app".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("app".to_string()).unwrap(),
         },
     ];
     let refs: Vec<&Action> = actions.iter().collect();
@@ -2046,13 +2119,13 @@ fn topo_levels_diamond_dependency() {
     );
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
     let refs: Vec<&Action> = actions.iter().collect();
@@ -2075,13 +2148,13 @@ fn parallel_creates_all_succeed() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -2094,7 +2167,10 @@ fn parallel_creates_all_succeed() {
     assert_eq!(observed.len(), 3);
     for obs in &observed {
         assert_eq!(obs.phase, ServicePhase::Running);
-        assert_eq!(obs.container_id, Some(format!("ctr-{}", obs.service_name)));
+        assert_eq!(
+            obs.container_id,
+            Some(format!("ctr-{}", obs.replica.service_name))
+        );
     }
 }
 
@@ -2119,13 +2195,13 @@ fn parallel_creates_with_dependency_ordering() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
     ];
 
@@ -2192,10 +2268,10 @@ fn resource_hints_passed_to_create_sandbox() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -2235,10 +2311,10 @@ fn create_sandbox_forwards_only_explicit_host_published_ports() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
 
@@ -2296,13 +2372,13 @@ fn custom_networks_multi_subnet_allocation() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -2360,10 +2436,10 @@ fn custom_networks_explicit_subnet() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
 
@@ -2409,13 +2485,13 @@ fn scoped_hosts_only_shared_networks() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "api".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -2468,10 +2544,10 @@ fn default_network_backward_compat() {
 
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "db".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
         },
     ];
 
@@ -2516,7 +2592,7 @@ fn caller_declared_extra_hosts_are_preserved_without_implicit_aliases() {
     let spec = stack("solo", vec![service]);
 
     let actions = vec![Action::ServiceCreate {
-        service_name: "only".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("only".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -2543,16 +2619,17 @@ fn port_tracker_snapshot_and_restore() {
         container_port: 80,
         protocol: "tcp".to_string(),
     }];
-    tracker.restore("web".to_string(), ports.clone());
+    let web = crate::state_store::ServiceReplicaKey::first("web").unwrap();
+    tracker.restore(web.clone(), ports.clone());
 
     let snapshot = tracker.allocated_snapshot();
-    assert_eq!(snapshot.get("web").unwrap(), &ports);
+    assert_eq!(snapshot.get(&web).unwrap(), &ports);
 
     let mut tracker2 = PortTracker::new();
     for (name, ports) in snapshot {
         tracker2.restore(name.clone(), ports.clone());
     }
-    assert_eq!(tracker2.allocated_snapshot().get("web").unwrap(), &ports);
+    assert_eq!(tracker2.allocated_snapshot().get(&web).unwrap(), &ports);
 }
 
 #[test]
@@ -2631,7 +2708,8 @@ fn exact_cleanup_failure_never_falls_back_to_id_only_remove() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
                 failed_create_ownership: Some(generation_ownership("myapp", "ctr-web", 5)),
@@ -2642,7 +2720,7 @@ fn exact_cleanup_failure_never_falls_back_to_id_only_remove() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -2664,7 +2742,10 @@ fn exact_cleanup_failure_never_falls_back_to_id_only_remove() {
 
     // State retains exact cleanup authority for retry.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
     assert!(web.failed_create_ownership.is_some());
@@ -2683,7 +2764,8 @@ fn remove_failure_retains_failed_state_and_container_for_retry() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
                 failed_create_ownership: Some(generation_ownership("myapp", "ctr-web", 6)),
@@ -2694,7 +2776,7 @@ fn remove_failure_retains_failed_state_and_container_for_retry() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -2703,7 +2785,10 @@ fn remove_failure_retains_failed_state_and_container_for_retry() {
 
     // Cleanup did not complete, so preserve the runtime ID for reconciliation.
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
     assert!(web.failed_create_ownership.is_some());
@@ -2726,7 +2811,8 @@ fn exact_cleanup_failure_retains_container_for_retry() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Running,
                 container_id: Some("ctr-web".to_string()),
                 failed_create_ownership: Some(generation_ownership("myapp", "ctr-web", 8)),
@@ -2737,7 +2823,7 @@ fn exact_cleanup_failure_retains_container_for_retry() {
         .unwrap();
 
     let actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let result = executor.execute(&spec, &actions).unwrap();
@@ -2750,7 +2836,10 @@ fn exact_cleanup_failure_retains_container_for_retry() {
     );
 
     let observed = executor.store().load_observed_state("myapp").unwrap();
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Failed);
     assert_eq!(web.container_id.as_deref(), Some("ctr-web"));
     let last_error = web.last_error.as_deref().unwrap();
@@ -2781,7 +2870,8 @@ fn malformed_failed_create_ownership_fails_closed() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: Some(ownership.container_id.clone()),
                 failed_create_ownership: Some(ownership.clone()),
@@ -2795,7 +2885,7 @@ fn malformed_failed_create_ownership_fails_closed() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -2828,7 +2918,8 @@ fn legacy_unscoped_persisted_ownership_never_reaches_cleanup() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: Some(ownership.container_id.clone()),
                 failed_create_ownership: Some(ownership.clone()),
@@ -2842,7 +2933,7 @@ fn legacy_unscoped_persisted_ownership_never_reaches_cleanup() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -2880,7 +2971,8 @@ fn already_absent_generation_cleanup_allows_recreation() {
         .save_observed_state(
             "myapp",
             &ServiceObservedState {
-                service_name: "web".to_string(),
+                replica: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: Some(ownership.container_id.clone()),
                 failed_create_ownership: Some(ownership.clone()),
@@ -2894,7 +2986,7 @@ fn already_absent_generation_cleanup_allows_recreation() {
         .execute(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
         )
         .unwrap();
@@ -2935,7 +3027,7 @@ fn ports_remain_reserved_when_exact_cleanup_fails() {
 
     // Create the service first.
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &actions).unwrap();
     assert!(result.all_succeeded());
@@ -2944,7 +3036,7 @@ fn ports_remain_reserved_when_exact_cleanup_fails() {
     // Exact cleanup fails, so the still-live generation keeps its port claim.
     let remove_spec = stack("myapp", vec![]);
     let remove_actions = vec![Action::ServiceRemove {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&remove_spec, &remove_actions).unwrap();
     assert_eq!(result.failed, 1, "cleanup failure must fail teardown");
@@ -2971,7 +3063,7 @@ fn ports_released_when_create_fails_on_retry() {
     // Create fails — ports were allocated during prepare_create but
     // service is marked Failed. Verify port state is usable for retry.
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     let result = executor.execute(&spec, &actions).unwrap();
     assert_eq!(result.failed, 1);
@@ -3010,7 +3102,9 @@ fn replica_scale_down_removes_excess_replicas() {
             .save_observed_state(
                 spec_name,
                 &ServiceObservedState {
-                    service_name: name.to_string(),
+                    replica: crate::state_store::ServiceReplicaKey::first(name.to_string())
+                        .unwrap(),
+                    applied_config_digest: None,
                     phase: ServicePhase::Running,
                     container_id: Some(cid.to_string()),
                     failed_create_ownership: Some(generation_ownership(spec_name, cid, 10)),
@@ -3045,7 +3139,7 @@ fn replica_scale_down_removes_excess_replicas() {
     let running: Vec<&str> = observed
         .iter()
         .filter(|o| matches!(o.phase, ServicePhase::Running))
-        .map(|o| o.service_name.as_str())
+        .map(|o| o.replica.service_name.as_str())
         .collect();
     assert_eq!(running, vec!["web"]);
 }
@@ -3063,7 +3157,7 @@ fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     assert!(
@@ -3110,7 +3204,7 @@ fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one()
     runtime.fail_scoped_activation = true;
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     let failed = executor
@@ -3158,7 +3252,7 @@ fn scoped_pull_failure_releases_reserved_generation_and_clears_recovery_fence() 
         .execute_with_operation(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "operation-pull-failure",
             0,
@@ -3192,7 +3286,7 @@ fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
         .execute_with_operation(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "operation-foreign",
             0,
@@ -3237,10 +3331,11 @@ fn scoped_parallel_create_publishes_each_exact_generation_once() {
             &spec,
             &[
                 Action::ServiceCreate {
-                    service_name: "web".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("web".to_string())
+                        .unwrap(),
                 },
                 Action::ServiceCreate {
-                    service_name: "db".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
                 },
             ],
             "operation-parallel",
@@ -3271,12 +3366,21 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
     store.save_project_state(&project).unwrap();
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
 
-    let initial = apply(&spec, &store, &HashMap::new()).unwrap();
+    let initial = plan_apply(&spec, &store, &HashMap::new()).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
     assert_eq!(
         initial.actions,
-        vec![Action::ServiceCreate {
-            service_name: "web".to_string(),
-        }]
+        vec![
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 1).unwrap(),
+            },
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            },
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
+            },
+        ]
     );
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     assert!(
@@ -3295,9 +3399,9 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
     assert_eq!(
         observed
             .iter()
-            .map(|state| state.service_name.as_str())
+            .map(|state| (state.replica.service_name.as_str(), state.replica.index()))
             .collect::<Vec<_>>(),
-        vec!["web", "web-2", "web-3"]
+        vec![("web", 1), ("web", 2), ("web", 3)]
     );
     assert!(
         observed
@@ -3305,7 +3409,7 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
             .all(|state| state.phase == ServicePhase::Running)
     );
 
-    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    let retry = plan_apply(&spec, executor.store(), &HashMap::new()).unwrap();
     assert!(retry.actions.is_empty(), "replica apply must converge");
     assert_eq!(
         executor
@@ -3318,15 +3422,19 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
 
     let mut scaled_down = spec.clone();
     scaled_down.services[0].resources.replicas = 1;
-    let down = apply(&scaled_down, executor.store(), &HashMap::new()).unwrap();
+    let down = plan_apply(&scaled_down, executor.store(), &HashMap::new()).unwrap();
+    executor
+        .store()
+        .save_desired_state(&scaled_down.name, &scaled_down)
+        .unwrap();
     assert_eq!(
         down.actions,
         vec![
             Action::ServiceRemove {
-                service_name: "web-2".to_string(),
+                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
             },
             Action::ServiceRemove {
-                service_name: "web-3".to_string(),
+                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
             },
         ]
     );
@@ -3337,7 +3445,7 @@ fn scoped_replicas_publish_distinct_observed_names_and_converge() {
             .all_succeeded()
     );
     assert!(
-        apply(&scaled_down, executor.store(), &HashMap::new())
+        plan_apply(&scaled_down, executor.store(), &HashMap::new())
             .unwrap()
             .actions
             .is_empty(),
@@ -3353,7 +3461,8 @@ fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() 
     let (project, scope) = scoped_topology(&spec.name);
     store.save_project_state(&project).unwrap();
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
-    let initial = apply(&spec, &store, &HashMap::new()).unwrap();
+    let initial = plan_apply(&spec, &store, &HashMap::new()).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     assert!(
         executor
@@ -3364,12 +3473,21 @@ fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() 
 
     let mut scaled_up = spec.clone();
     scaled_up.services[0].resources.replicas = 3;
-    let up = apply(&scaled_up, executor.store(), &HashMap::new()).unwrap();
+    let up = plan_apply(&scaled_up, executor.store(), &HashMap::new()).unwrap();
+    executor
+        .store()
+        .save_desired_state(&scaled_up.name, &scaled_up)
+        .unwrap();
     assert_eq!(
         up.actions,
-        vec![Action::ServiceCreate {
-            service_name: "web".to_string(),
-        }]
+        vec![
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 2).unwrap(),
+            },
+            Action::ServiceCreate {
+                target: crate::state_store::ServiceReplicaKey::new("web", 3).unwrap(),
+            },
+        ]
     );
     let result = executor
         .execute_with_operation(&scaled_up, &up.actions, "operation-scale-up", 0)
@@ -3385,11 +3503,208 @@ fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() 
         3
     );
     assert!(
-        apply(&scaled_up, executor.store(), &HashMap::new())
+        plan_apply(&scaled_up, executor.store(), &HashMap::new())
             .unwrap()
             .actions
             .is_empty()
     );
+}
+
+#[test]
+fn scoped_single_exact_action_mutates_only_target_replica() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut web = svc("web", "nginx:latest");
+    web.resources.replicas = 3;
+    let spec = stack("scoped-one-replica", vec![web]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let action = Action::ServiceCreate {
+        target: ServiceReplicaKey::new("web", 2).unwrap(),
+    };
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let result = executor
+        .execute_with_operation(
+            &spec,
+            std::slice::from_ref(&action),
+            "operation-only-two",
+            0,
+        )
+        .unwrap();
+    assert!(result.all_succeeded(), "{:?}", result.errors);
+    assert_eq!(result.outcomes.len(), 1);
+    assert_eq!(result.outcomes[0].target, *action.target());
+    assert_eq!(executor.runtime.scoped_generation_count(), 1);
+    let observed = executor.store().load_observed_state(&spec.name).unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].replica,
+        ServiceReplicaKey::new("web", 2).unwrap()
+    );
+}
+
+#[test]
+fn unscoped_single_exact_action_mutates_only_target_replica() {
+    let mut web = svc("web", "nginx:latest");
+    web.resources.replicas = 3;
+    let spec = stack("unscoped-one-replica", vec![web]);
+    let action = Action::ServiceCreate {
+        target: ServiceReplicaKey::new("web", 2).unwrap(),
+    };
+    let mut executor = make_executor(MockContainerRuntime::new());
+
+    let result = executor
+        .execute(&spec, std::slice::from_ref(&action))
+        .unwrap();
+
+    assert!(result.all_succeeded(), "{:?}", result.errors);
+    assert_eq!(result.outcomes.len(), 1);
+    assert_eq!(result.outcomes[0].target, *action.target());
+    let observed = executor.store().load_observed_state(&spec.name).unwrap();
+    assert_eq!(observed.len(), 1);
+    assert_eq!(
+        observed[0].replica,
+        ServiceReplicaKey::new("web", 2).unwrap()
+    );
+    assert_eq!(
+        executor
+            .runtime()
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "create_in_sandbox")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scoped_port_conflict_does_not_write_a_generic_replica_state() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut web = svc("web", "nginx:latest");
+    web.ports = vec![PortSpec {
+        protocol: "tcp".to_string(),
+        container_port: 80,
+        host_port: Some(18_080),
+    }];
+    let spec = stack("scoped-port-conflict", vec![web]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    executor
+        .ports
+        .allocate_replica(
+            &ServiceReplicaKey::first("already-owned").unwrap(),
+            &spec.services[0].ports,
+        )
+        .unwrap();
+    let action = Action::ServiceCreate {
+        target: ServiceReplicaKey::new("web", 2).unwrap(),
+    };
+
+    let result = executor
+        .execute_with_operation(
+            &spec,
+            std::slice::from_ref(&action),
+            "operation-port-conflict",
+            0,
+        )
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    assert!(matches!(
+        result.outcomes[0].result,
+        ActionOutcomeResult::Failed { .. }
+    ));
+    assert!(
+        executor
+            .store()
+            .load_observed_state(&spec.name)
+            .unwrap()
+            .is_empty(),
+        "pre-journal scoped failures must not synthesize replica #1 or #2 observed state"
+    );
+}
+
+#[test]
+fn scoped_outcomes_are_bijective_ordered_exact_and_offset_for_partial_failure() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut api = svc("api", "api:v1");
+    api.resources.replicas = 2;
+    let spec = stack("scoped-outcomes", vec![api, svc("api-2", "worker:v1")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let runtime = MockContainerRuntime::new();
+    runtime.fail_scoped_activation_ids.lock().unwrap().insert(
+        super::create::generated_runtime_container_id(&spec.name, "api", 2),
+    );
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
+    let actions = vec![
+        Action::ServiceCreate {
+            target: ServiceReplicaKey::new("api", 1).unwrap(),
+        },
+        Action::ServiceCreate {
+            target: ServiceReplicaKey::new("api", 2).unwrap(),
+        },
+        Action::ServiceCreate {
+            target: ServiceReplicaKey::new("api-2", 1).unwrap(),
+        },
+    ];
+    // A non-zero cursor is a resume, so the durable manifest must already
+    // contain the complete original action plan.  Stage seven prefix actions
+    // without executing them, then execute only the exact suffix under test.
+    let mut full_plan = (0..7)
+        .map(|_| Action::ServiceCreate {
+            target: ServiceReplicaKey::new("api", 1).unwrap(),
+        })
+        .collect::<Vec<_>>();
+    full_plan.extend(actions.clone());
+    executor
+        .prepare_scoped_batch_manifest(&spec, &full_plan, "operation-outcomes", 0)
+        .unwrap();
+    let result = executor
+        .execute_with_operation(&spec, &actions, "operation-outcomes", 7)
+        .unwrap();
+    assert_eq!(result.outcomes.len(), actions.len());
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.absolute_index)
+            .collect::<Vec<_>>(),
+        vec![7, 8, 9]
+    );
+    assert_eq!(
+        result
+            .outcomes
+            .iter()
+            .map(|outcome| outcome.target.clone())
+            .collect::<Vec<_>>(),
+        actions
+            .iter()
+            .map(|action| action.target().clone())
+            .collect::<Vec<_>>()
+    );
+    assert!(matches!(
+        result.outcomes[0].result,
+        ActionOutcomeResult::Succeeded
+    ));
+    assert!(matches!(
+        result.outcomes[1].result,
+        ActionOutcomeResult::Failed { .. }
+    ));
+    assert!(matches!(
+        result.outcomes[2].result,
+        ActionOutcomeResult::Succeeded
+    ));
+    assert_ne!(result.outcomes[1].target, result.outcomes[2].target);
 }
 
 #[test]
@@ -3411,7 +3726,7 @@ fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
 
     assert!(
@@ -3476,7 +3791,7 @@ fn scoped_interrupted_temp_staging_is_retryable_but_missing_final_manifest_is_no
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
@@ -3510,7 +3825,7 @@ fn scoped_manifest_rejects_config_change_before_new_reservation() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
@@ -3534,6 +3849,45 @@ fn scoped_manifest_rejects_config_change_before_new_reservation() {
 }
 
 #[test]
+fn scoped_manifest_distinguishes_suffix_ambiguous_exact_targets() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut api = svc("api", "api:v1");
+    api.resources.replicas = 2;
+    let spec = stack(
+        "scoped-manifest-exact",
+        vec![api, svc("api-2", "worker:v1")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let api_2 = Action::ServiceCreate {
+        target: ServiceReplicaKey::new("api", 2).unwrap(),
+    };
+    executor
+        .prepare_scoped_batch_manifest(
+            &spec,
+            std::slice::from_ref(&api_2),
+            "operation-exact-manifest",
+            0,
+        )
+        .unwrap();
+    let api_dash_2 = Action::ServiceCreate {
+        target: ServiceReplicaKey::new("api-2", 1).unwrap(),
+    };
+    let error = executor
+        .prepare_scoped_batch_manifest(
+            &spec,
+            std::slice::from_ref(&api_dash_2),
+            "operation-exact-manifest",
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("resumed actions do not match"));
+}
+
+#[test]
 fn scoped_running_replacement_is_blocked_and_never_reactivated() {
     let tmp = tempfile::tempdir().unwrap();
     let store = StateStore::in_memory().unwrap();
@@ -3544,7 +3898,7 @@ fn scoped_running_replacement_is_blocked_and_never_reactivated() {
     store.save_desired_state(&spec.name, &spec).unwrap();
     let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
     let actions = vec![Action::ServiceCreate {
-        service_name: "web".to_string(),
+        target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
     }];
     assert!(
         executor
@@ -3596,7 +3950,8 @@ fn scoped_remove_preserves_stop_signal_and_grace_policy() {
             .execute_with_operation(
                 &spec,
                 &[Action::ServiceCreate {
-                    service_name: "web".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("web".to_string())
+                        .unwrap(),
                 }],
                 "operation-remove-create",
                 0,
@@ -3609,7 +3964,8 @@ fn scoped_remove_preserves_stop_signal_and_grace_policy() {
             .execute_with_operation(
                 &spec,
                 &[Action::ServiceRemove {
-                    service_name: "web".to_string(),
+                    target: crate::state_store::ServiceReplicaKey::first("web".to_string())
+                        .unwrap(),
                 }],
                 "operation-remove",
                 0,
@@ -3654,10 +4010,10 @@ fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears(
     let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
     let actions = vec![
         Action::ServiceCreate {
-            service_name: "web".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceCreate {
-            service_name: "worker".to_string(),
+            target: crate::state_store::ServiceReplicaKey::first("worker".to_string()).unwrap(),
         },
     ];
     let first = executor
@@ -3707,7 +4063,7 @@ fn scoped_cleanup_mode_rejects_create_before_mutation() {
         .execute_with_operation(
             &spec,
             &[Action::ServiceCreate {
-                service_name: "web".to_string(),
+                target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
             }],
             "cleanup-cannot-create",
             0,

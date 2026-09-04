@@ -187,7 +187,7 @@ fn full_pipeline_parse_apply_execute() {
     assert_eq!(first.actions.len(), 1);
     assert!(matches!(
         &first.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "web"
+        Action::ServiceCreate { target } if target.service_name == "web"
     ));
 
     // Step 2: Execute first round through mock runtime.
@@ -204,7 +204,7 @@ fn full_pipeline_parse_apply_execute() {
     assert_eq!(second.actions.len(), 1);
     assert!(matches!(
         &second.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "api"
+        Action::ServiceCreate { target } if target.service_name == "api"
     ));
     let second_exec = executor.execute(&spec, &second.actions).unwrap();
     assert!(second_exec.all_succeeded());
@@ -214,7 +214,10 @@ fn full_pipeline_parse_apply_execute() {
     let observed = executor.store().load_observed_state("myapp").unwrap();
     assert_eq!(observed.len(), 2);
 
-    let web = observed.iter().find(|o| o.service_name == "web").unwrap();
+    let web = observed
+        .iter()
+        .find(|o| o.replica.service_name == "web")
+        .unwrap();
     assert_eq!(web.phase, ServicePhase::Running);
     assert!(
         web.container_id
@@ -222,7 +225,10 @@ fn full_pipeline_parse_apply_execute() {
             .is_some_and(|id| id.starts_with("ctr-vzs1-myapp-web-"))
     );
 
-    let api = observed.iter().find(|o| o.service_name == "api").unwrap();
+    let api = observed
+        .iter()
+        .find(|o| o.replica.service_name == "api")
+        .unwrap();
     assert_eq!(api.phase, ServicePhase::Running);
     assert!(
         api.container_id
@@ -259,7 +265,7 @@ fn full_pipeline_up_then_down() {
     assert_eq!(up_result_1.actions.len(), 1);
     assert!(matches!(
         &up_result_1.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "web"
+        Action::ServiceCreate { target } if target.service_name == "web"
     ));
 
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
@@ -272,7 +278,7 @@ fn full_pipeline_up_then_down() {
     assert_eq!(up_result_2.actions.len(), 1);
     assert!(matches!(
         &up_result_2.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "api"
+        Action::ServiceCreate { target } if target.service_name == "api"
     ));
     executor.execute(&spec, &up_result_2.actions).unwrap();
 
@@ -293,10 +299,10 @@ fn full_pipeline_up_then_down() {
     };
     let down_actions = vec![
         Action::ServiceRemove {
-            service_name: "web".to_string(),
+            target: vz_stack::ServiceReplicaKey::first("web".to_string()).unwrap(),
         },
         Action::ServiceRemove {
-            service_name: "api".to_string(),
+            target: vz_stack::ServiceReplicaKey::first("api".to_string()).unwrap(),
         },
     ];
 
@@ -350,7 +356,7 @@ fn health_check_gates_dependent_service() {
     assert_eq!(first.actions.len(), 1);
     assert!(matches!(
         &first.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "db"
+        Action::ServiceCreate { target } if target.service_name == "db"
     ));
 
     // Execute first round: db starts running.
@@ -368,7 +374,10 @@ fn health_check_gates_dependent_service() {
 
     // Verify db is now ready.
     let observed = executor.store().load_observed_state("hc-test").unwrap();
-    let db = observed.iter().find(|o| o.service_name == "db").unwrap();
+    let db = observed
+        .iter()
+        .find(|o| o.replica.service_name == "db")
+        .unwrap();
     assert!(db.ready);
 
     // Reconcile again: app is now unblocked by healthy db.
@@ -376,7 +385,7 @@ fn health_check_gates_dependent_service() {
     assert_eq!(second.actions.len(), 1);
     assert!(matches!(
         &second.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "app"
+        Action::ServiceCreate { target } if target.service_name == "app"
     ));
     executor.execute(&spec, &second.actions).unwrap();
 }
@@ -411,7 +420,10 @@ fn health_check_failure_marks_service_failed() {
 
     // Docker semantics: container stays Running (unhealthy), not killed.
     let observed = executor.store().load_observed_state("hc-fail").unwrap();
-    let db = observed.iter().find(|o| o.service_name == "db").unwrap();
+    let db = observed
+        .iter()
+        .find(|o| o.replica.service_name == "db")
+        .unwrap();
     assert_eq!(db.phase, ServicePhase::Running);
 
     // Counter is reset so health checks continue — a subsequent pass
@@ -449,7 +461,8 @@ fn restart_policy_generates_actions_for_failed_services() {
     // Simulate both services failing.
     let observed_states = vec![
         ServiceObservedState {
-            service_name: "worker".to_string(),
+            replica: vz_stack::ServiceReplicaKey::first("worker".to_string()).unwrap(),
+            applied_config_digest: None,
             phase: ServicePhase::Failed,
             container_id: None,
             failed_create_ownership: None,
@@ -457,7 +470,8 @@ fn restart_policy_generates_actions_for_failed_services() {
             ready: false,
         },
         ServiceObservedState {
-            service_name: "cron".to_string(),
+            replica: vz_stack::ServiceReplicaKey::first("cron".to_string()).unwrap(),
+            applied_config_digest: None,
             phase: ServicePhase::Failed,
             container_id: None,
             failed_create_ownership: None,
@@ -481,7 +495,7 @@ fn restart_policy_generates_actions_for_failed_services() {
     assert_eq!(restart_actions.len(), 1);
     assert!(matches!(
         &restart_actions[0],
-        Action::ServiceCreate { service_name } if service_name == "worker"
+        Action::ServiceCreate { target } if target.service_name == "worker"
     ));
 }
 
@@ -497,7 +511,8 @@ services:
     let spec = parse_compose(compose, "retry-test").unwrap();
 
     let observed = vec![ServiceObservedState {
-        service_name: "worker".to_string(),
+        replica: vz_stack::ServiceReplicaKey::first("worker".to_string()).unwrap(),
+        applied_config_digest: None,
         phase: ServicePhase::Failed,
         container_id: None,
         failed_create_ownership: None,
@@ -632,7 +647,7 @@ fn re_apply_after_execution_is_idempotent() {
     assert_eq!(result.actions.len(), 1);
     assert!(matches!(
         &result.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "web"
+        Action::ServiceCreate { target } if target.service_name == "web"
     ));
 
     let runtime = MockRuntime::new(vec!["ctr-web", "ctr-api"]);
@@ -645,7 +660,7 @@ fn re_apply_after_execution_is_idempotent() {
     assert_eq!(result2.actions.len(), 1);
     assert!(matches!(
         &result2.actions[0],
-        Action::ServiceCreate { service_name } if service_name == "api"
+        Action::ServiceCreate { target } if target.service_name == "api"
     ));
     executor.execute(&spec, &result2.actions).unwrap();
 

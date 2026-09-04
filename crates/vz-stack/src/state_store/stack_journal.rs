@@ -7,7 +7,7 @@ use vz_runtime_contract::{
     ProjectId,
 };
 
-use super::{ServiceObservedState, ServicePhase, StateStore};
+use super::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
 use crate::StackError;
 
 pub(super) const STACK_JOURNAL_SCHEMA_V4_DDL: &str = r#"
@@ -304,6 +304,9 @@ pub struct StackContainerCreateIntent {
     pub requested_container_id: String,
     pub definition_digest: String,
     pub action_digest: String,
+    /// Full service configuration this generation will apply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applied_config_digest: Option<String>,
     pub status: StackContainerCreateStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub last_error: Option<String>,
@@ -331,6 +334,9 @@ impl StackContainerCreateIntent {
         validate_text("requested_container_id", &self.requested_container_id)?;
         validate_digest("definition_digest", &self.definition_digest)?;
         validate_digest("action_digest", &self.action_digest)?;
+        if let Some(digest) = &self.applied_config_digest {
+            validate_digest("applied_config_digest", digest)?;
+        }
         if self.replica_index == 0 || self.service_generation == 0 {
             return invalid("replica_index and service_generation must be non-zero");
         }
@@ -359,6 +365,7 @@ impl StackContainerCreateIntent {
             && self.requested_container_id == other.requested_container_id
             && self.definition_digest == other.definition_digest
             && self.action_digest == other.action_digest
+            && self.applied_config_digest == other.applied_config_digest
             && self.created_at == other.created_at
     }
 }
@@ -398,6 +405,7 @@ pub struct StackContainerCreateSelector {
     pub requested_container_id: String,
     pub definition_digest: String,
     pub action_digest: String,
+    pub applied_config_digest: String,
 }
 
 impl StackContainerCreateSelector {
@@ -420,6 +428,7 @@ impl StackContainerCreateSelector {
             requested_container_id: self.requested_container_id.clone(),
             definition_digest: self.definition_digest.clone(),
             action_digest: self.action_digest.clone(),
+            applied_config_digest: Some(self.applied_config_digest.clone()),
             status: StackContainerCreateStatus::Intent,
             last_error: None,
             created_at: now,
@@ -440,6 +449,7 @@ impl StackContainerCreateSelector {
             && intent.requested_container_id == self.requested_container_id
             && intent.definition_digest == self.definition_digest
             && intent.action_digest == self.action_digest
+            && intent.applied_config_digest.as_deref() == Some(self.applied_config_digest.as_str())
     }
 }
 
@@ -560,7 +570,20 @@ impl StateStore {
             params![scope.stack_id],
             |row| row.get(0),
         )?;
-        if occupied {
+        let quarantined = if self.schema_version()? >= 5 {
+            self.conn.query_row(
+                "SELECT
+                     EXISTS(SELECT 1 FROM legacy_observed_state_quarantine_v5 WHERE stack_name = ?1)
+                  OR EXISTS(SELECT 1 FROM legacy_reconcile_progress_quarantine_v5 WHERE stack_name = ?1)
+                  OR EXISTS(SELECT 1 FROM legacy_reconcile_sessions_quarantine_v5 WHERE stack_name = ?1)
+                  OR EXISTS(SELECT 1 FROM legacy_reconcile_audit_quarantine_v5 WHERE stack_name = ?1)",
+                params![scope.stack_id],
+                |row| row.get::<_, bool>(0),
+            )?
+        } else {
+            false
+        };
+        if occupied || quarantined {
             return conflict(format!(
                 "stack_id `{}` has unowned legacy state; explicit ownership migration is required",
                 scope.stack_id
@@ -700,6 +723,11 @@ impl StateStore {
                     intent.scope.reservation_id
                 ));
             }
+            if store.schema_version()? >= 5 && intent.applied_config_digest.is_none() {
+                return invalid(
+                    "new v5 stack container create intent requires applied_config_digest",
+                );
+            }
             store.validate_intent_topology(intent)?;
             store.validate_journal_workload_owner(intent)?;
             // `observed_state` is keyed by stack name and service only. Production
@@ -777,7 +805,7 @@ impl StateStore {
                 ));
             }
             store.insert_stack_container_create_intent(intent)?;
-            store.save_journal_observed_state(intent, &creating_observed_state(intent))?;
+            store.save_journal_observed_state(intent, &creating_observed_state(intent)?)?;
             Ok(intent.clone())
         })
     }
@@ -876,7 +904,7 @@ impl StateStore {
                 ));
             }
             store.insert_stack_container_create_intent(&intent)?;
-            store.save_journal_observed_state(&intent, &creating_observed_state(&intent))?;
+            store.save_journal_observed_state(&intent, &creating_observed_state(&intent)?)?;
             Ok((intent, None))
         })
     }
@@ -1053,7 +1081,8 @@ impl StateStore {
             }
             store.require_journal_observed_consistent(&intent)?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Stopping,
                 container_id: Some(binding.ownership.container_id.clone()),
                 failed_create_ownership: Some(binding.ownership.clone()),
@@ -1292,7 +1321,8 @@ impl StateStore {
         self.with_immediate_transaction(|store| {
             let mut intent = store.require_stack_container_create_intent(reservation_id)?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: None,
                 failed_create_ownership: None,
@@ -1358,8 +1388,14 @@ impl StateStore {
                 })?;
             store.validate_binding_against_intent(&binding, &intent)?;
             store.validate_intent_topology(&intent)?;
+            let applied_config_digest = intent.applied_config_digest.clone().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "reservation `{reservation_id}` has no exact applied configuration digest"
+                ))
+            })?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: Some(applied_config_digest),
                 phase: ServicePhase::Running,
                 container_id: Some(intent.requested_container_id.clone()),
                 failed_create_ownership: Some(binding.ownership),
@@ -1382,6 +1418,87 @@ impl StateStore {
             intent.updated_at = now;
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
+            Ok(observed)
+        })
+    }
+
+    /// Monotonically publish readiness for an exact Running journal generation.
+    ///
+    /// The reservation and expected runtime identity fence stale health results;
+    /// all authority-bearing fields are reconstructed from the durable journal.
+    pub fn publish_stack_container_ready(
+        &self,
+        expected_target: &ServiceReplicaKey,
+        expected_ownership: &ContainerGenerationOwnership,
+    ) -> Result<ServiceObservedState, StackError> {
+        expected_ownership
+            .validate()
+            .map_err(StackError::InvalidSpec)?;
+        let reservation_id = &expected_ownership
+            .scope
+            .as_deref()
+            .ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "readiness ownership is missing its exact reservation scope".to_string(),
+                )
+            })?
+            .reservation_id;
+        self.with_immediate_transaction(|store| {
+            let intent = store.require_stack_container_create_intent(reservation_id)?;
+            if intent.status != StackContainerCreateStatus::Running {
+                return conflict(format!(
+                    "reservation `{reservation_id}` cannot publish readiness from status `{}`",
+                    intent.status.as_str()
+                ));
+            }
+            store.validate_journal_workload_owner(&intent)?;
+            store.validate_intent_topology(&intent)?;
+            let target = replica_key(&intent)?;
+            if &target != expected_target {
+                return conflict(format!(
+                    "stale readiness result does not match reservation `{reservation_id}`"
+                ));
+            }
+            let binding = store
+                .load_stack_container_generation_binding(reservation_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "running reservation `{reservation_id}` has no generation binding"
+                    ))
+                })?;
+            store.validate_binding_against_intent(&binding, &intent)?;
+            if &binding.ownership != expected_ownership {
+                return conflict(format!(
+                    "stale readiness generation does not match reservation `{reservation_id}`"
+                ));
+            }
+            store.require_journal_observed_consistent(&intent)?;
+            let applied_config_digest = intent.applied_config_digest.clone().ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "reservation `{reservation_id}` has no exact applied configuration digest"
+                ))
+            })?;
+            let observed = ServiceObservedState {
+                replica: target,
+                applied_config_digest: Some(applied_config_digest),
+                phase: ServicePhase::Running,
+                container_id: Some(intent.requested_container_id.clone()),
+                failed_create_ownership: Some(binding.ownership),
+                last_error: None,
+                ready: true,
+            };
+            if store
+                .load_service_observed(
+                    &intent.scope.stack_id,
+                    &intent.service_name,
+                    intent.replica_index,
+                )?
+                .as_ref()
+                == Some(&observed)
+            {
+                return Ok(observed);
+            }
+            store.save_journal_observed_state(&intent, &observed)?;
             Ok(observed)
         })
     }
@@ -1411,7 +1528,8 @@ impl StateStore {
             }
             store.require_journal_observed_consistent(&intent)?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: binding
                     .as_ref()
@@ -1450,7 +1568,8 @@ impl StateStore {
                 store.validate_binding_against_intent(binding, &intent)?;
             }
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Failed,
                 container_id: binding
                     .as_ref()
@@ -1503,7 +1622,8 @@ impl StateStore {
                 })?;
             store.validate_binding_against_intent(&binding, &intent)?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Stopping,
                 container_id: Some(binding.ownership.container_id.clone()),
                 failed_create_ownership: Some(binding.ownership),
@@ -1556,7 +1676,8 @@ impl StateStore {
                 })?;
             store.validate_binding_against_intent(&binding, &intent)?;
             let observed = ServiceObservedState {
-                service_name: observed_service_name(&intent),
+                replica: replica_key(&intent)?,
+                applied_config_digest: None,
                 phase: ServicePhase::Stopped,
                 container_id: None,
                 failed_create_ownership: None,
@@ -1831,41 +1952,92 @@ impl StateStore {
                         .to_string(),
                 )
             })?;
-        self.conn.execute(
-            "INSERT INTO stack_container_create_intents (
-                reservation_id, schema_version, project_id, environment_id, machine_id,
-                machine_incarnation_id, environment_generation, stack_id, service_name,
-                replica_index, service_generation, requested_container_id, definition_digest,
-                action_digest, status, intent_json, last_error, created_at, updated_at,
-                completed_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
-                       ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
-            params![
-                intent.scope.reservation_id,
-                intent.schema_version,
-                intent.scope.project_id.as_str(),
-                intent.scope.environment_id.as_str(),
-                intent.scope.machine_id.as_str(),
-                incarnation_id.as_str(),
-                sqlite_u64(intent.environment_generation, "environment_generation")?,
-                intent.scope.stack_id,
-                intent.service_name,
-                intent.replica_index,
-                sqlite_u64(intent.service_generation, "service_generation")?,
-                intent.requested_container_id,
-                intent.definition_digest,
-                intent.action_digest,
-                intent.status.as_str(),
-                serde_json::to_string(intent)?,
-                intent.last_error,
-                sqlite_u64(intent.created_at, "created_at")?,
-                sqlite_u64(intent.updated_at, "updated_at")?,
-                intent
-                    .completed_at
-                    .map(|value| sqlite_u64(value, "completed_at"))
-                    .transpose()?,
-            ],
+        let has_applied_config_digest: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('stack_container_create_intents')
+                WHERE name = 'applied_config_digest'
+             )",
+            [],
+            |row| row.get(0),
         )?;
+        let environment_generation =
+            sqlite_u64(intent.environment_generation, "environment_generation")?;
+        let service_generation = sqlite_u64(intent.service_generation, "service_generation")?;
+        let intent_json = serde_json::to_string(intent)?;
+        let created_at = sqlite_u64(intent.created_at, "created_at")?;
+        let updated_at = sqlite_u64(intent.updated_at, "updated_at")?;
+        let completed_at = intent
+            .completed_at
+            .map(|value| sqlite_u64(value, "completed_at"))
+            .transpose()?;
+        if has_applied_config_digest {
+            self.conn.execute(
+                "INSERT INTO stack_container_create_intents (
+                    reservation_id, schema_version, project_id, environment_id, machine_id,
+                    machine_incarnation_id, environment_generation, stack_id, service_name,
+                    replica_index, service_generation, requested_container_id, definition_digest,
+                    action_digest, status, intent_json, last_error, created_at, updated_at,
+                    completed_at, applied_config_digest
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                           ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+                params![
+                    intent.scope.reservation_id,
+                    intent.schema_version,
+                    intent.scope.project_id.as_str(),
+                    intent.scope.environment_id.as_str(),
+                    intent.scope.machine_id.as_str(),
+                    incarnation_id.as_str(),
+                    environment_generation,
+                    intent.scope.stack_id,
+                    intent.service_name,
+                    intent.replica_index,
+                    service_generation,
+                    intent.requested_container_id,
+                    intent.definition_digest,
+                    intent.action_digest,
+                    intent.status.as_str(),
+                    intent_json,
+                    intent.last_error,
+                    created_at,
+                    updated_at,
+                    completed_at,
+                    intent.applied_config_digest,
+                ],
+            )?;
+        } else {
+            self.conn.execute(
+                "INSERT INTO stack_container_create_intents (
+                    reservation_id, schema_version, project_id, environment_id, machine_id,
+                    machine_incarnation_id, environment_generation, stack_id, service_name,
+                    replica_index, service_generation, requested_container_id, definition_digest,
+                    action_digest, status, intent_json, last_error, created_at, updated_at,
+                    completed_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
+                           ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+                params![
+                    intent.scope.reservation_id,
+                    intent.schema_version,
+                    intent.scope.project_id.as_str(),
+                    intent.scope.environment_id.as_str(),
+                    intent.scope.machine_id.as_str(),
+                    incarnation_id.as_str(),
+                    environment_generation,
+                    intent.scope.stack_id,
+                    intent.service_name,
+                    intent.replica_index,
+                    service_generation,
+                    intent.requested_container_id,
+                    intent.definition_digest,
+                    intent.action_digest,
+                    intent.status.as_str(),
+                    intent_json,
+                    intent.last_error,
+                    created_at,
+                    updated_at,
+                    completed_at,
+                ],
+            )?;
+        }
         Ok(())
     }
 
@@ -1910,11 +2082,25 @@ impl StateStore {
         predicate: &str,
         value: &str,
     ) -> Result<Option<StackContainerCreateIntent>, StackError> {
+        let has_applied_config_digest: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM pragma_table_info('stack_container_create_intents')
+                WHERE name = 'applied_config_digest'
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        let applied_config_projection = if has_applied_config_digest {
+            "applied_config_digest"
+        } else {
+            "NULL"
+        };
         let sql = format!(
             "SELECT reservation_id, schema_version, project_id, environment_id, machine_id,
                     machine_incarnation_id, environment_generation, stack_id, service_name,
                     replica_index, service_generation, requested_container_id,
-                    definition_digest, action_digest, status, intent_json, last_error,
+                    definition_digest, action_digest, {applied_config_projection},
+                    status, intent_json, last_error,
                     created_at, updated_at, completed_at
              FROM stack_container_create_intents WHERE {predicate}"
         );
@@ -1936,12 +2122,13 @@ impl StateStore {
                     row.get::<_, String>(11)?,
                     row.get::<_, String>(12)?,
                     row.get::<_, String>(13)?,
-                    row.get::<_, String>(14)?,
+                    row.get::<_, Option<String>>(14)?,
                     row.get::<_, String>(15)?,
-                    row.get::<_, Option<String>>(16)?,
-                    row.get::<_, i64>(17)?,
+                    row.get::<_, String>(16)?,
+                    row.get::<_, Option<String>>(17)?,
                     row.get::<_, i64>(18)?,
-                    row.get::<_, Option<i64>>(19)?,
+                    row.get::<_, i64>(19)?,
+                    row.get::<_, Option<i64>>(20)?,
                 ))
             })
             .optional()?;
@@ -1960,6 +2147,7 @@ impl StateStore {
             container_id,
             definition_digest,
             action_digest,
+            applied_config_digest,
             status,
             intent_json,
             last_error,
@@ -2064,6 +2252,12 @@ impl StateStore {
             "action_digest",
         )?;
         require_projection(
+            !has_applied_config_digest || intent.applied_config_digest == applied_config_digest,
+            "stack_container_create_intents",
+            key,
+            "applied_config_digest",
+        )?;
+        require_projection(
             intent.status == StackContainerCreateStatus::parse(&status)?,
             "stack_container_create_intents",
             key,
@@ -2154,11 +2348,12 @@ impl StateStore {
         intent: &StackContainerCreateIntent,
         state: &ServiceObservedState,
     ) -> Result<(), StackError> {
-        let expected_name = observed_service_name(intent);
-        if state.service_name != expected_name {
+        let expected = ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index)?;
+        if state.replica != expected {
             return conflict(format!(
-                "observed state name `{}` does not match journal replica `{expected_name}`",
-                state.service_name
+                "observed state replica `{}` does not match journal replica `{}`",
+                state.replica.display_name(),
+                expected.display_name()
             ));
         }
         let json = serde_json::to_string(state)?;
@@ -2175,16 +2370,6 @@ impl StateStore {
                 json,
             ],
         )?;
-        if intent.replica_index > 0 {
-            // `apply` historically stages one replica-unaware row at index 0.
-            // Once a v4 journal row exists, the replica-qualified journal is the
-            // only authoritative observed projection for that service.
-            self.conn.execute(
-                "DELETE FROM observed_state
-                 WHERE stack_name = ?1 AND service_name = ?2 AND replica_index = 0",
-                params![intent.scope.stack_id, intent.service_name],
-            )?;
-        }
         Ok(())
     }
 
@@ -2203,7 +2388,8 @@ impl StateStore {
         } else {
             conflict(format!(
                 "observed state for `{}/{}` disagrees with its create journal",
-                intent.scope.stack_id, expected.service_name
+                intent.scope.stack_id,
+                expected.replica.display_name()
             ))
         }
     }
@@ -2217,13 +2403,13 @@ impl StateStore {
         self.load_observed_state_for_replica(stack_id, service_name, replica_index)
     }
 
-    fn require_journal_observed_consistent(
+    pub(super) fn require_journal_observed_consistent(
         &self,
         intent: &StackContainerCreateIntent,
     ) -> Result<(), StackError> {
         match intent.status {
             StackContainerCreateStatus::Intent | StackContainerCreateStatus::Reserved => {
-                self.require_exact_observed(intent, &creating_observed_state(intent))
+                self.require_exact_observed(intent, &creating_observed_state(intent)?)
             }
             StackContainerCreateStatus::Running => {
                 let binding = self
@@ -2241,11 +2427,13 @@ impl StateStore {
                     intent.replica_index,
                 )?;
                 let valid = actual.as_ref().is_some_and(|state| {
-                    state.service_name == observed_service_name(intent)
+                    state.replica.service_name == intent.service_name
+                        && state.replica.index() == intent.replica_index
                         && state.phase == ServicePhase::Running
                         && state.container_id.as_deref()
                             == Some(intent.requested_container_id.as_str())
                         && state.failed_create_ownership.as_ref() == Some(&binding.ownership)
+                        && state.applied_config_digest == intent.applied_config_digest
                         && state.last_error.is_none()
                 });
                 require_projection(
@@ -2294,7 +2482,11 @@ impl StateStore {
                 self.require_exact_observed(
                     intent,
                     &ServiceObservedState {
-                        service_name: observed_service_name(intent),
+                        replica: ServiceReplicaKey::new(
+                            intent.service_name.clone(),
+                            intent.replica_index,
+                        )?,
+                        applied_config_digest: None,
                         phase: ServicePhase::Failed,
                         container_id: binding
                             .as_ref()
@@ -2308,7 +2500,11 @@ impl StateStore {
             StackContainerCreateStatus::Cleaned => self.require_exact_observed(
                 intent,
                 &ServiceObservedState {
-                    service_name: observed_service_name(intent),
+                    replica: ServiceReplicaKey::new(
+                        intent.service_name.clone(),
+                        intent.replica_index,
+                    )?,
+                    applied_config_digest: None,
                     phase: ServicePhase::Stopped,
                     container_id: None,
                     failed_create_ownership: None,
@@ -2319,7 +2515,11 @@ impl StateStore {
             StackContainerCreateStatus::Failed => self.require_exact_observed(
                 intent,
                 &ServiceObservedState {
-                    service_name: observed_service_name(intent),
+                    replica: ServiceReplicaKey::new(
+                        intent.service_name.clone(),
+                        intent.replica_index,
+                    )?,
+                    applied_config_digest: None,
                     phase: ServicePhase::Failed,
                     container_id: None,
                     failed_create_ownership: None,
@@ -2331,23 +2531,22 @@ impl StateStore {
     }
 }
 
-fn creating_observed_state(intent: &StackContainerCreateIntent) -> ServiceObservedState {
-    ServiceObservedState {
-        service_name: observed_service_name(intent),
+fn creating_observed_state(
+    intent: &StackContainerCreateIntent,
+) -> Result<ServiceObservedState, StackError> {
+    Ok(ServiceObservedState {
+        replica: replica_key(intent)?,
+        applied_config_digest: None,
         phase: ServicePhase::Creating,
         container_id: None,
         failed_create_ownership: None,
         last_error: None,
         ready: false,
-    }
+    })
 }
 
-fn observed_service_name(intent: &StackContainerCreateIntent) -> String {
-    if intent.replica_index <= 1 {
-        intent.service_name.clone()
-    } else {
-        format!("{}-{}", intent.service_name, intent.replica_index)
-    }
+fn replica_key(intent: &StackContainerCreateIntent) -> Result<ServiceReplicaKey, StackError> {
+    ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index)
 }
 
 fn deterministic_reservation_id(
@@ -2375,6 +2574,7 @@ fn deterministic_reservation_id(
     frame(&mut digest, selector.requested_container_id.as_bytes());
     frame(&mut digest, selector.definition_digest.as_bytes());
     frame(&mut digest, selector.action_digest.as_bytes());
+    frame(&mut digest, selector.applied_config_digest.as_bytes());
     let bytes = digest.finalize();
     let mut encoded = String::with_capacity(78);
     encoded.push_str("vzscr1-sha256:");

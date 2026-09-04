@@ -19,7 +19,7 @@ use crate::events::StackEvent;
 use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
 use crate::spec::{SecretDef, SecretSource, ServiceSpec, StackSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
+use crate::state_store::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
 use crate::volume::VolumeManager;
 
 fn scope_state_conflict(message: impl Into<String>) -> StackError {
@@ -340,8 +340,8 @@ pub type LogStream = std::sync::mpsc::Receiver<LogLine>;
 /// Ensures no two services bind to the same host port and supports
 /// explicit host-port publishing only.
 pub struct PortTracker {
-    /// Allocated ports keyed by service name.
-    allocated: HashMap<String, Vec<PublishedPort>>,
+    /// Allocated ports keyed by exact logical replica identity.
+    allocated: HashMap<ServiceReplicaKey, Vec<PublishedPort>>,
 }
 
 impl PortTracker {
@@ -373,39 +373,66 @@ impl PortTracker {
         service_name: &str,
         ports: &[crate::spec::PortSpec],
     ) -> Result<Vec<PublishedPort>, StackError> {
-        // Release any previous allocation for this service so retries don't
-        // conflict with their own prior allocation.
-        self.allocated.remove(service_name);
+        self.allocate_replica(&ServiceReplicaKey::first(service_name)?, ports)
+    }
+
+    /// Allocate ports for one exact service replica.
+    pub fn allocate_replica(
+        &mut self,
+        target: &ServiceReplicaKey,
+        ports: &[crate::spec::PortSpec],
+    ) -> Result<Vec<PublishedPort>, StackError> {
         let explicit_publish_ports: Vec<_> = ports
             .iter()
             .filter(|port| port.host_port.is_some())
             .cloned()
             .collect();
-        let in_use = self.in_use();
+        // Exclude this replica's old allocation during conflict checking, but
+        // do not mutate it until replacement succeeds. A failed reallocation
+        // must preserve the last durable/in-memory lease.
+        let in_use = self
+            .allocated
+            .iter()
+            .filter(|(allocated_key, _)| *allocated_key != target)
+            .flat_map(|(_, ports)| ports.iter().map(|port| port.host_port))
+            .collect::<HashSet<_>>();
         let resolved = resolve_ports(&explicit_publish_ports, &in_use)?;
-        self.allocated
-            .insert(service_name.to_string(), resolved.clone());
+        self.allocated.insert(target.clone(), resolved.clone());
         Ok(resolved)
     }
 
     /// Release all ports for a service.
     pub fn release(&mut self, service_name: &str) {
-        self.allocated.remove(service_name);
+        if let Ok(target) = ServiceReplicaKey::first(service_name) {
+            self.release_replica(&target);
+        }
+    }
+
+    /// Release the ports owned by one exact replica only.
+    pub fn release_replica(&mut self, target: &ServiceReplicaKey) {
+        self.allocated.remove(target);
     }
 
     /// Snapshot of all allocated ports (for persistence).
-    pub fn allocated_snapshot(&self) -> &HashMap<String, Vec<PublishedPort>> {
+    pub fn allocated_snapshot(&self) -> &HashMap<ServiceReplicaKey, Vec<PublishedPort>> {
         &self.allocated
     }
 
     /// Restore a previous port allocation from a crash-recovery snapshot.
-    pub fn restore(&mut self, service_name: String, ports: Vec<PublishedPort>) {
-        self.allocated.insert(service_name, ports);
+    pub fn restore(&mut self, target: ServiceReplicaKey, ports: Vec<PublishedPort>) {
+        self.allocated.insert(target, ports);
     }
 
     /// Get the published ports for a service (if any).
     pub fn ports_for(&self, service_name: &str) -> Option<&[PublishedPort]> {
-        self.allocated.get(service_name).map(|v| v.as_slice())
+        ServiceReplicaKey::first(service_name)
+            .ok()
+            .and_then(|target| self.ports_for_replica(&target))
+    }
+
+    /// Get published ports for an exact replica.
+    pub fn ports_for_replica(&self, target: &ServiceReplicaKey) -> Option<&[PublishedPort]> {
+        self.allocated.get(target).map(Vec::as_slice)
     }
 }
 
@@ -431,12 +458,12 @@ pub struct StackExecutor<R: ContainerRuntime> {
     ports: PortTracker,
     /// Per-service primary IP (first network IP, used for port forwarding and /etc/hosts).
     /// Populated during shared VM boot / network setup.
-    service_ips: HashMap<String, String>,
+    service_ips: HashMap<ServiceReplicaKey, String>,
     /// Per-service IP addresses keyed by network name.
     ///
     /// Used to resolve peer hostnames on a shared network when a service is
     /// attached to multiple networks with different IPs.
-    service_network_ips: HashMap<String, HashMap<String, String>>,
+    service_network_ips: HashMap<ServiceReplicaKey, HashMap<String, String>>,
     /// Per-service VirtioFS mount tag offset for shared VM mode.
     ///
     /// In a shared VM, all services' bind mounts are configured as VirtioFS
@@ -462,6 +489,63 @@ struct ScopedExecutionAuthority {
     definition_digest: String,
 }
 
+/// Exact kind of a persisted reconcile action.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReconcileActionKind {
+    /// Create and start one exact replica.
+    Create,
+    /// Replace one exact replica.
+    Recreate,
+    /// Remove one exact replica.
+    Remove,
+}
+
+impl ReconcileActionKind {
+    /// Derive the typed kind from the authoritative action plan.
+    pub fn from_action(action: &Action) -> Self {
+        match action {
+            Action::ServiceCreate { .. } => Self::Create,
+            Action::ServiceRecreate { .. } => Self::Recreate,
+            Action::ServiceRemove { .. } => Self::Remove,
+        }
+    }
+
+    pub(crate) fn as_audit_str(self) -> &'static str {
+        match self {
+            Self::Create => "service_create",
+            Self::Recreate => "service_recreate",
+            Self::Remove => "service_remove",
+        }
+    }
+}
+
+/// Terminal result for one exact reconcile action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ActionOutcomeResult {
+    /// The exact action completed successfully.
+    Succeeded,
+    /// The exact action failed without invalidating outcomes for other actions.
+    Failed {
+        /// Stable diagnostic persisted in the reconcile audit log.
+        error: String,
+    },
+}
+
+/// Typed, index-qualified outcome for one exact reconcile action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexedActionOutcome {
+    /// Absolute index in the persisted session plan.
+    pub absolute_index: usize,
+    /// Stable hash of this single exact action.
+    pub action_hash: String,
+    /// Typed action kind; display labels are never identity.
+    pub action_kind: ReconcileActionKind,
+    /// Exact service-replica identity mutated by the action.
+    pub target: ServiceReplicaKey,
+    /// Terminal execution result.
+    pub result: ActionOutcomeResult,
+}
+
 /// Result of executing a batch of actions.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionResult {
@@ -471,6 +555,8 @@ pub struct ExecutionResult {
     pub failed: usize,
     /// Per-action error messages (service_name → error).
     pub errors: Vec<(String, String)>,
+    /// Exactly one typed outcome for every dispatched action, in absolute-index order.
+    pub outcomes: Vec<IndexedActionOutcome>,
     /// Bind mounts that were skipped during validation.
     pub skipped_mounts: Vec<crate::volume::SkippedMount>,
 }
@@ -717,10 +803,51 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
     /// Persist current allocator state for crash recovery.
     pub fn persist_allocator_state(&self, stack_name: &str) -> Result<(), StackError> {
-        use crate::state_store::AllocatorSnapshot;
+        use crate::state_store::{
+            AllocatorIpLease, AllocatorNetworkIpLease, AllocatorPortLease, AllocatorSnapshot,
+        };
+        let mut ports = self
+            .ports
+            .allocated_snapshot()
+            .iter()
+            .map(|(target, ports)| AllocatorPortLease {
+                target: target.clone(),
+                ports: ports.clone(),
+            })
+            .collect::<Vec<_>>();
+        ports.sort_by(|left, right| left.target.cmp(&right.target));
+        let mut service_ips = self
+            .service_ips
+            .iter()
+            .map(|(target, ip)| AllocatorIpLease {
+                target: target.clone(),
+                ip: ip.clone(),
+            })
+            .collect::<Vec<_>>();
+        service_ips.sort_by(|left, right| left.target.cmp(&right.target));
+        let mut service_network_ips = self
+            .service_network_ips
+            .iter()
+            .flat_map(|(target, networks)| {
+                networks
+                    .iter()
+                    .map(move |(network_name, ip)| AllocatorNetworkIpLease {
+                        target: target.clone(),
+                        network_name: network_name.clone(),
+                        ip: ip.clone(),
+                    })
+            })
+            .collect::<Vec<_>>();
+        service_network_ips.sort_by(|left, right| {
+            left.target
+                .cmp(&right.target)
+                .then_with(|| left.network_name.cmp(&right.network_name))
+        });
         let snapshot = AllocatorSnapshot {
-            ports: self.ports.allocated_snapshot().clone(),
-            service_ips: self.service_ips.clone(),
+            schema_version: 2,
+            ports,
+            service_ips,
+            service_network_ips,
             mount_tag_offsets: self.mount_tag_offsets.clone(),
         };
         self.store.save_allocator_state(stack_name, &snapshot)
@@ -729,11 +856,22 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// Restore allocator state from a previous crash-recovery snapshot.
     pub fn restore_allocator_state(&mut self, stack_name: &str) -> Result<(), StackError> {
         if let Some(snapshot) = self.store.load_allocator_state(stack_name)? {
-            self.service_ips = snapshot.service_ips;
+            self.ports = PortTracker::new();
+            self.service_ips = snapshot
+                .service_ips
+                .into_iter()
+                .map(|lease| (lease.target, lease.ip))
+                .collect();
             self.mount_tag_offsets = snapshot.mount_tag_offsets;
-            self.service_network_ips.clear();
-            for (name, ports) in snapshot.ports {
-                self.ports.restore(name, ports);
+            self.service_network_ips = HashMap::new();
+            for lease in snapshot.service_network_ips {
+                self.service_network_ips
+                    .entry(lease.target)
+                    .or_default()
+                    .insert(lease.network_name, lease.ip);
+            }
+            for lease in snapshot.ports {
+                self.ports.restore(lease.target, lease.ports);
             }
         }
         Ok(())

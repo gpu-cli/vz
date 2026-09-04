@@ -5,26 +5,25 @@
 //! persists all state transitions. Actions are ordered by service
 //! dependency graph (topological sort with name-based tie-break).
 
-use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::hash::{Hash, Hasher};
+
+use sha2::{Digest, Sha256};
 
 use crate::error::StackError;
 use crate::events::StackEvent;
 use crate::health::{DependencyCheck, HealthStatus, check_dependencies};
 use crate::spec::{ServiceSpec, StackSpec};
-use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
-use crate::volume;
+use crate::state_store::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
 
 /// Compute a deterministic digest of all config-affecting fields for a service.
 ///
-/// Any change to image, command, entrypoint, environment, working_dir, user,
-/// ports, capabilities, privileged mode, sysctls, hostname, or mounts will
-/// produce a different digest, triggering a `ServiceRecreate`.
+/// The versioned digest covers the canonical normalized service activation
+/// projection. Replica count is topology, not per-replica runtime config.
 mod planning;
 mod topo;
 
-use self::planning::{compute_actions_with_mount_digests, service_config_digest};
+use self::planning::compute_actions_with_mount_digests;
+pub use self::planning::service_config_digest;
 
 #[cfg(test)]
 mod tests;
@@ -34,18 +33,18 @@ mod tests;
 pub enum Action {
     /// Create and start a new service.
     ServiceCreate {
-        /// Service name.
-        service_name: String,
+        /// Exact service replica.
+        target: ServiceReplicaKey,
     },
     /// Recreate a service whose configuration changed.
     ServiceRecreate {
-        /// Service name.
-        service_name: String,
+        /// Exact service replica.
+        target: ServiceReplicaKey,
     },
     /// Remove a service that is no longer in the desired spec.
     ServiceRemove {
-        /// Service name.
-        service_name: String,
+        /// Exact service replica.
+        target: ServiceReplicaKey,
     },
 }
 
@@ -53,37 +52,46 @@ impl Action {
     /// Service name this action targets.
     pub fn service_name(&self) -> &str {
         match self {
-            Self::ServiceCreate { service_name }
-            | Self::ServiceRecreate { service_name }
-            | Self::ServiceRemove { service_name } => service_name,
+            Self::ServiceCreate { target }
+            | Self::ServiceRecreate { target }
+            | Self::ServiceRemove { target } => &target.service_name,
+        }
+    }
+
+    /// Exact replica targeted by this action.
+    pub fn target(&self) -> &ServiceReplicaKey {
+        match self {
+            Self::ServiceCreate { target }
+            | Self::ServiceRecreate { target }
+            | Self::ServiceRemove { target } => target,
         }
     }
 }
 
 /// Compute a deterministic hash of an action list for identity tracking.
 ///
-/// Two action lists that contain the same sequence of action kinds and
-/// service names produce the same hash, enabling callers to detect
-/// whether a resumed session matches the original plan.
+/// The versioned, length-framed digest covers action order, kind, exact base
+/// service name, and non-zero replica index.
 pub fn compute_actions_hash(actions: &[Action]) -> String {
-    let mut hasher = DefaultHasher::new();
-    for action in actions {
-        match action {
-            Action::ServiceCreate { service_name } => {
-                "create".hash(&mut hasher);
-                service_name.hash(&mut hasher);
-            }
-            Action::ServiceRecreate { service_name } => {
-                "recreate".hash(&mut hasher);
-                service_name.hash(&mut hasher);
-            }
-            Action::ServiceRemove { service_name } => {
-                "remove".hash(&mut hasher);
-                service_name.hash(&mut hasher);
-            }
-        }
+    fn frame(hasher: &mut Sha256, value: &[u8]) {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value);
     }
-    format!("{:016x}", hasher.finish())
+
+    let mut hasher = Sha256::new();
+    frame(&mut hasher, b"vz-reconcile-actions-v1");
+    frame(&mut hasher, &(actions.len() as u64).to_be_bytes());
+    for action in actions {
+        let (kind, target) = match action {
+            Action::ServiceCreate { target } => (b"create".as_slice(), target),
+            Action::ServiceRecreate { target } => (b"recreate".as_slice(), target),
+            Action::ServiceRemove { target } => (b"remove".as_slice(), target),
+        };
+        frame(&mut hasher, kind);
+        frame(&mut hasher, target.service_name.as_bytes());
+        frame(&mut hasher, &target.index().to_be_bytes());
+    }
+    format!("vzrah1-sha256:{:x}", hasher.finalize())
 }
 
 /// Result of an [`apply`] call.
@@ -128,7 +136,7 @@ pub fn plan_apply(
             .as_ref()
             .map(|stack| stack.services.as_slice()),
         &stored_mount_digests,
-    );
+    )?;
     Ok(ApplyResult { actions, deferred })
 }
 
@@ -193,7 +201,7 @@ pub fn apply(
         health_statuses,
         previous_desired.as_ref().map(|s| s.services.as_slice()),
         &stored_mount_digests,
-    );
+    )?;
 
     // 5. Emit events for deferred services.
     for d in &deferred {
@@ -212,23 +220,25 @@ pub fn apply(
     let failed = 0;
     for action in &actions {
         match action {
-            Action::ServiceCreate { service_name } => {
+            Action::ServiceCreate { target } => {
+                let service_name = &target.service_name;
                 if let Some(service) = desired_service_map.get(service_name.as_str()) {
                     let digest = service_config_digest(service);
                     store.save_service_mount_digest(&spec.name, service_name, &digest)?;
                 }
                 let failed_create_ownership = observed
                     .iter()
-                    .find(|state| state.service_name == *service_name)
+                    .find(|state| state.replica == *target)
                     .and_then(|state| state.failed_create_ownership.clone());
                 let existing_cid = observed
                     .iter()
-                    .find(|state| state.service_name == *service_name)
+                    .find(|state| state.replica == *target)
                     .and_then(|state| state.container_id.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
-                        service_name: service_name.clone(),
+                        replica: target.clone(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Pending,
                         container_id: existing_cid,
                         failed_create_ownership,
@@ -245,7 +255,8 @@ pub fn apply(
                 )?;
                 succeeded += 1;
             }
-            Action::ServiceRecreate { service_name } => {
+            Action::ServiceRecreate { target } => {
+                let service_name = &target.service_name;
                 let desired_digest = desired_service_map
                     .get(service_name.as_str())
                     .map(|service| service_config_digest(service))
@@ -267,16 +278,17 @@ pub fn apply(
                 // stop + remove the old container before creating the new one.
                 let existing_cid = observed
                     .iter()
-                    .find(|o| o.service_name == *service_name)
+                    .find(|o| o.replica == *target)
                     .and_then(|o| o.container_id.clone());
                 let failed_create_ownership = observed
                     .iter()
-                    .find(|o| o.service_name == *service_name)
+                    .find(|o| o.replica == *target)
                     .and_then(|o| o.failed_create_ownership.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
-                        service_name: service_name.clone(),
+                        replica: target.clone(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Pending,
                         container_id: existing_cid,
                         failed_create_ownership,
@@ -294,20 +306,22 @@ pub fn apply(
                 )?;
                 succeeded += 1;
             }
-            Action::ServiceRemove { service_name } => {
+            Action::ServiceRemove { target } => {
+                let service_name = &target.service_name;
                 store.delete_service_mount_digest(&spec.name, service_name)?;
                 let existing_cid = observed
                     .iter()
-                    .find(|state| state.service_name == *service_name)
+                    .find(|state| state.replica == *target)
                     .and_then(|state| state.container_id.clone());
                 let failed_create_ownership = observed
                     .iter()
-                    .find(|state| state.service_name == *service_name)
+                    .find(|state| state.replica == *target)
                     .and_then(|state| state.failed_create_ownership.clone());
                 store.save_observed_state(
                     &spec.name,
                     &ServiceObservedState {
-                        service_name: service_name.clone(),
+                        replica: target.clone(),
+                        applied_config_digest: None,
                         phase: ServicePhase::Stopped,
                         // Preserve the opaque runtime ID until the executor has
                         // actually completed stop + remove. This also makes a

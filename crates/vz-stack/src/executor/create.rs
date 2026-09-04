@@ -64,8 +64,7 @@ fn id_slug(value: &str) -> String {
 }
 
 pub(super) struct PreparedCreate {
-    pub(super) service_name: String,
-    pub(super) replica_index: u32,
+    pub(super) target: ServiceReplicaKey,
     pub(super) image: String,
     /// Exact caller-selected runtime ID whose create result this preparation owns.
     pub(super) requested_container_id: String,
@@ -75,10 +74,10 @@ pub(super) struct PreparedCreate {
 impl PreparedCreate {
     /// Full name including replica index if replicas > 1.
     pub(super) fn full_name(&self) -> String {
-        if self.replica_index > 1 {
-            format!("{}-{}", self.service_name, self.replica_index)
+        if self.target.replica_index.get() > 1 {
+            format!("{}-{}", self.target.service_name, self.target.replica_index)
         } else {
-            self.service_name.clone()
+            self.target.service_name.clone()
         }
     }
 }
@@ -105,7 +104,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             self.store.save_observed_state(
                 &spec.name,
                 &ServiceObservedState {
-                    service_name: service_name.to_string(),
+                    replica: ServiceReplicaKey::new(service_name, replica_index)?,
+                    applied_config_digest: None,
                     phase: ServicePhase::Creating,
                     container_id: None,
                     failed_create_ownership: None,
@@ -133,7 +133,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let _skipped = crate::volume::validate_bind_mounts(&mut resolved_mounts)?;
 
         // Allocate explicit host-published ports and check conflicts.
-        let published = match self.ports.allocate(service_name, &svc_spec.ports) {
+        let target = ServiceReplicaKey::new(service_name, replica_index)?;
+        let published = match self.ports.allocate_replica(&target, &svc_spec.ports) {
             Ok(p) => p,
             Err(e) => {
                 if let Some(first_port) = svc_spec.ports.first() {
@@ -146,7 +147,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         },
                     )?;
                 }
-                self.mark_failed(spec, service_name, &e.to_string())?;
+                if self.scoped_authority.is_none() {
+                    self.mark_failed(
+                        spec,
+                        &ServiceReplicaKey::new(service_name, replica_index)?,
+                        &e.to_string(),
+                    )?;
+                }
                 return Err(e);
             }
         };
@@ -221,7 +228,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         };
 
         // Override ports with resolved allocations.
-        let service_target_host = self.service_ips.get(&replica_qualified_name).cloned();
+        let service_target_host = self.service_ips.get(&target).cloned();
         run_config.ports = published
             .iter()
             .map(|p| {
@@ -258,10 +265,14 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             if let Some(shared_network) = shared_network {
                 let peer_ip = self
                     .service_network_ips
-                    .get(&svc.name)
+                    .get(&ServiceReplicaKey::first(&svc.name)?)
                     .and_then(|ips| ips.get(shared_network))
                     .cloned()
-                    .or_else(|| self.service_ips.get(&svc.name).cloned());
+                    .or_else(|| {
+                        self.service_ips
+                            .get(&ServiceReplicaKey::first(&svc.name).ok()?)
+                            .cloned()
+                    });
                 if let Some(ip) = peer_ip {
                     run_config.extra_hosts.push((svc.name.clone(), ip));
                 }
@@ -271,8 +282,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             Some(format!("/var/run/netns/{replica_qualified_name}"));
 
         Ok(PreparedCreate {
-            service_name: service_name.to_string(),
-            replica_index,
+            target,
             image: svc_spec.image.clone(),
             requested_container_id: container_id,
             run_config,
@@ -283,9 +293,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     pub(super) fn finalize_create(
         &self,
         spec: &StackSpec,
-        service_name: &str,
+        target: &ServiceReplicaKey,
         receipt: &vz_runtime_contract::ContainerCreateReceipt,
     ) -> Result<(), StackError> {
+        let service_name = target.service_name.as_str();
         let ownership = receipt
             .ownership
             .clone()
@@ -308,7 +319,17 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         self.store.save_observed_state(
             &spec.name,
             &ServiceObservedState {
-                service_name: service_name.to_string(),
+                replica: target.clone(),
+                applied_config_digest: Some(crate::reconcile::service_config_digest(
+                    spec.services
+                        .iter()
+                        .find(|service| service.name == target.service_name)
+                        .ok_or_else(|| {
+                            StackError::InvalidSpec(format!(
+                                "service `{service_name}` disappeared before create publication"
+                            ))
+                        })?,
+                )),
                 phase: ServicePhase::Running,
                 container_id: Some(receipt.container_id.clone()),
                 failed_create_ownership: ownership,

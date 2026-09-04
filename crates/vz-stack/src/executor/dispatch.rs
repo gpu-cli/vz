@@ -156,6 +156,21 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         actions: &[Action],
         batch: Option<(&str, usize)>,
     ) -> Result<ExecutionResult, StackError> {
+        for service in &spec.services {
+            let replicas = service.resources.replicas.max(1);
+            if replicas > 1 && service.container_name.is_some() {
+                return Err(StackError::InvalidSpec(format!(
+                    "service `{}` cannot combine container_name with replicas > 1",
+                    service.name
+                )));
+            }
+            if replicas > 1 && service.ports.iter().any(|port| port.host_port.is_some()) {
+                return Err(StackError::InvalidSpec(format!(
+                    "service `{}` cannot publish a fixed host port with replicas > 1",
+                    service.name
+                )));
+            }
+        }
         if let Some(authority) = &self.scoped_authority
             && authority.scope.stack_id != spec.name
         {
@@ -247,8 +262,9 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // network's subnet. Gateway is .1, services start at .2.
             // `service_primary_ip` maps service_name -> first assigned IP
             // (used for port forwarding target_host).
-            let mut service_primary_ip: HashMap<String, String> = HashMap::new();
-            let mut service_network_ips: HashMap<String, HashMap<String, String>> = HashMap::new();
+            let mut service_primary_ip: HashMap<ServiceReplicaKey, String> = HashMap::new();
+            let mut service_network_ips: HashMap<ServiceReplicaKey, HashMap<String, String>> =
+                HashMap::new();
             let mut network_services: Vec<vz_runtime_contract::NetworkServiceConfig> = Vec::new();
 
             for net in &spec.networks {
@@ -266,6 +282,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
                     let replicas = svc.resources.replicas.max(1);
                     for r in 1..=replicas {
+                        let target = ServiceReplicaKey::new(&svc.name, r)?;
                         let replica_name = if r == 1 {
                             svc.name.clone()
                         } else {
@@ -283,10 +300,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
                         // First IP assigned becomes the primary (for port forwarding).
                         service_primary_ip
-                            .entry(replica_name.clone())
+                            .entry(target.clone())
                             .or_insert(ip_no_prefix.clone());
                         service_network_ips
-                            .entry(replica_name.clone())
+                            .entry(target)
                             .or_default()
                             .insert(net.name.clone(), ip_no_prefix.clone());
 
@@ -304,7 +321,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // ── Collect explicit host-published ports using service identity ──
             let mut all_ports = Vec::new();
             for svc in &spec.services {
-                let Some(service_ip) = service_primary_ip.get(&svc.name) else {
+                let primary = ServiceReplicaKey::first(&svc.name)?;
+                let Some(service_ip) = service_primary_ip.get(&primary) else {
                     continue;
                 };
                 for port in &svc.ports {
@@ -557,25 +575,25 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // Recreates always remove the old container. For creates from a
             // Failed state, the old container may still exist in the runtime
             // — clean it up to avoid "container already exists" errors.
-            let mut cleanup_failed = HashSet::new();
+            let mut cleanup_failed: HashSet<ServiceReplicaKey> = HashSet::new();
             for action in level {
                 let should_remove = match action {
                     Action::ServiceRecreate { .. } => true,
-                    Action::ServiceCreate { service_name } => {
+                    Action::ServiceCreate { target } => {
                         let observed = self
                             .store
                             .load_observed_state(&spec.name)
                             .unwrap_or_default();
                         observed
                             .iter()
-                            .any(|o| o.service_name == *service_name && o.container_id.is_some())
+                            .any(|o| o.replica == *target && o.container_id.is_some())
                     }
                     _ => false,
                 };
                 if should_remove {
-                    if let Err(e) = self.execute_remove(spec, action.service_name()) {
+                    if let Err(e) = self.execute_remove(spec, action.target()) {
                         error!(service = %action.service_name(), error = %e, "failed to remove old container");
-                        cleanup_failed.insert(action.service_name().to_string());
+                        cleanup_failed.insert(action.target().clone());
                         result.failed += 1;
                         result
                             .errors
@@ -584,35 +602,25 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 }
             }
 
-            // Serial prep: allocate ports, resolve mounts, build configs.
-            // Expand each service into multiple creates based on replica count.
+            // Serial prep: allocate ports, resolve mounts, and build the exact
+            // replica named by each action. Reconciliation already expands a
+            // desired service into one action per replica; expanding again here
+            // would let one exact action mutate unrelated replicas.
             let mut prepared: Vec<PreparedCreate> = Vec::new();
             for action in level {
-                let service_name = action.service_name();
-                if cleanup_failed.contains(service_name) {
+                let target = action.target();
+                if cleanup_failed.contains(target) {
                     continue;
                 }
 
-                // Get replica count for this service
-                let replicas = if let Some(svc_spec) = service_map.get(service_name) {
-                    svc_spec.resources.replicas.max(1)
-                } else {
-                    1
-                };
-
-                // Create one PreparedCreate per replica
-                for replica_index in 1..=replicas {
-                    match self.prepare_create(spec, &service_map, service_name, replica_index) {
-                        Ok(prep) => prepared.push(prep),
-                        Err(e) => {
-                            result.failed += 1;
-                            let name = if replicas > 1 {
-                                format!("{}-{}", service_name, replica_index)
-                            } else {
-                                service_name.to_string()
-                            };
-                            result.errors.push((name, e.to_string()));
-                        }
+                match self.prepare_create(spec, &service_map, &target.service_name, target.index())
+                {
+                    Ok(prep) => prepared.push(prep),
+                    Err(error) => {
+                        result.failed += 1;
+                        result
+                            .errors
+                            .push((target.display_name(), error.to_string()));
                     }
                 }
             }
@@ -644,7 +652,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             for prep in failed_prepared {
                 let full_name = prep.full_name();
                 let msg = format!("image pull failed for {}", prep.image);
-                self.mark_failed(spec, &full_name, &msg)?;
+                self.mark_failed(spec, &prep.target, &msg)?;
                 result.failed += 1;
                 result.errors.push((full_name, msg));
             }
@@ -653,6 +661,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Single container — execute inline, no thread overhead.
                 for prep in ok_prepared {
                     let full_name = prep.full_name();
+                    let target = prep.target.clone();
                     let requested_container_id = prep.requested_container_id.clone();
                     info!(service = %full_name, image = %prep.image, "creating container");
                     let create_result = self.runtime.create_in_sandbox_owned(
@@ -662,7 +671,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     );
                     match create_result {
                         Ok(receipt) => {
-                            self.finalize_create(spec, &full_name, &receipt)?;
+                            self.finalize_create(spec, &target, &receipt)?;
                             result.succeeded += 1;
                         }
                         Err(failure) => {
@@ -673,7 +682,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             );
                             self.mark_failed_with_ownership(
                                 spec,
-                                &full_name,
+                                &target,
                                 &failure.error.to_string(),
                                 cleanup,
                             )?;
@@ -686,6 +695,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 // Parallel create for multiple containers at the same level.
                 // Images are already pulled; only create_in_sandbox runs in threads.
                 let full_names: Vec<String> = ok_prepared.iter().map(|p| p.full_name()).collect();
+                let full_targets: Vec<ServiceReplicaKey> =
+                    ok_prepared.iter().map(|p| p.target.clone()).collect();
                 info!(
                     services = ?full_names,
                     "creating {} containers in parallel",
@@ -737,12 +748,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 });
 
                 // Serial post: update state for each outcome.
-                for (service_name, (requested_container_id, outcome)) in
-                    full_names.iter().zip(outcomes)
+                for ((service_name, target), (requested_container_id, outcome)) in
+                    full_names.iter().zip(full_targets).zip(outcomes)
                 {
                     match outcome {
                         Ok(receipt) => {
-                            self.finalize_create(spec, service_name, &receipt)?;
+                            self.finalize_create(spec, &target, &receipt)?;
                             result.succeeded += 1;
                         }
                         Err(failure) => {
@@ -753,7 +764,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             );
                             self.mark_failed_with_ownership(
                                 spec,
-                                service_name,
+                                &target,
                                 &failure.error.to_string(),
                                 cleanup,
                             )?;
@@ -769,7 +780,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         // Execute removes sequentially.
         for action in &removes {
-            match self.execute_remove(spec, action.service_name()) {
+            match self.execute_remove(spec, action.target()) {
                 Ok(()) => result.succeeded += 1,
                 Err(e) => {
                     result.failed += 1;
@@ -781,6 +792,38 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
 
         result.skipped_mounts = all_skipped_mounts;
+        let first_action_index = batch.map(|(_, index)| index).unwrap_or(0);
+        result.outcomes = actions
+            .iter()
+            .enumerate()
+            .map(|(relative_index, action)| {
+                let exact_label = format!(
+                    "{}#{}",
+                    action.target().service_name,
+                    action.target().replica_index
+                );
+                let failure = result.errors.iter().find(|(label, _)| {
+                    label == &exact_label
+                        || label == action.service_name()
+                        || label == &action.target().display_name()
+                });
+                Ok(IndexedActionOutcome {
+                    absolute_index: first_action_index.checked_add(relative_index).ok_or_else(
+                        || StackError::InvalidSpec("absolute action index overflow".to_string()),
+                    )?,
+                    action_hash: crate::reconcile::compute_actions_hash(std::slice::from_ref(
+                        action,
+                    )),
+                    action_kind: ReconcileActionKind::from_action(action),
+                    target: action.target().clone(),
+                    result: failure
+                        .map(|(_, error)| ActionOutcomeResult::Failed {
+                            error: error.clone(),
+                        })
+                        .unwrap_or(ActionOutcomeResult::Succeeded),
+                })
+            })
+            .collect::<Result<Vec<_>, StackError>>()?;
         Ok(result)
     }
 }
