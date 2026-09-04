@@ -123,6 +123,8 @@ in `vz-356`.
 - `GOAL-0.4.0.md` — exact scope, acceptance matrix, release gates, evidence, and
   terminal definition of done
 - `architecture.md` — aggregate object model, identities, APIs, and invariants
+- `reconcile-generation-fencing.md` — exact planned-generation preconditions,
+  durable claims, mutation ordering, migration, and race/crash gates
 - `00-product-contract.md` — language, profiles, compatibility, and audit
 - `01-environment-lifecycle.md` — aggregate and Machine identity/lifecycle
 - `02-developer-cli.md` — five-verb CLI and deterministic selectors

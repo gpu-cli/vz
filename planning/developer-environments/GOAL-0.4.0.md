@@ -243,7 +243,10 @@ required E2E scenario and retained evidence:
     without changing its stable identity. Immutable/unsafe changes fail before
     mutation with a structured explanation. Concurrent updates, interrupted
     reconciliation, and stale clients converge or fail without mixed-version
-    topology, cross-owner adoption, or orphaned resources.
+    topology, cross-owner adoption, or orphaned resources. Every scoped create,
+    recreate, and remove additionally satisfies the exact-generation
+    precondition, durable-claim, fail-closed migration, and race/crash contract
+    in [`reconcile-generation-fencing.md`](reconcile-generation-fencing.md).
 
 ## Strict E2E release gate
 
