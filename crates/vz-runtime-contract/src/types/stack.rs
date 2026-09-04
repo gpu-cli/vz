@@ -1,11 +1,14 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::{EnvironmentId, MachineId, MachineIncarnationId, ProjectId};
 
 pub const MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION: u32 = 1;
+/// Schema version for generation-qualified container lifecycle proofs and receipts.
+pub const CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 
 /// Exact topology scope for workloads placed on one current Machine incarnation.
 ///
@@ -64,6 +67,7 @@ impl MachineWorkloadScope {
 /// distinguish a retried create from an older reservation even when every
 /// human-facing name is reused.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerGenerationScope {
     /// Unique, immutable identifier for this create reservation.
     pub reservation_id: String,
@@ -157,6 +161,7 @@ pub enum ContainerGenerationReleaseOutcome {
 /// container ID alone to clean up a failed create because a later lifecycle may
 /// have reused the same ID.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ContainerGenerationOwnership {
     /// Caller-selected runtime container identifier.
     pub container_id: String,
@@ -194,10 +199,665 @@ impl ContainerGenerationOwnership {
     }
 }
 
+/// Stable identity of one guest kernel object used to prove a running generation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationKernelObjectIdentity {
+    /// Device number reported by `stat(2)`.
+    pub device: u64,
+    /// Non-zero inode number reported by `stat(2)`.
+    pub inode: u64,
+}
+
+impl ContainerGenerationKernelObjectIdentity {
+    /// Reject an identity that cannot name a concrete kernel object.
+    pub fn validate(&self, field: &str) -> Result<(), String> {
+        if self.inode == 0 {
+            return Err(format!(
+                "container generation {field} identity must name a non-zero inode"
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Immutable namespace identities captured for one running container generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationNamespaceIdentity {
+    pub mount: ContainerGenerationKernelObjectIdentity,
+    pub network: ContainerGenerationKernelObjectIdentity,
+    pub pid: ContainerGenerationKernelObjectIdentity,
+    pub ipc: ContainerGenerationKernelObjectIdentity,
+    pub uts: ContainerGenerationKernelObjectIdentity,
+}
+
+impl ContainerGenerationNamespaceIdentity {
+    /// Validate every namespace identity required for exact exec admission.
+    pub fn validate(&self) -> Result<(), String> {
+        self.mount.validate("mount namespace")?;
+        self.network.validate("network namespace")?;
+        self.pid.validate("PID namespace")?;
+        self.ipc.validate("IPC namespace")?;
+        self.uts.validate("UTS namespace")
+    }
+}
+
+/// Exact authority expected by a caller performing a lifecycle observation.
+///
+/// The session and supervisor identities are part of the authority boundary, and the
+/// caller-issued freshness nonce fences one specific inspection request. Matching topology
+/// ownership alone must never let an older observation certify the current generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationLifecycleContext {
+    pub ownership: ContainerGenerationOwnership,
+    pub host_runtime_session_id: String,
+    pub guest_supervisor_id: String,
+    /// Caller-issued nonce unique to this lifecycle observation request.
+    pub freshness_nonce: String,
+}
+
+impl ContainerGenerationLifecycleContext {
+    /// Validate the expected authority before comparing an observation with it.
+    pub fn validate(&self) -> Result<(), String> {
+        self.ownership.validate()?;
+        require_machine_incarnation(&self.ownership)?;
+        validate_text("host_runtime_session_id", &self.host_runtime_session_id)?;
+        validate_text("guest_supervisor_id", &self.guest_supervisor_id)?;
+        validate_text("freshness_nonce", &self.freshness_nonce)
+    }
+}
+
+/// Guest- and host-qualified proof that one exact container generation is running.
+///
+/// Durable publication alone is intentionally insufficient. A valid proof joins the
+/// topology ownership envelope to the current host runtime session, the guest lifecycle
+/// supervisor, and immutable kernel identities captured for the container init.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationRunningProof {
+    pub schema_version: u32,
+    pub ownership: ContainerGenerationOwnership,
+    pub host_runtime_session_id: String,
+    pub guest_supervisor_id: String,
+    pub guest_observation_sequence: u64,
+    pub init_pid: u32,
+    pub init_start_time: u64,
+    pub cgroup_path: String,
+    pub cgroup: ContainerGenerationKernelObjectIdentity,
+    pub namespaces: ContainerGenerationNamespaceIdentity,
+    pub root: ContainerGenerationKernelObjectIdentity,
+    pub observed_unix_secs: u64,
+}
+
+impl ContainerGenerationRunningProof {
+    /// Validate every authority-bearing component of the running proof.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported container generation lifecycle schema version {}",
+                self.schema_version
+            ));
+        }
+        self.ownership.validate()?;
+        require_machine_incarnation(&self.ownership)?;
+        validate_text("host_runtime_session_id", &self.host_runtime_session_id)?;
+        validate_text("guest_supervisor_id", &self.guest_supervisor_id)?;
+        validate_observation_sequence(self.guest_observation_sequence)?;
+        if self.init_pid == 0 {
+            return Err(
+                "container generation running proof requires a non-zero init PID".to_string(),
+            );
+        }
+        if self.init_start_time == 0 {
+            return Err(
+                "container generation running proof requires a non-zero init start time"
+                    .to_string(),
+            );
+        }
+        validate_absolute_guest_path("cgroup_path", &self.cgroup_path)?;
+        self.cgroup.validate("cgroup")?;
+        self.namespaces.validate()?;
+        self.root.validate("root")?;
+        if self.observed_unix_secs == 0 {
+            return Err(
+                "container generation running proof requires a non-zero observation timestamp"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate stable authority dimensions; freshness is checked by the observation envelope.
+    fn validate_authority_for(
+        &self,
+        expected: &ContainerGenerationLifecycleContext,
+    ) -> Result<(), String> {
+        self.validate()?;
+        expected.validate()?;
+        validate_expected_ownership(&self.ownership, expected)?;
+        if self.host_runtime_session_id != expected.host_runtime_session_id {
+            return Err(
+                "container generation running proof belongs to a different host runtime session"
+                    .to_string(),
+            );
+        }
+        if self.guest_supervisor_id != expected.guest_supervisor_id {
+            return Err(
+                "container generation running proof belongs to a different guest supervisor"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Exact kernel-observed disposition of a reaped container init process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerGenerationExitDisposition {
+    /// The init called `_exit` or returned normally with this status.
+    Exited { code: i32 },
+    /// The init was terminated by a signal.
+    Signaled { signal: u32, core_dumped: bool },
+}
+
+impl ContainerGenerationExitDisposition {
+    /// Return the shell-compatible status while rejecting impossible wait results.
+    pub fn normalized_exit_code(self) -> Result<i32, String> {
+        match self {
+            Self::Exited { code } if (0..=255).contains(&code) => Ok(code),
+            Self::Exited { code } => Err(format!(
+                "container generation exit code {code} is outside 0..=255"
+            )),
+            Self::Signaled { signal, .. } if (1..=64).contains(&signal) => Ok(128 + signal as i32),
+            Self::Signaled { signal, .. } => Err(format!(
+                "Linux container generation exit signal {signal} is outside 1..=64"
+            )),
+        }
+    }
+}
+
+/// Kernel observation mechanism that produced an exact exit receipt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerGenerationExitReceiptProvenance {
+    /// A generation-owning guest supervisor reaped the init with `waitid`/`waitpid`.
+    GuestSupervisorWait,
+}
+
+/// Durable, generation-qualified receipt for one exactly reaped container init.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationExitReceipt {
+    pub schema_version: u32,
+    pub running_proof: ContainerGenerationRunningProof,
+    pub receipt_sequence: u64,
+    pub disposition: ContainerGenerationExitDisposition,
+    /// Persisted shell-compatible projection of `disposition`.
+    pub normalized_exit_code: i32,
+    pub exited_unix_secs: u64,
+    pub provenance: ContainerGenerationExitReceiptProvenance,
+    /// Canonical content identifier: SHA-256 of every other immutable receipt field.
+    ///
+    /// This detects accidental mutation and provides stable correlation. It does not
+    /// authenticate the issuer; transport and durable-store authentication do that.
+    pub content_digest: String,
+}
+
+impl ContainerGenerationExitReceipt {
+    /// Validate identity, ordering, and the exact-to-normalized exit mapping.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported container generation lifecycle schema version {}",
+                self.schema_version
+            ));
+        }
+        self.running_proof.validate()?;
+        if self.receipt_sequence <= self.running_proof.guest_observation_sequence {
+            return Err(
+                "container generation exit receipt sequence must follow its running observation"
+                    .to_string(),
+            );
+        }
+        if self.receipt_sequence == u64::MAX {
+            return Err("container generation exit receipt sequence is exhausted".to_string());
+        }
+        let expected = self.disposition.normalized_exit_code()?;
+        if self.normalized_exit_code != expected {
+            return Err(format!(
+                "container generation normalized exit code {} disagrees with exact disposition {expected}",
+                self.normalized_exit_code
+            ));
+        }
+        if self.exited_unix_secs < self.running_proof.observed_unix_secs {
+            return Err(
+                "container generation exit timestamp precedes its running observation".to_string(),
+            );
+        }
+        let expected_digest = self.computed_content_digest()?;
+        if self.content_digest != expected_digest {
+            return Err(
+                "container generation exit receipt digest does not match its immutable fields"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Validate stable authority dimensions; freshness is checked by the observation envelope.
+    fn validate_authority_for(
+        &self,
+        expected: &ContainerGenerationLifecycleContext,
+    ) -> Result<(), String> {
+        self.validate()?;
+        self.running_proof.validate_authority_for(expected)
+    }
+
+    /// Compute the canonical digest over immutable receipt material.
+    pub fn computed_content_digest(&self) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct DigestMaterial<'a> {
+            schema_version: u32,
+            running_proof: &'a ContainerGenerationRunningProof,
+            receipt_sequence: u64,
+            disposition: ContainerGenerationExitDisposition,
+            normalized_exit_code: i32,
+            exited_unix_secs: u64,
+            provenance: ContainerGenerationExitReceiptProvenance,
+        }
+
+        let bytes = serde_json::to_vec(&DigestMaterial {
+            schema_version: self.schema_version,
+            running_proof: &self.running_proof,
+            receipt_sequence: self.receipt_sequence,
+            disposition: self.disposition,
+            normalized_exit_code: self.normalized_exit_code,
+            exited_unix_secs: self.exited_unix_secs,
+            provenance: self.provenance,
+        })
+        .map_err(|error| format!("cannot serialize container exit receipt digest: {error}"))?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+
+    /// Stable identifier derived from the immutable receipt contents.
+    pub fn receipt_id(&self) -> &str {
+        &self.content_digest
+    }
+
+    /// Exact ownership to which this receipt is permanently bound.
+    pub fn ownership(&self) -> &ContainerGenerationOwnership {
+        &self.running_proof.ownership
+    }
+}
+
+/// Authoritative reason why a published generation cannot still be live.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerGenerationInactiveReason {
+    MachineStopped,
+    GuestConfirmedAbsent,
+    NeverActivated,
+}
+
+/// Typed reason why exact lifecycle state cannot currently be established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerGenerationUnavailableReason {
+    /// The prior host runtime ended, but the guest workload requires revalidation.
+    RuntimeSessionEnded,
+    RuntimeSessionOwnedElsewhere,
+    MachineUnavailable,
+    GuestAgentUnavailable,
+    LifecycleSupervisorUnavailable,
+    ObservationTimedOut,
+    ExitStatusUnknown,
+}
+
+/// Lifecycle state for one requested, topology-scoped container generation.
+///
+/// `Inactive` and `Unavailable` are intentionally distinct from `Exited`: neither
+/// carries an exit receipt and neither can satisfy a successful-completion predicate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerGenerationLifecycleInspection {
+    Absent,
+    ReservedUnpublished(ContainerGenerationOwnership),
+    Created(ContainerGenerationOwnership),
+    Running(ContainerGenerationRunningProof),
+    Exited(ContainerGenerationExitReceipt),
+    Inactive {
+        ownership: ContainerGenerationOwnership,
+        reason: ContainerGenerationInactiveReason,
+    },
+    Unavailable {
+        ownership: ContainerGenerationOwnership,
+        reason: ContainerGenerationUnavailableReason,
+    },
+    Foreign {
+        current: ContainerGenerationOwnership,
+    },
+    Replacement {
+        current: ContainerGenerationOwnership,
+    },
+    LegacyUnscoped,
+    Malformed(String),
+}
+
+impl ContainerGenerationLifecycleInspection {
+    /// Validate nested authority and reject unusable diagnostics.
+    pub fn validate(&self) -> Result<(), String> {
+        match self {
+            Self::ReservedUnpublished(ownership)
+            | Self::Created(ownership)
+            | Self::Inactive { ownership, .. }
+            | Self::Unavailable { ownership, .. } => ownership.validate(),
+            Self::Running(proof) => proof.validate(),
+            Self::Exited(receipt) => receipt.validate(),
+            Self::Foreign { current } | Self::Replacement { current } => {
+                current.validate()?;
+                require_machine_incarnation(current)
+            }
+            Self::Malformed(reason) => validate_diagnostic("malformed lifecycle reason", reason),
+            Self::Absent | Self::LegacyUnscoped => Ok(()),
+        }
+    }
+}
+
+/// Observer-qualified result for every lifecycle classification, including absence.
+///
+/// Unit classifications are meaningful only inside this envelope. Requested ownership,
+/// runtime session, guest supervisor, caller freshness nonce, sequence, and timestamp prevent
+/// a stale `Absent` or diagnostic from being reused as a current observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationLifecycleObservation {
+    pub schema_version: u32,
+    pub requested_ownership: ContainerGenerationOwnership,
+    pub host_runtime_session_id: String,
+    pub guest_supervisor_id: String,
+    /// Echo of the caller-issued request nonce; it is not a random issuer credential.
+    pub freshness_nonce: String,
+    pub guest_observation_sequence: u64,
+    pub observed_unix_secs: u64,
+    pub inspection: ContainerGenerationLifecycleInspection,
+}
+
+impl ContainerGenerationLifecycleObservation {
+    /// Validate the envelope and its classification evidence without granting current authority.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported container generation lifecycle schema version {}",
+                self.schema_version
+            ));
+        }
+        self.requested_ownership.validate()?;
+        require_machine_incarnation(&self.requested_ownership)?;
+        validate_text("host_runtime_session_id", &self.host_runtime_session_id)?;
+        validate_text("guest_supervisor_id", &self.guest_supervisor_id)?;
+        validate_text("freshness_nonce", &self.freshness_nonce)?;
+        validate_observation_sequence(self.guest_observation_sequence)?;
+        if self.observed_unix_secs == 0 {
+            return Err(
+                "container generation lifecycle observation requires a non-zero timestamp"
+                    .to_string(),
+            );
+        }
+        self.inspection.validate()?;
+
+        match &self.inspection {
+            ContainerGenerationLifecycleInspection::ReservedUnpublished(ownership)
+            | ContainerGenerationLifecycleInspection::Created(ownership)
+            | ContainerGenerationLifecycleInspection::Inactive { ownership, .. }
+            | ContainerGenerationLifecycleInspection::Unavailable { ownership, .. } => {
+                validate_requested_ownership(ownership, &self.requested_ownership)
+            }
+            ContainerGenerationLifecycleInspection::Running(proof) => {
+                validate_requested_ownership(&proof.ownership, &self.requested_ownership)?;
+                validate_observer_identity(
+                    &proof.host_runtime_session_id,
+                    &proof.guest_supervisor_id,
+                    self,
+                )?;
+                if proof.guest_observation_sequence != self.guest_observation_sequence
+                    || proof.observed_unix_secs != self.observed_unix_secs
+                {
+                    return Err(
+                        "running proof sequence/timestamp disagrees with its observation envelope"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            ContainerGenerationLifecycleInspection::Exited(receipt) => {
+                validate_requested_ownership(receipt.ownership(), &self.requested_ownership)?;
+                validate_observer_identity(
+                    &receipt.running_proof.host_runtime_session_id,
+                    &receipt.running_proof.guest_supervisor_id,
+                    self,
+                )?;
+                if self.guest_observation_sequence < receipt.receipt_sequence
+                    || self.observed_unix_secs < receipt.exited_unix_secs
+                {
+                    return Err(
+                        "exit receipt is newer than its lifecycle observation envelope".to_string(),
+                    );
+                }
+                Ok(())
+            }
+            ContainerGenerationLifecycleInspection::Foreign { current } => {
+                require_machine_incarnation(current)?;
+                validate_current_container_id_for_request(current, &self.requested_ownership)?;
+                if current.scope == self.requested_ownership.scope {
+                    return Err(
+                        "foreign lifecycle classification carries the requested ownership scope"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            ContainerGenerationLifecycleInspection::Replacement { current } => {
+                require_machine_incarnation(current)?;
+                validate_current_container_id_for_request(current, &self.requested_ownership)?;
+                if current.generation <= self.requested_ownership.generation {
+                    return Err(
+                        "replacement lifecycle classification must carry a newer generation"
+                            .to_string(),
+                    );
+                }
+                Ok(())
+            }
+            ContainerGenerationLifecycleInspection::Absent
+            | ContainerGenerationLifecycleInspection::LegacyUnscoped
+            | ContainerGenerationLifecycleInspection::Malformed(_) => Ok(()),
+        }
+    }
+
+    /// Validate that the whole observation was made for the caller's current authority.
+    pub fn validate_for(
+        &self,
+        expected: &ContainerGenerationLifecycleContext,
+    ) -> Result<(), String> {
+        self.validate()?;
+        expected.validate()?;
+        validate_requested_ownership(&self.requested_ownership, &expected.ownership)?;
+        if self.host_runtime_session_id != expected.host_runtime_session_id {
+            return Err(
+                "container generation lifecycle observation belongs to a different host runtime session"
+                    .to_string(),
+            );
+        }
+        if self.guest_supervisor_id != expected.guest_supervisor_id {
+            return Err(
+                "container generation lifecycle observation belongs to a different guest supervisor"
+                    .to_string(),
+            );
+        }
+        if self.freshness_nonce != expected.freshness_nonce {
+            return Err(
+                "container generation lifecycle observation carries a different freshness nonce"
+                    .to_string(),
+            );
+        }
+        match &self.inspection {
+            ContainerGenerationLifecycleInspection::Running(proof) => {
+                proof.validate_authority_for(expected)
+            }
+            ContainerGenerationLifecycleInspection::Exited(receipt) => {
+                receipt.validate_authority_for(expected)
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// Decide successful completion only from an envelope matching current authority.
+    pub fn is_successful_exit_for(
+        &self,
+        expected: &ContainerGenerationLifecycleContext,
+    ) -> Result<bool, String> {
+        self.validate_for(expected)?;
+        Ok(matches!(
+            self.inspection,
+            ContainerGenerationLifecycleInspection::Exited(ContainerGenerationExitReceipt {
+                disposition: ContainerGenerationExitDisposition::Exited { code: 0 },
+                ..
+            })
+        ))
+    }
+}
+
+fn require_machine_incarnation(ownership: &ContainerGenerationOwnership) -> Result<(), String> {
+    if ownership
+        .scope
+        .as_ref()
+        .and_then(|scope| scope.machine_incarnation_id.as_ref())
+        .is_none()
+    {
+        return Err(
+            "container generation lifecycle authority requires a Machine incarnation".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_expected_ownership(
+    actual: &ContainerGenerationOwnership,
+    expected: &ContainerGenerationLifecycleContext,
+) -> Result<(), String> {
+    if actual != &expected.ownership {
+        return Err(
+            "container generation lifecycle observation belongs to different ownership".to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_requested_ownership(
+    actual: &ContainerGenerationOwnership,
+    requested: &ContainerGenerationOwnership,
+) -> Result<(), String> {
+    if actual != requested {
+        return Err(
+            "container generation lifecycle classification belongs to different requested ownership"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_current_container_id_for_request(
+    current: &ContainerGenerationOwnership,
+    requested: &ContainerGenerationOwnership,
+) -> Result<(), String> {
+    if current.container_id != requested.container_id {
+        return Err(
+            "container generation lifecycle classification names a different container ID"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_observer_identity(
+    host_runtime_session_id: &str,
+    guest_supervisor_id: &str,
+    observation: &ContainerGenerationLifecycleObservation,
+) -> Result<(), String> {
+    if host_runtime_session_id != observation.host_runtime_session_id {
+        return Err(
+            "lifecycle evidence belongs to a different host runtime session than its observation envelope"
+                .to_string(),
+        );
+    }
+    if guest_supervisor_id != observation.guest_supervisor_id {
+        return Err(
+            "lifecycle evidence belongs to a different guest supervisor than its observation envelope"
+                .to_string(),
+        );
+    }
+    Ok(())
+}
+
+fn validate_observation_sequence(sequence: u64) -> Result<(), String> {
+    if sequence == 0 {
+        return Err(
+            "container generation lifecycle observation requires a non-zero guest observation sequence"
+                .to_string(),
+        );
+    }
+    if sequence == u64::MAX {
+        return Err(
+            "container generation lifecycle guest observation sequence is exhausted".to_string(),
+        );
+    }
+    Ok(())
+}
+
 fn validate_text(field: &str, value: &str) -> Result<(), String> {
     let trimmed = value.trim();
-    if trimmed.is_empty() || trimmed.len() > 128 {
-        return Err(format!("{field} must contain 1..=128 non-blank bytes"));
+    if trimmed.is_empty()
+        || trimmed.len() > 128
+        || trimmed != value
+        || value.chars().any(char::is_control)
+    {
+        return Err(format!(
+            "{field} must contain 1..=128 bytes with no leading/trailing whitespace or control characters"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_absolute_guest_path(field: &str, value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > 4096 || !value.starts_with('/') || value.contains('\0') {
+        return Err(format!(
+            "{field} must be an absolute guest path containing 1..=4096 bytes and no NUL"
+        ));
+    }
+    let mut components = value.split('/');
+    if components.next() != Some("") {
+        return Err(format!("{field} must be an absolute guest path"));
+    }
+    let components = components.collect::<Vec<_>>();
+    if components.is_empty()
+        || components
+            .iter()
+            .any(|component| component.is_empty() || matches!(*component, "." | ".."))
+    {
+        return Err(format!(
+            "{field} must be canonical and may not be root or contain empty, '.' or '..' components"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_diagnostic(field: &str, value: &str) -> Result<(), String> {
+    if value.trim().is_empty() || value.len() > 4096 || value.contains('\0') {
+        return Err(format!(
+            "{field} must contain 1..=4096 non-blank bytes and no NUL"
+        ));
     }
     Ok(())
 }

@@ -565,6 +565,710 @@ fn generation_scope(stack_id: &str) -> ContainerGenerationScope {
     }
 }
 
+fn generation_ownership(stack_id: &str) -> ContainerGenerationOwnership {
+    ContainerGenerationOwnership {
+        container_id: format!("ctr-{stack_id}"),
+        generation: 7,
+        stack_id: stack_id.to_string(),
+        scope: Some(Box::new(generation_scope(stack_id))),
+    }
+}
+
+fn kernel_identity(inode: u64) -> ContainerGenerationKernelObjectIdentity {
+    ContainerGenerationKernelObjectIdentity { device: 42, inode }
+}
+
+fn running_generation_proof(stack_id: &str) -> ContainerGenerationRunningProof {
+    ContainerGenerationRunningProof {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        ownership: generation_ownership(stack_id),
+        host_runtime_session_id: "runtime-session-1".to_string(),
+        guest_supervisor_id: "guest-supervisor-1".to_string(),
+        guest_observation_sequence: 11,
+        init_pid: 1234,
+        init_start_time: 99_001,
+        cgroup_path: "/vz/ctr-stack".to_string(),
+        cgroup: kernel_identity(101),
+        namespaces: ContainerGenerationNamespaceIdentity {
+            mount: kernel_identity(201),
+            network: kernel_identity(202),
+            pid: kernel_identity(203),
+            ipc: kernel_identity(204),
+            uts: kernel_identity(205),
+        },
+        root: kernel_identity(301),
+        observed_unix_secs: 1_750_000_000,
+    }
+}
+
+fn generation_lifecycle_context(stack_id: &str) -> ContainerGenerationLifecycleContext {
+    let proof = running_generation_proof(stack_id);
+    ContainerGenerationLifecycleContext {
+        ownership: proof.ownership,
+        host_runtime_session_id: proof.host_runtime_session_id,
+        guest_supervisor_id: proof.guest_supervisor_id,
+        freshness_nonce: "lifecycle-request-1".to_string(),
+    }
+}
+
+fn foreign_generation_ownership(
+    expected: &ContainerGenerationOwnership,
+) -> ContainerGenerationOwnership {
+    let mut foreign = expected.clone();
+    foreign.scope.as_mut().unwrap().reservation_id = "reservation-foreign".to_string();
+    foreign
+}
+
+fn replacement_generation_ownership(
+    expected: &ContainerGenerationOwnership,
+) -> ContainerGenerationOwnership {
+    let mut replacement = expected.clone();
+    replacement.generation += 1;
+    replacement
+}
+
+fn generation_exit_receipt(
+    disposition: ContainerGenerationExitDisposition,
+) -> ContainerGenerationExitReceipt {
+    let mut receipt = ContainerGenerationExitReceipt {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        running_proof: running_generation_proof("stack-lifecycle"),
+        receipt_sequence: 12,
+        normalized_exit_code: disposition.normalized_exit_code().unwrap(),
+        disposition,
+        exited_unix_secs: 1_750_000_001,
+        provenance: ContainerGenerationExitReceiptProvenance::GuestSupervisorWait,
+        content_digest: String::new(),
+    };
+    receipt.content_digest = receipt.computed_content_digest().unwrap();
+    receipt
+}
+
+fn generation_lifecycle_observation(
+    inspection: ContainerGenerationLifecycleInspection,
+) -> ContainerGenerationLifecycleObservation {
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    let (guest_observation_sequence, observed_unix_secs) = match &inspection {
+        ContainerGenerationLifecycleInspection::Running(proof) => {
+            (proof.guest_observation_sequence, proof.observed_unix_secs)
+        }
+        ContainerGenerationLifecycleInspection::Exited(receipt) => {
+            (receipt.receipt_sequence, receipt.exited_unix_secs)
+        }
+        _ => (20, 1_750_000_010),
+    };
+    ContainerGenerationLifecycleObservation {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        requested_ownership: expected.ownership,
+        host_runtime_session_id: expected.host_runtime_session_id,
+        guest_supervisor_id: expected.guest_supervisor_id,
+        freshness_nonce: expected.freshness_nonce,
+        guest_observation_sequence,
+        observed_unix_secs,
+        inspection,
+    }
+}
+
+#[test]
+fn generation_lifecycle_inspections_validate_and_serde_round_trip() {
+    let ownership = generation_ownership("stack-lifecycle");
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    let running = running_generation_proof("stack-lifecycle");
+    let exited = generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    let inspections = vec![
+        ContainerGenerationLifecycleInspection::Absent,
+        ContainerGenerationLifecycleInspection::ReservedUnpublished(ownership.clone()),
+        ContainerGenerationLifecycleInspection::Created(ownership.clone()),
+        ContainerGenerationLifecycleInspection::Running(running),
+        ContainerGenerationLifecycleInspection::Exited(exited),
+        ContainerGenerationLifecycleInspection::Inactive {
+            ownership: ownership.clone(),
+            reason: ContainerGenerationInactiveReason::MachineStopped,
+        },
+        ContainerGenerationLifecycleInspection::Unavailable {
+            ownership: ownership.clone(),
+            reason: ContainerGenerationUnavailableReason::RuntimeSessionEnded,
+        },
+        ContainerGenerationLifecycleInspection::Foreign {
+            current: foreign_generation_ownership(&ownership),
+        },
+        ContainerGenerationLifecycleInspection::Replacement {
+            current: replacement_generation_ownership(&ownership),
+        },
+        ContainerGenerationLifecycleInspection::LegacyUnscoped,
+        ContainerGenerationLifecycleInspection::Malformed(
+            "durable lifecycle record checksum mismatch".to_string(),
+        ),
+    ];
+
+    for inspection in inspections {
+        inspection.validate().unwrap();
+        let observation = generation_lifecycle_observation(inspection);
+        observation.validate_for(&expected).unwrap();
+        let json = serde_json::to_string(&observation).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ContainerGenerationLifecycleObservation>(&json).unwrap(),
+            observation
+        );
+    }
+}
+
+#[test]
+fn generation_exit_dispositions_validate_and_normalize_exactly() {
+    let clean = ContainerGenerationExitDisposition::Exited { code: 0 };
+    let nonzero = ContainerGenerationExitDisposition::Exited { code: 42 };
+    let signaled = ContainerGenerationExitDisposition::Signaled {
+        signal: 9,
+        core_dumped: false,
+    };
+
+    assert_eq!(clean.normalized_exit_code().unwrap(), 0);
+    assert_eq!(nonzero.normalized_exit_code().unwrap(), 42);
+    assert_eq!(signaled.normalized_exit_code().unwrap(), 137);
+    assert_eq!(
+        ContainerGenerationExitDisposition::Signaled {
+            signal: 64,
+            core_dumped: false,
+        }
+        .normalized_exit_code(),
+        Ok(192)
+    );
+    assert!(
+        ContainerGenerationExitDisposition::Exited { code: -1 }
+            .normalized_exit_code()
+            .is_err()
+    );
+    assert!(
+        ContainerGenerationExitDisposition::Signaled {
+            signal: 0,
+            core_dumped: false,
+        }
+        .normalized_exit_code()
+        .is_err()
+    );
+    assert!(
+        ContainerGenerationExitDisposition::Signaled {
+            signal: 65,
+            core_dumped: false,
+        }
+        .normalized_exit_code()
+        .is_err()
+    );
+}
+
+#[test]
+fn generation_running_proof_rejects_each_missing_authority_dimension() {
+    let valid = running_generation_proof("stack-lifecycle");
+    valid.validate().unwrap();
+
+    let mut invalid = valid.clone();
+    invalid.schema_version += 1;
+    assert!(invalid.validate().unwrap_err().contains("schema version"));
+
+    let mut invalid = valid.clone();
+    invalid
+        .ownership
+        .scope
+        .as_mut()
+        .unwrap()
+        .machine_incarnation_id = None;
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("Machine incarnation")
+    );
+
+    let mut invalid = valid.clone();
+    invalid.host_runtime_session_id.clear();
+    assert!(invalid.validate().unwrap_err().contains("runtime_session"));
+
+    let mut invalid = valid.clone();
+    invalid.guest_supervisor_id.clear();
+    assert!(invalid.validate().unwrap_err().contains("supervisor"));
+
+    let mut invalid = valid.clone();
+    invalid.guest_observation_sequence = 0;
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("observation sequence")
+    );
+
+    let mut invalid = valid.clone();
+    invalid.guest_observation_sequence = u64::MAX;
+    assert!(invalid.validate().unwrap_err().contains("exhausted"));
+
+    let mut invalid = valid.clone();
+    invalid.init_pid = 0;
+    assert!(invalid.validate().unwrap_err().contains("init PID"));
+
+    let mut invalid = valid.clone();
+    invalid.init_start_time = 0;
+    assert!(invalid.validate().unwrap_err().contains("init start time"));
+
+    let mut invalid = valid.clone();
+    invalid.cgroup_path = "relative/cgroup".to_string();
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("absolute guest path")
+    );
+
+    for path in [
+        "",
+        "/",
+        "/.",
+        "/..",
+        "/vz//container",
+        "/vz/./container",
+        "/vz/../container",
+        "/vz/container/",
+    ] {
+        let mut invalid = valid.clone();
+        invalid.cgroup_path = path.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "non-canonical cgroup path validated: {path:?}"
+        );
+    }
+
+    let mut invalid = valid.clone();
+    invalid.namespaces.network.inode = 0;
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("network namespace")
+    );
+
+    let mut invalid = valid.clone();
+    invalid.observed_unix_secs = 0;
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("observation timestamp")
+    );
+}
+
+#[test]
+fn generation_exit_receipt_rejects_fabricated_or_misordered_data() {
+    let valid = generation_exit_receipt(ContainerGenerationExitDisposition::Signaled {
+        signal: 15,
+        core_dumped: false,
+    });
+    valid.validate().unwrap();
+    assert_eq!(valid.normalized_exit_code, 143);
+    assert_eq!(valid.ownership(), &valid.running_proof.ownership);
+    assert!(valid.content_digest.starts_with("sha256:"));
+    assert_eq!(valid.content_digest.len(), 71);
+    assert_eq!(valid.receipt_id(), valid.content_digest);
+
+    let mut invalid = valid.clone();
+    invalid.receipt_sequence = invalid.running_proof.guest_observation_sequence;
+    assert!(invalid.validate().unwrap_err().contains("sequence"));
+
+    let mut invalid = valid.clone();
+    invalid.receipt_sequence = u64::MAX;
+    assert!(invalid.validate().unwrap_err().contains("exhausted"));
+
+    let mut invalid = valid.clone();
+    invalid.normalized_exit_code = 0;
+    assert!(invalid.validate().unwrap_err().contains("disagrees"));
+
+    let mut invalid = valid.clone();
+    invalid.exited_unix_secs = invalid.running_proof.observed_unix_secs - 1;
+    assert!(invalid.validate().unwrap_err().contains("precedes"));
+
+    let mut mutated = valid;
+    mutated.exited_unix_secs += 1;
+    assert!(mutated.validate().unwrap_err().contains("digest"));
+}
+
+#[test]
+fn generation_lifecycle_success_requires_the_exact_expected_context() {
+    let ownership = generation_ownership("stack-lifecycle");
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    let clean = ContainerGenerationLifecycleInspection::Exited(generation_exit_receipt(
+        ContainerGenerationExitDisposition::Exited { code: 0 },
+    ));
+    let clean = generation_lifecycle_observation(clean);
+    assert_eq!(clean.is_successful_exit_for(&expected), Ok(true));
+
+    let mut stale_receipts = Vec::new();
+    let mut old_generation =
+        generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    old_generation.running_proof.ownership.generation -= 1;
+    old_generation.content_digest = old_generation.computed_content_digest().unwrap();
+    stale_receipts.push(("old generation", old_generation));
+
+    let mut foreign =
+        generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    foreign.running_proof.ownership = foreign_generation_ownership(&ownership);
+    foreign.content_digest = foreign.computed_content_digest().unwrap();
+    stale_receipts.push(("foreign ownership", foreign));
+
+    let mut old_session =
+        generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    old_session.running_proof.host_runtime_session_id = "runtime-session-old".to_string();
+    old_session.content_digest = old_session.computed_content_digest().unwrap();
+    stale_receipts.push(("old host session", old_session));
+
+    let mut old_supervisor =
+        generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    old_supervisor.running_proof.guest_supervisor_id = "guest-supervisor-old".to_string();
+    old_supervisor.content_digest = old_supervisor.computed_content_digest().unwrap();
+    stale_receipts.push(("old guest supervisor", old_supervisor));
+
+    for (case, receipt) in stale_receipts {
+        receipt.validate().unwrap();
+        let observation = ContainerGenerationLifecycleObservation {
+            schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+            requested_ownership: receipt.running_proof.ownership.clone(),
+            host_runtime_session_id: receipt.running_proof.host_runtime_session_id.clone(),
+            guest_supervisor_id: receipt.running_proof.guest_supervisor_id.clone(),
+            freshness_nonce: "lifecycle-request-1".to_string(),
+            guest_observation_sequence: receipt.receipt_sequence,
+            observed_unix_secs: receipt.exited_unix_secs,
+            inspection: ContainerGenerationLifecycleInspection::Exited(receipt),
+        };
+        observation.validate().unwrap();
+        assert!(
+            observation.is_successful_exit_for(&expected).is_err(),
+            "stale receipt validated as current success: {case}"
+        );
+    }
+}
+
+#[test]
+fn generation_lifecycle_unknown_states_are_never_success_for_context() {
+    let ownership = generation_ownership("stack-lifecycle");
+    let expected = generation_lifecycle_context("stack-lifecycle");
+
+    let non_success = vec![
+        ContainerGenerationLifecycleInspection::Exited(generation_exit_receipt(
+            ContainerGenerationExitDisposition::Exited { code: 42 },
+        )),
+        ContainerGenerationLifecycleInspection::Exited(generation_exit_receipt(
+            ContainerGenerationExitDisposition::Signaled {
+                signal: 9,
+                core_dumped: false,
+            },
+        )),
+        ContainerGenerationLifecycleInspection::Inactive {
+            ownership: ownership.clone(),
+            reason: ContainerGenerationInactiveReason::MachineStopped,
+        },
+        ContainerGenerationLifecycleInspection::Unavailable {
+            ownership: ownership.clone(),
+            reason: ContainerGenerationUnavailableReason::ExitStatusUnknown,
+        },
+        ContainerGenerationLifecycleInspection::Absent,
+        ContainerGenerationLifecycleInspection::Replacement {
+            current: replacement_generation_ownership(&ownership),
+        },
+        ContainerGenerationLifecycleInspection::Foreign {
+            current: foreign_generation_ownership(&ownership),
+        },
+        ContainerGenerationLifecycleInspection::LegacyUnscoped,
+        ContainerGenerationLifecycleInspection::Malformed("unknown exit".to_string()),
+    ];
+
+    for inspection in non_success {
+        let observation = generation_lifecycle_observation(inspection);
+        assert_eq!(
+            observation.is_successful_exit_for(&expected),
+            Ok(false),
+            "{observation:?}"
+        );
+    }
+}
+
+#[test]
+fn generation_lifecycle_reasons_serde_round_trip_exhaustively() {
+    for reason in [
+        ContainerGenerationInactiveReason::MachineStopped,
+        ContainerGenerationInactiveReason::GuestConfirmedAbsent,
+        ContainerGenerationInactiveReason::NeverActivated,
+    ] {
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ContainerGenerationInactiveReason>(&json).unwrap(),
+            reason
+        );
+    }
+
+    for reason in [
+        ContainerGenerationUnavailableReason::RuntimeSessionEnded,
+        ContainerGenerationUnavailableReason::RuntimeSessionOwnedElsewhere,
+        ContainerGenerationUnavailableReason::MachineUnavailable,
+        ContainerGenerationUnavailableReason::GuestAgentUnavailable,
+        ContainerGenerationUnavailableReason::LifecycleSupervisorUnavailable,
+        ContainerGenerationUnavailableReason::ObservationTimedOut,
+        ContainerGenerationUnavailableReason::ExitStatusUnknown,
+    ] {
+        let json = serde_json::to_string(&reason).unwrap();
+        assert_eq!(
+            serde_json::from_str::<ContainerGenerationUnavailableReason>(&json).unwrap(),
+            reason
+        );
+    }
+}
+
+#[test]
+fn generation_lifecycle_context_and_classification_are_exact() {
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    expected.validate().unwrap();
+    let json = serde_json::to_string(&expected).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationLifecycleContext>(&json).unwrap(),
+        expected
+    );
+
+    let invalid_classifications = [
+        ContainerGenerationLifecycleInspection::Foreign {
+            current: expected.ownership.clone(),
+        },
+        ContainerGenerationLifecycleInspection::Replacement {
+            current: expected.ownership.clone(),
+        },
+        ContainerGenerationLifecycleInspection::Inactive {
+            ownership: replacement_generation_ownership(&expected.ownership),
+            reason: ContainerGenerationInactiveReason::MachineStopped,
+        },
+    ];
+    for inspection in invalid_classifications {
+        inspection.validate().unwrap();
+        let observation = generation_lifecycle_observation(inspection);
+        assert!(
+            observation.validate_for(&expected).is_err(),
+            "{observation:?}"
+        );
+    }
+
+    let mut wrong_container = replacement_generation_ownership(&expected.ownership);
+    wrong_container.container_id = "ctr-other".to_string();
+    let observation =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Replacement {
+            current: wrong_container,
+        });
+    assert!(observation.validate_for(&expected).is_err());
+
+    let mut older_generation = expected.ownership.clone();
+    older_generation.generation -= 1;
+    let observation =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Replacement {
+            current: older_generation,
+        });
+    assert!(observation.validate().is_err());
+
+    for inspection in [
+        ContainerGenerationLifecycleInspection::Foreign {
+            current: foreign_generation_ownership(&expected.ownership),
+        },
+        ContainerGenerationLifecycleInspection::Replacement {
+            current: replacement_generation_ownership(&expected.ownership),
+        },
+    ] {
+        let mut inspection = inspection;
+        match &mut inspection {
+            ContainerGenerationLifecycleInspection::Foreign { current }
+            | ContainerGenerationLifecycleInspection::Replacement { current } => {
+                current.scope.as_mut().unwrap().machine_incarnation_id = None;
+            }
+            _ => unreachable!(),
+        }
+        assert!(inspection.validate().is_err());
+    }
+}
+
+#[test]
+fn generation_lifecycle_stale_absence_cannot_validate_for_current_context() {
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    let mut stale =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Absent);
+    stale.freshness_nonce = "lifecycle-request-old".to_string();
+
+    stale.validate().unwrap();
+    assert!(stale.validate_for(&expected).is_err());
+    assert!(stale.is_successful_exit_for(&expected).is_err());
+}
+
+#[test]
+fn generation_lifecycle_same_session_stale_running_proof_cannot_validate() {
+    let expected = generation_lifecycle_context("stack-lifecycle");
+    let mut stale =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Running(
+            running_generation_proof("stack-lifecycle"),
+        ));
+    stale.freshness_nonce = "lifecycle-request-old".to_string();
+
+    stale.validate().unwrap();
+    assert_eq!(
+        stale.host_runtime_session_id,
+        expected.host_runtime_session_id
+    );
+    assert_eq!(stale.guest_supervisor_id, expected.guest_supervisor_id);
+    assert!(stale.validate_for(&expected).is_err());
+}
+
+#[test]
+fn generation_lifecycle_observation_rejects_invalid_freshness_fields() {
+    let valid = generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Absent);
+    valid.validate().unwrap();
+
+    for sequence in [0, u64::MAX] {
+        let mut invalid = valid.clone();
+        invalid.guest_observation_sequence = sequence;
+        assert!(
+            invalid.validate().is_err(),
+            "invalid observation sequence validated: {sequence}"
+        );
+    }
+
+    let mut invalid = valid;
+    invalid.observed_unix_secs = 0;
+    assert!(invalid.validate().unwrap_err().contains("timestamp"));
+}
+
+#[test]
+fn generation_lifecycle_authority_ids_reject_whitespace_and_control_bytes() {
+    let valid = generation_lifecycle_context("stack-lifecycle");
+    for invalid_id in [
+        " runtime-session",
+        "runtime-session ",
+        "runtime\nsession",
+        "runtime\0session",
+    ] {
+        let mut invalid = valid.clone();
+        invalid.host_runtime_session_id = invalid_id.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "authority ID validated: {invalid_id:?}"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.guest_supervisor_id = invalid_id.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "authority ID validated: {invalid_id:?}"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.freshness_nonce = invalid_id.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "authority ID validated: {invalid_id:?}"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.ownership.container_id = invalid_id.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "authority ID validated: {invalid_id:?}"
+        );
+
+        let mut invalid = valid.clone();
+        invalid.ownership.scope.as_mut().unwrap().reservation_id = invalid_id.to_string();
+        assert!(
+            invalid.validate().is_err(),
+            "authority ID validated: {invalid_id:?}"
+        );
+    }
+}
+
+#[test]
+fn generation_lifecycle_authority_structs_deny_unknown_fields() {
+    fn assert_rejects_unknown_field<T>(value: &T)
+    where
+        T: serde::Serialize + serde::de::DeserializeOwned,
+    {
+        let mut json = serde_json::to_value(value).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("unknown_authority".to_string(), serde_json::json!(true));
+        assert!(serde_json::from_value::<T>(json).is_err());
+    }
+
+    let running = running_generation_proof("stack-lifecycle");
+    let receipt = generation_exit_receipt(ContainerGenerationExitDisposition::Exited { code: 0 });
+    let context = generation_lifecycle_context("stack-lifecycle");
+    let observation = generation_lifecycle_observation(
+        ContainerGenerationLifecycleInspection::Exited(receipt.clone()),
+    );
+
+    assert_rejects_unknown_field(&kernel_identity(1));
+    assert_rejects_unknown_field(&running.namespaces);
+    assert_rejects_unknown_field(&context);
+    assert_rejects_unknown_field(&context.ownership);
+    assert_rejects_unknown_field(context.ownership.scope.as_ref().unwrap().as_ref());
+    assert_rejects_unknown_field(&running);
+    assert_rejects_unknown_field(&receipt);
+    assert_rejects_unknown_field(&observation);
+
+    let mut nested_ownership = serde_json::to_value(&observation).unwrap();
+    nested_ownership["requested_ownership"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<ContainerGenerationLifecycleObservation>(nested_ownership)
+            .is_err()
+    );
+
+    let mut nested_scope = serde_json::to_value(&observation).unwrap();
+    nested_scope["requested_ownership"]["scope"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<ContainerGenerationLifecycleObservation>(nested_scope).is_err()
+    );
+
+    let inactive = ContainerGenerationLifecycleInspection::Inactive {
+        ownership: context.ownership,
+        reason: ContainerGenerationInactiveReason::MachineStopped,
+    };
+    let mut variant_payload = serde_json::to_value(&inactive).unwrap();
+    variant_payload["inactive"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<ContainerGenerationLifecycleInspection>(variant_payload).is_err()
+    );
+
+    let disposition = ContainerGenerationExitDisposition::Signaled {
+        signal: 9,
+        core_dumped: false,
+    };
+    let mut disposition_payload = serde_json::to_value(disposition).unwrap();
+    disposition_payload["signaled"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<ContainerGenerationExitDisposition>(disposition_payload).is_err()
+    );
+}
+
+#[test]
+fn generation_lifecycle_malformed_reason_must_be_actionable() {
+    assert!(
+        ContainerGenerationLifecycleInspection::Malformed(" ".to_string())
+            .validate()
+            .is_err()
+    );
+    assert!(
+        ContainerGenerationLifecycleInspection::Malformed("bad\0reason".to_string())
+            .validate()
+            .is_err()
+    );
+}
+
 #[test]
 fn machine_workload_scope_requires_current_incarnation_and_binds_stable_reservation() {
     let workload = MachineWorkloadScope {
