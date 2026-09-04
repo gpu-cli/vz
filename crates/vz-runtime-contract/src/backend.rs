@@ -1,13 +1,27 @@
 use std::future::Future;
+use std::pin::Pin;
 use std::time::Duration;
 
+use tokio_stream::Stream;
+
 use crate::{
-    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationInspection,
+    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationExecCancelOutcome,
+    ContainerGenerationExecCancelRequest, ContainerGenerationExecRequest,
+    ContainerGenerationExecResult, ContainerGenerationInspection,
+    ContainerGenerationLifecycleInspectRequest, ContainerGenerationLifecycleObservation,
+    ContainerGenerationLifecycleWatchEvent, ContainerGenerationLifecycleWatchRequest,
     ContainerGenerationOwnership, ContainerGenerationReleaseOutcome, ContainerGenerationScope,
     ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput, GenerationCleanupOutcome,
     ImageInfo, IsolationLevel, NetworkServiceConfig, OwnedCreateError, PortMapping, PruneResult,
     RunConfig, RuntimeCapabilities, RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
 };
+
+/// Async stream returned by a generation-qualified lifecycle watch.
+pub type ContainerGenerationLifecycleWatchStream<'a> = Pin<
+    Box<
+        dyn Stream<Item = Result<ContainerGenerationLifecycleWatchEvent, RuntimeError>> + Send + 'a,
+    >,
+>;
 
 /// Workspace-oriented runtime manager that routes stack operations
 /// through backend capabilities with deterministic fallback behavior.
@@ -183,6 +197,42 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         ownership: &ContainerGenerationOwnership,
     ) -> Result<ContainerGenerationInspection, RuntimeError> {
         self.backend.inspect_container_generation(ownership).await
+    }
+
+    /// Return a bounded exact lifecycle snapshot.
+    pub async fn inspect_container_generation_lifecycle(
+        &self,
+        request: &ContainerGenerationLifecycleInspectRequest,
+    ) -> Result<ContainerGenerationLifecycleObservation, RuntimeError> {
+        self.backend
+            .inspect_container_generation_lifecycle(request)
+            .await
+    }
+
+    /// Open a stream of exact lifecycle observations.
+    pub async fn watch_container_generation_lifecycle(
+        &self,
+        request: ContainerGenerationLifecycleWatchRequest,
+    ) -> Result<ContainerGenerationLifecycleWatchStream<'_>, RuntimeError> {
+        self.backend
+            .watch_container_generation_lifecycle(request)
+            .await
+    }
+
+    /// Execute a bounded command against one exact live generation.
+    pub async fn exec_container_generation(
+        &self,
+        request: ContainerGenerationExecRequest,
+    ) -> Result<ContainerGenerationExecResult, RuntimeError> {
+        self.backend.exec_container_generation(request).await
+    }
+
+    /// Cancel and reap one exact generation-qualified exec.
+    pub async fn cancel_container_generation_exec(
+        &self,
+        request: ContainerGenerationExecCancelRequest,
+    ) -> Result<ContainerGenerationExecCancelOutcome, RuntimeError> {
+        self.backend.cancel_container_generation_exec(request).await
     }
 
     /// Activate only an exact generation returned by scoped reservation.
@@ -777,6 +827,83 @@ pub trait RuntimeBackend: Send + Sync {
             Err(RuntimeError::UnsupportedOperation {
                 operation: "inspect_container_generation".to_string(),
                 reason: "backend cannot inspect generation ownership".to_string(),
+            })
+        }
+    }
+
+    /// Return one bounded, freshness-qualified lifecycle snapshot.
+    ///
+    /// Implementations must inspect guest/runtime authority and may not infer Running from
+    /// published metadata alone.
+    fn inspect_container_generation_lifecycle(
+        &self,
+        _request: &ContainerGenerationLifecycleInspectRequest,
+    ) -> impl Future<Output = Result<ContainerGenerationLifecycleObservation, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::InspectContainerGenerationLifecycle
+                    .as_str()
+                    .to_string(),
+                reason: "backend cannot inspect exact generation lifecycle state".to_string(),
+            })
+        }
+    }
+
+    /// Open a stream of freshness-qualified lifecycle observations.
+    ///
+    /// The first event is a current snapshot (or the first event after the requested cursor),
+    /// and subsequent events must have strictly increasing guest observation sequences.
+    fn watch_container_generation_lifecycle(
+        &self,
+        _request: ContainerGenerationLifecycleWatchRequest,
+    ) -> impl Future<Output = Result<ContainerGenerationLifecycleWatchStream<'_>, RuntimeError>>
+    {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::WatchContainerGenerationLifecycle
+                    .as_str()
+                    .to_string(),
+                reason: "backend cannot stream exact generation lifecycle state".to_string(),
+            })
+        }
+    }
+
+    /// Execute with bounded captured output only after revalidating the exact Running proof.
+    ///
+    /// Implementations must acquire their generation lifecycle fence, obtain a fresh admission
+    /// observation, and launch the exec before releasing that fence. The returned result must
+    /// contain that admission observation and may be produced only after the exact exec process
+    /// is reaped. Dropping the future is cancellation: the backend must terminate and reap that
+    /// process and must not publish a late successful result.
+    fn exec_container_generation(
+        &self,
+        _request: ContainerGenerationExecRequest,
+    ) -> impl Future<Output = Result<ContainerGenerationExecResult, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::ExecContainerGeneration
+                    .as_str()
+                    .to_string(),
+                reason: "backend cannot execute against exact generation lifecycle authority"
+                    .to_string(),
+            })
+        }
+    }
+
+    /// Cancel and reap the exact exec identified by generation, execution ID, and request digest.
+    ///
+    /// Returning an outcome is a fence: the process is already reaped and no dropped exec future
+    /// or delayed transport response may later publish a different result for this request digest.
+    fn cancel_container_generation_exec(
+        &self,
+        _request: ContainerGenerationExecCancelRequest,
+    ) -> impl Future<Output = Result<ContainerGenerationExecCancelOutcome, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: RuntimeOperation::CancelContainerGenerationExec
+                    .as_str()
+                    .to_string(),
+                reason: "backend cannot cancel exact generation-qualified exec".to_string(),
             })
         }
     }

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -9,6 +10,12 @@ use super::{EnvironmentId, MachineId, MachineIncarnationId, ProjectId};
 pub const MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION: u32 = 1;
 /// Schema version for generation-qualified container lifecycle proofs and receipts.
 pub const CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+/// Maximum timeout accepted by the bounded generation-qualified exec contract.
+pub const MAX_CONTAINER_GENERATION_EXEC_TIMEOUT_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
+/// Maximum combined stdout and stderr retained by one exact exec operation.
+pub const MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
+/// Maximum duration of one bounded lifecycle snapshot inspection.
+pub const MAX_CONTAINER_GENERATION_LIFECYCLE_INSPECT_TIMEOUT_MILLIS: u64 = 60_000;
 
 /// Exact topology scope for workloads placed on one current Machine incarnation.
 ///
@@ -16,6 +23,7 @@ pub const CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
 /// Machine workload, then mint a distinct durable reservation for each container
 /// create intent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MachineWorkloadScope {
     pub schema_version: u32,
     pub project_id: ProjectId,
@@ -351,15 +359,31 @@ impl ContainerGenerationRunningProof {
         }
         Ok(())
     }
+
+    /// Compare the immutable kernel process identity while ignoring observation sequence/time.
+    pub fn proves_same_live_process(&self, other: &Self) -> Result<bool, String> {
+        self.validate()?;
+        other.validate()?;
+        Ok(self.schema_version == other.schema_version
+            && self.ownership == other.ownership
+            && self.host_runtime_session_id == other.host_runtime_session_id
+            && self.guest_supervisor_id == other.guest_supervisor_id
+            && self.init_pid == other.init_pid
+            && self.init_start_time == other.init_start_time
+            && self.cgroup_path == other.cgroup_path
+            && self.cgroup == other.cgroup
+            && self.namespaces == other.namespaces
+            && self.root == other.root)
+    }
 }
 
-/// Exact kernel-observed disposition of a reaped container init process.
+/// Exact Linux kernel wait disposition of a reaped generation-bound process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum ContainerGenerationExitDisposition {
-    /// The init called `_exit` or returned normally with this status.
+    /// The process called `_exit` or returned normally with this status.
     Exited { code: i32 },
-    /// The init was terminated by a signal.
+    /// The process was terminated by a signal.
     Signaled { signal: u32, core_dumped: bool },
 }
 
@@ -727,6 +751,586 @@ impl ContainerGenerationLifecycleObservation {
             })
         ))
     }
+}
+
+/// Bounded snapshot request for one exact container generation lifecycle.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationLifecycleInspectRequest {
+    pub schema_version: u32,
+    pub context: ContainerGenerationLifecycleContext,
+    pub timeout_millis: u64,
+}
+
+impl ContainerGenerationLifecycleInspectRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.context.validate()?;
+        if !(1..=MAX_CONTAINER_GENERATION_LIFECYCLE_INSPECT_TIMEOUT_MILLIS)
+            .contains(&self.timeout_millis)
+        {
+            return Err(format!(
+                "generation lifecycle inspect timeout_millis must be within 1..={MAX_CONTAINER_GENERATION_LIFECYCLE_INSPECT_TIMEOUT_MILLIS}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_observation(
+        &self,
+        observation: &ContainerGenerationLifecycleObservation,
+    ) -> Result<(), String> {
+        self.validate()?;
+        observation.validate_for(&self.context)
+    }
+}
+
+/// Stream subscription for lifecycle changes to one exact container generation.
+///
+/// A backend emits an initial current observation followed by strictly increasing guest
+/// observation sequences until cancellation or transport failure. `after_guest_observation_sequence`
+/// resumes strictly after a previously accepted event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationLifecycleWatchRequest {
+    pub schema_version: u32,
+    pub context: ContainerGenerationLifecycleContext,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after_guest_observation_sequence: Option<u64>,
+}
+
+impl ContainerGenerationLifecycleWatchRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.context.validate()?;
+        if let Some(sequence) = self.after_guest_observation_sequence {
+            validate_observation_sequence(sequence)?;
+        }
+        Ok(())
+    }
+
+    pub fn validate_next(
+        &self,
+        event: &ContainerGenerationLifecycleWatchEvent,
+        previous: Option<&ContainerGenerationLifecycleWatchEvent>,
+    ) -> Result<(), String> {
+        self.validate()?;
+        event.validate_for(self)?;
+        if let Some(previous) = previous {
+            previous.validate_for(self)?;
+            if event.observation.observed_unix_secs < previous.observation.observed_unix_secs {
+                return Err(
+                    "container generation lifecycle watch timestamp moved backwards".to_string(),
+                );
+            }
+        }
+        let lower_bound = previous
+            .map(|event| event.observation.guest_observation_sequence)
+            .or(self.after_guest_observation_sequence);
+        if lower_bound
+            .is_some_and(|sequence| event.observation.guest_observation_sequence <= sequence)
+        {
+            return Err(
+                "container generation lifecycle watch sequence did not advance".to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// One event from a generation-qualified lifecycle watch stream.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationLifecycleWatchEvent {
+    pub schema_version: u32,
+    pub observation: ContainerGenerationLifecycleObservation,
+}
+
+impl ContainerGenerationLifecycleWatchEvent {
+    pub fn validate_for(
+        &self,
+        request: &ContainerGenerationLifecycleWatchRequest,
+    ) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        request.validate()?;
+        self.observation.validate_for(&request.context)
+    }
+}
+
+/// Exact, freshness-fenced command execution request for a proven running generation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationExecRequest {
+    pub schema_version: u32,
+    pub context: ContainerGenerationLifecycleContext,
+    pub running_observation: ContainerGenerationLifecycleObservation,
+    pub execution_id: String,
+    pub command: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub working_directory: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub environment: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    pub timeout_millis: u64,
+    pub max_output_bytes: u64,
+}
+
+impl ContainerGenerationExecRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.context.validate()?;
+        self.running_observation.validate_for(&self.context)?;
+        if !matches!(
+            self.running_observation.inspection,
+            ContainerGenerationLifecycleInspection::Running(_)
+        ) {
+            return Err(
+                "generation-qualified exec requires a current running lifecycle proof".to_string(),
+            );
+        }
+        validate_text("execution_id", &self.execution_id)?;
+        validate_exec_command(&self.command)?;
+        if let Some(directory) = &self.working_directory {
+            validate_absolute_guest_path("working_directory", directory)?;
+        }
+        for (key, value) in &self.environment {
+            validate_exec_environment(key, value)?;
+        }
+        if let Some(user) = &self.user {
+            validate_exec_field("user", user, false)?;
+        }
+        if !(1..=MAX_CONTAINER_GENERATION_EXEC_TIMEOUT_MILLIS).contains(&self.timeout_millis) {
+            return Err(format!(
+                "generation-qualified exec timeout_millis must be within 1..={MAX_CONTAINER_GENERATION_EXEC_TIMEOUT_MILLIS}"
+            ));
+        }
+        if !(1..=MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES).contains(&self.max_output_bytes) {
+            return Err(format!(
+                "generation-qualified exec max_output_bytes must be within 1..={MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES}"
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn running_proof(&self) -> Result<&ContainerGenerationRunningProof, String> {
+        match &self.running_observation.inspection {
+            ContainerGenerationLifecycleInspection::Running(proof) => Ok(proof),
+            _ => Err(
+                "generation-qualified exec requires a current running lifecycle proof".to_string(),
+            ),
+        }
+    }
+
+    /// Domain-separated canonical digest binding every serialized request field.
+    ///
+    /// This is a stable correlation/fencing identifier, not issuer authentication.
+    pub fn computed_request_digest(&self) -> Result<String, String> {
+        self.validate()?;
+        let encoded = serde_json::to_vec(self)
+            .map_err(|error| format!("cannot serialize generation exec request: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"vz.container-generation-exec-request.v1\0");
+        digest.update(encoded);
+        Ok(format!("sha256:{:x}", digest.finalize()))
+    }
+}
+
+/// Why the exact exec process reached its reaped terminal wait disposition.
+///
+/// `TimedOut` and `Canceled` remain distinct even when the final wait result is exit code zero;
+/// neither is successful command completion. A backend may emit any variant only after the
+/// generation-fenced exec process has been reaped, excluding late results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum ContainerGenerationExecCompletion {
+    Completed {
+        disposition: ContainerGenerationExitDisposition,
+    },
+    TimedOut {
+        final_disposition: ContainerGenerationExitDisposition,
+    },
+    Canceled {
+        final_disposition: ContainerGenerationExitDisposition,
+    },
+}
+
+impl ContainerGenerationExecCompletion {
+    fn disposition(self) -> ContainerGenerationExitDisposition {
+        match self {
+            Self::Completed { disposition } => disposition,
+            Self::TimedOut { final_disposition } | Self::Canceled { final_disposition } => {
+                final_disposition
+            }
+        }
+    }
+
+    fn is_success(self) -> bool {
+        matches!(
+            self,
+            Self::Completed {
+                disposition: ContainerGenerationExitDisposition::Exited { code: 0 }
+            }
+        )
+    }
+}
+
+/// Bounded captured output and exact wait result for one generation-qualified exec.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationExecResult {
+    pub schema_version: u32,
+    pub context: ContainerGenerationLifecycleContext,
+    /// Fresh Running observation obtained atomically at backend exec admission.
+    pub admission_observation: ContainerGenerationLifecycleObservation,
+    pub execution_id: String,
+    /// Canonical digest of the entire originating exec request.
+    pub request_digest: String,
+    /// Guest-supervisor sequence assigned after the exact exec process was reaped.
+    pub completion_sequence: u64,
+    pub started_unix_millis: u64,
+    pub finished_unix_millis: u64,
+    pub completion: ContainerGenerationExecCompletion,
+    pub normalized_exit_code: i32,
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    /// Domain-separated digest of every other immutable terminal result field.
+    pub terminal_receipt_digest: String,
+}
+
+impl ContainerGenerationExecResult {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.context.validate()?;
+        self.admission_observation.validate_for(&self.context)?;
+        if !matches!(
+            self.admission_observation.inspection,
+            ContainerGenerationLifecycleInspection::Running(_)
+        ) {
+            return Err(
+                "generation-qualified exec admission requires a current running lifecycle proof"
+                    .to_string(),
+            );
+        }
+        validate_text("execution_id", &self.execution_id)?;
+        validate_sha256_digest("request_digest", &self.request_digest)?;
+        validate_observation_sequence(self.completion_sequence)?;
+        if self.completion_sequence <= self.admission_observation.guest_observation_sequence {
+            return Err(
+                "generation-qualified exec completion sequence must follow admission".to_string(),
+            );
+        }
+        if self.started_unix_millis == 0 {
+            return Err(
+                "generation-qualified exec result requires a non-zero start timestamp".to_string(),
+            );
+        }
+        if self.finished_unix_millis < self.started_unix_millis {
+            return Err(
+                "generation-qualified exec finish timestamp precedes its start".to_string(),
+            );
+        }
+        if self.started_unix_millis / 1_000 < self.admission_observation.observed_unix_secs {
+            return Err("generation-qualified exec start timestamp precedes admission".to_string());
+        }
+        let expected_code = self.completion.disposition().normalized_exit_code()?;
+        if self.normalized_exit_code != expected_code {
+            return Err(
+                "generation-qualified exec normalized exit code disagrees with exact disposition"
+                    .to_string(),
+            );
+        }
+        validate_captured_output_size(
+            &self.stdout,
+            &self.stderr,
+            MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES,
+        )?;
+        let expected_digest = self.computed_terminal_receipt_digest()?;
+        if self.terminal_receipt_digest != expected_digest {
+            return Err(
+                "generation-qualified exec terminal receipt digest does not match its immutable fields"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, request: &ContainerGenerationExecRequest) -> Result<(), String> {
+        self.validate()?;
+        request.validate()?;
+        if self.context != request.context
+            || self.execution_id != request.execution_id
+            || self.request_digest != request.computed_request_digest()?
+        {
+            return Err(
+                "generation-qualified exec result does not belong to the exact request".to_string(),
+            );
+        }
+        let requested_proof = request.running_proof()?;
+        let admitted_proof = match &self.admission_observation.inspection {
+            ContainerGenerationLifecycleInspection::Running(proof) => proof,
+            _ => unreachable!("result validation already required Running admission"),
+        };
+        if !admitted_proof.proves_same_live_process(requested_proof)?
+            || self.admission_observation.guest_observation_sequence
+                <= request.running_observation.guest_observation_sequence
+            || self.admission_observation.observed_unix_secs
+                < request.running_observation.observed_unix_secs
+        {
+            return Err(
+                "generation-qualified exec admission did not freshly revalidate the exact generation"
+                    .to_string(),
+            );
+        }
+        validate_captured_output_size(&self.stdout, &self.stderr, request.max_output_bytes)
+    }
+
+    pub fn is_successful_exit_for(
+        &self,
+        request: &ContainerGenerationExecRequest,
+    ) -> Result<bool, String> {
+        self.validate_for(request)?;
+        Ok(self.completion.is_success())
+    }
+
+    /// Canonical terminal receipt digest; correlation/fencing only, not issuer authentication.
+    pub fn computed_terminal_receipt_digest(&self) -> Result<String, String> {
+        #[derive(Serialize)]
+        struct DigestMaterial<'a> {
+            schema_version: u32,
+            context: &'a ContainerGenerationLifecycleContext,
+            admission_observation: &'a ContainerGenerationLifecycleObservation,
+            execution_id: &'a str,
+            request_digest: &'a str,
+            completion_sequence: u64,
+            started_unix_millis: u64,
+            finished_unix_millis: u64,
+            completion: ContainerGenerationExecCompletion,
+            normalized_exit_code: i32,
+            stdout: &'a [u8],
+            stderr: &'a [u8],
+            stdout_truncated: bool,
+            stderr_truncated: bool,
+        }
+
+        let material = DigestMaterial {
+            schema_version: self.schema_version,
+            context: &self.context,
+            admission_observation: &self.admission_observation,
+            execution_id: &self.execution_id,
+            request_digest: &self.request_digest,
+            completion_sequence: self.completion_sequence,
+            started_unix_millis: self.started_unix_millis,
+            finished_unix_millis: self.finished_unix_millis,
+            completion: self.completion,
+            normalized_exit_code: self.normalized_exit_code,
+            stdout: &self.stdout,
+            stderr: &self.stderr,
+            stdout_truncated: self.stdout_truncated,
+            stderr_truncated: self.stderr_truncated,
+        };
+        let encoded = serde_json::to_vec(&material)
+            .map_err(|error| format!("cannot serialize exec terminal receipt: {error}"))?;
+        let mut digest = Sha256::new();
+        digest.update(b"vz.container-generation-exec-terminal-receipt.v1\0");
+        digest.update(encoded);
+        Ok(format!("sha256:{:x}", digest.finalize()))
+    }
+
+    pub fn terminal_receipt_id(&self) -> &str {
+        &self.terminal_receipt_digest
+    }
+}
+
+/// Exact cancellation request for one generation-qualified exec payload.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationExecCancelRequest {
+    pub schema_version: u32,
+    pub context: ContainerGenerationLifecycleContext,
+    pub execution_id: String,
+    pub exec_request_digest: String,
+    pub cancellation_nonce: String,
+}
+
+impl ContainerGenerationExecCancelRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.context.validate()?;
+        validate_text("execution_id", &self.execution_id)?;
+        validate_sha256_digest("exec_request_digest", &self.exec_request_digest)?;
+        validate_text("cancellation_nonce", &self.cancellation_nonce)
+    }
+
+    pub fn validate_for(&self, request: &ContainerGenerationExecRequest) -> Result<(), String> {
+        self.validate()?;
+        request.validate()?;
+        if self.context != request.context
+            || self.execution_id != request.execution_id
+            || self.exec_request_digest != request.computed_request_digest()?
+        {
+            return Err(
+                "generation-qualified exec cancellation does not identify the exact request"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+}
+
+/// Whether cancellation caused terminal reaping or observed an existing terminal result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContainerGenerationExecCancelDisposition {
+    CanceledAndReaped,
+    AlreadyTerminal,
+}
+
+/// Exact cancellation outcome. No successful result may be published after this is returned.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerGenerationExecCancelOutcome {
+    pub schema_version: u32,
+    pub cancellation: ContainerGenerationExecCancelRequest,
+    pub disposition: ContainerGenerationExecCancelDisposition,
+    pub terminal_result: ContainerGenerationExecResult,
+}
+
+impl ContainerGenerationExecCancelOutcome {
+    pub fn validate(&self) -> Result<(), String> {
+        validate_lifecycle_schema_version(self.schema_version)?;
+        self.cancellation.validate()?;
+        self.terminal_result.validate()?;
+        if self.terminal_result.context != self.cancellation.context
+            || self.terminal_result.execution_id != self.cancellation.execution_id
+            || self.terminal_result.request_digest != self.cancellation.exec_request_digest
+        {
+            return Err(
+                "generation-qualified exec cancellation outcome belongs to a different exec"
+                    .to_string(),
+            );
+        }
+        if self.disposition == ContainerGenerationExecCancelDisposition::CanceledAndReaped
+            && !matches!(
+                self.terminal_result.completion,
+                ContainerGenerationExecCompletion::Canceled { .. }
+            )
+        {
+            return Err(
+                "canceled-and-reaped outcome requires a typed Canceled terminal result".to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    pub fn validate_for(&self, request: &ContainerGenerationExecRequest) -> Result<(), String> {
+        self.validate()?;
+        self.cancellation.validate_for(request)?;
+        self.terminal_result.validate_for(request)
+    }
+
+    /// Enforce terminal single-assignment after this cancellation fence is established.
+    ///
+    /// Exact byte-for-byte replays of the established terminal receipt are accepted. Any other
+    /// independently valid terminal result for the same request is a conflicting late result.
+    pub fn validate_terminal_replay(
+        &self,
+        candidate: &ContainerGenerationExecResult,
+        request: &ContainerGenerationExecRequest,
+    ) -> Result<(), String> {
+        self.validate_for(request)?;
+        candidate.validate_for(request)?;
+        if candidate.terminal_receipt_digest != self.terminal_result.terminal_receipt_digest
+            || candidate != &self.terminal_result
+        {
+            return Err(
+                "conflicting late terminal result after generation-qualified exec cancellation"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    }
+
+    /// Durable identity of the single assigned terminal result.
+    pub fn terminal_receipt_id(&self) -> &str {
+        self.terminal_result.terminal_receipt_id()
+    }
+}
+
+fn validate_lifecycle_schema_version(schema_version: u32) -> Result<(), String> {
+    if schema_version != CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION {
+        return Err(format!(
+            "unsupported container generation lifecycle schema version {schema_version}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_sha256_digest(field: &str, digest: &str) -> Result<(), String> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        return Err(format!("{field} must be a canonical sha256 digest"));
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{field} must be a canonical lowercase sha256 digest"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_exec_command(command: &[String]) -> Result<(), String> {
+    if command.is_empty() || command.len() > 256 {
+        return Err("generation-qualified exec command must contain 1..=256 arguments".to_string());
+    }
+    for (index, argument) in command.iter().enumerate() {
+        validate_exec_field("command argument", argument, index != 0)?;
+    }
+    Ok(())
+}
+
+fn validate_exec_environment(key: &str, value: &str) -> Result<(), String> {
+    if key.is_empty()
+        || key.len() > 256
+        || key.contains('=')
+        || !key
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        return Err(
+            "generation-qualified exec environment keys must contain 1..=256 ASCII alphanumeric or '_' bytes"
+                .to_string(),
+        );
+    }
+    validate_exec_field("environment value", value, true)
+}
+
+fn validate_exec_field(field: &str, value: &str, allow_empty: bool) -> Result<(), String> {
+    if (!allow_empty && value.is_empty()) || value.len() > 128 * 1024 || value.contains('\0') {
+        return Err(format!(
+            "generation-qualified exec {field} must contain at most 131072 bytes and no NUL"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_captured_output_size(stdout: &[u8], stderr: &[u8], limit: u64) -> Result<(), String> {
+    let total = stdout
+        .len()
+        .checked_add(stderr.len())
+        .and_then(|size| u64::try_from(size).ok())
+        .ok_or_else(|| "generation-qualified exec output size overflowed".to_string())?;
+    if total > limit {
+        return Err(format!(
+            "generation-qualified exec captured output {total} exceeds limit {limit}"
+        ));
+    }
+    Ok(())
 }
 
 fn require_machine_incarnation(ownership: &ContainerGenerationOwnership) -> Result<(), String> {

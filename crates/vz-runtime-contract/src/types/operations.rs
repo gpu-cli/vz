@@ -111,6 +111,14 @@ pub enum RuntimeOperation {
     GetContainerLogs,
     /// Execute command in container.
     ExecContainer,
+    /// Inspect one exact generation lifecycle snapshot.
+    InspectContainerGenerationLifecycle,
+    /// Stream one exact generation lifecycle.
+    WatchContainerGenerationLifecycle,
+    /// Execute against one exact live container generation.
+    ExecContainerGeneration,
+    /// Cancel one exact generation-qualified exec.
+    CancelContainerGenerationExec,
     /// Write stdin to running exec.
     WriteExecStdin,
     /// Signal running exec.
@@ -147,7 +155,7 @@ pub enum RuntimeOperation {
 
 impl RuntimeOperation {
     /// All required Runtime V2 operations.
-    pub const ALL: [RuntimeOperation; 34] = [
+    pub const ALL: [RuntimeOperation; 38] = [
         RuntimeOperation::CreateSandbox,
         RuntimeOperation::GetSandbox,
         RuntimeOperation::TerminateSandbox,
@@ -166,6 +174,10 @@ impl RuntimeOperation {
         RuntimeOperation::RemoveContainer,
         RuntimeOperation::GetContainerLogs,
         RuntimeOperation::ExecContainer,
+        RuntimeOperation::InspectContainerGenerationLifecycle,
+        RuntimeOperation::WatchContainerGenerationLifecycle,
+        RuntimeOperation::ExecContainerGeneration,
+        RuntimeOperation::CancelContainerGenerationExec,
         RuntimeOperation::WriteExecStdin,
         RuntimeOperation::SignalExec,
         RuntimeOperation::ResizeExecPty,
@@ -194,6 +206,8 @@ impl RuntimeOperation {
                 | RuntimeOperation::StartBuild
                 | RuntimeOperation::CreateContainer
                 | RuntimeOperation::ExecContainer
+                | RuntimeOperation::ExecContainerGeneration
+                | RuntimeOperation::CancelContainerGenerationExec
                 | RuntimeOperation::CreateCheckpoint
                 | RuntimeOperation::ForkCheckpoint
         )
@@ -208,6 +222,10 @@ impl RuntimeOperation {
             RuntimeOperation::StartBuild => Some("start_build"),
             RuntimeOperation::CreateContainer => Some("create_container"),
             RuntimeOperation::ExecContainer => Some("exec_container"),
+            RuntimeOperation::ExecContainerGeneration => Some("exec_container_generation"),
+            RuntimeOperation::CancelContainerGenerationExec => {
+                Some("cancel_container_generation_exec")
+            }
             RuntimeOperation::CreateCheckpoint => Some("create_checkpoint"),
             RuntimeOperation::ForkCheckpoint => Some("fork_checkpoint"),
             _ => None,
@@ -235,6 +253,14 @@ impl RuntimeOperation {
             RuntimeOperation::RemoveContainer => "remove_container",
             RuntimeOperation::GetContainerLogs => "get_container_logs",
             RuntimeOperation::ExecContainer => "exec_container",
+            RuntimeOperation::InspectContainerGenerationLifecycle => {
+                "inspect_container_generation_lifecycle"
+            }
+            RuntimeOperation::WatchContainerGenerationLifecycle => {
+                "watch_container_generation_lifecycle"
+            }
+            RuntimeOperation::ExecContainerGeneration => "exec_container_generation",
+            RuntimeOperation::CancelContainerGenerationExec => "cancel_container_generation_exec",
             RuntimeOperation::WriteExecStdin => "write_exec_stdin",
             RuntimeOperation::SignalExec => "signal_exec",
             RuntimeOperation::ResizeExecPty => "resize_exec_pty",

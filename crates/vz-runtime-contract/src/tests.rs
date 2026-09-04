@@ -669,6 +669,113 @@ fn generation_lifecycle_observation(
     }
 }
 
+fn generation_lifecycle_inspect_request() -> ContainerGenerationLifecycleInspectRequest {
+    ContainerGenerationLifecycleInspectRequest {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        context: generation_lifecycle_context("stack-lifecycle"),
+        timeout_millis: 5_000,
+    }
+}
+
+fn generation_lifecycle_watch_request() -> ContainerGenerationLifecycleWatchRequest {
+    ContainerGenerationLifecycleWatchRequest {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        context: generation_lifecycle_context("stack-lifecycle"),
+        after_guest_observation_sequence: Some(12),
+    }
+}
+
+fn generation_exec_request() -> ContainerGenerationExecRequest {
+    ContainerGenerationExecRequest {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        context: generation_lifecycle_context("stack-lifecycle"),
+        running_observation: generation_lifecycle_observation(
+            ContainerGenerationLifecycleInspection::Running(running_generation_proof(
+                "stack-lifecycle",
+            )),
+        ),
+        execution_id: "exec-generation-1".to_string(),
+        command: vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "printf ok".to_string(),
+        ],
+        working_directory: Some("/workspace".to_string()),
+        environment: BTreeMap::from([("MODE".to_string(), "test".to_string())]),
+        user: Some("1000:1000".to_string()),
+        timeout_millis: 30_000,
+        max_output_bytes: 1024,
+    }
+}
+
+fn generation_exec_result(
+    request: &ContainerGenerationExecRequest,
+) -> ContainerGenerationExecResult {
+    let mut admission_observation = request.running_observation.clone();
+    admission_observation.guest_observation_sequence += 1;
+    match &mut admission_observation.inspection {
+        ContainerGenerationLifecycleInspection::Running(proof) => {
+            proof.guest_observation_sequence = admission_observation.guest_observation_sequence;
+        }
+        _ => unreachable!(),
+    }
+    let mut result = ContainerGenerationExecResult {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        context: request.context.clone(),
+        admission_observation,
+        execution_id: request.execution_id.clone(),
+        completion_sequence: request.running_observation.guest_observation_sequence + 2,
+        started_unix_millis: 1_750_000_000_000,
+        finished_unix_millis: 1_750_000_000_010,
+        request_digest: request.computed_request_digest().unwrap(),
+        completion: ContainerGenerationExecCompletion::Completed {
+            disposition: ContainerGenerationExitDisposition::Exited { code: 0 },
+        },
+        normalized_exit_code: 0,
+        stdout: b"ok".to_vec(),
+        stderr: Vec::new(),
+        stdout_truncated: false,
+        stderr_truncated: false,
+        terminal_receipt_digest: String::new(),
+    };
+    result.terminal_receipt_digest = result.computed_terminal_receipt_digest().unwrap();
+    result
+}
+
+fn generation_exec_cancel_request(
+    request: &ContainerGenerationExecRequest,
+) -> ContainerGenerationExecCancelRequest {
+    ContainerGenerationExecCancelRequest {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        context: request.context.clone(),
+        execution_id: request.execution_id.clone(),
+        exec_request_digest: request.computed_request_digest().unwrap(),
+        cancellation_nonce: "cancel-request-1".to_string(),
+    }
+}
+
+fn generation_exec_cancel_outcome(
+    request: &ContainerGenerationExecRequest,
+) -> ContainerGenerationExecCancelOutcome {
+    let cancellation = generation_exec_cancel_request(request);
+    let mut terminal_result = generation_exec_result(request);
+    terminal_result.completion = ContainerGenerationExecCompletion::Canceled {
+        final_disposition: ContainerGenerationExitDisposition::Signaled {
+            signal: 9,
+            core_dumped: false,
+        },
+    };
+    terminal_result.normalized_exit_code = 137;
+    terminal_result.terminal_receipt_digest =
+        terminal_result.computed_terminal_receipt_digest().unwrap();
+    ContainerGenerationExecCancelOutcome {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        cancellation,
+        disposition: ContainerGenerationExecCancelDisposition::CanceledAndReaped,
+        terminal_result,
+    }
+}
+
 #[test]
 fn generation_lifecycle_inspections_validate_and_serde_round_trip() {
     let ownership = generation_ownership("stack-lifecycle");
@@ -1208,6 +1315,20 @@ fn generation_lifecycle_authority_structs_deny_unknown_fields() {
     assert_rejects_unknown_field(&running);
     assert_rejects_unknown_field(&receipt);
     assert_rejects_unknown_field(&observation);
+    assert_rejects_unknown_field(&generation_lifecycle_inspect_request());
+    assert_rejects_unknown_field(&generation_lifecycle_watch_request());
+    let watch_event = ContainerGenerationLifecycleWatchEvent {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        observation: generation_lifecycle_observation(
+            ContainerGenerationLifecycleInspection::Absent,
+        ),
+    };
+    assert_rejects_unknown_field(&watch_event);
+    let exec_request = generation_exec_request();
+    assert_rejects_unknown_field(&exec_request);
+    assert_rejects_unknown_field(&generation_exec_result(&exec_request));
+    assert_rejects_unknown_field(&generation_exec_cancel_request(&exec_request));
+    assert_rejects_unknown_field(&generation_exec_cancel_outcome(&exec_request));
 
     let mut nested_ownership = serde_json::to_value(&observation).unwrap();
     nested_ownership["requested_ownership"]
@@ -1253,6 +1374,419 @@ fn generation_lifecycle_authority_structs_deny_unknown_fields() {
     assert!(
         serde_json::from_value::<ContainerGenerationExitDisposition>(disposition_payload).is_err()
     );
+
+    let completion = ContainerGenerationExecCompletion::TimedOut {
+        final_disposition: ContainerGenerationExitDisposition::Signaled {
+            signal: 9,
+            core_dumped: false,
+        },
+    };
+    let mut completion_payload = serde_json::to_value(completion).unwrap();
+    completion_payload["timed_out"]
+        .as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+    assert!(
+        serde_json::from_value::<ContainerGenerationExecCompletion>(completion_payload).is_err()
+    );
+}
+
+#[test]
+fn generation_lifecycle_snapshot_request_is_bounded_and_freshness_qualified() {
+    let request = generation_lifecycle_inspect_request();
+    request.validate().unwrap();
+    let observation =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Running(
+            running_generation_proof("stack-lifecycle"),
+        ));
+    request.validate_observation(&observation).unwrap();
+
+    let json = serde_json::to_string(&request).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationLifecycleInspectRequest>(&json).unwrap(),
+        request
+    );
+
+    let mut stale = observation;
+    stale.freshness_nonce = "lifecycle-request-old".to_string();
+    assert!(request.validate_observation(&stale).is_err());
+
+    for timeout in [
+        0,
+        MAX_CONTAINER_GENERATION_LIFECYCLE_INSPECT_TIMEOUT_MILLIS + 1,
+    ] {
+        let mut invalid = request.clone();
+        invalid.timeout_millis = timeout;
+        assert!(invalid.validate().unwrap_err().contains("timeout_millis"));
+    }
+}
+
+#[test]
+fn generation_lifecycle_watch_enforces_cursor_and_strict_stream_order() {
+    let request = generation_lifecycle_watch_request();
+    request.validate().unwrap();
+    let mut observation =
+        generation_lifecycle_observation(ContainerGenerationLifecycleInspection::Absent);
+    observation.guest_observation_sequence = 13;
+    let event = ContainerGenerationLifecycleWatchEvent {
+        schema_version: CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION,
+        observation,
+    };
+    request.validate_next(&event, None).unwrap();
+    assert!(request.validate_next(&event, Some(&event)).is_err());
+    let mut newer_previous = event.clone();
+    newer_previous.observation.guest_observation_sequence = 14;
+    assert!(
+        request
+            .validate_next(&event, Some(&newer_previous))
+            .is_err()
+    );
+
+    let mut older_timestamp = event.clone();
+    older_timestamp.observation.guest_observation_sequence = 15;
+    older_timestamp.observation.observed_unix_secs -= 1;
+    assert!(
+        request
+            .validate_next(&older_timestamp, Some(&event))
+            .is_err()
+    );
+
+    let json = serde_json::to_string(&event).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationLifecycleWatchEvent>(&json).unwrap(),
+        event
+    );
+
+    let mut stale = event;
+    stale.observation.freshness_nonce = "lifecycle-request-old".to_string();
+    assert!(request.validate_next(&stale, None).is_err());
+
+    for cursor in [0, u64::MAX] {
+        let mut invalid = request.clone();
+        invalid.after_guest_observation_sequence = Some(cursor);
+        assert!(invalid.validate().is_err());
+    }
+}
+
+#[test]
+fn generation_exec_request_requires_exact_current_running_observation() {
+    let valid = generation_exec_request();
+    valid.validate().unwrap();
+    let digest = valid.computed_request_digest().unwrap();
+    assert!(digest.starts_with("sha256:"));
+    assert_eq!(digest.len(), 71);
+    assert_eq!(
+        valid.running_proof().unwrap(),
+        &running_generation_proof("stack-lifecycle")
+    );
+
+    let json = serde_json::to_string(&valid).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationExecRequest>(&json).unwrap(),
+        valid
+    );
+
+    let mut invalid = valid.clone();
+    invalid.running_observation.inspection =
+        ContainerGenerationLifecycleInspection::Created(invalid.context.ownership.clone());
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("running lifecycle proof")
+    );
+
+    let mut invalid = valid.clone();
+    invalid.running_observation.freshness_nonce = "lifecycle-request-old".to_string();
+    assert!(invalid.validate().is_err());
+
+    let mut invalid = valid.clone();
+    invalid.timeout_millis = 0;
+    assert!(invalid.validate().unwrap_err().contains("timeout_millis"));
+
+    let mut invalid = valid.clone();
+    invalid.max_output_bytes = MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES + 1;
+    assert!(invalid.validate().unwrap_err().contains("max_output_bytes"));
+
+    let mut invalid = valid.clone();
+    invalid.command.clear();
+    assert!(invalid.validate().unwrap_err().contains("command"));
+
+    let mut changed_payload = valid.clone();
+    changed_payload.command.push("changed".to_string());
+    assert_eq!(changed_payload.execution_id, valid.execution_id);
+    assert_ne!(changed_payload.computed_request_digest().unwrap(), digest);
+
+    let mut invalid = valid.clone();
+    invalid.command[0] = "bad\0command".to_string();
+    assert!(invalid.validate().unwrap_err().contains("NUL"));
+
+    let mut invalid = valid.clone();
+    invalid
+        .environment
+        .insert("BAD=KEY".to_string(), "value".to_string());
+    assert!(invalid.validate().unwrap_err().contains("environment keys"));
+
+    let mut invalid = valid;
+    invalid.working_directory = Some("relative".to_string());
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("absolute guest path")
+    );
+}
+
+#[test]
+fn generation_exec_result_is_exact_bounded_and_never_infers_timeout_status() {
+    let request = generation_exec_request();
+    let valid = generation_exec_result(&request);
+    valid.validate_for(&request).unwrap();
+    assert!(valid.terminal_receipt_id().starts_with("sha256:"));
+    assert_eq!(valid.terminal_receipt_id().len(), 71);
+    let json = serde_json::to_string(&valid).unwrap();
+    assert_eq!(
+        serde_json::from_str::<ContainerGenerationExecResult>(&json).unwrap(),
+        valid
+    );
+
+    let mut invalid = valid.clone();
+    invalid.context.freshness_nonce = "lifecycle-request-old".to_string();
+    assert!(invalid.validate_for(&request).is_err());
+
+    let mut invalid = valid.clone();
+    match &mut invalid.admission_observation.inspection {
+        ContainerGenerationLifecycleInspection::Running(proof) => {
+            proof.ownership.generation -= 1;
+        }
+        _ => unreachable!(),
+    }
+    assert!(invalid.validate_for(&request).is_err());
+
+    let mut stale_admission = valid.clone();
+    stale_admission
+        .admission_observation
+        .guest_observation_sequence = request.running_observation.guest_observation_sequence;
+    match &mut stale_admission.admission_observation.inspection {
+        ContainerGenerationLifecycleInspection::Running(proof) => {
+            proof.guest_observation_sequence = stale_admission
+                .admission_observation
+                .guest_observation_sequence;
+        }
+        _ => unreachable!(),
+    }
+    assert!(stale_admission.validate_for(&request).is_err());
+
+    for mutate in [
+        |proof: &mut ContainerGenerationRunningProof| proof.init_pid += 1,
+        |proof: &mut ContainerGenerationRunningProof| proof.namespaces.pid.inode += 1,
+    ] {
+        let mut replaced_process = valid.clone();
+        match &mut replaced_process.admission_observation.inspection {
+            ContainerGenerationLifecycleInspection::Running(proof) => mutate(proof),
+            _ => unreachable!(),
+        }
+        replaced_process.terminal_receipt_digest =
+            replaced_process.computed_terminal_receipt_digest().unwrap();
+        replaced_process.validate().unwrap();
+        assert!(replaced_process.validate_for(&request).is_err());
+    }
+
+    let mut changed_payload = request.clone();
+    changed_payload.command.push("changed".to_string());
+    assert_eq!(changed_payload.execution_id, request.execution_id);
+    assert!(valid.validate_for(&changed_payload).is_err());
+
+    for sequence in [
+        valid.admission_observation.guest_observation_sequence,
+        u64::MAX,
+    ] {
+        let mut invalid = valid.clone();
+        invalid.completion_sequence = sequence;
+        assert!(invalid.validate().is_err());
+    }
+
+    let mut invalid = valid.clone();
+    invalid.normalized_exit_code = 1;
+    assert!(
+        invalid
+            .validate()
+            .unwrap_err()
+            .contains("normalized exit code")
+    );
+
+    let mut mutated_terminal = valid.clone();
+    mutated_terminal.stdout.push(b'!');
+    assert!(mutated_terminal.validate().unwrap_err().contains("digest"));
+
+    let mut invalid = valid.clone();
+    invalid.finished_unix_millis = invalid.started_unix_millis - 1;
+    assert!(invalid.validate().unwrap_err().contains("precedes"));
+
+    let mut bounded_request = request.clone();
+    bounded_request.max_output_bytes = 1;
+    assert!(valid.validate_for(&bounded_request).is_err());
+
+    assert_eq!(valid.is_successful_exit_for(&request), Ok(true));
+
+    let mut timed_out = ContainerGenerationExecResult {
+        completion: ContainerGenerationExecCompletion::TimedOut {
+            final_disposition: ContainerGenerationExitDisposition::Exited { code: 0 },
+        },
+        ..valid
+    };
+    timed_out.terminal_receipt_digest = timed_out.computed_terminal_receipt_digest().unwrap();
+    timed_out.validate_for(&request).unwrap();
+    assert_eq!(timed_out.is_successful_exit_for(&request), Ok(false));
+
+    let mut canceled = ContainerGenerationExecResult {
+        completion: ContainerGenerationExecCompletion::Canceled {
+            final_disposition: ContainerGenerationExitDisposition::Signaled {
+                signal: 9,
+                core_dumped: false,
+            },
+        },
+        normalized_exit_code: 137,
+        ..timed_out
+    };
+    canceled.terminal_receipt_digest = canceled.computed_terminal_receipt_digest().unwrap();
+    canceled.validate_for(&request).unwrap();
+    assert_eq!(canceled.is_successful_exit_for(&request), Ok(false));
+}
+
+#[test]
+fn generation_exec_cancellation_is_digest_bound_reaped_and_late_result_fenced() {
+    let request = generation_exec_request();
+    let cancellation = generation_exec_cancel_request(&request);
+    cancellation.validate_for(&request).unwrap();
+    let outcome = generation_exec_cancel_outcome(&request);
+    outcome.validate_for(&request).unwrap();
+    assert_eq!(
+        outcome.terminal_receipt_id(),
+        outcome.terminal_result.terminal_receipt_id()
+    );
+    outcome
+        .validate_terminal_replay(&outcome.terminal_result, &request)
+        .unwrap();
+
+    let late_success = generation_exec_result(&request);
+    late_success.validate_for(&request).unwrap();
+    assert_eq!(late_success.is_successful_exit_for(&request), Ok(true));
+    assert_ne!(
+        late_success.terminal_receipt_id(),
+        outcome.terminal_receipt_id()
+    );
+    assert!(
+        outcome
+            .validate_terminal_replay(&late_success, &request)
+            .unwrap_err()
+            .contains("conflicting late terminal result")
+    );
+
+    for value in [
+        serde_json::to_string(&cancellation).unwrap(),
+        serde_json::to_string(&outcome).unwrap(),
+    ] {
+        assert!(!value.is_empty());
+    }
+
+    let mut changed_payload = request.clone();
+    changed_payload.timeout_millis += 1;
+    assert_eq!(changed_payload.execution_id, request.execution_id);
+    assert!(cancellation.validate_for(&changed_payload).is_err());
+    assert!(outcome.validate_for(&changed_payload).is_err());
+
+    let mut invalid = outcome.clone();
+    invalid.terminal_result.completion = ContainerGenerationExecCompletion::Completed {
+        disposition: ContainerGenerationExitDisposition::Exited { code: 0 },
+    };
+    invalid.terminal_result.normalized_exit_code = 0;
+    invalid.terminal_result.terminal_receipt_digest = invalid
+        .terminal_result
+        .computed_terminal_receipt_digest()
+        .unwrap();
+    assert!(invalid.validate().is_err());
+
+    let already_terminal = ContainerGenerationExecCancelOutcome {
+        disposition: ContainerGenerationExecCancelDisposition::AlreadyTerminal,
+        terminal_result: generation_exec_result(&request),
+        ..outcome
+    };
+    already_terminal.validate_for(&request).unwrap();
+}
+
+#[test]
+fn generation_backend_api_defaults_fail_unsupported_without_fabricating_state() {
+    let backend = StubBackend;
+    let inspect = generation_lifecycle_inspect_request();
+    let watch = generation_lifecycle_watch_request();
+    let exec = generation_exec_request();
+    let cancel = generation_exec_cancel_request(&exec);
+    let watch_error = match poll_immediate(backend.watch_container_generation_lifecycle(watch)) {
+        Err(error) => error,
+        Ok(_) => panic!("default lifecycle watch unexpectedly returned a stream"),
+    };
+    for (error, operation) in [
+        (
+            poll_immediate(backend.inspect_container_generation_lifecycle(&inspect)).unwrap_err(),
+            "inspect_container_generation_lifecycle",
+        ),
+        (watch_error, "watch_container_generation_lifecycle"),
+        (
+            poll_immediate(backend.exec_container_generation(exec)).unwrap_err(),
+            "exec_container_generation",
+        ),
+        (
+            poll_immediate(backend.cancel_container_generation_exec(cancel)).unwrap_err(),
+            "cancel_container_generation_exec",
+        ),
+    ] {
+        assert!(matches!(
+            error,
+            RuntimeError::UnsupportedOperation { operation: got, .. } if got == operation
+        ));
+    }
+}
+
+#[test]
+fn generation_backend_api_manager_delegates_all_canonical_operations() {
+    let manager = WorkspaceRuntimeManager::new(StubBackend);
+    let inspect = generation_lifecycle_inspect_request();
+    let watch = generation_lifecycle_watch_request();
+    let exec = generation_exec_request();
+    let cancel = generation_exec_cancel_request(&exec);
+
+    let inspect_error =
+        poll_immediate(manager.inspect_container_generation_lifecycle(&inspect)).unwrap_err();
+    let watch_error = match poll_immediate(manager.watch_container_generation_lifecycle(watch)) {
+        Err(error) => error,
+        Ok(_) => panic!("manager unexpectedly returned a lifecycle stream"),
+    };
+    let exec_error = poll_immediate(manager.exec_container_generation(exec)).unwrap_err();
+    let cancel_error =
+        poll_immediate(manager.cancel_container_generation_exec(cancel)).unwrap_err();
+
+    for (error, operation) in [
+        (
+            inspect_error,
+            RuntimeOperation::InspectContainerGenerationLifecycle,
+        ),
+        (
+            watch_error,
+            RuntimeOperation::WatchContainerGenerationLifecycle,
+        ),
+        (exec_error, RuntimeOperation::ExecContainerGeneration),
+        (
+            cancel_error,
+            RuntimeOperation::CancelContainerGenerationExec,
+        ),
+    ] {
+        assert!(matches!(
+            error,
+            RuntimeError::UnsupportedOperation { operation: got, .. }
+                if got == operation.as_str()
+        ));
+    }
 }
 
 #[test]
@@ -1313,6 +1847,24 @@ fn machine_workload_scope_rejects_unsupported_schema_version() {
             .container_generation_scope("reservation-stable")
             .is_err()
     );
+}
+
+#[test]
+fn machine_workload_scope_denies_unknown_fields() {
+    let workload = MachineWorkloadScope {
+        schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: ProjectId::new("prj_workload").unwrap(),
+        environment_id: EnvironmentId::new("env_workload").unwrap(),
+        machine_id: MachineId::new("mch_workload").unwrap(),
+        machine_incarnation_id: MachineIncarnationId::new("inc_workload_current").unwrap(),
+        stack_id: "stack-workload".to_string(),
+    };
+    let mut json = serde_json::to_value(workload).unwrap();
+    json.as_object_mut()
+        .unwrap()
+        .insert("unknown_authority".to_string(), serde_json::json!(true));
+
+    assert!(serde_json::from_value::<MachineWorkloadScope>(json).is_err());
 }
 
 #[test]
@@ -2208,12 +2760,12 @@ fn build_receipt_and_capability_invariants() {
 
 #[test]
 fn required_operations_and_idempotency_surface_match_contract() {
-    assert_eq!(REQUIRED_RUNTIME_OPERATIONS.len(), 34);
+    assert_eq!(REQUIRED_RUNTIME_OPERATIONS.len(), 38);
     assert_eq!(
         RuntimeOperation::ALL.len(),
         REQUIRED_RUNTIME_OPERATIONS.len()
     );
-    assert_eq!(REQUIRED_IDEMPOTENT_MUTATIONS.len(), 8);
+    assert_eq!(REQUIRED_IDEMPOTENT_MUTATIONS.len(), 10);
 
     for operation in REQUIRED_RUNTIME_OPERATIONS {
         assert_eq!(
@@ -2228,6 +2780,10 @@ fn required_operations_and_idempotency_surface_match_contract() {
     assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::StartBuild));
     assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CreateContainer));
     assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::ExecContainer));
+    assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::ExecContainerGeneration));
+    assert!(
+        REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CancelContainerGenerationExec)
+    );
     assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::CreateCheckpoint));
     assert!(REQUIRED_IDEMPOTENT_MUTATIONS.contains(&RuntimeOperation::ForkCheckpoint));
 
@@ -2318,6 +2874,10 @@ fn expected_manager_surface_operations() -> HashSet<RuntimeOperation> {
         RuntimeOperation::PullImage,
         RuntimeOperation::CreateContainer,
         RuntimeOperation::ExecContainer,
+        RuntimeOperation::InspectContainerGenerationLifecycle,
+        RuntimeOperation::WatchContainerGenerationLifecycle,
+        RuntimeOperation::ExecContainerGeneration,
+        RuntimeOperation::CancelContainerGenerationExec,
         RuntimeOperation::StopContainer,
         RuntimeOperation::RemoveContainer,
         RuntimeOperation::GetContainerLogs,
@@ -2420,6 +2980,17 @@ fn required_backend_adapter_operations_are_subset_of_runtime_surface() {
     }
     assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::CreateSandbox));
     assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::ExecContainer));
+    assert!(
+        REQUIRED_BACKEND_ADAPTER_OPERATIONS
+            .contains(&RuntimeOperation::InspectContainerGenerationLifecycle)
+    );
+    assert!(
+        REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::ExecContainerGeneration)
+    );
+    assert!(
+        REQUIRED_BACKEND_ADAPTER_OPERATIONS
+            .contains(&RuntimeOperation::CancelContainerGenerationExec)
+    );
     assert!(REQUIRED_BACKEND_ADAPTER_OPERATIONS.contains(&RuntimeOperation::GetCapabilities));
 }
 
@@ -2956,8 +3527,20 @@ fn manager_passthrough_for_network_domain_operations() {
 #[test]
 fn conformance_all_new_backend_trait_default_stubs_return_unsupported_machine_code() {
     let backend = StubBackend;
+    let inspect = generation_lifecycle_inspect_request();
+    let watch = generation_lifecycle_watch_request();
+    let exec = generation_exec_request();
+    let cancel = generation_exec_cancel_request(&exec);
+    let watch_error = match poll_immediate(backend.watch_container_generation_lifecycle(watch)) {
+        Err(error) => error,
+        Ok(_) => panic!("default lifecycle watch unexpectedly returned a stream"),
+    };
 
     let errors: Vec<RuntimeError> = vec![
+        poll_immediate(backend.inspect_container_generation_lifecycle(&inspect)).unwrap_err(),
+        watch_error,
+        poll_immediate(backend.exec_container_generation(exec)).unwrap_err(),
+        poll_immediate(backend.cancel_container_generation_exec(cancel)).unwrap_err(),
         poll_immediate(backend.write_exec_stdin("e", b"")).unwrap_err(),
         poll_immediate(backend.signal_exec("e", "SIGTERM")).unwrap_err(),
         poll_immediate(backend.resize_exec_pty("e", 80, 24)).unwrap_err(),
