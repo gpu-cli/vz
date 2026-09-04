@@ -43,6 +43,8 @@ pub struct MockContainerRuntime {
     pub exec_exit_code: i32,
     /// Whether exec should fail with an error (not just non-zero exit).
     pub fail_exec: bool,
+    /// Whether the runtime supports exact-generation exec.
+    pub support_generation_exec: bool,
     /// Optional delay before returning from exec (for timeout testing).
     pub exec_delay: Option<Duration>,
     /// Tracks calls: (operation, arg).
@@ -66,6 +68,8 @@ pub struct MockContainerRuntime {
     pub fail_scoped_activation_ids: Mutex<HashSet<String>>,
     /// Return a deliberately foreign cleanup proof from failed scoped activation.
     pub foreign_scoped_activation_cleanup: bool,
+    /// Return a deliberately foreign ownership proof from successful scoped activation.
+    pub foreign_scoped_activation_receipt: bool,
     /// Force reservation inspection to report a foreign owner.
     pub force_foreign_scoped_inspection: bool,
     /// Durable scoped generations, keyed by requested container ID.
@@ -99,6 +103,7 @@ impl MockContainerRuntime {
             remove_not_found: false,
             exec_exit_code: 0,
             fail_exec: false,
+            support_generation_exec: false,
             exec_delay: None,
             calls: Mutex::new(Vec::new()),
             create_counter: AtomicUsize::new(0),
@@ -110,6 +115,7 @@ impl MockContainerRuntime {
             fail_scoped_activation: false,
             fail_scoped_activation_ids: Mutex::new(HashSet::new()),
             foreign_scoped_activation_cleanup: false,
+            foreign_scoped_activation_receipt: false,
             force_foreign_scoped_inspection: false,
             scoped_generations: Mutex::new(HashMap::new()),
             next_scoped_generation: AtomicU64::new(1),
@@ -265,6 +271,30 @@ impl ContainerRuntime for MockContainerRuntime {
             return Err(StackError::InvalidSpec("mock exec failure".to_string()));
         }
         Ok(self.exec_exit_code)
+    }
+
+    fn exec_container_generation_with_output(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        self.calls.lock().unwrap().push((
+            "exec_generation".to_string(),
+            format!("{}:{}", ownership.container_id, command.join(" ")),
+        ));
+        if !self.support_generation_exec {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: "runtime does not provide exact-generation exec authority".to_string(),
+            });
+        }
+        if let Some(delay) = self.exec_delay {
+            std::thread::sleep(delay);
+        }
+        if self.fail_exec {
+            return Err(StackError::InvalidSpec("mock exec failure".to_string()));
+        }
+        Ok((self.exec_exit_code, String::new(), String::new()))
     }
 
     fn stream_logs(
@@ -528,9 +558,13 @@ impl ContainerRuntime for MockContainerRuntime {
             .lock()
             .unwrap()
             .push(("activated_image".to_string(), image.to_string()));
+        let mut receipt_ownership = ownership.clone();
+        if self.foreign_scoped_activation_receipt {
+            receipt_ownership.generation = receipt_ownership.generation.saturating_add(1);
+        }
         Ok(vz_runtime_contract::ContainerCreateReceipt {
             container_id: ownership.container_id.clone(),
-            ownership: Some(ownership),
+            ownership: Some(receipt_ownership),
         })
     }
 

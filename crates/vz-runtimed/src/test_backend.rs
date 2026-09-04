@@ -70,6 +70,37 @@ impl TestRuntimeBackend {
             .store(true, Ordering::SeqCst);
     }
 
+    /// Test double for the daemon's exact-generation stack exec bridge.
+    ///
+    /// Keep this separate from container-ID exec so adapter tests fail if the
+    /// production bridge ever drops generation or topology scope authority.
+    pub(crate) async fn exec_owned_container_generation(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+        config: ExecConfig,
+    ) -> Result<ExecOutput, RuntimeError> {
+        if !self.exact_generation_supported.load(Ordering::SeqCst) {
+            return Err(Self::unsupported_operation(
+                "exec_container_generation",
+                "test backend exact generation lifecycle is disabled",
+            ));
+        }
+        ownership.validate().map_err(RuntimeError::InvalidConfig)?;
+        let inspection = self.inspect_container_generation(ownership).await?;
+        match inspection {
+            ContainerGenerationInspection::Published(found) if found == *ownership => {}
+            other => {
+                return Err(RuntimeError::ExecFailed {
+                    id: ownership.container_id.clone(),
+                    reason: format!(
+                        "exact generation is not the current published owner: {other:?}"
+                    ),
+                });
+            }
+        }
+        self.exec_container(&ownership.container_id, config).await
+    }
+
     fn lock_poisoned_error(resource: &str) -> RuntimeError {
         RuntimeError::Backend {
             message: format!("test runtime backend lock poisoned: {resource}"),

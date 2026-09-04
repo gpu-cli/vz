@@ -375,14 +375,11 @@ impl ContainerStore {
         if let Err(reason) = current_scope.validate() {
             return Ok(ScopedGenerationInspection::Malformed(reason));
         }
-        if let Some(expected) = expected_generation
-            && record.generation != expected.0
-        {
-            return Ok(ScopedGenerationInspection::Replacement);
-        }
-        if current_scope != scope {
-            return Ok(ScopedGenerationInspection::Foreign);
-        }
+        // A released generation is durable history, not active ownership.
+        // Classify it before comparing the caller's successor scope or exact
+        // generation so a new reservation can safely reuse the container ID.
+        // Published metadata without an active reservation remains malformed
+        // and must never be admitted as absent.
         if !record.reserved {
             return Ok(if published {
                 ScopedGenerationInspection::Malformed(format!(
@@ -391,6 +388,14 @@ impl ContainerStore {
             } else {
                 ScopedGenerationInspection::Absent
             });
+        }
+        if let Some(expected) = expected_generation
+            && record.generation != expected.0
+        {
+            return Ok(ScopedGenerationInspection::Replacement);
+        }
+        if current_scope != scope {
+            return Ok(ScopedGenerationInspection::Foreign);
         }
         let generation = ContainerGeneration(record.generation);
         Ok(if published {
@@ -1287,6 +1292,139 @@ mod tests {
                 .unwrap(),
             ScopedGenerationInspection::Malformed(reason) if reason.contains("project_id")
         ));
+    }
+
+    #[test]
+    fn released_scoped_generation_is_absent_to_a_successor_reservation() {
+        let root = unique_temp_dir("generation-released-successor");
+        let store = ContainerStore::new(root);
+        let predecessor = generation_scope("reservation-predecessor", "stack-a");
+        let successor = generation_scope("reservation-successor", "stack-a");
+        let first = {
+            let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &predecessor, &lease)
+                .unwrap()
+        };
+        store
+            .upsert_if_generation(generation_test_container("recreate"), first)
+            .unwrap();
+        store.remove_if_generation("recreate", first).unwrap();
+
+        assert_eq!(
+            store
+                .inspect_scoped_reservation("recreate", &successor)
+                .unwrap(),
+            ScopedGenerationInspection::Absent
+        );
+        assert_eq!(
+            store
+                .inspect_scoped_generation("recreate", first, &predecessor)
+                .unwrap(),
+            ScopedGenerationInspection::Absent
+        );
+
+        let second = {
+            let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &successor, &lease)
+                .unwrap()
+        };
+        assert!(second.0 > first.0);
+        assert_eq!(
+            store
+                .inspect_scoped_reservation("recreate", &successor)
+                .unwrap(),
+            ScopedGenerationInspection::ReservedUnpublished(second)
+        );
+    }
+
+    #[test]
+    fn live_scoped_generation_remains_foreign_to_a_successor_reservation() {
+        let root = unique_temp_dir("generation-live-foreign-successor");
+        let store = ContainerStore::new(root);
+        let owner = generation_scope("reservation-owner", "stack-a");
+        let successor = generation_scope("reservation-successor", "stack-a");
+        let generation = {
+            let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &owner, &lease)
+                .unwrap()
+        };
+
+        assert_eq!(
+            store
+                .inspect_scoped_reservation("recreate", &successor)
+                .unwrap(),
+            ScopedGenerationInspection::Foreign
+        );
+        {
+            let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+            assert_eq!(
+                store
+                    .reserve_scoped_generation_with_write_lease("recreate", &successor, &lease)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists
+            );
+        }
+
+        store
+            .upsert_if_generation(generation_test_container("recreate"), generation)
+            .unwrap();
+        assert_eq!(
+            store
+                .inspect_scoped_reservation("recreate", &successor)
+                .unwrap(),
+            ScopedGenerationInspection::Foreign
+        );
+        let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+        assert_eq!(
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &successor, &lease)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn released_but_published_scoped_generation_remains_malformed() {
+        let root = unique_temp_dir("generation-released-published");
+        let store = ContainerStore::new(root);
+        let owner = generation_scope("reservation-owner", "stack-a");
+        let successor = generation_scope("reservation-successor", "stack-a");
+        let generation = {
+            let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &owner, &lease)
+                .unwrap()
+        };
+        store
+            .upsert_if_generation(generation_test_container("recreate"), generation)
+            .unwrap();
+
+        // Simulate corrupted durable state: published metadata survived after
+        // the generation reservation was released.
+        let mut records = store.load_generations().unwrap();
+        records.get_mut("recreate").unwrap().reserved = false;
+        store.write_generations(&records).unwrap();
+
+        assert!(matches!(
+            store
+                .inspect_scoped_reservation("recreate", &successor)
+                .unwrap(),
+            ScopedGenerationInspection::Malformed(reason)
+                if reason.contains("published without an active generation")
+        ));
+        let lease = store.try_acquire_container_write_lease("recreate").unwrap();
+        assert_eq!(
+            store
+                .reserve_scoped_generation_with_write_lease("recreate", &successor, &lease)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
     }
 
     #[test]

@@ -218,6 +218,56 @@ impl DaemonContainerRuntime {
         )
         .map_err(|error| map_runtime_error("release_container_reservation", error))
     }
+
+    /// Execute only against the exact published generation authorized by the
+    /// topology scope carried in `ownership`.
+    fn exec_container_generation_with_output(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        ownership
+            .validate()
+            .map_err(|message| StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::ValidationError,
+                message: format!("invalid exact generation exec authority: {message}"),
+            })?;
+        let config = vz_runtime_contract::ExecConfig {
+            cmd: command.to_vec(),
+            ..Default::default()
+        };
+
+        #[cfg(any(test, feature = "test-backend"))]
+        let result = self.block_on(
+            self.daemon
+                .manager()
+                .backend()
+                .exec_owned_container_generation(ownership, config),
+        );
+
+        #[cfg(all(not(any(test, feature = "test-backend")), target_os = "macos"))]
+        let result = self.block_on(
+            self.daemon
+                .manager()
+                .backend()
+                .exec_owned_container_generation(ownership, config),
+        );
+
+        // Linux-native does not yet expose an ownership-fenced exec primitive.
+        // Refuse the health probe rather than weakening it to container-ID exec.
+        #[cfg(all(not(any(test, feature = "test-backend")), target_os = "linux"))]
+        let result: Result<
+            vz_runtime_contract::ExecOutput,
+            vz_runtime_contract::RuntimeError,
+        > = Err(vz_runtime_contract::RuntimeError::UnsupportedOperation {
+            operation: "exec_container_generation".to_string(),
+            reason: "linux-native backend lacks exact generation exec authority".to_string(),
+        });
+
+        result
+            .map(|output| (output.exit_code, output.stdout, output.stderr))
+            .map_err(|error| map_runtime_error("exec_container_generation", error))
+    }
 }
 
 /// Decode the required topology authority for a mutating stack request.
@@ -934,6 +984,132 @@ mod runtime_error_mapping_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_exact_generation_exec_adapter_preserves_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(
+            RuntimeDaemon::start(crate::RuntimedConfig {
+                state_store_path: temp.path().join("state").join("stack-state.db"),
+                runtime_data_dir: temp.path().join("runtime"),
+                socket_path: temp.path().join("runtime").join("runtimed.sock"),
+            })
+            .unwrap(),
+        );
+        daemon
+            .manager()
+            .backend()
+            .enable_exact_generation_lifecycle();
+        let adapter = DaemonContainerRuntime::new(daemon);
+        let (_, workload) = topology_fixture();
+        let scope = workload
+            .container_generation_scope("reservation-daemon-exec-success")
+            .unwrap();
+        adapter
+            .create_sandbox(
+                &scope.stack_id,
+                Vec::new(),
+                vz_runtime_contract::StackResourceHint::default(),
+            )
+            .unwrap();
+        let ownership = adapter
+            .reserve_container_generation(&scope, "ctr-daemon-exec-success")
+            .unwrap();
+        adapter
+            .activate_container_generation(
+                ownership.clone(),
+                "alpine:latest",
+                vz_runtime_contract::RunConfig {
+                    container_id: Some(ownership.container_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let output = adapter
+            .exec_container_generation_with_output(
+                &ownership,
+                &["echo".to_string(), "exact authority".to_string()],
+            )
+            .unwrap();
+
+        assert_eq!(output, (0, "exact authority\n".to_string(), String::new()));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn daemon_exact_generation_exec_adapter_rejects_unpublished_foreign_and_stale() {
+        let temp = tempfile::tempdir().unwrap();
+        let daemon = Arc::new(
+            RuntimeDaemon::start(crate::RuntimedConfig {
+                state_store_path: temp.path().join("state").join("stack-state.db"),
+                runtime_data_dir: temp.path().join("runtime"),
+                socket_path: temp.path().join("runtime").join("runtimed.sock"),
+            })
+            .unwrap(),
+        );
+        daemon
+            .manager()
+            .backend()
+            .enable_exact_generation_lifecycle();
+        let adapter = DaemonContainerRuntime::new(daemon);
+        let (_, workload) = topology_fixture();
+        let scope = workload
+            .container_generation_scope("reservation-daemon-exec-reject")
+            .unwrap();
+        adapter
+            .create_sandbox(
+                &scope.stack_id,
+                Vec::new(),
+                vz_runtime_contract::StackResourceHint::default(),
+            )
+            .unwrap();
+        let ownership = adapter
+            .reserve_container_generation(&scope, "ctr-daemon-exec-reject")
+            .unwrap();
+        let command = ["true".to_string()];
+
+        let unpublished = adapter
+            .exec_container_generation_with_output(&ownership, &command)
+            .unwrap_err();
+        assert_eq!(
+            unpublished.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        assert!(unpublished.to_string().contains("ReservedUnpublished"));
+
+        adapter
+            .activate_container_generation(
+                ownership.clone(),
+                "alpine:latest",
+                vz_runtime_contract::RunConfig {
+                    container_id: Some(ownership.container_id.clone()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let mut foreign = ownership.clone();
+        foreign.scope.as_mut().unwrap().reservation_id = "reservation-foreign".to_string();
+        let foreign_error = adapter
+            .exec_container_generation_with_output(&foreign, &command)
+            .unwrap_err();
+        assert_eq!(
+            foreign_error.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        assert!(foreign_error.to_string().contains("Foreign"));
+
+        let mut stale = ownership;
+        stale.generation += 1;
+        let stale_error = adapter
+            .exec_container_generation_with_output(&stale, &command)
+            .unwrap_err();
+        assert_eq!(
+            stale_error.machine_code(),
+            vz_runtime_contract::MachineErrorCode::StateConflict
+        );
+        assert!(stale_error.to_string().contains("Replacement"));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn daemon_activation_adapter_runs_from_plain_worker_without_losing_owned_error() {
         let temp = tempfile::tempdir().unwrap();
         let daemon = Arc::new(
@@ -1054,6 +1230,14 @@ impl ContainerRuntime for DaemonContainerRuntime {
         )
         .map(|output| (output.exit_code, output.stdout, output.stderr))
         .map_err(|error| map_runtime_error("exec", error))
+    }
+
+    fn exec_container_generation_with_output(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        DaemonContainerRuntime::exec_container_generation_with_output(self, ownership, command)
     }
 
     fn create_sandbox(

@@ -133,6 +133,21 @@ pub trait ContainerRuntime: Send + Sync {
         Ok((code, String::new(), String::new()))
     }
 
+    /// Execute against one exact runtime generation and capture stdout/stderr.
+    ///
+    /// The default deliberately does not fall back to container-ID exec: a
+    /// replacement generation must never satisfy work authorized by `ownership`.
+    fn exec_container_generation_with_output(
+        &self,
+        _ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+        _command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        Err(StackError::Machine {
+            code: vz_runtime_contract::MachineErrorCode::StateConflict,
+            message: "runtime does not provide exact-generation exec authority".to_string(),
+        })
+    }
+
     /// Retrieve logs (stdout/stderr) from a container.
     ///
     /// Returns a [`ContainerLogs`] with captured stdout and stderr.

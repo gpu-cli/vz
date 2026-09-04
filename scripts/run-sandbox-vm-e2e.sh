@@ -479,6 +479,8 @@ EXEC_SUPERVISION_EVIDENCE="$RUN_DIR/runtime-exec-supervision.json"
 EXEC_SUPERVISION_SHA256="$RUN_DIR/runtime-exec-supervision.json.sha256"
 RUNTIME_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-crash-reopen.json"
 RUNTIME_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-crash-reopen.json.sha256"
+STACK_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-state-store-v7.json"
+STACK_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-state-store-v7.json.sha256"
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -1301,19 +1303,17 @@ validate_stack_teardown_evidence() {
         def nonempty_string: type == "string" and length > 0;
         def generation_scope:
             (type == "object") and
-            (((keys | sort) == ([
-                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
-            ] | sort)) or ((keys | sort) == ([
+            ((keys | sort) == ([
                 "environment_id", "machine_id", "machine_incarnation_id", "project_id",
                 "reservation_id", "stack_id"
-            ] | sort))) and
-            (.reservation_id | nonempty_string) and
+            ] | sort)) and
+            (.reservation_id | type == "string" and
+                test("^vzscr2-sha256:[0-9a-f]{64}$")) and
             (.project_id | nonempty_string) and
             (.environment_id | nonempty_string) and
             (.machine_id | nonempty_string) and
-            (.stack_id | nonempty_string) and
-            ((has("machine_incarnation_id") | not) or
-                (.machine_incarnation_id | nonempty_string));
+            (.machine_incarnation_id | nonempty_string) and
+            (.stack_id | nonempty_string);
         .container_ids as $container_ids |
         (type == "object") and
         ((keys | sort) == ([
@@ -1484,19 +1484,17 @@ validate_vm_full_unsupported_evidence() {
         def nonempty_string: type == "string" and length > 0;
         def generation_scope:
             (type == "object") and
-            (exact_keys([
-                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
-            ]) or exact_keys([
+            exact_keys([
                 "environment_id", "machine_id", "machine_incarnation_id", "project_id",
                 "reservation_id", "stack_id"
-            ])) and
-            (.reservation_id | nonempty_string) and
+            ]) and
+            (.reservation_id | type == "string" and
+                test("^vzscr2-sha256:[0-9a-f]{64}$")) and
             (.project_id | nonempty_string) and
             (.environment_id | nonempty_string) and
             (.machine_id | nonempty_string) and
-            (.stack_id | nonempty_string) and
-            ((has("machine_incarnation_id") | not) or
-                (.machine_incarnation_id | nonempty_string));
+            (.machine_incarnation_id | nonempty_string) and
+            (.stack_id | nonempty_string);
         def service_ids:
             (type == "object") and
             exact_keys(["api", "cache", "db"]) and
@@ -1732,19 +1730,33 @@ validate_stack_container_ownership_evidence() {
         def sha256: type == "string" and test("^[0-9a-f]{64}$");
         def generation_scope:
             (type == "object") and
-            (((keys | sort) == ([
-                "environment_id", "machine_id", "project_id", "reservation_id", "stack_id"
-            ] | sort)) or ((keys | sort) == ([
+            ((keys | sort) == ([
                 "environment_id", "machine_id", "machine_incarnation_id", "project_id",
                 "reservation_id", "stack_id"
-            ] | sort))) and
-            (.reservation_id | nonempty_string) and
+            ] | sort)) and
+            (.reservation_id | type == "string" and
+                test("^vzscr2-sha256:[0-9a-f]{64}$")) and
             (.project_id | nonempty_string) and
             (.environment_id | nonempty_string) and
             (.machine_id | nonempty_string) and
+            (.machine_incarnation_id | nonempty_string) and
             (.stack_id | nonempty_string) and
-            ((has("machine_incarnation_id") | not) or
-                (.machine_incarnation_id | nonempty_string));
+            (.project_id == "prj_stack_fixture") and
+            (.environment_id == "env_stack_fixture") and
+            (.machine_id == "mch_stack_fixture") and
+            (.machine_incarnation_id == "inc_stack_fixture");
+        def workload_scope:
+            (type == "object") and
+            ((keys | sort) == ([
+                "environment_id", "machine_id", "machine_incarnation_id", "project_id",
+                "schema_version", "stack_id"
+            ] | sort)) and
+            (.schema_version == 1) and
+            (.project_id == "prj_stack_fixture") and
+            (.environment_id == "env_stack_fixture") and
+            (.machine_id == "mch_stack_fixture") and
+            (.machine_incarnation_id == "inc_stack_fixture") and
+            (.stack_id | nonempty_string);
         def ownership:
             ((keys | sort) == (["container_id", "generation", "scope", "stack_id"] | sort)) and
             ((.container_id | type) == "string" and (.container_id | length) > 0) and
@@ -1752,12 +1764,7 @@ validate_stack_container_ownership_evidence() {
                 .generation == (.generation | floor)) and
             ((.stack_id | type) == "string" and (.stack_id | length) > 0) and
             (.scope | generation_scope) and
-            (.scope.stack_id == .stack_id) and
-            (.scope.project_id == "prj_synthetic_legacy_stack_compat") and
-            (.scope.environment_id == "env_synthetic_legacy_stack_compat") and
-            (.scope.machine_id == "mch_synthetic_legacy_stack_compat") and
-            (.scope | has("machine_incarnation_id") | not) and
-            (.scope.reservation_id | startswith("legacy-stack-compat-"));
+            (.scope.stack_id == .stack_id);
         def guest:
             ((keys | sort) == ([
                 "boot_id", "cgroup_identity", "cgroup_path", "guest_init_pid",
@@ -1816,17 +1823,25 @@ validate_stack_container_ownership_evidence() {
             "build_identity", "concurrent_same_service", "final", "foreign_collision",
             "owned_failure", "scenario", "schema_version", "scope_identity"
         ] | sort)) and
-        (.schema_version == 3) and
+        (.schema_version == 4) and
         (.scenario == "stack-container-ownership") and
         ((.build_identity | keys | sort) == (["profile", "test_binary_sha256"] | sort)) and
         (.build_identity.profile == "release") and
         (.build_identity.profile == $expected_profile) and
         (.build_identity.test_binary_sha256 | sha256) and
         (.build_identity.test_binary_sha256 == $expected_test_binary_sha256) and
-        (.scope_identity == {
-            "kind": "synthetic_legacy_compatibility",
-            "topology_authoritative": false
-        }) and
+        ((.scope_identity | keys | sort) == ([
+            "kind", "topology_authoritative", "workloads"
+        ] | sort)) and
+        (.scope_identity.kind == "machine_workload_scope") and
+        (.scope_identity.topology_authoritative == true) and
+        ((.scope_identity.workloads | type) == "array") and
+        ((.scope_identity.workloads | length) == 5) and
+        ((.scope_identity.workloads | map(.stack_id) | unique | length) == 5) and
+        (all(.scope_identity.workloads[]; . | workload_scope)) and
+        ((.scope_identity.workloads | map(.stack_id) | sort) == [
+            "foreign-contender", "foreign-owner", "owned", "same-a", "same-b"
+        ]) and
 
         (.concurrent_same_service as $same |
             (($same | keys | sort) == (["barrier", "lifecycle", "service_name", "stacks"] | sort)) and
@@ -1860,14 +1875,14 @@ validate_stack_container_ownership_evidence() {
             (($owned | keys | sort) == ([
                 "after_remove_before_recreate", "cleanup_operations", "failed_guest",
                 "failed_lifecycle", "failure_token", "injected_error_code",
-                "injection_point", "observed_token", "replacement_guest",
+                "injection_point", "journal_token", "replacement_guest",
                 "replacement_lifecycle", "replacement_token", "service_name", "stack_id"
             ] | sort)) and
             ($owned.stack_id == "owned") and ($owned.service_name == "worker") and
             ($owned.injection_point == "after_runtime_publication_before_executor_finalize") and
             ($owned.injected_error_code == "injected_post_publication") and
-            ($owned.failure_token | ownership) and ($owned.observed_token | ownership) and
-            ($owned.failure_token == $owned.observed_token) and
+            ($owned.failure_token | ownership) and ($owned.journal_token | ownership) and
+            ($owned.failure_token == $owned.journal_token) and
             ($owned.failure_token.stack_id == $owned.stack_id) and
             ($owned.failed_guest | guest) and
             ($owned.failed_guest.owner == "owned-generation-a") and
@@ -1877,10 +1892,10 @@ validate_stack_container_ownership_evidence() {
                     .container_id == $token.container_id and
                     .generation == $token.generation and
                     .scope == $token.scope and
-                    .reserved == true and .quarantined == false)) and
+                    .reserved == false and .quarantined == false)) and
             ($owned.failure_token as $token |
-                any($owned.failed_lifecycle.container_route_pairs[];
-                    . == [$token.container_id, $token.stack_id])) and
+                all($owned.failed_lifecycle.container_route_pairs[];
+                    .[0] != $token.container_id)) and
             (($owned.cleanup_operations | length) == 1) and
             ($owned.cleanup_operations[0] as $cleanup |
                 (($cleanup | keys | sort) == (["operation", "outcome", "ownership"] | sort)) and
@@ -2171,12 +2186,12 @@ validate_runtime_crash_reopen_evidence() {
     if ! jq -e '
         .coverage_classification == "runtime_store_post_commit_lost_ack_only" and
         .state_store_expectation == {
-            "schema_version": 4,
-            "status": "complete",
-            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication"
+            "schema_version": 7,
+            "status": "separate_companion_required",
+            "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }
     ' "$evidence_file" >/dev/null; then
-        echo "runtime generation crash/reopen evidence is incomplete: missing atomic executor/StateStore v4 binding and observed-state publication boundary" >&2
+        echo "runtime generation crash/reopen evidence is incomplete: missing the required schema-v7 Action-v3 StateStore companion declaration" >&2
         return 1
     fi
 
@@ -2239,9 +2254,9 @@ validate_runtime_crash_reopen_evidence() {
             "skips": 0
         }) and
         (.state_store_expectation == {
-            "schema_version": 4,
-            "status": "complete",
-            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication"
+            "schema_version": 7,
+            "status": "separate_companion_required",
+            "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }) and
         ((.boundaries | length) == 5) and
         (all(.boundaries[]; boundary)) and
@@ -2308,6 +2323,235 @@ validate_runtime_crash_reopen_evidence() {
             $case.post_raw_state.generations[$case.container_id].generation == $case.generation and
             $case.post_raw_state.generations[$case.container_id].scope == $case.scope and
             $case.post_raw_state.generations[$case.container_id].reserved == true)
+    ' "$evidence_file" >/dev/null
+}
+
+validate_stack_crash_reopen_evidence() {
+    local evidence_file="$1"
+    local expected_profile="$2"
+    local expected_test_binary_sha256="$3"
+    local expected_runtime_companion_sha256="$4"
+
+    jq -e \
+        --arg expected_profile "$expected_profile" \
+        --arg expected_test_binary_sha256 "$expected_test_binary_sha256" \
+        --arg expected_runtime_companion_sha256 "$expected_runtime_companion_sha256" '
+        def exact_keys($keys): (keys | sort) == ($keys | sort);
+        def nonempty: type == "string" and length > 0;
+        def hex_sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def scope:
+            exact_keys([
+                "environment_id", "machine_id", "machine_incarnation_id",
+                "project_id", "reservation_id", "stack_id"
+            ]) and
+            (all([
+                .environment_id, .machine_id, .machine_incarnation_id,
+                .project_id, .reservation_id, .stack_id
+            ][]; nonempty));
+        def ownership:
+            exact_keys(["container_id", "generation", "scope", "stack_id"]) and
+            (.container_id | nonempty) and
+            (.generation | type == "number" and . > 0 and . == floor) and
+            (.stack_id | nonempty) and
+            (.scope | scope) and
+            (.scope.stack_id == .stack_id);
+        def binding:
+            exact_keys(["bound_at", "ownership", "reservation_id", "service_name"]) and
+            (.bound_at | type == "number" and . > 0 and . == floor) and
+            (.reservation_id | nonempty) and
+            (.service_name | nonempty) and
+            (.ownership | ownership) and
+            (.reservation_id == .ownership.scope.reservation_id);
+        def event_counts:
+            exact_keys(["creating", "failed", "ready", "stopped", "stopping"]) and
+            all(.[]; type == "number" and . >= 0 and . == floor);
+        def store_snapshot:
+            exact_keys([
+                "action_schema_version", "audit_action_hash", "audit_rows", "audit_status",
+                "binding", "event_counts", "intent_status", "observed_phase", "ready",
+                "schema_version", "session_actions_hash", "session_cursor", "session_status"
+            ]) and
+            (.schema_version == 7) and
+            (.action_schema_version == 3) and
+            (.session_actions_hash | type == "string" and
+                test("^vzrah2-sha256:[0-9a-f]{64}$")) and
+            (.audit_action_hash | type == "string" and
+                test("^vzrah2-sha256:[0-9a-f]{64}$")) and
+            (.session_actions_hash == .audit_action_hash) and
+            (.session_status | nonempty) and
+            (.session_cursor | type == "number" and . >= 0 and . == floor) and
+            (.audit_rows | type == "number" and . >= 0 and . == floor) and
+            (.audit_status | nonempty) and
+            (.intent_status | nonempty) and
+            (.observed_phase | nonempty) and
+            (.ready | type == "boolean") and
+            (.binding | binding) and
+            (.event_counts | event_counts);
+        def runtime_snapshot:
+            exact_keys(["counters", "inspection"]) and
+            (.inspection | nonempty) and
+            (.counters | exact_keys(["activate", "cleanup", "reserve"])) and
+            all(.counters[]; type == "number" and . >= 0 and . == floor);
+        def runtime_deltas:
+            exact_keys(["activate", "cleanup", "reserve"]) and
+            all(.[]; type == "number" and . >= 0 and . == floor);
+        def boundary:
+            exact_keys(["boundary", "child", "ownership", "post_replay", "pre_replay", "replay"]) and
+            (.boundary | nonempty) and
+            (.child == {"signal": "SIGKILL", "expected_exit_code": 137}) and
+            (.ownership | ownership) and
+            (.pre_replay | exact_keys(["runtime", "store"])) and
+            (.pre_replay.store | store_snapshot) and
+            (.pre_replay.runtime | runtime_snapshot) and
+            (.post_replay | exact_keys(["runtime", "store"])) and
+            (.post_replay.store | store_snapshot) and
+            (.post_replay.runtime | runtime_snapshot) and
+            (.replay | exact_keys(["failed", "runtime_deltas", "succeeded"])) and
+            (.replay.failed | type == "number" and . >= 0 and . == floor) and
+            (.replay.succeeded | type == "number" and . >= 0 and . == floor) and
+            (.replay.failed + .replay.succeeded == 1) and
+            (.replay.runtime_deltas | runtime_deltas) and
+            (.pre_replay.store.binding.ownership == .ownership) and
+            (.post_replay.store.binding.ownership == .ownership);
+        def reserved_creating_pre:
+            .store.session_status == "active" and
+            .store.session_cursor == 0 and
+            .store.audit_rows == 1 and
+            .store.audit_status == "started" and
+            .store.intent_status == "reserved" and
+            .store.observed_phase == "creating" and
+            .store.ready == false and
+            .store.event_counts == {
+                "creating": 1, "failed": 0, "ready": 0, "stopping": 0, "stopped": 0
+            };
+        def completed_running_post:
+            .store.session_status == "completed" and
+            .store.session_cursor == 1 and
+            .store.audit_rows == 1 and
+            .store.audit_status == "completed" and
+            .store.intent_status == "running" and
+            .store.observed_phase == "running" and
+            .store.ready == false and
+            .store.event_counts == {
+                "creating": 1, "failed": 0, "ready": 0, "stopping": 0, "stopped": 0
+            } and
+            .runtime.inspection == "published";
+        def failed_cleaned_post:
+            .store.session_status == "failed" and
+            .store.session_cursor == 0 and
+            .store.audit_rows == 1 and
+            .store.audit_status == "failed" and
+            .store.intent_status == "cleaned" and
+            .store.observed_phase == "stopped" and
+            .store.ready == false and
+            .store.event_counts == {
+                "creating": 1, "failed": 1, "ready": 0, "stopping": 1, "stopped": 1
+            } and
+            .runtime.inspection == "absent";
+
+        (type == "object") and
+        (exact_keys([
+            "action_schema_version", "boundaries", "build_identity", "controls",
+            "coverage_classification", "foreign_receipt_zero_write", "runtime_store_companion",
+            "scenario", "schema_version"
+        ])) and
+        (.schema_version == 7) and
+        (.scenario == "runtime-generation-state-store-v7") and
+        (.coverage_classification == "action_v3_executor_state_store_atomicity") and
+        (.action_schema_version == 3) and
+        (.build_identity | exact_keys(["profile", "test_binary_sha256"])) and
+        (.build_identity.profile == "release") and
+        (.build_identity.profile == $expected_profile) and
+        (.build_identity.test_binary_sha256 | hex_sha256) and
+        (.build_identity.test_binary_sha256 == $expected_test_binary_sha256) and
+        (.runtime_store_companion | exact_keys(["scenario", "sha256"])) and
+        (.runtime_store_companion.scenario == "runtime-generation-crash-reopen") and
+        (.runtime_store_companion.sha256 | hex_sha256) and
+        (.runtime_store_companion.sha256 == $expected_runtime_companion_sha256) and
+        (.controls == {
+            "harness_invocations": 1,
+            "child_processes": 4,
+            "sigkills": 4,
+            "reopen_replays": 4,
+            "fallbacks": 0,
+            "skips": 0
+        }) and
+        ((.boundaries | length) == 4) and
+        (all(.boundaries[]; boundary)) and
+        ((.boundaries | map(.boundary) | sort) == ([
+            "observed_upsert_before_intent_cas", "running_committed_before_batch_commit",
+            "runtime_published_before_receipt", "successor_bound_before_activation"
+        ] | sort)) and
+
+        (.boundaries[] | select(.boundary == "successor_bound_before_activation") as $case |
+            ($case.pre_replay | reserved_creating_pre) and
+            ($case.pre_replay.runtime.inspection == "reserved_unpublished") and
+            ($case.pre_replay.runtime.counters == {
+                "reserve": 1, "activate": 0, "cleanup": 0
+            }) and
+            ($case.replay == {
+                "succeeded": 1, "failed": 0,
+                "runtime_deltas": {"reserve": 0, "activate": 1, "cleanup": 0}
+            }) and
+            ($case.post_replay | completed_running_post) and
+            ($case.post_replay.runtime.counters == {
+                "reserve": 1, "activate": 1, "cleanup": 0
+            })) and
+
+        (all(.boundaries[] |
+            select(.boundary == "runtime_published_before_receipt" or
+                .boundary == "observed_upsert_before_intent_cas");
+            (.pre_replay | reserved_creating_pre) and
+            (.pre_replay.runtime.inspection == "published") and
+            (.pre_replay.runtime.counters == {
+                "reserve": 1, "activate": 1, "cleanup": 0
+            }) and
+            (.replay == {
+                "succeeded": 0, "failed": 1,
+                "runtime_deltas": {"reserve": 0, "activate": 0, "cleanup": 1}
+            }) and
+            (.post_replay | failed_cleaned_post) and
+            (.post_replay.runtime.counters == {
+                "reserve": 1, "activate": 1, "cleanup": 1
+            }))) and
+
+        (.boundaries[] | select(.boundary == "running_committed_before_batch_commit") as $case |
+            ($case.pre_replay.store.session_status == "active") and
+            ($case.pre_replay.store.session_cursor == 0) and
+            ($case.pre_replay.store.audit_rows == 1) and
+            ($case.pre_replay.store.audit_status == "started") and
+            ($case.pre_replay.store.intent_status == "running") and
+            ($case.pre_replay.store.observed_phase == "running") and
+            ($case.pre_replay.store.ready == false) and
+            ($case.pre_replay.store.event_counts == {
+                "creating": 1, "failed": 0, "ready": 0, "stopping": 0, "stopped": 0
+            }) and
+            ($case.pre_replay.runtime.inspection == "published") and
+            ($case.pre_replay.runtime.counters == {
+                "reserve": 1, "activate": 1, "cleanup": 0
+            }) and
+            ($case.replay == {
+                "succeeded": 1, "failed": 0,
+                "runtime_deltas": {"reserve": 0, "activate": 0, "cleanup": 0}
+            }) and
+            ($case.post_replay | completed_running_post) and
+            ($case.post_replay.runtime.counters ==
+                $case.pre_replay.runtime.counters) and
+            ($case.post_replay.store.event_counts.ready ==
+                $case.pre_replay.store.event_counts.ready)) and
+
+        (.foreign_receipt_zero_write |
+            exact_keys([
+                "logical_sha256_after", "logical_sha256_before", "machine_code",
+                "runtime_deltas", "total_changes_delta"
+            ]) and
+            .machine_code == "state_conflict" and
+            .total_changes_delta == 0 and
+            (.logical_sha256_before | hex_sha256) and
+            (.logical_sha256_after | hex_sha256) and
+            .logical_sha256_before == .logical_sha256_after and
+            (.runtime_deltas | runtime_deltas) and
+            .runtime_deltas == {"reserve": 0, "activate": 0, "cleanup": 0})
     ' "$evidence_file" >/dev/null
 }
 
@@ -2388,6 +2632,17 @@ write_and_validate_runtime_crash_reopen_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+write_and_validate_stack_crash_reopen_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -2399,6 +2654,7 @@ run_and_log() {
     local exec_supervision_test_binary_sha256=""
     local stack_ownership_test_binary_sha256=""
     local crash_reopen_test_binary_sha256=""
+    local stack_crash_reopen_test_binary_sha256=""
     local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
@@ -2492,6 +2748,26 @@ run_and_log() {
         fi
     fi
 
+    if [[ "$label" == "runtime-generation-state-store-v7" ]]; then
+        if [[ "$PROFILE" != "release" ]]; then
+            echo "stack runtime-generation StateStore crash/reopen evidence cannot run under profile '$PROFILE'" >&2
+            return 110
+        fi
+        if [[ ! -f "$RUNTIME_CRASH_REOPEN_EVIDENCE" \
+            || "$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED" != "true" ]]; then
+            echo "stack crash/reopen companion requires validated runtime crash/reopen evidence" >&2
+            return 111
+        fi
+        stack_crash_reopen_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+        local runtime_crash_reopen_sha256_value
+        runtime_crash_reopen_sha256_value="$(shasum -a 256 "$RUNTIME_CRASH_REOPEN_EVIDENCE" | cut -d' ' -f1)"
+        rm -f "$STACK_CRASH_REOPEN_EVIDENCE" "$STACK_CRASH_REOPEN_SHA256"
+        cmd_env+=("VZ_STACK_CRASH_REOPEN_EVIDENCE=$STACK_CRASH_REOPEN_EVIDENCE")
+        cmd_env+=("VZ_STACK_CRASH_BUILD_PROFILE=$PROFILE")
+        cmd_env+=("VZ_STACK_CRASH_TEST_BINARY_SHA256=$stack_crash_reopen_test_binary_sha256")
+        cmd_env+=("VZ_RUNTIME_CRASH_REOPEN_SHA256_VALUE=$runtime_crash_reopen_sha256_value")
+    fi
+
     cmd_env+=("VZ_LINUX_DEVELOPER_BUNDLE_DIR=$REPO_ROOT/linux/out")
     cmd_env+=("VZ_LINUX_CONTAINER_BUNDLE_DIR=$REPO_ROOT/linux/out/container")
 
@@ -2556,9 +2832,9 @@ run_and_log() {
     if [[ $status -eq 0 && "$PROFILE" == "release" \
         && "$suite" == "stack" && "$label" == "stack" ]] \
         && ! grep -Fqx \
-            "test result: ok. 22 passed; 0 failed; 0 ignored; 0 measured; 5 filtered out; finished" \
+            "test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished" \
             <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
-        echo "complete stack suite did not report exactly 22/22 real-VM tests with zero ignored failures" >&2
+        echo "complete stack suite did not report exactly 24/24 real-VM tests with zero ignored failures" >&2
         return 99
     fi
 
@@ -2700,6 +2976,26 @@ run_and_log() {
         fi
     fi
 
+    if [[ $status -eq 0 && "$label" == "runtime-generation-state-store-v7" ]]; then
+        local runtime_crash_reopen_sha256_value
+        runtime_crash_reopen_sha256_value="$(shasum -a 256 "$RUNTIME_CRASH_REOPEN_EVIDENCE" | cut -d' ' -f1)"
+        if [[ ! -f "$STACK_CRASH_REOPEN_EVIDENCE" ]] \
+            || ! validate_stack_crash_reopen_evidence \
+                "$STACK_CRASH_REOPEN_EVIDENCE" \
+                "$PROFILE" \
+                "$stack_crash_reopen_test_binary_sha256" \
+                "$runtime_crash_reopen_sha256_value"; then
+            echo "stack runtime-generation StateStore crash/reopen evidence is missing or malformed" >&2
+            return 111
+        fi
+        if ! write_and_validate_stack_crash_reopen_checksum \
+            "$STACK_CRASH_REOPEN_EVIDENCE" "$STACK_CRASH_REOPEN_SHA256"; then
+            echo "stack runtime-generation StateStore crash/reopen evidence checksum failed" >&2
+            return 112
+        fi
+        STACK_CRASH_REOPEN_EVIDENCE_VALIDATED=true
+    fi
+
     return "$status"
 }
 
@@ -2732,6 +3028,8 @@ echo "==> output directory: $RUN_DIR"
     echo "environment_lifecycle_checksum=$ENVIRONMENT_LIFECYCLE_SHA256"
     echo "runtime_crash_reopen_evidence=$RUNTIME_CRASH_REOPEN_EVIDENCE"
     echo "runtime_crash_reopen_checksum=$RUNTIME_CRASH_REOPEN_SHA256"
+    echo "stack_crash_reopen_evidence=$STACK_CRASH_REOPEN_EVIDENCE"
+    echo "stack_crash_reopen_checksum=$STACK_CRASH_REOPEN_SHA256"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
@@ -2765,7 +3063,33 @@ VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED=false
 RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED=false
-RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=false
+RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED="$CRASH_REOPEN_LANE_SELECTED"
+STACK_CRASH_REOPEN_EVIDENCE_VALIDATED=false
+STACK_CRASH_REOPEN_EVIDENCE_REQUIRED="$CRASH_REOPEN_LANE_SELECTED"
+
+run_stack_crash_reopen_companion() {
+    local binary="$1"
+    local companion_args=(
+        "${RUN_ARGS[@]}" "--exact"
+        "crash_reopen_tests::action_v3_state_store_sigkill_crash_reopen"
+    )
+
+    if run_and_log \
+        "stack" \
+        "runtime-generation-state-store-v7" \
+        "$binary" \
+        "${companion_args[@]}"; then
+        echo "==> scenario passed: runtime-generation-state-store-v7"
+        PASSED+=("runtime-generation-state-store-v7")
+    else
+        local status=$?
+        echo "==> scenario failed: runtime-generation-state-store-v7 (exit $status)"
+        FAILED+=("runtime-generation-state-store-v7:$status")
+        if [[ "$KEEP_GOING" != "true" ]]; then
+            should_stop=true
+        fi
+    fi
+}
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -2799,6 +3123,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
     sign_binary "$test_binary" "$ENTITLEMENTS"
 
     crash_reopen_test_binary=""
+    stack_crash_reopen_test_binary=""
     if [[ "$suite" == "runtime" ]] \
         && { [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" ]] \
             || [[ " ${RESOLVED_SCENARIOS[*]:-} " == *" runtime-generation-crash-reopen "* ]]; }; then
@@ -2809,6 +3134,14 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             resolve_cargo_executable "$crash_reopen_artifact_log" "vz_oci_macos" "lib"
         )" || err "unable to resolve the vz-oci-macos library test executable"
         sign_binary "$crash_reopen_test_binary" "$ENTITLEMENTS"
+
+        stack_crash_reopen_artifact_log="$RUN_DIR/stack-crash-reopen-test-artifacts.jsonl"
+        run_cargo_recording_artifacts "$stack_crash_reopen_artifact_log" \
+            test -p vz-stack "${BUILD_ARGS[@]}" --lib --no-run
+        stack_crash_reopen_test_binary="$(
+            resolve_cargo_executable "$stack_crash_reopen_artifact_log" "vz_stack" "lib"
+        )" || err "unable to resolve the vz-stack library test executable"
+        sign_binary "$stack_crash_reopen_test_binary" "$ENTITLEMENTS"
     fi
 
     if [[ ${#RESOLVED_SCENARIOS[@]} -gt 0 ]]; then
@@ -2821,6 +3154,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             scenario_binary="$test_binary"
             if [[ "$scenario" == "runtime-generation-crash-reopen" ]]; then
                 RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=true
+                STACK_CRASH_REOPEN_EVIDENCE_REQUIRED=true
                 scenario_binary="$crash_reopen_test_binary"
             fi
             if [[ "$scenario" == "runtime-container-id-ownership" ]]; then
@@ -2830,15 +3164,24 @@ for suite in "${RESOLVED_SUITES[@]}"; do
                 EXEC_SUPERVISION_EVIDENCE_REQUIRED=true
             fi
 
+            scenario_passed=false
             if run_and_log "$suite" "$scenario" "$scenario_binary" "${scenario_args[@]}"; then
                 echo "==> scenario passed: $scenario"
                 PASSED+=("$scenario")
+                scenario_passed=true
             else
                 status=$?
                 echo "==> scenario failed: $scenario (exit $status)"
                 FAILED+=("$scenario:$status")
                 if [[ "$KEEP_GOING" != "true" ]]; then
                     should_stop=true
+                    break
+                fi
+            fi
+            if [[ "$scenario" == "runtime-generation-crash-reopen" \
+                && "$scenario_passed" == "true" ]]; then
+                run_stack_crash_reopen_companion "$stack_crash_reopen_test_binary"
+                if [[ "$should_stop" == "true" ]]; then
                     break
                 fi
             fi
@@ -2862,10 +3205,12 @@ for suite in "${RESOLVED_SUITES[@]}"; do
         if [[ "$suite" == "runtime" && "$FULL_CLOSURE_GATE_SELECTED" == "true" ]] \
             && { [[ "$should_stop" == "false" ]] || [[ "$KEEP_GOING" == "true" ]]; }; then
             RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=true
+            STACK_CRASH_REOPEN_EVIDENCE_REQUIRED=true
             crash_reopen_args=(
                 "${RUN_ARGS[@]}" "--exact"
                 "$(scenario_test_filter runtime-generation-crash-reopen)"
             )
+            crash_reopen_passed=false
             if run_and_log \
                 "$suite" \
                 "runtime-generation-crash-reopen" \
@@ -2873,6 +3218,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
                 "${crash_reopen_args[@]}"; then
                 echo "==> scenario passed: runtime-generation-crash-reopen"
                 PASSED+=("runtime-generation-crash-reopen")
+                crash_reopen_passed=true
             else
                 status=$?
                 echo "==> scenario failed: runtime-generation-crash-reopen (exit $status)"
@@ -2880,6 +3226,9 @@ for suite in "${RESOLVED_SUITES[@]}"; do
                 if [[ "$KEEP_GOING" != "true" ]]; then
                     should_stop=true
                 fi
+            fi
+            if [[ "$crash_reopen_passed" == "true" ]]; then
+                run_stack_crash_reopen_companion "$stack_crash_reopen_test_binary"
             fi
         fi
     fi
@@ -2936,6 +3285,12 @@ if [[ "$RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED" == "true" \
     && "$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED" != "true" ]]; then
     echo "==> required runtime generation crash/reopen evidence was not validated" >&2
     FAILED+=("runtime-generation-crash-reopen-evidence:111")
+fi
+
+if [[ "$STACK_CRASH_REOPEN_EVIDENCE_REQUIRED" == "true" \
+    && "$STACK_CRASH_REOPEN_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required stack runtime-generation StateStore crash/reopen evidence was not validated" >&2
+    FAILED+=("runtime-generation-state-store-v7-evidence:111")
 fi
 
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
@@ -3026,6 +3381,15 @@ action_summary="$RUN_DIR/summary.txt"
     fi
     echo "runtime_crash_reopen_required=$RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED"
     echo "runtime_crash_reopen_validated=$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED"
+    if [[ "$STACK_CRASH_REOPEN_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "stack_crash_reopen=$STACK_CRASH_REOPEN_EVIDENCE"
+        echo "stack_crash_reopen_sha256=$STACK_CRASH_REOPEN_SHA256"
+    else
+        echo "stack_crash_reopen=none"
+        echo "stack_crash_reopen_sha256=none"
+    fi
+    echo "stack_crash_reopen_required=$STACK_CRASH_REOPEN_EVIDENCE_REQUIRED"
+    echo "stack_crash_reopen_validated=$STACK_CRASH_REOPEN_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

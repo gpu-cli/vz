@@ -2,14 +2,14 @@ use rusqlite::{OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use vz_runtime_contract::{
-    ContainerGenerationOwnership, ContainerGenerationScope, EnvironmentId,
+    ContainerCreateReceipt, ContainerGenerationOwnership, ContainerGenerationScope, EnvironmentId,
     MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineErrorCode, MachineId, MachineWorkloadScope,
     ProjectId,
 };
 
 use super::{ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore};
-use crate::StackError;
 use crate::reconcile::{Action, ActionDraft, ExpectedJournalHead, ReplicaPrecondition};
+use crate::{StackError, StackEvent};
 
 pub(super) const STACK_JOURNAL_SCHEMA_V4_DDL: &str = r#"
 CREATE TABLE IF NOT EXISTS stack_workload_owners (
@@ -770,7 +770,7 @@ impl StateStore {
         claim: &super::ReconcileActionClaim,
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let ExpectedJournalHead::Exact {
                 reservation_id,
@@ -807,7 +807,7 @@ impl StateStore {
             };
             if intent.status == StackContainerCreateStatus::CleanupPending {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if !matches!(
                 intent.status,
@@ -823,8 +823,17 @@ impl StateStore {
             intent.updated_at = now;
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceStopping {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Complete cleanup of only the exact predecessor named by the claim.
@@ -833,7 +842,7 @@ impl StateStore {
         claim: &super::ReconcileActionClaim,
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let ExpectedJournalHead::Exact {
                 reservation_id,
@@ -884,7 +893,7 @@ impl StateStore {
             };
             if intent.status == StackContainerCreateStatus::Cleaned {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if intent.status != StackContainerCreateStatus::CleanupPending {
                 return conflict("claimed predecessor cleanup was not begun");
@@ -897,8 +906,18 @@ impl StateStore {
             intent.completed_at = Some(now);
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceStopped {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+                exit_code: 0,
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Record exact runtime ownership discovered for the claimed unbound
@@ -910,7 +929,7 @@ impl StateStore {
         binding: &StackContainerGenerationBinding,
     ) -> Result<StackContainerGenerationBinding, StackError> {
         binding.validate()?;
-        self.with_immediate_transaction(|store| {
+        let (binding, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             if !matches!(action, Action::ServiceRemove { .. }) {
                 return conflict("only claimed remove may bind an unbound predecessor");
@@ -936,7 +955,7 @@ impl StateStore {
                 if existing.same_immutable_authority(binding)
                     && intent.status == StackContainerCreateStatus::CleanupPending
                 {
-                    return Ok(existing);
+                    return Ok((existing, None));
                 }
                 return conflict("claimed predecessor already has foreign runtime ownership");
             }
@@ -964,8 +983,17 @@ impl StateStore {
             intent.updated_at = binding.bound_at;
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(binding.clone())
-        })
+            let event = StackEvent::ServiceStopping {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((binding.clone(), Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(binding)
     }
 
     /// Record an executor-confirmed absence for the exact unbound predecessor.
@@ -1222,7 +1250,7 @@ impl StateStore {
                 "claimed activation payload digest must be exactly 64 lowercase hexadecimal bytes",
             );
         }
-        self.with_immediate_transaction(|store| {
+        let (intent, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             if !matches!(
                 action,
@@ -1296,7 +1324,7 @@ impl StateStore {
                         action.target(),
                         allocation,
                     )?;
-                    return Ok(existing);
+                    return Ok((existing, None));
                 }
             }
 
@@ -1364,8 +1392,17 @@ impl StateStore {
             }
             store.insert_stack_container_create_intent(&intent)?;
             store.save_journal_observed_state(&intent, &creating_observed_state(&intent)?)?;
-            Ok(intent)
-        })
+            let event = StackEvent::ServiceCreating {
+                stack_name: workload.stack_id.clone(),
+                service_name: action.target().display_name(),
+            };
+            store.persist_event(&workload.stack_id, &event)?;
+            Ok((intent, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(intent)
     }
 
     fn require_unique_latest_claimed_successor(
@@ -1464,10 +1501,11 @@ impl StateStore {
         &self,
         claim: &super::ReconcileActionClaim,
         reservation_id: &str,
+        receipt: &ContainerCreateReceipt,
         ready: bool,
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let mut intent =
                 store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
@@ -1479,6 +1517,13 @@ impl StateStore {
                     )
                 })?;
             store.validate_binding_against_intent(&binding, &intent)?;
+            if receipt.container_id != binding.ownership.container_id
+                || receipt.ownership.as_ref() != Some(&binding.ownership)
+            {
+                return conflict(
+                    "activation receipt does not match the exact claim-linked runtime binding",
+                );
+            }
             let applied_config_digest = intent.applied_config_digest.clone().ok_or_else(|| {
                 StackError::InvalidSpec(
                     "claimed successor has no applied configuration digest".to_string(),
@@ -1488,14 +1533,14 @@ impl StateStore {
                 replica: replica_key(&intent)?,
                 applied_config_digest: Some(applied_config_digest),
                 phase: ServicePhase::Running,
-                container_id: Some(intent.requested_container_id.clone()),
-                failed_create_ownership: Some(binding.ownership),
+                container_id: Some(receipt.container_id.clone()),
+                failed_create_ownership: receipt.ownership.clone(),
                 last_error: None,
                 ready,
             };
             if intent.status == StackContainerCreateStatus::Running {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if intent.status != StackContainerCreateStatus::Reserved {
                 return conflict("claimed successor cannot publish success from its status");
@@ -1504,9 +1549,25 @@ impl StateStore {
             intent.status = StackContainerCreateStatus::Running;
             intent.updated_at = now;
             store.save_journal_observed_state(&intent, &observed)?;
+            #[cfg(all(test, target_os = "macos"))]
+            crate::crash_reopen_tests::pause_if_selected("observed_upsert_before_intent_cas");
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = ready.then(|| StackEvent::ServiceReady {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+                runtime_id: receipt.container_id.clone(),
+            });
+            if let Some(event) = &event {
+                store.persist_event(&intent.scope.stack_id, event)?;
+            }
+            Ok((observed, event))
+        })?;
+        #[cfg(all(test, target_os = "macos"))]
+        crate::crash_reopen_tests::pause_if_selected("running_committed_before_batch_commit");
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Publish an activation failure only for this claim's immediate successor.
@@ -1518,7 +1579,7 @@ impl StateStore {
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
         validate_digest("error", error)?;
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let mut intent =
                 store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
@@ -1544,7 +1605,7 @@ impl StateStore {
             };
             if intent.status == expected_status && intent.last_error.as_deref() == Some(error) {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if !matches!(
                 intent.status,
@@ -1559,8 +1620,18 @@ impl StateStore {
             intent.completed_at = intent.status.is_terminal().then_some(now);
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceFailed {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+                error: error.to_string(),
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Move a bound, claim-linked successor into exact cleanup. Activation
@@ -1571,7 +1642,7 @@ impl StateStore {
         reservation_id: &str,
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let mut intent =
                 store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
@@ -1594,7 +1665,7 @@ impl StateStore {
             };
             if intent.status == StackContainerCreateStatus::CleanupPending {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if intent.status != StackContainerCreateStatus::Blocked {
                 return conflict("claimed successor cannot begin cleanup from its status");
@@ -1605,8 +1676,17 @@ impl StateStore {
             intent.updated_at = now;
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceStopping {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Complete cleanup of only the bound immediate successor linked to this
@@ -1617,7 +1697,7 @@ impl StateStore {
         reservation_id: &str,
         now: u64,
     ) -> Result<ServiceObservedState, StackError> {
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let action = store.require_claimed_action_state(claim)?;
             let mut intent =
                 store.require_unique_latest_claimed_successor(claim, &action, reservation_id)?;
@@ -1640,7 +1720,7 @@ impl StateStore {
             };
             if intent.status == StackContainerCreateStatus::Cleaned {
                 store.require_exact_observed(&intent, &observed)?;
-                return Ok(observed);
+                return Ok((observed, None));
             }
             if intent.status != StackContainerCreateStatus::CleanupPending {
                 return conflict("claimed successor cleanup was not begun");
@@ -1653,8 +1733,18 @@ impl StateStore {
             intent.completed_at = Some(now);
             store.save_journal_observed_state(&intent, &observed)?;
             store.update_stack_container_create_intent_cas(&before, &intent)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceStopped {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+                exit_code: 0,
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     /// Publish a blocked state only for this claim's immediate successor.
@@ -3227,7 +3317,7 @@ impl StateStore {
                 )
             })?
             .reservation_id;
-        self.with_immediate_transaction(|store| {
+        let (observed, event) = self.with_immediate_transaction(|store| {
             let intent = store.require_stack_container_create_intent(reservation_id)?;
             store.reject_foreign_started_claim_for_target(
                 &intent.scope.stack_id,
@@ -3285,11 +3375,21 @@ impl StateStore {
                 .as_ref()
                 == Some(&observed)
             {
-                return Ok(observed);
+                return Ok((observed, None));
             }
             store.save_journal_observed_state(&intent, &observed)?;
-            Ok(observed)
-        })
+            let event = StackEvent::ServiceReady {
+                stack_name: intent.scope.stack_id.clone(),
+                service_name: observed.replica.display_name(),
+                runtime_id: expected_ownership.container_id.clone(),
+            };
+            store.persist_event(&intent.scope.stack_id, &event)?;
+            Ok((observed, Some(event)))
+        })?;
+        if let Some(event) = event {
+            self.notify_event(&event);
+        }
+        Ok(observed)
     }
 
     pub fn publish_stack_container_create_failure(

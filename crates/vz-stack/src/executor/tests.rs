@@ -3306,6 +3306,25 @@ fn scoped_claimed_batch_success_replays_terminal_commit_without_effects() {
         crate::state_store::ReconcileSessionStatus::Completed
     );
     assert_eq!(session.next_action_index, actions.len());
+    let observed = executor
+        .store()
+        .load_observed_state_for_replica(&spec.name, "web", 1)
+        .unwrap()
+        .unwrap();
+    assert!(
+        observed.ready,
+        "a service without a healthcheck must become ready with activation"
+    );
+    assert_eq!(
+        executor
+            .store()
+            .load_events(&spec.name)
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, StackEvent::ServiceReady { .. }))
+            .count(),
+        1
+    );
     let calls_before = executor.runtime().call_log();
     let records_before = executor
         .store()
@@ -3347,6 +3366,66 @@ fn scoped_claimed_batch_success_replays_terminal_commit_without_effects() {
         .unwrap_err();
     assert!(error.to_string().contains("activation payload"));
     assert_eq!(executor.runtime().call_log(), calls_before);
+    assert_eq!(
+        executor
+            .store()
+            .load_events(&spec.name)
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, StackEvent::ServiceReady { .. }))
+            .count(),
+        1,
+        "terminal batch replay must not duplicate ServiceReady"
+    );
+}
+
+#[test]
+fn scoped_claimed_healthchecked_activation_stays_unready_without_ready_event() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.healthcheck = Some(crate::spec::HealthCheckSpec {
+        test: vec!["CMD".to_string(), "true".to_string()],
+        interval_secs: Some(1),
+        timeout_secs: Some(1),
+        retries: Some(1),
+        start_period_secs: Some(0),
+    });
+    let spec = stack("scoped-healthchecked-activation", vec![service]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = planned_actions(&executor, &spec);
+
+    let result = executor
+        .execute_claimed_batch(
+            &spec,
+            &actions,
+            "session-healthchecked-activation",
+            "operation-healthchecked-activation",
+            0,
+        )
+        .unwrap();
+
+    assert!(result.all_succeeded());
+    let observed = executor
+        .store()
+        .load_observed_state_for_replica(&spec.name, "web", 1)
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.phase, ServicePhase::Running);
+    assert!(!observed.ready);
+    assert!(
+        executor
+            .store()
+            .load_events(&spec.name)
+            .unwrap()
+            .iter()
+            .all(|event| !matches!(event, StackEvent::ServiceReady { .. })),
+        "a healthchecked service must not emit ServiceReady during activation"
+    );
 }
 
 #[test]
@@ -3929,6 +4008,32 @@ fn assert_claimed_successor_crash_replay(reserve_before_replay: bool) {
         .unwrap();
     assert!(result.all_succeeded(), "{:?}", result.errors);
     assert_eq!(executor.runtime.scoped_generation_count(), 1);
+    let committed_events = vec![
+        StackEvent::ServiceCreating {
+            stack_name: spec.name.clone(),
+            service_name: "web".to_string(),
+        },
+        StackEvent::ServiceReady {
+            stack_name: spec.name.clone(),
+            service_name: "web".to_string(),
+            runtime_id: intent.requested_container_id.clone(),
+        },
+    ];
+    assert_eq!(
+        executor.store().load_events(&spec.name).unwrap(),
+        committed_events
+    );
+
+    let replay = executor
+        .execute_with_session(&spec, &actions, session_id, operation_id, 0, &claims)
+        .unwrap();
+    assert!(replay.all_succeeded(), "{:?}", replay.errors);
+    assert_eq!(executor.runtime.scoped_generation_count(), 1);
+    assert_eq!(
+        executor.store().load_events(&spec.name).unwrap(),
+        committed_events,
+        "Running successor replay must not duplicate lifecycle events"
+    );
 }
 
 #[test]
@@ -4472,6 +4577,46 @@ fn scoped_foreign_activation_cleanup_leaves_reserved_successor_unchanged() {
             "release_container_reservation" | "stop_and_remove_container_generation"
         )
     }));
+}
+
+#[test]
+fn scoped_foreign_success_receipt_cleans_published_reserved_successor() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-foreign-success-receipt",
+        vec![svc("web", "nginx:latest")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.foreign_scoped_activation_receipt = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
+    let actions = planned_actions(&executor, &spec);
+
+    let result = executor
+        .execute_with_test_session(&spec, &actions, "operation-foreign-receipt", 0)
+        .unwrap();
+
+    assert_eq!(result.failed, 1);
+    assert!(result.errors[0].1.contains("claim-linked runtime binding"));
+    assert_eq!(executor.runtime().scoped_generation_count(), 0);
+    assert!(
+        executor
+            .store()
+            .list_stack_container_recovery_records_for_machine_workload(&scope)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        executor
+            .runtime()
+            .call_log()
+            .iter()
+            .any(|(operation, _)| { operation == "stop_and_remove_container_generation" })
+    );
 }
 
 #[test]

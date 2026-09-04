@@ -504,9 +504,9 @@ async fn generation_ownership_sigkill_crash_reopen() {
             "skips": 0,
         },
         "state_store_expectation": {
-            "schema_version": 4,
-            "status": "missing_required_boundary",
-            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication",
+            "schema_version": 7,
+            "status": "separate_companion_required",
+            "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence",
         },
         "boundaries": boundaries,
     });
@@ -3365,6 +3365,65 @@ async fn cancelled_create_after_reservation_releases_unpublished_generation() {
     let after = observer.recv().await.unwrap();
     after.resume();
     retry_create.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn detached_scoped_reservation_reports_both_create_admission_boundaries() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("detached-reservation-admission-observer"),
+        ..RuntimeConfig::default()
+    });
+    let scope = generation_scope("detached-observer");
+    let mut observer = runtime.install_lifecycle_observer();
+    let reserving_runtime = runtime.clone();
+    let reserving_scope = scope.clone();
+    let reservation = tokio::spawn(async move {
+        reserving_runtime
+            .reserve_scoped_container_generation("detached-observer", &reserving_scope)
+            .await
+    });
+
+    let before = observer.recv().await.unwrap();
+    assert_eq!(
+        before.kind(),
+        RuntimeLifecycleAdmissionKind::CreateBeforeReservation
+    );
+    assert_eq!(before.container_id(), "detached-observer");
+    assert_eq!(
+        runtime
+            .container_store
+            .current_generation("detached-observer")
+            .unwrap(),
+        None,
+        "the before boundary must precede durable reservation"
+    );
+    before.resume();
+
+    let after = observer.recv().await.unwrap();
+    assert_eq!(
+        after.kind(),
+        RuntimeLifecycleAdmissionKind::CreateAfterReservation
+    );
+    assert_eq!(after.container_id(), "detached-observer");
+    assert!(
+        runtime
+            .container_store
+            .current_generation("detached-observer")
+            .unwrap()
+            .is_some(),
+        "the after boundary must follow durable reservation"
+    );
+    after.resume();
+
+    let ownership = reservation.await.unwrap().unwrap();
+    assert_eq!(ownership.scope.as_deref(), Some(&scope));
+    assert_eq!(
+        runtime
+            .release_scoped_container_reservation(&ownership)
+            .await
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationReleaseOutcome::Released
+    );
 }
 
 #[tokio::test]

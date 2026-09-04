@@ -27,7 +27,8 @@ use vz_oci_macos::{
     RuntimeLifecycleDiagnostics,
 };
 use vz_runtime_contract::{
-    Architecture, CapabilitySet, Container, ContainerCreateReceipt, ContainerGenerationOwnership,
+    Architecture, CapabilitySet, Container, ContainerCreateReceipt, ContainerGenerationInspection,
+    ContainerGenerationOwnership, ContainerGenerationReleaseOutcome, ContainerGenerationScope,
     ContainerState, ContractInvariantError, EnvironmentId, EnvironmentInstance,
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSpec, EnvironmentState, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
@@ -41,19 +42,36 @@ use vz_runtime_contract::{
     StackResourceHint, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 use vz_stack::{
-    Action, ContainerRuntime, ExpectedJournalHead, ImagePolicy, OrchestrationConfig,
-    ReplicaPrecondition, ServicePhase, StackError, StackEvent, StackExecutor, StackOrchestrator,
-    StateStore, apply as stack_apply, parse_compose, parse_compose_with_dir,
+    Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
+    StackEvent, StackExecutor, StackOrchestrator, StateStore, parse_compose,
+    parse_compose_with_dir,
 };
 
-fn install_planning_authority(store: &StateStore, stack_id: &str) {
-    if store.load_stack_workload_owner(stack_id).unwrap().is_some() {
-        return;
-    }
+fn planning_authority_scope(stack_id: &str) -> MachineWorkloadScope {
     let project_id = ProjectId::new("prj_stack_fixture").unwrap();
     let environment_id = EnvironmentId::new("env_stack_fixture").unwrap();
     let machine_id = MachineId::new("mch_stack_fixture").unwrap();
     let incarnation_id = MachineIncarnationId::new("inc_stack_fixture").unwrap();
+    MachineWorkloadScope {
+        schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id,
+        environment_id,
+        machine_id,
+        machine_incarnation_id: incarnation_id,
+        stack_id: stack_id.to_string(),
+    }
+}
+
+fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope {
+    let scope = planning_authority_scope(stack_id);
+    let project_id = scope.project_id.clone();
+    let environment_id = scope.environment_id.clone();
+    let machine_id = scope.machine_id.clone();
+    let incarnation_id = scope.machine_incarnation_id.clone();
+    if store.load_stack_workload_owner(stack_id).unwrap().is_some() {
+        store.validate_stack_workload_owner(&scope).unwrap();
+        return scope;
+    }
     if store
         .load_project_state(project_id.as_str())
         .unwrap()
@@ -152,44 +170,18 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) {
             })
             .unwrap();
     }
-    store
-        .reserve_stack_workload_owner(
-            &MachineWorkloadScope {
-                schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
-                project_id,
-                environment_id,
-                machine_id,
-                machine_incarnation_id: incarnation_id,
-                stack_id: stack_id.to_string(),
-            },
-            1,
-        )
-        .unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    scope
 }
 
-fn apply(
-    spec: &vz_stack::StackSpec,
-    store: &StateStore,
-    health: &HashMap<String, vz_stack::HealthStatus>,
-) -> Result<vz_stack::ApplyResult, StackError> {
-    install_planning_authority(store, &spec.name);
-    stack_apply(spec, store, health)
-}
-
-fn test_replica_precondition() -> ReplicaPrecondition {
-    ReplicaPrecondition::new(
-        MachineWorkloadScope {
-            schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
-            project_id: ProjectId::new("prj_stack_e2e").unwrap(),
-            environment_id: EnvironmentId::new("env_stack_e2e").unwrap(),
-            machine_id: MachineId::new("mch_stack_e2e").unwrap(),
-            machine_incarnation_id: MachineIncarnationId::new("inc_stack_e2e").unwrap(),
-            stack_id: "stack-e2e-action".to_string(),
-        },
-        0,
-        ExpectedJournalHead::NeverJournaled,
-    )
-    .unwrap()
+fn scoped_stack_executor<R: ContainerRuntime>(
+    runtime: R,
+    store: StateStore,
+    data_dir: &Path,
+    stack_id: &str,
+) -> StackExecutor<R> {
+    let scope = install_planning_authority(&store, stack_id);
+    StackExecutor::new_scoped(runtime, store, data_dir, scope).unwrap()
 }
 
 const EXPECTED_VM_FULL_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
@@ -236,6 +228,15 @@ fn stack_e2e_oci_data_dir() -> std::path::PathBuf {
         });
     std::fs::create_dir_all(&data_dir).expect("failed to create stack E2E OCI data directory");
     data_dir
+}
+
+fn private_tempdir() -> tempfile::TempDir {
+    use std::os::unix::fs::PermissionsExt;
+
+    tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o700))
+        .tempdir()
+        .expect("private stack E2E tempdir should be created")
 }
 
 /// Bridge the async [`MacosRuntimeBackend`] to the sync [`ContainerRuntime`] trait.
@@ -731,6 +732,7 @@ struct StackOwnershipFaultState {
     inject_stack_id: Option<String>,
     injected: bool,
     injected_ownership: Option<ContainerGenerationOwnership>,
+    failed_guest: Option<serde_json::Value>,
     failed_cgroup_path: Option<String>,
     cleanup_operations: Vec<serde_json::Value>,
     after_remove_before_recreate: Option<serde_json::Value>,
@@ -757,10 +759,8 @@ impl StackOwnershipE2eRuntime {
         faults.inject_stack_id = Some(stack_id.to_string());
         faults.injected = false;
         faults.injected_ownership = None;
-    }
-
-    fn set_failed_cgroup_path(&self, cgroup_path: &str) {
-        self.faults.lock().unwrap().failed_cgroup_path = Some(cgroup_path.to_string());
+        faults.failed_guest = None;
+        faults.failed_cgroup_path = None;
     }
 
     fn injected_ownership(&self) -> ContainerGenerationOwnership {
@@ -770,6 +770,15 @@ impl StackOwnershipE2eRuntime {
             .injected_ownership
             .clone()
             .expect("owned fault did not retain the runtime-issued ownership proof")
+    }
+
+    fn injected_guest_evidence(&self) -> serde_json::Value {
+        self.faults
+            .lock()
+            .unwrap()
+            .failed_guest
+            .clone()
+            .expect("owned fault did not retain its post-publication guest evidence")
     }
 
     fn cleanup_operations(&self) -> Vec<serde_json::Value> {
@@ -808,6 +817,76 @@ impl StackOwnershipE2eRuntime {
             .find(|ownership| ownership.stack_id == stack_id)
             .cloned()
             .unwrap_or_else(|| panic!("stack '{stack_id}' did not return generation ownership"))
+    }
+
+    fn observe_owned_create_result(
+        &self,
+        stack_id: &str,
+        result: Result<ContainerCreateReceipt, OwnedCreateError<StackError>>,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        match result {
+            Ok(receipt) => {
+                if let Some(ownership) = receipt.ownership.clone() {
+                    self.faults
+                        .lock()
+                        .unwrap()
+                        .successful_ownership
+                        .push(ownership);
+                }
+                let should_inject = {
+                    let faults = self.faults.lock().unwrap();
+                    !faults.injected && faults.inject_stack_id.as_deref() == Some(stack_id)
+                };
+                if should_inject {
+                    let ownership = receipt.ownership.clone().unwrap_or_else(|| {
+                        panic!("macOS runtime published a container without generation ownership")
+                    });
+                    // Action-v3 consumes an owned activation failure and cleans
+                    // the published generation before returning to the caller.
+                    // Capture the real guest identity at the injection boundary,
+                    // while the runtime-issued generation is still running.
+                    let failed_guest = self
+                        .inner
+                        .try_stack_guest_generation_evidence(
+                            stack_id,
+                            &ownership.container_id,
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "failed to inspect the published generation before injecting its acknowledgement loss: {error}"
+                            )
+                        });
+                    let failed_cgroup_path = failed_guest["cgroup_path"]
+                        .as_str()
+                        .filter(|path| !path.is_empty())
+                        .expect("published generation omitted its guest cgroup path")
+                        .to_string();
+                    let mut faults = self.faults.lock().unwrap();
+                    faults.injected = true;
+                    faults.injected_ownership = Some(ownership.clone());
+                    faults.failed_guest = Some(failed_guest);
+                    faults.failed_cgroup_path = Some(failed_cgroup_path);
+                    return Err(OwnedCreateError {
+                        error: StackError::Network(
+                            "injected_post_publication: control-plane acknowledgement lost after runtime publication"
+                                .to_string(),
+                        ),
+                        cleanup: Some(ownership),
+                    });
+                }
+                Ok(receipt)
+            }
+            Err(failure) => {
+                if failure.cleanup.is_none() {
+                    self.faults
+                        .lock()
+                        .unwrap()
+                        .unowned_failures
+                        .push((stack_id.to_string(), failure.error.machine_code()));
+                }
+                Err(failure)
+            }
+        }
     }
 }
 
@@ -866,6 +945,26 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
+    fn exec_container_generation_with_output(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.exec_owned_container_generation(
+                    ownership,
+                    ExecConfig {
+                        cmd: command.to_vec(),
+                        timeout: Some(Duration::from_secs(30)),
+                        ..ExecConfig::default()
+                    },
+                ))
+                .map(|output| (output.exit_code, output.stdout, output.stderr))
+                .map_err(StackError::from)
+        })
+    }
+
     fn create_sandbox(
         &self,
         sandbox_id: &str,
@@ -908,6 +1007,74 @@ impl ContainerRuntime for OciContainerRuntime {
                         .create_container_in_stack_owned_legacy(sandbox_id, image, config),
                 )
                 .map_err(|failure| failure.map_error(StackError::from))
+        })
+    }
+
+    fn reserve_container_generation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationOwnership, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .reserve_container_generation(scope, container_id),
+                )
+                .map_err(StackError::from)
+        })
+    }
+
+    fn inspect_container_reservation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationInspection, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .inspect_container_reservation(scope, container_id),
+                )
+                .map_err(StackError::from)
+        })
+    }
+
+    fn inspect_container_generation(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationInspection, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.inspect_container_generation(ownership))
+                .map_err(StackError::from)
+        })
+    }
+
+    fn activate_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(
+                    self.backend
+                        .activate_container_generation(ownership, image, config),
+                )
+                .map_err(|failure| failure.map_error(StackError::from))
+        })
+    }
+
+    fn release_container_reservation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationReleaseOutcome, StackError> {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.release_container_reservation(ownership))
+                .map_err(StackError::from)
         })
     }
 
@@ -1002,6 +1169,15 @@ impl ContainerRuntime for StackOwnershipE2eRuntime {
         self.inner.exec(container_id, command)
     }
 
+    fn exec_container_generation_with_output(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+        command: &[String],
+    ) -> Result<(i32, String, String), StackError> {
+        self.inner
+            .exec_container_generation_with_output(ownership, command)
+    }
+
     fn create_sandbox(
         &self,
         sandbox_id: &str,
@@ -1026,50 +1202,87 @@ impl ContainerRuntime for StackOwnershipE2eRuntime {
         image: &str,
         config: RunConfig,
     ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        self.observe_owned_create_result(
+            sandbox_id,
+            self.inner
+                .create_in_sandbox_owned(sandbox_id, image, config),
+        )
+    }
+
+    fn reserve_container_generation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationOwnership, StackError> {
+        let result = self.inner.reserve_container_generation(scope, container_id);
+        if let Err(error) = &result {
+            self.faults
+                .lock()
+                .unwrap()
+                .unowned_failures
+                .push((scope.stack_id.clone(), error.machine_code()));
+        }
+        result
+    }
+
+    fn inspect_container_reservation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationInspection, StackError> {
         let result = self
             .inner
-            .create_in_sandbox_owned(sandbox_id, image, config);
-        match result {
-            Ok(receipt) => {
-                if let Some(ownership) = receipt.ownership.clone() {
-                    self.faults
-                        .lock()
-                        .unwrap()
-                        .successful_ownership
-                        .push(ownership);
-                }
-                let should_inject = {
-                    let faults = self.faults.lock().unwrap();
-                    !faults.injected && faults.inject_stack_id.as_deref() == Some(sandbox_id)
-                };
-                if should_inject {
-                    let ownership = receipt.ownership.clone().unwrap_or_else(|| {
-                        panic!("macOS runtime published a container without generation ownership")
-                    });
-                    let mut faults = self.faults.lock().unwrap();
-                    faults.injected = true;
-                    faults.injected_ownership = Some(ownership.clone());
-                    return Err(OwnedCreateError {
-                        error: StackError::Network(
-                            "injected_post_publication: control-plane acknowledgement lost after runtime publication"
-                                .to_string(),
-                        ),
-                        cleanup: Some(ownership),
-                    });
-                }
-                Ok(receipt)
-            }
-            Err(failure) => {
-                if failure.cleanup.is_none() {
-                    self.faults
-                        .lock()
-                        .unwrap()
-                        .unowned_failures
-                        .push((sandbox_id.to_string(), failure.error.machine_code()));
-                }
-                Err(failure)
-            }
+            .inspect_container_reservation(scope, container_id);
+        let rejection = match &result {
+            Err(error) => Some(error.machine_code()),
+            Ok(
+                ContainerGenerationInspection::Foreign
+                | ContainerGenerationInspection::Replacement
+                | ContainerGenerationInspection::LegacyUnscoped
+                | ContainerGenerationInspection::Malformed(_),
+            ) => Some(MachineErrorCode::StateConflict),
+            Ok(
+                ContainerGenerationInspection::Absent
+                | ContainerGenerationInspection::ReservedUnpublished(_)
+                | ContainerGenerationInspection::Published(_),
+            ) => None,
+        };
+        if let Some(code) = rejection {
+            self.faults
+                .lock()
+                .unwrap()
+                .unowned_failures
+                .push((scope.stack_id.clone(), code));
         }
+        result
+    }
+
+    fn inspect_container_generation(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationInspection, StackError> {
+        self.inner.inspect_container_generation(ownership)
+    }
+
+    fn activate_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<StackError>> {
+        let stack_id = ownership.stack_id.clone();
+        self.observe_owned_create_result(
+            &stack_id,
+            self.inner
+                .activate_container_generation(ownership, image, config),
+        )
+    }
+
+    fn release_container_reservation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationReleaseOutcome, StackError> {
+        self.inner.release_container_reservation(ownership)
     }
 
     fn cleanup_container_generation(
@@ -1212,10 +1425,18 @@ fn stack_ownership_orchestrator(
     root: &Path,
     stack_id: &str,
 ) -> StackOrchestrator<StackOwnershipE2eRuntime> {
+    use std::os::unix::fs::PermissionsExt;
+
     let stack_dir = root.join(stack_id);
     std::fs::create_dir_all(&stack_dir).unwrap();
+    std::fs::set_permissions(&stack_dir, std::fs::Permissions::from_mode(0o700)).unwrap();
     let db_path = stack_dir.join("state.db");
-    let executor = StackExecutor::new(runtime, StateStore::open(&db_path).unwrap(), &stack_dir);
+    let executor = scoped_stack_executor(
+        runtime,
+        StateStore::open(&db_path).unwrap(),
+        &stack_dir,
+        stack_id,
+    );
     StackOrchestrator::new(
         executor,
         StateStore::open(&db_path).unwrap(),
@@ -1280,15 +1501,26 @@ async fn stack_container_generation_ownership() {
         raw_runtime.clone(),
         &oci_data,
     ));
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
+    let authoritative_workloads = [
+        "same-a",
+        "same-b",
+        "owned",
+        "foreign-owner",
+        "foreign-contender",
+    ]
+    .into_iter()
+    .map(planning_authority_scope)
+    .collect::<Vec<_>>();
 
     let mut evidence = serde_json::json!({
-        "schema_version": 3,
+        "schema_version": 4,
         "scenario": "stack-container-ownership",
         "build_identity": stack_ownership_build_identity(),
         "scope_identity": {
-            "kind": "synthetic_legacy_compatibility",
-            "topology_authoritative": false,
+            "kind": "machine_workload_scope",
+            "topology_authoritative": true,
+            "workloads": authoritative_workloads,
         },
         "concurrent_same_service": serde_json::Value::Null,
         "owned_failure": serde_json::Value::Null,
@@ -1423,32 +1655,43 @@ async fn stack_container_generation_ownership() {
     stop_stack_strict(&mut orchestrator_b, "same-b");
 
     // Inject a lost acknowledgement after the real backend has published the
-    // running generation. The returned ownership proof must survive the failed
-    // observed state and authorize exactly one cleanup before replacement.
+    // running generation. Action-v3 durably binds the returned ownership,
+    // performs exact cleanup, and projects the cleaned service as Stopped
+    // before returning to the caller.
     bridge.inject_once_after_publication("owned");
     let spec_owned_a = stack_ownership_spec("owned", "worker", "owned-generation-a", None);
     let mut owned_orchestrator = stack_ownership_orchestrator(bridge.clone(), tmp.path(), "owned");
     let first_owned = owned_orchestrator.run(&spec_owned_a, None).unwrap();
-    assert_eq!(first_owned.services_failed, 1);
+    assert!(!first_owned.converged);
+    assert_eq!(first_owned.services_ready, 0);
+    assert_eq!(first_owned.services_failed, 0);
     let failure_token = bridge.injected_ownership();
     let failed_state = owned_orchestrator
         .executor()
         .store()
         .load_observed_state("owned")
         .unwrap();
-    let observed_token = failed_state
+    let cleaned_state = failed_state
         .iter()
         .find(|state| state.replica.service_name == "worker")
-        .and_then(|state| state.failed_create_ownership.clone())
-        .expect("owned post-publication failure lost its cleanup proof");
-    assert_eq!(observed_token, failure_token);
-    let failed_guest =
-        stack_guest_generation_evidence(&raw_runtime, "owned", &failure_token.container_id).await;
-    bridge.set_failed_cgroup_path(
-        failed_guest["cgroup_path"]
-            .as_str()
-            .expect("failed generation omitted cgroup path"),
-    );
+        .expect("owned post-publication cleanup lost its observed projection");
+    assert_eq!(cleaned_state.phase, ServicePhase::Stopped);
+    assert!(cleaned_state.container_id.is_none());
+    assert!(cleaned_state.failed_create_ownership.is_none());
+    let failure_reservation_id = &failure_token
+        .scope
+        .as_deref()
+        .expect("owned failure token omitted its reservation scope")
+        .reservation_id;
+    let journal_token = owned_orchestrator
+        .executor()
+        .store()
+        .load_stack_container_generation_binding(failure_reservation_id)
+        .unwrap()
+        .expect("owned post-publication cleanup lost its durable generation binding")
+        .ownership;
+    assert_eq!(journal_token, failure_token);
+    let failed_guest = bridge.injected_guest_evidence();
     let failed_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
 
     let spec_owned_b = stack_ownership_spec("owned", "worker", "owned-generation-b", None);
@@ -1468,7 +1711,7 @@ async fn stack_container_generation_ownership() {
         "injection_point": "after_runtime_publication_before_executor_finalize",
         "injected_error_code": "injected_post_publication",
         "failure_token": ownership_json(&failure_token),
-        "observed_token": ownership_json(&observed_token),
+        "journal_token": ownership_json(&journal_token),
         "failed_guest": failed_guest,
         "failed_lifecycle": lifecycle_inventory(&failed_lifecycle),
         "cleanup_operations": bridge.cleanup_operations(),
@@ -1510,7 +1753,9 @@ async fn stack_container_generation_ownership() {
     let mut contender_orchestrator =
         stack_ownership_orchestrator(bridge.clone(), tmp.path(), "foreign-contender");
     let contender_result = contender_orchestrator.run(&contender_spec, None).unwrap();
-    assert_eq!(contender_result.services_failed, 1);
+    assert!(!contender_result.converged);
+    assert_eq!(contender_result.services_ready, 0);
+    assert_eq!(contender_result.services_failed, 0);
     let contender_state = contender_orchestrator
         .executor()
         .store()
@@ -1708,7 +1953,7 @@ services:
       - worker
 "#;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let oci_data = tmp.path().join("oci-data");
     std::fs::create_dir_all(&oci_data).unwrap();
@@ -1720,50 +1965,35 @@ services:
     // Execute through the real OCI runtime.
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
-    let mut executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        reconcile_store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 3,
+            image_policy: ImagePolicy::AllowAll,
+        },
+    );
 
-    // Dependency-aware reconciler behavior can require multiple rounds:
-    // first create `worker`, then create dependent `web`.
-    for round in 1..=3 {
-        let health = HashMap::new();
-        let result = apply(&spec, executor.store(), &health).unwrap();
-
-        assert!(
-            !result.actions.is_empty(),
-            "expected at least one action in round {round}"
-        );
-        if round == 1 {
-            assert!(
-                matches!(&result.actions[0], Action::ServiceCreate { target, .. } if target.service_name == "worker"),
-                "first round should prioritize worker dependency, got: {:?}",
-                result.actions[0]
-            );
-        }
-
-        let exec_result = executor.execute(&spec, &result.actions).unwrap();
-        assert_eq!(
-            exec_result.failed, 0,
-            "no actions should fail in round {round}: {:?}",
-            exec_result.errors
-        );
-
-        let observed = executor.store().load_observed_state("e2e-test").unwrap();
-        let ready = observed
-            .iter()
-            .filter(|service| service.container_id.is_some())
-            .count();
-        if ready >= 2 {
-            break;
-        }
-
-        assert!(
-            round < 3,
-            "services did not converge after 3 reconcile rounds"
-        );
-    }
+    // The production orchestration path plans immutable Action-v3 inputs,
+    // persists a session, claims every action, then executes the exact batch.
+    let result = orchestrator.run(&spec, None).unwrap();
+    assert!(result.converged, "services should converge");
+    assert_eq!(result.services_ready, 2);
+    assert_eq!(result.services_failed, 0);
+    assert!(
+        result.rounds >= 2,
+        "the dependent web service must wait for worker"
+    );
 
     // Verify observed state: both services running.
-    let observed = executor.store().load_observed_state("e2e-test").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("e2e-test")
+        .unwrap();
     for name in &["worker", "web"] {
         let svc = observed
             .iter()
@@ -1776,18 +2006,30 @@ services:
     }
 
     // Verify events were emitted.
-    let events = executor.store().load_events("e2e-test").unwrap();
-    let creating_count = events
+    let events = orchestrator
+        .executor()
+        .store()
+        .load_events("e2e-test")
+        .unwrap();
+    let creating_services = events
         .iter()
-        .filter(|e| matches!(e, StackEvent::ServiceCreating { .. }))
-        .count();
+        .filter_map(|event| match event {
+            StackEvent::ServiceCreating { service_name, .. } => Some(service_name.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
     let ready_count = events
         .iter()
         .filter(|e| matches!(e, StackEvent::ServiceReady { .. }))
         .count();
     assert!(
-        creating_count >= 2,
+        creating_services.len() >= 2,
         "should have at least 2 creating events"
+    );
+    assert_eq!(
+        creating_services.first().copied(),
+        Some("worker"),
+        "worker must be claimed and created before its dependent web service"
     );
     assert!(ready_count >= 2, "should have at least 2 ready events");
 
@@ -1799,29 +2041,28 @@ services:
         .container_id
         .as_ref()
         .unwrap();
-    let exit_code = executor
+    let exit_code = orchestrator
+        .executor()
         .runtime()
         .exec(worker_id, &["echo".into(), "stack-e2e".into()])
         .unwrap();
     assert_eq!(exit_code, 0, "exec inside worker should succeed");
 
-    // Teardown: stop and remove both containers.
-    let down_actions: Vec<Action> = spec
-        .services
-        .iter()
-        .map(|s| Action::ServiceRemove {
-            precondition: test_replica_precondition(),
-            target: vz_stack::ServiceReplicaKey::first(s.name.clone()).unwrap(),
-        })
-        .collect();
-    let down_result = executor.execute(&spec, &down_actions).unwrap();
-    assert_eq!(
-        down_result.failed, 0,
-        "teardown should succeed: {:?}",
-        down_result.errors
-    );
-    assert!(down_result.all_succeeded());
-    executor
+    // Teardown is planned from the exact observed journal heads and executes
+    // through the same persisted Action-v3 claim path.
+    let down_spec = vz_stack::StackSpec {
+        name: spec.name.clone(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let down_result = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down_result.converged);
+    assert_eq!(down_result.services_failed, 0);
+    orchestrator
+        .executor()
         .runtime()
         .shutdown_sandbox("e2e-test")
         .expect("e2e-test shared VM shutdown should succeed");
@@ -1843,49 +2084,62 @@ services:
       MY_VAR: "hello-from-stack"
 "#;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let oci_data = tmp.path().join("oci-data");
     std::fs::create_dir_all(&oci_data).unwrap();
 
     let spec = parse_compose(yaml, "exec-test").unwrap();
-    let store = StateStore::open(&db_path).unwrap();
-    let result = apply(&spec, &store, &HashMap::new()).unwrap();
-
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
-    let mut executor = StackExecutor::new(bridge, exec_store, tmp.path());
-
-    let exec_result = executor.execute(&spec, &result.actions).unwrap();
-    assert_eq!(exec_result.failed, 0);
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        reconcile_store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 1,
+            image_policy: ImagePolicy::AllowAll,
+        },
+    );
+    let exec_result = orchestrator.run(&spec, None).unwrap();
+    assert!(exec_result.converged);
+    assert_eq!(exec_result.services_failed, 0);
 
     // Exec into the container.
-    let observed = executor.store().load_observed_state("exec-test").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("exec-test")
+        .unwrap();
     let app = observed
         .iter()
         .find(|o| o.replica.service_name == "app")
         .unwrap();
     let container_id = app.container_id.as_ref().unwrap();
 
-    let exit_code = executor
+    let exit_code = orchestrator
+        .executor()
         .runtime()
         .exec(container_id, &["echo".into(), "alive".into()])
         .unwrap();
     assert_eq!(exit_code, 0);
 
-    // Cleanup.
-    let down = vec![Action::ServiceRemove {
-        precondition: test_replica_precondition(),
-        target: vz_stack::ServiceReplicaKey::first("app").unwrap(),
-    }];
-    let down_result = executor.execute(&spec, &down).unwrap();
-    assert_eq!(
-        down_result.failed, 0,
-        "teardown should succeed: {:?}",
-        down_result.errors
-    );
-    assert!(down_result.all_succeeded());
-    executor
+    // Cleanup through an exact planned-and-claimed Remove action.
+    let down_spec = vz_stack::StackSpec {
+        name: spec.name.clone(),
+        services: vec![],
+        networks: vec![],
+        volumes: vec![],
+        secrets: vec![],
+        disk_size_mb: None,
+    };
+    let down_result = orchestrator.run(&down_spec, None).unwrap();
+    assert!(down_result.converged);
+    assert_eq!(down_result.services_failed, 0);
+    orchestrator
+        .executor()
         .runtime()
         .shutdown_sandbox("exec-test")
         .expect("exec-test shared VM shutdown should succeed");
@@ -1912,7 +2166,7 @@ services:
       - db
 "#;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let oci_data = tmp.path().join("oci-data");
     std::fs::create_dir_all(&oci_data).unwrap();
@@ -1922,7 +2176,7 @@ services:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let mut orchestrator =
         StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
@@ -2022,7 +2276,7 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "real-svc").unwrap();
@@ -2031,7 +2285,7 @@ services:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -2158,14 +2412,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "exec-sock").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -2330,7 +2584,7 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(&yaml, "port-fwd").unwrap();
@@ -2339,7 +2593,7 @@ services:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -2818,40 +3072,9 @@ fn cleanup_snapshot_stack(
         )),
     }
 
-    // Successful VM shutdown publishes every member as stopped. Remove only
-    // the exact containers owned by this scenario if logical down left durable
-    // metadata/rootfs behind.
-    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        orchestrator
-            .executor()
-            .runtime()
-            .try_tracked_container_ids()
-    })) {
-        Ok(Ok(tracked)) => {
-            let tracked = tracked.into_iter().collect::<BTreeSet<_>>();
-            for container_id in exact_owned.intersection(&tracked) {
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    orchestrator.executor().runtime().remove(container_id)
-                })) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => failures.push(format!(
-                        "residual exact-owner removal failed for '{container_id}': {error}"
-                    )),
-                    Err(payload) => failures.push(format!(
-                        "residual exact-owner removal panicked for '{container_id}': {}",
-                        panic_payload_description(payload.as_ref())
-                    )),
-                }
-            }
-        }
-        Ok(Err(error)) => failures.push(format!(
-            "residual tracked-container inspection failed: {error}"
-        )),
-        Err(payload) => failures.push(format!(
-            "residual tracked-container inspection panicked: {}",
-            panic_payload_description(payload.as_ref())
-        )),
-    }
+    // Do not turn a captured container ID into cleanup authority. If exact
+    // Action-v3 stack-down failed, the final inventory checks below must expose
+    // the residual generation instead of deleting a possibly replaced owner.
 
     let mut final_tracked_evidence = None;
     match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -3035,7 +3258,7 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let snapshot_path = tmp.path().join("snapshot-stack.state");
 
@@ -3052,7 +3275,7 @@ services:
     );
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge.clone(), exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge.clone(), exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -3404,14 +3627,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "sbx-lifecycle").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -3511,14 +3734,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "phase-track").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let mut orchestrator =
         StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
@@ -3614,14 +3837,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "idempotent").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -3721,14 +3944,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "dep-healthy").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -3851,14 +4074,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "env-test").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let mut orchestrator =
         StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
@@ -3952,14 +4175,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "net-conn").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -4071,7 +4294,7 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     // Deploy v1.
@@ -4079,7 +4302,7 @@ services:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec_v1.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -4200,14 +4423,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "chain-3").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -4316,14 +4539,14 @@ services:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "exec-out").unwrap();
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let mut orchestrator =
         StackOrchestrator::new(executor, reconcile_store, OrchestrationConfig::default());
@@ -4406,6 +4629,7 @@ services:
 
 /// Deploy a service with replicas=3 and verify 3 running containers with distinct IDs.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn replicated_service_creates_multiple_containers() {
     if !require_virtualization_entitlement() {
         return;
@@ -4420,7 +4644,7 @@ services:
       replicas: 3
 "#;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let oci_data = tmp.path().join("oci-data");
     std::fs::create_dir_all(&oci_data).unwrap();
@@ -4434,27 +4658,49 @@ services:
     // Pre-pull image so parallel replica creation doesn't race on layer extraction.
     bridge.pull("alpine:latest").unwrap();
 
-    let store = StateStore::open(&db_path).unwrap();
-    let mut executor = StackExecutor::new(bridge, store, tmp.path());
-
-    // Reconcile and execute.
-    let health = HashMap::new();
-    let result = apply(&spec, executor.store(), &health).unwrap();
-    assert_eq!(result.actions.len(), 1);
-    assert!(matches!(
-        &result.actions[0],
-        Action::ServiceCreate { target, .. } if target.service_name == "web"
-    ));
-
-    let exec_result = executor.execute(&spec, &result.actions).unwrap();
-    assert_eq!(
-        exec_result.failed, 0,
-        "all replicas should succeed: {:?}",
-        exec_result.errors
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        reconcile_store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 3,
+            image_policy: ImagePolicy::AllowAll,
+        },
     );
 
+    // Preview the same exact Action-v3 plan the production orchestrator admits.
+    let health = HashMap::new();
+    let result = vz_stack::plan_apply(&spec, orchestrator.executor().store(), &health).unwrap();
+    let create_targets = result
+        .actions
+        .iter()
+        .map(|action| match action {
+            Action::ServiceCreate { target, .. } => (target.service_name.as_str(), target.index()),
+            other => panic!("replica preview returned a non-create action: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        create_targets,
+        vec![("web", 1), ("web", 2), ("web", 3)],
+        "planner should return one exact create target for each replica"
+    );
+
+    let exec_result = orchestrator.run(&spec, None).unwrap();
+    assert_eq!(
+        exec_result.services_failed, 0,
+        "all replicas should succeed"
+    );
+    assert!(exec_result.converged);
+
     // Verify 3 running replicas in observed state.
-    let observed = executor.store().load_observed_state("replica-e2e").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("replica-e2e")
+        .unwrap();
     let running: Vec<&str> = observed
         .iter()
         .filter(|o| o.container_id.is_some() && matches!(o.phase, ServicePhase::Running))
@@ -4474,7 +4720,7 @@ services:
     assert_eq!(cids.len(), 3, "expected 3 distinct container IDs");
 
     // Second reconcile should be a no-op (converged).
-    let result2 = apply(&spec, executor.store(), &health).unwrap();
+    let result2 = vz_stack::plan_apply(&spec, orchestrator.executor().store(), &health).unwrap();
     assert!(
         result2.actions.is_empty(),
         "converged replicas should produce no actions, got: {:?}",
@@ -4490,12 +4736,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let down_result = apply(&down_spec, executor.store(), &health).unwrap();
-    let execution = executor
-        .execute(&down_spec, &down_result.actions)
+    let down_result = orchestrator
+        .run(&down_spec, None)
         .expect("replica teardown execution should return");
-    assert!(execution.all_succeeded(), "replica teardown should succeed");
-    executor
+    assert!(down_result.converged, "replica teardown should succeed");
+    assert_eq!(down_result.services_failed, 0);
+    orchestrator
+        .executor()
         .runtime()
         .shutdown_sandbox("replica-e2e")
         .expect("replica shared VM shutdown should succeed");
@@ -4503,6 +4750,7 @@ services:
 
 /// Deploy replicas=3, then redeploy with replicas=1 and verify scale-down.
 #[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 async fn replicated_service_scale_down() {
     if !require_virtualization_entitlement() {
         return;
@@ -4517,7 +4765,7 @@ services:
       replicas: 3
 "#;
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
     let oci_data = tmp.path().join("oci-data");
     std::fs::create_dir_all(&oci_data).unwrap();
@@ -4528,20 +4776,30 @@ services:
     // Pre-pull image so parallel replica creation doesn't race on layer extraction.
     bridge.pull("alpine:latest").unwrap();
 
-    let store = StateStore::open(&db_path).unwrap();
-    let mut executor = StackExecutor::new(bridge, store, tmp.path());
+    let exec_store = StateStore::open(&db_path).unwrap();
+    let reconcile_store = StateStore::open(&db_path).unwrap();
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec3.name);
+    let mut orchestrator = StackOrchestrator::new(
+        executor,
+        reconcile_store,
+        OrchestrationConfig {
+            poll_interval: Some(0),
+            max_rounds: 3,
+            image_policy: ImagePolicy::AllowAll,
+        },
+    );
 
     // Deploy with replicas=3.
     let health = HashMap::new();
-    let r1 = apply(&spec3, executor.store(), &health).unwrap();
-    let er1 = executor.execute(&spec3, &r1.actions).unwrap();
-    assert_eq!(
-        er1.failed, 0,
-        "initial deploy should succeed: {:?}",
-        er1.errors
-    );
+    let er1 = orchestrator.run(&spec3, None).unwrap();
+    assert_eq!(er1.services_failed, 0, "initial deploy should succeed");
+    assert!(er1.converged);
 
-    let observed = executor.store().load_observed_state("scale-e2e").unwrap();
+    let observed = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("scale-e2e")
+        .unwrap();
     let running_count = observed
         .iter()
         .filter(|o| matches!(o.phase, ServicePhase::Running))
@@ -4558,7 +4816,7 @@ services:
       replicas: 1
 "#;
     let spec1 = parse_compose(yaml_1, "scale-e2e").unwrap();
-    let r2 = apply(&spec1, executor.store(), &health).unwrap();
+    let r2 = vz_stack::plan_apply(&spec1, orchestrator.executor().store(), &health).unwrap();
 
     // Should remove web-2 and web-3.
     let remove_names: Vec<&str> = r2
@@ -4575,11 +4833,16 @@ services:
         "should remove 2 excess replicas, got: {remove_names:?}"
     );
 
-    let er2 = executor.execute(&spec1, &r2.actions).unwrap();
-    assert_eq!(er2.failed, 0, "scale-down should succeed: {:?}", er2.errors);
+    let er2 = orchestrator.run(&spec1, None).unwrap();
+    assert_eq!(er2.services_failed, 0, "scale-down should succeed");
+    assert!(er2.converged);
 
     // Verify only 1 running replica remains.
-    let observed2 = executor.store().load_observed_state("scale-e2e").unwrap();
+    let observed2 = orchestrator
+        .executor()
+        .store()
+        .load_observed_state("scale-e2e")
+        .unwrap();
     let still_running: Vec<&str> = observed2
         .iter()
         .filter(|o| matches!(o.phase, ServicePhase::Running))
@@ -4600,12 +4863,13 @@ services:
         secrets: vec![],
         disk_size_mb: None,
     };
-    let down_result = apply(&down_spec, executor.store(), &health).unwrap();
-    let execution = executor
-        .execute(&down_spec, &down_result.actions)
+    let down_result = orchestrator
+        .run(&down_spec, None)
         .expect("scale teardown execution should return");
-    assert!(execution.all_succeeded(), "scale teardown should succeed");
-    executor
+    assert!(down_result.converged, "scale teardown should succeed");
+    assert_eq!(down_result.services_failed, 0);
+    orchestrator
+        .executor()
         .runtime()
         .shutdown_sandbox("scale-e2e")
         .expect("scale shared VM shutdown should succeed");
@@ -4631,7 +4895,7 @@ async fn sandbox_bind_mount_and_named_volume() {
         .with_test_writer()
         .try_init();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
 
     // Create a host file for bind mounting.
     let bind_dir = tmp.path().join("bind-src");
@@ -4672,7 +4936,7 @@ volumes:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -4772,7 +5036,7 @@ async fn sandbox_secret_injection() {
         .with_test_writer()
         .try_init();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
 
     // Stage secret files on the host.
     let secrets_src = tmp.path().join("secret-files");
@@ -4811,7 +5075,7 @@ secrets:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -4890,7 +5154,7 @@ async fn sandbox_env_file_loading() {
         .with_test_writer()
         .try_init();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let compose_dir = tmp.path().join("compose");
     std::fs::create_dir_all(&compose_dir).unwrap();
 
@@ -4936,7 +5200,7 @@ services:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),
@@ -5060,7 +5324,7 @@ networks:
     let oci_data = stack_e2e_oci_data_dir();
     std::fs::create_dir_all(&oci_data).unwrap();
 
-    let tmp = tempfile::tempdir().unwrap();
+    let tmp = private_tempdir();
     let db_path = tmp.path().join("state.db");
 
     let spec = parse_compose(yaml, "multinet-e2e").unwrap();
@@ -5069,7 +5333,7 @@ networks:
     let bridge = OciContainerRuntime::new(&oci_data);
     let exec_store = StateStore::open(&db_path).unwrap();
     let reconcile_store = StateStore::open(&db_path).unwrap();
-    let executor = StackExecutor::new(bridge, exec_store, tmp.path());
+    let executor = scoped_stack_executor(bridge, exec_store, tmp.path(), &spec.name);
 
     let orch_config = OrchestrationConfig {
         poll_interval: Some(2),

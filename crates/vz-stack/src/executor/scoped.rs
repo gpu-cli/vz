@@ -16,9 +16,7 @@ use crate::state_store::{
     ClaimedPredecessorInspection, ReconcileActionClaim, StackContainerCreateIntent,
     StackContainerCreateStatus, StackContainerGenerationBinding,
 };
-use vz_runtime_contract::{
-    ContainerCreateReceipt, ContainerGenerationInspection, ContainerGenerationOwnership,
-};
+use vz_runtime_contract::{ContainerGenerationInspection, ContainerGenerationOwnership};
 
 struct ScopedActivation {
     claim: ReconcileActionClaim,
@@ -27,6 +25,7 @@ struct ScopedActivation {
     ownership: ContainerGenerationOwnership,
     image: String,
     config: vz_runtime_contract::RunConfig,
+    initially_ready: bool,
 }
 
 enum ClaimedPreflightDecision {
@@ -478,6 +477,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         ownership,
                         image: prepared.image,
                         config: prepared.run_config,
+                        initially_ready: service.healthcheck.is_none(),
                     }),
                     Ok(None) => result.succeeded += 1,
                     Err(error) => {
@@ -550,33 +550,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 };
                 match outcome {
                     Ok(receipt) => {
-                        if let Err(error) = validate_exact_receipt(&activation.ownership, &receipt)
-                        {
-                            let message = error.to_string();
-                            match self.fail_and_cleanup_claimed_successor(
-                                &activation.claim,
-                                &activation.intent,
-                                &message,
-                            ) {
-                                Ok(()) => record_action_error(
-                                    &mut result,
-                                    &mut outcome_failures,
-                                    &activation.target,
-                                    error,
-                                ),
-                                Err(cleanup_error) => record_action_error(
-                                    &mut result,
-                                    &mut outcome_failures,
-                                    &activation.target,
-                                    cleanup_error,
-                                ),
-                            }
-                            continue;
-                        }
                         match self.store.publish_claimed_successor_success(
                             &activation.claim,
                             &activation.intent.scope.reservation_id,
-                            false,
+                            &receipt,
+                            activation.initially_ready,
                             unix_now(),
                         ) {
                             Ok(_) => result.succeeded += 1,
@@ -1204,20 +1182,6 @@ fn validate_exact_inspection(
 
 fn exact_target_label(target: &ServiceReplicaKey) -> String {
     format!("{}#{}", target.service_name, target.replica_index)
-}
-
-fn validate_exact_receipt(
-    ownership: &ContainerGenerationOwnership,
-    receipt: &ContainerCreateReceipt,
-) -> Result<(), StackError> {
-    if receipt.container_id != ownership.container_id
-        || receipt.ownership.as_ref() != Some(ownership)
-    {
-        return Err(scope_state_conflict(
-            "activation receipt does not match the exact reserved ownership",
-        ));
-    }
-    Ok(())
 }
 
 fn record_action_error(

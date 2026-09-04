@@ -592,6 +592,58 @@ fn poller_fails_closed_before_container_id_exec_for_scoped_generation() {
 }
 
 #[test]
+fn poller_uses_exact_generation_exec_for_scoped_generation() {
+    let mut runtime = MockContainerRuntime::new();
+    runtime.support_generation_exec = true;
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack_with_hc(
+        "scoped-health",
+        vec![ServiceSpec {
+            healthcheck: Some(make_hc_spec(Some(3))),
+            ..svc("web")
+        }],
+    );
+    let target = crate::state_store::ServiceReplicaKey::first("web").unwrap();
+    crate::reconcile::publish_test_container_running_with_ready(
+        &store,
+        &spec.name,
+        &target,
+        "scoped-health-config",
+        false,
+    );
+
+    let mut poller = HealthPoller::new();
+    let result = poller.poll_all(&runtime, &store, &spec).unwrap();
+
+    assert_eq!(result.checks_run, 1);
+    assert_eq!(result.newly_ready, vec!["web".to_string()]);
+    let calls = runtime.call_log();
+    assert!(
+        calls
+            .iter()
+            .any(|(operation, _)| operation == "exec_generation")
+    );
+    assert!(!calls.iter().any(|(operation, _)| operation == "exec"));
+    let events = store.load_events(&spec.name).unwrap();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, StackEvent::ServiceReady { .. }))
+            .count(),
+        1,
+        "the exact-generation readiness transition must persist one ServiceReady"
+    );
+    assert!(matches!(
+        events.first(),
+        Some(StackEvent::ServiceReady {
+            stack_name,
+            service_name,
+            ..
+        }) if stack_name == "scoped-health" && service_name == "web"
+    ));
+}
+
+#[test]
 fn poller_failure_emits_event_without_failing_service() {
     let mut runtime = MockContainerRuntime::new();
     runtime.exec_exit_code = 1;

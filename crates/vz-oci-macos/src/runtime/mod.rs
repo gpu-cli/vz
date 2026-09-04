@@ -834,16 +834,30 @@ impl Runtime {
             .container_store
             .try_acquire_container_write_lease(container_id)
             .map_err(|error| Self::map_container_store_error(container_id, error))?;
+        self.observe_lifecycle_admission(
+            RuntimeLifecycleAdmissionKind::CreateBeforeReservation,
+            container_id,
+        )
+        .await;
         let generation = self
             .container_store
             .reserve_scoped_generation_with_write_lease(container_id, scope, &os_guard)
             .map_err(|error| Self::map_container_store_error(container_id, error))?;
-        Ok(vz_runtime_contract::ContainerGenerationOwnership {
+        let ownership = vz_runtime_contract::ContainerGenerationOwnership {
             container_id: container_id.to_string(),
             generation: generation.0,
             stack_id: scope.stack_id.clone(),
             scope: Some(Box::new(scope.clone())),
-        })
+        };
+        // A detached reservation intentionally survives caller cancellation
+        // after publication. Expose that crash boundary to integration tests
+        // before returning the ownership proof.
+        self.observe_lifecycle_admission(
+            RuntimeLifecycleAdmissionKind::CreateAfterReservation,
+            container_id,
+        )
+        .await;
+        Ok(ownership)
     }
 
     /// Assign a runtime ID when needed, then reserve it without activation.

@@ -920,9 +920,9 @@ impl StateStore {
 
     /// Attach an event channel sender for real-time streaming.
     ///
-    /// When set, [`emit_event`](Self::emit_event) will send a clone of each
-    /// event through this channel in addition to persisting it to SQLite.
-    /// Sending failures (receiver dropped) are silently ignored.
+    /// When set, committed events are sent through this channel in addition to
+    /// being persisted to SQLite. Transaction-owned lifecycle methods notify
+    /// only after commit. Sending failures (receiver dropped) are ignored.
     pub fn set_event_sender(&mut self, sender: mpsc::Sender<StackEvent>) {
         self.event_sender = Some(sender);
     }
@@ -971,6 +971,28 @@ impl StateStore {
                 Err(error)
             }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn total_changes_for_test(&self) -> u64 {
+        self.conn.total_changes()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reconcile_action_schema_version_for_test(
+        &self,
+        session_id: &str,
+    ) -> Result<u32, StackError> {
+        let version = self.conn.query_row(
+            "SELECT action_schema_version FROM reconcile_sessions WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get::<_, i64>(0),
+        )?;
+        u32::try_from(version).map_err(|_| {
+            StackError::InvalidSpec(format!(
+                "reconcile session `{session_id}` has invalid action schema version"
+            ))
+        })
     }
 
     /// Return effective SQLite journal mode for this connection.
@@ -1792,16 +1814,30 @@ impl StateStore {
     /// a clone of the event is also pushed through the channel. Send
     /// failures (receiver dropped) are silently ignored.
     pub fn emit_event(&self, stack_name: &str, event: &StackEvent) -> Result<(), StackError> {
+        self.persist_event(stack_name, event)?;
+        self.notify_event(event);
+        Ok(())
+    }
+
+    /// Persist an event on the current connection without notifying subscribers.
+    ///
+    /// Claimed lifecycle transitions use this inside their encompassing SQLite
+    /// transaction, then notify only after that transaction commits.
+    fn persist_event(&self, stack_name: &str, event: &StackEvent) -> Result<(), StackError> {
         let json = serde_json::to_string(event)?;
         self.conn.execute(
             "INSERT INTO events (stack_name, event_json) VALUES (?1, ?2)",
             params![stack_name, json],
         )?;
-        // Push to real-time subscribers (ignore if receiver dropped).
+        Ok(())
+    }
+
+    /// Push a committed event to real-time subscribers.
+    fn notify_event(&self, event: &StackEvent) {
+        // Ignore a dropped receiver; the durable event remains authoritative.
         if let Some(ref sender) = self.event_sender {
             let _ = sender.send(event.clone());
         }
-        Ok(())
     }
 
     /// Load all events for a stack, ordered by creation time.

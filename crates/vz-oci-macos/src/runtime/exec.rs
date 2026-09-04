@@ -1333,6 +1333,42 @@ impl Runtime {
         self.exec_container_streaming(id, exec, |_| {}).await
     }
 
+    /// Execute only while `ownership` remains the exact published generation.
+    ///
+    /// The durable generation check and exec dispatch share one lifecycle read
+    /// admission, so replacement or removal cannot cross the authorization
+    /// boundary between validation and guest RPC dispatch.
+    pub async fn exec_owned_container_generation(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+        exec: ExecConfig,
+    ) -> Result<ExecOutput, OciError> {
+        ownership.validate().map_err(OciError::InvalidConfig)?;
+        let admission_guard = self
+            .acquire_container_read_admission(&ownership.container_id)
+            .await?;
+        match self.inspect_scoped_container_generation(ownership)? {
+            vz_runtime_contract::ContainerGenerationInspection::Published(found)
+                if found == *ownership => {}
+            other => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: ownership.container_id.clone(),
+                    reason: format!(
+                        "exact generation is not the current published owner: {other:?}"
+                    ),
+                });
+            }
+        }
+        self.exec_container_streaming_admitted(
+            &ownership.container_id,
+            exec,
+            |_| {},
+            Some(admission_guard),
+            Some(ContainerGeneration(ownership.generation)),
+        )
+        .await
+    }
+
     /// Execute a command inside an already-running container and emit
     /// incremental output events when available.
     pub async fn exec_container_streaming<F>(
@@ -1345,7 +1381,7 @@ impl Runtime {
         F: FnMut(InteractiveExecEvent),
     {
         let admission_guard = self.acquire_container_read_admission(id).await?;
-        self.exec_container_streaming_admitted(id, exec, on_event, Some(admission_guard))
+        self.exec_container_streaming_admitted(id, exec, on_event, Some(admission_guard), None)
             .await
     }
 
@@ -1356,8 +1392,14 @@ impl Runtime {
         transaction: &ContainerLifecycleTransaction,
     ) -> Result<ExecOutput, OciError> {
         debug_assert_eq!(id, transaction.container_id());
-        self.exec_container_streaming_admitted(id, exec, |_| {}, None)
-            .await
+        self.exec_container_streaming_admitted(
+            id,
+            exec,
+            |_| {},
+            None,
+            Some(transaction.generation()),
+        )
+        .await
     }
 
     async fn exec_container_streaming_admitted<F>(
@@ -1366,6 +1408,7 @@ impl Runtime {
         exec: ExecConfig,
         mut on_event: F,
         mut admission_guard: Option<ContainerReadAdmission>,
+        expected_generation: Option<ContainerGeneration>,
     ) -> Result<ExecOutput, OciError>
     where
         F: FnMut(InteractiveExecEvent),
@@ -1380,6 +1423,17 @@ impl Runtime {
         let deadline = tokio::time::Instant::now() + timeout;
         let execution_id = exec.execution_id.clone();
         let (vm, options, lifecycle_generation) = self.resolve_exec_binding(id, &exec).await?;
+        if let Some(expected_generation) = expected_generation
+            && expected_generation != lifecycle_generation
+        {
+            return Err(OciError::ContainerOwnershipMismatch {
+                id: id.to_string(),
+                reason: format!(
+                    "exec binding generation {} does not match authorized generation {}",
+                    lifecycle_generation.0, expected_generation.0,
+                ),
+            });
+        }
         let mut registration = self
             .register_exec_session(execution_id.as_deref(), Arc::clone(&vm), exec.pty)
             .await?;
@@ -1901,7 +1955,7 @@ impl Runtime {
             });
         }
         let admission_guard = self.acquire_container_read_admission(id).await?;
-        self.exec_container_streaming_admitted(id, exec, |_| {}, Some(admission_guard))
+        self.exec_container_streaming_admitted(id, exec, |_| {}, Some(admission_guard), None)
             .await
     }
 

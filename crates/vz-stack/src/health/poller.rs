@@ -163,20 +163,16 @@ impl HealthPoller {
             let Some(ref container_id) = obs.container_id else {
                 continue;
             };
-            if obs
+            let scoped_ownership = obs
                 .failed_create_ownership
                 .as_ref()
-                .and_then(|ownership| ownership.scope.as_deref())
-                .is_some_and(|scope| scope.machine_incarnation_id.is_some())
-            {
-                return Err(StackError::Machine {
-                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
-                    message: format!(
-                        "scoped health check for `{}` requires exact-generation exec authority",
-                        obs.replica.display_name()
-                    ),
-                });
-            }
+                .filter(|ownership| {
+                    ownership
+                        .scope
+                        .as_deref()
+                        .is_some_and(|scope| scope.machine_incarnation_id.is_some())
+                })
+                .cloned();
 
             // Track when we first saw this service running.
             let start_time = *self.start_times.entry(svc.name.clone()).or_insert(now);
@@ -219,9 +215,16 @@ impl HealthPoller {
                 let (tx, rx) = std::sync::mpsc::channel();
                 let cid = container_id.clone();
                 let cmd_clone = cmd.clone();
+                let exec_ownership = scoped_ownership.clone();
+                let requires_exact_authority = exec_ownership.is_some();
                 std::thread::scope(|s| {
                     s.spawn(|| {
-                        let result = runtime.exec_with_output(&cid, &cmd_clone);
+                        let result = match exec_ownership.as_ref() {
+                            Some(ownership) => {
+                                runtime.exec_container_generation_with_output(ownership, &cmd_clone)
+                            }
+                            None => runtime.exec_with_output(&cid, &cmd_clone),
+                        };
                         let _ = tx.send(result);
                     });
                     match rx.recv_timeout(timeout) {
@@ -236,29 +239,30 @@ impl HealthPoller {
                                     "health check returned non-zero"
                                 );
                             }
-                            (code, None, stdout, stderr)
+                            Ok((code, None, stdout, stderr))
                         }
+                        Ok(Err(error)) if requires_exact_authority => Err(error),
                         Ok(Err(e)) => {
                             debug!(service = %svc.name, error = %e, "health check exec failed");
-                            (
+                            Ok((
                                 1,
                                 Some(format!("exec error: {e}")),
                                 String::new(),
                                 String::new(),
-                            )
+                            ))
                         }
                         Err(_) => {
                             debug!(service = %svc.name, timeout_secs = timeout.as_secs(), "health check timed out");
-                            (
+                            Ok((
                                 1,
                                 Some(format!("timed out after {}s", timeout.as_secs())),
                                 String::new(),
                                 String::new(),
-                            )
+                            ))
                         }
                     }
                 })
-            };
+            }?;
 
             let status = self
                 .statuses
@@ -285,7 +289,11 @@ impl HealthPoller {
                         last_error: None,
                         ready: true,
                     };
-                    store.save_observed_state(&spec.name, &ready_state)?;
+                    if let Some(ownership) = scoped_ownership.as_ref() {
+                        store.publish_stack_container_ready(&obs.replica, ownership)?;
+                    } else {
+                        store.save_observed_state(&spec.name, &ready_state)?;
+                    }
                     store.emit_event(
                         &spec.name,
                         &StackEvent::HealthCheckPassed {

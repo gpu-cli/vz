@@ -10,6 +10,8 @@
 mod chaos_tests;
 mod compose;
 mod convert;
+#[cfg(all(test, target_os = "macos"))]
+mod crash_reopen_tests;
 mod error;
 mod events;
 mod executor;

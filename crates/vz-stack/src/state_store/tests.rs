@@ -5,7 +5,6 @@ use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use vz_runtime_contract::MachineErrorCode;
 use vz_runtime_contract::types::{
     Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
     EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance,
@@ -20,6 +19,7 @@ use vz_runtime_contract::types::{
     TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
     WorkspaceProjectionMode,
 };
+use vz_runtime_contract::{ContainerCreateReceipt, MachineErrorCode};
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
 const V0_3_20_AMBIGUOUS_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-ambiguous.sql");
@@ -11748,7 +11748,9 @@ fn stack_create_success_publishes_binding_and_observed_state_atomically() {
 fn journal_readiness_update_is_exact_idempotent_and_survives_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let path = temp.path().join("journal-readiness.db");
-    let store = StateStore::open(&path).unwrap();
+    let mut store = StateStore::open(&path).unwrap();
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    store.set_event_sender(event_tx);
     let (project, intent, binding) = journal_fixture("reservation-readiness");
     store.save_project_state(&project).unwrap();
     reserve_journal_owner(&store, &intent);
@@ -11758,16 +11760,72 @@ fn journal_readiness_update_is_exact_idempotent_and_survives_reopen() {
         .publish_stack_container_create_success(&intent.scope.reservation_id, false, 102)
         .unwrap();
     assert!(!running.ready);
+    assert!(store.load_events("stack-journal").unwrap().is_empty());
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "Running with ready=false must not emit or stream ServiceReady"
+    );
     let target = ServiceReplicaKey::new(&intent.service_name, intent.replica_index).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_readiness_event
+             BEFORE INSERT ON events
+             BEGIN SELECT RAISE(ABORT, 'injected readiness event failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .publish_stack_container_ready(&target, &binding.ownership)
+            .is_err()
+    );
+    assert!(
+        !store
+            .load_observed_state_for_replica("stack-journal", "web", 1)
+            .unwrap()
+            .unwrap()
+            .ready,
+        "failed event persistence must roll readiness back"
+    );
+    assert!(store.load_events("stack-journal").unwrap().is_empty());
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "rolled-back readiness must not notify subscribers"
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_readiness_event;")
+        .unwrap();
     let ready = store
         .publish_stack_container_ready(&target, &binding.ownership)
         .unwrap();
     assert!(ready.ready);
+    let ready_event = StackEvent::ServiceReady {
+        stack_name: "stack-journal".to_string(),
+        service_name: "web".to_string(),
+        runtime_id: binding.ownership.container_id.clone(),
+    };
+    assert_eq!(
+        store.load_events("stack-journal").unwrap(),
+        vec![ready_event.clone()]
+    );
+    assert_eq!(event_rx.try_recv().unwrap(), ready_event.clone());
     assert_eq!(
         store
             .publish_stack_container_ready(&target, &binding.ownership)
             .unwrap(),
         ready
+    );
+    assert_eq!(
+        store.load_events("stack-journal").unwrap(),
+        vec![ready_event.clone()]
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "readiness replay must not duplicate its durable or live event"
     );
     assert!(
         store
@@ -11793,6 +11851,11 @@ fn journal_readiness_update_is_exact_idempotent_and_survives_reopen() {
             .unwrap()
             .unwrap()
             .ready
+    );
+    assert_eq!(
+        reopened.load_events("stack-journal").unwrap(),
+        vec![ready_event],
+        "ready state and its single durable event must survive reopen together"
     );
 }
 
@@ -13489,6 +13552,15 @@ fn binding_for_claimed_intent(
     }
 }
 
+fn receipt_for_claimed_binding(
+    binding: &StackContainerGenerationBinding,
+) -> ContainerCreateReceipt {
+    ContainerCreateReceipt {
+        container_id: binding.ownership.container_id.clone(),
+        ownership: Some(binding.ownership.clone()),
+    }
+}
+
 fn inject_journal_intent_for_test(store: &StateStore, intent: &StackContainerCreateIntent) {
     intent.validate().unwrap();
     let (persisted_status, observed) = match intent.status {
@@ -14913,6 +14985,14 @@ fn claimed_exact_successor_lifecycle_replays_after_reopen() {
             .unwrap(),
         stopping
     );
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        vec![StackEvent::ServiceStopping {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+        }],
+        "cleanup admission replay must not duplicate ServiceStopping"
+    );
     assert!(matches!(
         store.inspect_claimed_predecessor(&claim).unwrap(),
         ClaimedPredecessorInspection::ExactBoundCleanupPending { .. }
@@ -14929,6 +15009,21 @@ fn claimed_exact_successor_lifecycle_replays_after_reopen() {
             .complete_claimed_predecessor_cleanup(&claim, 201)
             .unwrap(),
         stopped
+    );
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        vec![
+            StackEvent::ServiceStopping {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+            },
+            StackEvent::ServiceStopped {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+                exit_code: 0,
+            },
+        ],
+        "terminal cleanup replay must not duplicate ServiceStopped"
     );
     assert!(matches!(
         store.inspect_claimed_predecessor(&claim).unwrap(),
@@ -14960,8 +15055,15 @@ fn claimed_exact_successor_lifecycle_replays_after_reopen() {
             .unwrap(),
         binding
     );
+    let receipt = receipt_for_claimed_binding(&binding);
     let running = store
-        .publish_claimed_successor_success(&claim, &successor.scope.reservation_id, true, 204)
+        .publish_claimed_successor_success(
+            &claim,
+            &successor.scope.reservation_id,
+            &receipt,
+            true,
+            204,
+        )
         .unwrap();
     assert_eq!(running.phase, ServicePhase::Running);
     assert!(running.ready);
@@ -14979,9 +15081,568 @@ fn claimed_exact_successor_lifecycle_replays_after_reopen() {
     );
     assert_eq!(
         store
-            .publish_claimed_successor_success(&claim, &successor.scope.reservation_id, true, 204,)
+            .publish_claimed_successor_success(
+                &claim,
+                &successor.scope.reservation_id,
+                &receipt,
+                true,
+                204,
+            )
             .unwrap(),
         running
+    );
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        vec![
+            StackEvent::ServiceStopping {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+            },
+            StackEvent::ServiceStopped {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+                exit_code: 0,
+            },
+            StackEvent::ServiceCreating {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+            },
+            StackEvent::ServiceReady {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+                runtime_id: receipt.container_id,
+            },
+        ],
+        "the exact recreate lifecycle is emitted once in journal order"
+    );
+}
+
+#[test]
+fn claimed_successor_success_rejects_foreign_receipts_without_db_changes_and_replays_exactly() {
+    let mut store = StateStore::in_memory().unwrap();
+    let seeded = exact_batch_actions_for_claim(&store);
+    let actions = vec![seeded[0].clone()];
+    install_unstarted_batch(
+        &store,
+        "rs-claimed-success-receipt",
+        "op-claimed-success-receipt",
+        &actions,
+    );
+    let claim = store
+        .start_reconcile_batch(
+            "rs-claimed-success-receipt",
+            "exact-batch",
+            "op-claimed-success-receipt",
+            0,
+            &actions,
+        )
+        .unwrap()
+        .remove(0);
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    store.set_event_sender(event_tx);
+    let input = claimed_create_input(&store, &actions[0], "success-receipt");
+    let allocation = empty_claimed_allocator_target();
+    let intent = store
+        .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 300)
+        .unwrap();
+    assert_eq!(
+        store
+            .resolve_or_begin_claimed_successor(&claim, &input, &allocation, 300)
+            .unwrap(),
+        intent,
+        "claim-linked intent replay must reuse the exact successor"
+    );
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        vec![StackEvent::ServiceCreating {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+        }],
+        "replica-qualified Creating is emitted exactly once"
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap(),
+        StackEvent::ServiceCreating {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+        }
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "intent replay must not notify subscribers twice"
+    );
+    let binding = binding_for_claimed_intent(&intent, 71, 301);
+    store
+        .bind_claimed_successor_generation(&claim, &binding)
+        .unwrap();
+
+    let reserved_intent = store
+        .load_stack_container_create_intent(&intent.scope.reservation_id)
+        .unwrap();
+    let creating_observed = store
+        .load_observed_state_for_replica(
+            &intent.scope.stack_id,
+            &intent.service_name,
+            intent.replica_index,
+        )
+        .unwrap();
+
+    let mut foreign_ownership = binding.ownership.clone();
+    foreign_ownership.generation += 1;
+    let ownership_mismatch = ContainerCreateReceipt {
+        container_id: binding.ownership.container_id.clone(),
+        ownership: Some(foreign_ownership),
+    };
+    let changes_before = store.conn.total_changes();
+    assert_eq!(
+        store
+            .publish_claimed_successor_success(
+                &claim,
+                &intent.scope.reservation_id,
+                &ownership_mismatch,
+                true,
+                302,
+            )
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(store.conn.total_changes(), changes_before);
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(&intent.scope.reservation_id)
+            .unwrap(),
+        reserved_intent
+    );
+    assert_eq!(
+        store
+            .load_observed_state_for_replica(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )
+            .unwrap(),
+        creating_observed
+    );
+
+    let container_id_mismatch = ContainerCreateReceipt {
+        container_id: "foreign-container-id".to_string(),
+        ownership: Some(binding.ownership.clone()),
+    };
+    let changes_before = store.conn.total_changes();
+    assert_eq!(
+        store
+            .publish_claimed_successor_success(
+                &claim,
+                &intent.scope.reservation_id,
+                &container_id_mismatch,
+                true,
+                303,
+            )
+            .unwrap_err()
+            .machine_code(),
+        MachineErrorCode::StateConflict
+    );
+    assert_eq!(store.conn.total_changes(), changes_before);
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(&intent.scope.reservation_id)
+            .unwrap(),
+        reserved_intent
+    );
+    assert_eq!(
+        store
+            .load_observed_state_for_replica(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )
+            .unwrap(),
+        creating_observed
+    );
+
+    let receipt = receipt_for_claimed_binding(&binding);
+    let expected = ServiceObservedState {
+        replica: ServiceReplicaKey::new(intent.service_name.clone(), intent.replica_index).unwrap(),
+        applied_config_digest: intent.applied_config_digest.clone(),
+        phase: ServicePhase::Running,
+        container_id: Some(receipt.container_id.clone()),
+        failed_create_ownership: receipt.ownership.clone(),
+        last_error: None,
+        ready: true,
+    };
+    assert_eq!(
+        store
+            .publish_claimed_successor_success(
+                &claim,
+                &intent.scope.reservation_id,
+                &receipt,
+                true,
+                304,
+            )
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        store
+            .load_observed_state_for_replica(
+                &intent.scope.stack_id,
+                &intent.service_name,
+                intent.replica_index,
+            )
+            .unwrap(),
+        Some(expected.clone())
+    );
+    let committed_events = vec![
+        StackEvent::ServiceCreating {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+        },
+        StackEvent::ServiceReady {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+            runtime_id: receipt.container_id.clone(),
+        },
+    ];
+    assert_eq!(store.load_events("exact-batch").unwrap(), committed_events);
+    assert_eq!(
+        event_rx.try_recv().unwrap(),
+        committed_events[1],
+        "Ready is streamed only after its journal transaction commits"
+    );
+
+    let changes_before_replay = store.conn.total_changes();
+    assert_eq!(
+        store
+            .publish_claimed_successor_success(
+                &claim,
+                &intent.scope.reservation_id,
+                &receipt,
+                true,
+                305,
+            )
+            .unwrap(),
+        expected
+    );
+    assert_eq!(store.conn.total_changes(), changes_before_replay);
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        committed_events,
+        "terminal success replay must not duplicate lifecycle events"
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "terminal success replay must not notify subscribers twice"
+    );
+}
+
+#[test]
+fn claimed_successor_post_publication_failure_cleanup_commits_events_once_and_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("claimed-successor-cleanup-events.db");
+    let (claim, reservation_id, stopping) = {
+        let mut store = StateStore::open(&path).unwrap();
+        let seeded = exact_batch_actions_for_claim(&store);
+        let actions = vec![seeded[0].clone()];
+        install_unstarted_batch(
+            &store,
+            "rs-claimed-cleanup-events",
+            "op-claimed-cleanup-events",
+            &actions,
+        );
+        let claim = store
+            .start_reconcile_batch(
+                "rs-claimed-cleanup-events",
+                "exact-batch",
+                "op-claimed-cleanup-events",
+                0,
+                &actions,
+            )
+            .unwrap()
+            .remove(0);
+        let (event_tx, event_rx) = std::sync::mpsc::channel();
+        store.set_event_sender(event_tx);
+        let input = claimed_create_input(&store, &actions[0], "cleanup-events");
+        let successor = store
+            .resolve_or_begin_claimed_successor(
+                &claim,
+                &input,
+                &empty_claimed_allocator_target(),
+                400,
+            )
+            .unwrap();
+        assert!(matches!(
+            event_rx.try_recv().unwrap(),
+            StackEvent::ServiceCreating { .. }
+        ));
+        let reservation_id = successor.scope.reservation_id.clone();
+        let binding = binding_for_claimed_intent(&successor, 81, 401);
+        store
+            .bind_claimed_successor_generation(&claim, &binding)
+            .unwrap();
+        let reserved_intent = store
+            .load_stack_container_create_intent(&reservation_id)
+            .unwrap()
+            .unwrap();
+        let creating = store
+            .load_observed_state_for_replica("exact-batch", "api", 2)
+            .unwrap()
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_successor_failed_event
+                 BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected failed event failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .publish_claimed_successor_failure(
+                    &claim,
+                    &reservation_id,
+                    "runtime published but activation acknowledgement failed",
+                    402,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_stack_container_create_intent(&reservation_id)
+                .unwrap()
+                .unwrap(),
+            reserved_intent,
+            "failure event persistence error must roll back the journal failure"
+        );
+        assert_eq!(
+            store
+                .load_observed_state_for_replica("exact-batch", "api", 2)
+                .unwrap()
+                .unwrap(),
+            creating,
+            "failure event persistence error must roll back observed failure"
+        );
+        assert_eq!(
+            event_rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty,
+            "rolled-back failure must not notify subscribers"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_successor_failed_event;")
+            .unwrap();
+        let failed = store
+            .publish_claimed_successor_failure(
+                &claim,
+                &reservation_id,
+                "runtime published but activation acknowledgement failed",
+                402,
+            )
+            .unwrap();
+        assert_eq!(failed.phase, ServicePhase::Failed);
+        let failed_event = StackEvent::ServiceFailed {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+            error: "runtime published but activation acknowledgement failed".to_string(),
+        };
+        assert_eq!(event_rx.try_recv().unwrap(), failed_event.clone());
+        assert_eq!(
+            store
+                .publish_claimed_successor_failure(
+                    &claim,
+                    &reservation_id,
+                    "runtime published but activation acknowledgement failed",
+                    402,
+                )
+                .unwrap(),
+            failed
+        );
+        assert_eq!(
+            event_rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty,
+            "failure replay must not notify subscribers twice"
+        );
+        let blocked_intent = store
+            .load_stack_container_create_intent(&reservation_id)
+            .unwrap()
+            .unwrap();
+
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER reject_successor_stopping_event
+                 BEFORE INSERT ON events
+                 BEGIN SELECT RAISE(ABORT, 'injected stopping event failure'); END;",
+            )
+            .unwrap();
+        assert!(
+            store
+                .begin_claimed_successor_cleanup(&claim, &reservation_id, 403)
+                .is_err()
+        );
+        assert_eq!(
+            store
+                .load_stack_container_create_intent(&reservation_id)
+                .unwrap()
+                .unwrap(),
+            blocked_intent,
+            "event persistence failure must roll back CleanupPending"
+        );
+        assert_eq!(
+            store
+                .load_observed_state_for_replica("exact-batch", "api", 2)
+                .unwrap(),
+            Some(failed),
+            "event persistence failure must roll back Stopping observation"
+        );
+        assert_eq!(
+            store.load_events("exact-batch").unwrap(),
+            vec![
+                StackEvent::ServiceCreating {
+                    stack_name: "exact-batch".to_string(),
+                    service_name: "api-2".to_string(),
+                },
+                failed_event.clone(),
+            ]
+        );
+        assert_eq!(
+            event_rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty,
+            "rolled-back events must not reach subscribers"
+        );
+        store
+            .conn
+            .execute_batch("DROP TRIGGER reject_successor_stopping_event;")
+            .unwrap();
+
+        let stopping = store
+            .begin_claimed_successor_cleanup(&claim, &reservation_id, 404)
+            .unwrap();
+        assert_eq!(stopping.phase, ServicePhase::Stopping);
+        let stopping_event = StackEvent::ServiceStopping {
+            stack_name: "exact-batch".to_string(),
+            service_name: "api-2".to_string(),
+        };
+        assert_eq!(event_rx.try_recv().unwrap(), stopping_event);
+        assert_eq!(
+            store
+                .begin_claimed_successor_cleanup(&claim, &reservation_id, 405)
+                .unwrap(),
+            stopping
+        );
+        assert_eq!(
+            event_rx.try_recv().unwrap_err(),
+            std::sync::mpsc::TryRecvError::Empty,
+            "cleanup admission replay must not notify subscribers twice"
+        );
+        assert_eq!(
+            store.load_events("exact-batch").unwrap(),
+            vec![
+                StackEvent::ServiceCreating {
+                    stack_name: "exact-batch".to_string(),
+                    service_name: "api-2".to_string(),
+                },
+                failed_event,
+                stopping_event,
+            ]
+        );
+        (claim, reservation_id, stopping)
+    };
+
+    let mut store = StateStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .load_observed_state_for_replica("exact-batch", "api", 2)
+            .unwrap(),
+        Some(stopping.clone()),
+        "Stopping observation and event must survive reopen together"
+    );
+    let (event_tx, event_rx) = std::sync::mpsc::channel();
+    store.set_event_sender(event_tx);
+    let cleanup_pending_intent = store
+        .load_stack_container_create_intent(&reservation_id)
+        .unwrap()
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_successor_stopped_event
+             BEFORE INSERT ON events
+             BEGIN SELECT RAISE(ABORT, 'injected stopped event failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .complete_claimed_successor_cleanup(&claim, &reservation_id, 406)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(&reservation_id)
+            .unwrap()
+            .unwrap(),
+        cleanup_pending_intent,
+        "event persistence failure must roll back Cleaned"
+    );
+    assert_eq!(
+        store
+            .load_observed_state_for_replica("exact-batch", "api", 2)
+            .unwrap(),
+        Some(stopping),
+        "event persistence failure must roll back Stopped observation"
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "rolled-back terminal events must not reach subscribers"
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_successor_stopped_event;")
+        .unwrap();
+
+    let stopped = store
+        .complete_claimed_successor_cleanup(&claim, &reservation_id, 407)
+        .unwrap();
+    assert_eq!(stopped.phase, ServicePhase::Stopped);
+    let stopped_event = StackEvent::ServiceStopped {
+        stack_name: "exact-batch".to_string(),
+        service_name: "api-2".to_string(),
+        exit_code: 0,
+    };
+    assert_eq!(event_rx.try_recv().unwrap(), stopped_event);
+    assert_eq!(
+        store
+            .complete_claimed_successor_cleanup(&claim, &reservation_id, 408)
+            .unwrap(),
+        stopped
+    );
+    assert_eq!(
+        event_rx.try_recv().unwrap_err(),
+        std::sync::mpsc::TryRecvError::Empty,
+        "terminal cleanup replay must not notify subscribers twice"
+    );
+    assert_eq!(
+        store.load_events("exact-batch").unwrap(),
+        vec![
+            StackEvent::ServiceCreating {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+            },
+            StackEvent::ServiceFailed {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+                error: "runtime published but activation acknowledgement failed".to_string(),
+            },
+            StackEvent::ServiceStopping {
+                stack_name: "exact-batch".to_string(),
+                service_name: "api-2".to_string(),
+            },
+            stopped_event,
+        ],
+        "post-publication failure cleanup events are durable and emitted exactly once"
     );
 }
 
@@ -16104,8 +16765,15 @@ fn inspect_claimed_predecessor_reopens_every_structurally_legal_linked_successor
                     store
                         .bind_claimed_successor_generation(&claim, &binding)
                         .unwrap();
+                    let receipt = receipt_for_claimed_binding(&binding);
                     store
-                        .publish_claimed_successor_success(&claim, &reservation_id, true, 102)
+                        .publish_claimed_successor_success(
+                            &claim,
+                            &reservation_id,
+                            &receipt,
+                            true,
+                            102,
+                        )
                         .unwrap();
                 }
                 StackContainerCreateStatus::Blocked => {

@@ -33,6 +33,19 @@ impl MacosRuntimeBackend {
         &self.runtime
     }
 
+    /// Execute against one exact published container generation.
+    pub async fn exec_owned_container_generation(
+        &self,
+        ownership: &contract::ContainerGenerationOwnership,
+        config: contract::ExecConfig,
+    ) -> Result<contract::ExecOutput, RuntimeError> {
+        self.runtime
+            .exec_owned_container_generation(ownership, exec_config_from_contract(config))
+            .await
+            .map(exec_output_to_contract)
+            .map_err(oci_err)
+    }
+
     /// Execute setup commands inside a running container.
     ///
     /// Runs each command as `sh -c <cmd>` in order. If any command
@@ -1269,6 +1282,53 @@ mod tests {
                 contract::ContainerGenerationInspection::Published(ownership)
             );
         }
+    }
+
+    #[tokio::test]
+    async fn owned_generation_exec_rejects_unpublished_and_foreign_authority() {
+        let temp = tempdir().unwrap();
+        let backend = MacosRuntimeBackend::new(crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: temp.path().to_path_buf(),
+            ..oci_config::RuntimeConfig::default()
+        }));
+        let scope = generation_scope("stack-exact-exec");
+        let ownership = backend
+            .reserve_container_generation(&scope, "exact-exec")
+            .await
+            .unwrap();
+        let config = contract::ExecConfig {
+            cmd: vec!["true".to_string()],
+            ..contract::ExecConfig::default()
+        };
+
+        let unpublished = backend
+            .exec_owned_container_generation(&ownership, config.clone())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            unpublished.machine_code(),
+            contract::MachineErrorCode::StateConflict
+        );
+        assert!(unpublished.to_string().contains("current published owner"));
+
+        let mut foreign = ownership.clone();
+        foreign.scope.as_mut().unwrap().reservation_id = "reservation-foreign".to_string();
+        let foreign_error = backend
+            .exec_owned_container_generation(&foreign, config)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            foreign_error.machine_code(),
+            contract::MachineErrorCode::StateConflict
+        );
+        assert!(foreign_error.to_string().contains("Foreign"));
+        assert_eq!(
+            backend
+                .inspect_container_generation(&ownership)
+                .await
+                .unwrap(),
+            contract::ContainerGenerationInspection::ReservedUnpublished(ownership)
+        );
     }
 
     #[tokio::test]
