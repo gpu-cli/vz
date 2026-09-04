@@ -413,6 +413,9 @@ pub struct TeardownFinalizer {
     pub initial_volumes: Vec<String>,
     pub initial_disk_image: bool,
     pub initial_runtime_present: bool,
+    /// Exact shared-runtime boot captured before teardown mutation.
+    #[serde(default)]
+    pub initial_runtime_identity: Option<vz_runtime_contract::StackRuntimeIdentity>,
     pub runtime_shutdown: bool,
     pub staged_volumes: Vec<String>,
     pub purged_volumes: Vec<String>,
@@ -1110,7 +1113,8 @@ impl StateStore {
                 store.create_reconcile_schema_v6()?;
                 store.create_claim_schema_v7()?;
                 store.create_teardown_finalizer_schema_v8()?;
-                store.validate_v8_schema()?;
+                store.create_teardown_runtime_identity_schema_v9()?;
+                store.validate_v9_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -1138,7 +1142,8 @@ impl StateStore {
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
@@ -1146,32 +1151,41 @@ impl StateStore {
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
             3 => {
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
             4 => {
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
             5 => {
                 self.migrate_reconcile_v5_to_v6()?;
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
             6 => {
                 self.migrate_claim_v6_to_v7()?;
-                self.migrate_teardown_finalizer_v7_to_v8()
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
             }
-            7 => self.migrate_teardown_finalizer_v7_to_v8(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v8_schema(),
+            7 => {
+                self.migrate_teardown_finalizer_v7_to_v8()?;
+                self.migrate_teardown_runtime_identity_v8_to_v9()
+            }
+            8 => self.migrate_teardown_runtime_identity_v8_to_v9(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v9_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",

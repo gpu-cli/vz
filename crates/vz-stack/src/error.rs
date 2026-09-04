@@ -2,7 +2,7 @@ use std::collections::BTreeMap;
 
 use vz_runtime_contract::{
     MachineError, MachineErrorCode, MachineErrorEnvelope, RequestMetadata, RuntimeError,
-    TopologyLifecycleError, TopologyResolutionError,
+    TopologyLifecycleError, TopologyResolutionError, runtime_error_machine_error,
 };
 
 /// Owner recorded for a physical/runtime resource key that could not be reserved.
@@ -77,6 +77,15 @@ pub enum StackError {
         /// Human-readable context string.
         message: String,
     },
+
+    /// Runtime failure retained in typed form so action transports preserve
+    /// its variant-specific structured details.
+    #[error(transparent)]
+    Runtime(RuntimeError),
+
+    /// Fully classified machine error retained across stack execution.
+    #[error("{code}: {message}", code = .0.code, message = .0.message)]
+    TypedMachine(MachineError),
 }
 
 impl StackError {
@@ -143,6 +152,8 @@ impl StackError {
             }
             StackError::Network(_) => MachineErrorCode::BackendUnavailable,
             StackError::Machine { code, .. } => *code,
+            StackError::Runtime(error) => error.machine_code(),
+            StackError::TypedMachine(error) => error.code,
         }
     }
 
@@ -188,12 +199,26 @@ impl StackError {
             StackError::Machine { message, .. } => {
                 details.insert("reason".to_string(), message.clone());
             }
+            StackError::Runtime(error) => {
+                details.insert("reason".to_string(), error.to_string());
+            }
+            StackError::TypedMachine(error) => details.extend(error.details.clone()),
         }
         details
     }
 
     /// Convert a stack error into the shared machine-error payload.
     pub fn to_machine_error(&self, metadata: &RequestMetadata) -> MachineError {
+        if let StackError::Runtime(error) = self {
+            return runtime_error_machine_error(error, metadata);
+        }
+        if let StackError::TypedMachine(error) = self {
+            let mut error = error.clone();
+            if metadata.request_id.is_some() {
+                error.request_id = metadata.request_id.clone();
+            }
+            return error;
+        }
         MachineError::new(
             self.machine_code(),
             self.to_string(),
@@ -222,10 +247,7 @@ impl From<TopologyLifecycleError> for StackError {
 
 impl From<RuntimeError> for StackError {
     fn from(error: RuntimeError) -> Self {
-        StackError::Machine {
-            code: error.machine_code(),
-            message: error.to_string(),
-        }
+        StackError::Runtime(error)
     }
 }
 
@@ -244,7 +266,7 @@ mod tests {
             stack_error.machine_code(),
             MachineErrorCode::UnsupportedOperation
         );
-        assert!(matches!(stack_error, StackError::Machine { .. }));
+        assert!(matches!(stack_error, StackError::Runtime(_)));
     }
 
     #[test]

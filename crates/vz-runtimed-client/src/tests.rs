@@ -72,6 +72,135 @@ fn client_config(tmp: &tempfile::TempDir, auto_spawn: bool) -> DaemonClientConfi
     }
 }
 
+fn seed_stack_topology(
+    config: &RuntimedConfig,
+    stack_id: &str,
+) -> runtime_v2::MachineWorkloadScope {
+    use vz_runtime_contract::{
+        Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+        EnvironmentState, MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId,
+        MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState,
+        MachineWorkloadScope, OperatingSystem, OwnedResourceKind, OwnershipRecord,
+        ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    };
+
+    let project_id = ProjectId::new("prj-runtimed-client").expect("valid project id");
+    let environment_id = EnvironmentId::new("env-runtimed-client").expect("valid environment id");
+    let machine_id = MachineId::new("mch-runtimed-client").expect("valid machine id");
+    let incarnation_id =
+        MachineIncarnationId::new("inc-runtimed-client").expect("valid incarnation id");
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "ubuntu:24.04".to_string(),
+        version: None,
+        channel: None,
+        digest: Some("sha256:runtimed-client".to_string()),
+    };
+    let capabilities = CapabilitySet::new([
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "runtimed-client".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![MachineSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                workspace: None,
+            }],
+            networks: Vec::new(),
+            endpoints: Vec::new(),
+        },
+    };
+    let environment = EnvironmentInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        environment_id: environment_id.clone(),
+        project_id: project_id.clone(),
+        name: "developer".to_string(),
+        definition_digest: definition.digest().expect("definition digest"),
+        state: EnvironmentState::Ready,
+        lifecycle_generation: 1,
+        active_operation_id: None,
+        bindings: Vec::new(),
+        machines: vec![MachineInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machine_id: machine_id.clone(),
+            environment_id: environment_id.clone(),
+            name: "linux".to_string(),
+            profile: MachineProfile::Developer,
+            target,
+            resources: MachineResources::default(),
+            requested_capabilities: capabilities.clone(),
+            negotiated_capabilities: capabilities,
+            backend: None,
+            incarnation: Some(MachineIncarnation {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                incarnation_id: incarnation_id.clone(),
+                machine_id: machine_id.clone(),
+                generation: 1,
+                created_at: 1,
+            }),
+            state: MachineState::Ready,
+            legacy_sandbox_id: None,
+        }],
+        networks: Vec::new(),
+        endpoints: Vec::new(),
+        ownership: vec![
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Machine,
+                resource_id: machine_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Incarnation,
+                resource_id: incarnation_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+        ],
+        legacy_migration: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+
+    std::fs::create_dir_all(
+        config
+            .state_store_path
+            .parent()
+            .expect("state store path has a parent"),
+    )
+    .expect("create state store directory");
+    vz_stack::StateStore::open(&config.state_store_path)
+        .expect("open state store")
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        })
+        .expect("seed stack topology");
+
+    vz_runtime_translate::machine_workload_scope_to_proto(&MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id,
+        environment_id,
+        machine_id,
+        machine_incarnation_id: incarnation_id,
+        stack_id: stack_id.to_string(),
+    })
+}
+
 fn required_sandbox_labels(tmp: &tempfile::TempDir) -> HashMap<String, String> {
     HashMap::from([("project_dir".to_string(), tmp.path().display().to_string())])
 }
@@ -87,6 +216,32 @@ fn assert_grpc_status_in(error: DaemonClientError, expected: &[Code]) {
             );
         }
         other => panic!("expected grpc status error, got {other:?}"),
+    }
+}
+
+#[test]
+fn structured_unavailable_status_preserves_application_error_details() {
+    let socket = Path::new("/tmp/vz-structured-status.sock");
+    let status = tonic::Status::with_details(
+        Code::Unavailable,
+        "backend_unavailable: runtime operation failed",
+        vec![1, 2, 3].into(),
+    );
+    match crate::transport::status_to_client_error(socket, status) {
+        DaemonClientError::Grpc(status) => assert_eq!(status.details(), &[1, 2, 3]),
+        other => panic!("structured application status was flattened: {other:?}"),
+    }
+}
+
+#[test]
+fn detail_free_unavailable_status_remains_a_connection_failure() {
+    let socket = Path::new("/tmp/vz-unavailable.sock");
+    match crate::transport::status_to_client_error(
+        socket,
+        tonic::Status::unavailable("connection closed"),
+    ) {
+        DaemonClientError::Unavailable { socket_path, .. } => assert_eq!(socket_path, socket),
+        other => panic!("detail-free transport status changed category: {other:?}"),
     }
 }
 
@@ -401,12 +556,14 @@ async fn create_sandbox_stream_terminal_error_is_mapped_to_invalid_argument() {
 #[tokio::test]
 async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let daemon_config = runtimed_config(&tmp);
+    let stack_name = "stack-client-e2e".to_string();
+    let scope = seed_stack_topology(&daemon_config, &stack_name);
+    let daemon = start_daemon(daemon_config).await;
     let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
         .await
         .expect("client connect");
 
-    let stack_name = "stack-client-e2e".to_string();
     let applied = client
         .apply_stack_with_metadata(runtime_v2::ApplyStackRequest {
             metadata: None,
@@ -415,7 +572,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             compose_dir: ".".to_string(),
             detach: false,
             dry_run: false,
-            scope: None,
+            scope: Some(scope.clone()),
         })
         .await
         .expect("apply stack");
@@ -427,7 +584,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
         .get_stack_status(runtime_v2::GetStackStatusRequest {
             metadata: None,
             stack_name: stack_name.clone(),
-            scope: None,
+            scope: Some(scope.clone()),
         })
         .await
         .expect("get stack status");
@@ -439,7 +596,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             stack_name: stack_name.clone(),
             after: 0,
             limit: 100,
-            scope: None,
+            scope: Some(scope.clone()),
         })
         .await
         .expect("list stack events");
@@ -454,7 +611,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             stack_name,
             remove_volumes: false,
             dry_run: false,
-            scope: None,
+            scope: Some(scope),
         })
         .await
         .expect("teardown stack");
@@ -755,12 +912,14 @@ async fn checkpoint_export_and_import_missing_paths_return_not_found() {
 #[tokio::test]
 async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let daemon_config = runtimed_config(&tmp);
+    let stack_name = "stack-client-aux".to_string();
+    let scope = seed_stack_topology(&daemon_config, &stack_name);
+    let daemon = start_daemon(daemon_config).await;
     let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
         .await
         .expect("client connect");
 
-    let stack_name = "stack-client-aux".to_string();
     client
         .apply_stack(runtime_v2::ApplyStackRequest {
             metadata: None,
@@ -769,7 +928,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             compose_dir: ".".to_string(),
             dry_run: false,
             detach: false,
-            scope: None,
+            scope: Some(scope.clone()),
         })
         .await
         .expect("apply stack");
@@ -796,11 +955,21 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service: "svc".to_string(),
             tail: 50,
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope.clone()
+            }),
         })
         .await;
     if let Err(error) = logs_result {
-        assert_grpc_status_in(error, &[Code::NotFound, Code::Unimplemented]);
+        assert_grpc_status_in(
+            error,
+            &[
+                Code::NotFound,
+                Code::FailedPrecondition,
+                Code::Unimplemented,
+            ],
+        );
     }
 
     let stop_error = client
@@ -808,7 +977,10 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope.clone()
+            }),
         })
         .await
         .expect_err("stop stack service should fail for missing stack/service");
@@ -819,7 +991,10 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope.clone()
+            }),
         })
         .await
         .expect_err("start stack service should fail for missing stack/service");
@@ -830,7 +1005,10 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope.clone()
+            }),
         })
         .await
         .expect_err("restart stack service should fail for missing stack/service");
@@ -842,7 +1020,10 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
             run_service_name: "svc-run".to_string(),
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope.clone()
+            }),
         })
         .await
         .expect_err("create stack run container should fail for missing stack/service");
@@ -857,7 +1038,10 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
             run_service_name: "svc-run".to_string(),
-            scope: None,
+            scope: Some(runtime_v2::MachineWorkloadScope {
+                stack_id: "stack-missing-client".to_string(),
+                ..scope
+            }),
         })
         .await
         .expect_err("remove stack run container should fail for missing stack/service");

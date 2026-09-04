@@ -11,6 +11,21 @@ use super::*;
 
 pub(super) const SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
 
+pub(super) fn classify_stack_runtime_shutdown(
+    current: Option<&vz_runtime_contract::StackRuntimeIdentity>,
+    expected: &vz_runtime_contract::StackRuntimeIdentity,
+) -> vz_runtime_contract::StackRuntimeShutdownOutcome {
+    match current {
+        None => vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent,
+        Some(current) if current == expected => {
+            vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped
+        }
+        Some(current) => vz_runtime_contract::StackRuntimeShutdownOutcome::ReplacementPresent {
+            current: current.clone(),
+        },
+    }
+}
+
 /// Owned proof that one stack's complete guest activation transaction is
 /// serialized. The first overlay mutation requires this value, and its drop
 /// scope extends through OCI activation and post-start validation.
@@ -805,7 +820,15 @@ impl Runtime {
                 .insert(stack_id.to_string(), pf);
         }
 
-        self.stack_vms.lock().await.insert(stack_id.to_string(), vm);
+        let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
+            .map_err(OciError::InvalidConfig)?;
+        self.stack_vms.lock().await.insert(
+            stack_id.to_string(),
+            super::StackVmRecord {
+                identity: runtime_identity,
+                vm,
+            },
+        );
 
         Ok(())
     }
@@ -864,7 +887,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .cloned()
+            .map(|record| record.vm.clone())
             .ok_or_else(|| {
                 OciError::InvalidConfig(format!(
                     "no shared VM running for stack '{stack_id}'; call boot_shared_vm first"
@@ -1160,7 +1183,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .is_some_and(|current| Arc::ptr_eq(current, &vm));
+            .is_some_and(|current| Arc::ptr_eq(&current.vm, &vm));
         if !vm_is_current {
             container.status = ContainerStatus::Stopped { exit_code: -1 };
             container.stopped_unix_secs = Some(current_unix_secs());
@@ -1578,7 +1601,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .cloned()
+            .map(|record| record.vm.clone())
             .ok_or_else(|| {
                 OciError::InvalidConfig(format!(
                     "no shared VM running for stack '{stack_id}'; call boot_shared_vm first"
@@ -1651,6 +1674,11 @@ impl Runtime {
             .await
             .write_owned()
             .await;
+        self.shutdown_shared_vm_locked(stack_id).await
+    }
+
+    /// Shut down a shared VM while the caller holds the stack lifecycle writer.
+    async fn shutdown_shared_vm_locked(&self, stack_id: &str) -> Result<(), OciError> {
         let (stack_vms_count, stack_port_forwards_count) = {
             let vms = self.stack_vms.lock().await;
             let pfs = self.stack_port_forwards.lock().await;
@@ -1686,7 +1714,13 @@ impl Runtime {
             }
         }
 
-        let Some(vm) = self.stack_vms.lock().await.get(stack_id).cloned() else {
+        let Some(vm) = self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .map(|record| record.vm.clone())
+        else {
             // Bug B fix: in-memory state can be empty after a daemon
             // respawn (kill -9 / OS reboot mid-operation). In that case
             // the SQLite state-store may still claim the sandbox is
@@ -1855,6 +1889,46 @@ impl Runtime {
         Ok(())
     }
 
+    /// Return the identity of the currently active shared-runtime boot.
+    pub async fn inspect_shared_vm_identity(
+        &self,
+        stack_id: &str,
+    ) -> Result<Option<vz_runtime_contract::StackRuntimeIdentity>, OciError> {
+        let _stack_lifecycle_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        Ok(self
+            .stack_vms
+            .lock()
+            .await
+            .get(stack_id)
+            .map(|record| record.identity.clone()))
+    }
+
+    /// Atomically compare and stop exactly one shared-runtime boot.
+    pub async fn shutdown_shared_vm_exact(
+        &self,
+        request: &vz_runtime_contract::StackRuntimeShutdownRequest,
+    ) -> Result<vz_runtime_contract::StackRuntimeShutdownOutcome, OciError> {
+        request.validate().map_err(OciError::InvalidConfig)?;
+        let expected = &request.expected;
+        let stack_id = expected.stack_id.as_str();
+        let _stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
+        let current = self.stack_vms.lock().await.get(stack_id).cloned();
+        match classify_stack_runtime_shutdown(
+            current.as_ref().map(|record| &record.identity),
+            expected,
+        ) {
+            vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped => {
+                self.shutdown_shared_vm_locked(stack_id).await?;
+                Ok(vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped)
+            }
+            outcome => Ok(outcome),
+        }
+    }
+
     /// Check whether a shared VM is running for the given stack.
     pub async fn has_shared_vm(&self, stack_id: &str) -> bool {
         self.stack_vms.lock().await.contains_key(stack_id)
@@ -1915,7 +1989,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .cloned()
+            .map(|record| record.vm.clone())
             .ok_or_else(|| {
                 OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
@@ -1946,7 +2020,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .cloned()
+            .map(|record| record.vm.clone())
             .ok_or_else(|| {
                 OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;
@@ -1970,7 +2044,7 @@ impl Runtime {
             .lock()
             .await
             .get(stack_id)
-            .cloned()
+            .map(|record| record.vm.clone())
             .ok_or_else(|| {
                 OciError::InvalidConfig(format!("no shared VM running for stack '{stack_id}'"))
             })?;

@@ -30,10 +30,13 @@ message RequestMetadata {
 
 // ── Error envelope ─────────────────────────────────────────────────
 
+// Serialized ErrorDetail protobuf bytes are carried in tonic Status details.
 message ErrorDetail {
   string code = 1;
   string message = 2;
   string request_id = 3;
+  // Stable machine-readable context retained across gRPC failures.
+  map<string, string> details = 4;
 }
 
 // ── Developer Environment topology contract ──────────────────────

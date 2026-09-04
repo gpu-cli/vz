@@ -12,14 +12,35 @@ use super::exec::{
     pending_control_error,
 };
 use super::stack_vm::{
-    activation_error_with_rollback, clear_recovery_route_last, commit_stack_cleanup_batch,
-    hosts_write_command, publish_recovery_route_first, require_running_pid,
-    require_successful_hosts_write, shutdown_container_cleanup_transition,
+    activation_error_with_rollback, classify_stack_runtime_shutdown, clear_recovery_route_last,
+    commit_stack_cleanup_batch, hosts_write_command, publish_recovery_route_first,
+    require_running_pid, require_successful_hosts_write, shutdown_container_cleanup_transition,
 };
 use super::*;
 use vz_linux::KernelVersion;
 
 const EXPECTED_SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
+
+#[test]
+fn exact_stack_runtime_shutdown_classification_never_authorizes_a_replacement() {
+    let expected = vz_runtime_contract::StackRuntimeIdentity::new("stack-a").unwrap();
+    let replacement = vz_runtime_contract::StackRuntimeIdentity::new("stack-a").unwrap();
+
+    assert_eq!(
+        classify_stack_runtime_shutdown(None, &expected),
+        vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent
+    );
+    assert_eq!(
+        classify_stack_runtime_shutdown(Some(&expected), &expected),
+        vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped
+    );
+    assert_eq!(
+        classify_stack_runtime_shutdown(Some(&replacement), &expected),
+        vz_runtime_contract::StackRuntimeShutdownOutcome::ReplacementPresent {
+            current: replacement,
+        }
+    );
+}
 
 fn unique_temp_dir(name: &str) -> PathBuf {
     let mut base = env::temp_dir();
@@ -504,7 +525,7 @@ async fn generation_ownership_sigkill_crash_reopen() {
             "skips": 0,
         },
         "state_store_expectation": {
-            "schema_version": 8,
+            "schema_version": 9,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence",
         },

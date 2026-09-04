@@ -667,14 +667,14 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         actions: &[Action],
         claims: &[ReconcileActionClaim],
-    ) -> HashMap<ServiceReplicaKey, String> {
+    ) -> HashMap<ServiceReplicaKey, vz_runtime_contract::MachineError> {
         let mut failures = HashMap::new();
         let mut decisions = Vec::with_capacity(actions.len());
         for (action, claim) in actions.iter().zip(claims) {
             match self.inspect_claimed_predecessor_decision(spec, action, claim) {
                 Ok(decision) => decisions.push((action.target().clone(), decision)),
                 Err(error) => {
-                    failures.insert(action.target().clone(), error.to_string());
+                    failures.insert(action.target().clone(), execution_machine_error(&error));
                 }
             }
         }
@@ -683,7 +683,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         }
         for (target, decision) in decisions {
             if let Err(error) = self.apply_claimed_preflight_decision(decision) {
-                failures.insert(target, error.to_string());
+                failures.insert(target, execution_machine_error(&error));
                 break;
             }
         }
@@ -1190,11 +1190,8 @@ fn record_action_error(
     target: &ServiceReplicaKey,
     error: StackError,
 ) {
-    let message = error.to_string();
     result.failed += 1;
-    result
-        .errors
-        .push((exact_target_label(target), message.clone()));
+    let message = record_execution_error(result, exact_target_label(target), &error);
     outcome_failures.entry(target.clone()).or_insert(message);
 }
 

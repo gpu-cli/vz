@@ -9,7 +9,8 @@ use vz_runtime_contract::{
     ContainerGenerationOwnership, ContainerGenerationReleaseOutcome, ContainerGenerationScope,
     ContainerInfo, ContainerLogs, ContainerStatus, Event, EventScope, ExecConfig, ExecOutput,
     GenerationCleanupOutcome, ImageInfo, OwnedCreateError, PortMapping, PruneResult, RunConfig,
-    RuntimeBackend, RuntimeCapabilities, RuntimeError, StackResourceHint,
+    RuntimeBackend, RuntimeCapabilities, RuntimeError, StackResourceHint, StackRuntimeIdentity,
+    StackRuntimeShutdownOutcome, StackRuntimeShutdownRequest,
 };
 
 #[cfg(target_os = "macos")]
@@ -45,8 +46,9 @@ pub struct TestRuntimeBackend {
     exact_generation_supported: AtomicBool,
     fail_next_generation_cleanup: AtomicBool,
     fail_next_shared_vm_shutdown: AtomicBool,
+    fail_next_shared_vm_shutdown_after_stop: AtomicBool,
     shared_vm_shutdown_count: AtomicU64,
-    shared_vms: Mutex<HashSet<String>>,
+    shared_vms: Mutex<HashMap<String, StackRuntimeIdentity>>,
     containers: Mutex<HashMap<String, MockContainerRecord>>,
     generations: Mutex<HashMap<String, MockGenerationRecord>>,
     live_exec_sessions: Mutex<HashSet<String>>,
@@ -63,6 +65,12 @@ impl TestRuntimeBackend {
     #[cfg(test)]
     pub(crate) fn fail_next_shared_vm_shutdown(&self) {
         self.fail_next_shared_vm_shutdown
+            .store(true, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_next_shared_vm_shutdown_after_stop(&self) {
+        self.fail_next_shared_vm_shutdown_after_stop
             .store(true, Ordering::SeqCst);
     }
 
@@ -166,7 +174,7 @@ impl TestRuntimeBackend {
                 .shared_vms
                 .lock()
                 .map_err(|_| Self::lock_poisoned_error("shared_vms"))?;
-            if !shared_vms.contains(stack_id) {
+            if !shared_vms.contains_key(stack_id) {
                 return Err(Self::missing_shared_vm_error(stack_id));
             }
         }
@@ -475,7 +483,10 @@ impl RuntimeBackend for TestRuntimeBackend {
                 .shared_vms
                 .lock()
                 .map_err(|_| Self::lock_poisoned_error("shared_vms"))?;
-            shared_vms.insert(stack_id.to_string());
+            shared_vms.insert(
+                stack_id.to_string(),
+                StackRuntimeIdentity::new(stack_id).map_err(RuntimeError::InvalidConfig)?,
+            );
             Ok(())
         })();
         ready(result)
@@ -766,10 +777,63 @@ impl RuntimeBackend for TestRuntimeBackend {
         ready(result)
     }
 
+    fn inspect_shared_vm(
+        &self,
+        stack_id: &str,
+    ) -> impl Future<Output = Result<Option<StackRuntimeIdentity>, RuntimeError>> {
+        let result = self
+            .shared_vms
+            .lock()
+            .map_err(|_| Self::lock_poisoned_error("shared_vms"))
+            .map(|shared_vms| shared_vms.get(stack_id).cloned());
+        ready(result)
+    }
+
+    fn shutdown_shared_vm_exact(
+        &self,
+        request: &StackRuntimeShutdownRequest,
+    ) -> impl Future<Output = Result<StackRuntimeShutdownOutcome, RuntimeError>> {
+        let result = (|| {
+            request.validate().map_err(RuntimeError::InvalidConfig)?;
+            let mut shared_vms = self
+                .shared_vms
+                .lock()
+                .map_err(|_| Self::lock_poisoned_error("shared_vms"))?;
+            let Some(current) = shared_vms.get(&request.expected.stack_id).cloned() else {
+                return Ok(StackRuntimeShutdownOutcome::AlreadyAbsent);
+            };
+            if current != request.expected {
+                return Ok(StackRuntimeShutdownOutcome::ReplacementPresent { current });
+            }
+            self.shared_vm_shutdown_count.fetch_add(1, Ordering::SeqCst);
+            if self
+                .fail_next_shared_vm_shutdown
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(RuntimeError::Io(std::io::Error::other(format!(
+                    "injected shared VM shutdown failure for stack '{}'",
+                    request.expected.stack_id
+                ))));
+            }
+            shared_vms.remove(&request.expected.stack_id);
+            if self
+                .fail_next_shared_vm_shutdown_after_stop
+                .swap(false, Ordering::SeqCst)
+            {
+                return Err(RuntimeError::Io(std::io::Error::other(format!(
+                    "injected lost shutdown acknowledgement for stack '{}'",
+                    request.expected.stack_id
+                ))));
+            }
+            Ok(StackRuntimeShutdownOutcome::Stopped)
+        })();
+        ready(result)
+    }
+
     fn has_shared_vm(&self, stack_id: &str) -> bool {
         self.shared_vms
             .lock()
-            .map(|shared_vms| shared_vms.contains(stack_id))
+            .map(|shared_vms| shared_vms.contains_key(stack_id))
             .unwrap_or(false)
     }
 
@@ -922,6 +986,67 @@ impl RuntimeBackend for TestRuntimeBackend {
             Ok(record.build.clone())
         })();
         ready(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn stale_exact_shutdown_never_stops_a_replacement_runtime() {
+        let backend = TestRuntimeBackend::default();
+        backend
+            .boot_shared_vm(
+                "stack-replacement",
+                Vec::new(),
+                StackResourceHint::default(),
+            )
+            .await
+            .unwrap();
+        let original = backend
+            .inspect_shared_vm("stack-replacement")
+            .await
+            .unwrap()
+            .unwrap();
+        let request = StackRuntimeShutdownRequest {
+            schema_version: vz_runtime_contract::STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+            operation_id: "teardown:original".to_string(),
+            expected: original.clone(),
+        };
+        assert_eq!(
+            backend.shutdown_shared_vm_exact(&request).await.unwrap(),
+            StackRuntimeShutdownOutcome::Stopped
+        );
+
+        backend
+            .boot_shared_vm(
+                "stack-replacement",
+                Vec::new(),
+                StackResourceHint::default(),
+            )
+            .await
+            .unwrap();
+        let replacement = backend
+            .inspect_shared_vm("stack-replacement")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(replacement, original);
+        assert_eq!(
+            backend.shutdown_shared_vm_exact(&request).await.unwrap(),
+            StackRuntimeShutdownOutcome::ReplacementPresent {
+                current: replacement.clone()
+            }
+        );
+        assert_eq!(
+            backend
+                .inspect_shared_vm("stack-replacement")
+                .await
+                .unwrap(),
+            Some(replacement)
+        );
+        assert_eq!(backend.shared_vm_shutdown_count(), 1);
     }
 }
 

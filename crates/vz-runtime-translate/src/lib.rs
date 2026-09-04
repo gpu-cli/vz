@@ -2034,6 +2034,7 @@ pub fn machine_error_to_proto_detail(error: &MachineError) -> runtime_v2::ErrorD
         code: error.code.as_str().to_string(),
         message: error.message.clone(),
         request_id: error.request_id.clone().unwrap_or_default(),
+        details: btree_to_hash_map(&error.details),
     }
 }
 
@@ -2046,7 +2047,7 @@ pub fn machine_error_from_proto_detail(
         code,
         detail.message.clone(),
         normalize_optional_wire_field(&detail.request_id),
-        BTreeMap::new(),
+        hash_to_btree_map(&detail.details),
     ))
 }
 
@@ -4086,6 +4087,7 @@ mod tests {
             code: "made_up".to_string(),
             message: "x".to_string(),
             request_id: String::new(),
+            details: std::collections::HashMap::new(),
         };
 
         let err = machine_error_from_proto_detail(&detail).expect_err("should reject unknown code");

@@ -71,6 +71,21 @@ fn validate_teardown_finalizer(record: &TeardownFinalizer) -> Result<(), StackEr
         )));
     }
     record.scope.validate().map_err(StackError::InvalidSpec)?;
+    if let Some(identity) = &record.initial_runtime_identity {
+        identity.validate().map_err(StackError::InvalidSpec)?;
+        if identity.stack_id != record.scope.stack_id {
+            return Err(StackError::InvalidSpec(
+                "teardown runtime identity does not match its workload stack".to_string(),
+            ));
+        }
+    }
+    if record.status == TeardownFinalizerStatus::Prepared
+        && record.initial_runtime_present != record.initial_runtime_identity.is_some()
+    {
+        return Err(StackError::InvalidSpec(
+            "prepared teardown finalizer lacks exact runtime identity evidence".to_string(),
+        ));
+    }
     if record.scope.stack_id != record.scope.stack_id.trim()
         || record.operation_key.trim().is_empty()
         || (!record.operation_key.starts_with("idem:") && !record.operation_key.starts_with("req:"))
@@ -214,6 +229,7 @@ fn teardown_finalizer_identity_matches(
         && left.initial_volumes == right.initial_volumes
         && left.initial_disk_image == right.initial_disk_image
         && left.initial_runtime_present == right.initial_runtime_present
+        && left.initial_runtime_identity == right.initial_runtime_identity
 }
 
 fn teardown_idempotency_pending_value(operation_key: &str) -> String {
@@ -4106,7 +4122,7 @@ impl StateStore {
                         environment_id, machine_id, machine_incarnation_id, stack_name,
                         remove_volumes, changed_actions, actions_hash, desired_state_digest,
                         initial_volumes_json, initial_disk_image, initial_runtime_present,
-                        runtime_shutdown, staged_volumes_json, purged_volumes_json,
+                        initial_runtime_identity_json, runtime_shutdown, staged_volumes_json, purged_volumes_json,
                         disk_staged, disk_purged, status, receipt_id, created_at, updated_at,
                         completed_at
                  FROM teardown_finalizers WHERE operation_key = ?1",
@@ -4132,16 +4148,17 @@ impl StateStore {
                         row.get::<_, String>(16)?,
                         row.get::<_, i64>(17)?,
                         row.get::<_, i64>(18)?,
-                        row.get::<_, i64>(19)?,
-                        row.get::<_, String>(20)?,
+                        row.get::<_, Option<String>>(19)?,
+                        row.get::<_, i64>(20)?,
                         row.get::<_, String>(21)?,
-                        row.get::<_, i64>(22)?,
+                        row.get::<_, String>(22)?,
                         row.get::<_, i64>(23)?,
-                        row.get::<_, String>(24)?,
-                        row.get::<_, Option<String>>(25)?,
-                        row.get::<_, i64>(26)?,
+                        row.get::<_, i64>(24)?,
+                        row.get::<_, String>(25)?,
+                        row.get::<_, Option<String>>(26)?,
                         row.get::<_, i64>(27)?,
-                        row.get::<_, Option<i64>>(28)?,
+                        row.get::<_, i64>(28)?,
+                        row.get::<_, Option<i64>>(29)?,
                     ))
                 },
             )
@@ -4152,8 +4169,10 @@ impl StateStore {
         let record: TeardownFinalizer = serde_json::from_str(&row.0)?;
         validate_teardown_finalizer(&record)?;
         let initial_volumes: Vec<String> = serde_json::from_str(&row.16)?;
-        let staged_volumes: Vec<String> = serde_json::from_str(&row.20)?;
-        let purged_volumes: Vec<String> = serde_json::from_str(&row.21)?;
+        let projected_runtime_identity: Option<vz_runtime_contract::StackRuntimeIdentity> =
+            row.19.as_deref().map(serde_json::from_str).transpose()?;
+        let staged_volumes: Vec<String> = serde_json::from_str(&row.21)?;
+        let purged_volumes: Vec<String> = serde_json::from_str(&row.22)?;
         let receipt_id = record
             .receipt
             .as_ref()
@@ -4176,19 +4195,20 @@ impl StateStore {
             && record.initial_volumes == initial_volumes
             && record.initial_disk_image == (row.17 != 0)
             && record.initial_runtime_present == (row.18 != 0)
-            && record.runtime_shutdown == (row.19 != 0)
+            && record.initial_runtime_identity == projected_runtime_identity
+            && record.runtime_shutdown == (row.20 != 0)
             && record.staged_volumes == staged_volumes
             && record.purged_volumes == purged_volumes
-            && record.disk_staged == (row.22 != 0)
-            && record.disk_purged == (row.23 != 0)
-            && record.status.as_str() == row.24
-            && receipt_id == row.25.as_deref()
-            && i64::try_from(record.created_at).ok() == Some(row.26)
-            && i64::try_from(record.updated_at).ok() == Some(row.27)
+            && record.disk_staged == (row.23 != 0)
+            && record.disk_purged == (row.24 != 0)
+            && record.status.as_str() == row.25
+            && receipt_id == row.26.as_deref()
+            && i64::try_from(record.created_at).ok() == Some(row.27)
+            && i64::try_from(record.updated_at).ok() == Some(row.28)
             && record
                 .completed_at
                 .and_then(|value| i64::try_from(value).ok())
-                == row.28;
+                == row.29;
         if !projections_match {
             return Err(StackError::InvalidSpec(format!(
                 "teardown finalizer `{operation_key}` JSON/projection mismatch"
@@ -4320,13 +4340,13 @@ impl StateStore {
                     environment_id, machine_id, machine_incarnation_id, stack_name,
                     remove_volumes, changed_actions, actions_hash, desired_state_digest,
                     initial_volumes_json, initial_disk_image, initial_runtime_present,
-                    runtime_shutdown, staged_volumes_json, purged_volumes_json,
+                    initial_runtime_identity_json, runtime_shutdown, staged_volumes_json, purged_volumes_json,
                     disk_staged, disk_purged, status, receipt_id, finalizer_json,
                     created_at, updated_at, completed_at
                  ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                     ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
-                    ?21, ?22, ?23, ?24, ?25, NULL, ?26, ?27, ?28, NULL
+                    ?21, ?22, ?23, ?24, ?25, ?26, NULL, ?27, ?28, ?29, NULL
                  )",
                 params![
                     record.operation_key,
@@ -4348,6 +4368,11 @@ impl StateStore {
                     initial_volumes_json,
                     record.initial_disk_image,
                     record.initial_runtime_present,
+                    record
+                        .initial_runtime_identity
+                        .as_ref()
+                        .map(serde_json::to_string)
+                        .transpose()?,
                     record.runtime_shutdown,
                     staged_volumes_json,
                     purged_volumes_json,

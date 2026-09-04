@@ -35,7 +35,7 @@ Options:
   --profile <debug|release>   Cargo profile for builds (default: debug)
                               complete runtime-containing lanes require release
   --suite <name>              Suite to run (repeatable, comma-separated allowed)
-                              names: runtime, stack, buildkit, sandbox, all
+                              names: runtime, runtimed, stack, buildkit, sandbox, all
                               default: sandbox (runtime + stack)
   --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
                               names:
@@ -44,6 +44,7 @@ Options:
                                 runtime-exec-defaults,
                                 runtime-port-forwarding, runtime-shared-vm-net,
                                 runtime-generation-crash-reopen, stack-real-services,
+                                runtimed-teardown-finalizer-crash-reopen,
                                 stack-control-socket, stack-port-forwarding,
                                 stack-container-ownership,
                                 stack-snapshot-restore,
@@ -113,6 +114,9 @@ expand_suite_token() {
             runtime)
                 append_unique "runtime"
                 ;;
+            runtimed)
+                append_unique "runtimed"
+                ;;
             stack)
                 append_unique "stack"
                 ;;
@@ -126,11 +130,12 @@ expand_suite_token() {
             all)
                 FULL_CLOSURE_GATE_SELECTED=true
                 append_unique "runtime"
+                append_unique "runtimed"
                 append_unique "stack"
                 append_unique "buildkit"
                 ;;
             *)
-                err "unknown suite '$part' (expected runtime|stack|buildkit|sandbox|all)"
+                err "unknown suite '$part' (expected runtime|runtimed|stack|buildkit|sandbox|all)"
                 ;;
         esac
     done
@@ -147,7 +152,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen|runtimed-teardown-finalizer-crash-reopen|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -174,6 +179,7 @@ expand_scenario_token() {
                 append_unique_scenario "runtime-port-forwarding"
                 append_unique_scenario "runtime-shared-vm-net"
                 append_unique_scenario "runtime-generation-crash-reopen"
+                append_unique_scenario "runtimed-teardown-finalizer-crash-reopen"
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
@@ -193,6 +199,9 @@ scenario_suite() {
     case "$1" in
         runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen)
             echo "runtime"
+            ;;
+        runtimed-teardown-finalizer-crash-reopen)
+            echo "runtimed"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|environment-lifecycle-journal-linux-vm)
             echo "stack"
@@ -237,6 +246,9 @@ scenario_test_filter() {
             ;;
         runtime-generation-crash-reopen)
             echo "runtime::tests::generation_ownership_sigkill_crash_reopen"
+            ;;
+        runtimed-teardown-finalizer-crash-reopen)
+            echo "teardown_finalizer_sigkill_restart_replacement_refusal"
             ;;
         stack-real-services)
             echo "real_services_postgres_and_redis"
@@ -362,6 +374,16 @@ if [[ "$CRASH_REOPEN_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; the
     err "runtime generation crash/reopen evidence requires --profile release"
 fi
 
+RUNTIMED_TEARDOWN_LANE_SELECTED=false
+if [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" \
+    || " ${RESOLVED_SUITES[*]} " == *" runtimed "* \
+    || " ${RESOLVED_SCENARIOS[*]:-} " == *" runtimed-teardown-finalizer-crash-reopen "* ]]; then
+    RUNTIMED_TEARDOWN_LANE_SELECTED=true
+fi
+if [[ "$RUNTIMED_TEARDOWN_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
+    err "runtimed teardown finalizer crash/reopen evidence requires --profile release"
+fi
+
 BUILDKIT_SELECTED=false
 for selected_suite in "${RESOLVED_SUITES[@]}"; do
     if [[ "$selected_suite" == "buildkit" ]]; then
@@ -481,6 +503,8 @@ RUNTIME_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-crash-reopen.json"
 RUNTIME_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-crash-reopen.json.sha256"
 STACK_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-state-store-v7.json"
 STACK_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-state-store-v7.json.sha256"
+RUNTIMED_TEARDOWN_EVIDENCE="$RUN_DIR/runtimed-teardown-finalizer-crash-reopen.json"
+RUNTIMED_TEARDOWN_SHA256="$RUN_DIR/runtimed-teardown-finalizer-crash-reopen.json.sha256"
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -688,6 +712,35 @@ resolve_cargo_executable() {
         ' "$artifact_log"
 }
 
+resolve_cargo_features() {
+    local artifact_log="$1"
+    local target_name="$2"
+    local target_kind="$3"
+
+    jq -cers \
+        --arg target_name "$target_name" \
+        --arg target_kind "$target_kind" '
+            [
+                .[]
+                | select(
+                    .reason == "compiler-artifact"
+                    and .target.name == $target_name
+                    and (.target.kind | index($target_kind)) != null
+                    and .executable != null
+                )
+                | .features
+            ]
+            | unique
+            | if length == 1 then
+                .[0]
+              elif length == 0 then
+                error("Cargo did not report features for \($target_kind) target \($target_name)")
+              else
+                error("Cargo reported multiple feature sets for \($target_kind) target \($target_name): \(.)")
+              end
+        ' "$artifact_log"
+}
+
 sign_binary() {
     local binary="$1"
     local entitlements="${2:-}"
@@ -711,6 +764,9 @@ suite_package() {
         runtime)
             echo "vz-oci-macos"
             ;;
+        runtimed)
+            echo "vz-runtimed"
+            ;;
         stack)
             echo "vz-stack"
             ;;
@@ -727,6 +783,9 @@ suite_test_name() {
     case "$1" in
         runtime)
             echo "runtime_e2e"
+            ;;
+        runtimed)
+            echo "teardown_finalizer_e2e"
             ;;
         stack)
             echo "stack_e2e"
@@ -2186,7 +2245,7 @@ validate_runtime_crash_reopen_evidence() {
     if ! jq -e '
         .coverage_classification == "runtime_store_post_commit_lost_ack_only" and
         .state_store_expectation == {
-            "schema_version": 8,
+            "schema_version": 9,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }
@@ -2254,7 +2313,7 @@ validate_runtime_crash_reopen_evidence() {
             "skips": 0
         }) and
         (.state_store_expectation == {
-            "schema_version": 8,
+            "schema_version": 9,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }) and
@@ -2371,7 +2430,7 @@ validate_stack_crash_reopen_evidence() {
                 "binding", "event_counts", "intent_status", "observed_phase", "ready",
                 "schema_version", "session_actions_hash", "session_cursor", "session_status"
             ]) and
-            (.schema_version == 8) and
+            (.schema_version == 9) and
             (.action_schema_version == 3) and
             (.session_actions_hash | type == "string" and
                 test("^vzrah2-sha256:[0-9a-f]{64}$")) and
@@ -2555,6 +2614,95 @@ validate_stack_crash_reopen_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_runtimed_teardown_evidence() {
+    local evidence_file="$1"
+    local expected_profile="$2"
+    local expected_test_binary_sha256="$3"
+    local expected_installed_daemon="$4"
+    local expected_installed_daemon_sha256="$5"
+
+    jq -e \
+        --arg expected_profile "$expected_profile" \
+        --arg expected_test_binary_sha256 "$expected_test_binary_sha256" \
+        --arg expected_installed_daemon "$expected_installed_daemon" \
+        --arg expected_installed_daemon_sha256 "$expected_installed_daemon_sha256" '
+        def exact_keys($keys): (keys | sort) == ($keys | sort);
+        def nonempty: type == "string" and length > 0;
+        def hex_sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def identity:
+            exact_keys(["incarnation_id", "schema_version", "stack_id"]) and
+            (.schema_version == 1) and (.stack_id | nonempty) and
+            (.incarnation_id | nonempty);
+        (type == "object") and
+        (exact_keys([
+            "backend", "build_identity", "host_os", "machine_target_os",
+            "installed_product_daemon",
+            "original_runtime_identity", "prepared_finalizer_reopened", "receipt_count",
+            "replacement_refusal_code", "replacement_runtime_identity",
+            "replacement_survived_refusal", "same_operation_completed_after_replacement_removal",
+            "scenario", "schema_version", "sigkill_after_stop_before_progress", "stop_boundary"
+        ])) and
+        (.schema_version == 1) and
+        (.scenario == "runtimed-teardown-finalizer-crash-reopen") and
+        (.host_os == "macos") and (.machine_target_os == "linux") and
+        (.backend == "macos-vz") and
+        (.build_identity | exact_keys(["profile", "test_binary_sha256"])) and
+        (.build_identity.profile == "release") and
+        (.build_identity.profile == $expected_profile) and
+        (.build_identity.test_binary_sha256 | hex_sha256) and
+        (.build_identity.test_binary_sha256 == $expected_test_binary_sha256) and
+        (.installed_product_daemon | exact_keys([
+            "apply_changed_actions", "apply_request_id", "backend", "captured_runtime_identity",
+            "cargo_features", "codesign_verify_strict", "daemon_id", "destroyed_event_count",
+            "executable_path", "finalizer_runtime_shutdown", "ready_services_before_teardown",
+            "live_container_ids_after_teardown", "ready_services_after_teardown", "receipt_count",
+            "retained_stopped_services_after_teardown", "sha256", "teardown_changed_actions",
+            "teardown_request_id"
+        ])) and
+        (.installed_product_daemon.executable_path == $expected_installed_daemon) and
+        (.installed_product_daemon.sha256 | hex_sha256) and
+        (.installed_product_daemon.sha256 == $expected_installed_daemon_sha256) and
+        (.installed_product_daemon.cargo_features == []) and
+        (.installed_product_daemon.codesign_verify_strict == true) and
+        (.installed_product_daemon.backend == "macos-vz") and
+        (.installed_product_daemon.daemon_id | nonempty) and
+        (.installed_product_daemon.apply_request_id == "req-runtimed-installed-product-apply") and
+        (.installed_product_daemon.apply_changed_actions >= 1) and
+        (.installed_product_daemon.ready_services_before_teardown == 1) and
+        (.installed_product_daemon.teardown_request_id == "req-runtimed-installed-product-teardown") and
+        (.installed_product_daemon.teardown_changed_actions >= 1) and
+        (.installed_product_daemon.retained_stopped_services_after_teardown == 1) and
+        (.installed_product_daemon.ready_services_after_teardown == 0) and
+        (.installed_product_daemon.live_container_ids_after_teardown == 0) and
+        (.installed_product_daemon.captured_runtime_identity | identity) and
+        (.installed_product_daemon.captured_runtime_identity.stack_id == "runtimed-installed-product-e2e") and
+        (.installed_product_daemon.finalizer_runtime_shutdown == true) and
+        (.installed_product_daemon.receipt_count == 1) and
+        (.installed_product_daemon.destroyed_event_count == 1) and
+        (.original_runtime_identity | identity) and
+        (.replacement_runtime_identity | identity) and
+        (.replacement_survived_refusal | identity) and
+        (.original_runtime_identity.stack_id == .replacement_runtime_identity.stack_id) and
+        (.original_runtime_identity.incarnation_id != .replacement_runtime_identity.incarnation_id) and
+        (.replacement_survived_refusal == .replacement_runtime_identity) and
+        (.stop_boundary | exact_keys([
+            "expected_runtime_identity", "finalizer_progress_persisted", "operation_id",
+            "outcome", "schema_version", "stack_id"
+        ])) and
+        (.stop_boundary.schema_version == 1) and
+        (.stop_boundary.stack_id == .original_runtime_identity.stack_id) and
+        (.stop_boundary.expected_runtime_identity == .original_runtime_identity) and
+        (.stop_boundary.operation_id | nonempty) and
+        (.stop_boundary.outcome == "stopped") and
+        (.stop_boundary.finalizer_progress_persisted == false) and
+        (.sigkill_after_stop_before_progress == true) and
+        (.prepared_finalizer_reopened == true) and
+        (.replacement_refusal_code == "state_conflict") and
+        (.same_operation_completed_after_replacement_removal == true) and
+        (.receipt_count == 1)
+    ' "$evidence_file" >/dev/null
+}
+
 write_and_validate_container_id_ownership_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -2643,6 +2791,17 @@ write_and_validate_stack_crash_reopen_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+write_and_validate_runtimed_teardown_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -2655,6 +2814,7 @@ run_and_log() {
     local stack_ownership_test_binary_sha256=""
     local crash_reopen_test_binary_sha256=""
     local stack_crash_reopen_test_binary_sha256=""
+    local runtimed_teardown_test_binary_sha256=""
     local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
@@ -2669,10 +2829,25 @@ run_and_log() {
         cmd_env+=("VZ_BUILDKIT_ARTIFACT_SHA256=$BUILDKIT_EXPECTED_SHA256")
     fi
 
-    if [[ "$suite" == "stack" || "$suite" == "runtime" ]]; then
+    if [[ "$suite" == "stack" || "$suite" == "runtime" || "$suite" == "runtimed" ]]; then
         local stack_serial_dir="$RUN_DIR/${label}-vm-serial"
         mkdir -p "$stack_serial_dir"
         cmd_env+=("VZ_STACK_SERIAL_LOG_DIR=$stack_serial_dir")
+    fi
+
+    if [[ "$suite" == "runtimed" ]]; then
+        if [[ "$PROFILE" != "release" ]]; then
+            echo "runtimed teardown finalizer evidence cannot run under profile '$PROFILE'" >&2
+            return 113
+        fi
+        runtimed_teardown_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+        rm -f "$RUNTIMED_TEARDOWN_EVIDENCE" "$RUNTIMED_TEARDOWN_SHA256"
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_FINALIZER_EVIDENCE=$RUNTIMED_TEARDOWN_EVIDENCE")
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_BUILD_PROFILE=$PROFILE")
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_TEST_BINARY_SHA256=$runtimed_teardown_test_binary_sha256")
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_INSTALLED_DAEMON=$INSTALLED_RUNTIMED_BINARY")
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_INSTALLED_DAEMON_SHA256=$INSTALLED_RUNTIMED_SHA256")
+        cmd_env+=("VZ_RUNTIMED_TEARDOWN_INSTALLED_DAEMON_FEATURES=$INSTALLED_RUNTIMED_FEATURES")
     fi
 
     # Stack E2Es intentionally use stable service names as container IDs. Give
@@ -2847,6 +3022,15 @@ run_and_log() {
         return 100
     fi
 
+    if [[ $status -eq 0 && "$PROFILE" == "release" \
+        && "$suite" == "runtimed" && "$label" == "runtimed" ]] \
+        && ! grep -Fqx \
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished" \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "complete runtimed teardown suite did not report exactly 1/1 real-VM test" >&2
+        return 114
+    fi
+
     if [[ $status -eq 0 && "$label" != "$suite" ]] \
         && ! grep -Eq \
             '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished$' \
@@ -2976,6 +3160,25 @@ run_and_log() {
         fi
     fi
 
+    if [[ $status -eq 0 ]] && [[ "$suite" == "runtimed" ]]; then
+        if [[ ! -f "$RUNTIMED_TEARDOWN_EVIDENCE" ]] \
+            || ! validate_runtimed_teardown_evidence \
+                "$RUNTIMED_TEARDOWN_EVIDENCE" \
+                "$PROFILE" \
+                "$runtimed_teardown_test_binary_sha256" \
+                "$INSTALLED_RUNTIMED_BINARY" \
+                "$INSTALLED_RUNTIMED_SHA256"; then
+            echo "runtimed teardown finalizer crash/reopen evidence is missing or malformed" >&2
+            return 115
+        fi
+        if ! write_and_validate_runtimed_teardown_checksum \
+            "$RUNTIMED_TEARDOWN_EVIDENCE" "$RUNTIMED_TEARDOWN_SHA256"; then
+            echo "runtimed teardown finalizer evidence checksum failed" >&2
+            return 116
+        fi
+        RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED=true
+    fi
+
     if [[ $status -eq 0 && "$label" == "runtime-generation-state-store-v7" ]]; then
         local runtime_crash_reopen_sha256_value
         runtime_crash_reopen_sha256_value="$(shasum -a 256 "$RUNTIME_CRASH_REOPEN_EVIDENCE" | cut -d' ' -f1)"
@@ -3030,20 +3233,46 @@ echo "==> output directory: $RUN_DIR"
     echo "runtime_crash_reopen_checksum=$RUNTIME_CRASH_REOPEN_SHA256"
     echo "stack_crash_reopen_evidence=$STACK_CRASH_REOPEN_EVIDENCE"
     echo "stack_crash_reopen_checksum=$STACK_CRASH_REOPEN_SHA256"
+    echo "runtimed_teardown_evidence=$RUNTIMED_TEARDOWN_EVIDENCE"
+    echo "runtimed_teardown_checksum=$RUNTIMED_TEARDOWN_SHA256"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
 host_artifact_log="$RUN_DIR/host-build-artifacts.jsonl"
 run_cargo_recording_artifacts "$host_artifact_log" \
-    build "${BUILD_ARGS[@]}" -p vz-cli -p vz-guest-agent
+    build "${BUILD_ARGS[@]}" -p vz-cli -p vz-guest-agent -p vz-runtimed
 
 vz_binary="$(resolve_cargo_executable "$host_artifact_log" "vz" "bin")" \
     || err "unable to resolve the vz executable from $host_artifact_log"
 guest_agent_binary="$(resolve_cargo_executable "$host_artifact_log" "vz-guest-agent" "bin")" \
     || err "unable to resolve the vz-guest-agent executable from $host_artifact_log"
+runtimed_binary="$(resolve_cargo_executable "$host_artifact_log" "vz-runtimed" "bin")" \
+    || err "unable to resolve the vz-runtimed executable from $host_artifact_log"
+INSTALLED_RUNTIMED_FEATURES="$(resolve_cargo_features "$host_artifact_log" "vz-runtimed" "bin")" \
+    || err "unable to resolve the vz-runtimed feature inventory from $host_artifact_log"
+if [[ "$INSTALLED_RUNTIMED_FEATURES" != "[]" ]]; then
+    err "staged installed vz-runtimed must be built with no Cargo features, got $INSTALLED_RUNTIMED_FEATURES"
+fi
 
 sign_binary "$vz_binary" "$ENTITLEMENTS"
 sign_binary "$guest_agent_binary"
+
+# Preserve a default-feature product daemon before the later runtimed E2E test
+# build enables instrumentation in Cargo's ordinary target output.
+INSTALLED_RUNTIMED_DIR="$RUN_DIR/staged-install/bin"
+INSTALLED_RUNTIMED_BINARY="$INSTALLED_RUNTIMED_DIR/vz-runtimed"
+mkdir -p "$INSTALLED_RUNTIMED_DIR"
+cp "$runtimed_binary" "$INSTALLED_RUNTIMED_BINARY"
+chmod 0755 "$INSTALLED_RUNTIMED_BINARY"
+sign_binary "$INSTALLED_RUNTIMED_BINARY" "$ENTITLEMENTS"
+codesign --verify --strict --verbose "$INSTALLED_RUNTIMED_BINARY"
+INSTALLED_RUNTIMED_SHA256="$(shasum -a 256 "$INSTALLED_RUNTIMED_BINARY" | cut -d' ' -f1)"
+{
+    echo "installed_runtimed_binary=$INSTALLED_RUNTIMED_BINARY"
+    echo "installed_runtimed_sha256=$INSTALLED_RUNTIMED_SHA256"
+    echo "installed_runtimed_cargo_features=$INSTALLED_RUNTIMED_FEATURES"
+    echo "installed_runtimed_codesign_verify_strict=true"
+} >> "$RUN_DIR/run-info.txt"
 
 FAILED=()
 PASSED=()
@@ -3066,6 +3295,8 @@ RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED=false
 RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED="$CRASH_REOPEN_LANE_SELECTED"
 STACK_CRASH_REOPEN_EVIDENCE_VALIDATED=false
 STACK_CRASH_REOPEN_EVIDENCE_REQUIRED="$CRASH_REOPEN_LANE_SELECTED"
+RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED=false
+RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED="$RUNTIMED_TEARDOWN_LANE_SELECTED"
 
 run_stack_crash_reopen_companion() {
     local binary="$1"
@@ -3114,8 +3345,14 @@ for suite in "${RESOLVED_SUITES[@]}"; do
 
     echo "==> building [$suite] ($package::$test_name)"
     test_artifact_log="$RUN_DIR/${suite}-test-artifacts.jsonl"
-    run_cargo_recording_artifacts "$test_artifact_log" \
-        test -p "$package" "${BUILD_ARGS[@]}" --test "$test_name" --no-run
+    if [[ "$suite" == "runtimed" ]]; then
+        run_cargo_recording_artifacts "$test_artifact_log" \
+            test -p "$package" "${BUILD_ARGS[@]}" --features e2e-test-hooks \
+            --test "$test_name" --no-run
+    else
+        run_cargo_recording_artifacts "$test_artifact_log" \
+            test -p "$package" "${BUILD_ARGS[@]}" --test "$test_name" --no-run
+    fi
 
     test_binary="$(resolve_cargo_executable "$test_artifact_log" "$test_name" "test")" \
         || err "unable to resolve the $test_name executable from $test_artifact_log"
@@ -3293,6 +3530,12 @@ if [[ "$STACK_CRASH_REOPEN_EVIDENCE_REQUIRED" == "true" \
     FAILED+=("runtime-generation-state-store-v7-evidence:111")
 fi
 
+if [[ "$RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED" == "true" \
+    && "$RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required runtimed teardown finalizer evidence was not validated" >&2
+    FAILED+=("runtimed-teardown-finalizer-evidence:115")
+fi
+
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
     if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" && ${#FAILED[@]} -eq 0 ]]; then
         BUILDKIT_RELEASE_GATE_QUALIFIED="true"
@@ -3390,6 +3633,15 @@ action_summary="$RUN_DIR/summary.txt"
     fi
     echo "stack_crash_reopen_required=$STACK_CRASH_REOPEN_EVIDENCE_REQUIRED"
     echo "stack_crash_reopen_validated=$STACK_CRASH_REOPEN_EVIDENCE_VALIDATED"
+    if [[ "$RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "runtimed_teardown=$RUNTIMED_TEARDOWN_EVIDENCE"
+        echo "runtimed_teardown_sha256=$RUNTIMED_TEARDOWN_SHA256"
+    else
+        echo "runtimed_teardown=none"
+        echo "runtimed_teardown_sha256=none"
+    fi
+    echo "runtimed_teardown_required=$RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED"
+    echo "runtimed_teardown_validated=$RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

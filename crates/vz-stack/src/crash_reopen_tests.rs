@@ -648,7 +648,7 @@ fn assert_boundary_contract(evidence: &Value) {
     let replay = &evidence["replay"];
     let post_store = &evidence["post_replay"]["store"];
     let post_runtime = &evidence["post_replay"]["runtime"];
-    assert_eq!(pre_store["schema_version"], 8);
+    assert_eq!(pre_store["schema_version"], 9);
     assert_eq!(pre_store["action_schema_version"], 3);
     assert_eq!(pre_store["session_status"], "active");
     assert_eq!(pre_store["session_cursor"], 0);
@@ -659,7 +659,7 @@ fn assert_boundary_contract(evidence: &Value) {
         pre_store["audit_action_hash"]
     );
     assert_eq!(pre_store["ready"], false);
-    assert_eq!(post_store["schema_version"], 8);
+    assert_eq!(post_store["schema_version"], 9);
     assert_eq!(post_store["action_schema_version"], 3);
     assert_eq!(post_store["audit_rows"], 1);
     assert_eq!(

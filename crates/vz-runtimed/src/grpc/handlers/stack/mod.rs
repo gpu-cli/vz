@@ -579,10 +579,17 @@ fn map_runtime_error(operation: &str, error: vz_runtime_contract::RuntimeError) 
             operation,
             format!("backend_operation={backend_operation}; {reason}"),
         ),
-        other => StackError::Machine {
-            code: other.machine_code(),
-            message: format!("{operation} failed: {other}"),
-        },
+        other => {
+            let mut error = vz_runtime_contract::runtime_error_machine_error(
+                &other,
+                &vz_runtime_contract::RequestMetadata::default(),
+            );
+            error.message = format!("{operation} failed: {}", error.message);
+            error
+                .details
+                .insert("stack_operation".to_string(), operation.to_string());
+            StackError::TypedMachine(error)
+        }
     }
 }
 
@@ -727,6 +734,22 @@ mod runtime_error_mapping_tests {
             vz_runtime_contract::MachineErrorCode::StateConflict
         );
         assert!(mapped.to_string().contains("generation changed"));
+        let machine = mapped.to_machine_error(
+            &vz_runtime_contract::RequestMetadata::from_optional_refs(Some("req-map"), None),
+        );
+        assert_eq!(machine.request_id.as_deref(), Some("req-map"));
+        assert_eq!(
+            machine.details.get("container_id").map(String::as_str),
+            Some("owned-id")
+        );
+        assert_eq!(
+            machine.details.get("reason").map(String::as_str),
+            Some("generation changed")
+        );
+        assert_eq!(
+            machine.details.get("stack_operation").map(String::as_str),
+            Some("cleanup_container_generation")
+        );
     }
 
     #[test]
@@ -1163,15 +1186,13 @@ mod runtime_error_mapping_tests {
 
 async fn shutdown_stack_runtime_for_teardown(
     daemon: Arc<RuntimeDaemon>,
-    stack_id: String,
-) -> Result<(), StackError> {
-    let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        handle.block_on(daemon.manager().shutdown_stack_runtime(&stack_id))
-    })
-    .await
-    .map_err(|error| StackError::Network(format!("shutdown_sandbox task failed: {error}")))?
-    .map_err(|error| map_runtime_error("shutdown_sandbox", error))
+    request: vz_runtime_contract::StackRuntimeShutdownRequest,
+) -> Result<vz_runtime_contract::StackRuntimeShutdownOutcome, StackError> {
+    daemon
+        .manager()
+        .shutdown_stack_runtime_exact(&request)
+        .await
+        .map_err(|error| map_runtime_error("shutdown_stack_runtime_exact", error))
 }
 
 impl ContainerRuntime for DaemonContainerRuntime {
@@ -1865,16 +1886,11 @@ fn execute_stack_service_action(
             .iter()
             .all(|outcome| matches!(outcome.result, vz_stack::ActionOutcomeResult::Succeeded));
     if !complete_success {
-        let first_error = result
-            .errors
-            .first()
-            .map(|(_, message)| message.as_str())
-            .unwrap_or("claimed stack service action did not commit one successful outcome");
-        return Err(status_from_machine_error(MachineError::new(
+        return Err(status_from_machine_error(execution_failure_machine_error(
+            &result,
+            request_id,
             failure_code,
-            first_error.to_string(),
-            Some(request_id.to_string()),
-            BTreeMap::new(),
+            "claimed stack service action did not commit one successful outcome",
         )));
     }
     let committed = executor
@@ -1899,6 +1915,47 @@ fn execute_stack_service_action(
     }
 
     Ok(())
+}
+
+fn execution_failure_machine_error(
+    result: &vz_stack::ExecutionResult,
+    request_id: &str,
+    fallback_code: MachineErrorCode,
+    fallback_message: &str,
+) -> MachineError {
+    let mut error = result
+        .action_failures
+        .first()
+        .map(|failure| {
+            let mut error = failure.error.clone();
+            error
+                .details
+                .entry("action".to_string())
+                .or_insert_with(|| failure.action.clone());
+            error
+        })
+        .unwrap_or_else(|| {
+            MachineError::new(
+                fallback_code,
+                result
+                    .errors
+                    .first()
+                    .map(|(_, message)| message.clone())
+                    .unwrap_or_else(|| fallback_message.to_string()),
+                None,
+                BTreeMap::new(),
+            )
+        });
+    error.request_id = Some(request_id.to_string());
+    error
+        .details
+        .entry("failed_actions".to_string())
+        .or_insert_with(|| result.failed.to_string());
+    error
+        .details
+        .entry("succeeded_actions".to_string())
+        .or_insert_with(|| result.succeeded.to_string());
+    error
 }
 
 #[cfg(test)]
@@ -1929,17 +1986,11 @@ fn teardown_execution_failure_response(
         )
     };
 
-    let status = status_from_machine_error(MachineError::new(
+    let status = status_from_machine_error(execution_failure_machine_error(
+        result,
+        request_id,
         MachineErrorCode::BackendUnavailable,
-        message,
-        Some(request_id.to_string()),
-        BTreeMap::from([
-            ("failed_actions".to_string(), result.failed.to_string()),
-            (
-                "succeeded_actions".to_string(),
-                result.succeeded.to_string(),
-            ),
-        ]),
+        &message,
     ));
     events.push(Err(status));
     Some(stack_stream_response(std::mem::take(events), None))

@@ -32,18 +32,24 @@ fn validate_failed_create_ownership(
 fn claimed_preflight_failure_result(
     actions: &[Action],
     first_action_index: usize,
-    failures: &HashMap<ServiceReplicaKey, String>,
+    failures: &HashMap<ServiceReplicaKey, vz_runtime_contract::MachineError>,
 ) -> Result<ExecutionResult, StackError> {
     let mut result = ExecutionResult::default();
     for (relative_index, action) in actions.iter().enumerate() {
-        let error = failures.get(action.target()).cloned().unwrap_or_else(|| {
-            "scoped batch stopped before effects because another claimed predecessor failed preflight"
-                .to_string()
+        let machine_error = failures.get(action.target()).cloned().unwrap_or_else(|| {
+            execution_machine_error(&super::scope_state_conflict(
+                "scoped batch stopped before effects because another claimed predecessor failed preflight",
+            ))
         });
+        let error = machine_error.message.clone();
         result.failed += 1;
         result
             .errors
             .push((action.target().display_name(), error.clone()));
+        result.action_failures.push(ActionExecutionFailure {
+            action: action.target().display_name(),
+            error: machine_error,
+        });
         result.outcomes.push(IndexedActionOutcome {
             absolute_index: first_action_index
                 .checked_add(relative_index)
@@ -804,6 +810,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     result
                         .errors
                         .push((action.target().display_name(), error.clone()));
+                    result.action_failures.push(ActionExecutionFailure {
+                        action: action.target().display_name(),
+                        error: execution_machine_error(&StackError::Machine {
+                            code: vz_runtime_contract::MachineErrorCode::InternalError,
+                            message: error.clone(),
+                        }),
+                    });
                     ActionOutcomeResult::Failed { error }
                 }
                 _ => {
@@ -1510,9 +1523,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         error!(service = %action.service_name(), error = %e, "failed to remove old container");
                         cleanup_failed.insert(action.target().clone());
                         result.failed += 1;
-                        result
-                            .errors
-                            .push((action.service_name().to_string(), e.to_string()));
+                        record_execution_error(&mut result, action.service_name().to_string(), &e);
                     }
                 }
             }
@@ -1533,9 +1544,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     Ok(prep) => prepared.push(prep),
                     Err(error) => {
                         result.failed += 1;
-                        result
-                            .errors
-                            .push((target.display_name(), error.to_string()));
+                        record_execution_error(&mut result, target.display_name(), &error);
                     }
                 }
             }
@@ -1569,7 +1578,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 let msg = format!("image pull failed for {}", prep.image);
                 self.mark_failed(spec, &prep.target, &msg)?;
                 result.failed += 1;
-                result.errors.push((full_name, msg));
+                record_execution_error(&mut result, full_name, &StackError::Network(msg));
             }
 
             if ok_prepared.len() <= 1 {
@@ -1602,7 +1611,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 cleanup,
                             )?;
                             result.failed += 1;
-                            result.errors.push((full_name, failure.error.to_string()));
+                            record_execution_error(&mut result, full_name, &failure.error);
                         }
                     }
                 }
@@ -1684,9 +1693,11 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 cleanup,
                             )?;
                             result.failed += 1;
-                            result
-                                .errors
-                                .push((service_name.clone(), failure.error.to_string()));
+                            record_execution_error(
+                                &mut result,
+                                service_name.clone(),
+                                &failure.error,
+                            );
                         }
                     }
                 }
@@ -1699,9 +1710,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 Ok(()) => result.succeeded += 1,
                 Err(e) => {
                     result.failed += 1;
-                    result
-                        .errors
-                        .push((action.service_name().to_string(), e.to_string()));
+                    record_execution_error(&mut result, action.service_name().to_string(), &e);
                 }
             }
         }

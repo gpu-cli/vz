@@ -17,7 +17,7 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 8;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 9;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
 const REPLICA_SCHEMA_VERSION: u32 = 5;
 const CLAIM_SCHEMA_VERSION: u32 = 7;
@@ -523,6 +523,46 @@ WHEN EXISTS (
 )
 BEGIN
     SELECT RAISE(ABORT, 'teardown finalizer receipt is durable replay evidence');
+END;
+"#;
+
+const TEARDOWN_RUNTIME_IDENTITY_SCHEMA_V9_DDL: &str = r#"
+ALTER TABLE teardown_finalizers
+    ADD COLUMN initial_runtime_identity_json TEXT
+        CHECK(initial_runtime_identity_json IS NULL OR json_valid(initial_runtime_identity_json));
+DROP TRIGGER teardown_finalizer_identity_immutable;
+CREATE TRIGGER teardown_finalizer_identity_immutable
+BEFORE UPDATE OF
+    operation_key, schema_version, request_id, idempotency_key, request_digest,
+    session_id, reconcile_operation_id, project_id, environment_id, machine_id,
+    machine_incarnation_id, stack_name, remove_volumes, changed_actions,
+    actions_hash, desired_state_digest, initial_volumes_json, initial_disk_image,
+    initial_runtime_present, initial_runtime_identity_json, created_at
+ON teardown_finalizers
+WHEN
+    NEW.operation_key IS NOT OLD.operation_key OR
+    NEW.schema_version IS NOT OLD.schema_version OR
+    NEW.request_id IS NOT OLD.request_id OR
+    NEW.idempotency_key IS NOT OLD.idempotency_key OR
+    NEW.request_digest IS NOT OLD.request_digest OR
+    NEW.session_id IS NOT OLD.session_id OR
+    NEW.reconcile_operation_id IS NOT OLD.reconcile_operation_id OR
+    NEW.project_id IS NOT OLD.project_id OR
+    NEW.environment_id IS NOT OLD.environment_id OR
+    NEW.machine_id IS NOT OLD.machine_id OR
+    NEW.machine_incarnation_id IS NOT OLD.machine_incarnation_id OR
+    NEW.stack_name IS NOT OLD.stack_name OR
+    NEW.remove_volumes IS NOT OLD.remove_volumes OR
+    NEW.changed_actions IS NOT OLD.changed_actions OR
+    NEW.actions_hash IS NOT OLD.actions_hash OR
+    NEW.desired_state_digest IS NOT OLD.desired_state_digest OR
+    NEW.initial_volumes_json IS NOT OLD.initial_volumes_json OR
+    NEW.initial_disk_image IS NOT OLD.initial_disk_image OR
+    NEW.initial_runtime_present IS NOT OLD.initial_runtime_present OR
+    NEW.initial_runtime_identity_json IS NOT OLD.initial_runtime_identity_json OR
+    NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'teardown finalizer identity and original inventory are immutable');
 END;
 "#;
 
@@ -1212,6 +1252,23 @@ impl StateStore {
         self.validate_schema_against(8, &reference.conn)
     }
 
+    pub(super) fn validate_v9_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+        reference.create_teardown_finalizer_schema_v8()?;
+        reference.create_teardown_runtime_identity_schema_v9()?;
+
+        self.validate_schema_against(9, &reference.conn)
+    }
+
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
         self.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
         self.conn
@@ -1228,6 +1285,12 @@ impl StateStore {
 
     pub(super) fn create_teardown_finalizer_schema_v8(&self) -> Result<(), StackError> {
         self.conn.execute_batch(TEARDOWN_FINALIZER_SCHEMA_V8_DDL)?;
+        Ok(())
+    }
+
+    pub(super) fn create_teardown_runtime_identity_schema_v9(&self) -> Result<(), StackError> {
+        self.conn
+            .execute_batch(TEARDOWN_RUNTIME_IDENTITY_SCHEMA_V9_DDL)?;
         Ok(())
     }
 
@@ -3983,6 +4046,35 @@ impl StateStore {
             store.create_teardown_finalizer_schema_v8()?;
             hook(TeardownFinalizerV8MigrationStage::FinalizerSchemaCreated)?;
             store.validate_v8_schema()?;
+            store.set_schema_version(8)?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn migrate_teardown_runtime_identity_v8_to_v9(&self) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 8 {
+                return Err(StackError::InvalidSpec(format!(
+                    "teardown-runtime-identity migration requires state schema version 8, found {schema_version}"
+                )));
+            }
+            store.validate_v8_schema()?;
+            let prepared: Option<String> = store
+                .conn
+                .query_row(
+                    "SELECT operation_key FROM teardown_finalizers WHERE status = 'prepared' ORDER BY operation_key LIMIT 1",
+                    [],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(operation_key) = prepared {
+                return Err(StackError::InvalidSpec(format!(
+                    "v8 prepared teardown finalizer `{operation_key}` lacks exact runtime identity evidence; explicit recovery is required before v9 migration"
+                )));
+            }
+            store.create_teardown_runtime_identity_schema_v9()?;
+            store.validate_v9_schema()?;
             store.set_schema_version(STORE_SCHEMA_VERSION)?;
             Ok(())
         })

@@ -608,6 +608,15 @@ pub struct IndexedActionOutcome {
     pub result: ActionOutcomeResult,
 }
 
+/// One exact action failure with its transport-stable classification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionExecutionFailure {
+    /// Human-readable action or service-replica label.
+    pub action: String,
+    /// Stable machine error. Its request ID is attached at the transport boundary.
+    pub error: vz_runtime_contract::MachineError,
+}
+
 /// Result of executing a batch of actions.
 #[derive(Debug, Clone, Default)]
 pub struct ExecutionResult {
@@ -615,8 +624,14 @@ pub struct ExecutionResult {
     pub succeeded: usize,
     /// Number of actions that failed.
     pub failed: usize,
-    /// Per-action error messages (service_name → error).
+    /// Compatibility diagnostics (service_name → display message).
     pub errors: Vec<(String, String)>,
+    /// Per-action typed failures in the same order as [`Self::errors`].
+    ///
+    /// Request identifiers are deliberately unset inside the stack layer.
+    /// Transport adapters attach their correlated request ID without
+    /// discarding the stable code or structured details.
+    pub action_failures: Vec<ActionExecutionFailure>,
     /// Exactly one typed outcome for every dispatched action, in absolute-index order.
     pub outcomes: Vec<IndexedActionOutcome>,
     /// Bind mounts that were skipped during validation.
@@ -661,6 +676,25 @@ impl ExecutionResult {
     pub fn all_succeeded(&self) -> bool {
         self.failed == 0
     }
+}
+
+fn execution_machine_error(error: &StackError) -> vz_runtime_contract::MachineError {
+    error.to_machine_error(&vz_runtime_contract::RequestMetadata::default())
+}
+
+fn record_execution_error(
+    result: &mut ExecutionResult,
+    action: String,
+    error: &StackError,
+) -> String {
+    let machine_error = execution_machine_error(error);
+    let message = machine_error.message.clone();
+    result.errors.push((action.clone(), message.clone()));
+    result.action_failures.push(ActionExecutionFailure {
+        action,
+        error: machine_error,
+    });
+    message
 }
 
 /// Pre-computed data for a service create, ready for parallel execution.

@@ -411,6 +411,52 @@ impl RuntimeDaemon {
         self.manager.capabilities()
     }
 
+    /// Boot a real stack runtime for black-box daemon crash/reopen tests.
+    ///
+    /// This bypasses stack admission only to arrange an otherwise unreachable
+    /// replacement-runtime state after a prepared teardown has fenced public
+    /// mutations. It is unavailable in ordinary builds.
+    #[cfg(feature = "e2e-test-hooks")]
+    #[doc(hidden)]
+    pub async fn e2e_boot_stack_runtime(
+        &self,
+        stack_id: &str,
+    ) -> Result<vz_runtime_contract::StackRuntimeIdentity, RuntimeError> {
+        self.manager
+            .ensure_stack_runtime(
+                stack_id,
+                Vec::new(),
+                vz_runtime_contract::StackResourceHint::default(),
+            )
+            .await?;
+        self.manager
+            .inspect_stack_runtime(stack_id)
+            .await?
+            .ok_or_else(|| RuntimeError::Backend {
+                message: format!("booted stack runtime `{stack_id}` has no identity"),
+                source: Box::new(std::io::Error::other(
+                    "booted stack runtime has no identity",
+                )),
+            })
+    }
+
+    /// Inspect a real stack runtime after a stale teardown refusal.
+    #[cfg(feature = "e2e-test-hooks")]
+    #[doc(hidden)]
+    pub async fn e2e_inspect_stack_runtime(
+        &self,
+        stack_id: &str,
+    ) -> Result<Option<vz_runtime_contract::StackRuntimeIdentity>, RuntimeError> {
+        self.manager.inspect_stack_runtime(stack_id).await
+    }
+
+    /// Clean up a real stack runtime arranged by the E2E replacement hook.
+    #[cfg(feature = "e2e-test-hooks")]
+    #[doc(hidden)]
+    pub async fn e2e_shutdown_stack_runtime(&self, stack_id: &str) -> Result<(), RuntimeError> {
+        self.manager.shutdown_stack_runtime(stack_id).await
+    }
+
     /// Snapshot daemon health information for monitoring/probes.
     pub fn health(&self) -> DaemonHealth {
         DaemonHealth {

@@ -14,6 +14,7 @@ use crate::{
     ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput, GenerationCleanupOutcome,
     ImageInfo, IsolationLevel, NetworkServiceConfig, OwnedCreateError, PortMapping, PruneResult,
     RunConfig, RuntimeCapabilities, RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
+    StackRuntimeIdentity, StackRuntimeShutdownOutcome, StackRuntimeShutdownRequest,
 };
 
 /// Async stream returned by a generation-qualified lifecycle watch.
@@ -328,6 +329,29 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
             self.backend.shutdown_shared_vm(stack_id).await?;
         }
         Ok(())
+    }
+
+    /// Inspect the opaque identity of the currently active stack runtime.
+    pub async fn inspect_stack_runtime(
+        &self,
+        stack_id: &str,
+    ) -> Result<Option<StackRuntimeIdentity>, RuntimeError> {
+        if !self.capabilities().shared_vm {
+            return Ok(None);
+        }
+        self.backend.inspect_shared_vm(stack_id).await
+    }
+
+    /// Atomically stop only the exact runtime incarnation named by `expected`.
+    pub async fn shutdown_stack_runtime_exact(
+        &self,
+        request: &StackRuntimeShutdownRequest,
+    ) -> Result<StackRuntimeShutdownOutcome, RuntimeError> {
+        request.validate().map_err(RuntimeError::InvalidConfig)?;
+        if !self.capabilities().shared_vm {
+            return Ok(StackRuntimeShutdownOutcome::AlreadyAbsent);
+        }
+        self.backend.shutdown_shared_vm_exact(request).await
     }
 
     /// Whether stack runtime is currently active.
@@ -1017,6 +1041,38 @@ pub trait RuntimeBackend: Send + Sync {
         _stack_id: &str,
     ) -> impl Future<Output = Result<(), RuntimeError>> {
         async { Ok(()) }
+    }
+
+    /// Inspect the opaque identity of the active shared runtime, if any.
+    fn inspect_shared_vm(
+        &self,
+        stack_id: &str,
+    ) -> impl Future<Output = Result<Option<StackRuntimeIdentity>, RuntimeError>> {
+        let stack_id = stack_id.to_string();
+        async move {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "inspect_shared_vm".to_string(),
+                reason: format!(
+                    "backend does not provide incarnation-aware inspection for stack `{stack_id}`"
+                ),
+            })
+        }
+    }
+
+    /// Atomically compare and stop one exact shared-runtime incarnation.
+    fn shutdown_shared_vm_exact(
+        &self,
+        request: &StackRuntimeShutdownRequest,
+    ) -> impl Future<Output = Result<StackRuntimeShutdownOutcome, RuntimeError>> {
+        let stack_id = request.expected.stack_id.clone();
+        async move {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "shutdown_shared_vm_exact".to_string(),
+                reason: format!(
+                    "backend does not provide incarnation-aware shutdown for stack `{stack_id}`"
+                ),
+            })
+        }
     }
 
     /// Check if a shared stack environment is currently booted.

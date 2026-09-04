@@ -282,6 +282,31 @@ impl RuntimeBackend for ManagerRoutingBackend {
         ready(Ok(()))
     }
 
+    fn inspect_shared_vm(
+        &self,
+        stack_id: &str,
+    ) -> impl Future<Output = Result<Option<StackRuntimeIdentity>, RuntimeError>> {
+        self.record("inspect_shared_vm");
+        ready(
+            StackRuntimeIdentity::new(stack_id)
+                .map(Some)
+                .map_err(RuntimeError::InvalidConfig),
+        )
+    }
+
+    fn shutdown_shared_vm_exact(
+        &self,
+        request: &StackRuntimeShutdownRequest,
+    ) -> impl Future<Output = Result<StackRuntimeShutdownOutcome, RuntimeError>> {
+        self.record("shutdown_shared_vm_exact");
+        ready(
+            request
+                .validate()
+                .map(|()| StackRuntimeShutdownOutcome::Stopped)
+                .map_err(RuntimeError::InvalidConfig),
+        )
+    }
+
     fn has_shared_vm(&self, _stack_id: &str) -> bool {
         self.record("has_shared_vm");
         true
@@ -2109,6 +2134,60 @@ fn manager_has_sandbox_delegates_to_has_shared_vm() {
 
     assert!(manager.has_sandbox("sbx-1"));
     assert_eq!(manager.backend().calls(), vec!["has_shared_vm"]);
+}
+
+#[test]
+fn manager_exact_stack_shutdown_preserves_operation_and_incarnation() {
+    let backend = ManagerRoutingBackend::new(RuntimeCapabilities::stack_baseline());
+    let manager = WorkspaceRuntimeManager::new(backend);
+    let identity = poll_immediate(manager.inspect_stack_runtime("stack-exact"))
+        .unwrap()
+        .expect("backend should return one exact identity");
+    let request = StackRuntimeShutdownRequest {
+        schema_version: STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+        operation_id: "teardown:req-123".to_string(),
+        expected: identity.clone(),
+    };
+
+    assert_eq!(
+        poll_immediate(manager.shutdown_stack_runtime_exact(&request)).unwrap(),
+        StackRuntimeShutdownOutcome::Stopped
+    );
+    assert_eq!(request.expected, identity);
+    assert_eq!(
+        manager.backend().calls(),
+        vec!["inspect_shared_vm", "shutdown_shared_vm_exact"]
+    );
+}
+
+#[test]
+fn exact_stack_shutdown_request_rejects_missing_operation_or_corrupt_identity() {
+    let mut identity = StackRuntimeIdentity::new("stack-exact").unwrap();
+    let missing_operation = StackRuntimeShutdownRequest {
+        schema_version: STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+        operation_id: " ".to_string(),
+        expected: identity.clone(),
+    };
+    assert!(missing_operation.validate().is_err());
+
+    identity.stack_id.clear();
+    let corrupt_identity = StackRuntimeShutdownRequest {
+        schema_version: STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+        operation_id: "teardown:req-123".to_string(),
+        expected: identity,
+    };
+    assert!(corrupt_identity.validate().is_err());
+}
+
+#[test]
+fn default_stack_runtime_inspection_fails_closed() {
+    let error = poll_immediate(StubBackend.inspect_shared_vm("stack-exact")).unwrap_err();
+
+    assert!(matches!(
+        error,
+        RuntimeError::UnsupportedOperation { operation, reason }
+            if operation == "inspect_shared_vm" && reason.contains("stack-exact")
+    ));
 }
 
 #[test]

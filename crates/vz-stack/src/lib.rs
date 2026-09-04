@@ -36,10 +36,10 @@ pub use events::{
     emit_event_to_sink,
 };
 pub use executor::{
-    ActionOutcomeResult, ClaimedTeardownAdmission, ContainerLogs, ContainerRuntime,
-    ExecutionResult, IndexedActionOutcome, LogLine, LogStream, PendingClaimedTeardown, PortTracker,
-    ReconcileActionKind, StackExecutor, claimed_teardown_operation_id,
-    matches_claimed_teardown_operation,
+    ActionExecutionFailure, ActionOutcomeResult, ClaimedTeardownAdmission, ContainerLogs,
+    ContainerRuntime, ExecutionResult, IndexedActionOutcome, LogLine, LogStream,
+    PendingClaimedTeardown, PortTracker, ReconcileActionKind, StackExecutor,
+    claimed_teardown_operation_id, matches_claimed_teardown_operation,
 };
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,

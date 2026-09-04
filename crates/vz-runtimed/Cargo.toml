@@ -9,6 +9,7 @@ repository.workspace = true
 
 [features]
 test-backend = []
+e2e-test-hooks = []
 
 [dependencies]
 fs2 = { workspace = true }
@@ -21,6 +22,7 @@ thiserror = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "signal"] }
 tokio-stream = { workspace = true, features = ["net"] }
 tonic = { workspace = true }
+prost = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 tower = { workspace = true }

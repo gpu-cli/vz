@@ -11,6 +11,7 @@ pub struct RequestMetadata {
     #[prost(string, tag = "3")]
     pub trace_id: ::prost::alloc::string::String,
 }
+/// Serialized ErrorDetail protobuf bytes are carried in tonic Status details.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ErrorDetail {
     #[prost(string, tag = "1")]
@@ -19,6 +20,12 @@ pub struct ErrorDetail {
     pub message: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub request_id: ::prost::alloc::string::String,
+    /// Stable machine-readable context retained across gRPC failures.
+    #[prost(map = "string, string", tag = "4")]
+    pub details: ::std::collections::HashMap<
+        ::prost::alloc::string::String,
+        ::prost::alloc::string::String,
+    >,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HostSpec {

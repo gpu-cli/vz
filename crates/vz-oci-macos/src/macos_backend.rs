@@ -749,6 +749,26 @@ impl RuntimeBackend for MacosRuntimeBackend {
             .map_err(oci_err)
     }
 
+    async fn inspect_shared_vm(
+        &self,
+        stack_id: &str,
+    ) -> Result<Option<contract::StackRuntimeIdentity>, RuntimeError> {
+        self.runtime
+            .inspect_shared_vm_identity(stack_id)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn shutdown_shared_vm_exact(
+        &self,
+        request: &contract::StackRuntimeShutdownRequest,
+    ) -> Result<contract::StackRuntimeShutdownOutcome, RuntimeError> {
+        self.runtime
+            .shutdown_shared_vm_exact(request)
+            .await
+            .map_err(oci_err)
+    }
+
     fn has_shared_vm(&self, stack_id: &str) -> bool {
         // Runtime::has_shared_vm is async (uses Mutex::lock().await).
         // Use block_in_place since this is called from sync context.

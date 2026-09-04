@@ -38,6 +38,7 @@ pub struct LinuxNativeBackend {
 }
 
 struct StackState {
+    identity: contract::StackRuntimeIdentity,
     bridge_name: String,
     services: HashMap<String, ServiceNetState>,
     port_forwards: Vec<PortForwardRule>,
@@ -71,6 +72,59 @@ impl LinuxNativeBackend {
             stacks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+}
+
+fn take_stack_for_exact_shutdown(
+    stacks: &mut HashMap<String, StackState>,
+    request: &contract::StackRuntimeShutdownRequest,
+) -> Result<(contract::StackRuntimeShutdownOutcome, Option<StackState>), RuntimeError> {
+    request.validate().map_err(RuntimeError::InvalidConfig)?;
+    let stack_id = request.expected.stack_id.as_str();
+    let Some(current) = stacks.get(stack_id) else {
+        return Ok((contract::StackRuntimeShutdownOutcome::AlreadyAbsent, None));
+    };
+    if current.identity != request.expected {
+        return Ok((
+            contract::StackRuntimeShutdownOutcome::ReplacementPresent {
+                current: current.identity.clone(),
+            },
+            None,
+        ));
+    }
+
+    Ok((
+        contract::StackRuntimeShutdownOutcome::Stopped,
+        stacks.remove(stack_id),
+    ))
+}
+
+async fn teardown_stack_state(stack_id: &str, stack: &StackState) {
+    // Tear down port forwards.
+    for pf in &stack.port_forwards {
+        let _ = network::teardown_port_forward(
+            pf.host_port,
+            &pf.dest_ip,
+            pf.container_port,
+            &pf.protocol,
+        )
+        .await;
+    }
+
+    // Tear down NAT masquerade.
+    let _ =
+        network::teardown_nat_masquerade(&stack.bridge_name, network::DEFAULT_BRIDGE_SUBNET).await;
+
+    // Tear down all services.
+    for (name, svc) in &stack.services {
+        debug!(name, "tearing down service network");
+        let _ = network::delete_veth(&svc.veth_host).await;
+        let _ = ns::delete_netns(&svc.netns_name).await;
+    }
+
+    // Delete bridge.
+    let _ = network::delete_bridge(&stack.bridge_name).await;
+
+    info!(stack_id, "stack network shut down");
 }
 
 fn now_unix_secs() -> u64 {
@@ -845,6 +899,8 @@ impl RuntimeBackend for LinuxNativeBackend {
             debug!(stack_id, "stack already booted");
             return Ok(());
         }
+        let identity =
+            contract::StackRuntimeIdentity::new(stack_id).map_err(RuntimeError::InvalidConfig)?;
 
         let bridge_name = format!("vz-{}", &stack_id[..std::cmp::min(8, stack_id.len())]);
 
@@ -880,6 +936,7 @@ impl RuntimeBackend for LinuxNativeBackend {
         stacks.insert(
             stack_id.to_string(),
             StackState {
+                identity,
                 bridge_name,
                 services: HashMap::new(),
                 port_forwards,
@@ -987,34 +1044,35 @@ impl RuntimeBackend for LinuxNativeBackend {
             return Ok(());
         };
 
-        // Tear down port forwards.
-        for pf in &stack.port_forwards {
-            let _ = network::teardown_port_forward(
-                pf.host_port,
-                &pf.dest_ip,
-                pf.container_port,
-                &pf.protocol,
-            )
-            .await;
-        }
-
-        // Tear down NAT masquerade.
-        let _ =
-            network::teardown_nat_masquerade(&stack.bridge_name, network::DEFAULT_BRIDGE_SUBNET)
-                .await;
-
-        // Tear down all services.
-        for (name, svc) in &stack.services {
-            debug!(name, "tearing down service network");
-            let _ = network::delete_veth(&svc.veth_host).await;
-            let _ = ns::delete_netns(&svc.netns_name).await;
-        }
-
-        // Delete bridge.
-        let _ = network::delete_bridge(&stack.bridge_name).await;
-
-        info!(stack_id, "stack network shut down");
+        teardown_stack_state(stack_id, &stack).await;
         Ok(())
+    }
+
+    async fn inspect_shared_vm(
+        &self,
+        stack_id: &str,
+    ) -> Result<Option<contract::StackRuntimeIdentity>, RuntimeError> {
+        Ok(self
+            .stacks
+            .lock()
+            .await
+            .get(stack_id)
+            .map(|stack| stack.identity.clone()))
+    }
+
+    async fn shutdown_shared_vm_exact(
+        &self,
+        request: &contract::StackRuntimeShutdownRequest,
+    ) -> Result<contract::StackRuntimeShutdownOutcome, RuntimeError> {
+        // Keep the stack writer held through physical cleanup. Otherwise a new
+        // boot could reuse the bridge/netns names after comparison but before
+        // the old incarnation's cleanup finishes and be deleted by that cleanup.
+        let mut stacks = self.stacks.lock().await;
+        let (outcome, stack) = take_stack_for_exact_shutdown(&mut stacks, request)?;
+        if let Some(stack) = stack {
+            teardown_stack_state(&request.expected.stack_id, &stack).await;
+        }
+        Ok(outcome)
     }
 
     fn has_shared_vm(&self, stack_id: &str) -> bool {
@@ -1050,4 +1108,123 @@ fn uuid_short() -> String {
         .unwrap_or_default()
         .as_nanos();
     format!("{:x}", nanos % 0xFFFF_FFFF)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn stack_state(identity: contract::StackRuntimeIdentity) -> StackState {
+        StackState {
+            identity,
+            bridge_name: "vz-test".to_string(),
+            services: HashMap::new(),
+            port_forwards: Vec::new(),
+        }
+    }
+
+    fn shutdown_request(
+        expected: contract::StackRuntimeIdentity,
+    ) -> contract::StackRuntimeShutdownRequest {
+        contract::StackRuntimeShutdownRequest {
+            schema_version: contract::STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+            operation_id: "teardown:operation-1".to_string(),
+            expected,
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_runtime_inspection_returns_the_tracked_incarnation() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let backend = LinuxNativeBackend::new(LinuxNativeConfig {
+            data_dir: data_dir.path().to_path_buf(),
+            ..LinuxNativeConfig::default()
+        });
+        let identity = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        backend
+            .stacks
+            .lock()
+            .await
+            .insert(identity.stack_id.clone(), stack_state(identity.clone()));
+
+        assert_eq!(
+            backend.inspect_shared_vm("stack-a").await.unwrap(),
+            Some(identity)
+        );
+        assert_eq!(backend.inspect_shared_vm("stack-b").await.unwrap(), None);
+    }
+
+    #[test]
+    fn exact_shutdown_takes_only_the_expected_incarnation() {
+        let expected = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        let mut stacks =
+            HashMap::from([(expected.stack_id.clone(), stack_state(expected.clone()))]);
+
+        let (outcome, removed) =
+            take_stack_for_exact_shutdown(&mut stacks, &shutdown_request(expected)).unwrap();
+
+        assert_eq!(outcome, contract::StackRuntimeShutdownOutcome::Stopped);
+        assert!(removed.is_some());
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn exact_shutdown_refuses_a_replacement_without_removing_it() {
+        let expected = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        let replacement = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        let mut stacks = HashMap::from([(
+            replacement.stack_id.clone(),
+            stack_state(replacement.clone()),
+        )]);
+
+        let (outcome, removed) =
+            take_stack_for_exact_shutdown(&mut stacks, &shutdown_request(expected)).unwrap();
+
+        assert_eq!(
+            outcome,
+            contract::StackRuntimeShutdownOutcome::ReplacementPresent {
+                current: replacement.clone(),
+            }
+        );
+        assert!(removed.is_none());
+        assert_eq!(
+            stacks.get("stack-a").map(|stack| stack.identity.clone()),
+            Some(replacement)
+        );
+    }
+
+    #[test]
+    fn exact_shutdown_reports_an_absent_runtime_without_mutation() {
+        let expected = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        let mut stacks = HashMap::new();
+
+        let (outcome, removed) =
+            take_stack_for_exact_shutdown(&mut stacks, &shutdown_request(expected)).unwrap();
+
+        assert_eq!(
+            outcome,
+            contract::StackRuntimeShutdownOutcome::AlreadyAbsent
+        );
+        assert!(removed.is_none());
+        assert!(stacks.is_empty());
+    }
+
+    #[test]
+    fn exact_shutdown_rejects_invalid_operation_before_mutation() {
+        let expected = contract::StackRuntimeIdentity::new("stack-a").unwrap();
+        let mut request = shutdown_request(expected.clone());
+        request.operation_id = " ".to_string();
+        let mut stacks =
+            HashMap::from([(expected.stack_id.clone(), stack_state(expected.clone()))]);
+
+        let error = take_stack_for_exact_shutdown(&mut stacks, &request)
+            .err()
+            .expect("invalid operation must be rejected");
+
+        assert!(matches!(error, RuntimeError::InvalidConfig(_)));
+        assert_eq!(
+            stacks.get("stack-a").map(|stack| stack.identity.clone()),
+            Some(expected)
+        );
+    }
 }

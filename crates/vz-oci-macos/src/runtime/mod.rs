@@ -509,6 +509,12 @@ impl ContainerLifecycleTransaction {
     }
 }
 
+#[derive(Clone)]
+struct StackVmRecord {
+    identity: vz_runtime_contract::StackRuntimeIdentity,
+    vm: Arc<LinuxVm>,
+}
+
 /// Unified runtime entrypoint.
 #[derive(Clone)]
 pub struct Runtime {
@@ -523,7 +529,7 @@ pub struct Runtime {
     /// When a container belongs to a stack, its VM handle in [`vm_handles`]
     /// points to the same [`LinuxVm`] instance stored here. Individual
     /// container stop/remove should not tear down the shared VM.
-    stack_vms: Arc<Mutex<HashMap<String, Arc<LinuxVm>>>>,
+    stack_vms: Arc<Mutex<HashMap<String, StackVmRecord>>>,
     /// Serializes the guest-critical OCI activation transaction per stack.
     ///
     /// Image/rootfs preparation remains parallel, and distinct stacks use
@@ -1659,7 +1665,11 @@ impl Runtime {
         let guest_vm = if vm.is_some() {
             vm
         } else if let Some(stack_id) = stack_id.as_deref() {
-            self.stack_vms.lock().await.get(stack_id).cloned()
+            self.stack_vms
+                .lock()
+                .await
+                .get(stack_id)
+                .map(|record| record.vm.clone())
         } else {
             None
         };

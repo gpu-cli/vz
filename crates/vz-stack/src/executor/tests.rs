@@ -3820,6 +3820,10 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
             )
         }
     };
+    let finalizer_scope = executor.scoped_authority.as_ref().unwrap().scope.clone();
+    let initial_runtime_identity = Some(
+        vz_runtime_contract::StackRuntimeIdentity::new(finalizer_scope.stack_id.clone()).unwrap(),
+    );
     let prepared = crate::state_store::TeardownFinalizer {
         schema_version: crate::state_store::TEARDOWN_FINALIZER_SCHEMA_VERSION,
         operation_key: "req:request-finalize".to_string(),
@@ -3828,7 +3832,7 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
         request_digest: "vztr3-sha256:executor-finalizer".to_string(),
         session_id: replay.session_id.clone(),
         reconcile_operation_id: replay.operation_id.clone(),
-        scope: executor.scoped_authority.as_ref().unwrap().scope.clone(),
+        scope: finalizer_scope,
         remove_volumes: false,
         changed_actions: 1,
         actions_hash: crate::reconcile::compute_actions_hash(&replay.actions),
@@ -3836,6 +3840,7 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
         initial_volumes: Vec::new(),
         initial_disk_image: false,
         initial_runtime_present: true,
+        initial_runtime_identity,
         runtime_shutdown: false,
         staged_volumes: Vec::new(),
         purged_volumes: Vec::new(),
@@ -3981,6 +3986,21 @@ fn scoped_claimed_teardown_failed_remove_keeps_exact_claim_active_for_retry() {
         }
     };
     assert_eq!(result.failed, 1);
+    assert_eq!(result.action_failures.len(), 1);
+    assert_eq!(
+        result.action_failures[0].error.code,
+        vz_runtime_contract::MachineErrorCode::ValidationError
+    );
+    assert_eq!(result.action_failures[0].action, "web");
+    assert_eq!(
+        result.action_failures[0]
+            .error
+            .details
+            .get("reason")
+            .map(String::as_str),
+        Some("mock generation cleanup failure")
+    );
+    assert!(result.action_failures[0].error.request_id.is_none());
     let session = executor
         .store()
         .load_reconcile_session("session-teardown-failure")

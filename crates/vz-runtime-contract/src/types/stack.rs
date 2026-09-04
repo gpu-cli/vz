@@ -10,12 +10,96 @@ use super::{EnvironmentId, MachineId, MachineIncarnationId, ProjectId};
 pub const MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION: u32 = 1;
 /// Schema version for generation-qualified container lifecycle proofs and receipts.
 pub const CONTAINER_GENERATION_LIFECYCLE_SCHEMA_VERSION: u32 = 1;
+/// Schema version for opaque, per-boot shared-runtime identities.
+pub const STACK_RUNTIME_IDENTITY_SCHEMA_VERSION: u32 = 1;
+/// Schema version for operation-bound exact shared-runtime shutdown requests.
+pub const STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION: u32 = 1;
 /// Maximum timeout accepted by the bounded generation-qualified exec contract.
 pub const MAX_CONTAINER_GENERATION_EXEC_TIMEOUT_MILLIS: u64 = 7 * 24 * 60 * 60 * 1_000;
 /// Maximum combined stdout and stderr retained by one exact exec operation.
 pub const MAX_CONTAINER_GENERATION_EXEC_OUTPUT_BYTES: u64 = 64 * 1024 * 1024;
 /// Maximum duration of one bounded lifecycle snapshot inspection.
 pub const MAX_CONTAINER_GENERATION_LIFECYCLE_INSPECT_TIMEOUT_MILLIS: u64 = 60_000;
+
+/// Opaque identity for one exact boot of a shared stack runtime.
+///
+/// A stack name is a reusable selector, not lifecycle authority. Callers persist
+/// this proof before teardown and present it to compare-and-stop so a later boot
+/// under the same stack name cannot be stopped by an older operation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StackRuntimeIdentity {
+    pub schema_version: u32,
+    pub stack_id: String,
+    pub incarnation_id: String,
+}
+
+impl StackRuntimeIdentity {
+    /// Mint an identity for a newly booted shared runtime.
+    pub fn new(stack_id: impl Into<String>) -> Result<Self, String> {
+        let identity = Self {
+            schema_version: STACK_RUNTIME_IDENTITY_SCHEMA_VERSION,
+            stack_id: stack_id.into(),
+            incarnation_id: Uuid::new_v4().to_string(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    /// Validate an identity received from durable state or an API boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != STACK_RUNTIME_IDENTITY_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported stack runtime identity schema version {}; expected {}",
+                self.schema_version, STACK_RUNTIME_IDENTITY_SCHEMA_VERSION
+            ));
+        }
+        if self.stack_id.trim().is_empty() {
+            return Err("stack runtime identity stack_id cannot be empty".to_string());
+        }
+        Uuid::parse_str(&self.incarnation_id)
+            .map_err(|error| format!("invalid stack runtime incarnation_id: {error}"))?;
+        Ok(())
+    }
+}
+
+/// Result of atomically comparing and stopping one exact shared-runtime boot.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub enum StackRuntimeShutdownOutcome {
+    /// The exact requested runtime was stopped.
+    Stopped,
+    /// No runtime is active, so the requested incarnation is already gone.
+    AlreadyAbsent,
+    /// The reusable stack selector now names a different runtime incarnation.
+    ReplacementPresent { current: StackRuntimeIdentity },
+}
+
+/// Operation-bound authority to stop one exact shared-runtime incarnation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StackRuntimeShutdownRequest {
+    pub schema_version: u32,
+    /// Durable reconcile operation authorizing this attempt.
+    pub operation_id: String,
+    /// Exact runtime boot captured before teardown mutation began.
+    pub expected: StackRuntimeIdentity,
+}
+
+impl StackRuntimeShutdownRequest {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported stack runtime shutdown request schema version {}; expected {}",
+                self.schema_version, STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION
+            ));
+        }
+        if self.operation_id.trim().is_empty() {
+            return Err("stack runtime shutdown operation_id cannot be empty".to_string());
+        }
+        self.expected.validate()
+    }
+}
 
 /// Exact topology scope for workloads placed on one current Machine incarnation.
 ///

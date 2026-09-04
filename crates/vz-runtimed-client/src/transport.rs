@@ -41,10 +41,12 @@ pub(crate) async fn connect_channel(socket_path: &Path, timeout: Duration) -> Re
 }
 
 pub(crate) fn status_to_client_error(socket_path: &Path, status: Status) -> DaemonClientError {
-    if matches!(
-        status.code(),
-        Code::Unavailable | Code::DeadlineExceeded | Code::Unknown
-    ) {
+    if status.details().is_empty()
+        && matches!(
+            status.code(),
+            Code::Unavailable | Code::DeadlineExceeded | Code::Unknown
+        )
+    {
         return DaemonClientError::Unavailable {
             socket_path: socket_path.to_path_buf(),
             reason: status.to_string(),

@@ -310,10 +310,18 @@ mod tests {
             code: "not_found".into(),
             message: "sandbox not found".into(),
             request_id: "req-abc".into(),
+            details: std::collections::HashMap::from([(
+                "sandbox_id".to_string(),
+                "sb-123".to_string(),
+            )]),
         };
         assert_eq!(err.code, "not_found");
         assert_eq!(err.message, "sandbox not found");
         assert_eq!(err.request_id, "req-abc");
+        assert_eq!(
+            err.details.get("sandbox_id").map(String::as_str),
+            Some("sb-123")
+        );
     }
 
     #[test]

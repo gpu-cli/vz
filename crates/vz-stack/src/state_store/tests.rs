@@ -101,6 +101,20 @@ fn create_v5_store(path: &Path) -> StateStore {
     store
 }
 
+fn create_v8_store(path: &Path) -> StateStore {
+    let store = create_v5_store(path);
+    store
+        .migrate_reconcile_v5_to_v6()
+        .expect("create canonical v6 state database");
+    store
+        .migrate_claim_v6_to_v7()
+        .expect("create canonical v7 state database");
+    store
+        .migrate_teardown_finalizer_v7_to_v8()
+        .expect("create canonical v8 state database");
+    store
+}
+
 fn application_schema_snapshot(connection: &Connection) -> Vec<(String, String, String, String)> {
     let mut statement = connection
         .prepare(
@@ -3416,7 +3430,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 8);
+    assert_eq!(version, 9);
 }
 
 #[test]
@@ -4511,13 +4525,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(8).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        store.set_schema_version(9).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 9);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
     }
 }
 
@@ -5058,7 +5072,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         let definition_json: String = store
             .conn
             .query_row(
@@ -7026,7 +7040,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 8);
+    assert_eq!(retried.schema_version().unwrap(), 9);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -7084,7 +7098,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 8);
+        assert_eq!(store.schema_version().unwrap(), 9);
         assert_eq!(
             store
                 .conn
@@ -7319,7 +7333,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 8);
+    assert_eq!(retried.schema_version().unwrap(), 9);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -7466,7 +7480,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v8 shape mismatch"));
+    assert!(error.contains("state schema v9 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -7495,7 +7509,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v8 shape mismatch"));
+    assert!(error.contains("state schema v9 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -7600,7 +7614,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v8 shape mismatch"),
+            error.contains("state schema v9 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -7966,15 +7980,15 @@ fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
 fn migration_v4_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "8" after initial init.
+    // Schema version must be present and equal to "9" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "8");
+    assert_eq!(version_str, "9");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
 
     // created_at must also be set.
     assert!(
@@ -8034,7 +8048,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -8116,7 +8130,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
 }
 
 fn journal_fixture(
@@ -8573,7 +8587,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -8616,7 +8630,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -9273,7 +9287,7 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
 #[test]
 fn fresh_store_uses_v7_reconcile_claim_schema_and_replica_claim_index() {
     let store = StateStore::in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 8);
+    assert_eq!(store.schema_version().unwrap(), 9);
 
     for table in ["reconcile_sessions", "reconcile_progress"] {
         let sql: String = store
@@ -9562,7 +9576,7 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 8);
+        assert_eq!(reopened.schema_version().unwrap(), 9);
         assert_eq!(
             reopened
                 .conn
@@ -9630,8 +9644,8 @@ fn v7_to_v8_teardown_finalizer_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
-    reopened.validate_v8_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 9);
+    reopened.validate_v9_schema().unwrap();
     for object in [
         "teardown_finalizers",
         "teardown_one_active_workload",
@@ -9703,7 +9717,7 @@ fn v7_to_v8_preserves_terminal_claimed_teardown_history() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     let session = reopened
         .load_reconcile_session(session_id)
         .unwrap()
@@ -9711,9 +9725,90 @@ fn v7_to_v8_preserves_terminal_claimed_teardown_history() {
     assert_eq!(session.status, ReconcileSessionStatus::Completed);
 }
 
+#[test]
+fn v8_to_v9_adds_exact_runtime_identity_projection() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v8-runtime-identity.db");
+    let store = create_v8_store(&path);
+    assert_eq!(store.schema_version().unwrap(), 8);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 9);
+    reopened.validate_v9_schema().unwrap();
+    let column_count: i64 = reopened
+        .conn
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('teardown_finalizers') WHERE name = 'initial_runtime_identity_json'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(column_count, 1);
+}
+
+#[test]
+fn v8_to_v9_rejects_prepared_teardown_without_exact_runtime_identity() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v8-prepared-runtime-identity.db");
+    let store = create_v8_store(&path);
+    store
+        .conn
+        .execute(
+            "INSERT INTO teardown_finalizers (
+                operation_key, schema_version, request_id, idempotency_key,
+                request_digest, session_id, reconcile_operation_id, project_id,
+                environment_id, machine_id, machine_incarnation_id, stack_name,
+                remove_volumes, changed_actions, actions_hash, desired_state_digest,
+                initial_volumes_json, initial_disk_image, initial_runtime_present,
+                runtime_shutdown, staged_volumes_json, purged_volumes_json,
+                disk_staged, disk_purged, status, receipt_id, finalizer_json,
+                created_at, updated_at, completed_at
+             ) VALUES (
+                'req:legacy-runtime', 1, 'legacy-runtime', NULL,
+                'digest', 'session-legacy-runtime', 'teardown:req-legacy-runtime', 'project',
+                'environment', 'machine', 'incarnation', 'stack',
+                0, 0, 'actions', 'desired',
+                '[]', 0, 1,
+                0, '[]', '[]',
+                0, 0, 'prepared', NULL, '{}',
+                1, 1, NULL
+             )",
+            [],
+        )
+        .unwrap();
+    drop(store);
+
+    let error = match StateStore::open(&path) {
+        Ok(_) => panic!("v9 migration must reject an unqualified prepared teardown"),
+        Err(error) => error.to_string(),
+    };
+    assert!(error.contains("lacks exact runtime identity evidence"));
+    let raw = Connection::open(&path).unwrap();
+    assert_eq!(
+        raw.query_row(
+            "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .unwrap(),
+        "8"
+    );
+    let missing_column: i64 = raw
+        .query_row(
+            "SELECT COUNT(*) FROM pragma_table_info('teardown_finalizers') WHERE name = 'initial_runtime_identity_json'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(missing_column, 0, "failed migration must roll back DDL");
+}
+
 fn teardown_finalizer_fixture(operation_key: &str) -> TeardownFinalizer {
     let (_, intent, _) = journal_fixture("teardown-finalizer-fixture");
     let scope = workload_scope_for_journal_intent(&intent);
+    let initial_runtime_identity =
+        Some(vz_runtime_contract::StackRuntimeIdentity::new(scope.stack_id.clone()).unwrap());
     TeardownFinalizer {
         schema_version: TEARDOWN_FINALIZER_SCHEMA_VERSION,
         operation_key: operation_key.to_string(),
@@ -9733,6 +9828,7 @@ fn teardown_finalizer_fixture(operation_key: &str) -> TeardownFinalizer {
         initial_volumes: vec!["cache".to_string(), "database".to_string()],
         initial_disk_image: true,
         initial_runtime_present: true,
+        initial_runtime_identity,
         runtime_shutdown: false,
         staged_volumes: Vec::new(),
         purged_volumes: Vec::new(),
@@ -9865,6 +9961,9 @@ fn prepared_teardown_fences_normal_reconcile_after_reservation_crash() {
     let actions = exact_batch_actions_for_claim(&store);
     let mut finalizer = teardown_finalizer_fixture("req:crash-after-reservation");
     finalizer.scope = actions[0].precondition().workload().clone();
+    finalizer.initial_runtime_identity = Some(
+        vz_runtime_contract::StackRuntimeIdentity::new(finalizer.scope.stack_id.clone()).unwrap(),
+    );
     finalizer.session_id = "rs-reserved-teardown-owner".to_string();
     finalizer.reconcile_operation_id =
         format!("{CLAIMED_TEARDOWN_OPERATION_PREFIX}reserved-teardown-owner");
@@ -9939,6 +10038,9 @@ fn prepared_teardown_does_not_fence_same_stack_name_on_sibling_machine() {
     sibling.scope = actions[0].precondition().workload().clone();
     sibling.scope.machine_id = MachineId::new("mac_sibling").unwrap();
     sibling.scope.machine_incarnation_id = MachineIncarnationId::new("inc_sibling_001").unwrap();
+    sibling.initial_runtime_identity = Some(
+        vz_runtime_contract::StackRuntimeIdentity::new(sibling.scope.stack_id.clone()).unwrap(),
+    );
     sibling.session_id = "rs-sibling-teardown".to_string();
     sibling.reconcile_operation_id = format!("{CLAIMED_TEARDOWN_OPERATION_PREFIX}sibling-teardown");
     store.reserve_teardown_finalizer(&sibling).unwrap();
@@ -9984,7 +10086,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     for trigger in [
         "reconcile_session_identity_immutable",
         "reconcile_audit_identity_immutable",
@@ -10002,7 +10104,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
             1
         );
     }
-    reopened.validate_v8_schema().unwrap();
+    reopened.validate_v9_schema().unwrap();
 }
 
 #[test]
@@ -10075,7 +10177,7 @@ fn v6_to_v7_preserves_effect_free_active_session_and_terminal_history() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 8);
+        assert_eq!(reopened.schema_version().unwrap(), 9);
         assert_eq!(
             reopened
                 .load_reconcile_session_actions(&session_id)
@@ -10146,7 +10248,7 @@ fn v6_to_v7_preserves_terminal_history_beside_one_effect_free_active_session() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert_eq!(
         reopened
             .load_audit_log_for_session("rs-v6-terminal")
@@ -10268,7 +10370,7 @@ fn v6_to_v7_preserves_length_framed_whitespace_ids_for_atomic_claim() {
     };
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert_eq!(
         crate::reconcile::ReconcileActionExecutionKey::new(
             session_id,
@@ -10333,7 +10435,7 @@ fn v7_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 8);
+    assert_eq!(reopened.schema_version().unwrap(), 9);
     assert_eq!(
         reopened
             .load_reconcile_session_actions(&session.session_id)
@@ -12047,7 +12149,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v8_schema().unwrap();
+    store.validate_v9_schema().unwrap();
 }
 
 #[test]
@@ -14188,6 +14290,8 @@ fn terminal_claimed_teardown_reconstructs_one_atomic_finalizer_result() {
     let (_, intent, _) = journal_fixture("terminal-finalizer-reconstruction");
     let mut scope = workload_scope_for_journal_intent(&intent);
     scope.stack_id = "exact-batch".to_string();
+    let initial_runtime_identity =
+        Some(vz_runtime_contract::StackRuntimeIdentity::new(scope.stack_id.clone()).unwrap());
     let mut finalizer = TeardownFinalizer {
         schema_version: TEARDOWN_FINALIZER_SCHEMA_VERSION,
         operation_key: "req:req-state-store-test".to_string(),
@@ -14204,6 +14308,7 @@ fn terminal_claimed_teardown_reconstructs_one_atomic_finalizer_result() {
         initial_volumes: Vec::new(),
         initial_disk_image: false,
         initial_runtime_present: true,
+        initial_runtime_identity,
         runtime_shutdown: false,
         staged_volumes: Vec::new(),
         purged_volumes: Vec::new(),
