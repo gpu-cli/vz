@@ -2,11 +2,11 @@ use std::future::Future;
 use std::time::Duration;
 
 use crate::{
-    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationOwnership,
-    ContainerGenerationScope, ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput,
-    GenerationCleanupOutcome, ImageInfo, IsolationLevel, NetworkServiceConfig, OwnedCreateError,
-    PortMapping, PruneResult, RunConfig, RuntimeCapabilities, RuntimeError, RuntimeOperation,
-    SandboxSpec, StackResourceHint,
+    Build, BuildSpec, ContainerCreateReceipt, ContainerGenerationInspection,
+    ContainerGenerationOwnership, ContainerGenerationReleaseOutcome, ContainerGenerationScope,
+    ContainerInfo, ContainerLogs, Event, ExecConfig, ExecOutput, GenerationCleanupOutcome,
+    ImageInfo, IsolationLevel, NetworkServiceConfig, OwnedCreateError, PortMapping, PruneResult,
+    RunConfig, RuntimeCapabilities, RuntimeError, RuntimeOperation, SandboxSpec, StackResourceHint,
 };
 
 /// Workspace-oriented runtime manager that routes stack operations
@@ -147,6 +147,62 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
         self.backend
             .create_container_in_stack_owned(scope, image, config)
             .await
+    }
+
+    /// Durably reserve an exact scoped container generation without activating it.
+    pub async fn reserve_stack_container_generation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationOwnership, RuntimeError> {
+        if !self.capabilities().shared_vm {
+            return Err(RuntimeError::UnsupportedOperation {
+                operation: "reserve_container_generation".to_string(),
+                reason: "scoped generation reservation requires shared runtime support".to_string(),
+            });
+        }
+        self.backend
+            .reserve_container_generation(scope, container_id)
+            .await
+    }
+
+    /// Inspect a reservation by its exact scope after response loss or restart.
+    pub async fn inspect_stack_container_reservation(
+        &self,
+        scope: &ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<ContainerGenerationInspection, RuntimeError> {
+        self.backend
+            .inspect_container_reservation(scope, container_id)
+            .await
+    }
+
+    /// Inspect an exact generation and distinguish a replacement generation.
+    pub async fn inspect_stack_container_generation(
+        &self,
+        ownership: &ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationInspection, RuntimeError> {
+        self.backend.inspect_container_generation(ownership).await
+    }
+
+    /// Activate only an exact generation returned by scoped reservation.
+    pub async fn activate_stack_container_generation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+        image: &str,
+        config: RunConfig,
+    ) -> Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>> {
+        self.backend
+            .activate_container_generation(ownership, image, config)
+            .await
+    }
+
+    /// Abandon an exact unpublished reservation without touching published state.
+    pub async fn release_stack_container_reservation(
+        &self,
+        ownership: ContainerGenerationOwnership,
+    ) -> Result<ContainerGenerationReleaseOutcome, RuntimeError> {
+        self.backend.release_container_reservation(ownership).await
     }
 
     /// Compatibility adapter for callers that still identify a stack by name.
@@ -681,6 +737,77 @@ pub trait RuntimeBackend: Send + Sync {
                     reason: "backend cannot issue generation ownership".to_string(),
                 },
             ))
+        }
+    }
+
+    /// Reserve an exact scoped generation without OCI, rootfs, or guest mutation.
+    fn reserve_container_generation(
+        &self,
+        _scope: &ContainerGenerationScope,
+        _container_id: &str,
+    ) -> impl Future<Output = Result<ContainerGenerationOwnership, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "reserve_container_generation".to_string(),
+                reason: "backend cannot reserve detached scoped generations".to_string(),
+            })
+        }
+    }
+
+    /// Inspect an exact reservation, including after backend reopen.
+    fn inspect_container_reservation(
+        &self,
+        _scope: &ContainerGenerationScope,
+        _container_id: &str,
+    ) -> impl Future<Output = Result<ContainerGenerationInspection, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "inspect_container_reservation".to_string(),
+                reason: "backend cannot inspect scoped generation reservations".to_string(),
+            })
+        }
+    }
+
+    /// Inspect a generation-qualified ownership proof without adopting it.
+    fn inspect_container_generation(
+        &self,
+        _ownership: &ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<ContainerGenerationInspection, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "inspect_container_generation".to_string(),
+                reason: "backend cannot inspect generation ownership".to_string(),
+            })
+        }
+    }
+
+    /// Activate a previously reserved exact scoped generation.
+    fn activate_container_generation(
+        &self,
+        _ownership: ContainerGenerationOwnership,
+        _image: &str,
+        _config: RunConfig,
+    ) -> impl Future<Output = Result<ContainerCreateReceipt, OwnedCreateError<RuntimeError>>> {
+        async {
+            Err(OwnedCreateError::unowned(
+                RuntimeError::UnsupportedOperation {
+                    operation: "activate_container_generation".to_string(),
+                    reason: "backend cannot activate detached scoped generations".to_string(),
+                },
+            ))
+        }
+    }
+
+    /// Release only an exact unpublished reservation.
+    fn release_container_reservation(
+        &self,
+        _ownership: ContainerGenerationOwnership,
+    ) -> impl Future<Output = Result<ContainerGenerationReleaseOutcome, RuntimeError>> {
+        async {
+            Err(RuntimeError::UnsupportedOperation {
+                operation: "release_container_reservation".to_string(),
+                reason: "backend cannot release detached scoped generations".to_string(),
+            })
         }
     }
 

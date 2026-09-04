@@ -45,6 +45,7 @@ pub(crate) async fn try_apply_stack_via_daemon(
         compose_dir: body.compose_dir,
         dry_run: body.dry_run.unwrap_or(false),
         detach: body.detach.unwrap_or(false),
+        scope: None,
     };
 
     match client.apply_stack_with_metadata(grpc_request).await {
@@ -135,6 +136,7 @@ pub(crate) async fn try_teardown_stack_via_daemon(
         stack_name: body.stack_name,
         dry_run: body.dry_run.unwrap_or(false),
         remove_volumes: body.remove_volumes.unwrap_or(false),
+        scope: None,
     };
 
     match client.teardown_stack_with_metadata(grpc_request).await {
@@ -201,6 +203,7 @@ pub(crate) async fn try_get_stack_status_via_daemon(
         .get_stack_status(runtime_v2::GetStackStatusRequest {
             metadata: Some(daemon_request_metadata(request_id, None)),
             stack_name: stack_name.to_string(),
+            scope: None,
         })
         .await
     {
@@ -265,6 +268,7 @@ pub(crate) async fn try_list_stack_events_via_daemon(
             stack_name: stack_name.to_string(),
             after,
             limit: limit as u32,
+            scope: None,
         })
         .await
     {
@@ -323,6 +327,7 @@ pub(crate) async fn try_get_stack_logs_via_daemon(
             stack_name: stack_name.to_string(),
             service: query.service.clone().unwrap_or_default(),
             tail: query.tail.unwrap_or(0),
+            scope: None,
         })
         .await
     {
@@ -387,6 +392,7 @@ pub(crate) async fn try_stack_service_action_via_daemon(
         )),
         stack_name: stack_name.to_string(),
         service_name: service_name.to_string(),
+        scope: None,
     };
 
     let grpc_response = match action {
@@ -490,6 +496,7 @@ pub(crate) async fn try_create_stack_run_container_via_daemon(
             stack_name: body.stack_name,
             service_name: body.service_name,
             run_service_name: body.run_service_name.unwrap_or_default(),
+            scope: None,
         })
         .await
     {
@@ -566,6 +573,7 @@ pub(crate) async fn try_remove_stack_run_container_via_daemon(
             stack_name: body.stack_name,
             service_name: body.service_name,
             run_service_name: body.run_service_name.unwrap_or_default(),
+            scope: None,
         })
         .await
     {

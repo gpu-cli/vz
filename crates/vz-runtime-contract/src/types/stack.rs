@@ -5,6 +5,59 @@ use uuid::Uuid;
 
 use super::{EnvironmentId, MachineId, MachineIncarnationId, ProjectId};
 
+pub const MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION: u32 = 1;
+
+/// Exact topology scope for workloads placed on one current Machine incarnation.
+///
+/// Reservation identity is deliberately absent: callers reuse this scope for the
+/// Machine workload, then mint a distinct durable reservation for each container
+/// create intent.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MachineWorkloadScope {
+    pub schema_version: u32,
+    pub project_id: ProjectId,
+    pub environment_id: EnvironmentId,
+    pub machine_id: MachineId,
+    pub machine_incarnation_id: MachineIncarnationId,
+    pub stack_id: String,
+}
+
+impl MachineWorkloadScope {
+    /// Validate IDs that may have crossed an untrusted serialization boundary.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.schema_version != MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION {
+            return Err(format!(
+                "unsupported Machine workload scope schema version {}",
+                self.schema_version
+            ));
+        }
+        ProjectId::new(self.project_id.as_str()).map_err(|error| error.to_string())?;
+        EnvironmentId::new(self.environment_id.as_str()).map_err(|error| error.to_string())?;
+        MachineId::new(self.machine_id.as_str()).map_err(|error| error.to_string())?;
+        MachineIncarnationId::new(self.machine_incarnation_id.as_str())
+            .map_err(|error| error.to_string())?;
+        validate_stack_id(&self.stack_id)
+    }
+
+    /// Bind a caller-persisted reservation identity to this workload scope.
+    pub fn container_generation_scope(
+        &self,
+        reservation_id: impl Into<String>,
+    ) -> Result<ContainerGenerationScope, String> {
+        self.validate()?;
+        let scope = ContainerGenerationScope {
+            reservation_id: reservation_id.into(),
+            project_id: self.project_id.clone(),
+            environment_id: self.environment_id.clone(),
+            machine_id: self.machine_id.clone(),
+            machine_incarnation_id: Some(self.machine_incarnation_id.clone()),
+            stack_id: self.stack_id.clone(),
+        };
+        scope.validate()?;
+        Ok(scope)
+    }
+}
+
 /// Exact topology and operation scope that admits one container generation.
 ///
 /// `reservation_id` is allocated before the runtime call. It lets recovery
@@ -28,13 +81,21 @@ pub struct ContainerGenerationScope {
 }
 
 impl ContainerGenerationScope {
+    /// Construct a topology-native generation scope from a current Machine workload.
+    pub fn for_machine_workload(
+        workload: &MachineWorkloadScope,
+        reservation_id: impl Into<String>,
+    ) -> Result<Self, String> {
+        workload.container_generation_scope(reservation_id)
+    }
+
     /// Mint an explicitly synthetic topology scope for the pre-topology stack API.
     ///
     /// This exists only to keep legacy stack-name callers on the exact scoped
     /// generation path while topology identity is plumbed through those callers.
     /// Every invocation receives a fresh reservation identity.
     pub fn synthetic_legacy_stack(stack_id: &str) -> Result<Self, String> {
-        validate_text("stack_id", stack_id)?;
+        validate_stack_id(stack_id)?;
         let scope = Self {
             reservation_id: format!("legacy-stack-compat-{}", Uuid::new_v4().simple()),
             project_id: ProjectId::new("prj_synthetic_legacy_stack_compat")
@@ -60,8 +121,34 @@ impl ContainerGenerationScope {
             MachineIncarnationId::new(incarnation_id.as_str())
                 .map_err(|error| error.to_string())?;
         }
-        validate_text("stack_id", &self.stack_id)
+        validate_stack_id(&self.stack_id)
     }
+}
+
+/// Durable state observed for one exact topology-scoped create reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContainerGenerationInspection {
+    /// No active generation exists for the requested container ID.
+    Absent,
+    /// The exact reservation owns a generation but has not published metadata.
+    ReservedUnpublished(ContainerGenerationOwnership),
+    /// The exact reservation owns a published generation.
+    Published(ContainerGenerationOwnership),
+    /// The container ID is owned by another scoped reservation.
+    Foreign,
+    /// A caller-supplied generation was replaced by a different generation.
+    Replacement,
+    /// The active generation predates scoped ownership and cannot be adopted.
+    LegacyUnscoped,
+    /// Durable generation metadata is malformed and cannot be trusted.
+    Malformed(String),
+}
+
+/// Result of abandoning an exact unpublished reservation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContainerGenerationReleaseOutcome {
+    Released,
+    AlreadyAbsent,
 }
 
 /// Runtime-issued proof that one stack reserved a specific container-ID generation.
@@ -111,6 +198,21 @@ fn validate_text(field: &str, value: &str) -> Result<(), String> {
     let trimmed = value.trim();
     if trimmed.is_empty() || trimmed.len() > 128 {
         return Err(format!("{field} must contain 1..=128 non-blank bytes"));
+    }
+    Ok(())
+}
+
+fn validate_stack_id(value: &str) -> Result<(), String> {
+    validate_text("stack_id", value)?;
+    if matches!(value, "." | "..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err(
+            "stack_id must be one safe path component using only ASCII letters, digits, '-', '_', or '.'"
+                .to_string(),
+        );
     }
     Ok(())
 }

@@ -24,7 +24,7 @@ use vz_linux::{
 use vz_oci::bundle::{BundleMount, BundleSpec, write_oci_bundle};
 use vz_oci::container_store::{
     ContainerGeneration, ContainerGenerationDiagnostic, ContainerIdLease, ContainerInfo,
-    ContainerStatus, ContainerStore,
+    ContainerStatus, ContainerStore, ScopedGenerationInspection,
 };
 
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
@@ -113,6 +113,45 @@ fn validate_container_id(container_id: &str) -> Result<(), OciError> {
         ));
     }
     Ok(())
+}
+
+fn contract_inspection(
+    container_id: &str,
+    scope: &vz_runtime_contract::ContainerGenerationScope,
+    inspection: ScopedGenerationInspection,
+) -> vz_runtime_contract::ContainerGenerationInspection {
+    let ownership =
+        |generation: ContainerGeneration| vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: container_id.to_string(),
+            generation: generation.0,
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope.clone())),
+        };
+    match inspection {
+        ScopedGenerationInspection::Absent => {
+            vz_runtime_contract::ContainerGenerationInspection::Absent
+        }
+        ScopedGenerationInspection::ReservedUnpublished(generation) => {
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(ownership(
+                generation,
+            ))
+        }
+        ScopedGenerationInspection::Published(generation) => {
+            vz_runtime_contract::ContainerGenerationInspection::Published(ownership(generation))
+        }
+        ScopedGenerationInspection::Foreign => {
+            vz_runtime_contract::ContainerGenerationInspection::Foreign
+        }
+        ScopedGenerationInspection::Replacement => {
+            vz_runtime_contract::ContainerGenerationInspection::Replacement
+        }
+        ScopedGenerationInspection::LegacyUnscoped => {
+            vz_runtime_contract::ContainerGenerationInspection::LegacyUnscoped
+        }
+        ScopedGenerationInspection::Malformed(reason) => {
+            vz_runtime_contract::ContainerGenerationInspection::Malformed(reason)
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -368,6 +407,7 @@ struct ContainerLifecycleLease {
     generation: ContainerGeneration,
     scope: Option<vz_runtime_contract::ContainerGenerationScope>,
     container_store: ContainerStore,
+    container_stack: Arc<Mutex<HashMap<String, String>>>,
     _os_guard: ContainerIdLease,
     _stack_guard: Option<OwnedRwLockReadGuard<()>>,
     _container_guard: OwnedRwLockWriteGuard<()>,
@@ -422,9 +462,17 @@ impl Drop for RootfsAssemblyReturn {
 
 impl Drop for ContainerLifecycleLease {
     fn drop(&mut self) {
-        let _ = self
+        let released = self
             .container_store
-            .release_generation_if_absent(&self.container_id, self.generation);
+            .release_generation_if_absent(&self.container_id, self.generation)
+            .unwrap_or(false);
+        if released
+            && let Some(scope) = self.scope.as_ref()
+            && let Ok(mut routes) = self.container_stack.try_lock()
+            && routes.get(&self.container_id) == Some(&scope.stack_id)
+        {
+            routes.remove(&self.container_id);
+        }
     }
 }
 
@@ -758,6 +806,158 @@ impl Runtime {
             .await
     }
 
+    /// Reserve a detached generation without beginning OCI/rootfs/guest activation.
+    ///
+    /// Unlike `ContainerLifecycleTransaction`, the returned ownership has no
+    /// drop-release behavior and therefore survives caller or process loss.
+    pub async fn reserve_scoped_container_generation(
+        &self,
+        container_id: &str,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<vz_runtime_contract::ContainerGenerationOwnership, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
+        validate_container_id(container_id)?;
+        scope.validate().map_err(OciError::InvalidConfig)?;
+        let _stack_guard = self
+            .stack_lifecycle_lock(&scope.stack_id)
+            .await
+            .read_owned()
+            .await;
+        let _container_guard = self
+            .container_lifecycle_lock(container_id)
+            .await
+            .try_write_owned()
+            .map_err(|_| OciError::ContainerAlreadyExists {
+                id: container_id.to_string(),
+            })?;
+        let os_guard = self
+            .container_store
+            .try_acquire_container_write_lease(container_id)
+            .map_err(|error| Self::map_container_store_error(container_id, error))?;
+        let generation = self
+            .container_store
+            .reserve_scoped_generation_with_write_lease(container_id, scope, &os_guard)
+            .map_err(|error| Self::map_container_store_error(container_id, error))?;
+        Ok(vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: container_id.to_string(),
+            generation: generation.0,
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope.clone())),
+        })
+    }
+
+    /// Assign a runtime ID when needed, then reserve it without activation.
+    pub async fn reserve_scoped_container_run(
+        &self,
+        run: &mut RunConfig,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<vz_runtime_contract::ContainerGenerationOwnership, OciError> {
+        let container_id = run.container_id.clone().unwrap_or_else(new_container_id);
+        run.container_id = Some(container_id.clone());
+        self.reserve_scoped_container_generation(&container_id, scope)
+            .await
+    }
+
+    /// Inspect a detached reservation without updating route or lifecycle caches.
+    pub fn inspect_scoped_container_reservation(
+        &self,
+        container_id: &str,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, OciError> {
+        validate_container_id(container_id)?;
+        scope.validate().map_err(OciError::InvalidConfig)?;
+        let inspection = match self
+            .container_store
+            .inspect_scoped_reservation(container_id, scope)
+        {
+            Ok(inspection) => inspection,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(
+                    vz_runtime_contract::ContainerGenerationInspection::Malformed(
+                        error.to_string(),
+                    ),
+                );
+            }
+            Err(error) => return Err(Self::map_container_store_error(container_id, error)),
+        };
+        Ok(contract_inspection(container_id, scope, inspection))
+    }
+
+    /// Inspect an exact generation without adopting or repairing it.
+    pub fn inspect_scoped_container_generation(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, OciError> {
+        ownership.validate().map_err(OciError::InvalidConfig)?;
+        let scope = ownership.scope.as_deref().ok_or_else(|| {
+            OciError::InvalidConfig("generation ownership requires exact scope".to_string())
+        })?;
+        let inspection = match self.container_store.inspect_scoped_generation(
+            &ownership.container_id,
+            ContainerGeneration(ownership.generation),
+            scope,
+        ) {
+            Ok(inspection) => inspection,
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
+                return Ok(
+                    vz_runtime_contract::ContainerGenerationInspection::Malformed(
+                        error.to_string(),
+                    ),
+                );
+            }
+            Err(error) => {
+                return Err(Self::map_container_store_error(
+                    &ownership.container_id,
+                    error,
+                ));
+            }
+        };
+        Ok(contract_inspection(
+            &ownership.container_id,
+            scope,
+            inspection,
+        ))
+    }
+
+    /// Explicitly abandon only an exact unpublished detached reservation.
+    pub async fn release_scoped_container_reservation(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationReleaseOutcome, OciError> {
+        self.ensure_ownership_mutation_allowed()?;
+        ownership.validate().map_err(OciError::InvalidConfig)?;
+        let scope = ownership.scope.as_deref().ok_or_else(|| {
+            OciError::InvalidConfig("generation ownership requires exact scope".to_string())
+        })?;
+        let _stack_guard = self
+            .stack_lifecycle_lock(&scope.stack_id)
+            .await
+            .read_owned()
+            .await;
+        let _container_guard = self
+            .container_lifecycle_lock(&ownership.container_id)
+            .await
+            .write_owned()
+            .await;
+        let os_guard = self
+            .acquire_container_os_write(&ownership.container_id)
+            .await?;
+        let released = self
+            .container_store
+            .release_scoped_generation_with_write_lease(
+                &ownership.container_id,
+                ContainerGeneration(ownership.generation),
+                scope,
+                &os_guard,
+            )
+            .map_err(|error| Self::map_container_store_error(&ownership.container_id, error))?;
+        Ok(if released {
+            vz_runtime_contract::ContainerGenerationReleaseOutcome::Released
+        } else {
+            vz_runtime_contract::ContainerGenerationReleaseOutcome::AlreadyAbsent
+        })
+    }
+
     async fn begin_container_create_inner(
         &self,
         run: &mut RunConfig,
@@ -808,6 +1008,7 @@ impl Runtime {
                 generation,
                 scope: scope.cloned(),
                 container_store: self.container_store.clone(),
+                container_stack: Arc::clone(&self.container_stack),
                 _os_guard: os_guard,
                 _stack_guard: stack_guard,
                 _container_guard: container_guard,
@@ -910,6 +1111,7 @@ impl Runtime {
                     generation,
                     scope,
                     container_store: self.container_store.clone(),
+                    container_stack: Arc::clone(&self.container_stack),
                     _os_guard: os_guard,
                     _stack_guard: stack_guard,
                     _container_guard: container_guard,
@@ -929,6 +1131,29 @@ impl Runtime {
         generation: ContainerGeneration,
         scope: &vz_runtime_contract::ContainerGenerationScope,
     ) -> Result<Option<ContainerLifecycleTransaction>, OciError> {
+        self.begin_owned_container_generation_inner(id, generation, scope, false)
+            .await
+    }
+
+    /// Acquire exact lifecycle ownership for cleanup of either an unpublished
+    /// reservation or its published container metadata.
+    async fn begin_owned_container_generation_for_cleanup(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+    ) -> Result<Option<ContainerLifecycleTransaction>, OciError> {
+        self.begin_owned_container_generation_inner(id, generation, scope, true)
+            .await
+    }
+
+    async fn begin_owned_container_generation_inner(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        allow_published: bool,
+    ) -> Result<Option<ContainerLifecycleTransaction>, OciError> {
         self.ensure_ownership_mutation_allowed()?;
         validate_container_id(id)?;
         scope.validate().map_err(OciError::InvalidConfig)?;
@@ -941,51 +1166,59 @@ impl Runtime {
         let os_guard = self.acquire_container_os_write(id).await?;
         let current = self
             .container_store
-            .generation_diagnostic(id)
+            .inspect_scoped_generation(id, generation, scope)
             .map_err(|error| Self::map_container_store_error(id, error))?;
+        match current {
+            ScopedGenerationInspection::ReservedUnpublished(current) if current == generation => {}
+            ScopedGenerationInspection::Absent => return Ok(None),
+            ScopedGenerationInspection::Published(current)
+                if allow_published && current == generation => {}
+            ScopedGenerationInspection::Published(_) => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: "exact generation is already published and cannot be activated again"
+                        .to_string(),
+                });
+            }
+            ScopedGenerationInspection::Foreign => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: "proof scope does not match the durable generation scope".to_string(),
+                });
+            }
+            ScopedGenerationInspection::Replacement => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: "proof generation was replaced by another generation".to_string(),
+                });
+            }
+            ScopedGenerationInspection::LegacyUnscoped => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: "current generation is legacy-unscoped and quarantined".to_string(),
+                });
+            }
+            ScopedGenerationInspection::Malformed(reason) => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: format!("durable generation metadata is malformed: {reason}"),
+                });
+            }
+            ScopedGenerationInspection::ReservedUnpublished(current) => {
+                return Err(OciError::ContainerOwnershipMismatch {
+                    id: id.to_string(),
+                    reason: format!(
+                        "proof names generation {}, but current generation is {}",
+                        generation.0, current.0
+                    ),
+                });
+            }
+        }
 
-        let Some(current) = current else {
-            return Ok(None);
-        };
-        if current.generation != generation {
-            return Err(OciError::ContainerOwnershipMismatch {
-                id: id.to_string(),
-                reason: format!(
-                    "proof names generation {}, but current generation is {}",
-                    generation.0, current.generation.0
-                ),
-            });
-        }
-        let Some(current_scope) = current.scope else {
-            return Err(OciError::ContainerOwnershipMismatch {
-                id: id.to_string(),
-                reason: "current generation is legacy-unscoped and quarantined".to_string(),
-            });
-        };
-        if current_scope != *scope {
-            return Err(OciError::ContainerOwnershipMismatch {
-                id: id.to_string(),
-                reason: "proof scope does not match the durable generation scope".to_string(),
-            });
-        }
-        if !current.reserved {
-            return Ok(None);
-        }
-
-        // A process-local route is only a cache. Missing state is reconstructed
-        // from the durable scope; conflicting state is rejected without cleanup.
+        // A process-local route is only a cache. The exact durable scope was
+        // validated while holding stack -> container -> OS -> store ownership,
+        // so stale cache state must be repaired rather than overriding it.
         let mut routes = self.container_stack.lock().await;
-        if let Some(current_stack) = routes.get(id)
-            && current_stack != &scope.stack_id
-        {
-            return Err(OciError::ContainerOwnershipMismatch {
-                id: id.to_string(),
-                reason: format!(
-                    "cached route belongs to stack '{current_stack}', durable scope belongs to '{}'",
-                    scope.stack_id
-                ),
-            });
-        }
         routes.insert(id.to_string(), scope.stack_id.clone());
         drop(routes);
 
@@ -993,8 +1226,9 @@ impl Runtime {
             lease: Some(ContainerLifecycleLease {
                 container_id: id.to_string(),
                 generation,
-                scope: Some(current_scope),
+                scope: Some(scope.clone()),
                 container_store: self.container_store.clone(),
+                container_stack: Arc::clone(&self.container_stack),
                 _os_guard: os_guard,
                 _stack_guard: Some(stack_guard),
                 _container_guard: container_guard,
@@ -1036,7 +1270,7 @@ impl Runtime {
         grace_period: Option<Duration>,
     ) -> Result<vz_runtime_contract::GenerationCleanupOutcome, OciError> {
         let Some(transaction) = self
-            .begin_owned_container_generation(id, generation, scope)
+            .begin_owned_container_generation_for_cleanup(id, generation, scope)
             .await?
         else {
             return Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent);

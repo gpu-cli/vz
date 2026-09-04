@@ -1,6 +1,11 @@
 #![allow(clippy::unwrap_used)]
 
 use std::env;
+use std::process::{Command, Stdio};
+use std::thread;
+
+use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use super::exec::{
     MAX_PENDING_EXEC_CONTROLS, MAX_PENDING_EXEC_STDIN_BYTES, PendingExecQueueError,
@@ -40,6 +45,475 @@ fn generation_scope(stack_id: &str) -> vz_runtime_contract::ContainerGenerationS
             vz_runtime_contract::MachineIncarnationId::new("inc_generation").unwrap(),
         ),
         stack_id: stack_id.to_string(),
+    }
+}
+
+const CRASH_REOPEN_CHILD_TEST: &str = "runtime::tests::generation_ownership_crash_boundary_child";
+
+fn crash_scope(boundary: &str, reservation: &str) -> vz_runtime_contract::ContainerGenerationScope {
+    vz_runtime_contract::ContainerGenerationScope {
+        reservation_id: format!("reservation-crash-{boundary}-{reservation}"),
+        project_id: vz_runtime_contract::ProjectId::new("prj_crash_reopen").unwrap(),
+        environment_id: vz_runtime_contract::EnvironmentId::new("env_crash_reopen").unwrap(),
+        machine_id: vz_runtime_contract::MachineId::new("mch_crash_reopen").unwrap(),
+        machine_incarnation_id: Some(
+            vz_runtime_contract::MachineIncarnationId::new("inc_crash_reopen").unwrap(),
+        ),
+        stack_id: format!("stack-crash-{boundary}"),
+    }
+}
+
+fn read_raw_json(path: &Path, absent: serde_json::Value) -> serde_json::Value {
+    match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap(),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => absent,
+        Err(error) => panic!("read raw runtime state {}: {error}", path.display()),
+    }
+}
+
+async fn crash_raw_state(runtime: &Runtime, data_dir: &Path) -> serde_json::Value {
+    let diagnostics = runtime.lifecycle_diagnostics().await.unwrap();
+    json!({
+        "containers": read_raw_json(&data_dir.join("containers.json"), json!([])),
+        "generations": read_raw_json(
+            &data_dir.join("container-generations.json"),
+            json!({}),
+        ),
+        "routes": diagnostics
+            .container_route_pairs
+            .into_iter()
+            .map(|(container_id, stack_id)| json!([container_id, stack_id]))
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn inspection_name(
+    inspection: &vz_runtime_contract::ContainerGenerationInspection,
+) -> &'static str {
+    match inspection {
+        vz_runtime_contract::ContainerGenerationInspection::Absent => "absent",
+        vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(_) => {
+            "reserved_unpublished"
+        }
+        vz_runtime_contract::ContainerGenerationInspection::Published(_) => "published",
+        vz_runtime_contract::ContainerGenerationInspection::Foreign => "foreign",
+        vz_runtime_contract::ContainerGenerationInspection::Replacement => "replacement",
+        vz_runtime_contract::ContainerGenerationInspection::LegacyUnscoped => "legacy_unscoped",
+        vz_runtime_contract::ContainerGenerationInspection::Malformed(_) => "malformed",
+    }
+}
+
+/// Persist one runtime-store boundary, then wait to be killed after the mutation returns.
+///
+/// These checkpoints prove reopen behavior after a committed mutation whose caller loses
+/// acknowledgement. They are not executor/StateStore failpoints and do not claim interruption
+/// inside a multi-store publication transaction.
+async fn persist_crash_boundary_and_wait(
+    boundary: &str,
+    data_dir: &Path,
+    snapshot_path: &Path,
+    marker_path: &Path,
+) {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.to_path_buf(),
+        ..RuntimeConfig::default()
+    });
+    let container_id = format!("crash-{boundary}");
+    let owner_scope = crash_scope(boundary, "owner");
+
+    let (generation, prior_scope, prior_generation, cleanup_outcome) = match boundary {
+        "reservation_persistence" => {
+            let ownership = runtime
+                .reserve_scoped_container_generation(&container_id, &owner_scope)
+                .await
+                .unwrap();
+            (ownership.generation, None, None, None)
+        }
+        "metadata_publication" => {
+            let ownership = runtime
+                .reserve_scoped_container_generation(&container_id, &owner_scope)
+                .await
+                .unwrap();
+            let transaction = runtime
+                .begin_owned_container_generation(
+                    &container_id,
+                    ContainerGeneration(ownership.generation),
+                    &owner_scope,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .persist_owned(
+                    &transaction,
+                    ContainerInfo {
+                        id: container_id.clone(),
+                        image: "crash-fixture:latest".to_string(),
+                        image_id: "sha256:crash-metadata-publication".to_string(),
+                        status: ContainerStatus::Created,
+                        created_unix_secs: 1,
+                        started_unix_secs: None,
+                        stopped_unix_secs: None,
+                        rootfs_path: None,
+                        host_pid: Some(process::id()),
+                    },
+                )
+                .unwrap();
+            // Keep the transaction alive until SIGKILL so Drop cannot turn this
+            // into a graceful cleanup simulation.
+            std::mem::forget(transaction);
+            (ownership.generation, None, None, None)
+        }
+        "route_publication" => {
+            let ownership = runtime
+                .reserve_scoped_container_generation(&container_id, &owner_scope)
+                .await
+                .unwrap();
+            let transaction = runtime
+                .begin_owned_container_generation(
+                    &container_id,
+                    ContainerGeneration(ownership.generation),
+                    &owner_scope,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            std::mem::forget(transaction);
+            (ownership.generation, None, None, None)
+        }
+        "cleanup_completion" => {
+            let ownership = runtime
+                .reserve_scoped_container_generation(&container_id, &owner_scope)
+                .await
+                .unwrap();
+            let transaction = runtime
+                .begin_owned_container_generation(
+                    &container_id,
+                    ContainerGeneration(ownership.generation),
+                    &owner_scope,
+                )
+                .await
+                .unwrap()
+                .unwrap();
+            runtime
+                .persist_owned(
+                    &transaction,
+                    ContainerInfo {
+                        id: container_id.clone(),
+                        image: "crash-fixture:latest".to_string(),
+                        image_id: "sha256:crash-cleanup-completion".to_string(),
+                        status: ContainerStatus::Stopped { exit_code: -1 },
+                        created_unix_secs: 1,
+                        started_unix_secs: None,
+                        stopped_unix_secs: Some(2),
+                        rootfs_path: None,
+                        host_pid: None,
+                    },
+                )
+                .unwrap();
+            drop(transaction);
+            let outcome = runtime
+                .cleanup_owned_container_generation(
+                    &container_id,
+                    ContainerGeneration(ownership.generation),
+                    &owner_scope,
+                )
+                .await
+                .unwrap();
+            (
+                ownership.generation,
+                None,
+                None,
+                Some(format!("{outcome:?}").to_ascii_lowercase()),
+            )
+        }
+        "replacement_persistence" => {
+            let original = runtime
+                .reserve_scoped_container_generation(&container_id, &owner_scope)
+                .await
+                .unwrap();
+            assert_eq!(
+                runtime
+                    .release_scoped_container_reservation(&original)
+                    .await
+                    .unwrap(),
+                vz_runtime_contract::ContainerGenerationReleaseOutcome::Released
+            );
+            let replacement_scope = crash_scope(boundary, "replacement");
+            let replacement = runtime
+                .reserve_scoped_container_generation(&container_id, &replacement_scope)
+                .await
+                .unwrap();
+            assert!(replacement.generation > original.generation);
+            (
+                replacement.generation,
+                Some(owner_scope.clone()),
+                Some(original.generation),
+                None,
+            )
+        }
+        other => panic!("unknown crash boundary {other}"),
+    };
+
+    let scope = if boundary == "replacement_persistence" {
+        crash_scope(boundary, "replacement")
+    } else {
+        owner_scope
+    };
+    let snapshot = json!({
+        "boundary": boundary,
+        "container_id": container_id,
+        "scope": scope,
+        "generation": generation,
+        "prior_scope": prior_scope,
+        "prior_generation": prior_generation,
+        "cleanup_outcome": cleanup_outcome,
+        "raw_state": crash_raw_state(&runtime, data_dir).await,
+    });
+    fs::write(snapshot_path, serde_json::to_vec_pretty(&snapshot).unwrap()).unwrap();
+    fs::write(marker_path, b"durable-boundary-ready\n").unwrap();
+
+    loop {
+        thread::sleep(Duration::from_secs(60));
+    }
+}
+
+#[test]
+#[ignore = "subprocess helper; invoked only by generation_ownership_sigkill_crash_reopen"]
+fn generation_ownership_crash_boundary_child() {
+    let Ok(boundary) = env::var("VZ_RUNTIME_CRASH_CHILD_BOUNDARY") else {
+        return;
+    };
+    let data_dir = PathBuf::from(env::var_os("VZ_RUNTIME_CRASH_DATA_DIR").unwrap());
+    let snapshot_path = PathBuf::from(env::var_os("VZ_RUNTIME_CRASH_SNAPSHOT").unwrap());
+    let marker_path = PathBuf::from(env::var_os("VZ_RUNTIME_CRASH_MARKER").unwrap());
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap()
+        .block_on(persist_crash_boundary_and_wait(
+            &boundary,
+            &data_dir,
+            &snapshot_path,
+            &marker_path,
+        ));
+}
+
+async fn kill_and_reopen_crash_boundary(root: &Path, boundary: &str) -> serde_json::Value {
+    let data_dir = root.join(boundary);
+    fs::create_dir_all(&data_dir).unwrap();
+    let snapshot_path = root.join(format!("{boundary}-pre.json"));
+    let marker_path = root.join(format!("{boundary}.ready"));
+    let mut child = Command::new(env::current_exe().unwrap())
+        .args([
+            "--ignored",
+            "--nocapture",
+            "--exact",
+            CRASH_REOPEN_CHILD_TEST,
+        ])
+        .env("VZ_RUNTIME_CRASH_CHILD_BOUNDARY", boundary)
+        .env("VZ_RUNTIME_CRASH_DATA_DIR", &data_dir)
+        .env("VZ_RUNTIME_CRASH_SNAPSHOT", &snapshot_path)
+        .env("VZ_RUNTIME_CRASH_MARKER", &marker_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !marker_path.is_file() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "child did not reach {boundary} boundary"
+        );
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "child exited before {boundary} boundary"
+        );
+        thread::sleep(Duration::from_millis(10));
+    }
+    let pre: serde_json::Value =
+        serde_json::from_slice(&fs::read(&snapshot_path).unwrap()).unwrap();
+    child.kill().unwrap();
+    let status = child.wait().unwrap();
+    assert!(!status.success());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt as _;
+        assert_eq!(status.signal(), Some(9), "child did not die from SIGKILL");
+    }
+
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        ..RuntimeConfig::default()
+    });
+    let container_id = pre["container_id"].as_str().unwrap();
+    let generation = pre["generation"].as_u64().unwrap();
+    let scope: vz_runtime_contract::ContainerGenerationScope =
+        serde_json::from_value(pre["scope"].clone()).unwrap();
+    let exact = runtime
+        .inspect_scoped_container_generation(&vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: container_id.to_string(),
+            generation,
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope.clone())),
+        })
+        .unwrap();
+
+    let mut same_reservation_generation = None;
+    let mut foreign_inspection = None;
+    let mut replacement_inspection = None;
+    match boundary {
+        "reservation_persistence" | "route_publication" => {
+            let retry = runtime
+                .reserve_scoped_container_generation(container_id, &scope)
+                .await
+                .unwrap();
+            assert_eq!(retry.generation, generation);
+            same_reservation_generation = Some(retry.generation);
+            let foreign = crash_scope(boundary, "foreign");
+            let inspection = runtime
+                .inspect_scoped_container_reservation(container_id, &foreign)
+                .unwrap();
+            assert!(matches!(
+                inspection,
+                vz_runtime_contract::ContainerGenerationInspection::Foreign
+            ));
+            foreign_inspection = Some(inspection_name(&inspection));
+        }
+        "metadata_publication" => {
+            assert!(matches!(
+                exact,
+                vz_runtime_contract::ContainerGenerationInspection::Published(_)
+            ));
+        }
+        "cleanup_completion" => {
+            assert!(matches!(
+                exact,
+                vz_runtime_contract::ContainerGenerationInspection::Absent
+            ));
+        }
+        "replacement_persistence" => {
+            assert!(matches!(
+                exact,
+                vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(_)
+            ));
+            let retry = runtime
+                .reserve_scoped_container_generation(container_id, &scope)
+                .await
+                .unwrap();
+            assert_eq!(retry.generation, generation);
+            same_reservation_generation = Some(retry.generation);
+            let prior_scope: vz_runtime_contract::ContainerGenerationScope =
+                serde_json::from_value(pre["prior_scope"].clone()).unwrap();
+            let prior_generation = pre["prior_generation"].as_u64().unwrap();
+            let prior = runtime
+                .inspect_scoped_container_generation(
+                    &vz_runtime_contract::ContainerGenerationOwnership {
+                        container_id: container_id.to_string(),
+                        generation: prior_generation,
+                        stack_id: prior_scope.stack_id.clone(),
+                        scope: Some(Box::new(prior_scope)),
+                    },
+                )
+                .unwrap();
+            assert!(matches!(
+                prior,
+                vz_runtime_contract::ContainerGenerationInspection::Replacement
+            ));
+            replacement_inspection = Some(inspection_name(&prior));
+            let foreign = crash_scope(boundary, "foreign");
+            let inspection = runtime
+                .inspect_scoped_container_reservation(container_id, &foreign)
+                .unwrap();
+            assert!(matches!(
+                inspection,
+                vz_runtime_contract::ContainerGenerationInspection::Foreign
+            ));
+            foreign_inspection = Some(inspection_name(&inspection));
+        }
+        _ => unreachable!(),
+    }
+
+    let post_raw_state = crash_raw_state(&runtime, &data_dir).await;
+    if boundary == "metadata_publication" {
+        assert_eq!(
+            post_raw_state["containers"][0]["status"],
+            json!({"Stopped": {"exit_code": -1}})
+        );
+    }
+    if boundary == "route_publication" {
+        assert_eq!(
+            post_raw_state["routes"],
+            json!([[container_id, scope.stack_id]])
+        );
+    }
+
+    json!({
+        "boundary": boundary,
+        "container_id": container_id,
+        "scope": scope,
+        "generation": generation,
+        "prior_scope": pre["prior_scope"].clone(),
+        "prior_generation": pre["prior_generation"].clone(),
+        "child": {"signal": "SIGKILL", "expected_exit_code": 137},
+        "pre_raw_state": pre["raw_state"].clone(),
+        "post_raw_state": post_raw_state,
+        "outcomes": {
+            "exact_inspection": inspection_name(&exact),
+            "same_reservation_generation": same_reservation_generation,
+            "foreign_inspection": foreign_inspection,
+            "replacement_inspection": replacement_inspection,
+            "cleanup_outcome": pre["cleanup_outcome"].clone(),
+        },
+    })
+}
+
+#[tokio::test]
+#[ignore = "physical local-process SIGKILL/reopen evidence; run through run-sandbox-vm-e2e.sh"]
+async fn generation_ownership_sigkill_crash_reopen() {
+    let root = unique_temp_dir("generation-sigkill-crash-reopen");
+    let mut boundaries = Vec::new();
+    for boundary in [
+        "reservation_persistence",
+        "metadata_publication",
+        "route_publication",
+        "cleanup_completion",
+        "replacement_persistence",
+    ] {
+        boundaries.push(kill_and_reopen_crash_boundary(&root, boundary).await);
+    }
+
+    let test_binary = env::current_exe().unwrap();
+    let binary_sha256 = format!("{:x}", Sha256::digest(fs::read(&test_binary).unwrap()));
+    let evidence = json!({
+        "schema_version": 1,
+        "scenario": "runtime-generation-crash-reopen",
+        "coverage_classification": "runtime_store_post_commit_lost_ack_only",
+        "build_identity": {
+            "profile": env::var("VZ_RUNTIME_CRASH_BUILD_PROFILE").unwrap_or_else(|_| "debug".to_string()),
+            "test_binary_sha256": env::var("VZ_RUNTIME_CRASH_TEST_BINARY_SHA256")
+                .unwrap_or(binary_sha256),
+        },
+        "controls": {
+            "harness_invocations": 1,
+            "child_processes": 5,
+            "retries": 0,
+            "fallbacks": 0,
+            "skips": 0,
+        },
+        "state_store_expectation": {
+            "schema_version": 4,
+            "status": "missing_required_boundary",
+            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication",
+        },
+        "boundaries": boundaries,
+    });
+    let rendered = serde_json::to_string_pretty(&evidence).unwrap();
+    eprintln!("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE={rendered}");
+    if let Some(path) = env::var_os("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE") {
+        fs::write(path, format!("{rendered}\n")).unwrap();
     }
 }
 
@@ -1952,6 +2426,359 @@ async fn generation_owned_cleanup_rejects_every_mismatched_scope_field() {
             .unwrap(),
         Some(generation)
     );
+}
+
+#[tokio::test]
+async fn detached_scoped_reservation_survives_reopen_and_exact_retry_is_idempotent() {
+    let data_dir = unique_temp_dir("detached-reservation-reopen");
+    let scope = generation_scope("stack-detached");
+    let ownership = {
+        let runtime = Runtime::new(RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..RuntimeConfig::default()
+        });
+        let ownership = runtime
+            .reserve_scoped_container_generation("detached", &scope)
+            .await
+            .unwrap();
+        assert_eq!(ownership.generation, 1);
+        assert_eq!(
+            runtime
+                .inspect_scoped_container_generation(&ownership)
+                .unwrap(),
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(
+                ownership.clone()
+            )
+        );
+        ownership
+    };
+
+    let reopened = Runtime::new(RuntimeConfig {
+        data_dir,
+        ..RuntimeConfig::default()
+    });
+    assert_eq!(
+        reopened
+            .inspect_scoped_container_generation(&ownership)
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(ownership.clone())
+    );
+    assert_eq!(
+        reopened
+            .reserve_scoped_container_generation("detached", &scope)
+            .await
+            .unwrap(),
+        ownership,
+        "reopening and retrying the same reservation must preserve its generation"
+    );
+    assert_eq!(
+        reopened
+            .release_scoped_container_reservation(&ownership)
+            .await
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationReleaseOutcome::Released
+    );
+    assert_eq!(
+        reopened
+            .release_scoped_container_reservation(&ownership)
+            .await
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationReleaseOutcome::AlreadyAbsent
+    );
+}
+
+#[tokio::test]
+async fn detached_scoped_inspection_distinguishes_foreign_replacement_legacy_and_malformed() {
+    let data_dir = unique_temp_dir("detached-reservation-inspection");
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        ..RuntimeConfig::default()
+    });
+    let owner_scope = generation_scope("stack-owner");
+    let owner = runtime
+        .reserve_scoped_container_generation("classified", &owner_scope)
+        .await
+        .unwrap();
+    let mut foreign_scope = owner_scope.clone();
+    foreign_scope.reservation_id = "reservation-foreign".to_string();
+    assert_eq!(
+        runtime
+            .inspect_scoped_container_reservation("classified", &foreign_scope)
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::Foreign
+    );
+    runtime
+        .release_scoped_container_reservation(&owner)
+        .await
+        .unwrap();
+    let replacement = runtime
+        .reserve_scoped_container_generation("classified", &foreign_scope)
+        .await
+        .unwrap();
+    assert!(replacement.generation > owner.generation);
+    assert_eq!(
+        runtime.inspect_scoped_container_generation(&owner).unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::Replacement
+    );
+
+    runtime
+        .container_store
+        .reserve_generation("legacy")
+        .unwrap();
+    assert_eq!(
+        runtime
+            .inspect_scoped_container_reservation("legacy", &owner_scope)
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::LegacyUnscoped
+    );
+
+    fs::write(
+        data_dir.join("container-generations.json"),
+        br#"{
+            "malformed": {
+                "generation": 3,
+                "reserved": true,
+                "owner_pid": 0,
+                "scope": {
+                    "reservation_id": "reservation-malformed",
+                    "project_id": "not/valid",
+                    "environment_id": "env_generation",
+                    "machine_id": "mch_generation",
+                    "machine_incarnation_id": "inc_generation",
+                    "stack_id": "stack-owner"
+                }
+            }
+        }"#,
+    )
+    .unwrap();
+    assert!(matches!(
+        runtime
+            .inspect_scoped_container_reservation("malformed", &owner_scope)
+            .unwrap(),
+        vz_runtime_contract::ContainerGenerationInspection::Malformed(reason)
+            if reason.contains("project_id")
+    ));
+}
+
+#[tokio::test]
+async fn unpublished_activation_route_rolls_back_and_durable_replacement_repairs_stale_cache() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("unpublished-route-replacement"),
+        ..RuntimeConfig::default()
+    });
+    let owner_scope = generation_scope("stack-old");
+    let owner = runtime
+        .reserve_scoped_container_generation("route-replacement", &owner_scope)
+        .await
+        .unwrap();
+    let transaction = runtime
+        .begin_owned_container_generation(
+            &owner.container_id,
+            ContainerGeneration(owner.generation),
+            &owner_scope,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .get(&owner.container_id)
+            .map(String::as_str),
+        Some("stack-old")
+    );
+    drop(transaction);
+    assert!(
+        !runtime
+            .container_stack
+            .lock()
+            .await
+            .contains_key(&owner.container_id),
+        "dropping an unpublished activation must roll back its recovery route"
+    );
+
+    let mut replacement_scope = generation_scope("stack-new");
+    replacement_scope.reservation_id = "reservation-replacement".to_string();
+    let replacement = runtime
+        .reserve_scoped_container_generation("route-replacement", &replacement_scope)
+        .await
+        .unwrap();
+    assert!(replacement.generation > owner.generation);
+    assert!(matches!(
+        runtime
+            .begin_owned_container_generation(
+                &owner.container_id,
+                ContainerGeneration(owner.generation),
+                &owner_scope,
+            )
+            .await,
+        Err(OciError::ContainerOwnershipMismatch { .. })
+    ));
+
+    // Even if a stale process-local route is observed, the exact durable scope
+    // repairs it while canonical lifecycle ownership is held.
+    runtime
+        .container_stack
+        .lock()
+        .await
+        .insert(owner.container_id.clone(), owner_scope.stack_id.clone());
+    let replacement_transaction = runtime
+        .begin_owned_container_generation(
+            &replacement.container_id,
+            ContainerGeneration(replacement.generation),
+            &replacement_scope,
+        )
+        .await
+        .unwrap()
+        .expect("durable replacement must be admitted");
+    assert_eq!(
+        runtime
+            .container_stack
+            .lock()
+            .await
+            .get(&replacement.container_id)
+            .map(String::as_str),
+        Some("stack-new")
+    );
+    drop(replacement_transaction);
+}
+
+#[tokio::test]
+async fn locked_activation_admission_rejects_generation_published_while_waiting() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("activation-publication-race"),
+        ..RuntimeConfig::default()
+    });
+    let scope = generation_scope("stack-race");
+    let ownership = runtime
+        .reserve_scoped_container_generation("publication-race", &scope)
+        .await
+        .unwrap();
+    let first = runtime
+        .begin_owned_container_generation(
+            &ownership.container_id,
+            ContainerGeneration(ownership.generation),
+            &scope,
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+    let waiter_runtime = runtime.clone();
+    let waiter_scope = scope.clone();
+    let waiter_id = ownership.container_id.clone();
+    let waiter_generation = ownership.generation;
+    let mut waiter = tokio::spawn(async move {
+        waiter_runtime
+            .begin_owned_container_generation(
+                &waiter_id,
+                ContainerGeneration(waiter_generation),
+                &waiter_scope,
+            )
+            .await
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+            .await
+            .is_err(),
+        "the second admission must wait for exact lifecycle ownership"
+    );
+
+    let published = ContainerInfo {
+        id: ownership.container_id.clone(),
+        image: "alpine:latest".to_string(),
+        image_id: "sha256:publication-race".to_string(),
+        status: ContainerStatus::Created,
+        created_unix_secs: 1,
+        started_unix_secs: None,
+        stopped_unix_secs: None,
+        rootfs_path: None,
+        host_pid: None,
+    };
+    runtime.persist_owned(&first, published.clone()).unwrap();
+    drop(first);
+
+    let error = match waiter.await.unwrap() {
+        Ok(_) => panic!("published exact generation yielded a second activation transaction"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
+    assert!(error.to_string().contains("already published"));
+    assert_eq!(
+        runtime
+            .container_store
+            .find(&ownership.container_id)
+            .unwrap(),
+        Some(published),
+        "rejected waiter must not overwrite published metadata"
+    );
+}
+
+#[tokio::test]
+async fn exact_cleanup_admission_accepts_created_running_and_stopped_publications() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("published-cleanup-admission"),
+        ..RuntimeConfig::default()
+    });
+    let scope = generation_scope("stack-cleanup");
+
+    for (suffix, status) in [
+        ("created", ContainerStatus::Created),
+        ("running", ContainerStatus::Running),
+        ("stopped", ContainerStatus::Stopped { exit_code: 0 }),
+    ] {
+        let container_id = format!("cleanup-{suffix}");
+        let mut reservation_scope = scope.clone();
+        reservation_scope.reservation_id = format!("reservation-cleanup-{suffix}");
+        let ownership = runtime
+            .reserve_scoped_container_generation(&container_id, &reservation_scope)
+            .await
+            .unwrap();
+        let publisher = runtime
+            .begin_owned_container_generation(
+                &container_id,
+                ContainerGeneration(ownership.generation),
+                &reservation_scope,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        runtime
+            .persist_owned(
+                &publisher,
+                ContainerInfo {
+                    id: container_id.clone(),
+                    image: "alpine:latest".to_string(),
+                    image_id: format!("sha256:cleanup-{suffix}"),
+                    status,
+                    created_unix_secs: 1,
+                    started_unix_secs: (suffix == "running").then_some(2),
+                    stopped_unix_secs: (suffix == "stopped").then_some(3),
+                    rootfs_path: None,
+                    host_pid: None,
+                },
+            )
+            .unwrap();
+        drop(publisher);
+
+        let cleanup = runtime
+            .begin_owned_container_generation_for_cleanup(
+                &container_id,
+                ContainerGeneration(ownership.generation),
+                &reservation_scope,
+            )
+            .await
+            .unwrap()
+            .expect("exact published ownership must remain valid for cleanup");
+        assert_eq!(cleanup.container_id(), container_id);
+        assert_eq!(
+            cleanup.generation(),
+            ContainerGeneration(ownership.generation)
+        );
+        drop(cleanup);
+    }
 }
 
 #[tokio::test]

@@ -1,5 +1,5 @@
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use super::*;
@@ -58,6 +58,20 @@ pub struct MockContainerRuntime {
     pub listed_containers: Mutex<Vec<String>>,
     /// Pre-configured log lines returned by `stream_logs`.
     pub mock_log_lines: Mutex<Vec<LogLine>>,
+    /// Whether exact scoped activation should fail after reservation admission.
+    pub fail_scoped_activation: bool,
+    /// Force reservation inspection to report a foreign owner.
+    pub force_foreign_scoped_inspection: bool,
+    /// Durable scoped generations, keyed by requested container ID.
+    scoped_generations: Mutex<HashMap<String, ScopedGeneration>>,
+    /// Monotonic runtime generation allocator for scoped reservations.
+    next_scoped_generation: AtomicU64,
+}
+
+#[derive(Clone)]
+struct ScopedGeneration {
+    ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    published: bool,
 }
 
 impl MockContainerRuntime {
@@ -86,6 +100,10 @@ impl MockContainerRuntime {
             captured_network_services: Mutex::new(Vec::new()),
             listed_containers: Mutex::new(Vec::new()),
             mock_log_lines: Mutex::new(Vec::new()),
+            fail_scoped_activation: false,
+            force_foreign_scoped_inspection: false,
+            scoped_generations: Mutex::new(HashMap::new()),
+            next_scoped_generation: AtomicU64::new(1),
         }
     }
 
@@ -105,6 +123,35 @@ impl MockContainerRuntime {
             .lock()
             .unwrap()
             .insert(requested.to_string(), returned.to_string());
+    }
+
+    pub fn scoped_generation_count(&self) -> usize {
+        self.scoped_generations.lock().unwrap().len()
+    }
+
+    pub fn scoped_ownership(
+        &self,
+        container_id: &str,
+    ) -> Option<vz_runtime_contract::ContainerGenerationOwnership> {
+        self.scoped_generations
+            .lock()
+            .unwrap()
+            .get(container_id)
+            .map(|record| record.ownership.clone())
+    }
+
+    pub fn insert_scoped_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        published: bool,
+    ) {
+        self.scoped_generations.lock().unwrap().insert(
+            ownership.container_id.clone(),
+            ScopedGeneration {
+                ownership,
+                published,
+            },
+        );
     }
 
     /// Generate a deterministic container ID from the RunConfig.
@@ -336,6 +383,154 @@ impl ContainerRuntime for MockContainerRuntime {
             })
     }
 
+    fn reserve_container_generation(
+        &self,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationOwnership, StackError> {
+        let mut generations = self.scoped_generations.lock().unwrap();
+        if let Some(existing) = generations.get(container_id) {
+            if existing.ownership.scope.as_deref() == Some(scope) {
+                return Ok(existing.ownership.clone());
+            }
+            return Err(scope_state_conflict(
+                "mock container ID has foreign ownership",
+            ));
+        }
+        let ownership = vz_runtime_contract::ContainerGenerationOwnership {
+            container_id: container_id.to_string(),
+            generation: self.next_scoped_generation.fetch_add(1, Ordering::SeqCst),
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope.clone())),
+        };
+        generations.insert(
+            container_id.to_string(),
+            ScopedGeneration {
+                ownership: ownership.clone(),
+                published: false,
+            },
+        );
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("reserve_scoped".to_string(), container_id.to_string()));
+        Ok(ownership)
+    }
+
+    fn inspect_container_reservation(
+        &self,
+        scope: &vz_runtime_contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        if self.force_foreign_scoped_inspection {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Foreign);
+        }
+        let generations = self.scoped_generations.lock().unwrap();
+        let Some(record) = generations.get(container_id) else {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Absent);
+        };
+        if record.ownership.scope.as_deref() != Some(scope) {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Foreign);
+        }
+        Ok(if record.published {
+            vz_runtime_contract::ContainerGenerationInspection::Published(record.ownership.clone())
+        } else {
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(
+                record.ownership.clone(),
+            )
+        })
+    }
+
+    fn inspect_container_generation(
+        &self,
+        ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        let generations = self.scoped_generations.lock().unwrap();
+        let Some(record) = generations.get(&ownership.container_id) else {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Absent);
+        };
+        if record.ownership.scope != ownership.scope {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Foreign);
+        }
+        if record.ownership.generation != ownership.generation {
+            return Ok(vz_runtime_contract::ContainerGenerationInspection::Replacement);
+        }
+        Ok(if record.published {
+            vz_runtime_contract::ContainerGenerationInspection::Published(record.ownership.clone())
+        } else {
+            vz_runtime_contract::ContainerGenerationInspection::ReservedUnpublished(
+                record.ownership.clone(),
+            )
+        })
+    }
+
+    fn activate_container_generation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        image: &str,
+        config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        self.calls.lock().unwrap().push((
+            "activate_scoped".to_string(),
+            ownership.container_id.clone(),
+        ));
+        let mut generations = self.scoped_generations.lock().unwrap();
+        let exact_unpublished = generations
+            .get(&ownership.container_id)
+            .is_some_and(|record| record.ownership == ownership && !record.published);
+        if !exact_unpublished {
+            return Err(vz_runtime_contract::OwnedCreateError::unowned(
+                scope_state_conflict("mock activation lacks exact unpublished reservation"),
+            ));
+        }
+        if self.fail_scoped_activation {
+            return Err(vz_runtime_contract::OwnedCreateError {
+                error: StackError::InvalidSpec("mock scoped activation failure".to_string()),
+                cleanup: Some(ownership),
+            });
+        }
+        generations
+            .get_mut(&ownership.container_id)
+            .expect("checked scoped generation")
+            .published = true;
+        self.captured_configs
+            .lock()
+            .unwrap()
+            .push((ownership.container_id.clone(), config));
+        self.calls
+            .lock()
+            .unwrap()
+            .push(("activated_image".to_string(), image.to_string()));
+        Ok(vz_runtime_contract::ContainerCreateReceipt {
+            container_id: ownership.container_id.clone(),
+            ownership: Some(ownership),
+        })
+    }
+
+    fn release_container_reservation(
+        &self,
+        ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationReleaseOutcome, StackError> {
+        let mut generations = self.scoped_generations.lock().unwrap();
+        match generations.get(&ownership.container_id) {
+            None => Ok(vz_runtime_contract::ContainerGenerationReleaseOutcome::AlreadyAbsent),
+            Some(record) if record.ownership == ownership && !record.published => {
+                generations.remove(&ownership.container_id);
+                self.calls
+                    .lock()
+                    .unwrap()
+                    .push(("release_scoped".to_string(), ownership.container_id));
+                Ok(vz_runtime_contract::ContainerGenerationReleaseOutcome::Released)
+            }
+            _ => Err(scope_state_conflict(
+                "mock release lacks exact unpublished ownership",
+            )),
+        }
+    }
+
     fn cleanup_container_generation(
         &self,
         ownership: vz_runtime_contract::ContainerGenerationOwnership,
@@ -384,6 +579,13 @@ impl ContainerRuntime for MockContainerRuntime {
         if self.generation_cleanup_already_absent {
             Ok(vz_runtime_contract::GenerationCleanupOutcome::AlreadyAbsent)
         } else {
+            let mut generations = self.scoped_generations.lock().unwrap();
+            if generations
+                .get(&ownership.container_id)
+                .is_some_and(|record| record.ownership == ownership)
+            {
+                generations.remove(&ownership.container_id);
+            }
             Ok(vz_runtime_contract::GenerationCleanupOutcome::Removed)
         }
     }

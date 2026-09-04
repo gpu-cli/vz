@@ -444,7 +444,12 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     deferred = apply_result.deferred.len(),
                     "executing actions"
                 );
-                let result = self.executor.execute(spec, &apply_result.actions)?;
+                let result = self.executor.execute_with_operation(
+                    spec,
+                    &apply_result.actions,
+                    &operation_id,
+                    0,
+                )?;
                 self.reconcile_store.save_reconcile_progress(
                     &spec.name,
                     &operation_id,
@@ -536,7 +541,27 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
                     restarts = restart_actions.len(),
                     "executing restart actions"
                 );
-                let _restart_result = self.executor.execute(spec, &restart_actions)?;
+                let operation_id =
+                    Self::next_operation_id(&format!("{}-restart", spec.name), round);
+                self.reconcile_store.save_reconcile_progress(
+                    &spec.name,
+                    &operation_id,
+                    &restart_actions,
+                    0,
+                )?;
+                let _restart_result = self.executor.execute_with_operation(
+                    spec,
+                    &restart_actions,
+                    &operation_id,
+                    0,
+                )?;
+                self.reconcile_store.save_reconcile_progress(
+                    &spec.name,
+                    &operation_id,
+                    &restart_actions,
+                    restart_actions.len(),
+                )?;
+                self.reconcile_store.clear_reconcile_progress(&spec.name)?;
                 for action in &restart_actions {
                     if let Action::ServiceCreate { service_name } = action {
                         self.restart_tracker.record_restart(service_name);
@@ -704,7 +729,12 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             "resuming incomplete apply operation"
         );
 
-        let result = self.executor.execute(spec, &remaining)?;
+        let result = self.executor.execute_with_operation(
+            spec,
+            &remaining,
+            &progress.operation_id,
+            progress.next_action_index,
+        )?;
         self.reconcile_store.save_reconcile_progress(
             &spec.name,
             &progress.operation_id,

@@ -229,6 +229,7 @@ mod tests {
         let _ = GetReceiptRequest::default();
         let _ = ListEventsRequest::default();
         let _ = ApplyStackRequest::default();
+        let _ = MachineWorkloadScope::default();
         let _ = StackRunContainerRequest::default();
         let _ = GetCapabilitiesRequest::default();
 
@@ -323,6 +324,191 @@ mod tests {
         assert_eq!(
             observed, expected,
             "Runtime V2 RPC mode contract changed; classify new RPCs and keep long-running surfaces stream-first."
+        );
+    }
+
+    #[test]
+    fn runtime_v2_stack_rpc_modes_remain_compatible() {
+        let observed = parse_runtime_v2_rpc_modes(include_str!("../proto/runtime_v2.proto"));
+
+        for rpc in [
+            "ApplyStack",
+            "TeardownStack",
+            "StopStackService",
+            "StartStackService",
+            "RestartStackService",
+        ] {
+            assert_eq!(observed.get(rpc), Some(&RpcMode::ServerStreaming), "{rpc}");
+        }
+        for rpc in ["CreateStackRunContainer", "RemoveStackRunContainer"] {
+            assert_eq!(observed.get(rpc), Some(&RpcMode::Unary), "{rpc}");
+        }
+    }
+
+    #[test]
+    fn runtime_v2_machine_workload_scope_inventory_and_request_tags_are_stable() {
+        let proto = include_str!("../proto/runtime_v2.proto");
+
+        for (message, fields) in [
+            (
+                "MachineWorkloadScope",
+                &[
+                    ("schema_version", 1),
+                    ("project_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("machine_incarnation_id", 5),
+                    ("stack_id", 6),
+                ][..],
+            ),
+            (
+                "ApplyStackRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("compose_yaml", 3),
+                    ("compose_dir", 4),
+                    ("dry_run", 5),
+                    ("detach", 6),
+                    ("scope", 7),
+                ],
+            ),
+            (
+                "TeardownStackRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("dry_run", 3),
+                    ("remove_volumes", 4),
+                    ("scope", 5),
+                ],
+            ),
+            (
+                "GetStackStatusRequest",
+                &[("metadata", 1), ("stack_name", 2), ("scope", 3)],
+            ),
+            (
+                "ListStackEventsRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("after", 3),
+                    ("limit", 4),
+                    ("scope", 5),
+                ],
+            ),
+            (
+                "GetStackLogsRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("service", 3),
+                    ("tail", 4),
+                    ("scope", 5),
+                ],
+            ),
+            (
+                "StackServiceActionRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("service_name", 3),
+                    ("scope", 4),
+                ],
+            ),
+            (
+                "StackRunContainerRequest",
+                &[
+                    ("metadata", 1),
+                    ("stack_name", 2),
+                    ("service_name", 3),
+                    ("run_service_name", 4),
+                    ("scope", 5),
+                ],
+            ),
+        ] {
+            assert_proto_fields(proto, message, fields);
+        }
+    }
+
+    #[test]
+    fn runtime_v2_machine_workload_scope_presence_and_round_trip() {
+        use crate::runtime_v2::*;
+
+        let scope = MachineWorkloadScope {
+            schema_version: 1,
+            project_id: "prj-01".into(),
+            environment_id: "env-01".into(),
+            machine_id: "mch-01".into(),
+            machine_incarnation_id: "inc-01".into(),
+            stack_id: "stk-01".into(),
+        };
+
+        macro_rules! assert_scope_round_trip {
+            ($request:expr, $request_type:ty) => {{
+                let request: $request_type = $request;
+                let encoded = request.encode_to_vec();
+                let decoded = <$request_type>::decode(encoded.as_slice()).unwrap();
+                assert_eq!(decoded.scope, Some(scope.clone()));
+            }};
+        }
+
+        assert!(ApplyStackRequest::default().scope.is_none());
+        assert!(TeardownStackRequest::default().scope.is_none());
+        assert!(GetStackStatusRequest::default().scope.is_none());
+        assert!(ListStackEventsRequest::default().scope.is_none());
+        assert!(GetStackLogsRequest::default().scope.is_none());
+        assert!(StackServiceActionRequest::default().scope.is_none());
+        assert!(StackRunContainerRequest::default().scope.is_none());
+
+        assert_scope_round_trip!(
+            ApplyStackRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            ApplyStackRequest
+        );
+        assert_scope_round_trip!(
+            TeardownStackRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            TeardownStackRequest
+        );
+        assert_scope_round_trip!(
+            GetStackStatusRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            GetStackStatusRequest
+        );
+        assert_scope_round_trip!(
+            ListStackEventsRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            ListStackEventsRequest
+        );
+        assert_scope_round_trip!(
+            GetStackLogsRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            GetStackLogsRequest
+        );
+        assert_scope_round_trip!(
+            StackServiceActionRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            StackServiceActionRequest
+        );
+        assert_scope_round_trip!(
+            StackRunContainerRequest {
+                scope: Some(scope.clone()),
+                ..Default::default()
+            },
+            StackRunContainerRequest
         );
     }
 

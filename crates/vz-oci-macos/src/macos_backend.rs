@@ -185,24 +185,104 @@ impl MacosRuntimeBackend {
                 RuntimeError::InvalidConfig(reason),
             ));
         }
-        let stack_id = scope.stack_id.as_str();
+        let mut reserve_config = run_config_from_contract(config.clone());
+        let ownership = self
+            .runtime
+            .reserve_scoped_container_run(&mut reserve_config, scope)
+            .await
+            .map_err(|error| contract::OwnedCreateError::unowned(oci_err(error)))?;
+        let cleanup = ownership.clone();
+        match self
+            .activate_container_in_stack_with_ownership(ownership, image, config)
+            .await
+        {
+            Ok(receipt) => Ok(receipt),
+            Err(mut failure) => {
+                // This compatibility path itself admitted the exact generation.
+                // Preserve that cleanup proof even when activation fails before
+                // constructing its RAII lifecycle transaction.
+                failure.cleanup.get_or_insert(cleanup);
+                Err(failure)
+            }
+        }
+    }
+
+    async fn activate_container_in_stack_with_ownership(
+        &self,
+        ownership: contract::ContainerGenerationOwnership,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
+        if let Err(reason) = ownership.validate() {
+            return Err(contract::OwnedCreateError::unowned(
+                RuntimeError::InvalidConfig(reason),
+            ));
+        }
+        let scope = ownership.scope.as_deref().ok_or_else(|| {
+            contract::OwnedCreateError::unowned(RuntimeError::InvalidConfig(
+                "generation ownership requires exact scope".to_string(),
+            ))
+        })?;
+        if let Some(requested) = config.container_id.as_deref()
+            && requested != ownership.container_id
+        {
+            return Err(contract::OwnedCreateError::unowned(
+                RuntimeError::InvalidConfig(format!(
+                    "activation container ID '{requested}' does not match reserved ID '{}'",
+                    ownership.container_id
+                )),
+            ));
+        }
         let setup_commands = config.setup_commands.clone();
         let setup_env = config.env.clone();
         let setup_user = config.user.clone();
         let mut oci_config = run_config_from_contract(config);
+        oci_config.container_id = Some(ownership.container_id.clone());
+        match self.runtime.inspect_scoped_container_generation(&ownership) {
+            Ok(contract::ContainerGenerationInspection::Published(current)) => {
+                return Err(contract::OwnedCreateError {
+                    error: RuntimeError::ContainerFailed {
+                        id: current.container_id.clone(),
+                        reason: "exact generation is already published, but publication alone does not prove activation completed successfully"
+                            .to_string(),
+                    },
+                    cleanup: Some(current),
+                });
+            }
+            Ok(contract::ContainerGenerationInspection::ReservedUnpublished(current))
+                if current == ownership => {}
+            Ok(other) => {
+                return Err(contract::OwnedCreateError::unowned(
+                    RuntimeError::ContainerFailed {
+                        id: ownership.container_id.clone(),
+                        reason: format!("reserved generation is not activatable: {other:?}"),
+                    },
+                ));
+            }
+            Err(error) => {
+                return Err(contract::OwnedCreateError::unowned(oci_err(error)));
+            }
+        }
+        let stack_id = scope.stack_id.as_str();
         let mut transaction = match self
             .runtime
-            .begin_scoped_container_create(&mut oci_config, scope)
+            .begin_owned_container_generation(
+                &ownership.container_id,
+                oci_container::ContainerGeneration(ownership.generation),
+                scope,
+            )
             .await
         {
-            Ok(transaction) => transaction,
+            Ok(Some(transaction)) => transaction,
+            Ok(None) => {
+                return Err(contract::OwnedCreateError::unowned(
+                    RuntimeError::ContainerFailed {
+                        id: ownership.container_id.clone(),
+                        reason: "reserved generation is no longer active".to_string(),
+                    },
+                ));
+            }
             Err(error) => return Err(contract::OwnedCreateError::unowned(oci_err(error))),
-        };
-        let ownership = contract::ContainerGenerationOwnership {
-            container_id: transaction.container_id().to_string(),
-            generation: transaction.generation().0,
-            stack_id: stack_id.to_string(),
-            scope: Some(Box::new(scope.clone())),
         };
         let setup_commit_ref = (!setup_commands.is_empty())
             .then(|| crate::Runtime::setup_commit_reference(image, &setup_commands));
@@ -499,6 +579,66 @@ impl RuntimeBackend for MacosRuntimeBackend {
             Ok(result) => result,
             Err(error) => Err(contract::OwnedCreateError::unowned(error)),
         }
+    }
+
+    async fn reserve_container_generation(
+        &self,
+        scope: &contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<contract::ContainerGenerationOwnership, RuntimeError> {
+        self.runtime
+            .reserve_scoped_container_generation(container_id, scope)
+            .await
+            .map_err(oci_err)
+    }
+
+    async fn inspect_container_reservation(
+        &self,
+        scope: &contract::ContainerGenerationScope,
+        container_id: &str,
+    ) -> Result<contract::ContainerGenerationInspection, RuntimeError> {
+        self.runtime
+            .inspect_scoped_container_reservation(container_id, scope)
+            .map_err(oci_err)
+    }
+
+    async fn inspect_container_generation(
+        &self,
+        ownership: &contract::ContainerGenerationOwnership,
+    ) -> Result<contract::ContainerGenerationInspection, RuntimeError> {
+        self.runtime
+            .inspect_scoped_container_generation(ownership)
+            .map_err(oci_err)
+    }
+
+    async fn activate_container_generation(
+        &self,
+        ownership: contract::ContainerGenerationOwnership,
+        image: &str,
+        config: contract::RunConfig,
+    ) -> Result<contract::ContainerCreateReceipt, contract::OwnedCreateError<RuntimeError>> {
+        let backend = self.clone();
+        let image = image.to_string();
+        match run_owned_create(move || async move {
+            Ok(backend
+                .activate_container_in_stack_with_ownership(ownership, &image, config)
+                .await)
+        })
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => Err(contract::OwnedCreateError::unowned(error)),
+        }
+    }
+
+    async fn release_container_reservation(
+        &self,
+        ownership: contract::ContainerGenerationOwnership,
+    ) -> Result<contract::ContainerGenerationReleaseOutcome, RuntimeError> {
+        self.runtime
+            .release_scoped_container_reservation(&ownership)
+            .await
+            .map_err(oci_err)
     }
 
     async fn cleanup_container_generation(
@@ -966,6 +1106,169 @@ mod tests {
                 .unwrap(),
             contract::GenerationCleanupOutcome::AlreadyAbsent
         );
+    }
+
+    #[tokio::test]
+    async fn detached_backend_reservation_reopens_idempotently_and_stale_activation_is_unowned() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let owner_scope = generation_scope("stack-detached");
+        let owner = {
+            let backend =
+                MacosRuntimeBackend::new(crate::Runtime::new(oci_config::RuntimeConfig {
+                    data_dir: data_dir.clone(),
+                    ..oci_config::RuntimeConfig::default()
+                }));
+            backend
+                .reserve_container_generation(&owner_scope, "detached-backend")
+                .await
+                .unwrap()
+        };
+
+        let reopened = MacosRuntimeBackend::new(crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..oci_config::RuntimeConfig::default()
+        }));
+        assert_eq!(
+            reopened.inspect_container_generation(&owner).await.unwrap(),
+            contract::ContainerGenerationInspection::ReservedUnpublished(owner.clone())
+        );
+        assert_eq!(
+            reopened
+                .reserve_container_generation(&owner_scope, "detached-backend")
+                .await
+                .unwrap(),
+            owner
+        );
+
+        let mut stale = owner.clone();
+        stale.generation += 1;
+        let failure = reopened
+            .activate_container_generation(
+                stale,
+                "alpine:latest",
+                contract::RunConfig {
+                    container_id: Some("detached-backend".to_string()),
+                    ..contract::RunConfig::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(failure.cleanup.is_none());
+        assert!(failure.error.to_string().contains("not activatable"));
+        assert_eq!(
+            reopened.inspect_container_generation(&owner).await.unwrap(),
+            contract::ContainerGenerationInspection::ReservedUnpublished(owner.clone()),
+            "stale activation must fail before publishing or releasing the owner"
+        );
+
+        let mut foreign_scope = owner_scope.clone();
+        foreign_scope.reservation_id = "reservation-foreign".to_string();
+        assert_eq!(
+            reopened
+                .inspect_container_reservation(&foreign_scope, "detached-backend")
+                .await
+                .unwrap(),
+            contract::ContainerGenerationInspection::Foreign
+        );
+        assert_eq!(
+            reopened
+                .release_container_reservation(owner.clone())
+                .await
+                .unwrap(),
+            contract::ContainerGenerationReleaseOutcome::Released
+        );
+        let replacement = reopened
+            .reserve_container_generation(&foreign_scope, "detached-backend")
+            .await
+            .unwrap();
+        assert!(replacement.generation > owner.generation);
+        assert_eq!(
+            reopened.inspect_container_generation(&owner).await.unwrap(),
+            contract::ContainerGenerationInspection::Replacement
+        );
+
+        oci_container::ContainerStore::new(data_dir)
+            .reserve_generation("legacy-backend")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .inspect_container_reservation(&owner_scope, "legacy-backend")
+                .await
+                .unwrap(),
+            contract::ContainerGenerationInspection::LegacyUnscoped
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_published_created_or_stopped_generation_never_claims_activation_success() {
+        let temp = tempdir().unwrap();
+        let data_dir = temp.path().to_path_buf();
+        let backend = MacosRuntimeBackend::new(crate::Runtime::new(oci_config::RuntimeConfig {
+            data_dir: data_dir.clone(),
+            ..oci_config::RuntimeConfig::default()
+        }));
+        let store = oci_container::ContainerStore::new(data_dir);
+
+        for (suffix, status) in [
+            ("created", oci_container::ContainerStatus::Created),
+            (
+                "stopped",
+                oci_container::ContainerStatus::Stopped { exit_code: -1 },
+            ),
+        ] {
+            let container_id = format!("published-{suffix}");
+            let mut scope = generation_scope("stack-published");
+            scope.reservation_id = format!("reservation-published-{suffix}");
+            let ownership = backend
+                .reserve_container_generation(&scope, &container_id)
+                .await
+                .unwrap();
+            let expected = oci_container::ContainerInfo {
+                id: container_id.clone(),
+                image: "alpine:latest".to_string(),
+                image_id: format!("sha256:{suffix}"),
+                status,
+                created_unix_secs: 1,
+                started_unix_secs: None,
+                stopped_unix_secs: (suffix == "stopped").then_some(2),
+                rootfs_path: None,
+                host_pid: None,
+            };
+            store
+                .upsert_if_generation(
+                    expected.clone(),
+                    oci_container::ContainerGeneration(ownership.generation),
+                )
+                .unwrap();
+
+            let failure = backend
+                .activate_container_generation(
+                    ownership.clone(),
+                    "alpine:latest",
+                    contract::RunConfig {
+                        container_id: Some(container_id.clone()),
+                        ..contract::RunConfig::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(failure.cleanup, Some(ownership.clone()));
+            assert!(
+                failure
+                    .error
+                    .to_string()
+                    .contains("does not prove activation")
+            );
+            assert_eq!(store.find(&container_id).unwrap(), Some(expected));
+            assert_eq!(
+                backend
+                    .inspect_container_generation(&ownership)
+                    .await
+                    .unwrap(),
+                contract::ContainerGenerationInspection::Published(ownership)
+            );
+        }
     }
 
     #[tokio::test]

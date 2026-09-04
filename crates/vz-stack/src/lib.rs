@@ -49,7 +49,9 @@ pub use network::{
     PortConflict, PublishedPort, detect_port_conflicts, ports_changed, resolve_ports,
 };
 pub use orchestrator::{OrchestrationConfig, OrchestrationResult, RoundReport, StackOrchestrator};
-pub use reconcile::{Action, ApplyResult, DeferredService, apply, compute_actions_hash};
+pub use reconcile::{
+    Action, ApplyResult, DeferredService, apply, compute_actions_hash, plan_apply,
+};
 pub use restart::{RestartTracker, compute_restarts};
 pub use spec::{
     DependencyCondition, HealthCheckSpec, LoggingConfig, MountSpec, NetworkSpec, PortSpec,
@@ -61,7 +63,9 @@ pub use state_store::{
     DriftFinding, DriftSeverity, EnvironmentUpReservation, IDEMPOTENCY_TTL_SECS, IdempotencyRecord,
     ImageRecord, Receipt, ReceiptGcReport, ReceiptRetentionPolicy, ReceiptRetentionState,
     ReconcileAuditEntry, ReconcileSession, ReconcileSessionStatus, RetentionGcReason,
-    ServiceObservedState, ServicePhase, StateStore, StateStorePragmas,
+    ServiceObservedState, ServicePhase, StackContainerCreateIntent, StackContainerCreateSelector,
+    StackContainerCreateStatus, StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,

@@ -97,6 +97,18 @@ pub struct ContainerGenerationDiagnostic {
     pub quarantined: bool,
 }
 
+/// Non-authorizing classification of one requested scoped reservation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScopedGenerationInspection {
+    Absent,
+    ReservedUnpublished(ContainerGeneration),
+    Published(ContainerGeneration),
+    Foreign,
+    Replacement,
+    LegacyUnscoped,
+    Malformed(String),
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct GenerationRecord {
     generation: u64,
@@ -249,19 +261,10 @@ impl ContainerStore {
         reclaim_unpublished: bool,
     ) -> io::Result<ContainerGeneration> {
         let _lock = self.lock()?;
-        if self.load_all()?.iter().any(|container| container.id == id) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("container '{id}' already exists; stop and remove it before recreating"),
-            ));
-        }
-
         let mut records = self.load_generations()?;
-        if let Some(record) = records.get_mut(id)
-            && record.reserved
-        {
+        if let Some(record) = records.get_mut(id) {
             let same_scope = record.scope.as_ref() == scope;
-            if same_scope && scope.is_some() && reclaim_unpublished {
+            if same_scope && scope.is_some() && reclaim_unpublished && record.reserved {
                 // The caller holds the stable per-ID OS lease, so no original
                 // writer remains. Replaying the exact reservation after a
                 // crash must recover its authority rather than silently mint
@@ -271,18 +274,34 @@ impl ContainerStore {
                 self.write_generations(&records)?;
                 return Ok(generation);
             }
-            let active_owner = record.owner_pid != 0 && is_process_alive(record.owner_pid);
-            if !same_scope || (!reclaim_unpublished && active_owner) {
-                let reason = if !same_scope {
-                    "owned by a different or legacy-unscoped reservation"
-                } else {
-                    "already has an in-flight generation"
-                };
+            if same_scope && scope.is_some() && reclaim_unpublished {
                 return Err(io::Error::new(
                     io::ErrorKind::AlreadyExists,
-                    format!("container '{id}' {reason}"),
+                    format!(
+                        "container '{id}' reservation was finalized or released and cannot be reused"
+                    ),
                 ));
             }
+            if record.reserved {
+                let active_owner = record.owner_pid != 0 && is_process_alive(record.owner_pid);
+                if !same_scope || (!reclaim_unpublished && active_owner) {
+                    let reason = if !same_scope {
+                        "owned by a different or legacy-unscoped reservation"
+                    } else {
+                        "already has an in-flight generation"
+                    };
+                    return Err(io::Error::new(
+                        io::ErrorKind::AlreadyExists,
+                        format!("container '{id}' {reason}"),
+                    ));
+                }
+            }
+        }
+        if self.load_all()?.iter().any(|container| container.id == id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("container '{id}' already exists; stop and remove it before recreating"),
+            ));
         }
         let generation = records
             .get(id)
@@ -298,6 +317,87 @@ impl ContainerStore {
         );
         self.write_generations(&records)?;
         Ok(ContainerGeneration(generation))
+    }
+
+    /// Inspect a reservation by its exact topology scope without adopting it.
+    pub fn inspect_scoped_reservation(
+        &self,
+        id: &str,
+        scope: &ContainerGenerationScope,
+    ) -> io::Result<ScopedGenerationInspection> {
+        scope
+            .validate()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        self.inspect_scoped_generation_inner(id, scope, None)
+    }
+
+    /// Inspect an exact generation-qualified reservation without adopting it.
+    pub fn inspect_scoped_generation(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &ContainerGenerationScope,
+    ) -> io::Result<ScopedGenerationInspection> {
+        scope
+            .validate()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        self.inspect_scoped_generation_inner(id, scope, Some(generation))
+    }
+
+    fn inspect_scoped_generation_inner(
+        &self,
+        id: &str,
+        scope: &ContainerGenerationScope,
+        expected_generation: Option<ContainerGeneration>,
+    ) -> io::Result<ScopedGenerationInspection> {
+        let _lock = self.lock()?;
+        let records = self.load_generations()?;
+        let published = self.load_all()?.iter().any(|container| container.id == id);
+        let Some(record) = records.get(id) else {
+            return Ok(if published {
+                ScopedGenerationInspection::LegacyUnscoped
+            } else {
+                ScopedGenerationInspection::Absent
+            });
+        };
+        if record.generation == 0 {
+            return Ok(ScopedGenerationInspection::Malformed(format!(
+                "container '{id}' has invalid zero generation"
+            )));
+        }
+        let Some(current_scope) = record.scope.as_ref() else {
+            return Ok(if record.reserved || published {
+                ScopedGenerationInspection::LegacyUnscoped
+            } else {
+                ScopedGenerationInspection::Absent
+            });
+        };
+        if let Err(reason) = current_scope.validate() {
+            return Ok(ScopedGenerationInspection::Malformed(reason));
+        }
+        if let Some(expected) = expected_generation
+            && record.generation != expected.0
+        {
+            return Ok(ScopedGenerationInspection::Replacement);
+        }
+        if current_scope != scope {
+            return Ok(ScopedGenerationInspection::Foreign);
+        }
+        if !record.reserved {
+            return Ok(if published {
+                ScopedGenerationInspection::Malformed(format!(
+                    "container '{id}' is published without an active generation"
+                ))
+            } else {
+                ScopedGenerationInspection::Absent
+            });
+        }
+        let generation = ContainerGeneration(record.generation);
+        Ok(if published {
+            ScopedGenerationInspection::Published(generation)
+        } else {
+            ScopedGenerationInspection::ReservedUnpublished(generation)
+        })
     }
 
     /// Return the currently reserved generation for an existing container.
@@ -411,6 +511,48 @@ impl ContainerStore {
         };
         if !record.reserved || record.generation != generation.0 {
             return Ok(false);
+        }
+        record.reserved = false;
+        self.write_generations(&records)?;
+        Ok(true)
+    }
+
+    /// Release an unpublished generation only when its generation and scope match exactly.
+    pub fn release_scoped_generation_with_write_lease(
+        &self,
+        id: &str,
+        generation: ContainerGeneration,
+        scope: &ContainerGenerationScope,
+        lease: &ContainerIdLease,
+    ) -> io::Result<bool> {
+        scope
+            .validate()
+            .map_err(|reason| io::Error::new(io::ErrorKind::InvalidInput, reason))?;
+        if !lease.exclusive || lease.lock_path != self.container_lease_path(id) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("exclusive lifecycle lease does not belong to container '{id}'"),
+            ));
+        }
+        let _lock = self.lock()?;
+        if self.load_all()?.iter().any(|container| container.id == id) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("container '{id}' is published and cannot release its reservation"),
+            ));
+        }
+        let mut records = self.load_generations()?;
+        let Some(record) = records.get_mut(id) else {
+            return Ok(false);
+        };
+        if !record.reserved {
+            return Ok(false);
+        }
+        if record.generation != generation.0 || record.scope.as_ref() != Some(scope) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("container '{id}' reservation ownership changed"),
+            ));
         }
         record.reserved = false;
         self.write_generations(&records)?;
@@ -570,6 +712,12 @@ fn generation_diagnostic(
     container_id: String,
     record: GenerationRecord,
 ) -> io::Result<ContainerGenerationDiagnostic> {
+    if record.generation == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("container '{container_id}' has invalid zero generation"),
+        ));
+    }
     if let Some(scope) = &record.scope {
         scope.validate().map_err(|reason| {
             io::Error::new(
@@ -983,6 +1131,162 @@ mod tests {
                 .filter_map(Result::ok)
                 .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp."))
         );
+    }
+
+    #[test]
+    fn scoped_generation_inspection_is_exact_idempotent_and_reopen_safe() {
+        let root = unique_temp_dir("generation-scoped-inspection");
+        let scope = generation_scope("reservation-stable", "stack-a");
+        let store = ContainerStore::new(root.clone());
+        assert_eq!(
+            store.inspect_scoped_reservation("scoped", &scope).unwrap(),
+            ScopedGenerationInspection::Absent
+        );
+        let generation = {
+            let lease = store.try_acquire_container_write_lease("scoped").unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("scoped", &scope, &lease)
+                .unwrap()
+        };
+        drop(store);
+
+        let reopened = ContainerStore::new(root);
+        assert_eq!(
+            reopened
+                .inspect_scoped_reservation("scoped", &scope)
+                .unwrap(),
+            ScopedGenerationInspection::ReservedUnpublished(generation)
+        );
+        assert_eq!(
+            reopened
+                .inspect_scoped_generation("scoped", generation, &scope)
+                .unwrap(),
+            ScopedGenerationInspection::ReservedUnpublished(generation)
+        );
+        let lease = reopened
+            .try_acquire_container_write_lease("scoped")
+            .unwrap();
+        assert_eq!(
+            reopened
+                .reserve_scoped_generation_with_write_lease("scoped", &scope, &lease)
+                .unwrap(),
+            generation,
+            "an exact retry must never allocate a second generation"
+        );
+        reopened
+            .upsert_if_generation(generation_test_container("scoped"), generation)
+            .unwrap();
+        assert_eq!(
+            reopened
+                .inspect_scoped_generation("scoped", generation, &scope)
+                .unwrap(),
+            ScopedGenerationInspection::Published(generation)
+        );
+        assert_eq!(
+            reopened
+                .release_scoped_generation_with_write_lease("scoped", generation, &scope, &lease)
+                .unwrap_err()
+                .kind(),
+            io::ErrorKind::AlreadyExists
+        );
+    }
+
+    #[test]
+    fn scoped_generation_inspection_never_adopts_foreign_replacement_or_legacy_state() {
+        let root = unique_temp_dir("generation-scoped-inspection-conflicts");
+        let store = ContainerStore::new(root.clone());
+        let owner = generation_scope("reservation-owner", "stack-a");
+        let mut foreign = owner.clone();
+        foreign.reservation_id = "reservation-foreign".to_string();
+        let first = {
+            let lease = store
+                .try_acquire_container_write_lease("replacement")
+                .unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("replacement", &owner, &lease)
+                .unwrap()
+        };
+        assert_eq!(
+            store
+                .inspect_scoped_generation("replacement", first, &foreign)
+                .unwrap(),
+            ScopedGenerationInspection::Foreign
+        );
+        {
+            let lease = store
+                .try_acquire_container_write_lease("replacement")
+                .unwrap();
+            assert!(
+                store
+                    .release_scoped_generation_with_write_lease(
+                        "replacement",
+                        first,
+                        &owner,
+                        &lease,
+                    )
+                    .unwrap()
+            );
+        }
+        {
+            let lease = store
+                .try_acquire_container_write_lease("replacement")
+                .unwrap();
+            assert_eq!(
+                store
+                    .reserve_scoped_generation_with_write_lease("replacement", &owner, &lease,)
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::AlreadyExists,
+                "a released reservation identity must not mint another generation"
+            );
+        }
+        let second = {
+            let lease = store
+                .try_acquire_container_write_lease("replacement")
+                .unwrap();
+            store
+                .reserve_scoped_generation_with_write_lease("replacement", &foreign, &lease)
+                .unwrap()
+        };
+        assert!(second.0 > first.0);
+        assert_eq!(
+            store
+                .inspect_scoped_generation("replacement", first, &owner)
+                .unwrap(),
+            ScopedGenerationInspection::Replacement
+        );
+
+        store.reserve_generation("legacy").unwrap();
+        assert_eq!(
+            store.inspect_scoped_reservation("legacy", &owner).unwrap(),
+            ScopedGenerationInspection::LegacyUnscoped
+        );
+
+        fs::write(
+            store.generations_path(),
+            br#"{
+                "malformed": {
+                    "generation": 7,
+                    "reserved": true,
+                    "owner_pid": 0,
+                    "scope": {
+                        "reservation_id": "reservation-malformed",
+                        "project_id": "not/valid",
+                        "environment_id": "env_store",
+                        "machine_id": "mch_store",
+                        "machine_incarnation_id": "inc_store",
+                        "stack_id": "stack-a"
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            store
+                .inspect_scoped_reservation("malformed", &owner)
+                .unwrap(),
+            ScopedGenerationInspection::Malformed(reason) if reason.contains("project_id")
+        ));
     }
 
     #[test]

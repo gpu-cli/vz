@@ -9,7 +9,16 @@ use crate::spec::{
     PortSpec, ResourcesSpec, SecretDef, SecretSource, ServiceKind, ServiceSecretRef, StackSpec,
     VolumeSpec,
 };
+use crate::state_store::StackContainerCreateStatus;
 use std::collections::HashMap;
+use std::os::unix::fs::PermissionsExt;
+use vz_runtime_contract::types::{
+    Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EnvironmentState, MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId,
+    MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState, OperatingSystem,
+    OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId, ProjectState,
+    TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+};
 
 fn svc(name: &str, image: &str) -> ServiceSpec {
     ServiceSpec {
@@ -90,6 +99,124 @@ fn make_executor_with_dir(
 ) -> StackExecutor<MockContainerRuntime> {
     let store = StateStore::in_memory().unwrap();
     StackExecutor::new(runtime, store, dir)
+}
+
+fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::MachineWorkloadScope) {
+    let project_id = ProjectId::new("prj_executor_scope").unwrap();
+    let environment_id = EnvironmentId::new("env_executor_scope").unwrap();
+    let machine_id = MachineId::new("mac_executor_scope").unwrap();
+    let incarnation_id = MachineIncarnationId::new("inc_executor_scope").unwrap();
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "ubuntu:24.04".to_string(),
+        version: None,
+        channel: None,
+        digest: Some("sha256:executor-fixture".to_string()),
+    };
+    let capabilities = CapabilitySet::new([
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "executor-fixture".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![MachineSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                workspace: None,
+            }],
+            networks: vec![],
+            endpoints: vec![],
+        },
+    };
+    let definition_digest = definition.digest().unwrap();
+    let machine = MachineInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        machine_id: machine_id.clone(),
+        environment_id: environment_id.clone(),
+        name: "linux".to_string(),
+        profile: MachineProfile::Developer,
+        target,
+        resources: MachineResources::default(),
+        requested_capabilities: capabilities.clone(),
+        negotiated_capabilities: capabilities,
+        backend: None,
+        incarnation: Some(MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: incarnation_id.clone(),
+            machine_id: machine_id.clone(),
+            generation: 1,
+            created_at: 1,
+        }),
+        state: MachineState::Ready,
+        legacy_sandbox_id: None,
+    };
+    let environment = EnvironmentInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        environment_id: environment_id.clone(),
+        project_id: project_id.clone(),
+        name: "dev".to_string(),
+        definition_digest,
+        state: EnvironmentState::Ready,
+        lifecycle_generation: 0,
+        active_operation_id: None,
+        bindings: vec![],
+        machines: vec![machine],
+        networks: vec![],
+        endpoints: vec![],
+        ownership: vec![
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Machine,
+                resource_id: machine_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Incarnation,
+                resource_id: incarnation_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+        ],
+        legacy_migration: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    (
+        ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        },
+        vz_runtime_contract::MachineWorkloadScope {
+            schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+            project_id,
+            environment_id,
+            machine_id,
+            machine_incarnation_id: incarnation_id,
+            stack_id: stack_id.to_string(),
+        },
+    )
+}
+
+fn make_scoped_executor<'a>(
+    runtime: MockContainerRuntime,
+    store: StateStore,
+    dir: &'a Path,
+    scope: vz_runtime_contract::MachineWorkloadScope,
+) -> StackExecutor<MockContainerRuntime> {
+    StackExecutor::new_scoped(runtime, store, dir, scope).unwrap()
 }
 
 fn generation_ownership(
@@ -2921,4 +3048,672 @@ fn replica_scale_down_removes_excess_replicas() {
         .map(|o| o.service_name.as_str())
         .collect();
     assert_eq!(running, vec!["web"]);
+}
+
+// ── Topology-scoped two-phase create tests ──
+
+#[test]
+fn scoped_create_rejoins_exact_running_attempt_without_a_second_generation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-rejoin", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-rejoin", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let first = executor
+        .runtime
+        .scoped_ownership(&super::create::generated_runtime_container_id(
+            &spec.name, "web", 1,
+        ));
+    assert_eq!(first.as_ref().unwrap().generation, 1);
+
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-rejoin", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    assert_eq!(executor.runtime.scoped_generation_count(), 1);
+    assert_eq!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "activate_scoped")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scoped_activation_failure_cleans_before_terminal_retry_allocates_n_plus_one() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-retry", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_scoped_activation = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+
+    let failed = executor
+        .execute_with_operation(&spec, &actions, "operation-retry", 0)
+        .unwrap();
+    assert_eq!(failed.failed, 1);
+    assert_eq!(executor.runtime.scoped_generation_count(), 0);
+    assert!(
+        executor
+            .store()
+            .list_stack_container_recovery_records_for_machine_workload(&scope)
+            .unwrap()
+            .is_empty(),
+        "cleaned activation must not retain the environment deletion fence"
+    );
+
+    executor.runtime.fail_scoped_activation = false;
+    let retried = executor
+        .execute_with_operation(&spec, &actions, "operation-retry", 0)
+        .unwrap();
+    assert!(retried.all_succeeded());
+    let records = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(records[0].intent.service_generation, 2);
+    assert_eq!(records[0].binding.as_ref().unwrap().ownership.generation, 2);
+}
+
+#[test]
+fn scoped_pull_failure_releases_reserved_generation_and_clears_recovery_fence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-pull-failure", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_pull = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
+
+    let result = executor
+        .execute_with_operation(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+            "operation-pull-failure",
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.failed, 1);
+    assert_eq!(executor.runtime.scoped_generation_count(), 0);
+    assert!(
+        executor
+            .store()
+            .list_stack_container_recovery_records_for_machine_workload(&scope)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn scoped_foreign_reservation_is_blocked_without_runtime_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-foreign", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.force_foreign_scoped_inspection = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope.clone());
+
+    let result = executor
+        .execute_with_operation(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+            "operation-foreign",
+            0,
+        )
+        .unwrap();
+    assert_eq!(result.failed, 1);
+    assert_eq!(executor.runtime.scoped_generation_count(), 0);
+    assert!(
+        !executor
+            .runtime
+            .call_log()
+            .iter()
+            .any(|(operation, _)| operation == "activate_scoped")
+    );
+    let records = executor
+        .store()
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    assert_eq!(records.len(), 1);
+    assert_eq!(
+        records[0].intent.status,
+        StackContainerCreateStatus::Blocked
+    );
+}
+
+#[test]
+fn scoped_parallel_create_publishes_each_exact_generation_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack(
+        "scoped-parallel",
+        vec![svc("web", "nginx:latest"), svc("db", "postgres:16")],
+    );
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+
+    let result = executor
+        .execute_with_operation(
+            &spec,
+            &[
+                Action::ServiceCreate {
+                    service_name: "web".to_string(),
+                },
+                Action::ServiceCreate {
+                    service_name: "db".to_string(),
+                },
+            ],
+            "operation-parallel",
+            0,
+        )
+        .unwrap();
+    assert!(result.all_succeeded());
+    assert_eq!(executor.runtime.scoped_generation_count(), 2);
+    assert_eq!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "activate_scoped")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn scoped_replicas_publish_distinct_observed_names_and_converge() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut web = svc("web", "nginx:latest");
+    web.resources.replicas = 3;
+    let spec = stack("scoped-replicas", vec![web]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+
+    let initial = apply(&spec, &store, &HashMap::new()).unwrap();
+    assert_eq!(
+        initial.actions,
+        vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }]
+    );
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    assert!(
+        executor
+            .execute_with_operation(&spec, &initial.actions, "operation-replicas", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+
+    let observed = executor.store().load_observed_state(&spec.name).unwrap();
+    assert_eq!(
+        observed.len(),
+        3,
+        "legacy replica-zero projection must be removed"
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .map(|state| state.service_name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["web", "web-2", "web-3"]
+    );
+    assert!(
+        observed
+            .iter()
+            .all(|state| state.phase == ServicePhase::Running)
+    );
+
+    let retry = apply(&spec, executor.store(), &HashMap::new()).unwrap();
+    assert!(retry.actions.is_empty(), "replica apply must converge");
+    assert_eq!(
+        executor
+            .store()
+            .load_observed_state(&spec.name)
+            .unwrap()
+            .len(),
+        3
+    );
+
+    let mut scaled_down = spec.clone();
+    scaled_down.services[0].resources.replicas = 1;
+    let down = apply(&scaled_down, executor.store(), &HashMap::new()).unwrap();
+    assert_eq!(
+        down.actions,
+        vec![
+            Action::ServiceRemove {
+                service_name: "web-2".to_string(),
+            },
+            Action::ServiceRemove {
+                service_name: "web-3".to_string(),
+            },
+        ]
+    );
+    assert!(
+        executor
+            .execute_with_operation(&scaled_down, &down.actions, "operation-scale-down", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    assert!(
+        apply(&scaled_down, executor.store(), &HashMap::new())
+            .unwrap()
+            .actions
+            .is_empty(),
+        "terminal stopped excess replicas must not be removed repeatedly"
+    );
+}
+
+#[test]
+fn scoped_scale_up_skips_exact_running_replicas_and_creates_only_missing_ones() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-scale-up", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    let initial = apply(&spec, &store, &HashMap::new()).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    assert!(
+        executor
+            .execute_with_operation(&spec, &initial.actions, "operation-scale-up-initial", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+
+    let mut scaled_up = spec.clone();
+    scaled_up.services[0].resources.replicas = 3;
+    let up = apply(&scaled_up, executor.store(), &HashMap::new()).unwrap();
+    assert_eq!(
+        up.actions,
+        vec![Action::ServiceCreate {
+            service_name: "web".to_string(),
+        }]
+    );
+    let result = executor
+        .execute_with_operation(&scaled_up, &up.actions, "operation-scale-up", 0)
+        .unwrap();
+    assert!(result.all_succeeded(), "{:?}", result.errors);
+    assert_eq!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "activate_scoped")
+            .count(),
+        3
+    );
+    assert!(
+        apply(&scaled_up, executor.store(), &HashMap::new())
+            .unwrap()
+            .actions
+            .is_empty()
+    );
+}
+
+#[test]
+fn scoped_secret_manifest_is_redacted_private_and_tamper_evident() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("source-secret");
+    std::fs::write(&source, b"never-serialize-this-secret").unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.secrets = vec![secret_ref("api_token")];
+    let mut spec = stack("scoped-secret", vec![service]);
+    spec.secrets = vec![SecretDef {
+        name: "api_token".to_string(),
+        source: SecretSource::File(source.display().to_string()),
+    }];
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-secret", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let root = tmp.path().join("scoped-activation");
+    let owner = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .unwrap()
+        .path();
+    let manifest = std::fs::read(owner.join("manifest.json")).unwrap();
+    assert!(
+        !manifest
+            .windows(b"never-serialize-this-secret".len())
+            .any(|window| window == b"never-serialize-this-secret")
+    );
+    assert_eq!(
+        std::fs::metadata(&owner).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+    let staged = owner.join("secrets/api_token");
+    assert_eq!(
+        std::fs::metadata(&staged).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+
+    std::fs::write(&staged, b"tampered").unwrap();
+    let error = executor
+        .execute_with_operation(&spec, &actions, "operation-secret", 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("digest validation"));
+    assert_eq!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "activate_scoped")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn scoped_interrupted_temp_staging_is_retryable_but_missing_final_manifest_is_not() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("scoped-activation");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let orphan = root.join(".tmp-interrupted");
+    std::fs::create_dir(&orphan).unwrap();
+    std::fs::set_permissions(&orphan, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-staging", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-staging", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let owner = std::fs::read_dir(&root)
+        .unwrap()
+        .filter_map(Result::ok)
+        .find(|entry| !entry.file_name().to_string_lossy().starts_with(".tmp-"))
+        .unwrap()
+        .path();
+    std::fs::remove_file(owner.join("manifest.json")).unwrap();
+    let error = executor
+        .execute_with_operation(&spec, &actions, "operation-staging", 0)
+        .unwrap_err();
+    assert!(error.to_string().contains("manifest is missing"));
+}
+
+#[test]
+fn scoped_manifest_rejects_config_change_before_new_reservation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.command = Some(vec!["serve".to_string(), "--safe".to_string()]);
+    let spec = stack("scoped-config", vec![service]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-config", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let reservations = executor.runtime.scoped_generation_count();
+
+    let mut changed = spec.clone();
+    changed.services[0].command = Some(vec!["serve".to_string(), "--unsafe".to_string()]);
+    let error = executor
+        .execute_with_operation(&changed, &actions, "operation-config", 0)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("does not match resumed action batch")
+    );
+    assert_eq!(executor.runtime.scoped_generation_count(), reservations);
+}
+
+#[test]
+fn scoped_running_replacement_is_blocked_and_never_reactivated() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-replacement", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let actions = vec![Action::ServiceCreate {
+        service_name: "web".to_string(),
+    }];
+    assert!(
+        executor
+            .execute_with_operation(&spec, &actions, "operation-replacement", 0)
+            .unwrap()
+            .all_succeeded()
+    );
+    let container_id = super::create::generated_runtime_container_id(&spec.name, "web", 1);
+    let mut replacement = executor.runtime.scoped_ownership(&container_id).unwrap();
+    replacement.generation += 1;
+    executor.runtime.insert_scoped_generation(replacement, true);
+    let activations = executor
+        .runtime
+        .call_log()
+        .iter()
+        .filter(|(operation, _)| operation == "activate_scoped")
+        .count();
+
+    let result = executor
+        .execute_with_operation(&spec, &actions, "operation-replacement", 0)
+        .unwrap();
+    assert_eq!(result.failed, 1);
+    assert_eq!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .filter(|(operation, _)| operation == "activate_scoped")
+            .count(),
+        activations
+    );
+}
+
+#[test]
+fn scoped_remove_preserves_stop_signal_and_grace_policy() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut service = svc("web", "nginx:latest");
+    service.stop_signal = Some("SIGQUIT".to_string());
+    service.stop_grace_period_secs = Some(17);
+    let spec = stack("scoped-remove", vec![service]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    assert!(
+        executor
+            .execute_with_operation(
+                &spec,
+                &[Action::ServiceCreate {
+                    service_name: "web".to_string(),
+                }],
+                "operation-remove-create",
+                0,
+            )
+            .unwrap()
+            .all_succeeded()
+    );
+    assert!(
+        executor
+            .execute_with_operation(
+                &spec,
+                &[Action::ServiceRemove {
+                    service_name: "web".to_string(),
+                }],
+                "operation-remove",
+                0,
+            )
+            .unwrap()
+            .all_succeeded()
+    );
+    assert_eq!(executor.runtime.scoped_generation_count(), 0);
+    assert!(
+        executor
+            .runtime
+            .call_log()
+            .iter()
+            .any(|(operation, value)| {
+                operation == "stop_and_remove_container_generation"
+                    && value.contains("signal=SIGQUIT:grace_ms=17000")
+            })
+    );
+}
+
+#[test]
+fn scoped_nonzero_resume_uses_operation_manifest_after_secret_source_disappears() {
+    let tmp = tempfile::tempdir().unwrap();
+    let source = tmp.path().join("resume-secret-source");
+    std::fs::write(&source, b"staged-before-crash").unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let mut web = svc("web", "nginx:latest");
+    web.secrets = vec![secret_ref("api_token")];
+    let mut worker = svc("worker", "busybox:latest");
+    worker.secrets = vec![secret_ref("api_token")];
+    let mut spec = stack("scoped-resume-secret", vec![web, worker]);
+    spec.secrets = vec![SecretDef {
+        name: "api_token".to_string(),
+        source: SecretSource::File(source.display().to_string()),
+    }];
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut runtime = MockContainerRuntime::new();
+    runtime.fail_scoped_activation = true;
+    let mut executor = make_scoped_executor(runtime, store, tmp.path(), scope);
+    let actions = vec![
+        Action::ServiceCreate {
+            service_name: "web".to_string(),
+        },
+        Action::ServiceCreate {
+            service_name: "worker".to_string(),
+        },
+    ];
+    let first = executor
+        .execute_with_operation(&spec, &actions, "operation-cursor", 0)
+        .unwrap();
+    assert_eq!(first.failed, 2);
+    std::fs::remove_file(&source).unwrap();
+    executor.runtime.fail_scoped_activation = false;
+
+    let resumed = executor
+        .execute_with_operation(&spec, &actions[1..], "operation-cursor", 1)
+        .unwrap();
+    assert!(resumed.all_succeeded(), "{:?}", resumed.errors);
+    let captured = executor.runtime.captured_configs.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    let staged = std::fs::read(
+        captured[0]
+            .1
+            .mounts
+            .iter()
+            .find_map(|mount| mount.source.as_ref())
+            .unwrap()
+            .join("api_token"),
+    )
+    .unwrap();
+    assert_eq!(staged, b"staged-before-crash");
+}
+
+#[test]
+fn scoped_cleanup_mode_rejects_create_before_mutation() {
+    let tmp = tempfile::tempdir().unwrap();
+    let store = StateStore::in_memory().unwrap();
+    let spec = stack("scoped-cleanup-only", vec![svc("web", "nginx:latest")]);
+    let (project, scope) = scoped_topology(&spec.name);
+    store.save_project_state(&project).unwrap();
+    store.reserve_stack_workload_owner(&scope, 1).unwrap();
+    store.save_desired_state(&spec.name, &spec).unwrap();
+    let mut executor = StackExecutor::new_scoped_for_cleanup(
+        MockContainerRuntime::new(),
+        store,
+        tmp.path(),
+        scope,
+    )
+    .unwrap();
+
+    let error = executor
+        .execute_with_operation(
+            &spec,
+            &[Action::ServiceCreate {
+                service_name: "web".to_string(),
+            }],
+            "cleanup-cannot-create",
+            0,
+        )
+        .unwrap_err();
+    assert!(error.to_string().contains("cleanup-only"));
+    assert!(executor.runtime.call_log().is_empty());
+    assert!(!tmp.path().join("scoped-activation").exists());
 }

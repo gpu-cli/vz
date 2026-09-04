@@ -42,6 +42,7 @@ pub(super) async fn cmd_up(args: UpArgs) -> anyhow::Result<()> {
                     compose_dir: compose_dir.clone(),
                     dry_run: args.dry_run,
                     detach: args.detach,
+                    scope: None,
                 })
                 .await
                 .with_context(|| format!("failed to apply stack `{stack_name}` via daemon"))?;
@@ -138,6 +139,7 @@ pub(super) async fn cmd_exec(args: ExecArgs) -> anyhow::Result<()> {
                 .get_stack_status(runtime_v2::GetStackStatusRequest {
                     metadata: None,
                     stack_name: args.name.clone(),
+                    scope: None,
                 })
                 .await
                 .with_context(|| {
@@ -191,6 +193,7 @@ pub(super) async fn cmd_service_action(
                 metadata: None,
                 stack_name: args.name.clone(),
                 service_name: args.service.clone(),
+                scope: None,
             };
             let mut stream = match action {
                 ControlAction::Stop => client
@@ -308,6 +311,7 @@ pub(super) async fn cmd_down(args: DownArgs) -> anyhow::Result<()> {
                     stack_name: args.name.clone(),
                     dry_run: args.dry_run,
                     remove_volumes: args.volumes,
+                    scope: None,
                 })
                 .await
                 .with_context(|| format!("failed to teardown stack `{}` via daemon", args.name))?;
@@ -388,6 +392,7 @@ pub(super) async fn cmd_ps(args: PsArgs) -> anyhow::Result<()> {
                 .get_stack_status(runtime_v2::GetStackStatusRequest {
                     metadata: None,
                     stack_name: args.name.clone(),
+                    scope: None,
                 })
                 .await
                 .with_context(|| {
@@ -438,6 +443,7 @@ pub(super) async fn cmd_events(args: EventsArgs) -> anyhow::Result<()> {
                         stack_name: args.name.clone(),
                         after: cursor,
                         limit: 1000,
+                        scope: None,
                     })
                     .await
                     .with_context(|| {
@@ -523,6 +529,7 @@ pub(super) async fn cmd_logs(args: LogsArgs) -> anyhow::Result<()> {
                         stack_name: args.name.clone(),
                         service: service_filter.clone(),
                         tail: if first_iteration { tail_limit } else { 0 },
+                        scope: None,
                     })
                     .await
                     .with_context(|| {
@@ -868,6 +875,7 @@ pub(super) async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                     stack_name: args.name.clone(),
                     service_name: args.service.clone(),
                     run_service_name: String::new(),
+                    scope: None,
                 })
                 .await
                 .with_context(|| {
@@ -938,6 +946,7 @@ pub(super) async fn cmd_run(args: RunArgs) -> anyhow::Result<()> {
                         stack_name: args.name.clone(),
                         service_name: args.service.clone(),
                         run_service_name: run_service_name.clone(),
+                        scope: None,
                     })
                     .await
                     .with_context(|| {

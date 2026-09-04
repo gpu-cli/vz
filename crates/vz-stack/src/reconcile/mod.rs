@@ -111,6 +111,27 @@ pub struct DeferredService {
     pub waiting_on: Vec<String>,
 }
 
+/// Compute an apply plan without persisting desired/observed state or events.
+pub fn plan_apply(
+    spec: &StackSpec,
+    store: &StateStore,
+    health_statuses: &HashMap<String, HealthStatus>,
+) -> Result<ApplyResult, StackError> {
+    let previous_desired = store.load_desired_state(&spec.name)?;
+    let observed = store.load_observed_state(&spec.name)?;
+    let stored_mount_digests = store.load_service_mount_digests(&spec.name)?;
+    let (actions, deferred) = compute_actions_with_mount_digests(
+        &spec.services,
+        &observed,
+        health_statuses,
+        previous_desired
+            .as_ref()
+            .map(|stack| stack.services.as_slice()),
+        &stored_mount_digests,
+    );
+    Ok(ApplyResult { actions, deferred })
+}
+
 /// Persist desired state, compute action plan, and update observed state.
 ///
 /// The reconciler:

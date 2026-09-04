@@ -20,16 +20,16 @@ use vz_runtime_contract::{
     EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState,
     EnvironmentTombstone, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec,
     Lease, LeaseState, LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult,
-    LifecycleStepStatus, MachineBackend, MachineCapability, MachineError, MachineErrorCode,
-    MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
-    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
-    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec, OperatingSystem,
-    OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
-    ProjectDefinition, ProjectId, ProjectState, RequestMetadata, RuntimeCapabilities,
-    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyLifecycleError,
-    TopologyResolutionError, TopologyValidationError, WorkspaceBinding, WorkspaceBindingId,
-    WorkspaceProjection, WorkspaceProjectionMode,
+    LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineBackend, MachineCapability,
+    MachineError, MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId,
+    MachineInstance, MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineProfile,
+    MachineResources, MachineSpec, MachineState, MachineWorkloadScope, NetworkId, NetworkInstance,
+    NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipCleanupStep,
+    OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectId,
+    ProjectState, RequestMetadata, RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF,
+    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState, TargetSpec,
+    TopologyCandidate, TopologyLifecycleError, TopologyResolutionError, TopologyValidationError,
+    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -444,6 +444,47 @@ pub fn machine_incarnation_from_proto(
         generation: incarnation.generation,
         created_at: incarnation.created_at,
     })
+}
+
+/// Convert one authoritative Machine workload scope to its versioned wire form.
+pub fn machine_workload_scope_to_proto(
+    scope: &MachineWorkloadScope,
+) -> runtime_v2::MachineWorkloadScope {
+    runtime_v2::MachineWorkloadScope {
+        schema_version: scope.schema_version,
+        project_id: scope.project_id.to_string(),
+        environment_id: scope.environment_id.to_string(),
+        machine_id: scope.machine_id.to_string(),
+        machine_incarnation_id: scope.machine_incarnation_id.to_string(),
+        stack_id: scope.stack_id.clone(),
+    }
+}
+
+/// Decode a Machine workload scope without inventing missing topology authority.
+pub fn machine_workload_scope_from_proto(
+    scope: &runtime_v2::MachineWorkloadScope,
+) -> Result<MachineWorkloadScope, TranslationError> {
+    if scope.schema_version != MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION {
+        return Err(TranslationError::InvalidValue {
+            field: "machine_workload_scope.schema_version",
+            value: scope.schema_version.to_string(),
+        });
+    }
+    let decoded = MachineWorkloadScope {
+        schema_version: scope.schema_version,
+        project_id: ProjectId::new(scope.project_id.clone())?,
+        environment_id: EnvironmentId::new(scope.environment_id.clone())?,
+        machine_id: MachineId::new(scope.machine_id.clone())?,
+        machine_incarnation_id: MachineIncarnationId::new(scope.machine_incarnation_id.clone())?,
+        stack_id: scope.stack_id.clone(),
+    };
+    decoded
+        .validate()
+        .map_err(|reason| TranslationError::InvalidValue {
+            field: "machine_workload_scope",
+            value: reason,
+        })?;
+    Ok(decoded)
 }
 
 /// Convert a persisted Machine to wire form.
@@ -3474,6 +3515,67 @@ mod tests {
             negotiated.unsupported.get(&MachineCapability::Checkpoint),
             Some(&"kernel profile does not expose checkpoint restore".to_string())
         );
+    }
+
+    #[test]
+    fn topology_machine_workload_scope_round_trips_without_losing_authority() {
+        let domain = MachineWorkloadScope {
+            schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+            project_id: project_id("prj-workload"),
+            environment_id: environment_id("env-workload"),
+            machine_id: machine_id("mch-workload"),
+            machine_incarnation_id: MachineIncarnationId::new("inc-workload")
+                .expect("valid incarnation ID"),
+            stack_id: "stack-workload".to_string(),
+        };
+
+        let wire = machine_workload_scope_to_proto(&domain);
+        let bytes = wire.encode_to_vec();
+        let decoded_wire = runtime_v2::MachineWorkloadScope::decode(bytes.as_slice())
+            .expect("workload scope protobuf decode");
+        let decoded = machine_workload_scope_from_proto(&decoded_wire)
+            .expect("authoritative workload scope decode");
+
+        assert_eq!(decoded, domain);
+    }
+
+    #[test]
+    fn topology_machine_workload_scope_rejects_unknown_version_and_missing_authority() {
+        let valid = runtime_v2::MachineWorkloadScope {
+            schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+            project_id: "prj-workload".to_string(),
+            environment_id: "env-workload".to_string(),
+            machine_id: "mch-workload".to_string(),
+            machine_incarnation_id: "inc-workload".to_string(),
+            stack_id: "stack-workload".to_string(),
+        };
+
+        let mut unknown_version = valid.clone();
+        unknown_version.schema_version += 1;
+        assert_eq!(
+            machine_workload_scope_from_proto(&unknown_version),
+            Err(TranslationError::InvalidValue {
+                field: "machine_workload_scope.schema_version",
+                value: unknown_version.schema_version.to_string(),
+            })
+        );
+
+        let mut missing_incarnation = valid.clone();
+        missing_incarnation.machine_incarnation_id.clear();
+        assert!(matches!(
+            machine_workload_scope_from_proto(&missing_incarnation),
+            Err(TranslationError::InvalidTopology(_))
+        ));
+
+        let mut missing_stack = valid;
+        missing_stack.stack_id.clear();
+        assert!(matches!(
+            machine_workload_scope_from_proto(&missing_stack),
+            Err(TranslationError::InvalidValue {
+                field: "machine_workload_scope",
+                ..
+            })
+        ));
     }
 
     #[test]

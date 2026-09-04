@@ -8,7 +8,7 @@
 //!
 //! State transitions and lifecycle events are persisted to the [`StateStore`].
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use tracing::{error, info};
@@ -21,6 +21,13 @@ use crate::reconcile::Action;
 use crate::spec::{SecretDef, SecretSource, ServiceSpec, StackSpec};
 use crate::state_store::{ServiceObservedState, ServicePhase, StateStore};
 use crate::volume::VolumeManager;
+
+fn scope_state_conflict(message: impl Into<String>) -> StackError {
+    StackError::Machine {
+        code: vz_runtime_contract::MachineErrorCode::StateConflict,
+        message: message.into(),
+    }
+}
 
 fn load_secret_source_bytes(secret_def: &SecretDef) -> Result<Vec<u8>, StackError> {
     match &secret_def.source {
@@ -170,6 +177,71 @@ pub trait ContainerRuntime: Send + Sync {
                 "unsupported_operation: surface=stack; operation=create_in_sandbox_owned; reason=runtime cannot issue generation ownership"
                     .to_string(),
             ),
+        ))
+    }
+
+    /// Durably reserve an exact scoped generation without OCI or guest mutation.
+    fn reserve_container_generation(
+        &self,
+        _scope: &vz_runtime_contract::ContainerGenerationScope,
+        _container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationOwnership, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=reserve_container_generation; reason=runtime lacks two-phase create"
+                .to_string(),
+        ))
+    }
+
+    /// Inspect the generation, if any, owned by one exact reservation.
+    fn inspect_container_reservation(
+        &self,
+        _scope: &vz_runtime_contract::ContainerGenerationScope,
+        _container_id: &str,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=inspect_container_reservation; reason=runtime lacks two-phase create"
+                .to_string(),
+        ))
+    }
+
+    /// Inspect an exact generation without adopting replacements or legacy state.
+    fn inspect_container_generation(
+        &self,
+        _ownership: &vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationInspection, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=inspect_container_generation; reason=runtime lacks two-phase create"
+                .to_string(),
+        ))
+    }
+
+    /// Activate only a previously reserved exact ownership proof.
+    #[allow(clippy::result_large_err)]
+    fn activate_container_generation(
+        &self,
+        _ownership: vz_runtime_contract::ContainerGenerationOwnership,
+        _image: &str,
+        _config: vz_runtime_contract::RunConfig,
+    ) -> Result<
+        vz_runtime_contract::ContainerCreateReceipt,
+        vz_runtime_contract::OwnedCreateError<StackError>,
+    > {
+        Err(vz_runtime_contract::OwnedCreateError::unowned(
+            StackError::Network(
+                "unsupported_operation: surface=stack; operation=activate_container_generation; reason=runtime lacks two-phase create"
+                    .to_string(),
+            ),
+        ))
+    }
+
+    /// Release only an exact unpublished reservation.
+    fn release_container_reservation(
+        &self,
+        _ownership: vz_runtime_contract::ContainerGenerationOwnership,
+    ) -> Result<vz_runtime_contract::ContainerGenerationReleaseOutcome, StackError> {
+        Err(StackError::Network(
+            "unsupported_operation: surface=stack; operation=release_container_reservation; reason=runtime lacks two-phase create"
+                .to_string(),
         ))
     }
 
@@ -371,6 +443,23 @@ pub struct StackExecutor<R: ContainerRuntime> {
     /// shares with globally-unique sequential tags. Each service's mounts
     /// start at an offset so tags don't collide between services.
     mount_tag_offsets: HashMap<String, usize>,
+    /// Exact production topology authority. `None` is legacy compatibility only.
+    scoped_authority: Option<ScopedExecutionAuthority>,
+    /// Durable input bytes loaded from the scoped batch manifest.
+    scoped_secret_inputs: BTreeMap<String, Vec<u8>>,
+    /// Digest metadata for the exact staged secret bytes.
+    scoped_secret_digests: BTreeMap<String, String>,
+    /// Owner-scoped directory containing the staged secret files.
+    scoped_secret_dir: Option<PathBuf>,
+    /// Recovery-only authority may clean exact journal ownership but never create.
+    scoped_cleanup_only: bool,
+}
+
+#[derive(Debug, Clone)]
+struct ScopedExecutionAuthority {
+    scope: vz_runtime_contract::MachineWorkloadScope,
+    environment_generation: u64,
+    definition_digest: String,
 }
 
 /// Result of executing a batch of actions.
@@ -400,6 +489,7 @@ impl ExecutionResult {
 mod create;
 mod dispatch;
 mod remove;
+mod scoped;
 
 #[cfg(test)]
 mod tests;
@@ -407,6 +497,22 @@ mod tests;
 pub(crate) mod tests_support;
 
 impl<R: ContainerRuntime> StackExecutor<R> {
+    fn load_secret_input(&self, secret_def: &SecretDef) -> Result<Vec<u8>, StackError> {
+        if self.scoped_authority.is_some() {
+            return self
+                .scoped_secret_inputs
+                .get(&secret_def.name)
+                .cloned()
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "scoped activation manifest is missing secret '{}'",
+                        secret_def.name
+                    ))
+                });
+        }
+        load_secret_source_bytes(secret_def)
+    }
+
     /// Create a new executor with the given runtime, state store, and data directory.
     ///
     /// The data directory is used for named volume storage under `<data_dir>/volumes/`
@@ -421,7 +527,155 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             service_ips: HashMap::new(),
             service_network_ips: HashMap::new(),
             mount_tag_offsets: HashMap::new(),
+            scoped_authority: None,
+            scoped_secret_inputs: BTreeMap::new(),
+            scoped_secret_digests: BTreeMap::new(),
+            scoped_secret_dir: None,
+            scoped_cleanup_only: false,
         }
+    }
+
+    /// Create a production executor fenced to one current, runnable Machine workload.
+    pub fn new_scoped(
+        runtime: R,
+        store: StateStore,
+        data_dir: &Path,
+        scope: vz_runtime_contract::MachineWorkloadScope,
+    ) -> Result<Self, StackError> {
+        scope.validate().map_err(StackError::InvalidSpec)?;
+        store.validate_stack_workload_owner(&scope)?;
+        let project = store
+            .load_project_state(scope.project_id.as_str())?
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!("Project `{}` was not found", scope.project_id))
+            })?;
+        let environment = project
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == scope.environment_id)
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Environment `{}` was not found in Project `{}`",
+                    scope.environment_id, scope.project_id
+                ))
+            })?;
+        if environment.project_id != scope.project_id {
+            return Err(scope_state_conflict(
+                "Project does not own scoped Environment",
+            ));
+        }
+        if environment.state != vz_runtime_contract::EnvironmentState::Ready {
+            return Err(scope_state_conflict(format!(
+                "Environment `{}` is not runnable for stack reconciliation ({:?})",
+                environment.environment_id, environment.state
+            )));
+        }
+        let machine = environment
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == scope.machine_id)
+            .ok_or_else(|| {
+                StackError::InvalidSpec(format!(
+                    "Machine `{}` was not found in Environment `{}`",
+                    scope.machine_id, scope.environment_id
+                ))
+            })?;
+        if machine.environment_id != scope.environment_id {
+            return Err(scope_state_conflict(
+                "Environment does not own scoped Machine",
+            ));
+        }
+        if machine.state != vz_runtime_contract::MachineState::Ready {
+            return Err(scope_state_conflict(format!(
+                "Machine `{}` is not runnable ({:?})",
+                machine.machine_id, machine.state
+            )));
+        }
+        let incarnation = machine.incarnation.as_ref().ok_or_else(|| {
+            scope_state_conflict(format!(
+                "Machine `{}` has no current incarnation",
+                machine.machine_id
+            ))
+        })?;
+        if incarnation.incarnation_id != scope.machine_incarnation_id {
+            return Err(scope_state_conflict(
+                "Machine workload scope names a stale incarnation",
+            ));
+        }
+        let authority = ScopedExecutionAuthority {
+            scope,
+            environment_generation: environment.lifecycle_generation,
+            definition_digest: environment.definition_digest.clone(),
+        };
+        let mut executor = Self::new(runtime, store, data_dir);
+        executor.scoped_authority = Some(authority);
+        Ok(executor)
+    }
+
+    /// Create a recovery-only executor for exact journal-owned cleanup.
+    ///
+    /// Unlike activation admission, cleanup remains available while lifecycle
+    /// state is non-runnable and for an incarnation retained only by an exact
+    /// scoped journal record. The resulting executor rejects every create or
+    /// recreate action before filesystem or runtime mutation.
+    pub fn new_scoped_for_cleanup(
+        runtime: R,
+        store: StateStore,
+        data_dir: &Path,
+        scope: vz_runtime_contract::MachineWorkloadScope,
+    ) -> Result<Self, StackError> {
+        scope.validate().map_err(StackError::InvalidSpec)?;
+        store.validate_stack_workload_owner(&scope)?;
+        let project = store
+            .load_project_state(scope.project_id.as_str())?
+            .ok_or_else(|| scope_state_conflict("scoped cleanup Project was not found"))?;
+        let environment = project
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == scope.environment_id)
+            .ok_or_else(|| scope_state_conflict("scoped cleanup Environment was not found"))?;
+        if environment.project_id != scope.project_id {
+            return Err(scope_state_conflict(
+                "scoped cleanup Project does not own Environment",
+            ));
+        }
+        let machine = environment
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == scope.machine_id)
+            .ok_or_else(|| scope_state_conflict("scoped cleanup Machine was not found"))?;
+        if machine.environment_id != scope.environment_id {
+            return Err(scope_state_conflict(
+                "scoped cleanup Environment does not own Machine",
+            ));
+        }
+        let current_incarnation = machine
+            .incarnation
+            .as_ref()
+            .map(|incarnation| &incarnation.incarnation_id);
+        if current_incarnation != Some(&scope.machine_incarnation_id) {
+            let journal_proves_historical_scope = store
+                .list_stack_container_recovery_records_for_machine_workload(&scope)?
+                .iter()
+                .any(|record| {
+                    record.intent.scope.machine_incarnation_id.as_ref()
+                        == Some(&scope.machine_incarnation_id)
+                });
+            if !journal_proves_historical_scope {
+                return Err(scope_state_conflict(
+                    "scoped cleanup incarnation is neither current nor journal-owned",
+                ));
+            }
+        }
+        let authority = ScopedExecutionAuthority {
+            scope,
+            environment_generation: environment.lifecycle_generation,
+            definition_digest: environment.definition_digest.clone(),
+        };
+        let mut executor = Self::new(runtime, store, data_dir);
+        executor.scoped_authority = Some(authority);
+        executor.scoped_cleanup_only = true;
+        Ok(executor)
     }
 
     /// Access the underlying state store.

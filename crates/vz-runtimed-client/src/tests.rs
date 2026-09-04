@@ -415,6 +415,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             compose_dir: ".".to_string(),
             detach: false,
             dry_run: false,
+            scope: None,
         })
         .await
         .expect("apply stack");
@@ -426,6 +427,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
         .get_stack_status(runtime_v2::GetStackStatusRequest {
             metadata: None,
             stack_name: stack_name.clone(),
+            scope: None,
         })
         .await
         .expect("get stack status");
@@ -437,6 +439,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             stack_name: stack_name.clone(),
             after: 0,
             limit: 100,
+            scope: None,
         })
         .await
         .expect("list stack events");
@@ -451,6 +454,7 @@ async fn stack_apply_and_teardown_round_trip_via_daemon_client() {
             stack_name,
             remove_volumes: false,
             dry_run: false,
+            scope: None,
         })
         .await
         .expect("teardown stack");
@@ -765,6 +769,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             compose_dir: ".".to_string(),
             dry_run: false,
             detach: false,
+            scope: None,
         })
         .await
         .expect("apply stack");
@@ -791,6 +796,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service: "svc".to_string(),
             tail: 50,
+            scope: None,
         })
         .await;
     if let Err(error) = logs_result {
@@ -802,6 +808,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
+            scope: None,
         })
         .await
         .expect_err("stop stack service should fail for missing stack/service");
@@ -812,6 +819,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
+            scope: None,
         })
         .await
         .expect_err("start stack service should fail for missing stack/service");
@@ -822,6 +830,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             metadata: None,
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
+            scope: None,
         })
         .await
         .expect_err("restart stack service should fail for missing stack/service");
@@ -833,6 +842,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
             run_service_name: "svc-run".to_string(),
+            scope: None,
         })
         .await
         .expect_err("create stack run container should fail for missing stack/service");
@@ -847,6 +857,7 @@ async fn stack_auxiliary_methods_and_event_stream_paths_are_covered() {
             stack_name: "stack-missing-client".to_string(),
             service_name: "svc".to_string(),
             run_service_name: "svc-run".to_string(),
+            scope: None,
         })
         .await
         .expect_err("remove stack run container should fail for missing stack/service");

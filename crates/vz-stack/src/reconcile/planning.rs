@@ -201,7 +201,10 @@ pub(super) fn compute_actions_with_mount_digests(
                         .and_then(|n| n.parse::<u32>().ok())
                         .is_some_and(|n| n > 1)
                 });
-            if belongs && !desired_set.contains(o.service_name.as_str()) {
+            if belongs
+                && !desired_set.contains(o.service_name.as_str())
+                && o.phase != ServicePhase::Stopped
+            {
                 actions.push(Action::ServiceRemove {
                     service_name: o.service_name.clone(),
                 });
@@ -213,6 +216,7 @@ pub(super) fn compute_actions_with_mount_digests(
     let mut removals: Vec<String> = observed
         .iter()
         .filter(|o| !all_desired_replica_names.contains(&o.service_name))
+        .filter(|o| o.phase != ServicePhase::Stopped)
         .filter(|o| {
             // Don't double-add scale-down removals already handled above.
             !actions.iter().any(|a| {

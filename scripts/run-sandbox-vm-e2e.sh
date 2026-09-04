@@ -20,6 +20,7 @@ ENTITLEMENTS="$REPO_ROOT/entitlements/vz-cli.entitlements.plist"
 PROFILE="debug"
 OUTPUT_ROOT="$REPO_ROOT/.artifacts/sandbox-vm-e2e"
 KEEP_GOING=false
+FULL_CLOSURE_GATE_SELECTED=false
 SUITE_TOKENS=()
 SCENARIO_TOKENS=()
 RUN_ARGS=("--ignored" "--nocapture" "--test-threads=1")
@@ -41,7 +42,8 @@ Options:
                                 runtime-smoke, runtime-lifecycle, runtime-container-id-ownership,
                                 runtime-exec-semantics, runtime-exec-supervision,
                                 runtime-exec-defaults,
-                                runtime-port-forwarding, runtime-shared-vm-net, stack-real-services,
+                                runtime-port-forwarding, runtime-shared-vm-net,
+                                runtime-generation-crash-reopen, stack-real-services,
                                 stack-control-socket, stack-port-forwarding,
                                 stack-container-ownership,
                                 stack-snapshot-restore,
@@ -122,6 +124,7 @@ expand_suite_token() {
                 append_unique "stack"
                 ;;
             all)
+                FULL_CLOSURE_GATE_SELECTED=true
                 append_unique "runtime"
                 append_unique "stack"
                 append_unique "buildkit"
@@ -144,7 +147,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -170,6 +173,7 @@ expand_scenario_token() {
                 append_unique_scenario "runtime-exec-defaults"
                 append_unique_scenario "runtime-port-forwarding"
                 append_unique_scenario "runtime-shared-vm-net"
+                append_unique_scenario "runtime-generation-crash-reopen"
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
@@ -187,7 +191,7 @@ expand_scenario_token() {
 
 scenario_suite() {
     case "$1" in
-        runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net)
+        runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen)
             echo "runtime"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|environment-lifecycle-journal-linux-vm)
@@ -230,6 +234,9 @@ scenario_test_filter() {
             ;;
         runtime-shared-vm-net)
             echo "shared_vm_inter_service_connectivity"
+            ;;
+        runtime-generation-crash-reopen)
+            echo "runtime::tests::generation_ownership_sigkill_crash_reopen"
             ;;
         stack-real-services)
             echo "real_services_postgres_and_redis"
@@ -344,6 +351,15 @@ elif [[ " ${RESOLVED_SCENARIOS[*]} " == *" runtime-exec-supervision "* ]]; then
 fi
 if [[ "$EXEC_SUPERVISION_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
     err "every lane that emits runtime-exec-supervision evidence requires --profile release"
+fi
+
+CRASH_REOPEN_LANE_SELECTED=false
+if [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" \
+    || " ${RESOLVED_SCENARIOS[*]:-} " == *" runtime-generation-crash-reopen "* ]]; then
+    CRASH_REOPEN_LANE_SELECTED=true
+fi
+if [[ "$CRASH_REOPEN_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
+    err "runtime generation crash/reopen evidence requires --profile release"
 fi
 
 BUILDKIT_SELECTED=false
@@ -461,6 +477,8 @@ ENVIRONMENT_LIFECYCLE_EVIDENCE="$RUN_DIR/environment-lifecycle-journal-linux-vm.
 ENVIRONMENT_LIFECYCLE_SHA256="$RUN_DIR/environment-lifecycle-journal-linux-vm.json.sha256"
 EXEC_SUPERVISION_EVIDENCE="$RUN_DIR/runtime-exec-supervision.json"
 EXEC_SUPERVISION_SHA256="$RUN_DIR/runtime-exec-supervision.json.sha256"
+RUNTIME_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-crash-reopen.json"
+RUNTIME_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-crash-reopen.json.sha256"
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -2145,6 +2163,154 @@ validate_environment_lifecycle_evidence() {
     ' "$evidence_file" >/dev/null
 }
 
+validate_runtime_crash_reopen_evidence() {
+    local evidence_file="$1"
+    local expected_profile="$2"
+    local expected_test_binary_sha256="$3"
+
+    if ! jq -e '
+        .coverage_classification == "runtime_store_post_commit_lost_ack_only" and
+        .state_store_expectation == {
+            "schema_version": 4,
+            "status": "complete",
+            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication"
+        }
+    ' "$evidence_file" >/dev/null; then
+        echo "runtime generation crash/reopen evidence is incomplete: missing atomic executor/StateStore v4 binding and observed-state publication boundary" >&2
+        return 1
+    fi
+
+    jq -e \
+        --arg expected_profile "$expected_profile" \
+        --arg expected_test_binary_sha256 "$expected_test_binary_sha256" '
+        def exact_keys($keys): (keys | sort) == ($keys | sort);
+        def nonempty: type == "string" and length > 0;
+        def hex_sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def scope:
+            exact_keys([
+                "environment_id", "machine_id", "machine_incarnation_id",
+                "project_id", "reservation_id", "stack_id"
+            ]) and
+            (all([
+                .environment_id, .machine_id, .machine_incarnation_id,
+                .project_id, .reservation_id, .stack_id
+            ][]; nonempty));
+        def raw_state:
+            exact_keys(["containers", "generations", "routes"]) and
+            ((.containers | type) == "array") and
+            ((.generations | type) == "object") and
+            ((.routes | type) == "array") and
+            (all(.routes[]; type == "array" and length == 2 and all(.[]; nonempty)));
+        def boundary:
+            exact_keys([
+                "boundary", "child", "container_id", "generation", "outcomes",
+                "post_raw_state", "pre_raw_state", "prior_generation", "prior_scope", "scope"
+            ]) and
+            (.boundary | nonempty) and (.container_id | nonempty) and
+            (.scope | scope) and
+            (.generation | type == "number" and . > 0 and . == floor) and
+            (.child == {"expected_exit_code": 137, "signal": "SIGKILL"}) and
+            (.pre_raw_state | raw_state) and (.post_raw_state | raw_state) and
+            (.outcomes | exact_keys([
+                "cleanup_outcome", "exact_inspection", "foreign_inspection",
+                "replacement_inspection", "same_reservation_generation"
+            ])) and
+            (.pre_raw_state.generations[.container_id].generation == .generation) and
+            (.pre_raw_state.generations[.container_id].scope == .scope);
+
+        (type == "object") and
+        (exact_keys([
+            "boundaries", "build_identity", "controls", "coverage_classification", "scenario",
+            "schema_version", "state_store_expectation"
+        ])) and
+        (.schema_version == 1) and
+        (.scenario == "runtime-generation-crash-reopen") and
+        (.coverage_classification == "runtime_store_post_commit_lost_ack_only") and
+        (.build_identity | exact_keys(["profile", "test_binary_sha256"])) and
+        (.build_identity.profile == "release") and
+        (.build_identity.profile == $expected_profile) and
+        (.build_identity.test_binary_sha256 | hex_sha256) and
+        (.build_identity.test_binary_sha256 == $expected_test_binary_sha256) and
+        (.controls == {
+            "harness_invocations": 1,
+            "child_processes": 5,
+            "retries": 0,
+            "fallbacks": 0,
+            "skips": 0
+        }) and
+        (.state_store_expectation == {
+            "schema_version": 4,
+            "status": "complete",
+            "required_boundary": "atomic executor failpoints joining runtime ownership with StateStore v4 binding and observed-state publication"
+        }) and
+        ((.boundaries | length) == 5) and
+        (all(.boundaries[]; boundary)) and
+        ((.boundaries | map(.boundary) | sort) == ([
+            "cleanup_completion", "metadata_publication", "replacement_persistence",
+            "reservation_persistence", "route_publication"
+        ] | sort)) and
+
+        (.boundaries[] | select(.boundary == "reservation_persistence") as $case |
+            $case.prior_scope == null and $case.prior_generation == null and
+            $case.outcomes.exact_inspection == "reserved_unpublished" and
+            $case.outcomes.same_reservation_generation == $case.generation and
+            $case.outcomes.foreign_inspection == "foreign" and
+            $case.outcomes.replacement_inspection == null and
+            $case.outcomes.cleanup_outcome == null and
+            $case.pre_raw_state.containers == [] and
+            $case.post_raw_state.containers == [] and
+            $case.post_raw_state.generations[$case.container_id].generation == $case.generation and
+            $case.post_raw_state.generations[$case.container_id].scope == $case.scope and
+            $case.post_raw_state.generations[$case.container_id].reserved == true) and
+
+        (.boundaries[] | select(.boundary == "metadata_publication") as $case |
+            $case.outcomes.exact_inspection == "published" and
+            $case.outcomes.same_reservation_generation == null and
+            $case.outcomes.foreign_inspection == null and
+            $case.outcomes.replacement_inspection == null and
+            $case.outcomes.cleanup_outcome == null and
+            ($case.pre_raw_state.containers | length) == 1 and
+            $case.pre_raw_state.containers[0].id == $case.container_id and
+            $case.pre_raw_state.containers[0].status == "Created" and
+            ($case.post_raw_state.containers | length) == 1 and
+            $case.post_raw_state.containers[0].id == $case.container_id and
+            ($case.post_raw_state.containers[0].status.Stopped.exit_code == -1)) and
+
+        (.boundaries[] | select(.boundary == "route_publication") as $case |
+            $case.outcomes.exact_inspection == "reserved_unpublished" and
+            $case.outcomes.same_reservation_generation == $case.generation and
+            $case.outcomes.foreign_inspection == "foreign" and
+            $case.outcomes.replacement_inspection == null and
+            $case.outcomes.cleanup_outcome == null and
+            any($case.pre_raw_state.routes[]; . == [$case.container_id, $case.scope.stack_id]) and
+            any($case.post_raw_state.routes[]; . == [$case.container_id, $case.scope.stack_id])) and
+
+        (.boundaries[] | select(.boundary == "cleanup_completion") as $case |
+            $case.outcomes.exact_inspection == "absent" and
+            $case.outcomes.same_reservation_generation == null and
+            $case.outcomes.foreign_inspection == null and
+            $case.outcomes.replacement_inspection == null and
+            $case.outcomes.cleanup_outcome == "removed" and
+            $case.pre_raw_state.containers == [] and
+            $case.post_raw_state.containers == [] and
+            $case.pre_raw_state.generations[$case.container_id].reserved == false and
+            $case.post_raw_state.generations[$case.container_id].reserved == false and
+            $case.post_raw_state.routes == []) and
+
+        (.boundaries[] | select(.boundary == "replacement_persistence") as $case |
+            ($case.prior_scope | scope) and
+            ($case.prior_generation | type == "number" and . > 0 and . < $case.generation) and
+            $case.outcomes.exact_inspection == "reserved_unpublished" and
+            $case.outcomes.same_reservation_generation == $case.generation and
+            $case.outcomes.foreign_inspection == "foreign" and
+            $case.outcomes.replacement_inspection == "replacement" and
+            $case.outcomes.cleanup_outcome == null and
+            $case.post_raw_state.generations[$case.container_id].generation == $case.generation and
+            $case.post_raw_state.generations[$case.container_id].scope == $case.scope and
+            $case.post_raw_state.generations[$case.container_id].reserved == true)
+    ' "$evidence_file" >/dev/null
+}
+
 write_and_validate_container_id_ownership_checksum() {
     local evidence_file="$1"
     local checksum_file="$2"
@@ -2211,6 +2377,17 @@ write_and_validate_environment_lifecycle_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+write_and_validate_runtime_crash_reopen_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local evidence_name
+    evidence_name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$evidence_name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -2221,6 +2398,7 @@ run_and_log() {
     local cmd_env=()
     local exec_supervision_test_binary_sha256=""
     local stack_ownership_test_binary_sha256=""
+    local crash_reopen_test_binary_sha256=""
     local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
@@ -2300,6 +2478,17 @@ run_and_log() {
             cmd_env+=("VZ_EXEC_SUPERVISION_DEVELOPER_INITRAMFS_SHA256=$DEVELOPER_INITRAMFS_SHA256")
             cmd_env+=("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_BEFORE_READY_COMMAND=/vz-exec-response-loss-command/sh")
             cmd_env+=("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS=5000")
+        fi
+        if [[ "$label" == "runtime-generation-crash-reopen" ]]; then
+            if [[ "$PROFILE" != "release" ]]; then
+                echo "runtime generation crash/reopen evidence cannot run under profile '$PROFILE'" >&2
+                return 110
+            fi
+            crash_reopen_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+            rm -f "$RUNTIME_CRASH_REOPEN_EVIDENCE" "$RUNTIME_CRASH_REOPEN_SHA256"
+            cmd_env+=("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE=$RUNTIME_CRASH_REOPEN_EVIDENCE")
+            cmd_env+=("VZ_RUNTIME_CRASH_BUILD_PROFILE=$PROFILE")
+            cmd_env+=("VZ_RUNTIME_CRASH_TEST_BINARY_SHA256=$crash_reopen_test_binary_sha256")
         fi
     fi
 
@@ -2493,6 +2682,22 @@ run_and_log() {
             fi
             EXEC_SUPERVISION_EVIDENCE_VALIDATED=true
         fi
+        if [[ "$label" == "runtime-generation-crash-reopen" ]]; then
+            if [[ ! -f "$RUNTIME_CRASH_REOPEN_EVIDENCE" ]] \
+                || ! validate_runtime_crash_reopen_evidence \
+                    "$RUNTIME_CRASH_REOPEN_EVIDENCE" \
+                    "$PROFILE" \
+                    "$crash_reopen_test_binary_sha256"; then
+                echo "runtime generation crash/reopen evidence is missing or malformed" >&2
+                return 111
+            fi
+            if ! write_and_validate_runtime_crash_reopen_checksum \
+                "$RUNTIME_CRASH_REOPEN_EVIDENCE" "$RUNTIME_CRASH_REOPEN_SHA256"; then
+                echo "runtime generation crash/reopen evidence checksum failed" >&2
+                return 112
+            fi
+            RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED=true
+        fi
     fi
 
     return "$status"
@@ -2525,6 +2730,8 @@ echo "==> output directory: $RUN_DIR"
     echo "vm_full_unsupported_checksum=$VM_FULL_UNSUPPORTED_SHA256"
     echo "environment_lifecycle_evidence=$ENVIRONMENT_LIFECYCLE_EVIDENCE"
     echo "environment_lifecycle_checksum=$ENVIRONMENT_LIFECYCLE_SHA256"
+    echo "runtime_crash_reopen_evidence=$RUNTIME_CRASH_REOPEN_EVIDENCE"
+    echo "runtime_crash_reopen_checksum=$RUNTIME_CRASH_REOPEN_SHA256"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
@@ -2557,6 +2764,8 @@ VM_FULL_UNSUPPORTED_EVIDENCE_VALIDATED=false
 VM_FULL_UNSUPPORTED_EVIDENCE_REQUIRED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED=false
 ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED=false
+RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED=false
+RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=false
 
 for suite in "${RESOLVED_SUITES[@]}"; do
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
@@ -2589,6 +2798,19 @@ for suite in "${RESOLVED_SUITES[@]}"; do
 
     sign_binary "$test_binary" "$ENTITLEMENTS"
 
+    crash_reopen_test_binary=""
+    if [[ "$suite" == "runtime" ]] \
+        && { [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" ]] \
+            || [[ " ${RESOLVED_SCENARIOS[*]:-} " == *" runtime-generation-crash-reopen "* ]]; }; then
+        crash_reopen_artifact_log="$RUN_DIR/runtime-crash-reopen-test-artifacts.jsonl"
+        run_cargo_recording_artifacts "$crash_reopen_artifact_log" \
+            test -p "$package" "${BUILD_ARGS[@]}" --lib --no-run
+        crash_reopen_test_binary="$(
+            resolve_cargo_executable "$crash_reopen_artifact_log" "vz_oci_macos" "lib"
+        )" || err "unable to resolve the vz-oci-macos library test executable"
+        sign_binary "$crash_reopen_test_binary" "$ENTITLEMENTS"
+    fi
+
     if [[ ${#RESOLVED_SCENARIOS[@]} -gt 0 ]]; then
         for scenario in "${RESOLVED_SCENARIOS[@]}"; do
             if [[ "$(scenario_suite "$scenario")" != "$suite" ]]; then
@@ -2596,6 +2818,11 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             fi
             test_filter="$(scenario_test_filter "$scenario")" || err "unknown scenario '$scenario'"
             scenario_args=("${RUN_ARGS[@]}" "--exact" "$test_filter")
+            scenario_binary="$test_binary"
+            if [[ "$scenario" == "runtime-generation-crash-reopen" ]]; then
+                RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=true
+                scenario_binary="$crash_reopen_test_binary"
+            fi
             if [[ "$scenario" == "runtime-container-id-ownership" ]]; then
                 RUNTIME_ID_EVIDENCE_REQUIRED=true
             fi
@@ -2603,7 +2830,7 @@ for suite in "${RESOLVED_SUITES[@]}"; do
                 EXEC_SUPERVISION_EVIDENCE_REQUIRED=true
             fi
 
-            if run_and_log "$suite" "$scenario" "$test_binary" "${scenario_args[@]}"; then
+            if run_and_log "$suite" "$scenario" "$scenario_binary" "${scenario_args[@]}"; then
                 echo "==> scenario passed: $scenario"
                 PASSED+=("$scenario")
             else
@@ -2630,6 +2857,29 @@ for suite in "${RESOLVED_SUITES[@]}"; do
             FAILED+=("$suite:$status")
             if [[ "$KEEP_GOING" != "true" ]]; then
                 should_stop=true
+            fi
+        fi
+        if [[ "$suite" == "runtime" && "$FULL_CLOSURE_GATE_SELECTED" == "true" ]] \
+            && { [[ "$should_stop" == "false" ]] || [[ "$KEEP_GOING" == "true" ]]; }; then
+            RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED=true
+            crash_reopen_args=(
+                "${RUN_ARGS[@]}" "--exact"
+                "$(scenario_test_filter runtime-generation-crash-reopen)"
+            )
+            if run_and_log \
+                "$suite" \
+                "runtime-generation-crash-reopen" \
+                "$crash_reopen_test_binary" \
+                "${crash_reopen_args[@]}"; then
+                echo "==> scenario passed: runtime-generation-crash-reopen"
+                PASSED+=("runtime-generation-crash-reopen")
+            else
+                status=$?
+                echo "==> scenario failed: runtime-generation-crash-reopen (exit $status)"
+                FAILED+=("runtime-generation-crash-reopen:$status")
+                if [[ "$KEEP_GOING" != "true" ]]; then
+                    should_stop=true
+                fi
             fi
         fi
     fi
@@ -2680,6 +2930,12 @@ if [[ "$ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED" == "true" \
     && "$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED" != "true" ]]; then
     echo "==> required Environment lifecycle evidence was not validated" >&2
     FAILED+=("environment-lifecycle-evidence:104")
+fi
+
+if [[ "$RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED" == "true" \
+    && "$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required runtime generation crash/reopen evidence was not validated" >&2
+    FAILED+=("runtime-generation-crash-reopen-evidence:111")
 fi
 
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
@@ -2761,6 +3017,15 @@ action_summary="$RUN_DIR/summary.txt"
     fi
     echo "environment_lifecycle_required=$ENVIRONMENT_LIFECYCLE_EVIDENCE_REQUIRED"
     echo "environment_lifecycle_validated=$ENVIRONMENT_LIFECYCLE_EVIDENCE_VALIDATED"
+    if [[ "$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "runtime_crash_reopen=$RUNTIME_CRASH_REOPEN_EVIDENCE"
+        echo "runtime_crash_reopen_sha256=$RUNTIME_CRASH_REOPEN_SHA256"
+    else
+        echo "runtime_crash_reopen=none"
+        echo "runtime_crash_reopen_sha256=none"
+    fi
+    echo "runtime_crash_reopen_required=$RUNTIME_CRASH_REOPEN_EVIDENCE_REQUIRED"
+    echo "runtime_crash_reopen_validated=$RUNTIME_CRASH_REOPEN_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

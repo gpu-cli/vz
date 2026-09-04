@@ -19,13 +19,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::CreateContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -43,9 +36,32 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let workload_scope = validate_stack_apply_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            &request_id,
+        )?;
 
         let spec = parse_stack_spec(&stack_name, &request.compose_yaml, &request.compose_dir)
             .map_err(|error| status_from_stack_error(error, &request_id))?;
+        if spec.name != stack_name || spec.name != workload_scope.stack_id {
+            return Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::StateConflict,
+                format!(
+                    "compose stack `{}` does not match requested scoped stack `{stack_name}`",
+                    spec.name
+                ),
+                Some(request_id),
+                BTreeMap::new(),
+            )));
+        }
+        enforce_stack_policy_preflight_read_only(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateContainer,
+            &metadata,
+            &request_id,
+        )?;
         let mut sequence = 1u64;
         let mut events = vec![Ok(apply_stack_progress_event(
             &request_id,
@@ -53,6 +69,94 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             "planning",
             "planning stack apply actions",
         ))];
+
+        let health_statuses = HashMap::new();
+        if request.dry_run {
+            let (apply_result, observed) = match self.daemon.with_state_store(|store| {
+                Ok((
+                    plan_apply(&spec, store, &health_statuses)?,
+                    store.load_observed_state(&stack_name)?,
+                ))
+            }) {
+                Ok(value) => value,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
+            let mut projected = observed;
+            for action in &apply_result.actions {
+                match action {
+                    Action::ServiceCreate { service_name }
+                    | Action::ServiceRecreate { service_name } => {
+                        if let Some(status) = projected
+                            .iter_mut()
+                            .find(|status| status.service_name == *service_name)
+                        {
+                            status.phase = ServicePhase::Pending;
+                            status.last_error = None;
+                            status.ready = false;
+                        } else {
+                            projected.push(ServiceObservedState {
+                                service_name: service_name.clone(),
+                                phase: ServicePhase::Pending,
+                                container_id: None,
+                                failed_create_ownership: None,
+                                last_error: None,
+                                ready: false,
+                            });
+                        }
+                    }
+                    Action::ServiceRemove { service_name } => {
+                        if let Some(status) = projected
+                            .iter_mut()
+                            .find(|status| status.service_name == *service_name)
+                        {
+                            status.phase = ServicePhase::Stopped;
+                            status.last_error = None;
+                            status.ready = false;
+                        }
+                    }
+                }
+            }
+            let services: Vec<runtime_v2::StackServiceStatus> =
+                projected.iter().map(stack_status_from_observed).collect();
+            let services_ready = projected.iter().filter(|item| item.ready).count();
+            let services_failed = projected
+                .iter()
+                .filter(|item| item.phase == ServicePhase::Failed)
+                .count();
+            sequence += 1;
+            events.push(Ok(apply_stack_completion_event(
+                &request_id,
+                sequence,
+                runtime_v2::ApplyStackResponse {
+                    request_id: request_id.clone(),
+                    stack_name,
+                    changed_actions: apply_result.actions.len() as u32,
+                    converged: false,
+                    services_ready: services_ready as u32,
+                    services_failed: services_failed as u32,
+                    services,
+                },
+                "",
+            )));
+            return Ok(stack_stream_response(events, None));
+        }
+
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateContainer,
+            &metadata,
+            &request_id,
+        )?;
+        if let Err(error) = self.daemon.with_state_store(|store| {
+            store.reserve_stack_workload_owner(&workload_scope, current_unix_secs())?;
+            Ok(())
+        }) {
+            events.push(Err(status_from_stack_error(error, &request_id)));
+            return Ok(stack_stream_response(events, None));
+        }
 
         let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
         if let Err(error) = std::fs::create_dir_all(&stack_dir) {
@@ -75,7 +179,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 return Ok(stack_stream_response(events, None));
             }
         };
-        let health_statuses = HashMap::new();
         let apply_result = match apply(&spec, &preview_store, &health_statuses) {
             Ok(result) => result,
             Err(error) => {
@@ -83,38 +186,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 return Ok(stack_stream_response(events, None));
             }
         };
-        if request.dry_run {
-            let observed = match preview_store.load_observed_state(&stack_name) {
-                Ok(value) => value,
-                Err(error) => {
-                    events.push(Err(status_from_stack_error(error, &request_id)));
-                    return Ok(stack_stream_response(events, None));
-                }
-            };
-            let services: Vec<runtime_v2::StackServiceStatus> =
-                observed.iter().map(stack_status_from_observed).collect();
-            let services_ready = observed.iter().filter(|item| item.ready).count();
-            let services_failed = observed
-                .iter()
-                .filter(|item| item.phase == ServicePhase::Failed)
-                .count();
-            sequence += 1;
-            events.push(Ok(apply_stack_completion_event(
-                &request_id,
-                sequence,
-                runtime_v2::ApplyStackResponse {
-                    request_id: request_id.clone(),
-                    stack_name,
-                    changed_actions: apply_result.actions.len() as u32,
-                    converged: false,
-                    services_ready: services_ready as u32,
-                    services_failed: services_failed as u32,
-                    services,
-                },
-                "",
-            )));
-            return Ok(stack_stream_response(events, None));
-        }
 
         sequence += 1;
         events.push(Ok(apply_stack_progress_event(
@@ -157,7 +228,14 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             }
         };
         let runtime = DaemonContainerRuntime::new(self.daemon.clone());
-        let executor = StackExecutor::new(runtime, exec_store, &stack_dir);
+        let executor =
+            match StackExecutor::new_scoped(runtime, exec_store, &stack_dir, workload_scope) {
+                Ok(executor) => executor,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
         let config = if request.detach {
             OrchestrationConfig {
                 max_rounds: 1,
@@ -266,12 +344,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::RemoveContainer,
-            &metadata,
-            &request_id,
-        )?;
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -280,6 +352,27 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Some(request_id),
                 BTreeMap::new(),
             )));
+        }
+        let workload_scope = validate_stack_cleanup_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            &request_id,
+        )?;
+        if request.dry_run {
+            enforce_stack_policy_preflight_read_only(
+                self.daemon.as_ref(),
+                RuntimeOperation::RemoveContainer,
+                &metadata,
+                &request_id,
+            )?;
+        } else {
+            enforce_mutation_policy_preflight(
+                self.daemon.as_ref(),
+                RuntimeOperation::RemoveContainer,
+                &metadata,
+                &request_id,
+            )?;
         }
 
         let (desired, observed) = self
@@ -316,10 +409,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             disk_size_mb: None,
         };
         let health_statuses = HashMap::new();
-        let apply_result = match self
-            .daemon
-            .with_state_store(|store| apply(&empty_spec, store, &health_statuses))
-        {
+        let apply_result = match self.daemon.with_state_store(|store| {
+            if request.dry_run {
+                plan_apply(&empty_spec, store, &health_statuses)
+            } else {
+                apply(&empty_spec, store, &health_statuses)
+            }
+        }) {
             Ok(result) => result,
             Err(error) => {
                 events.push(Err(status_from_stack_error(error, &request_id)));
@@ -372,8 +468,24 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 }
             };
             let runtime = DaemonContainerRuntime::new(self.daemon.clone());
-            let mut executor = StackExecutor::new(runtime, exec_store, &stack_dir);
-            let execution_result = match executor.execute(&empty_spec, &apply_result.actions) {
+            let mut executor = match StackExecutor::new_scoped_for_cleanup(
+                runtime,
+                exec_store,
+                &stack_dir,
+                workload_scope.clone(),
+            ) {
+                Ok(executor) => executor,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
+            let execution_result = match executor.execute_with_operation(
+                &empty_spec,
+                &apply_result.actions,
+                &request_id,
+                0,
+            ) {
                 Ok(result) => result,
                 Err(error) => {
                     events.push(Err(status_from_stack_error(error, &request_id)));
@@ -503,6 +615,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            false,
+            &request_id,
+        )?;
 
         let (desired, observed) = self
             .daemon
@@ -549,6 +668,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            false,
+            &request_id,
+        )?;
         let limit = if request.limit == 0 {
             100
         } else {
@@ -594,6 +720,13 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            false,
+            &request_id,
+        )?;
         let service_filter = request.service.trim().to_string();
         let tail = request.tail as usize;
 
@@ -667,13 +800,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::StopContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -699,6 +825,18 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let workload_scope = validate_stack_cleanup_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            &request_id,
+        )?;
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::StopContainer,
+            &metadata,
+            &request_id,
+        )?;
 
         let (spec, observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
@@ -726,6 +864,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Action::ServiceRemove {
                     service_name: service_name.clone(),
                 },
+                workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::StateConflict,
             ) {
@@ -804,13 +943,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::CreateContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -836,6 +968,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let workload_scope = validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            true,
+            &request_id,
+        )?;
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateContainer,
+            &metadata,
+            &request_id,
+        )?;
 
         let (spec, observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
@@ -864,6 +1009,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Action::ServiceCreate {
                     service_name: service_name.clone(),
                 },
+                workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::InternalError,
             ) {
@@ -942,13 +1088,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::CreateContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -974,6 +1113,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        let workload_scope = validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            true,
+            &request_id,
+        )?;
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateContainer,
+            &metadata,
+            &request_id,
+        )?;
 
         let (spec, _observed_state) = match load_stack_service_action_context(
             self.daemon.as_ref(),
@@ -1000,6 +1152,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             Action::ServiceRecreate {
                 service_name: service_name.clone(),
             },
+            workload_scope,
             &request_id,
             MachineErrorCode::InternalError,
         ) {
@@ -1077,13 +1230,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::CreateContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -1102,12 +1248,25 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
-
         let run_service_name = if request.run_service_name.trim().is_empty() {
             generated_stack_run_service_name(&service_name)
         } else {
             request.run_service_name.trim().to_string()
         };
+        reject_primary_service_run_alias(&service_name, &run_service_name, &request_id)?;
+        let workload_scope = validate_stack_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            true,
+            &request_id,
+        )?;
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::CreateContainer,
+            &metadata,
+            &request_id,
+        )?;
         let (spec, _) = load_stack_service_action_context(
             self.daemon.as_ref(),
             &stack_name,
@@ -1136,6 +1295,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Action::ServiceCreate {
                     service_name: run_service_name.clone(),
                 },
+                workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::InternalError,
             )?;
@@ -1202,13 +1362,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             .request_id
             .clone()
             .unwrap_or_else(generate_request_id);
-        enforce_mutation_policy_preflight(
-            self.daemon.as_ref(),
-            RuntimeOperation::StopContainer,
-            &metadata,
-            &request_id,
-        )?;
-
         let stack_name = request.stack_name.trim().to_string();
         if stack_name.is_empty() {
             return Err(status_from_machine_error(MachineError::new(
@@ -1236,6 +1389,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
+        reject_primary_service_run_alias(&service_name, &run_service_name, &request_id)?;
+        let workload_scope = validate_stack_cleanup_request_scope(
+            self.daemon.as_ref(),
+            request.scope.as_ref(),
+            &stack_name,
+            &request_id,
+        )?;
+        enforce_mutation_policy_preflight(
+            self.daemon.as_ref(),
+            RuntimeOperation::StopContainer,
+            &metadata,
+            &request_id,
+        )?;
 
         let (spec, _) = load_stack_service_action_context(
             self.daemon.as_ref(),
@@ -1269,6 +1435,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 Action::ServiceRemove {
                     service_name: run_service_name.clone(),
                 },
+                workload_scope.clone(),
                 &request_id,
                 MachineErrorCode::StateConflict,
             )?;
@@ -1315,7 +1482,125 @@ mod tests {
     use std::collections::VecDeque;
     use std::sync::Mutex;
     use tokio_stream::StreamExt;
-    use vz_runtime_contract::{Build, RuntimeError};
+    use vz_runtime_contract::{
+        Build, PolicyDecision, RequestMetadata, RuntimeError, RuntimeOperation, RuntimePolicyHook,
+    };
+
+    struct AllowThenDenyCreatePolicyHook {
+        create_evaluations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl RuntimePolicyHook for AllowThenDenyCreatePolicyHook {
+        fn evaluate(
+            &self,
+            operation: RuntimeOperation,
+            _metadata: &RequestMetadata,
+        ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
+            if operation != RuntimeOperation::CreateContainer {
+                return Ok(PolicyDecision::Allow);
+            }
+            let evaluation = self
+                .create_evaluations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if evaluation == 0 {
+                Ok(PolicyDecision::Allow)
+            } else {
+                Ok(PolicyDecision::Deny {
+                    reason: "blocked after read-only apply preflight".to_string(),
+                })
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn apply_policy_denial_cannot_claim_immutable_stack_owner() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let config = RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        };
+        let daemon = Arc::new(
+            RuntimeDaemon::start_with_policy_hook(
+                config.clone(),
+                Arc::new(AllowThenDenyCreatePolicyHook {
+                    create_evaluations: std::sync::atomic::AtomicUsize::new(0),
+                }),
+                Some("deny-second-create-v1".to_string()),
+            )
+            .expect("daemon start"),
+        );
+        let stack_name = "policy-denied-owner";
+        let wire_scope = crate::grpc::tests::seed_stack_topology(daemon.as_ref(), stack_name);
+        let service = StackServiceImpl::new(daemon.clone());
+
+        let error = runtime_v2::stack_service_server::StackService::apply_stack(
+            &service,
+            tonic::Request::new(runtime_v2::ApplyStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-policy-denied-owner".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                compose_yaml: "services:\n  web:\n    image: alpine:latest\n".to_string(),
+                compose_dir: ".".to_string(),
+                dry_run: false,
+                detach: true,
+                scope: Some(wire_scope),
+            }),
+        )
+        .await
+        .expect_err("the audited mutation policy must deny apply");
+
+        assert_eq!(error.code(), tonic::Code::PermissionDenied);
+        let (owner, desired, observed, stack_events, stack_receipts, policy_receipts) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_stack_workload_owner(stack_name)?,
+                    store.load_desired_state(stack_name)?,
+                    store.load_observed_state(stack_name)?,
+                    store.load_events(stack_name)?,
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                    store.list_receipts_for_entity("policy", "req-policy-denied-owner")?,
+                ))
+            })
+            .expect("inspect denied apply state");
+        assert!(
+            owner.is_none(),
+            "policy denial must not claim the owner tombstone"
+        );
+        assert!(
+            desired.is_none(),
+            "policy denial must not persist desired state"
+        );
+        assert!(
+            observed.is_empty(),
+            "policy denial must not persist observed state"
+        );
+        assert!(
+            stack_events.is_empty(),
+            "policy denial must not emit stack events"
+        );
+        assert!(
+            stack_receipts.is_empty(),
+            "policy denial must not persist stack receipts"
+        );
+        assert_eq!(
+            policy_receipts.len(),
+            1,
+            "the denial itself remains audited"
+        );
+        assert_eq!(policy_receipts[0].status, "deny");
+        assert!(
+            !config
+                .runtime_data_dir
+                .join("stacks")
+                .join(stack_name)
+                .exists(),
+            "policy denial must happen before stack filesystem mutation"
+        );
+    }
 
     #[tokio::test]
     async fn teardown_execution_failure_returns_only_a_terminal_error() {
@@ -1389,6 +1674,7 @@ mod tests {
     async fn teardown_runtime_shutdown_failure_has_no_success_side_effects() {
         let (tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-failure";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
         let empty_spec = StackSpec {
             name: stack_name.to_string(),
             services: Vec::new(),
@@ -1429,6 +1715,7 @@ mod tests {
                 stack_name: stack_name.to_string(),
                 remove_volumes: true,
                 dry_run: false,
+                scope: Some(wire_scope),
             }),
         )
         .await
@@ -1493,6 +1780,7 @@ mod tests {
     async fn teardown_runtime_shutdown_succeeds_on_current_thread_runtime() {
         let (_tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-success";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
         let empty_spec = StackSpec {
             name: stack_name.to_string(),
             services: Vec::new(),
@@ -1522,6 +1810,7 @@ mod tests {
                 stack_name: stack_name.to_string(),
                 remove_volumes: false,
                 dry_run: false,
+                scope: Some(wire_scope),
             }),
         )
         .await
@@ -1971,6 +2260,21 @@ services:
         (tmp, daemon)
     }
 
+    fn seed_owned_stack_topology(
+        daemon: &RuntimeDaemon,
+        stack_name: &str,
+    ) -> runtime_v2::MachineWorkloadScope {
+        let wire_scope = crate::grpc::tests::seed_stack_topology(daemon, stack_name);
+        let workload_scope = vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope)
+            .expect("valid test workload scope");
+        daemon
+            .with_state_store(|store| {
+                store.reserve_stack_workload_owner(&workload_scope, current_unix_secs())
+            })
+            .expect("reserve test stack workload owner");
+        wire_scope
+    }
+
     async fn read_stack_service_action_completion(
         response: Response<StackServiceActionEventStream>,
     ) -> runtime_v2::StackServiceActionResponse {
@@ -1993,6 +2297,7 @@ services:
     #[tokio::test]
     async fn stop_stack_service_noop_returns_stopped_status() {
         let (_tmp, daemon) = stack_test_daemon();
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), "demo");
         let spec = parse_stack_spec(
             "demo",
             "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
@@ -2024,6 +2329,7 @@ services:
                 metadata: None,
                 stack_name: "demo".to_string(),
                 service_name: "web".to_string(),
+                scope: Some(wire_scope),
             }),
         )
         .await
@@ -2039,6 +2345,7 @@ services:
     #[tokio::test]
     async fn start_stack_service_noop_for_running_service_returns_running_status() {
         let (_tmp, daemon) = stack_test_daemon();
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), "demo");
         let spec = parse_stack_spec(
             "demo",
             "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
@@ -2070,6 +2377,7 @@ services:
                 metadata: None,
                 stack_name: "demo".to_string(),
                 service_name: "web".to_string(),
+                scope: Some(wire_scope),
             }),
         )
         .await
@@ -2086,6 +2394,7 @@ services:
     #[tokio::test]
     async fn stop_stack_service_returns_not_found_for_unknown_service() {
         let (_tmp, daemon) = stack_test_daemon();
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), "demo");
         let spec = parse_stack_spec(
             "demo",
             "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
@@ -2106,6 +2415,7 @@ services:
                 metadata: None,
                 stack_name: "demo".to_string(),
                 service_name: "api".to_string(),
+                scope: Some(wire_scope),
             }),
         )
         .await
@@ -2133,6 +2443,7 @@ services:
                 stack_name: "demo".to_string(),
                 service_name: "web".to_string(),
                 run_service_name: String::new(),
+                scope: None,
             }),
         )
         .await
@@ -2152,6 +2463,7 @@ services:
                 stack_name: "demo".to_string(),
                 service_name: String::new(),
                 run_service_name: String::new(),
+                scope: None,
             }),
         )
         .await

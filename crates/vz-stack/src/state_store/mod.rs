@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
 use vz_runtime_contract::{
     Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointFileEntry,
@@ -24,6 +24,13 @@ use crate::error::StackError;
 use crate::events::{EventRecord, StackEvent};
 use crate::network::PublishedPort;
 use crate::reconcile::Action;
+
+mod stack_journal;
+pub use stack_journal::{
+    StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
+    StackContainerGenerationBinding, StackContainerRecoveryDisposition,
+    StackContainerRecoveryRecord, StackWorkloadOwner,
+};
 
 /// Severity level for a drift finding detected during startup verification.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -627,7 +634,8 @@ impl StateStore {
             return self.with_immediate_transaction(|store| {
                 store.create_legacy_schema()?;
                 store.create_topology_schema_v3()?;
-                store.validate_v3_schema()?;
+                store.create_stack_journal_schema_v4()?;
+                store.validate_v4_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -650,10 +658,15 @@ impl StateStore {
         match version {
             1 => {
                 self.migrate_legacy_v1_to_v2()?;
-                self.migrate_topology_v2_to_v3()
+                self.migrate_topology_v2_to_v3()?;
+                self.migrate_stack_journal_v3_to_v4()
             }
-            2 => self.migrate_topology_v2_to_v3(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v3_schema(),
+            2 => {
+                self.migrate_topology_v2_to_v3()?;
+                self.migrate_stack_journal_v3_to_v4()
+            }
+            3 => self.migrate_stack_journal_v3_to_v4(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v4_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",
@@ -1077,16 +1090,44 @@ impl StateStore {
         stack_name: &str,
         state: &ServiceObservedState,
     ) -> Result<(), StackError> {
+        self.save_observed_state_for_replica(stack_name, 0, state)
+    }
+
+    pub fn save_observed_state_for_replica(
+        &self,
+        stack_name: &str,
+        replica_index: u32,
+        state: &ServiceObservedState,
+    ) -> Result<(), StackError> {
         let json = serde_json::to_string(state)?;
         self.conn.execute(
-            "INSERT INTO observed_state (stack_name, service_name, state_json)
-             VALUES (?1, ?2, ?3)
-             ON CONFLICT(stack_name, service_name) DO UPDATE SET
+            "INSERT INTO observed_state (stack_name, service_name, replica_index, state_json)
+             VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(stack_name, service_name, replica_index) DO UPDATE SET
                 state_json = excluded.state_json,
                 updated_at = datetime('now')",
-            params![stack_name, state.service_name, json],
+            params![stack_name, state.service_name, replica_index, json],
         )?;
         Ok(())
+    }
+
+    pub fn load_observed_state_for_replica(
+        &self,
+        stack_name: &str,
+        service_name: &str,
+        replica_index: u32,
+    ) -> Result<Option<ServiceObservedState>, StackError> {
+        let json = self
+            .conn
+            .query_row(
+                "SELECT state_json FROM observed_state
+                 WHERE stack_name = ?1 AND service_name = ?2 AND replica_index = ?3",
+                params![stack_name, service_name, replica_index],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        json.map(|json| serde_json::from_str(&json).map_err(Into::into))
+            .transpose()
     }
 
     /// Load all observed service states for a stack.
@@ -1094,9 +1135,10 @@ impl StateStore {
         &self,
         stack_name: &str,
     ) -> Result<Vec<ServiceObservedState>, StackError> {
-        let mut stmt = self
-            .conn
-            .prepare("SELECT state_json FROM observed_state WHERE stack_name = ?1")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT state_json FROM observed_state WHERE stack_name = ?1
+                 ORDER BY service_name, replica_index",
+        )?;
         let rows = stmt.query_map(params![stack_name], |row| row.get::<_, String>(0))?;
 
         let mut states = Vec::new();

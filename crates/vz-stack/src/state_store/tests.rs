@@ -10,13 +10,14 @@ use vz_runtime_contract::types::{
     EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance,
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentSpec,
-    EnvironmentState, LifecycleStepResult, LifecycleStepStatus, MachineCapability, MachineId,
-    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement,
-    MachineProfile, MachineResources, MachineSpec, MachineState, NetworkId, NetworkInstance,
-    NetworkKind, NetworkSpec as TopologyNetworkSpec, OperatingSystem, OwnedResourceKind,
-    OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectId,
-    ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec, TopologyResolutionError,
-    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
+    EnvironmentState, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
+    MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
+    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec,
+    OperatingSystem, OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
+    ProjectDefinition, ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
+    WorkspaceProjectionMode,
 };
 
 const V0_3_20_FIXTURE: &str = include_str!("../../tests/fixtures/v0.3.20-state.sql");
@@ -60,6 +61,26 @@ fn create_v2_store(path: &Path) -> StateStore {
             store.set_schema_version(2)
         })
         .expect("create canonical v2 state database");
+    store
+}
+
+fn create_v3_store(path: &Path) -> StateStore {
+    let connection = Connection::open(path).expect("open v3 state database");
+    connection
+        .pragma_update(None, "foreign_keys", "ON")
+        .expect("enable foreign keys for v3 state database");
+    let store = StateStore {
+        conn: connection,
+        event_sender: None,
+    };
+    store
+        .with_immediate_transaction(|store| {
+            store.create_legacy_schema()?;
+            store.create_topology_schema_v3()?;
+            store.validate_v3_schema()?;
+            store.set_schema_version(3)
+        })
+        .expect("create canonical v3 state database");
     store
 }
 
@@ -3018,7 +3039,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 3);
+    assert_eq!(version, 4);
 }
 
 #[test]
@@ -3962,13 +3983,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(3).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        store.set_schema_version(4).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 }
 
@@ -4068,8 +4089,8 @@ fn phase2_validation_event_queries_after_migration() {
     assert!(matches!(since[0].event, StackEvent::ServiceCreating { .. }));
 
     // Set schema version and verify queries still work
-    store.set_schema_version(3).unwrap();
-    assert_eq!(store.schema_version().unwrap(), 3);
+    store.set_schema_version(4).unwrap();
+    assert_eq!(store.schema_version().unwrap(), 4);
 
     let events_after = store.load_events("myapp").unwrap();
     assert_eq!(events_after.len(), 2);
@@ -4504,7 +4525,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         let definition_json: String = store
             .conn
             .query_row(
@@ -4932,7 +4953,9 @@ fn persisted_topology_rejects_self_consistent_child_that_diverges_from_parent_sn
 
 #[test]
 fn v3_schema_has_durable_lifecycle_shape_and_constraints() {
-    let store = StateStore::in_memory().unwrap();
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_path = temp_dir.path().join("canonical-v3.db");
+    let store = create_v3_store(&db_path);
     assert_eq!(store.schema_version().unwrap(), 3);
     store.validate_v3_schema().unwrap();
 
@@ -6470,7 +6493,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 3);
+    assert_eq!(retried.schema_version().unwrap(), 4);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -6528,7 +6551,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         assert_eq!(
             store
                 .conn
@@ -6544,7 +6567,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
                 )
                 .unwrap(),
             2,
-            "opening exact v1 state must chain through v2 to the complete v3 schema"
+            "opening exact v1 state must chain through v2, v3, and the complete v4 schema"
         );
         let projects = store.list_project_states().unwrap();
         assert_eq!(projects.len(), 1);
@@ -6763,7 +6786,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 3);
+    assert_eq!(retried.schema_version().unwrap(), 4);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -6869,7 +6892,7 @@ fn daemon_pragmas_do_not_change_journal_mode_before_legacy_validation() {
 }
 
 #[test]
-fn future_and_incomplete_v3_schemas_are_rejected_without_repair() {
+fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
     let future_dir = tempfile::tempdir().unwrap();
     let future_path = future_dir.path().join("future.db");
     seed_v0_3_20_fixture(&future_path, None);
@@ -6908,9 +6931,9 @@ fn future_and_incomplete_v3_schemas_are_rejected_without_repair() {
     }
     let error = StateStore::open(&incomplete_path)
         .err()
-        .expect("incomplete v3 schema must fail")
+        .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v3 shape mismatch"));
+    assert!(error.contains("state schema v4 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -6939,7 +6962,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v3 shape mismatch"));
+    assert!(error.contains("state schema v4 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -7001,7 +7024,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
 }
 
 #[test]
-fn v3_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
+fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
     for (name, mutation, expected, verification_sql) in [
         (
             "missing-table",
@@ -7041,10 +7064,10 @@ fn v3_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
 
         let error = StateStore::open(&db_path)
             .err()
-            .expect("noncanonical v3 schema must fail")
+            .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v3 shape mismatch"),
+            error.contains("state schema v4 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -7405,20 +7428,20 @@ fn missing_and_malformed_schema_versions_are_rejected_before_mutation() {
     }
 }
 
-/// Verify that fresh state stores advertise the current v3 schema.
+/// Verify that fresh state stores advertise the current v4 schema.
 #[test]
-fn migration_v3_schema_detectable() {
+fn migration_v4_schema_detectable() {
     let store = StateStore::in_memory().unwrap();
 
-    // Schema version must be present and equal to "3" after initial init.
+    // Schema version must be present and equal to "4" after initial init.
     let version_str = store
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "3");
+    assert_eq!(version_str, "4");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
 
     // created_at must also be set.
     assert!(
@@ -7477,7 +7500,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(store.schema_version().unwrap(), 4);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -7557,7 +7580,2181 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
+    assert_eq!(store.schema_version().unwrap(), 4);
+}
+
+fn journal_fixture(
+    reservation_id: &str,
+) -> (
+    ProjectState,
+    StackContainerCreateIntent,
+    StackContainerGenerationBinding,
+) {
+    let project = topology_project_state("prj_journal", &["journal"], "/checkout");
+    let (intent, binding) = journal_records_for_environment(
+        &project,
+        0,
+        reservation_id,
+        "stack-journal",
+        "web",
+        "ctr-journal-web",
+    );
+    (project, intent, binding)
+}
+
+fn journal_records_for_environment(
+    project: &ProjectState,
+    environment_index: usize,
+    reservation_id: &str,
+    stack_id: &str,
+    service_name: &str,
+    requested_container_id: &str,
+) -> (StackContainerCreateIntent, StackContainerGenerationBinding) {
+    let environment = &project.environments[environment_index];
+    let machine = &environment.machines[0];
+    let scope = vz_runtime_contract::ContainerGenerationScope {
+        reservation_id: reservation_id.to_string(),
+        project_id: project.definition.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        machine_id: machine.machine_id.clone(),
+        machine_incarnation_id: Some(machine.incarnation.as_ref().unwrap().incarnation_id.clone()),
+        stack_id: stack_id.to_string(),
+    };
+    let intent = StackContainerCreateIntent {
+        schema_version: StackContainerCreateIntent::SCHEMA_VERSION,
+        scope: scope.clone(),
+        environment_generation: environment.lifecycle_generation,
+        service_name: service_name.to_string(),
+        replica_index: 1,
+        service_generation: 1,
+        requested_container_id: requested_container_id.to_string(),
+        definition_digest: environment.definition_digest.clone(),
+        action_digest: "sha256:action-journal".to_string(),
+        status: StackContainerCreateStatus::Intent,
+        last_error: None,
+        created_at: 100,
+        updated_at: 100,
+        completed_at: None,
+    };
+    let binding = StackContainerGenerationBinding {
+        reservation_id: reservation_id.to_string(),
+        service_name: intent.service_name.clone(),
+        ownership: ContainerGenerationOwnership {
+            container_id: intent.requested_container_id.clone(),
+            generation: 7,
+            stack_id: scope.stack_id.clone(),
+            scope: Some(Box::new(scope)),
+        },
+        bound_at: 101,
+    };
+    (intent, binding)
+}
+
+fn overwrite_journal_fixture_environment(store: &StateStore, environment: &EnvironmentInstance) {
+    store
+        .conn
+        .execute(
+            "UPDATE environment_instances
+             SET state = ?1, instance_json = ?2, updated_at = ?3,
+                 lifecycle_generation = ?4, active_operation_id = ?5
+             WHERE environment_id = ?6",
+            params![
+                serde_json::to_string(&environment.state).unwrap(),
+                serde_json::to_string(environment).unwrap(),
+                environment.updated_at as i64,
+                environment.lifecycle_generation as i64,
+                environment
+                    .active_operation_id
+                    .as_ref()
+                    .map(|id| id.as_str()),
+                environment.environment_id.as_str(),
+            ],
+        )
+        .unwrap();
+    for machine in &environment.machines {
+        store
+            .conn
+            .execute(
+                "UPDATE machine_instances SET state = ?1, instance_json = ?2
+                 WHERE machine_id = ?3",
+                params![
+                    serde_json::to_string(&machine.state).unwrap(),
+                    serde_json::to_string(machine).unwrap(),
+                    machine.machine_id.as_str(),
+                ],
+            )
+            .unwrap();
+    }
+}
+
+fn selector_for_intent(intent: &StackContainerCreateIntent) -> StackContainerCreateSelector {
+    StackContainerCreateSelector {
+        project_id: intent.scope.project_id.clone(),
+        environment_id: intent.scope.environment_id.clone(),
+        machine_id: intent.scope.machine_id.clone(),
+        machine_incarnation_id: intent.scope.machine_incarnation_id.clone().unwrap(),
+        environment_generation: intent.environment_generation,
+        stack_id: intent.scope.stack_id.clone(),
+        service_name: intent.service_name.clone(),
+        replica_index: intent.replica_index,
+        requested_container_id: intent.requested_container_id.clone(),
+        definition_digest: intent.definition_digest.clone(),
+        action_digest: intent.action_digest.clone(),
+    }
+}
+
+fn workload_scope_for_journal_intent(
+    intent: &StackContainerCreateIntent,
+) -> vz_runtime_contract::MachineWorkloadScope {
+    vz_runtime_contract::MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: intent.scope.project_id.clone(),
+        environment_id: intent.scope.environment_id.clone(),
+        machine_id: intent.scope.machine_id.clone(),
+        machine_incarnation_id: intent.scope.machine_incarnation_id.clone().unwrap(),
+        stack_id: intent.scope.stack_id.clone(),
+    }
+}
+
+fn reserve_journal_owner(store: &StateStore, intent: &StackContainerCreateIntent) {
+    store
+        .reserve_stack_workload_owner(
+            &workload_scope_for_journal_intent(intent),
+            intent.created_at,
+        )
+        .unwrap();
+}
+
+fn reserve_selector_owner(store: &StateStore, selector: &StackContainerCreateSelector) {
+    store
+        .reserve_stack_workload_owner(
+            &vz_runtime_contract::MachineWorkloadScope {
+                schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+                project_id: selector.project_id.clone(),
+                environment_id: selector.environment_id.clone(),
+                machine_id: selector.machine_id.clone(),
+                machine_incarnation_id: selector.machine_incarnation_id.clone(),
+                stack_id: selector.stack_id.clone(),
+            },
+            0,
+        )
+        .unwrap();
+}
+
+#[test]
+fn v3_to_v4_stack_journal_migration_preserves_rows_without_backfilling_authority() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v3-to-v4.db");
+    let store = create_v3_store(&path);
+    let (project, _, binding) = journal_fixture("reservation-legacy-observed");
+    store.save_project_state(&project).unwrap();
+    let observed = ServiceObservedState {
+        service_name: "web".to_string(),
+        phase: ServicePhase::Running,
+        container_id: Some(binding.ownership.container_id.clone()),
+        failed_create_ownership: Some(binding.ownership),
+        last_error: None,
+        ready: true,
+    };
+    store
+        .conn
+        .execute(
+            "INSERT INTO observed_state (stack_name, service_name, state_json)
+             VALUES ('stack-journal', 'web', ?1)",
+            params![serde_json::to_string(&observed).unwrap()],
+        )
+        .unwrap();
+
+    store.migrate_stack_journal_v3_to_v4().unwrap();
+
+    assert_eq!(store.schema_version().unwrap(), 4);
+    assert_eq!(
+        store.load_project_state("prj_journal").unwrap(),
+        Some(project)
+    );
+    assert_eq!(
+        store.load_observed_state("stack-journal").unwrap(),
+        vec![observed]
+    );
+    assert!(
+        store
+            .load_observed_state_for_replica("stack-journal", "web", 0)
+            .unwrap()
+            .is_some(),
+        "legacy observed rows migrate into the replica-zero compatibility slot"
+    );
+    assert!(
+        store
+            .list_resumable_stack_container_creates()
+            .unwrap()
+            .is_empty()
+    );
+    let journal_rows: i64 = store
+        .conn
+        .query_row(
+            "SELECT
+                (SELECT COUNT(*) FROM stack_container_create_intents) +
+                (SELECT COUNT(*) FROM stack_container_generation_bindings)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        journal_rows, 0,
+        "legacy observed JSON must not mint authority"
+    );
+    let owner_rows: i64 = store
+        .conn
+        .query_row("SELECT COUNT(*) FROM stack_workload_owners", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert_eq!(
+        owner_rows, 0,
+        "legacy desired/observed rows must not mint stable stack ownership"
+    );
+}
+
+#[test]
+fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v3-to-v4-failpoint.db");
+    let store = create_v3_store(&path);
+    let (project, _, _) = journal_fixture("reservation-migrate");
+    store.save_project_state(&project).unwrap();
+    let before = application_schema_snapshot(&store.conn);
+
+    let error = store
+        .migrate_stack_journal_v3_to_v4_with_failpoint(
+            topology::StackJournalV4MigrationFailpoint::AfterJournalSchemaCreated,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("after journal schema creation"));
     assert_eq!(store.schema_version().unwrap(), 3);
+    assert_eq!(application_schema_snapshot(&store.conn), before);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 4);
+    assert_eq!(
+        reopened.load_project_state("prj_journal").unwrap(),
+        Some(project)
+    );
+}
+
+#[test]
+fn stack_workload_owner_reservation_is_exact_and_rejects_foreign_machine_scope() {
+    let store = StateStore::in_memory().unwrap();
+    let project = topology_project_state("prj_stack_owner", &["owner_a", "owner_b"], "/checkout");
+    let (first_intent, _) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-owner-a",
+        "global-stack-owner",
+        "web",
+        "ctr-owner-a",
+    );
+    let (foreign_intent, _) = journal_records_for_environment(
+        &project,
+        1,
+        "reservation-owner-b",
+        "global-stack-owner",
+        "web",
+        "ctr-owner-b",
+    );
+    store.save_project_state(&project).unwrap();
+    let first_scope = workload_scope_for_journal_intent(&first_intent);
+    let owner = store
+        .reserve_stack_workload_owner(&first_scope, 100)
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_stack_workload_owner(&first_scope, 999)
+            .unwrap(),
+        owner,
+        "exact replay returns the original immutable timestamp"
+    );
+    assert_eq!(
+        store.validate_stack_workload_owner(&first_scope).unwrap(),
+        owner
+    );
+    assert_eq!(
+        store
+            .load_stack_workload_owner("global-stack-owner")
+            .unwrap(),
+        Some(owner)
+    );
+
+    let error = store
+        .reserve_stack_workload_owner(&workload_scope_for_journal_intent(&foreign_intent), 101)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn stack_workload_owner_claim_rejects_unowned_legacy_namespace_atomically() {
+    let store = StateStore::in_memory().unwrap();
+    let project = topology_project_state("prj_stack_legacy", &["owner"], "/checkout");
+    let (intent, _) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-legacy-claim",
+        "legacy-global-stack",
+        "web",
+        "ctr-legacy-claim",
+    );
+    let scope = workload_scope_for_journal_intent(&intent);
+    store.save_project_state(&project).unwrap();
+    let mut legacy_spec = sample_spec();
+    legacy_spec.name = scope.stack_id.clone();
+    store
+        .save_desired_state(&scope.stack_id, &legacy_spec)
+        .unwrap();
+    let legacy_observed = ServiceObservedState {
+        service_name: "web".to_string(),
+        phase: ServicePhase::Running,
+        container_id: Some("legacy-container".to_string()),
+        failed_create_ownership: None,
+        last_error: None,
+        ready: true,
+    };
+    store
+        .save_observed_state(&scope.stack_id, &legacy_observed)
+        .unwrap();
+
+    let prospective = store
+        .validate_stack_workload_owner_claim(&scope)
+        .unwrap_err();
+    assert!(
+        prospective
+            .to_string()
+            .contains("explicit ownership migration")
+    );
+    let reserve = store.reserve_stack_workload_owner(&scope, 100).unwrap_err();
+    assert!(reserve.to_string().contains("explicit ownership migration"));
+    assert!(store.begin_stack_container_create(&intent).is_err());
+    assert!(
+        store
+            .resolve_or_begin_stack_container_create(&selector_for_intent(&intent), 100)
+            .is_err()
+    );
+    assert!(
+        store
+            .load_stack_workload_owner(&scope.stack_id)
+            .unwrap()
+            .is_none(),
+        "a rejected legacy namespace must remain unowned"
+    );
+    assert_eq!(
+        store
+            .load_desired_state(&scope.stack_id)
+            .unwrap()
+            .expect("legacy desired state remains")
+            .name,
+        scope.stack_id
+    );
+    assert_eq!(
+        store.load_observed_state(&scope.stack_id).unwrap(),
+        vec![legacy_observed]
+    );
+    assert!(
+        store
+            .load_stack_container_create_intent(&intent.scope.reservation_id)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn direct_stack_journal_admission_requires_preexisting_exact_owner() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-owner-required");
+    store.save_project_state(&project).unwrap();
+
+    assert!(store.begin_stack_container_create(&intent).is_err());
+    assert!(
+        store
+            .resolve_or_begin_stack_container_create(&selector_for_intent(&intent), 100)
+            .is_err()
+    );
+    assert!(
+        store
+            .load_stack_workload_owner(&intent.scope.stack_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_stack_container_create_intent(&intent.scope.reservation_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_observed_state(&intent.scope.stack_id)
+            .unwrap()
+            .is_empty()
+    );
+
+    reserve_journal_owner(&store, &intent);
+    assert_eq!(store.begin_stack_container_create(&intent).unwrap(), intent);
+}
+
+#[test]
+fn stack_workload_owner_survives_machine_incarnation_replacement() {
+    let store = StateStore::in_memory().unwrap();
+    let mut project = topology_project_state("prj_owner_replacement", &["owner"], "/checkout");
+    let (intent, _) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-owner-replacement",
+        "stable-stack-owner",
+        "web",
+        "ctr-owner",
+    );
+    store.save_project_state(&project).unwrap();
+    let old_scope = workload_scope_for_journal_intent(&intent);
+    let owner = store.reserve_stack_workload_owner(&old_scope, 100).unwrap();
+
+    let replacement = MachineIncarnationId::new("inc_owner_replacement").unwrap();
+    let environment = &mut project.environments[0];
+    let incarnation = environment.machines[0].incarnation.as_mut().unwrap();
+    incarnation.incarnation_id = replacement.clone();
+    incarnation.generation += 1;
+    let incarnation_ownership = environment
+        .ownership
+        .iter_mut()
+        .find(|record| record.resource_kind == OwnedResourceKind::Incarnation)
+        .unwrap();
+    let previous_incarnation_id = incarnation_ownership.resource_id.clone();
+    incarnation_ownership.resource_id = replacement.to_string();
+    store
+        .conn
+        .execute(
+            "UPDATE topology_ownership SET resource_id = ?1, record_json = ?2
+             WHERE resource_kind = ?3 AND resource_id = ?4",
+            params![
+                incarnation_ownership.resource_id,
+                serde_json::to_string(incarnation_ownership).unwrap(),
+                serde_json::to_string(&OwnedResourceKind::Incarnation).unwrap(),
+                previous_incarnation_id,
+            ],
+        )
+        .unwrap();
+    environment.updated_at += 1;
+    overwrite_journal_fixture_environment(&store, environment);
+
+    let replacement_scope = vz_runtime_contract::MachineWorkloadScope {
+        machine_incarnation_id: replacement,
+        ..old_scope.clone()
+    };
+    assert_eq!(
+        store
+            .reserve_stack_workload_owner(&replacement_scope, 200)
+            .unwrap(),
+        owner
+    );
+    assert_eq!(
+        store.validate_stack_workload_owner(&old_scope).unwrap(),
+        owner,
+        "stable-owner validation remains usable by exact historical cleanup"
+    );
+}
+
+#[test]
+fn stack_workload_owner_projection_drift_fails_closed() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-owner-corrupt");
+    store.save_project_state(&project).unwrap();
+    let scope = workload_scope_for_journal_intent(&intent);
+    store.reserve_stack_workload_owner(&scope, 100).unwrap();
+    store
+        .conn
+        .execute_batch("DROP TRIGGER stack_workload_owner_immutable")
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE stack_workload_owners SET project_id = 'prj_corrupt'
+             WHERE stack_id = ?1",
+            params![scope.stack_id],
+        )
+        .unwrap();
+    let error = store
+        .load_stack_workload_owner("stack-journal")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("projection"));
+    assert!(store.validate_stack_workload_owner(&scope).is_err());
+}
+
+#[test]
+fn stack_create_intent_exact_replay_and_active_collision_are_stable() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-a");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+
+    assert_eq!(store.begin_stack_container_create(&intent).unwrap(), intent);
+    assert_eq!(store.begin_stack_container_create(&intent).unwrap(), intent);
+    assert_eq!(
+        store.load_observed_state("stack-journal").unwrap(),
+        vec![ServiceObservedState {
+            service_name: "web".to_string(),
+            phase: ServicePhase::Creating,
+            container_id: None,
+            failed_create_ownership: None,
+            last_error: None,
+            ready: false,
+        }]
+    );
+
+    let mut collision = intent.clone();
+    collision.scope.reservation_id = "reservation-b".to_string();
+    collision.service_generation = 2;
+    let error = store.begin_stack_container_create(&collision).unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+    assert!(
+        store
+            .load_stack_container_create_intent("reservation-b")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn stack_create_intent_and_creating_observed_state_are_atomic_and_replay_checked() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-atomic-begin");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_journal_creating
+             BEFORE INSERT ON observed_state
+             WHEN NEW.stack_name = 'stack-journal'
+             BEGIN SELECT RAISE(ABORT, 'injected observed failure'); END;",
+        )
+        .unwrap();
+
+    assert!(store.begin_stack_container_create(&intent).is_err());
+    assert!(
+        store
+            .load_stack_container_create_intent("reservation-atomic-begin")
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_stack_workload_owner("stack-journal")
+            .unwrap()
+            .is_some(),
+        "failed journal insertion must not remove the pre-reserved stable owner"
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_journal_creating")
+        .unwrap();
+    store.begin_stack_container_create(&intent).unwrap();
+    store
+        .save_observed_state_for_replica(
+            "stack-journal",
+            intent.replica_index,
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Pending,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            },
+        )
+        .unwrap();
+    let error = store
+        .begin_stack_container_create(&intent)
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("observed state"));
+}
+
+#[test]
+fn stack_create_intent_rejects_foreign_project_and_stale_incarnation() {
+    for mutation in ["project", "incarnation"] {
+        let store = StateStore::in_memory().unwrap();
+        let (project, mut intent, _) = journal_fixture("reservation-invalid");
+        store.save_project_state(&project).unwrap();
+        match mutation {
+            "project" => {
+                intent.scope.project_id = ProjectId::new("prj_foreign").unwrap();
+            }
+            "incarnation" => {
+                intent.scope.machine_incarnation_id =
+                    Some(MachineIncarnationId::new("inc_replacement").unwrap());
+            }
+            _ => unreachable!(),
+        }
+        let error = store.begin_stack_container_create(&intent).unwrap_err();
+        assert!(matches!(
+            error,
+            StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                ..
+            }
+        ));
+        assert!(
+            store
+                .list_resumable_stack_container_creates()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stack_generation_binding_is_exact_immutable_and_resumable() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("reservation-bind");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+
+    assert_eq!(
+        store.bind_stack_container_generation(&binding).unwrap(),
+        binding
+    );
+    let mut retry = binding.clone();
+    retry.bound_at = 999;
+    assert_eq!(
+        store.bind_stack_container_generation(&retry).unwrap(),
+        binding
+    );
+    assert_eq!(
+        store.begin_stack_container_create(&intent).unwrap().status,
+        StackContainerCreateStatus::Reserved
+    );
+    let loaded = store
+        .load_stack_container_generation_binding("reservation-bind")
+        .unwrap();
+    assert_eq!(loaded, Some(binding.clone()));
+    let resumable = store.list_resumable_stack_container_creates().unwrap();
+    assert_eq!(resumable.len(), 1);
+    assert_eq!(resumable[0].1, Some(binding));
+
+    assert!(
+        store
+            .conn
+            .execute(
+                "UPDATE stack_container_generation_bindings
+                 SET runtime_generation = 8 WHERE reservation_id = 'reservation-bind'",
+                [],
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .conn
+            .execute(
+                "DELETE FROM stack_container_generation_bindings
+                 WHERE reservation_id = 'reservation-bind'",
+                [],
+            )
+            .is_err()
+    );
+}
+
+#[test]
+fn stack_generation_binding_uniqueness_is_scoped_to_machine_incarnation() {
+    let store = StateStore::in_memory().unwrap();
+    let project = topology_project_state(
+        "prj_binding_scope",
+        &["binding_a", "binding_b"],
+        "/checkout",
+    );
+    let (first_intent, first_binding) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-binding-a",
+        "stack-binding-a",
+        "web",
+        "same-container-id",
+    );
+    let (second_intent, second_binding) = journal_records_for_environment(
+        &project,
+        1,
+        "reservation-binding-b",
+        "stack-binding-b",
+        "web",
+        "same-container-id",
+    );
+    let (third_intent, third_binding) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-binding-c",
+        "stack-binding-c",
+        "worker",
+        "same-container-id",
+    );
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &first_intent);
+    reserve_journal_owner(&store, &second_intent);
+    reserve_journal_owner(&store, &third_intent);
+
+    store.begin_stack_container_create(&first_intent).unwrap();
+    store
+        .bind_stack_container_generation(&first_binding)
+        .unwrap();
+    store.begin_stack_container_create(&second_intent).unwrap();
+    store
+        .bind_stack_container_generation(&second_binding)
+        .expect("private Machine runtimes may issue the same container generation");
+
+    store.begin_stack_container_create(&third_intent).unwrap();
+    let error = store
+        .bind_stack_container_generation(&third_binding)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn stack_id_namespace_rejects_cross_machine_observed_state_aliases() {
+    let store = StateStore::in_memory().unwrap();
+    let project = topology_project_state(
+        "prj_stack_namespace",
+        &["namespace_a", "namespace_b"],
+        "/checkout",
+    );
+    let (first, _) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-namespace-a",
+        "topology-workload-id",
+        "web",
+        "ctr-a",
+    );
+    let (second, _) = journal_records_for_environment(
+        &project,
+        1,
+        "reservation-namespace-b",
+        "topology-workload-id",
+        "worker",
+        "ctr-b",
+    );
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &first);
+    store.begin_stack_container_create(&first).unwrap();
+
+    let error = store.begin_stack_container_create(&second).unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+    assert!(
+        store
+            .load_stack_container_create_intent("reservation-namespace-b")
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn stack_observed_state_is_replica_qualified_without_aliasing() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, first, _) = journal_fixture("reservation-replica-1");
+    let mut second = first.clone();
+    second.scope.reservation_id = "reservation-replica-2".to_string();
+    second.replica_index = 2;
+    second.requested_container_id = "ctr-journal-web-2".to_string();
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &first);
+    store.begin_stack_container_create(&first).unwrap();
+    store.begin_stack_container_create(&second).unwrap();
+
+    assert_eq!(store.load_observed_state("stack-journal").unwrap().len(), 2);
+    assert_eq!(
+        store
+            .load_observed_state_for_replica("stack-journal", "web", 1)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ServicePhase::Creating
+    );
+    store
+        .save_observed_state_for_replica(
+            "stack-journal",
+            2,
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Failed,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: Some("replica two only".to_string()),
+                ready: false,
+            },
+        )
+        .unwrap();
+    assert_eq!(
+        store
+            .load_observed_state_for_replica("stack-journal", "web", 1)
+            .unwrap()
+            .unwrap()
+            .phase,
+        ServicePhase::Creating
+    );
+}
+
+#[test]
+fn stack_selector_exact_replay_mismatch_and_terminal_generation_are_stable() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, fixture, mut selected_binding) = journal_fixture("ignored-selector-reservation");
+    store.save_project_state(&project).unwrap();
+    let selector = selector_for_intent(&fixture);
+    reserve_selector_owner(&store, &selector);
+    let (first, binding) = store
+        .resolve_or_begin_stack_container_create(&selector, 100)
+        .unwrap();
+    assert!(binding.is_none());
+    assert_eq!(first.service_generation, 1);
+    selected_binding.reservation_id = first.scope.reservation_id.clone();
+    selected_binding.ownership.scope = Some(Box::new(first.scope.clone()));
+    store
+        .bind_stack_container_generation(&selected_binding)
+        .unwrap();
+    let replay = store
+        .resolve_or_begin_stack_container_create(&selector, 999)
+        .unwrap();
+    assert_eq!(replay.0.scope.reservation_id, first.scope.reservation_id);
+    assert_eq!(replay.0.status, StackContainerCreateStatus::Reserved);
+    assert_eq!(replay.0.created_at, 100);
+    assert_eq!(replay.1, Some(selected_binding.clone()));
+    let mut mismatch = selector.clone();
+    mismatch.action_digest = "sha256:different-action".to_string();
+    assert!(
+        store
+            .resolve_or_begin_stack_container_create(&mismatch, 999)
+            .is_err()
+    );
+    store
+        .publish_stack_container_create_failure(
+            first.scope.reservation_id.as_str(),
+            "terminal before retry",
+            102,
+        )
+        .unwrap();
+    store
+        .publish_stack_container_cleanup_success(first.scope.reservation_id.as_str(), 103)
+        .unwrap();
+    let next_selector = selector;
+    let (next, next_binding) = store
+        .resolve_or_begin_stack_container_create(&next_selector, 104)
+        .unwrap();
+    assert!(next_binding.is_none());
+    assert_eq!(next.service_generation, 2);
+    assert_ne!(next.scope.reservation_id, first.scope.reservation_id);
+}
+
+#[test]
+fn stack_selector_is_concurrent_length_framed_and_overflow_checked() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("selector-concurrent.db");
+    let (project, fixture, _) = journal_fixture("ignored-concurrent");
+    let selector = selector_for_intent(&fixture);
+    let initial_store = StateStore::open(&path).unwrap();
+    initial_store.save_project_state(&project).unwrap();
+    reserve_selector_owner(&initial_store, &selector);
+    drop(initial_store);
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+    let handles = [100_u64, 999]
+        .into_iter()
+        .map(|now| {
+            let path = path.clone();
+            let selector = selector.clone();
+            let barrier = barrier.clone();
+            std::thread::spawn(move || {
+                let store = StateStore::open(&path).unwrap();
+                barrier.wait();
+                store
+                    .resolve_or_begin_stack_container_create(&selector, now)
+                    .unwrap()
+                    .0
+            })
+        })
+        .collect::<Vec<_>>();
+    let results = handles
+        .into_iter()
+        .map(|handle| handle.join().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        results[0].scope.reservation_id,
+        results[1].scope.reservation_id
+    );
+    assert_eq!(results[0].created_at, results[1].created_at);
+
+    let store_a = StateStore::in_memory().unwrap();
+    let store_b = StateStore::in_memory().unwrap();
+    store_a.save_project_state(&project).unwrap();
+    store_b.save_project_state(&project).unwrap();
+    let mut framed_a = selector.clone();
+    framed_a.stack_id = "ab".to_string();
+    framed_a.service_name = "c".to_string();
+    let mut framed_b = selector.clone();
+    framed_b.stack_id = "a".to_string();
+    framed_b.service_name = "bc".to_string();
+    reserve_selector_owner(&store_a, &framed_a);
+    reserve_selector_owner(&store_b, &framed_b);
+    let id_a = store_a
+        .resolve_or_begin_stack_container_create(&framed_a, 100)
+        .unwrap()
+        .0
+        .scope
+        .reservation_id;
+    let id_b = store_b
+        .resolve_or_begin_stack_container_create(&framed_b, 100)
+        .unwrap()
+        .0
+        .scope
+        .reservation_id;
+    assert_ne!(id_a, id_b);
+    assert!(id_a.starts_with("vzscr1-sha256:"));
+
+    let overflow_store = StateStore::in_memory().unwrap();
+    overflow_store.save_project_state(&project).unwrap();
+    let mut maximum = fixture;
+    maximum.scope.reservation_id = "reservation-max-generation".to_string();
+    maximum.service_generation = i64::MAX as u64;
+    reserve_journal_owner(&overflow_store, &maximum);
+    overflow_store
+        .begin_stack_container_create(&maximum)
+        .unwrap();
+    overflow_store
+        .publish_stack_container_create_failure(
+            maximum.scope.reservation_id.as_str(),
+            "terminal maximum",
+            101,
+        )
+        .unwrap();
+    assert!(
+        overflow_store
+            .resolve_or_begin_stack_container_create(&selector, 102)
+            .unwrap_err()
+            .to_string()
+            .contains("generation overflow")
+    );
+}
+
+#[test]
+fn stack_generation_binding_rejects_foreign_scope_without_partial_write() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, mut binding) = journal_fixture("reservation-foreign-bind");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    binding.ownership.scope.as_mut().unwrap().environment_id =
+        EnvironmentId::new("env_foreign").unwrap();
+
+    let error = store.bind_stack_container_generation(&binding).unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+    assert!(
+        store
+            .load_stack_container_generation_binding("reservation-foreign-bind")
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-foreign-bind")
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::Intent
+    );
+}
+
+#[test]
+fn stack_activation_replays_reject_stopped_or_reincarnated_machine_scope() {
+    for mutation in ["stopped", "reincarnated"] {
+        let store = StateStore::in_memory().unwrap();
+        let (mut project, intent, binding) =
+            journal_fixture(&format!("reservation-stale-{mutation}"));
+        store.save_project_state(&project).unwrap();
+        reserve_journal_owner(&store, &intent);
+        store.begin_stack_container_create(&intent).unwrap();
+        store.bind_stack_container_generation(&binding).unwrap();
+        let observed_before = store.load_observed_state("stack-journal").unwrap();
+
+        let environment = &mut project.environments[0];
+        environment.updated_at += 1;
+        match mutation {
+            "stopped" => {
+                environment.lifecycle_generation += 1;
+                environment.state = EnvironmentState::Stopped;
+                environment.machines[0].state = MachineState::Stopped;
+            }
+            "reincarnated" => {
+                let incarnation = environment.machines[0].incarnation.as_mut().unwrap();
+                incarnation.incarnation_id =
+                    MachineIncarnationId::new("inc_journal_replacement").unwrap();
+                incarnation.generation += 1;
+            }
+            _ => unreachable!(),
+        }
+        overwrite_journal_fixture_environment(&store, environment);
+
+        assert!(store.begin_stack_container_create(&intent).is_err());
+        assert!(store.bind_stack_container_generation(&binding).is_err());
+        assert!(store.list_resumable_stack_container_creates().is_err());
+        assert!(
+            store
+                .publish_stack_container_create_success(
+                    intent.scope.reservation_id.as_str(),
+                    true,
+                    102,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .publish_stack_container_create_failure(
+                    intent.scope.reservation_id.as_str(),
+                    "late stale failure",
+                    102,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.load_observed_state("stack-journal").unwrap(),
+            observed_before
+        );
+        assert_eq!(
+            store
+                .load_stack_container_create_intent(intent.scope.reservation_id.as_str())
+                .unwrap()
+                .unwrap()
+                .status,
+            StackContainerCreateStatus::Reserved
+        );
+        if mutation == "reincarnated" {
+            let stopping = store
+                .begin_stack_container_cleanup(intent.scope.reservation_id.as_str(), 103)
+                .expect("stale exact binding remains cleanup authority");
+            assert_eq!(stopping.phase, ServicePhase::Stopping);
+            assert_eq!(
+                stopping.failed_create_ownership,
+                Some(binding.ownership.clone())
+            );
+            store
+                .publish_stack_container_cleanup_success(intent.scope.reservation_id.as_str(), 104)
+                .unwrap();
+            assert_eq!(
+                store
+                    .load_stack_container_create_intent(intent.scope.reservation_id.as_str())
+                    .unwrap()
+                    .unwrap()
+                    .status,
+                StackContainerCreateStatus::Cleaned
+            );
+        }
+    }
+}
+
+#[test]
+fn stale_unbound_runtime_ownership_binds_cleanup_only_and_replays_exactly() {
+    let store = StateStore::in_memory().unwrap();
+    let (mut project, intent, binding) = journal_fixture("reservation-cleanup-only-bind");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+
+    let current_error = store
+        .bind_stack_container_generation_for_cleanup(&binding)
+        .unwrap_err();
+    assert!(current_error.to_string().contains("still current"));
+    assert!(
+        store
+            .load_stack_container_generation_binding(&binding.reservation_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let environment = &mut project.environments[0];
+    environment.updated_at += 1;
+    let incarnation = environment.machines[0].incarnation.as_mut().unwrap();
+    incarnation.incarnation_id = MachineIncarnationId::new("inc_cleanup_only_new").unwrap();
+    incarnation.generation += 1;
+    overwrite_journal_fixture_environment(&store, environment);
+
+    assert!(store.bind_stack_container_generation(&binding).is_err());
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_cleanup_only_observed
+             BEFORE UPDATE OF state_json ON observed_state
+             WHEN NEW.stack_name = 'stack-journal' AND NEW.state_json LIKE '%\"Stopping\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected cleanup-only failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .bind_stack_container_generation_for_cleanup(&binding)
+            .is_err()
+    );
+    assert!(
+        store
+            .load_stack_container_generation_binding(&binding.reservation_id)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(&binding.reservation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::Intent
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_cleanup_only_observed")
+        .unwrap();
+    assert_eq!(
+        store
+            .bind_stack_container_generation_for_cleanup(&binding)
+            .unwrap(),
+        binding
+    );
+    let pending = store
+        .load_stack_container_create_intent(&binding.reservation_id)
+        .unwrap()
+        .unwrap();
+    assert_eq!(pending.status, StackContainerCreateStatus::CleanupPending);
+    assert_eq!(pending.updated_at, binding.bound_at);
+    let observed = store
+        .load_observed_state_for_replica(
+            &intent.scope.stack_id,
+            &intent.service_name,
+            intent.replica_index,
+        )
+        .unwrap()
+        .unwrap();
+    assert_eq!(observed.phase, ServicePhase::Stopping);
+    assert_eq!(
+        observed.failed_create_ownership,
+        Some(binding.ownership.clone())
+    );
+
+    let mut retry = binding.clone();
+    retry.bound_at = 999;
+    assert_eq!(
+        store
+            .bind_stack_container_generation_for_cleanup(&retry)
+            .unwrap(),
+        binding
+    );
+    assert!(
+        store
+            .publish_stack_container_create_success(&binding.reservation_id, true, 1000)
+            .is_err()
+    );
+    assert!(
+        store
+            .publish_stack_container_create_failure(
+                &binding.reservation_id,
+                "late create failure",
+                1000,
+            )
+            .is_err()
+    );
+
+    store
+        .publish_stack_container_cleanup_success(&binding.reservation_id, 102)
+        .unwrap();
+    assert!(
+        store
+            .require_no_nonterminal_stack_container_creates("env_journal")
+            .is_ok()
+    );
+}
+
+#[test]
+fn blocked_unbound_runtime_ownership_can_bind_only_for_cleanup() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, mut binding) = journal_fixture("reservation-blocked-cleanup-bind");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store
+        .publish_stack_container_blocked(
+            &intent.scope.reservation_id,
+            "runtime outcome requires operator cleanup",
+            102,
+        )
+        .unwrap();
+    binding.bound_at = 103;
+
+    assert_eq!(
+        store
+            .bind_stack_container_generation_for_cleanup(&binding)
+            .unwrap(),
+        binding
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent(&binding.reservation_id)
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::CleanupPending
+    );
+    assert!(store.bind_stack_container_generation(&binding).is_err());
+    store
+        .publish_stack_container_cleanup_success(&binding.reservation_id, 104)
+        .unwrap();
+}
+
+#[test]
+fn blocked_journal_recovery_rejects_every_observed_authority_tamper() {
+    for bound in [false, true] {
+        for field in ["name", "container", "ownership", "error", "ready"] {
+            let store = StateStore::in_memory().unwrap();
+            let reservation = format!("reservation-blocked-tamper-{bound}-{field}");
+            let (project, mut intent, mut binding) = journal_fixture(&reservation);
+            intent.replica_index = 2;
+            intent.requested_container_id = format!("ctr-blocked-tamper-{bound}-{field}");
+            binding.ownership.container_id = intent.requested_container_id.clone();
+            store.save_project_state(&project).unwrap();
+            reserve_journal_owner(&store, &intent);
+            store.begin_stack_container_create(&intent).unwrap();
+            if bound {
+                store.bind_stack_container_generation(&binding).unwrap();
+            }
+            let mut observed = store
+                .publish_stack_container_blocked(
+                    &intent.scope.reservation_id,
+                    "runtime ownership is uncertain",
+                    102,
+                )
+                .unwrap();
+            match field {
+                "name" => observed.service_name = "web-foreign-replica".to_string(),
+                "container" => {
+                    observed.container_id = if bound {
+                        Some("foreign-container".to_string())
+                    } else {
+                        Some(intent.requested_container_id.clone())
+                    };
+                }
+                "ownership" => {
+                    let mut foreign = binding.ownership.clone();
+                    foreign.generation += 1;
+                    observed.failed_create_ownership = Some(foreign);
+                }
+                "error" => observed.last_error = Some("different error".to_string()),
+                "ready" => observed.ready = true,
+                _ => unreachable!(),
+            }
+            store
+                .conn
+                .execute(
+                    "UPDATE observed_state SET state_json = ?1
+                     WHERE stack_name = ?2 AND service_name = ?3 AND replica_index = ?4",
+                    params![
+                        serde_json::to_string(&observed).unwrap(),
+                        intent.scope.stack_id,
+                        intent.service_name,
+                        intent.replica_index,
+                    ],
+                )
+                .unwrap();
+
+            assert!(
+                store
+                    .list_stack_container_recovery_records()
+                    .unwrap_err()
+                    .to_string()
+                    .contains("observed state"),
+                "bound={bound} field={field} must fail recovery closed"
+            );
+            assert!(
+                store
+                    .publish_stack_container_blocked(
+                        &intent.scope.reservation_id,
+                        "runtime ownership is uncertain",
+                        999,
+                    )
+                    .is_err(),
+                "bound={bound} field={field} must fail exact replay"
+            );
+            if bound {
+                assert!(
+                    store
+                        .begin_stack_container_cleanup(&intent.scope.reservation_id, 999)
+                        .is_err()
+                );
+            } else {
+                assert!(
+                    store
+                        .abandon_stale_stack_container_create(
+                            &intent.scope.reservation_id,
+                            "abandon corrupted blocked intent",
+                            999,
+                        )
+                        .is_err()
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn stack_new_admission_requires_ready_environment_and_machine() {
+    let environment_states = [
+        EnvironmentState::Reconciling,
+        EnvironmentState::Stopped,
+        EnvironmentState::Deleting,
+    ];
+    for state in environment_states {
+        let store = StateStore::in_memory().unwrap();
+        let (mut project, mut intent, _) =
+            journal_fixture(&format!("reservation-environment-{state:?}"));
+        if matches!(
+            state,
+            EnvironmentState::Reconciling | EnvironmentState::Deleting
+        ) {
+            project.environments[0].lifecycle_generation = 1;
+            intent.environment_generation = 1;
+        }
+        store.save_project_state(&project).unwrap();
+        let environment = &mut project.environments[0];
+        environment.state = state;
+        if matches!(
+            state,
+            EnvironmentState::Reconciling | EnvironmentState::Deleting
+        ) {
+            environment.active_operation_id = Some(LifecycleOperationId::generate());
+        }
+        if state == EnvironmentState::Stopped {
+            environment.machines[0].state = MachineState::Stopped;
+        }
+        environment.updated_at += 1;
+        overwrite_journal_fixture_environment(&store, environment);
+
+        let error = store.begin_stack_container_create(&intent).unwrap_err();
+        assert!(error.to_string().contains("Environment"));
+        assert!(error.to_string().contains("not runnable"));
+        assert!(
+            store
+                .resolve_or_begin_stack_container_create(&selector_for_intent(&intent), 101)
+                .is_err()
+        );
+        assert!(
+            store
+                .load_stack_container_create_intent(intent.scope.reservation_id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_observed_state("stack-journal")
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    for state in [
+        MachineState::Creating,
+        MachineState::Stopped,
+        MachineState::Failed,
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let (mut project, intent, _) = journal_fixture(&format!("reservation-machine-{state:?}"));
+        store.save_project_state(&project).unwrap();
+        let environment = &mut project.environments[0];
+        environment.machines[0].state = state;
+        environment.updated_at += 1;
+        overwrite_journal_fixture_environment(&store, environment);
+
+        let error = store.begin_stack_container_create(&intent).unwrap_err();
+        assert!(
+            error.to_string().contains("Machine")
+                || error.to_string().contains("Ready requires every Machine")
+        );
+        assert!(
+            store
+                .resolve_or_begin_stack_container_create(&selector_for_intent(&intent), 101)
+                .is_err()
+        );
+        assert!(
+            store
+                .load_stack_container_create_intent(intent.scope.reservation_id.as_str())
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            store
+                .load_observed_state("stack-journal")
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn stack_activation_rejects_non_runnable_current_generation_but_cleanup_remains_possible() {
+    for mode in [
+        "environment_deleting",
+        "environment_stopped",
+        "machine_stopped",
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let (mut project, mut intent, binding) =
+            journal_fixture(&format!("reservation-current-state-{mode}"));
+        if mode == "environment_deleting" {
+            project.environments[0].lifecycle_generation = 1;
+            intent.environment_generation = 1;
+        }
+        store.save_project_state(&project).unwrap();
+        reserve_journal_owner(&store, &intent);
+        store.begin_stack_container_create(&intent).unwrap();
+        store.bind_stack_container_generation(&binding).unwrap();
+        let observed_before = store.load_observed_state("stack-journal").unwrap();
+
+        let environment = &mut project.environments[0];
+        environment.updated_at += 1;
+        match mode {
+            "environment_deleting" => {
+                environment.state = EnvironmentState::Deleting;
+                environment.active_operation_id = Some(LifecycleOperationId::generate());
+            }
+            "environment_stopped" => {
+                environment.state = EnvironmentState::Stopped;
+                environment.machines[0].state = MachineState::Stopped;
+            }
+            "machine_stopped" => environment.machines[0].state = MachineState::Stopped,
+            _ => unreachable!(),
+        }
+        // Keep the definition, lifecycle generation, and Machine incarnation exact:
+        // lifecycle state alone must fence activation and replay.
+        overwrite_journal_fixture_environment(&store, environment);
+
+        assert!(store.begin_stack_container_create(&intent).is_err());
+        assert!(store.bind_stack_container_generation(&binding).is_err());
+        assert!(store.list_resumable_stack_container_creates().is_err());
+        assert!(
+            store
+                .publish_stack_container_create_success(
+                    intent.scope.reservation_id.as_str(),
+                    true,
+                    102,
+                )
+                .is_err()
+        );
+        assert!(
+            store
+                .publish_stack_container_create_failure(
+                    intent.scope.reservation_id.as_str(),
+                    "late failure from non-runnable topology",
+                    102,
+                )
+                .is_err()
+        );
+        assert_eq!(
+            store.load_observed_state("stack-journal").unwrap(),
+            observed_before
+        );
+
+        let recovery = store.list_stack_container_recovery_records().unwrap();
+        assert_eq!(recovery.len(), 1);
+        assert!(matches!(
+            recovery[0].disposition,
+            StackContainerRecoveryDisposition::CleanupOnly { .. }
+        ));
+        store
+            .begin_stack_container_cleanup(intent.scope.reservation_id.as_str(), 103)
+            .unwrap();
+        store
+            .publish_stack_container_cleanup_success(intent.scope.reservation_id.as_str(), 104)
+            .unwrap();
+        assert!(
+            store
+                .require_no_nonterminal_stack_container_creates("env_journal")
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn stale_recovery_discovery_survives_reopen_for_cleanup_and_abandonment() {
+    for bound in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp
+            .path()
+            .join(if bound { "bound.db" } else { "intent.db" });
+        let reservation = if bound {
+            "reservation-reopen-bound"
+        } else {
+            "reservation-reopen-intent"
+        };
+        let (mut project, intent, binding) = journal_fixture(reservation);
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.save_project_state(&project).unwrap();
+            reserve_journal_owner(&store, &intent);
+            store.begin_stack_container_create(&intent).unwrap();
+            if bound {
+                store.bind_stack_container_generation(&binding).unwrap();
+            }
+            let environment = &mut project.environments[0];
+            environment.updated_at += 1;
+            let incarnation = environment.machines[0].incarnation.as_mut().unwrap();
+            incarnation.incarnation_id =
+                MachineIncarnationId::new(format!("inc_reopen_{bound}")).unwrap();
+            incarnation.generation += 1;
+            overwrite_journal_fixture_environment(&store, environment);
+        }
+
+        let reopened = StateStore::open(&path).unwrap();
+        let recovery = reopened.list_stack_container_recovery_records().unwrap();
+        assert_eq!(recovery.len(), 1);
+        if bound {
+            assert!(matches!(
+                recovery[0].disposition,
+                StackContainerRecoveryDisposition::CleanupOnly { .. }
+            ));
+            reopened
+                .begin_stack_container_cleanup(reservation, 103)
+                .unwrap();
+            reopened
+                .publish_stack_container_cleanup_success(reservation, 104)
+                .unwrap();
+        } else {
+            assert!(matches!(
+                recovery[0].disposition,
+                StackContainerRecoveryDisposition::Abandonable { .. }
+            ));
+            let abandoned = reopened
+                .abandon_stale_stack_container_create(reservation, "stale intent", 103)
+                .unwrap();
+            assert_eq!(abandoned.phase, ServicePhase::Failed);
+            assert_eq!(
+                reopened
+                    .abandon_stale_stack_container_create(reservation, "stale intent", 999)
+                    .unwrap(),
+                abandoned
+            );
+        }
+        assert!(
+            reopened
+                .require_no_nonterminal_stack_container_creates("env_journal")
+                .is_ok()
+        );
+        assert!(
+            reopened
+                .list_stack_container_recovery_records()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn blocked_recovery_is_executable_after_reopen_and_clears_deletion_fence() {
+    for bound in [false, true] {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join(if bound {
+            "blocked-bound.db"
+        } else {
+            "blocked-unbound.db"
+        });
+        let reservation = if bound {
+            "reservation-blocked-bound"
+        } else {
+            "reservation-blocked-unbound"
+        };
+        let (mut project, intent, binding) = journal_fixture(reservation);
+        {
+            let store = StateStore::open(&path).unwrap();
+            store.save_project_state(&project).unwrap();
+            reserve_journal_owner(&store, &intent);
+            store.begin_stack_container_create(&intent).unwrap();
+            if bound {
+                store.bind_stack_container_generation(&binding).unwrap();
+            }
+            store
+                .publish_stack_container_blocked(reservation, "recovery cannot adopt", 102)
+                .unwrap();
+            if !bound {
+                let environment = &mut project.environments[0];
+                environment.state = EnvironmentState::Deleting;
+                environment.updated_at += 1;
+                overwrite_journal_fixture_environment(&store, environment);
+            }
+        }
+
+        let reopened = StateStore::open(&path).unwrap();
+        assert!(
+            reopened
+                .require_no_nonterminal_stack_container_creates("env_journal")
+                .is_err()
+        );
+        let recovery = reopened.list_stack_container_recovery_records().unwrap();
+        assert_eq!(recovery.len(), 1);
+        if bound {
+            assert!(matches!(
+                recovery[0].disposition,
+                StackContainerRecoveryDisposition::CleanupOnly { .. }
+            ));
+            let stopping = reopened
+                .begin_stack_container_cleanup(reservation, 103)
+                .unwrap();
+            assert_eq!(stopping.phase, ServicePhase::Stopping);
+            assert_eq!(stopping.failed_create_ownership, Some(binding.ownership));
+            reopened
+                .publish_stack_container_cleanup_success(reservation, 104)
+                .unwrap();
+        } else {
+            assert!(matches!(
+                recovery[0].disposition,
+                StackContainerRecoveryDisposition::Abandonable { .. }
+            ));
+            let abandoned = reopened
+                .abandon_stale_stack_container_create(
+                    reservation,
+                    "blocked without runtime ownership",
+                    103,
+                )
+                .unwrap();
+            assert_eq!(abandoned.phase, ServicePhase::Failed);
+            assert!(abandoned.failed_create_ownership.is_none());
+            assert_eq!(
+                reopened
+                    .abandon_stale_stack_container_create(
+                        reservation,
+                        "blocked without runtime ownership",
+                        999,
+                    )
+                    .unwrap(),
+                abandoned
+            );
+        }
+        assert!(
+            reopened
+                .require_no_nonterminal_stack_container_creates("env_journal")
+                .is_ok()
+        );
+        assert!(
+            reopened
+                .list_stack_container_recovery_records()
+                .unwrap()
+                .is_empty()
+        );
+    }
+}
+
+#[test]
+fn machine_workload_recovery_discovers_old_incarnations_without_sibling_leakage() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("machine-workload-recovery.db");
+    let mut project =
+        topology_project_state("prj_recovery_history", &["journal", "sibling"], "/checkout");
+    let (old_bound, binding) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-old-bound",
+        "stack-incarnation-stable",
+        "web",
+        "ctr-old-web",
+    );
+    let (old_unbound, _) = journal_records_for_environment(
+        &project,
+        0,
+        "reservation-old-unbound",
+        "stack-incarnation-stable",
+        "worker",
+        "ctr-old-worker",
+    );
+    let (sibling, _) = journal_records_for_environment(
+        &project,
+        1,
+        "reservation-sibling",
+        "stack-sibling",
+        "web",
+        "ctr-sibling-web",
+    );
+    let current_incarnation = MachineIncarnationId::new("inc_journal_reopened").unwrap();
+    {
+        let store = StateStore::open(&path).unwrap();
+        store.save_project_state(&project).unwrap();
+        reserve_journal_owner(&store, &old_bound);
+        reserve_journal_owner(&store, &sibling);
+        store.begin_stack_container_create(&old_bound).unwrap();
+        store.bind_stack_container_generation(&binding).unwrap();
+        store.begin_stack_container_create(&old_unbound).unwrap();
+        store.begin_stack_container_create(&sibling).unwrap();
+
+        let environment = &mut project.environments[0];
+        let incarnation = environment.machines[0].incarnation.as_mut().unwrap();
+        incarnation.incarnation_id = current_incarnation.clone();
+        incarnation.generation += 1;
+        let incarnation_ownership = environment
+            .ownership
+            .iter_mut()
+            .find(|record| record.resource_kind == OwnedResourceKind::Incarnation)
+            .unwrap();
+        let previous_incarnation_id = incarnation_ownership.resource_id.clone();
+        incarnation_ownership.resource_id = current_incarnation.to_string();
+        store
+            .conn
+            .execute(
+                "UPDATE topology_ownership SET resource_id = ?1, record_json = ?2
+                 WHERE resource_kind = ?3 AND resource_id = ?4",
+                params![
+                    incarnation_ownership.resource_id,
+                    serde_json::to_string(incarnation_ownership).unwrap(),
+                    serde_json::to_string(&OwnedResourceKind::Incarnation).unwrap(),
+                    previous_incarnation_id,
+                ],
+            )
+            .unwrap();
+        environment.updated_at += 1;
+        overwrite_journal_fixture_environment(&store, environment);
+    }
+
+    let reopened = StateStore::open(&path).unwrap();
+    let scope = vz_runtime_contract::MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: old_bound.scope.project_id.clone(),
+        environment_id: old_bound.scope.environment_id.clone(),
+        machine_id: old_bound.scope.machine_id.clone(),
+        machine_incarnation_id: current_incarnation.clone(),
+        stack_id: old_bound.scope.stack_id.clone(),
+    };
+    let recovery = reopened
+        .list_stack_container_recovery_records_for_machine_workload(&scope)
+        .unwrap();
+    assert_eq!(recovery.len(), 2);
+    assert_eq!(
+        recovery
+            .iter()
+            .map(|record| record.intent.scope.reservation_id.as_str())
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["reservation-old-bound", "reservation-old-unbound",])
+    );
+    assert!(recovery.iter().any(|record| {
+        record.intent.scope.reservation_id == "reservation-old-bound"
+            && matches!(
+                record.disposition,
+                StackContainerRecoveryDisposition::CleanupOnly { .. }
+            )
+    }));
+    assert!(recovery.iter().any(|record| {
+        record.intent.scope.reservation_id == "reservation-old-unbound"
+            && matches!(
+                record.disposition,
+                StackContainerRecoveryDisposition::Abandonable { .. }
+            )
+    }));
+    assert_eq!(
+        reopened
+            .list_stack_container_recovery_records_for_machine_workload(
+                &vz_runtime_contract::MachineWorkloadScope {
+                    schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+                    project_id: sibling.scope.project_id.clone(),
+                    environment_id: sibling.scope.environment_id.clone(),
+                    machine_id: sibling.scope.machine_id.clone(),
+                    machine_incarnation_id: sibling.scope.machine_incarnation_id.clone().unwrap(),
+                    stack_id: sibling.scope.stack_id.clone(),
+                },
+            )
+            .unwrap()
+            .len(),
+        1
+    );
+
+    reopened
+        .begin_stack_container_cleanup("reservation-old-bound", 103)
+        .unwrap();
+    reopened
+        .publish_stack_container_cleanup_success("reservation-old-bound", 104)
+        .unwrap();
+    reopened
+        .abandon_stale_stack_container_create(
+            "reservation-old-unbound",
+            "old incarnation has no runtime ownership",
+            103,
+        )
+        .unwrap();
+    assert!(
+        reopened
+            .require_no_nonterminal_stack_container_creates("env_journal")
+            .is_ok()
+    );
+
+    let mut next_selector = selector_for_intent(&old_bound);
+    next_selector.machine_incarnation_id = current_incarnation;
+    let (next, next_binding) = reopened
+        .resolve_or_begin_stack_container_create(&next_selector, 105)
+        .unwrap();
+    assert!(next_binding.is_none());
+    assert_eq!(next.service_generation, 2);
+    assert_ne!(
+        next.scope.machine_incarnation_id,
+        old_bound.scope.machine_incarnation_id
+    );
+}
+
+#[test]
+fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
+    let store = StateStore::in_memory().unwrap();
+    store
+        .conn
+        .execute_batch(
+            "DROP TRIGGER stack_container_create_stack_scope_guard;
+             CREATE TRIGGER stack_container_create_stack_scope_guard
+             BEFORE INSERT ON stack_container_create_intents
+             WHEN EXISTS (
+                 SELECT 1 FROM stack_container_create_intents existing
+                 WHERE existing.stack_id = NEW.stack_id
+                   AND existing.machine_incarnation_id <> NEW.machine_incarnation_id
+             )
+             BEGIN
+                 SELECT RAISE(ABORT, 'legacy incarnation-scoped stack guard');
+             END;
+             DROP INDEX idx_stack_create_one_active_service;
+             CREATE UNIQUE INDEX idx_stack_create_one_active_service
+             ON stack_container_create_intents(
+                 machine_incarnation_id, stack_id, service_name, replica_index
+             ) WHERE status IN ('intent', 'reserved', 'running', 'cleanup_pending', 'blocked');",
+        )
+        .unwrap();
+
+    store.create_stack_journal_schema_v4().unwrap();
+    let trigger_sql: String = store
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'trigger' AND name = 'stack_container_create_stack_scope_guard'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!trigger_sql.contains("machine_incarnation_id"));
+    let index_sql: String = store
+        .conn
+        .query_row(
+            "SELECT sql FROM sqlite_master
+             WHERE type = 'index' AND name = 'idx_stack_create_one_active_service'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(index_sql.contains("project_id"));
+    assert!(!index_sql.contains("machine_incarnation_id"));
+    store.validate_v4_schema().unwrap();
+}
+
+#[test]
+fn stack_create_success_publishes_binding_and_observed_state_atomically() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("reservation-success");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+
+    let failed = store
+        .publish_stack_container_create_success("reservation-success", true, 99)
+        .unwrap_err();
+    assert!(failed.to_string().contains("updated_at precedes"));
+    assert!(
+        store
+            .load_observed_state("stack-journal")
+            .unwrap()
+            .iter()
+            .all(|state| state.phase == ServicePhase::Creating)
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-success")
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::Reserved
+    );
+
+    let observed = store
+        .publish_stack_container_create_success("reservation-success", true, 102)
+        .unwrap();
+    assert_eq!(observed.phase, ServicePhase::Running);
+    assert_eq!(observed.failed_create_ownership, Some(binding.ownership));
+    assert_eq!(
+        store.load_observed_state("stack-journal").unwrap(),
+        vec![observed]
+    );
+    assert_eq!(
+        store
+            .list_resumable_stack_container_creates()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    let journal_before = store
+        .load_stack_container_create_intent("reservation-success")
+        .unwrap()
+        .unwrap();
+    let observed_before = store.load_observed_state("stack-journal").unwrap();
+    assert!(
+        store
+            .publish_stack_container_create_failure(
+                "reservation-success",
+                "delayed create error",
+                103,
+            )
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-success")
+            .unwrap(),
+        Some(journal_before)
+    );
+    assert_eq!(
+        store.load_observed_state("stack-journal").unwrap(),
+        observed_before
+    );
+}
+
+#[test]
+fn stack_create_failure_atomically_retains_bound_cleanup_authority() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("reservation-failure");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+
+    let observed = store
+        .publish_stack_container_create_failure("reservation-failure", "setup failed", 102)
+        .unwrap();
+    assert_eq!(observed.phase, ServicePhase::Failed);
+    assert_eq!(observed.failed_create_ownership, Some(binding.ownership));
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-failure")
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::CleanupPending
+    );
+}
+
+#[test]
+fn stack_cleanup_transitions_are_atomic_replayable_and_clear_the_fence() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("reservation-cleanup");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+    store
+        .publish_stack_container_create_success("reservation-cleanup", true, 102)
+        .unwrap();
+    assert!(
+        store
+            .require_no_nonterminal_stack_container_creates("env_journal")
+            .is_err()
+    );
+
+    let stopping = store
+        .begin_stack_container_cleanup("reservation-cleanup", 103)
+        .unwrap();
+    assert_eq!(stopping.phase, ServicePhase::Stopping);
+    assert_eq!(
+        store
+            .begin_stack_container_cleanup("reservation-cleanup", 999)
+            .unwrap(),
+        stopping
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-cleanup")
+            .unwrap()
+            .unwrap()
+            .updated_at,
+        103
+    );
+
+    store
+        .conn
+        .execute_batch(
+            "CREATE TRIGGER reject_journal_stopped
+             BEFORE UPDATE OF state_json ON observed_state
+             WHEN NEW.stack_name = 'stack-journal' AND NEW.state_json LIKE '%\"Stopped\"%'
+             BEGIN SELECT RAISE(ABORT, 'injected stopped failure'); END;",
+        )
+        .unwrap();
+    assert!(
+        store
+            .publish_stack_container_cleanup_success("reservation-cleanup", 104)
+            .is_err()
+    );
+    assert_eq!(
+        store
+            .load_stack_container_create_intent("reservation-cleanup")
+            .unwrap()
+            .unwrap()
+            .status,
+        StackContainerCreateStatus::CleanupPending
+    );
+    store
+        .conn
+        .execute_batch("DROP TRIGGER reject_journal_stopped")
+        .unwrap();
+
+    let stopped = store
+        .publish_stack_container_cleanup_success("reservation-cleanup", 104)
+        .unwrap();
+    assert_eq!(stopped.phase, ServicePhase::Stopped);
+    assert_eq!(
+        store
+            .publish_stack_container_cleanup_success("reservation-cleanup", 999)
+            .unwrap(),
+        stopped
+    );
+    let cleaned = store
+        .load_stack_container_create_intent("reservation-cleanup")
+        .unwrap()
+        .unwrap();
+    assert_eq!(cleaned.status, StackContainerCreateStatus::Cleaned);
+    assert_eq!(cleaned.updated_at, 104);
+    assert!(
+        store
+            .require_no_nonterminal_stack_container_creates("env_journal")
+            .is_ok()
+    );
+
+    store
+        .save_observed_state_for_replica(
+            "stack-journal",
+            intent.replica_index,
+            &ServiceObservedState {
+                service_name: "web".to_string(),
+                phase: ServicePhase::Pending,
+                container_id: None,
+                failed_create_ownership: None,
+                last_error: None,
+                ready: false,
+            },
+        )
+        .unwrap();
+    assert!(store.begin_stack_container_create(&intent).is_err());
+    assert!(
+        store
+            .publish_stack_container_cleanup_success("reservation-cleanup", 999)
+            .is_err()
+    );
+}
+
+#[test]
+fn malformed_stack_intent_projection_fails_closed() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-malformed");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    let mut json = serde_json::to_value(&intent).unwrap();
+    json["service_name"] = serde_json::Value::String("different".to_string());
+    store
+        .conn
+        .execute(
+            "UPDATE stack_container_create_intents SET intent_json = ?1
+             WHERE reservation_id = 'reservation-malformed'",
+            params![serde_json::to_string(&json).unwrap()],
+        )
+        .unwrap();
+
+    let error = store
+        .load_stack_container_create_intent("reservation-malformed")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("mismatched `service_name` projection"));
+}
+
+#[test]
+fn malformed_stack_binding_projection_fails_closed() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, binding) = journal_fixture("reservation-malformed-binding");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store.bind_stack_container_generation(&binding).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "DROP TRIGGER stack_container_generation_binding_immutable;
+             UPDATE stack_container_generation_bindings
+             SET project_id = 'prj_foreign'
+             WHERE reservation_id = 'reservation-malformed-binding';",
+        )
+        .unwrap();
+
+    let error = store
+        .load_stack_container_generation_binding("reservation-malformed-binding")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("mismatched `project_id` projection"));
+}
+
+#[test]
+fn malformed_stack_journal_projection_cannot_bypass_environment_delete_fence() {
+    let store = StateStore::in_memory().unwrap();
+    let (project, intent, _) = journal_fixture("reservation-malformed-fence");
+    store.save_project_state(&project).unwrap();
+    reserve_journal_owner(&store, &intent);
+    store.begin_stack_container_create(&intent).unwrap();
+    store
+        .conn
+        .execute_batch(
+            "DROP TRIGGER stack_container_create_intent_immutable;
+             UPDATE stack_container_create_intents
+             SET environment_id = 'env_foreign', status = 'failed', completed_at = updated_at
+             WHERE reservation_id = 'reservation-malformed-fence';",
+        )
+        .unwrap();
+
+    let error = store
+        .require_no_nonterminal_stack_container_creates("env_journal")
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("mismatched `environment_id` projection"));
 }
 
 /// Serialize and deserialize a checkpoint through the state store,

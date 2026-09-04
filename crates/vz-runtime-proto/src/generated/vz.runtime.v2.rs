@@ -2151,6 +2151,28 @@ pub struct StreamEventsRequest {
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<RequestMetadata>,
 }
+/// Authoritative identity for a stack workload on one persisted Machine.
+///
+/// Servers validate every identifier against persisted topology before using the
+/// scope to select or mutate a stack. An empty or missing
+/// machine_incarnation_id is invalid for authoritative mutation. The
+/// schema_version makes future scope evolution explicit; clients must not
+/// synthesize missing identity fields.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineWorkloadScope {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub machine_incarnation_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub stack_id: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ApplyStackRequest {
     #[prost(message, optional, tag = "1")]
@@ -2165,6 +2187,8 @@ pub struct ApplyStackRequest {
     pub dry_run: bool,
     #[prost(bool, tag = "6")]
     pub detach: bool,
+    #[prost(message, optional, tag = "7")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StackServiceStatus {
@@ -2239,6 +2263,8 @@ pub struct TeardownStackRequest {
     pub dry_run: bool,
     #[prost(bool, tag = "4")]
     pub remove_volumes: bool,
+    #[prost(message, optional, tag = "5")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TeardownStackResponse {
@@ -2283,6 +2309,8 @@ pub struct GetStackStatusRequest {
     pub metadata: ::core::option::Option<RequestMetadata>,
     #[prost(string, tag = "2")]
     pub stack_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetStackStatusResponse {
@@ -2303,6 +2331,8 @@ pub struct ListStackEventsRequest {
     pub after: i64,
     #[prost(uint32, tag = "4")]
     pub limit: u32,
+    #[prost(message, optional, tag = "5")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ListStackEventsResponse {
@@ -2323,6 +2353,8 @@ pub struct GetStackLogsRequest {
     pub service: ::prost::alloc::string::String,
     #[prost(uint32, tag = "4")]
     pub tail: u32,
+    #[prost(message, optional, tag = "5")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StackServiceLog {
@@ -2348,6 +2380,8 @@ pub struct StackServiceActionRequest {
     pub stack_name: ::prost::alloc::string::String,
     #[prost(string, tag = "3")]
     pub service_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "4")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StackServiceActionResponse {
@@ -2394,6 +2428,8 @@ pub struct StackRunContainerRequest {
     pub service_name: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub run_service_name: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub scope: ::core::option::Option<MachineWorkloadScope>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StackRunContainerResponse {

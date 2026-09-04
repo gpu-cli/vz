@@ -131,8 +131,74 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         spec: &StackSpec,
         actions: &[Action],
     ) -> Result<ExecutionResult, StackError> {
+        self.execute_internal(spec, actions, None)
+    }
+
+    /// Execute a persisted action batch with stable operation identity.
+    pub fn execute_with_operation(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        operation_id: &str,
+        first_action_index: usize,
+    ) -> Result<ExecutionResult, StackError> {
+        if operation_id.trim().is_empty() {
+            return Err(StackError::InvalidSpec(
+                "scoped stack execution requires a non-empty operation_id".to_string(),
+            ));
+        }
+        self.execute_internal(spec, actions, Some((operation_id, first_action_index)))
+    }
+
+    fn execute_internal(
+        &mut self,
+        spec: &StackSpec,
+        actions: &[Action],
+        batch: Option<(&str, usize)>,
+    ) -> Result<ExecutionResult, StackError> {
+        if let Some(authority) = &self.scoped_authority
+            && authority.scope.stack_id != spec.name
+        {
+            return Err(super::scope_state_conflict(format!(
+                "stack spec `{}` does not match scoped stack `{}`",
+                spec.name, authority.scope.stack_id
+            )));
+        }
+        if self.scoped_cleanup_only
+            && actions.iter().any(|action| {
+                matches!(
+                    action,
+                    Action::ServiceCreate { .. } | Action::ServiceRecreate { .. }
+                )
+            })
+        {
+            return Err(super::scope_state_conflict(
+                "cleanup-only scoped executor cannot reserve or activate containers",
+            ));
+        }
+        if self.scoped_authority.is_some() {
+            let (operation_id, first_action_index) = batch.ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "scoped executor requires persisted operation identity".to_string(),
+                )
+            })?;
+            if !self.scoped_cleanup_only {
+                // Validate and durably stage every external input before any volume,
+                // sandbox, network, journal, or runtime mutation.
+                self.prepare_scoped_batch_manifest(
+                    spec,
+                    actions,
+                    operation_id,
+                    first_action_index,
+                )?;
+            }
+        }
         // Ensure named volume directories exist before creating containers.
-        let created_volumes = self.volumes.ensure_volumes(&spec.volumes)?;
+        let created_volumes = if self.scoped_cleanup_only {
+            Vec::new()
+        } else {
+            self.volumes.ensure_volumes(&spec.volumes)?
+        };
         for vol_name in &created_volumes {
             self.store.emit_event(
                 &spec.name,
@@ -294,7 +360,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
             // Stage all secrets before boot so they can be included in VirtioFS shares.
             // This must happen BEFORE creating resources so secrets are in all_volume_mounts.
-            let secrets_dir = self.data_dir.join("secrets").join(&spec.name);
+            let secrets_dir = self
+                .scoped_secret_dir
+                .clone()
+                .unwrap_or_else(|| self.data_dir.join("secrets").join(&spec.name));
             for svc in &spec.services {
                 for secret_ref in &svc.secrets {
                     let def = spec
@@ -309,7 +378,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         })?;
                     let secret_path = secrets_dir.join(&secret_ref.source);
                     if !secret_path.exists() {
-                        let content = load_secret_source_bytes(def)?;
+                        if self.scoped_authority.is_some() {
+                            return Err(super::scope_state_conflict(format!(
+                                "scoped staged secret '{}' is missing",
+                                secret_ref.source
+                            )));
+                        }
+                        let content = self.load_secret_input(def)?;
                         std::fs::create_dir_all(&secrets_dir).map_err(|error| {
                             StackError::InvalidSpec(format!(
                                 "failed to create staged secrets directory '{}': {error}",
@@ -322,17 +397,17 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                                 secret_path.display()
                             ))
                         })?;
-
-                        // Add secret to volume mounts for VirtioFS sharing.
-                        // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
-                        let idx = all_volume_mounts.len();
-                        all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
-                            tag: format!("vz-mount-{idx}"),
-                            host_path: secrets_dir.clone(),
-                            guest_path: None,
-                            read_only: true,
-                        });
                     }
+
+                    // Add secret to volume mounts for VirtioFS sharing.
+                    // Use "vz-mount-" prefix so OCI runtime translates to /mnt/vz-mount-X.
+                    let idx = all_volume_mounts.len();
+                    all_volume_mounts.push(vz_runtime_contract::StackVolumeMount {
+                        tag: format!("vz-mount-{idx}"),
+                        host_path: secrets_dir.clone(),
+                        guest_path: None,
+                        read_only: true,
+                    });
                 }
             }
 
@@ -440,6 +515,22 @@ impl<R: ContainerRuntime> StackExecutor<R> {
 
         let service_map: HashMap<&str, &ServiceSpec> =
             spec.services.iter().map(|s| (s.name.as_str(), s)).collect();
+
+        if self.scoped_authority.is_some() {
+            let (operation_id, first_action_index) = batch.ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "scoped executor lost its validated operation identity".to_string(),
+                )
+            })?;
+            return self.execute_scoped_actions(
+                spec,
+                actions,
+                &service_map,
+                operation_id,
+                first_action_index,
+                all_skipped_mounts,
+            );
+        }
 
         let mut result = ExecutionResult::default();
 

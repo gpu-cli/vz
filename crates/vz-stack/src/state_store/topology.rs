@@ -17,7 +17,7 @@ use super::StateStore;
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 3;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 4;
 
 /// Result of atomically selecting or reserving an Environment for `up`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -307,6 +307,11 @@ enum TopologyV3MigrationStage {
     LifecycleSchemaCreated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StackJournalV4MigrationStage {
+    JournalSchemaCreated,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -317,6 +322,12 @@ pub(super) enum LegacyMigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TopologyV3MigrationFailpoint {
     AfterOwnershipRebuild,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StackJournalV4MigrationFailpoint {
+    AfterJournalSchemaCreated,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -572,6 +583,18 @@ impl StateStore {
         reference.create_topology_schema_v3()?;
 
         self.validate_schema_against(3, &reference.conn)
+    }
+
+    pub(super) fn validate_v4_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+
+        self.validate_schema_against(4, &reference.conn)
     }
 
     fn validate_schema_against(
@@ -1658,6 +1681,9 @@ impl StateStore {
             let environment = store
                 .load_environment_instance(operation.environment_id.as_str())?
                 .ok_or_else(|| environment_not_found(operation.environment_id.as_str()))?;
+            store.require_no_nonterminal_stack_container_creates(
+                operation.environment_id.as_str(),
+            )?;
             let operation_before = operation.clone();
             let tombstone = operation.finish_delete(&environment, now)?;
             store.update_environment_lifecycle_cas(&operation_before, &operation)?;
@@ -1699,7 +1725,7 @@ impl StateStore {
             .collect()
     }
 
-    fn load_environment_instance(
+    pub(super) fn load_environment_instance(
         &self,
         environment_id: &str,
     ) -> Result<Option<EnvironmentInstance>, StackError> {
@@ -3143,6 +3169,30 @@ impl StateStore {
         self.migrate_topology_v2_to_v3_with_hook(|_| Ok(()))
     }
 
+    pub(super) fn migrate_stack_journal_v3_to_v4(&self) -> Result<(), StackError> {
+        self.migrate_stack_journal_v3_to_v4_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_stack_journal_v3_to_v4_with_hook(
+        &self,
+        mut hook: impl FnMut(StackJournalV4MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 3 {
+                return Err(StackError::InvalidSpec(format!(
+                    "stack journal migration requires state schema version 3, found {schema_version}"
+                )));
+            }
+            store.validate_v3_schema()?;
+            store.create_stack_journal_schema_v4()?;
+            hook(StackJournalV4MigrationStage::JournalSchemaCreated)?;
+            store.validate_v4_schema()?;
+            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
     fn migrate_topology_v2_to_v3_with_hook(
         &self,
         mut hook: impl FnMut(TopologyV3MigrationStage) -> Result<(), StackError>,
@@ -3164,7 +3214,7 @@ impl StateStore {
 
             store.validate_v3_schema()?;
             // The version marker is deliberately the final write in the transaction.
-            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            store.set_schema_version(3)?;
             Ok(())
         })
     }
@@ -3205,6 +3255,27 @@ impl StateStore {
             ) {
                 return Err(StackError::InvalidSpec(
                     "injected v2-to-v3 migration failure after ownership rebuild".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_stack_journal_v3_to_v4_with_failpoint(
+        &self,
+        failpoint: StackJournalV4MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_stack_journal_v3_to_v4_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    StackJournalV4MigrationFailpoint::AfterJournalSchemaCreated,
+                    StackJournalV4MigrationStage::JournalSchemaCreated
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v3-to-v4 migration failure after journal schema creation".to_string(),
                 ));
             }
             Ok(())

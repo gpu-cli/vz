@@ -99,26 +99,29 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             StackError::InvalidSpec(format!("service '{service_name}' not found in stack spec"))
         })?;
 
-        // Update state to Creating.
-        self.store.save_observed_state(
-            &spec.name,
-            &ServiceObservedState {
-                service_name: service_name.to_string(),
-                phase: ServicePhase::Creating,
-                container_id: None,
-                failed_create_ownership: None,
-                last_error: None,
-                ready: false,
-            },
-        )?;
+        // The scoped journal atomically publishes Creating with its intent.
+        // Legacy callers retain their pre-journal observed-state behavior.
+        if self.scoped_authority.is_none() {
+            self.store.save_observed_state(
+                &spec.name,
+                &ServiceObservedState {
+                    service_name: service_name.to_string(),
+                    phase: ServicePhase::Creating,
+                    container_id: None,
+                    failed_create_ownership: None,
+                    last_error: None,
+                    ready: false,
+                },
+            )?;
 
-        self.store.emit_event(
-            &spec.name,
-            &StackEvent::ServiceCreating {
-                stack_name: spec.name.clone(),
-                service_name: service_name.to_string(),
-            },
-        )?;
+            self.store.emit_event(
+                &spec.name,
+                &StackEvent::ServiceCreating {
+                    stack_name: spec.name.clone(),
+                    service_name: service_name.to_string(),
+                },
+            )?;
+        }
 
         // Resolve mounts using volume manager.
         let mut resolved_mounts = self
@@ -152,8 +155,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         let secret_mounts = if svc_spec.secrets.is_empty() {
             vec![]
         } else {
-            let secrets_dir = self.data_dir.join("secrets").join(&spec.name);
-            std::fs::create_dir_all(&secrets_dir)?;
+            let secrets_dir = self
+                .scoped_secret_dir
+                .clone()
+                .unwrap_or_else(|| self.data_dir.join("secrets").join(&spec.name));
+            if self.scoped_authority.is_none() {
+                std::fs::create_dir_all(&secrets_dir)?;
+            }
             for secret_ref in &svc_spec.secrets {
                 let secret_def = spec
                     .secrets
@@ -165,8 +173,19 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                             secret_ref.source, service_name,
                         ))
                     })?;
-                let content = load_secret_source_bytes(secret_def)?;
-                std::fs::write(secrets_dir.join(&secret_ref.source), content)?;
+                let content = self.load_secret_input(secret_def)?;
+                let secret_path = secrets_dir.join(&secret_ref.source);
+                if self.scoped_authority.is_some() {
+                    let staged = std::fs::read(&secret_path)?;
+                    if staged != content {
+                        return Err(super::scope_state_conflict(format!(
+                            "staged secret '{}' changed during a scoped create attempt",
+                            secret_ref.source
+                        )));
+                    }
+                } else {
+                    std::fs::write(secret_path, content)?;
+                }
             }
             secrets_to_mounts(&svc_spec.secrets, &secrets_dir)
         };

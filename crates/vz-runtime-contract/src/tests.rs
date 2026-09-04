@@ -566,6 +566,52 @@ fn generation_scope(stack_id: &str) -> ContainerGenerationScope {
 }
 
 #[test]
+fn machine_workload_scope_requires_current_incarnation_and_binds_stable_reservation() {
+    let workload = MachineWorkloadScope {
+        schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: ProjectId::new("prj_workload").unwrap(),
+        environment_id: EnvironmentId::new("env_workload").unwrap(),
+        machine_id: MachineId::new("mch_workload").unwrap(),
+        machine_incarnation_id: MachineIncarnationId::new("inc_workload_current").unwrap(),
+        stack_id: "stack-workload".to_string(),
+    };
+
+    let first =
+        ContainerGenerationScope::for_machine_workload(&workload, "reservation-stable").unwrap();
+    let retry = workload
+        .container_generation_scope("reservation-stable")
+        .unwrap();
+
+    assert_eq!(first, retry);
+    assert_eq!(first.reservation_id, "reservation-stable");
+    assert_eq!(
+        first.machine_incarnation_id.as_ref(),
+        Some(&workload.machine_incarnation_id)
+    );
+    assert_eq!(first.stack_id, workload.stack_id);
+}
+
+#[test]
+fn machine_workload_scope_rejects_unsupported_schema_version() {
+    let workload = MachineWorkloadScope {
+        schema_version: MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION + 1,
+        project_id: ProjectId::new("prj_workload").unwrap(),
+        environment_id: EnvironmentId::new("env_workload").unwrap(),
+        machine_id: MachineId::new("mch_workload").unwrap(),
+        machine_incarnation_id: MachineIncarnationId::new("inc_workload_current").unwrap(),
+        stack_id: "stack-workload".to_string(),
+    };
+
+    let error = workload.validate().unwrap_err();
+    assert!(error.contains("unsupported Machine workload scope schema version"));
+    assert!(
+        workload
+            .container_generation_scope("reservation-stable")
+            .is_err()
+    );
+}
+
+#[test]
 fn synthetic_legacy_stack_scope_is_labeled_valid_and_fresh() {
     let first = ContainerGenerationScope::synthetic_legacy_stack("actual-stack").unwrap();
     let second = ContainerGenerationScope::synthetic_legacy_stack("actual-stack").unwrap();
@@ -592,7 +638,12 @@ fn synthetic_legacy_stack_scope_is_labeled_valid_and_fresh() {
 
 #[test]
 fn synthetic_legacy_stack_scope_rejects_invalid_stack_identity() {
-    assert!(ContainerGenerationScope::synthetic_legacy_stack("  ").is_err());
+    for invalid in ["  ", ".", "..", "/absolute", "../escape", "a/b", "a\\b"] {
+        assert!(
+            ContainerGenerationScope::synthetic_legacy_stack(invalid).is_err(),
+            "unsafe stack ID should fail: {invalid:?}"
+        );
+    }
     assert!(ContainerGenerationScope::synthetic_legacy_stack(&"x".repeat(129)).is_err());
 }
 

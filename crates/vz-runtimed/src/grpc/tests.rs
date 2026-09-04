@@ -10,9 +10,14 @@ use tonic::Code;
 use tonic::transport::{Channel, Endpoint, Uri};
 use tower::service_fn;
 use vz_runtime_contract::{
-    PolicyDecision, RequestMetadata, RuntimeOperation, RuntimePolicyHook,
-    SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX,
-    SANDBOX_SPACE_MODE_REQUIRED, SPACE_CACHE_KEY_SCHEMA_VERSION, SandboxBackend,
+    Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+    EnvironmentState, MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId,
+    MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState,
+    MachineWorkloadScope, OperatingSystem, OwnedResourceKind, OwnershipRecord, PolicyDecision,
+    ProjectDefinition, ProjectId, ProjectState, RequestMetadata, RuntimeOperation,
+    RuntimePolicyHook, SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE,
+    SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_SPACE_MODE_REQUIRED,
+    SPACE_CACHE_KEY_SCHEMA_VERSION, SandboxBackend, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 
 use super::*;
@@ -51,6 +56,119 @@ fn seed_test_sandbox(daemon: &RuntimeDaemon, sandbox_id: &str, project_dir: &Pat
             })
         })
         .expect("seed test sandbox");
+}
+
+pub(super) fn seed_stack_topology(
+    daemon: &RuntimeDaemon,
+    stack_id: &str,
+) -> runtime_v2::MachineWorkloadScope {
+    let project_id = ProjectId::new("prj-stack-rpc").unwrap();
+    let environment_id = EnvironmentId::new("env-stack-rpc").unwrap();
+    let machine_id = MachineId::new("mch-stack-rpc").unwrap();
+    let incarnation_id = MachineIncarnationId::new("inc-stack-rpc").unwrap();
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "ubuntu:24.04".to_string(),
+        version: None,
+        channel: None,
+        digest: Some("sha256:stack-rpc".to_string()),
+    };
+    let capabilities = CapabilitySet::new([
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "stack-rpc".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![MachineSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources::default(),
+                requested_capabilities: capabilities.clone(),
+                workspace: None,
+            }],
+            networks: Vec::new(),
+            endpoints: Vec::new(),
+        },
+    };
+    let environment = EnvironmentInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        environment_id: environment_id.clone(),
+        project_id: project_id.clone(),
+        name: "developer".to_string(),
+        definition_digest: definition.digest().unwrap(),
+        state: EnvironmentState::Ready,
+        lifecycle_generation: 1,
+        active_operation_id: None,
+        bindings: Vec::new(),
+        machines: vec![MachineInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machine_id: machine_id.clone(),
+            environment_id: environment_id.clone(),
+            name: "linux".to_string(),
+            profile: MachineProfile::Developer,
+            target,
+            resources: MachineResources::default(),
+            requested_capabilities: capabilities.clone(),
+            negotiated_capabilities: capabilities,
+            backend: None,
+            incarnation: Some(MachineIncarnation {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                incarnation_id: incarnation_id.clone(),
+                machine_id: machine_id.clone(),
+                generation: 1,
+                created_at: 1,
+            }),
+            state: MachineState::Ready,
+            legacy_sandbox_id: None,
+        }],
+        networks: Vec::new(),
+        endpoints: Vec::new(),
+        ownership: vec![
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Machine,
+                resource_id: machine_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+            OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Incarnation,
+                resource_id: incarnation_id.to_string(),
+                environment_id: environment_id.clone(),
+                machine_id: Some(machine_id.clone()),
+            },
+        ],
+        legacy_migration: None,
+        created_at: 1,
+        updated_at: 1,
+    };
+    daemon
+        .with_state_store(|store| {
+            store.save_project_state(&ProjectState {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                definition,
+                environments: vec![environment],
+            })
+        })
+        .unwrap();
+    let scope = MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id,
+        environment_id,
+        machine_id,
+        machine_incarnation_id: incarnation_id,
+        stack_id: stack_id.to_string(),
+    };
+    vz_runtime_translate::machine_workload_scope_to_proto(&scope)
 }
 
 #[cfg(target_os = "macos")]
@@ -3020,6 +3138,10 @@ async fn apply_stack_dry_run_multiservice_round_trip() {
     };
 
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let wire_scope = seed_stack_topology(daemon.as_ref(), "stack-multi");
+    let stack_dir = config.runtime_data_dir.join("stacks").join("stack-multi");
+    assert!(!stack_dir.exists());
+    std::fs::create_dir_all(&config.runtime_data_dir).expect("create runtime data directory");
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_task = shutdown.clone();
     let daemon_task = daemon.clone();
@@ -3043,6 +3165,102 @@ services:
     image: postgres:16
 "#;
 
+    let missing_scope = stack_client
+        .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-stack-missing-scope".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: "stack-multi".to_string(),
+            compose_yaml: compose_yaml.to_string(),
+            compose_dir: ".".to_string(),
+            detach: false,
+            dry_run: false,
+            scope: None,
+        }))
+        .await;
+    assert!(missing_scope.is_err());
+    let mut foreign_scope = wire_scope.clone();
+    foreign_scope.stack_id = "another-stack".to_string();
+    let foreign_scope = stack_client
+        .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-stack-foreign-scope".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: "stack-multi".to_string(),
+            compose_yaml: compose_yaml.to_string(),
+            compose_dir: ".".to_string(),
+            detach: false,
+            dry_run: false,
+            scope: Some(foreign_scope),
+        }))
+        .await;
+    assert!(foreign_scope.is_err());
+    let legacy_stack_dir = config.runtime_data_dir.join("stacks").join("legacy-stack");
+    std::fs::create_dir_all(&legacy_stack_dir).expect("seed unowned legacy stack directory");
+    let mut legacy_scope = wire_scope.clone();
+    legacy_scope.stack_id = "legacy-stack".to_string();
+    let legacy_namespace = stack_client
+        .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
+            metadata: None,
+            stack_name: "legacy-stack".to_string(),
+            compose_yaml: compose_yaml.to_string(),
+            compose_dir: ".".to_string(),
+            detach: false,
+            dry_run: true,
+            scope: Some(legacy_scope),
+        }))
+        .await;
+    assert!(legacy_namespace.is_err());
+    let create_alias = stack_client
+        .create_stack_run_container(Request::new(runtime_v2::StackRunContainerRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-stack-create-run-alias".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: "stack-multi".to_string(),
+            service_name: "api".to_string(),
+            run_service_name: "api".to_string(),
+            scope: Some(wire_scope.clone()),
+        }))
+        .await
+        .expect_err("create run must reject primary-service alias");
+    assert!(create_alias.message().contains("must not alias"));
+    let remove_alias = stack_client
+        .remove_stack_run_container(Request::new(runtime_v2::StackRunContainerRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-stack-remove-run-alias".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: "stack-multi".to_string(),
+            service_name: "api".to_string(),
+            run_service_name: "api".to_string(),
+            scope: Some(wire_scope.clone()),
+        }))
+        .await
+        .expect_err("remove run must reject primary-service alias");
+    assert!(remove_alias.message().contains("must not alias"));
+    daemon
+        .with_state_store(|store| {
+            let receipts = store.list_receipts()?;
+            assert!(!receipts.iter().any(|receipt| {
+                matches!(
+                    receipt.request_id.as_str(),
+                    "req-stack-missing-scope"
+                        | "req-stack-foreign-scope"
+                        | "req-stack-create-run-alias"
+                        | "req-stack-remove-run-alias"
+                )
+            }));
+            Ok(())
+        })
+        .unwrap();
+
     let applied = read_apply_stack_completion_response(
         stack_client
             .apply_stack(Request::new(runtime_v2::ApplyStackRequest {
@@ -3056,6 +3274,7 @@ services:
                 compose_dir: ".".to_string(),
                 detach: false,
                 dry_run: true,
+                scope: Some(wire_scope),
             }))
             .await
             .expect("apply stack dry-run"),
@@ -3073,6 +3292,116 @@ services:
         .collect();
     assert!(service_names.contains("api"));
     assert!(service_names.contains("db"));
+    assert!(
+        !stack_dir.exists(),
+        "dry-run must not create a stack directory"
+    );
+    daemon
+        .with_state_store(|store| {
+            assert!(store.load_stack_workload_owner("stack-multi")?.is_none());
+            assert!(store.load_desired_state("stack-multi")?.is_none());
+            assert!(store.load_observed_state("stack-multi")?.is_empty());
+            assert!(store.load_events("stack-multi")?.is_empty());
+            assert!(
+                !store
+                    .list_receipts()?
+                    .iter()
+                    .any(|receipt| receipt.request_id == "req-stack-apply")
+            );
+            Ok(())
+        })
+        .unwrap();
+
+    shutdown.notify_waiters();
+    let result = tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("server join timeout")
+        .expect("server join should succeed");
+    assert!(result.is_ok());
+}
+
+#[tokio::test]
+async fn teardown_stack_dry_run_preserves_database_and_filesystem() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = RuntimedConfig {
+        state_store_path: tmp.path().join("state").join("stack-state.db"),
+        runtime_data_dir: tmp.path().join("runtime"),
+        socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+    };
+    let stack_name = "stack-dry-teardown";
+    let compose_yaml = "services:\n  web:\n    image: nginx:latest\n";
+    let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let wire_scope = seed_stack_topology(daemon.as_ref(), stack_name);
+    let scope = vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope).unwrap();
+    let spec = vz_stack::parse_compose(compose_yaml, stack_name).unwrap();
+    let event_count_before = daemon
+        .with_state_store(|store| {
+            store.reserve_stack_workload_owner(&scope, 1)?;
+            vz_stack::apply(&spec, store, &HashMap::new())?;
+            Ok(store.load_events(stack_name)?.len())
+        })
+        .unwrap();
+    let stack_dir = config.runtime_data_dir.join("stacks").join(stack_name);
+    assert!(!stack_dir.exists());
+    std::fs::create_dir_all(&config.runtime_data_dir).expect("create runtime data directory");
+
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+    let shutdown_task = shutdown.clone();
+    let daemon_task = daemon.clone();
+    let socket_path = config.socket_path.clone();
+    let server = tokio::spawn(async move {
+        serve_runtime_uds_with_shutdown(daemon_task, socket_path, async move {
+            shutdown_task.notified().await;
+        })
+        .await
+    });
+    wait_for_socket(&config.socket_path).await;
+
+    let mut stack_client = connect_stack_client(&config.socket_path).await;
+    let response = read_teardown_stack_completion_response(
+        stack_client
+            .teardown_stack(Request::new(runtime_v2::TeardownStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-stack-dry-teardown".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                dry_run: true,
+                remove_volumes: true,
+                scope: Some(wire_scope),
+            }))
+            .await
+            .expect("teardown stack dry-run"),
+    )
+    .await;
+
+    assert_eq!(response.changed_actions, 1);
+    assert_eq!(response.removed_volumes, 0);
+    assert!(
+        !stack_dir.exists(),
+        "dry-run must not create a stack directory"
+    );
+    daemon
+        .with_state_store(|store| {
+            let desired = store
+                .load_desired_state(stack_name)?
+                .expect("desired state remains present");
+            assert_eq!(desired.services.len(), 1);
+            let observed = store.load_observed_state(stack_name)?;
+            assert_eq!(observed.len(), 1);
+            assert_eq!(observed[0].phase, vz_stack::ServicePhase::Pending);
+            assert_eq!(store.load_events(stack_name)?.len(), event_count_before);
+            assert!(
+                !store
+                    .list_receipts()?
+                    .iter()
+                    .any(|receipt| receipt.request_id == "req-stack-dry-teardown")
+            );
+            assert!(store.load_stack_workload_owner(stack_name)?.is_some());
+            Ok(())
+        })
+        .unwrap();
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)
@@ -3092,6 +3421,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
     };
 
     let daemon = Arc::new(RuntimeDaemon::start(config.clone()).expect("daemon start"));
+    let wire_scope = seed_stack_topology(daemon.as_ref(), "stack-empty");
     let shutdown = Arc::new(tokio::sync::Notify::new());
     let shutdown_task = shutdown.clone();
     let daemon_task = daemon.clone();
@@ -3122,6 +3452,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
             compose_dir: ".".to_string(),
             detach: false,
             dry_run: false,
+            scope: Some(wire_scope.clone()),
         }))
         .await
         .expect("apply stack");
@@ -3138,6 +3469,7 @@ async fn apply_and_teardown_stack_persist_receipts_with_metadata() {
             stack_name: stack_name.clone(),
             remove_volumes: false,
             dry_run: false,
+            scope: Some(wire_scope),
         }))
         .await
         .expect("teardown stack");
@@ -4212,6 +4544,7 @@ services:
             compose_dir: ".".to_string(),
             dry_run: false,
             detach: false,
+            scope: None,
         }))
         .await
     {
@@ -4240,6 +4573,7 @@ services:
                 stack_name: stack_name.to_string(),
                 dry_run: false,
                 remove_volumes: false,
+                scope: None,
             }))
             .await;
         shutdown.notify_waiters();
@@ -4299,6 +4633,7 @@ services:
                         stack_name: stack_name.to_string(),
                         dry_run: false,
                         remove_volumes: false,
+                        scope: None,
                     }))
                     .await;
                 shutdown.notify_waiters();
@@ -4352,6 +4687,7 @@ services:
             stack_name: stack_name.to_string(),
             dry_run: false,
             remove_volumes: false,
+            scope: None,
         }))
         .await;
     shutdown.notify_waiters();

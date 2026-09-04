@@ -1598,6 +1598,22 @@ service StackService {
   rpc RemoveStackRunContainer(StackRunContainerRequest) returns (StackRunContainerResponse);
 }
 
+// Authoritative identity for a stack workload on one persisted Machine.
+//
+// Servers validate every identifier against persisted topology before using the
+// scope to select or mutate a stack. An empty or missing
+// machine_incarnation_id is invalid for authoritative mutation. The
+// schema_version makes future scope evolution explicit; clients must not
+// synthesize missing identity fields.
+message MachineWorkloadScope {
+  uint32 schema_version = 1;
+  string project_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string machine_incarnation_id = 5;
+  string stack_id = 6;
+}
+
 message ApplyStackRequest {
   RequestMetadata metadata = 1;
   string stack_name = 2;
@@ -1605,6 +1621,7 @@ message ApplyStackRequest {
   string compose_dir = 4;
   bool dry_run = 5;
   bool detach = 6;
+  MachineWorkloadScope scope = 7;
 }
 
 message StackServiceStatus {
@@ -1649,6 +1666,7 @@ message TeardownStackRequest {
   string stack_name = 2;
   bool dry_run = 3;
   bool remove_volumes = 4;
+  MachineWorkloadScope scope = 5;
 }
 
 message TeardownStackResponse {
@@ -1675,6 +1693,7 @@ message TeardownStackEvent {
 message GetStackStatusRequest {
   RequestMetadata metadata = 1;
   string stack_name = 2;
+  MachineWorkloadScope scope = 3;
 }
 
 message GetStackStatusResponse {
@@ -1688,6 +1707,7 @@ message ListStackEventsRequest {
   string stack_name = 2;
   int64 after = 3;
   uint32 limit = 4;
+  MachineWorkloadScope scope = 5;
 }
 
 message ListStackEventsResponse {
@@ -1701,6 +1721,7 @@ message GetStackLogsRequest {
   string stack_name = 2;
   string service = 3;
   uint32 tail = 4;
+  MachineWorkloadScope scope = 5;
 }
 
 message StackServiceLog {
@@ -1718,6 +1739,7 @@ message StackServiceActionRequest {
   RequestMetadata metadata = 1;
   string stack_name = 2;
   string service_name = 3;
+  MachineWorkloadScope scope = 4;
 }
 
 message StackServiceActionResponse {
@@ -1745,6 +1767,7 @@ message StackRunContainerRequest {
   string stack_name = 2;
   string service_name = 3;
   string run_service_name = 4;
+  MachineWorkloadScope scope = 5;
 }
 
 message StackRunContainerResponse {
