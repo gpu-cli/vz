@@ -504,7 +504,7 @@ async fn generation_ownership_sigkill_crash_reopen() {
             "skips": 0,
         },
         "state_store_expectation": {
-            "schema_version": 7,
+            "schema_version": 8,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence",
         },

@@ -2186,12 +2186,12 @@ validate_runtime_crash_reopen_evidence() {
     if ! jq -e '
         .coverage_classification == "runtime_store_post_commit_lost_ack_only" and
         .state_store_expectation == {
-            "schema_version": 7,
+            "schema_version": 8,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }
     ' "$evidence_file" >/dev/null; then
-        echo "runtime generation crash/reopen evidence is incomplete: missing the required schema-v7 Action-v3 StateStore companion declaration" >&2
+        echo "runtime generation crash/reopen evidence is incomplete: missing the required schema-v8 Action-v3 StateStore companion declaration" >&2
         return 1
     fi
 
@@ -2254,7 +2254,7 @@ validate_runtime_crash_reopen_evidence() {
             "skips": 0
         }) and
         (.state_store_expectation == {
-            "schema_version": 7,
+            "schema_version": 8,
             "status": "separate_companion_required",
             "required_boundary": "Action-v3 executor and StateStore atomic crash/reopen companion evidence"
         }) and
@@ -2371,7 +2371,7 @@ validate_stack_crash_reopen_evidence() {
                 "binding", "event_counts", "intent_status", "observed_phase", "ready",
                 "schema_version", "session_actions_hash", "session_cursor", "session_status"
             ]) and
-            (.schema_version == 7) and
+            (.schema_version == 8) and
             (.action_schema_version == 3) and
             (.session_actions_hash | type == "string" and
                 test("^vzrah2-sha256:[0-9a-f]{64}$")) and

@@ -63,6 +63,163 @@ fn persisted_optional_u64(
         .transpose()
 }
 
+fn validate_teardown_finalizer(record: &TeardownFinalizer) -> Result<(), StackError> {
+    if record.schema_version != TEARDOWN_FINALIZER_SCHEMA_VERSION {
+        return Err(StackError::InvalidSpec(format!(
+            "unsupported teardown finalizer schema version {}",
+            record.schema_version
+        )));
+    }
+    record.scope.validate().map_err(StackError::InvalidSpec)?;
+    if record.scope.stack_id != record.scope.stack_id.trim()
+        || record.operation_key.trim().is_empty()
+        || (!record.operation_key.starts_with("idem:") && !record.operation_key.starts_with("req:"))
+        || record.request_id.trim().is_empty()
+        || record.request_digest.trim().is_empty()
+        || record.session_id.trim().is_empty()
+        || !record
+            .reconcile_operation_id
+            .starts_with(CLAIMED_TEARDOWN_OPERATION_PREFIX)
+        || record.actions_hash.trim().is_empty()
+        || record.desired_state_digest.trim().is_empty()
+    {
+        return Err(StackError::InvalidSpec(
+            "teardown finalizer has invalid immutable identity".to_string(),
+        ));
+    }
+    if record.operation_key.starts_with("idem:") != record.idempotency_key.is_some()
+        || record.idempotency_key.as_ref().is_some_and(|key| {
+            key.trim().is_empty()
+                || record.operation_key.strip_prefix("idem:") != Some(key.as_str())
+        })
+        || (record.operation_key.starts_with("req:")
+            && record.operation_key.strip_prefix("req:") != Some(record.request_id.as_str()))
+    {
+        return Err(StackError::InvalidSpec(
+            "teardown finalizer operation key does not match its request identity".to_string(),
+        ));
+    }
+    let canonical = |values: &[String]| {
+        values.windows(2).all(|pair| pair[0] < pair[1])
+            && values.iter().all(|value| !value.trim().is_empty())
+    };
+    if !canonical(&record.initial_volumes)
+        || !canonical(&record.staged_volumes)
+        || !canonical(&record.purged_volumes)
+        || record
+            .staged_volumes
+            .iter()
+            .any(|volume| record.initial_volumes.binary_search(volume).is_err())
+        || record
+            .purged_volumes
+            .iter()
+            .any(|volume| record.staged_volumes.binary_search(volume).is_err())
+        || (!record.remove_volumes
+            && (!record.initial_volumes.is_empty()
+                || record.initial_disk_image
+                || !record.staged_volumes.is_empty()
+                || !record.purged_volumes.is_empty()
+                || record.disk_staged
+                || record.disk_purged))
+        || (record.disk_purged && !record.disk_staged)
+    {
+        return Err(StackError::InvalidSpec(
+            "teardown finalizer filesystem progress is not canonical and monotonic".to_string(),
+        ));
+    }
+    match record.status {
+        TeardownFinalizerStatus::Prepared => {
+            if record.receipt.is_some()
+                || record.response_json.is_some()
+                || record.completed_at.is_some()
+            {
+                return Err(StackError::InvalidSpec(
+                    "prepared teardown finalizer contains terminal output".to_string(),
+                ));
+            }
+        }
+        TeardownFinalizerStatus::Completed => {
+            let receipt = record.receipt.as_ref().ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "completed teardown finalizer has no immutable receipt".to_string(),
+                )
+            })?;
+            let removed_volumes = u32::try_from(record.initial_volumes.len()).map_err(|_| {
+                StackError::InvalidSpec(
+                    "teardown finalizer volume count exceeds response range".to_string(),
+                )
+            })?;
+            let response_json = record.response_json.as_deref().ok_or_else(|| {
+                StackError::InvalidSpec(
+                    "completed teardown finalizer has no immutable response".to_string(),
+                )
+            })?;
+            let response: serde_json::Value = serde_json::from_str(response_json)?;
+            let expected_response = serde_json::json!({
+                "request_id": record.request_id,
+                "stack_name": record.scope.stack_id,
+                "changed_actions": record.changed_actions,
+                "removed_volumes": removed_volumes,
+            });
+            if record.completed_at.is_none()
+                || receipt.request_id != record.request_id
+                || receipt.entity_id != record.scope.stack_id
+                || receipt.operation != "teardown_stack"
+                || receipt.entity_type != "stack"
+                || receipt.status != "success"
+                || receipt.receipt_id
+                    != teardown_receipt_id(&record.operation_key, &record.request_digest)
+                || receipt
+                    .metadata
+                    .get("request_digest")
+                    .and_then(|value| value.as_str())
+                    != Some(record.request_digest.as_str())
+                || receipt
+                    .metadata
+                    .get("changed_actions")
+                    .and_then(|value| value.as_u64())
+                    != Some(u64::from(record.changed_actions))
+                || receipt
+                    .metadata
+                    .get("removed_volumes")
+                    .and_then(|value| value.as_u64())
+                    != Some(u64::from(removed_volumes))
+                || response != expected_response
+            {
+                return Err(StackError::InvalidSpec(
+                    "completed teardown finalizer output does not match its identity".to_string(),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn teardown_finalizer_identity_matches(
+    left: &TeardownFinalizer,
+    right: &TeardownFinalizer,
+) -> bool {
+    left.schema_version == right.schema_version
+        && left.operation_key == right.operation_key
+        && (left.operation_key.starts_with("idem:") || left.request_id == right.request_id)
+        && left.idempotency_key == right.idempotency_key
+        && left.request_digest == right.request_digest
+        && left.session_id == right.session_id
+        && left.reconcile_operation_id == right.reconcile_operation_id
+        && left.scope == right.scope
+        && left.remove_volumes == right.remove_volumes
+        && left.changed_actions == right.changed_actions
+        && left.actions_hash == right.actions_hash
+        && left.desired_state_digest == right.desired_state_digest
+        && left.initial_volumes == right.initial_volumes
+        && left.initial_disk_image == right.initial_disk_image
+        && left.initial_runtime_present == right.initial_runtime_present
+}
+
+fn teardown_idempotency_pending_value(operation_key: &str) -> String {
+    format!("vz:teardown-pending:v1:{operation_key}")
+}
+
 fn persisted_usize(entity: &str, id: &str, field: &str, value: i64) -> Result<usize, StackError> {
     usize::try_from(value).map_err(|_| {
         StackError::InvalidSpec(format!(
@@ -738,6 +895,76 @@ impl StateStore {
         Ok(())
     }
 
+    fn prepared_teardown_for_scope(
+        &self,
+        scope: &vz_runtime_contract::MachineWorkloadScope,
+    ) -> Result<Option<(String, String, String)>, StackError> {
+        self.conn
+            .query_row(
+                "SELECT operation_key, session_id, reconcile_operation_id
+                 FROM teardown_finalizers
+                 WHERE project_id = ?1 AND environment_id = ?2 AND machine_id = ?3
+                   AND machine_incarnation_id = ?4 AND stack_name = ?5
+                   AND status = 'prepared' LIMIT 1",
+                params![
+                    scope.project_id.as_str(),
+                    scope.environment_id.as_str(),
+                    scope.machine_id.as_str(),
+                    scope.machine_incarnation_id.as_str(),
+                    scope.stack_id,
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Reject a new apply while an exact-scope teardown finalizer is prepared.
+    pub fn ensure_no_prepared_teardown(
+        &self,
+        scope: &vz_runtime_contract::MachineWorkloadScope,
+    ) -> Result<(), StackError> {
+        scope.validate().map_err(StackError::InvalidSpec)?;
+        if let Some((operation_key, _, _)) = self.prepared_teardown_for_scope(scope)? {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "stack `{}` is fenced by prepared teardown `{operation_key}`",
+                    scope.stack_id
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    /// Atomically fence a scoped apply and persist its desired intent.
+    ///
+    /// This admission also covers zero-action applies, which never create a
+    /// reconcile batch and therefore cannot rely on the batch-level fence.
+    pub fn save_desired_state_unless_prepared_teardown(
+        &self,
+        scope: &vz_runtime_contract::MachineWorkloadScope,
+        spec: &StackSpec,
+    ) -> Result<(), StackError> {
+        scope.validate().map_err(StackError::InvalidSpec)?;
+        if spec.name != scope.stack_id {
+            return Err(StackError::InvalidSpec(format!(
+                "desired stack `{}` does not match scoped stack `{}`",
+                spec.name, scope.stack_id
+            )));
+        }
+        self.with_immediate_transaction(|store| {
+            store.ensure_no_prepared_teardown(scope)?;
+            store.save_desired_state(&spec.name, spec)
+        })
+    }
+
     /// Atomically install an exact action plan as the active reconcile operation.
     pub fn create_reconcile_batch(
         &self,
@@ -764,7 +991,31 @@ impl StateStore {
                 "reconcile action plan contains a duplicate exact replica target".to_string(),
             ));
         }
+        let workload = actions[0].precondition().workload();
+        if workload.stack_id != session.stack_name
+            || actions
+                .iter()
+                .any(|action| action.precondition().workload() != workload)
+        {
+            return Err(StackError::InvalidSpec(
+                "reconcile action plan does not have one exact workload scope".to_string(),
+            ));
+        }
         self.with_immediate_transaction(|store| {
+            let prepared_finalizer = store.prepared_teardown_for_scope(workload)?;
+            if let Some((operation_key, finalizer_session, finalizer_operation)) =
+                prepared_finalizer
+                && (session.session_id != finalizer_session
+                    || session.operation_id != finalizer_operation)
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "stack `{}` is fenced by prepared teardown `{operation_key}`",
+                        session.stack_name
+                    ),
+                });
+            }
             let active_session = store
                 .conn
                 .query_row(
@@ -1351,12 +1602,14 @@ impl StateStore {
                 outcomes,
             },
             None,
+            None,
             #[cfg(test)]
             None,
         )
     }
 
     /// Commit a reserved teardown-finalizer batch under its exact started claims.
+    #[cfg(test)]
     pub(crate) fn commit_claimed_teardown_batch(
         &self,
         request: ClaimedTeardownCommit<'_>,
@@ -1392,15 +1645,60 @@ impl StateStore {
                 outcomes,
             },
             Some(claims),
+            None,
             #[cfg(test)]
             None,
         )
+    }
+
+    pub(crate) fn commit_claimed_teardown_finalized(
+        &self,
+        request: ClaimedTeardownCommit<'_>,
+        finalization: &TeardownFinalizationCommit<'_>,
+    ) -> Result<ReconcileBatchCommit, StackError> {
+        let ClaimedTeardownCommit {
+            claims,
+            session_id,
+            stack_name,
+            operation_id,
+            expected_cursor,
+            actions,
+            outcomes,
+        } = request;
+        if finalization.finalizer.session_id != session_id
+            || finalization.finalizer.reconcile_operation_id != operation_id
+            || finalization.finalizer.scope.stack_id != stack_name
+            || usize::try_from(finalization.finalizer.changed_actions).ok() != Some(actions.len())
+            || finalization.finalizer.actions_hash
+                != crate::reconcile::compute_actions_hash(actions)
+        {
+            return Err(StackError::InvalidSpec(
+                "teardown finalization does not match its reconcile claim".to_string(),
+            ));
+        }
+        let result = self.commit_reconcile_batch_inner(
+            ReconcileBatchCommitInput {
+                session_id,
+                stack_name,
+                operation_id,
+                expected_cursor,
+                actions,
+                outcomes,
+            },
+            Some(claims),
+            Some(finalization),
+            #[cfg(test)]
+            None,
+        )?;
+        self.notify_event(finalization.event);
+        Ok(result)
     }
 
     fn commit_reconcile_batch_inner(
         &self,
         input: ReconcileBatchCommitInput<'_>,
         teardown_claims: Option<&[ReconcileActionClaim]>,
+        teardown_finalization: Option<&TeardownFinalizationCommit<'_>>,
         #[cfg(test)] failpoint: Option<ReconcileBatchCommitFailpoint>,
     ) -> Result<ReconcileBatchCommit, StackError> {
         let ReconcileBatchCommitInput {
@@ -1713,6 +2011,15 @@ impl StateStore {
                 )));
             }
 
+            if let Some(finalization) = teardown_finalization {
+                if status != ReconcileSessionStatus::Completed {
+                    return Err(StackError::InvalidSpec(
+                        "teardown finalization requires a completed reconcile batch".to_string(),
+                    ));
+                }
+                store.complete_teardown_finalizer_in_transaction(finalization)?;
+            }
+
             Ok(ReconcileBatchCommit {
                 next_action_index,
                 status,
@@ -1823,6 +2130,7 @@ impl StateStore {
                 actions,
                 outcomes,
             },
+            None,
             None,
             Some(failpoint),
         )
@@ -2577,6 +2885,22 @@ impl StateStore {
     /// Uses upsert semantics so that concurrent callers racing on the
     /// same key converge to the first-written response.
     pub fn save_idempotency_result(&self, record: &IdempotencyRecord) -> Result<(), StackError> {
+        let finalizer_owned: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM teardown_finalizers WHERE idempotency_key = ?1
+             )",
+            params![record.key],
+            |row| row.get(0),
+        )?;
+        if finalizer_owned {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "idempotency key `{}` is owned by a durable teardown finalizer",
+                    record.key
+                ),
+            });
+        }
         self.conn.execute(
             "INSERT INTO idempotency_keys (key, operation, request_hash, response_json, status_code, created_at, expires_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
@@ -2605,7 +2929,12 @@ impl StateStore {
             .map(|d| d.as_secs())
             .unwrap_or(0);
         let deleted = self.conn.execute(
-            "DELETE FROM idempotency_keys WHERE expires_at <= ?1",
+            "DELETE FROM idempotency_keys
+             WHERE expires_at <= ?1
+               AND NOT EXISTS (
+                   SELECT 1 FROM teardown_finalizers
+                   WHERE teardown_finalizers.idempotency_key = idempotency_keys.key
+               )",
             params![now as i64],
         )?;
         Ok(deleted)
@@ -3761,6 +4090,584 @@ impl StateStore {
         Ok(())
     }
 
+    // ── Durable stack teardown finalizers ──
+
+    /// Load one operation-bound teardown finalizer and cross-check every
+    /// normalized projection against its canonical JSON record.
+    pub fn load_teardown_finalizer(
+        &self,
+        operation_key: &str,
+    ) -> Result<Option<TeardownFinalizer>, StackError> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT finalizer_json, schema_version, request_id, idempotency_key,
+                        request_digest, session_id, reconcile_operation_id, project_id,
+                        environment_id, machine_id, machine_incarnation_id, stack_name,
+                        remove_volumes, changed_actions, actions_hash, desired_state_digest,
+                        initial_volumes_json, initial_disk_image, initial_runtime_present,
+                        runtime_shutdown, staged_volumes_json, purged_volumes_json,
+                        disk_staged, disk_purged, status, receipt_id, created_at, updated_at,
+                        completed_at
+                 FROM teardown_finalizers WHERE operation_key = ?1",
+                params![operation_key],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, String>(7)?,
+                        row.get::<_, String>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, String>(10)?,
+                        row.get::<_, String>(11)?,
+                        row.get::<_, i64>(12)?,
+                        row.get::<_, i64>(13)?,
+                        row.get::<_, String>(14)?,
+                        row.get::<_, String>(15)?,
+                        row.get::<_, String>(16)?,
+                        row.get::<_, i64>(17)?,
+                        row.get::<_, i64>(18)?,
+                        row.get::<_, i64>(19)?,
+                        row.get::<_, String>(20)?,
+                        row.get::<_, String>(21)?,
+                        row.get::<_, i64>(22)?,
+                        row.get::<_, i64>(23)?,
+                        row.get::<_, String>(24)?,
+                        row.get::<_, Option<String>>(25)?,
+                        row.get::<_, i64>(26)?,
+                        row.get::<_, i64>(27)?,
+                        row.get::<_, Option<i64>>(28)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let record: TeardownFinalizer = serde_json::from_str(&row.0)?;
+        validate_teardown_finalizer(&record)?;
+        let initial_volumes: Vec<String> = serde_json::from_str(&row.16)?;
+        let staged_volumes: Vec<String> = serde_json::from_str(&row.20)?;
+        let purged_volumes: Vec<String> = serde_json::from_str(&row.21)?;
+        let receipt_id = record
+            .receipt
+            .as_ref()
+            .map(|receipt| receipt.receipt_id.as_str());
+        let projections_match = i64::from(record.schema_version) == row.1
+            && record.request_id == row.2
+            && record.idempotency_key == row.3
+            && record.request_digest == row.4
+            && record.session_id == row.5
+            && record.reconcile_operation_id == row.6
+            && record.scope.project_id.as_str() == row.7
+            && record.scope.environment_id.as_str() == row.8
+            && record.scope.machine_id.as_str() == row.9
+            && record.scope.machine_incarnation_id.as_str() == row.10
+            && record.scope.stack_id == row.11
+            && record.remove_volumes == (row.12 != 0)
+            && i64::from(record.changed_actions) == row.13
+            && record.actions_hash == row.14
+            && record.desired_state_digest == row.15
+            && record.initial_volumes == initial_volumes
+            && record.initial_disk_image == (row.17 != 0)
+            && record.initial_runtime_present == (row.18 != 0)
+            && record.runtime_shutdown == (row.19 != 0)
+            && record.staged_volumes == staged_volumes
+            && record.purged_volumes == purged_volumes
+            && record.disk_staged == (row.22 != 0)
+            && record.disk_purged == (row.23 != 0)
+            && record.status.as_str() == row.24
+            && receipt_id == row.25.as_deref()
+            && i64::try_from(record.created_at).ok() == Some(row.26)
+            && i64::try_from(record.updated_at).ok() == Some(row.27)
+            && record
+                .completed_at
+                .and_then(|value| i64::try_from(value).ok())
+                == row.28;
+        if !projections_match {
+            return Err(StackError::InvalidSpec(format!(
+                "teardown finalizer `{operation_key}` JSON/projection mismatch"
+            )));
+        }
+        if let Some(embedded) = &record.receipt
+            && self.load_receipt(&embedded.receipt_id)?.as_ref() != Some(embedded)
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "teardown finalizer `{operation_key}` embedded receipt mismatch"
+            )));
+        }
+        Ok(Some(record))
+    }
+
+    /// Insert an immutable teardown intent, or replay its exact existing state.
+    pub fn reserve_teardown_finalizer(
+        &self,
+        record: &TeardownFinalizer,
+    ) -> Result<TeardownFinalizer, StackError> {
+        validate_teardown_finalizer(record)?;
+        if record.status != TeardownFinalizerStatus::Prepared {
+            return Err(StackError::InvalidSpec(
+                "new teardown finalizer must be prepared".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            if let Some(existing) = store.load_teardown_finalizer(&record.operation_key)? {
+                if existing.request_digest != record.request_digest
+                    || !teardown_finalizer_identity_matches(&existing, record)
+                {
+                    return Err(StackError::Machine {
+                        code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                        message: format!(
+                            "teardown operation key `{}` is bound to different parameters",
+                            record.operation_key
+                        ),
+                    });
+                }
+                if let Some(key) = &existing.idempotency_key {
+                    let idempotency = store.find_idempotency_result(key)?.ok_or_else(|| {
+                        StackError::InvalidSpec(format!(
+                            "teardown finalizer `{}` lost its global idempotency claim",
+                            existing.operation_key
+                        ))
+                    })?;
+                    let valid_pending = existing.status == TeardownFinalizerStatus::Prepared
+                        && idempotency.response_json
+                            == teardown_idempotency_pending_value(&existing.operation_key)
+                        && idempotency.status_code == 102;
+                    let valid_completed = existing.status == TeardownFinalizerStatus::Completed
+                        && existing.response_json.as_deref()
+                            == Some(idempotency.response_json.as_str())
+                        && idempotency.status_code == 200;
+                    if idempotency.operation != "teardown_stack"
+                        || idempotency.request_hash != existing.request_digest
+                        || (!valid_pending && !valid_completed)
+                    {
+                        return Err(StackError::InvalidSpec(format!(
+                            "teardown finalizer `{}` idempotency projection mismatch",
+                            existing.operation_key
+                        )));
+                    }
+                }
+                return Ok(existing);
+            }
+            let active_operation = store
+                .conn
+                .query_row(
+                    "SELECT operation_key FROM teardown_finalizers
+                     WHERE project_id = ?1 AND environment_id = ?2 AND machine_id = ?3
+                       AND machine_incarnation_id = ?4 AND stack_name = ?5
+                       AND status = 'prepared'",
+                    params![
+                        record.scope.project_id.as_str(),
+                        record.scope.environment_id.as_str(),
+                        record.scope.machine_id.as_str(),
+                        record.scope.machine_incarnation_id.as_str(),
+                        record.scope.stack_id,
+                    ],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            if let Some(active_operation) = active_operation {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "workload already has active teardown finalizer `{active_operation}`"
+                    ),
+                });
+            }
+            if let Some(key) = &record.idempotency_key {
+                if let Some(existing) = store.find_idempotency_result(key)? {
+                    return Err(StackError::Machine {
+                        code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                        message: format!(
+                            "idempotency key `{key}` is already bound to operation `{}`",
+                            existing.operation
+                        ),
+                    });
+                }
+                store.conn.execute(
+                    "INSERT INTO idempotency_keys (
+                        key, operation, request_hash, response_json, status_code,
+                        created_at, expires_at
+                     ) VALUES (?1, 'teardown_stack', ?2, ?3, 102, ?4, ?5)",
+                    params![
+                        key,
+                        record.request_digest,
+                        teardown_idempotency_pending_value(&record.operation_key),
+                        i64::try_from(record.created_at).map_err(|_| StackError::InvalidSpec(
+                            "teardown idempotency created_at exceeds SQLite range".to_string()
+                        ))?,
+                        i64::try_from(record.created_at.saturating_add(IDEMPOTENCY_TTL_SECS))
+                            .map_err(|_| StackError::InvalidSpec(
+                                "teardown idempotency expiry exceeds SQLite range".to_string()
+                            ))?,
+                    ],
+                )?;
+            }
+            let finalizer_json = serde_json::to_string(record)?;
+            let initial_volumes_json = serde_json::to_string(&record.initial_volumes)?;
+            let staged_volumes_json = serde_json::to_string(&record.staged_volumes)?;
+            let purged_volumes_json = serde_json::to_string(&record.purged_volumes)?;
+            store.conn.execute(
+                "INSERT INTO teardown_finalizers (
+                    operation_key, schema_version, request_id, idempotency_key,
+                    request_digest, session_id, reconcile_operation_id, project_id,
+                    environment_id, machine_id, machine_incarnation_id, stack_name,
+                    remove_volumes, changed_actions, actions_hash, desired_state_digest,
+                    initial_volumes_json, initial_disk_image, initial_runtime_present,
+                    runtime_shutdown, staged_volumes_json, purged_volumes_json,
+                    disk_staged, disk_purged, status, receipt_id, finalizer_json,
+                    created_at, updated_at, completed_at
+                 ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
+                    ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20,
+                    ?21, ?22, ?23, ?24, ?25, NULL, ?26, ?27, ?28, NULL
+                 )",
+                params![
+                    record.operation_key,
+                    i64::from(record.schema_version),
+                    record.request_id,
+                    record.idempotency_key,
+                    record.request_digest,
+                    record.session_id,
+                    record.reconcile_operation_id,
+                    record.scope.project_id.as_str(),
+                    record.scope.environment_id.as_str(),
+                    record.scope.machine_id.as_str(),
+                    record.scope.machine_incarnation_id.as_str(),
+                    record.scope.stack_id,
+                    record.remove_volumes,
+                    i64::from(record.changed_actions),
+                    record.actions_hash,
+                    record.desired_state_digest,
+                    initial_volumes_json,
+                    record.initial_disk_image,
+                    record.initial_runtime_present,
+                    record.runtime_shutdown,
+                    staged_volumes_json,
+                    purged_volumes_json,
+                    record.disk_staged,
+                    record.disk_purged,
+                    record.status.as_str(),
+                    finalizer_json,
+                    i64::try_from(record.created_at).map_err(|_| StackError::InvalidSpec(
+                        "teardown finalizer created_at exceeds SQLite range".to_string()
+                    ))?,
+                    i64::try_from(record.updated_at).map_err(|_| StackError::InvalidSpec(
+                        "teardown finalizer updated_at exceeds SQLite range".to_string()
+                    ))?,
+                ],
+            )?;
+            Ok(record.clone())
+        })
+    }
+
+    /// Compare-and-swap monotonic runtime/filesystem milestones.
+    pub fn save_teardown_finalizer_progress(
+        &self,
+        record: &TeardownFinalizer,
+    ) -> Result<(), StackError> {
+        validate_teardown_finalizer(record)?;
+        if record.status != TeardownFinalizerStatus::Prepared {
+            return Err(StackError::InvalidSpec(
+                "teardown progress update must remain prepared".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            let existing = store
+                .load_teardown_finalizer(&record.operation_key)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "teardown finalizer progress has no reserved intent".to_string(),
+                    )
+                })?;
+            let monotonic = teardown_finalizer_identity_matches(&existing, record)
+                && existing.status == TeardownFinalizerStatus::Prepared
+                && (!existing.runtime_shutdown || record.runtime_shutdown)
+                && existing
+                    .staged_volumes
+                    .iter()
+                    .all(|value| record.staged_volumes.binary_search(value).is_ok())
+                && existing
+                    .purged_volumes
+                    .iter()
+                    .all(|value| record.purged_volumes.binary_search(value).is_ok())
+                && (!existing.disk_staged || record.disk_staged)
+                && (!existing.disk_purged || record.disk_purged)
+                && record.updated_at >= existing.updated_at;
+            if !monotonic {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "teardown finalizer progress is stale or changes immutable input"
+                        .to_string(),
+                });
+            }
+            let old_json = serde_json::to_string(&existing)?;
+            let new_json = serde_json::to_string(record)?;
+            let changed = store.conn.execute(
+                "UPDATE teardown_finalizers
+                 SET runtime_shutdown = ?1, staged_volumes_json = ?2,
+                     purged_volumes_json = ?3, disk_staged = ?4, disk_purged = ?5,
+                     finalizer_json = ?6, updated_at = ?7
+                 WHERE operation_key = ?8 AND status = 'prepared' AND finalizer_json = ?9",
+                params![
+                    record.runtime_shutdown,
+                    serde_json::to_string(&record.staged_volumes)?,
+                    serde_json::to_string(&record.purged_volumes)?,
+                    record.disk_staged,
+                    record.disk_purged,
+                    new_json,
+                    i64::try_from(record.updated_at).map_err(|_| StackError::InvalidSpec(
+                        "teardown finalizer updated_at exceeds SQLite range".to_string()
+                    ))?,
+                    record.operation_key,
+                    old_json,
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "teardown finalizer progress compare-and-swap lost".to_string(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    fn complete_teardown_finalizer_in_transaction(
+        &self,
+        completion: &TeardownFinalizationCommit<'_>,
+    ) -> Result<(), StackError> {
+        let record = completion.finalizer;
+        validate_teardown_finalizer(record)?;
+        if !matches!(
+            completion.event,
+            StackEvent::StackDestroyed { stack_name }
+                if stack_name == &record.scope.stack_id
+        ) {
+            return Err(StackError::InvalidSpec(
+                "teardown terminal event does not match exact stack".to_string(),
+            ));
+        }
+        if record.status != TeardownFinalizerStatus::Completed
+            || !record.runtime_shutdown
+            || record.staged_volumes != record.initial_volumes
+            || record.purged_volumes != record.initial_volumes
+            || (record.initial_disk_image && !record.disk_staged)
+            || (record.initial_disk_image && !record.disk_purged)
+        {
+            return Err(StackError::InvalidSpec(
+                "terminal teardown requires runtime inspection and every original filesystem item logically detached"
+                    .to_string(),
+            ));
+        }
+        let existing = self
+            .load_teardown_finalizer(&record.operation_key)?
+            .ok_or_else(|| {
+                StackError::InvalidSpec("terminal teardown has no reserved finalizer".to_string())
+            })?;
+        if existing.status != TeardownFinalizerStatus::Prepared
+            || !teardown_finalizer_identity_matches(&existing, record)
+            || existing.runtime_shutdown != record.runtime_shutdown
+            || existing.staged_volumes != record.staged_volumes
+            || existing.purged_volumes != record.purged_volumes
+            || existing.disk_staged != record.disk_staged
+            || existing.disk_purged != record.disk_purged
+        {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: "terminal teardown does not match exact durable progress".to_string(),
+            });
+        }
+        let receipt = record.receipt.as_ref().ok_or_else(|| {
+            StackError::InvalidSpec("completed teardown finalizer has no receipt".to_string())
+        })?;
+        let response_json = record.response_json.as_deref().ok_or_else(|| {
+            StackError::InvalidSpec("completed teardown finalizer has no response".to_string())
+        })?;
+        if let Some(idempotency) = completion.idempotency {
+            if record.idempotency_key.as_deref() != Some(idempotency.key.as_str())
+                || idempotency.operation != "teardown_stack"
+                || idempotency.request_hash != record.request_digest
+                || idempotency.response_json != response_json
+            {
+                return Err(StackError::InvalidSpec(
+                    "teardown idempotency result does not match finalizer output".to_string(),
+                ));
+            }
+        } else if record.idempotency_key.is_some() {
+            return Err(StackError::InvalidSpec(
+                "idempotency-key teardown requires an atomic idempotency result".to_string(),
+            ));
+        }
+
+        let metadata_json = serde_json::to_string(&receipt.metadata)?;
+        self.conn.execute(
+            "INSERT INTO receipt_state (
+                receipt_id, operation, entity_id, entity_type, request_id,
+                status, created_at, metadata_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                receipt.receipt_id,
+                receipt.operation,
+                receipt.entity_id,
+                receipt.entity_type,
+                receipt.request_id,
+                receipt.status,
+                i64::try_from(receipt.created_at).map_err(|_| StackError::InvalidSpec(
+                    "teardown receipt created_at exceeds SQLite range".to_string()
+                ))?,
+                metadata_json,
+            ],
+        )?;
+        if let Some(idempotency) = completion.idempotency {
+            let changed = self.conn.execute(
+                "UPDATE idempotency_keys
+                 SET response_json = ?1, status_code = ?2, expires_at = ?3
+                 WHERE key = ?4 AND operation = ?5 AND request_hash = ?6
+                   AND response_json = ?7 AND status_code = 102",
+                params![
+                    idempotency.response_json,
+                    i64::from(idempotency.status_code),
+                    i64::try_from(idempotency.expires_at).map_err(|_| StackError::InvalidSpec(
+                        "teardown idempotency expires_at exceeds SQLite range".to_string()
+                    ))?,
+                    idempotency.key,
+                    idempotency.operation,
+                    idempotency.request_hash,
+                    teardown_idempotency_pending_value(&record.operation_key),
+                ],
+            )?;
+            if changed != 1 {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "teardown idempotency terminal compare-and-swap lost".to_string(),
+                });
+            }
+        }
+        self.persist_event(&record.scope.stack_id, completion.event)?;
+        let old_json = serde_json::to_string(&existing)?;
+        let completed_json = serde_json::to_string(record)?;
+        let changed = self.conn.execute(
+            "UPDATE teardown_finalizers
+             SET status = 'completed', receipt_id = ?1, finalizer_json = ?2,
+                 updated_at = ?3, completed_at = ?4
+             WHERE operation_key = ?5 AND status = 'prepared' AND finalizer_json = ?6",
+            params![
+                receipt.receipt_id,
+                completed_json,
+                i64::try_from(record.updated_at).map_err(|_| StackError::InvalidSpec(
+                    "teardown finalizer updated_at exceeds SQLite range".to_string()
+                ))?,
+                record
+                    .completed_at
+                    .and_then(|value| i64::try_from(value).ok()),
+                record.operation_key,
+                old_json,
+            ],
+        )?;
+        if changed != 1 {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: "teardown finalizer terminal compare-and-swap lost".to_string(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Finish a prepared finalizer whose exact reconcile remove session was
+    /// already committed before a process crash. No runtime or filesystem
+    /// effect is performed here; all broad-effect milestones must already be
+    /// durable and every exact action audit must be successfully terminal.
+    pub fn complete_terminal_teardown_finalizer(
+        &self,
+        finalizer: &TeardownFinalizer,
+        idempotency: Option<&IdempotencyRecord>,
+        event: &StackEvent,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let session = store
+                .load_reconcile_session(&finalizer.session_id)?
+                .ok_or_else(|| {
+                    StackError::InvalidSpec(
+                        "terminal teardown finalizer references a missing reconcile session"
+                            .to_string(),
+                    )
+                })?;
+            if session.stack_name != finalizer.scope.stack_id
+                || session.operation_id != finalizer.reconcile_operation_id
+                || session.status != ReconcileSessionStatus::Completed
+                || session.next_action_index != session.total_actions
+                || session.total_actions
+                    != usize::try_from(finalizer.changed_actions).map_err(|_| {
+                        StackError::InvalidSpec(
+                            "teardown changed_actions cannot be represented as an action count"
+                                .to_string(),
+                        )
+                    })?
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "terminal teardown reconcile identity is not exact".to_string(),
+                });
+            }
+            let actions = store.load_reconcile_session_actions(&session.session_id)?;
+            let audits = store.load_audit_log_for_session(&session.session_id)?;
+            if crate::reconcile::compute_actions_hash(&actions) != finalizer.actions_hash
+                || audits.len() != actions.len()
+                || audits.iter().any(|audit| audit.status != "completed")
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "terminal teardown action/audit evidence is incomplete".to_string(),
+                });
+            }
+            store.complete_teardown_finalizer_in_transaction(&TeardownFinalizationCommit {
+                finalizer,
+                idempotency,
+                event,
+            })
+        })?;
+        self.notify_event(event);
+        Ok(())
+    }
+
+    /// Atomically complete a stack-wide teardown that had no service actions.
+    /// Runtime and filesystem authority still comes from the prepared finalizer.
+    pub fn complete_effect_only_teardown_finalizer(
+        &self,
+        finalizer: &TeardownFinalizer,
+        idempotency: Option<&IdempotencyRecord>,
+        event: &StackEvent,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            if finalizer.changed_actions != 0
+                || finalizer.actions_hash != crate::reconcile::compute_actions_hash(&[])
+                || store
+                    .load_reconcile_session(&finalizer.session_id)?
+                    .is_some()
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: "effect-only teardown has unexpected reconcile action evidence"
+                        .to_string(),
+                });
+            }
+            store.complete_teardown_finalizer_in_transaction(&TeardownFinalizationCommit {
+                finalizer,
+                idempotency,
+                event,
+            })
+        })?;
+        self.notify_event(event);
+        Ok(())
+    }
+
     // ── Receipt persistence (agent-a03881b1's complete version) ──
 
     /// Persist a receipt for a completed mutating operation.
@@ -3922,6 +4829,22 @@ impl StateStore {
 
     /// Delete a receipt by identifier.
     pub fn delete_receipt(&self, receipt_id: &str) -> Result<(), StackError> {
+        let protected: bool = self.conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM teardown_finalizers
+                WHERE receipt_id = ?1 AND status = 'completed'
+             )",
+            params![receipt_id],
+            |row| row.get(0),
+        )?;
+        if protected {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "receipt `{receipt_id}` is protected by durable teardown replay evidence"
+                ),
+            });
+        }
         self.conn.execute(
             "DELETE FROM receipt_state WHERE receipt_id = ?1",
             params![receipt_id],
@@ -3939,10 +4862,21 @@ impl StateStore {
         let (age_deleted, count_deleted) = Self::compute_receipt_gc_plan(&receipts, policy, now);
         let age_set: std::collections::HashSet<_> = age_deleted.into_iter().collect();
         let count_set: std::collections::HashSet<_> = count_deleted.into_iter().collect();
+        let mut protected_stmt = self.conn.prepare(
+            "SELECT receipt_id FROM teardown_finalizers
+             WHERE status = 'completed' AND receipt_id IS NOT NULL",
+        )?;
+        let protected_rows = protected_stmt.query_map([], |row| row.get::<_, String>(0))?;
+        let mut protected = std::collections::HashSet::new();
+        for receipt_id in protected_rows {
+            protected.insert(receipt_id?);
+        }
 
         let mut states = HashMap::new();
         for receipt in receipts {
-            let gc_reason = if age_set.contains(&receipt.receipt_id) {
+            let gc_reason = if protected.contains(&receipt.receipt_id) {
+                None
+            } else if age_set.contains(&receipt.receipt_id) {
                 Some(RetentionGcReason::AgeLimit)
             } else if count_set.contains(&receipt.receipt_id) {
                 Some(RetentionGcReason::CountLimit)
@@ -3983,8 +4917,22 @@ impl StateStore {
         now: u64,
     ) -> Result<ReceiptGcReport, StackError> {
         let receipts = self.list_receipts()?;
-        let (deleted_by_age, deleted_by_count) =
+        let (mut deleted_by_age, mut deleted_by_count) =
             Self::compute_receipt_gc_plan(&receipts, policy, now);
+        let is_protected = |receipt_id: &str| -> Result<bool, StackError> {
+            self.conn
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM teardown_finalizers
+                        WHERE receipt_id = ?1 AND status = 'completed'
+                     )",
+                    params![receipt_id],
+                    |row| row.get(0),
+                )
+                .map_err(Into::into)
+        };
+        deleted_by_age.retain(|receipt_id| !is_protected(receipt_id).unwrap_or(true));
+        deleted_by_count.retain(|receipt_id| !is_protected(receipt_id).unwrap_or(true));
         let to_delete: Vec<String> = deleted_by_age
             .iter()
             .chain(deleted_by_count.iter())

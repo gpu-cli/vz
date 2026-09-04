@@ -622,14 +622,20 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         if all_removes_succeeded {
             Ok(ClaimedTeardownAdmission::Ready(Box::new(pending)))
         } else {
-            Ok(ClaimedTeardownAdmission::Failed(
-                self.commit_claimed_teardown_batch(pending)?,
-            ))
+            // A failed broad teardown effect is retryable under this exact
+            // durable claim. Keep the session and its started audits active so
+            // an identical request can replay the remove-only batch. Marking
+            // the session Failed here would discard reconcile progress while
+            // the prepared teardown finalizer continued to fence the workload,
+            // permanently wedging every exact retry.
+            Ok(ClaimedTeardownAdmission::Failed(pending.result))
         }
     }
 
-    /// Commit a previously executed teardown after its broad finalizer succeeds.
-    pub fn commit_claimed_teardown_batch(
+    /// Test-only escape hatch for verifying the underlying claimed-batch commit.
+    /// Production teardown must use [`Self::commit_claimed_teardown_finalized`].
+    #[cfg(test)]
+    pub(crate) fn commit_claimed_teardown_batch(
         &mut self,
         pending: PendingClaimedTeardown,
     ) -> Result<ExecutionResult, StackError> {
@@ -664,6 +670,63 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 outcomes: &pending.result.outcomes,
             },
         )?;
+        Self::require_exact_claimed_teardown_commit(&pending, &commit)?;
+        Ok(pending.result)
+    }
+
+    /// Atomically terminalize the exact reconcile claims with the stack event,
+    /// immutable receipt/response, and optional idempotency result.
+    pub fn commit_claimed_teardown_finalized(
+        &mut self,
+        pending: PendingClaimedTeardown,
+        finalizer: &TeardownFinalizer,
+        idempotency: Option<&IdempotencyRecord>,
+        event: &StackEvent,
+    ) -> Result<ExecutionResult, StackError> {
+        if !self.scoped_cleanup_only {
+            return Err(super::scope_state_conflict(
+                "claimed teardown finalization requires cleanup-only authority",
+            ));
+        }
+        let authority = self.scoped_authority.as_ref().ok_or_else(|| {
+            super::scope_state_conflict("claimed teardown finalization requires scoped authority")
+        })?;
+        if authority.scope.stack_id != pending.stack_name || finalizer.scope != authority.scope {
+            return Err(super::scope_state_conflict(
+                "claimed teardown finalization authority does not match its exact workload",
+            ));
+        }
+        self.require_scoped_batch_manifest(
+            &pending.spec,
+            &pending.actions,
+            &pending.session_id,
+            &pending.operation_id,
+            pending.first_action_index,
+        )?;
+        let commit = self.store.commit_claimed_teardown_finalized(
+            crate::state_store::ClaimedTeardownCommit {
+                claims: &pending.claims,
+                session_id: &pending.session_id,
+                stack_name: &pending.stack_name,
+                operation_id: &pending.operation_id,
+                expected_cursor: pending.first_action_index,
+                actions: &pending.actions,
+                outcomes: &pending.result.outcomes,
+            },
+            &crate::state_store::TeardownFinalizationCommit {
+                finalizer,
+                idempotency,
+                event,
+            },
+        )?;
+        Self::require_exact_claimed_teardown_commit(&pending, &commit)?;
+        Ok(pending.result)
+    }
+
+    fn require_exact_claimed_teardown_commit(
+        pending: &PendingClaimedTeardown,
+        commit: &ReconcileBatchCommit,
+    ) -> Result<(), StackError> {
         let successful_prefix = pending
             .result
             .outcomes
@@ -697,7 +760,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 "claimed teardown commit did not prove its exact terminal result",
             ));
         }
-        Ok(pending.result)
+        Ok(())
     }
 
     fn reconstruct_terminal_claimed_result(

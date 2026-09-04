@@ -13,11 +13,12 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use vz_runtime_contract::{
     Build, BuildSpec, BuildState, Checkpoint, CheckpointClass, CheckpointFileEntry,
     CheckpointState, Container, ContainerGenerationOwnership, ContainerSpec, ContainerState,
-    Execution, ExecutionSpec, ExecutionState, Lease, LeaseState, MachineErrorCode, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState,
+    Execution, ExecutionSpec, ExecutionState, Lease, LeaseState, MachineErrorCode,
+    MachineWorkloadScope, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
 };
 
 use crate::StackSpec;
@@ -350,6 +351,82 @@ pub(crate) struct ClaimedTeardownCommit<'a> {
     pub(crate) outcomes: &'a [crate::executor::IndexedActionOutcome],
 }
 
+pub(crate) struct TeardownFinalizationCommit<'a> {
+    pub(crate) finalizer: &'a TeardownFinalizer,
+    pub(crate) idempotency: Option<&'a IdempotencyRecord>,
+    pub(crate) event: &'a StackEvent,
+}
+
+/// Storage schema for one durable stack teardown finalizer record.
+pub const TEARDOWN_FINALIZER_SCHEMA_VERSION: u32 = 1;
+
+/// Derive the immutable receipt identifier for one exact teardown operation.
+pub fn teardown_receipt_id(operation_key: &str, request_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in ["vz-teardown-receipt-v1", operation_key, request_digest] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("rcp-teardown-{:x}", hasher.finalize())
+}
+
+/// Durable phase of a stack-wide teardown finalizer.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TeardownFinalizerStatus {
+    /// Immutable inputs are frozen and effects may be resumed by inspection.
+    Prepared,
+    /// Reconcile claims, event, receipt, and response were committed together.
+    Completed,
+}
+
+impl TeardownFinalizerStatus {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Prepared => "prepared",
+            Self::Completed => "completed",
+        }
+    }
+}
+
+/// Durable, replayable state for one exact stack teardown request.
+///
+/// Initial observations and counters are immutable. Filesystem lists record a
+/// monotonic two-step logical detach (rename to an operation-owned tombstone)
+/// and physical purge, so a restart can resolve every crash window by exact
+/// source/tombstone inspection without recomputing the original result.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct TeardownFinalizer {
+    pub schema_version: u32,
+    pub operation_key: String,
+    pub request_id: String,
+    pub idempotency_key: Option<String>,
+    pub request_digest: String,
+    pub session_id: String,
+    pub reconcile_operation_id: String,
+    pub scope: MachineWorkloadScope,
+    pub remove_volumes: bool,
+    pub changed_actions: u32,
+    pub actions_hash: String,
+    pub desired_state_digest: String,
+    pub initial_volumes: Vec<String>,
+    pub initial_disk_image: bool,
+    pub initial_runtime_present: bool,
+    pub runtime_shutdown: bool,
+    pub staged_volumes: Vec<String>,
+    pub purged_volumes: Vec<String>,
+    pub disk_staged: bool,
+    pub disk_purged: bool,
+    pub status: TeardownFinalizerStatus,
+    pub receipt: Option<Receipt>,
+    /// Exact serialized protobuf-JSON response returned to every replay.
+    pub response_json: Option<String>,
+    pub created_at: u64,
+    pub updated_at: u64,
+    pub completed_at: Option<u64>,
+}
+
 /// A single audit entry from the reconcile audit log.
 ///
 /// Each action in a reconcile session produces one entry when started
@@ -467,7 +544,7 @@ pub struct ImageRecord {
 
 /// Record of a completed mutating operation, providing a durable receipt
 /// that clients can retrieve for auditability and idempotent retry verification.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Receipt {
     /// Unique receipt identifier (e.g. `rcp-{uuid}`).
     pub receipt_id: String,
@@ -1032,7 +1109,8 @@ impl StateStore {
                 store.create_replica_schema_v5()?;
                 store.create_reconcile_schema_v6()?;
                 store.create_claim_schema_v7()?;
-                store.validate_v7_schema()?;
+                store.create_teardown_finalizer_schema_v8()?;
+                store.validate_v8_schema()?;
                 store.set_schema_version(topology::STORE_SCHEMA_VERSION)?;
                 Ok(())
             });
@@ -1059,32 +1137,41 @@ impl StateStore {
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
-                self.migrate_claim_v6_to_v7()
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
-                self.migrate_claim_v6_to_v7()
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
             }
             3 => {
                 self.migrate_stack_journal_v3_to_v4()?;
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
-                self.migrate_claim_v6_to_v7()
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
             }
             4 => {
                 self.migrate_replica_v4_to_v5()?;
                 self.migrate_reconcile_v5_to_v6()?;
-                self.migrate_claim_v6_to_v7()
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
             }
             5 => {
                 self.migrate_reconcile_v5_to_v6()?;
-                self.migrate_claim_v6_to_v7()
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
             }
-            6 => self.migrate_claim_v6_to_v7(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v7_schema(),
+            6 => {
+                self.migrate_claim_v6_to_v7()?;
+                self.migrate_teardown_finalizer_v7_to_v8()
+            }
+            7 => self.migrate_teardown_finalizer_v7_to_v8(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v8_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",
@@ -1354,7 +1441,8 @@ impl StateStore {
              VALUES (?1, ?2)
              ON CONFLICT(stack_name) DO UPDATE SET
                 spec_json = excluded.spec_json,
-                updated_at = datetime('now')",
+                updated_at = datetime('now')
+             WHERE desired_state.spec_json IS NOT excluded.spec_json",
             params![stack_name, json],
         )?;
         Ok(())

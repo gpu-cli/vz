@@ -43,6 +43,7 @@ pub struct TestRuntimeBackend {
     next_build_seq: AtomicU64,
     next_generation_seq: AtomicU64,
     exact_generation_supported: AtomicBool,
+    fail_next_generation_cleanup: AtomicBool,
     fail_next_shared_vm_shutdown: AtomicBool,
     shared_vm_shutdown_count: AtomicU64,
     shared_vms: Mutex<HashSet<String>>,
@@ -53,6 +54,12 @@ pub struct TestRuntimeBackend {
 }
 
 impl TestRuntimeBackend {
+    #[cfg(test)]
+    pub(crate) fn fail_next_generation_cleanup(&self) {
+        self.fail_next_generation_cleanup
+            .store(true, Ordering::SeqCst);
+    }
+
     #[cfg(test)]
     pub(crate) fn fail_next_shared_vm_shutdown(&self) {
         self.fail_next_shared_vm_shutdown
@@ -709,6 +716,14 @@ impl RuntimeBackend for TestRuntimeBackend {
             return ready(Err(Self::unsupported_operation(
                 "stop_and_remove_container_generation",
                 "test backend exact generation lifecycle is disabled",
+            )));
+        }
+        if self
+            .fail_next_generation_cleanup
+            .swap(false, Ordering::SeqCst)
+        {
+            return ready(Err(RuntimeError::InvalidConfig(
+                "injected exact generation cleanup failure".to_string(),
             )));
         }
         ready(self.cleanup_generation_internal(&ownership))

@@ -355,6 +355,17 @@ pub struct VolumeManager {
     stack_data_dir: PathBuf,
 }
 
+/// Exact filesystem observation for a teardown-owned resource.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeardownPathState {
+    /// The live source still exists and no operation tombstone exists.
+    Source,
+    /// The source was atomically detached into the operation tombstone.
+    Tombstone,
+    /// Neither source nor tombstone exists.
+    Missing,
+}
+
 impl VolumeManager {
     /// Create a new volume manager for the given stack data directory.
     ///
@@ -454,20 +465,49 @@ impl VolumeManager {
 
     /// List all volume directories that currently exist on disk.
     pub fn list_volumes(&self) -> Result<Vec<String>, StackError> {
-        if !self.volumes_dir.exists() {
-            return Ok(Vec::new());
+        match std::fs::symlink_metadata(&self.volumes_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(error.into()),
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                return Err(StackError::InvalidSpec(format!(
+                    "volume inventory root `{}` is not a real directory",
+                    self.volumes_dir.display()
+                )));
+            }
+            Ok(_) => {}
         }
         let mut names = Vec::new();
         for entry in std::fs::read_dir(&self.volumes_dir)? {
             let entry = entry?;
-            if entry.file_type()?.is_dir() {
-                if let Some(name) = entry.file_name().to_str() {
-                    names.push(name.to_string());
-                }
+            let name = entry.file_name().into_string().map_err(|_| {
+                StackError::InvalidSpec(format!(
+                    "volume inventory `{}` contains a non-UTF-8 entry",
+                    self.volumes_dir.display()
+                ))
+            })?;
+            Self::checked_volume_name(&name)?;
+            let file_type = entry.file_type()?;
+            if file_type.is_symlink() || !file_type.is_dir() {
+                return Err(StackError::InvalidSpec(format!(
+                    "volume inventory entry `{}` is not a real directory",
+                    entry.path().display()
+                )));
             }
+            names.push(name);
         }
         names.sort();
         Ok(names)
+    }
+
+    /// Capture the exact initial storage inventory used by a teardown.
+    /// Malformed entries, symlinks, and unexpected object types fail closed.
+    pub fn strict_teardown_inventory(&self) -> Result<(Vec<String>, bool), StackError> {
+        if !Self::validate_existing_directory(&self.stack_data_dir)? {
+            return Ok((Vec::new(), false));
+        }
+        let volumes = self.list_volumes()?;
+        let disk_present = Self::checked_path_exists(&self.disk_image_path(), false)?;
+        Ok((volumes, disk_present))
     }
 
     /// Path to the persistent disk image for named volumes.
@@ -511,6 +551,349 @@ impl VolumeManager {
         Ok(true)
     }
 
+    fn teardown_root(&self, operation_token: &str) -> Result<PathBuf, StackError> {
+        if operation_token.is_empty()
+            || operation_token.len() > 128
+            || !operation_token
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err(StackError::InvalidSpec(
+                "teardown filesystem token must be 1..=128 safe ASCII bytes".to_string(),
+            ));
+        }
+        Ok(self
+            .stack_data_dir
+            .join(".teardown-finalizers")
+            .join(operation_token))
+    }
+
+    fn checked_volume_name(name: &str) -> Result<(), StackError> {
+        let mut components = Path::new(name).components();
+        if name.is_empty()
+            || name
+                .bytes()
+                .any(|byte| byte == b'/' || byte == b'\\' || byte == 0)
+            || !matches!(components.next(), Some(std::path::Component::Normal(_)))
+            || components.next().is_some()
+        {
+            return Err(StackError::InvalidSpec(format!(
+                "invalid teardown volume name `{name}`"
+            )));
+        }
+        Ok(())
+    }
+
+    fn checked_path_exists(path: &Path, directory: bool) -> Result<bool, StackError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() => Err(StackError::InvalidSpec(
+                format!("teardown path `{}` must not be a symlink", path.display()),
+            )),
+            Ok(metadata) if directory && !metadata.is_dir() => {
+                Err(StackError::InvalidSpec(format!(
+                    "teardown volume path `{}` is not a directory",
+                    path.display()
+                )))
+            }
+            Ok(metadata) if !directory && !metadata.is_file() => {
+                Err(StackError::InvalidSpec(format!(
+                    "teardown disk path `{}` is not a regular file",
+                    path.display()
+                )))
+            }
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn exact_teardown_state(
+        source: &Path,
+        tombstone: &Path,
+        directory: bool,
+    ) -> Result<TeardownPathState, StackError> {
+        match (
+            Self::checked_path_exists(source, directory)?,
+            Self::checked_path_exists(tombstone, directory)?,
+        ) {
+            (true, false) => Ok(TeardownPathState::Source),
+            (false, true) => Ok(TeardownPathState::Tombstone),
+            (false, false) => Ok(TeardownPathState::Missing),
+            (true, true) => Err(StackError::InvalidSpec(format!(
+                "teardown source `{}` and tombstone `{}` both exist",
+                source.display(),
+                tombstone.display()
+            ))),
+        }
+    }
+
+    fn fsync_directory(path: &Path) -> Result<(), StackError> {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
+            return Err(StackError::InvalidSpec(format!(
+                "teardown parent `{}` is not a real directory",
+                path.display()
+            )));
+        }
+        std::fs::File::open(path)?.sync_all()?;
+        Ok(())
+    }
+
+    fn validate_existing_directory(path: &Path) -> Result<bool, StackError> {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                Err(StackError::InvalidSpec(format!(
+                    "teardown ancestor `{}` is not a real directory",
+                    path.display()
+                )))
+            }
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn validate_teardown_ancestry(
+        &self,
+        operation_token: &str,
+        include_volumes: bool,
+    ) -> Result<(), StackError> {
+        if !Self::validate_existing_directory(&self.stack_data_dir)? {
+            return Err(StackError::InvalidSpec(format!(
+                "stack data root `{}` does not exist",
+                self.stack_data_dir.display()
+            )));
+        }
+        if include_volumes {
+            let _ = Self::validate_existing_directory(&self.volumes_dir)?;
+        }
+        let teardown_base = self.stack_data_dir.join(".teardown-finalizers");
+        if Self::validate_existing_directory(&teardown_base)? {
+            let operation_root = self.teardown_root(operation_token)?;
+            if Self::validate_existing_directory(&operation_root)? && include_volumes {
+                let _ = Self::validate_existing_directory(&operation_root.join("volumes"))?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fn rename_noreplace(source: &Path, tombstone: &Path) -> Result<(), StackError> {
+        rustix::fs::renameat_with(
+            rustix::fs::CWD,
+            source,
+            rustix::fs::CWD,
+            tombstone,
+            rustix::fs::RenameFlags::NOREPLACE,
+        )
+        .map_err(|error| {
+            let error = std::io::Error::from(error);
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::DirectoryNotEmpty
+            ) {
+                StackError::InvalidSpec(format!(
+                    "teardown tombstone `{}` already exists",
+                    tombstone.display()
+                ))
+            } else {
+                error.into()
+            }
+        })
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn rename_noreplace(_source: &Path, _tombstone: &Path) -> Result<(), StackError> {
+        Err(StackError::InvalidSpec(
+            "atomic no-replace teardown detach is not implemented on this host".to_string(),
+        ))
+    }
+
+    fn create_teardown_dir_all_synced(&self, path: &Path) -> Result<(), StackError> {
+        let relative = path.strip_prefix(&self.stack_data_dir).map_err(|_| {
+            StackError::InvalidSpec("teardown directory escaped stack data root".to_string())
+        })?;
+        Self::fsync_directory(&self.stack_data_dir)?;
+        let mut current = self.stack_data_dir.clone();
+        for component in relative.components() {
+            if !matches!(component, std::path::Component::Normal(_)) {
+                return Err(StackError::InvalidSpec(
+                    "teardown directory contains unsafe components".to_string(),
+                ));
+            }
+            let parent = current.clone();
+            current.push(component.as_os_str());
+            match std::fs::create_dir(&current) {
+                Ok(()) => Self::fsync_directory(&parent)?,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    Self::fsync_directory(&current)?;
+                    // A retry can observe the directory after mkdir but before
+                    // the creating process synced the parent entry.
+                    Self::fsync_directory(&parent)?;
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        Ok(())
+    }
+
+    fn volume_teardown_paths(
+        &self,
+        operation_token: &str,
+        name: &str,
+    ) -> Result<(PathBuf, PathBuf), StackError> {
+        Self::checked_volume_name(name)?;
+        let source = self.volumes_dir.join(name);
+        let tombstone = self
+            .teardown_root(operation_token)?
+            .join("volumes")
+            .join(name);
+        Ok((source, tombstone))
+    }
+
+    /// Inspect one immutable-inventory volume without changing it.
+    pub fn inspect_teardown_volume(
+        &self,
+        operation_token: &str,
+        name: &str,
+    ) -> Result<TeardownPathState, StackError> {
+        self.validate_teardown_ancestry(operation_token, true)?;
+        let (source, tombstone) = self.volume_teardown_paths(operation_token, name)?;
+        Self::exact_teardown_state(&source, &tombstone, true)
+    }
+
+    /// Atomically detach one live volume into its same-filesystem tombstone.
+    pub fn stage_teardown_volume(
+        &self,
+        operation_token: &str,
+        name: &str,
+    ) -> Result<TeardownPathState, StackError> {
+        self.validate_teardown_ancestry(operation_token, true)?;
+        let (source, tombstone) = self.volume_teardown_paths(operation_token, name)?;
+        match Self::exact_teardown_state(&source, &tombstone, true)? {
+            TeardownPathState::Source => {
+                let tombstone_parent = tombstone.parent().ok_or_else(|| {
+                    StackError::InvalidSpec("teardown volume tombstone has no parent".to_string())
+                })?;
+                self.create_teardown_dir_all_synced(tombstone_parent)?;
+                if Self::checked_path_exists(&tombstone, true)? {
+                    return Err(StackError::InvalidSpec(
+                        "teardown volume tombstone appeared during detach".to_string(),
+                    ));
+                }
+                Self::rename_noreplace(&source, &tombstone)?;
+                // Persist the destination link before the source removal so a
+                // crash cannot durably lose both names.
+                Self::fsync_directory(tombstone_parent)?;
+                Self::fsync_directory(&self.volumes_dir)?;
+                Ok(TeardownPathState::Tombstone)
+            }
+            TeardownPathState::Tombstone => {
+                Self::fsync_directory(&self.volumes_dir)?;
+                Self::fsync_directory(tombstone.parent().ok_or_else(|| {
+                    StackError::InvalidSpec("teardown volume tombstone has no parent".to_string())
+                })?)?;
+                Ok(TeardownPathState::Tombstone)
+            }
+            TeardownPathState::Missing => Ok(TeardownPathState::Missing),
+        }
+    }
+
+    /// Purge an already-durably-staged volume tombstone.
+    pub fn purge_teardown_volume(
+        &self,
+        operation_token: &str,
+        name: &str,
+    ) -> Result<bool, StackError> {
+        self.validate_teardown_ancestry(operation_token, true)?;
+        let (_, tombstone) = self.volume_teardown_paths(operation_token, name)?;
+        if !Self::checked_path_exists(&tombstone, true)? {
+            if let Some(parent) = tombstone.parent()
+                && Self::checked_path_exists(parent, true)?
+            {
+                Self::fsync_directory(parent)?;
+            }
+            return Ok(false);
+        }
+        std::fs::remove_dir_all(&tombstone)?;
+        Self::fsync_directory(tombstone.parent().ok_or_else(|| {
+            StackError::InvalidSpec("teardown volume tombstone has no parent".to_string())
+        })?)?;
+        Ok(true)
+    }
+
+    fn disk_teardown_paths(&self, operation_token: &str) -> Result<(PathBuf, PathBuf), StackError> {
+        Ok((
+            self.disk_image_path(),
+            self.teardown_root(operation_token)?.join("data.img"),
+        ))
+    }
+
+    /// Inspect the persistent disk source and exact operation tombstone.
+    pub fn inspect_teardown_disk(
+        &self,
+        operation_token: &str,
+    ) -> Result<TeardownPathState, StackError> {
+        self.validate_teardown_ancestry(operation_token, false)?;
+        let (source, tombstone) = self.disk_teardown_paths(operation_token)?;
+        Self::exact_teardown_state(&source, &tombstone, false)
+    }
+
+    /// Atomically detach the persistent disk into its same-filesystem tombstone.
+    pub fn stage_teardown_disk(
+        &self,
+        operation_token: &str,
+    ) -> Result<TeardownPathState, StackError> {
+        self.validate_teardown_ancestry(operation_token, false)?;
+        let (source, tombstone) = self.disk_teardown_paths(operation_token)?;
+        match Self::exact_teardown_state(&source, &tombstone, false)? {
+            TeardownPathState::Source => {
+                let parent = tombstone.parent().ok_or_else(|| {
+                    StackError::InvalidSpec("teardown disk tombstone has no parent".to_string())
+                })?;
+                self.create_teardown_dir_all_synced(parent)?;
+                if Self::checked_path_exists(&tombstone, false)? {
+                    return Err(StackError::InvalidSpec(
+                        "teardown disk tombstone appeared during detach".to_string(),
+                    ));
+                }
+                Self::rename_noreplace(&source, &tombstone)?;
+                // Persist the destination link before the source removal so a
+                // crash cannot durably lose both names.
+                Self::fsync_directory(parent)?;
+                Self::fsync_directory(&self.stack_data_dir)?;
+                Ok(TeardownPathState::Tombstone)
+            }
+            TeardownPathState::Tombstone => {
+                Self::fsync_directory(&self.stack_data_dir)?;
+                Self::fsync_directory(tombstone.parent().ok_or_else(|| {
+                    StackError::InvalidSpec("teardown disk tombstone has no parent".to_string())
+                })?)?;
+                Ok(TeardownPathState::Tombstone)
+            }
+            TeardownPathState::Missing => Ok(TeardownPathState::Missing),
+        }
+    }
+
+    /// Purge an already-durably-staged persistent disk tombstone.
+    pub fn purge_teardown_disk(&self, operation_token: &str) -> Result<bool, StackError> {
+        self.validate_teardown_ancestry(operation_token, false)?;
+        let (_, tombstone) = self.disk_teardown_paths(operation_token)?;
+        if !Self::checked_path_exists(&tombstone, false)? {
+            if let Some(parent) = tombstone.parent()
+                && Self::checked_path_exists(parent, true)?
+            {
+                Self::fsync_directory(parent)?;
+            }
+            return Ok(false);
+        }
+        std::fs::remove_file(&tombstone)?;
+        Self::fsync_directory(tombstone.parent().ok_or_else(|| {
+            StackError::InvalidSpec("teardown disk tombstone has no parent".to_string())
+        })?)?;
+        Ok(true)
+    }
+
     /// Resolve mount specs using this manager's volumes directory.
     pub fn resolve_mounts(
         &self,
@@ -527,6 +910,257 @@ mod tests {
 
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn strict_teardown_inventory_is_sorted_and_includes_regular_disk() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_volume("zeta").unwrap();
+        manager.ensure_volume("alpha").unwrap();
+        manager.ensure_disk_image(Some(64)).unwrap();
+
+        assert_eq!(
+            manager.strict_teardown_inventory().unwrap(),
+            (vec!["alpha".to_string(), "zeta".to_string()], true)
+        );
+    }
+
+    #[test]
+    fn strict_teardown_inventory_treats_absent_stack_storage_as_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(&tmp.path().join("never-created-stack"));
+
+        assert_eq!(
+            manager.strict_teardown_inventory().unwrap(),
+            (Vec::new(), false)
+        );
+    }
+
+    #[test]
+    fn strict_teardown_inventory_rejects_unexpected_volume_object_type() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_volume("database").unwrap();
+        std::fs::write(manager.volumes_dir().join("unexpected-file"), b"decoy").unwrap();
+
+        assert!(
+            manager
+                .strict_teardown_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+    }
+
+    #[test]
+    fn teardown_volume_name_rejects_cross_platform_separators() {
+        assert!(VolumeManager::checked_volume_name("nested/volume").is_err());
+        assert!(VolumeManager::checked_volume_name("nested\\volume").is_err());
+        assert!(VolumeManager::checked_volume_name(".").is_err());
+        assert!(VolumeManager::checked_volume_name("..").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_teardown_inventory_rejects_symlink_entries() {
+        use std::os::unix::fs::symlink;
+
+        let symlink_tmp = tempfile::tempdir().unwrap();
+        let symlink_manager = VolumeManager::new(symlink_tmp.path());
+        symlink_manager.ensure_volume("database").unwrap();
+        symlink(
+            symlink_manager.volumes_dir().join("database"),
+            symlink_manager.volumes_dir().join("alias"),
+        )
+        .unwrap();
+        assert!(symlink_manager.strict_teardown_inventory().is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn strict_teardown_inventory_rejects_non_utf8_entries() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::OsStringExt;
+
+        let utf8_tmp = tempfile::tempdir().unwrap();
+        let utf8_manager = VolumeManager::new(utf8_tmp.path());
+        utf8_manager.ensure_volume("database").unwrap();
+        let malformed = OsString::from_vec(vec![b'b', b'a', b'd', 0xff]);
+        std::fs::create_dir(utf8_manager.volumes_dir().join(malformed)).unwrap();
+        assert!(
+            utf8_manager
+                .strict_teardown_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("non-UTF-8")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_teardown_inventory_rejects_disk_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        let outside = tmp.path().join("outside.img");
+        std::fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, manager.disk_image_path()).unwrap();
+        assert!(manager.strict_teardown_inventory().is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_teardown_inventory_rejects_symlinked_stack_root() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let linked_root = tmp.path().join("linked-stack");
+        symlink(outside.path(), &linked_root).unwrap();
+
+        let manager = VolumeManager::new(&linked_root);
+        assert!(
+            manager
+                .strict_teardown_inventory()
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn teardown_rejects_symlinked_tombstone_ancestry() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_volume("database").unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        symlink(outside.path(), tmp.path().join(".teardown-finalizers")).unwrap();
+
+        assert!(
+            manager
+                .inspect_teardown_volume("operation-symlink", "database")
+                .unwrap_err()
+                .to_string()
+                .contains("not a real directory")
+        );
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn teardown_rename_noreplace_preserves_both_objects_on_collision() {
+        let tmp = tempfile::tempdir().unwrap();
+        let source = tmp.path().join("source");
+        let tombstone = tmp.path().join("tombstone");
+        std::fs::write(&source, b"source-bytes").unwrap();
+        std::fs::write(&tombstone, b"tombstone-bytes").unwrap();
+
+        assert!(VolumeManager::rename_noreplace(&source, &tombstone).is_err());
+        assert_eq!(std::fs::read(source).unwrap(), b"source-bytes");
+        assert_eq!(std::fs::read(tombstone).unwrap(), b"tombstone-bytes");
+    }
+
+    #[test]
+    fn teardown_volume_tombstone_resolves_rename_and_purge_crash_windows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_volume("database").unwrap();
+        std::fs::write(
+            manager.volumes_dir().join("database").join("sentinel"),
+            b"must survive atomic detach",
+        )
+        .unwrap();
+
+        assert_eq!(
+            manager
+                .inspect_teardown_volume("operation-a", "database")
+                .unwrap(),
+            TeardownPathState::Source
+        );
+        assert_eq!(
+            manager
+                .stage_teardown_volume("operation-a", "database")
+                .unwrap(),
+            TeardownPathState::Tombstone
+        );
+        assert_eq!(
+            manager
+                .stage_teardown_volume("operation-a", "database")
+                .unwrap(),
+            TeardownPathState::Tombstone,
+            "retry after rename-before-database-CAS must not repeat the detach"
+        );
+        assert!(
+            manager
+                .purge_teardown_volume("operation-a", "database")
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .purge_teardown_volume("operation-a", "database")
+                .unwrap()
+        );
+        assert_eq!(
+            manager
+                .inspect_teardown_volume("operation-a", "database")
+                .unwrap(),
+            TeardownPathState::Missing
+        );
+    }
+
+    #[test]
+    fn teardown_disk_tombstone_is_exact_and_rejects_ambiguous_dual_presence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_disk_image(Some(64)).unwrap();
+        assert_eq!(
+            manager.stage_teardown_disk("operation-b").unwrap(),
+            TeardownPathState::Tombstone
+        );
+
+        std::fs::write(manager.disk_image_path(), b"foreign replacement").unwrap();
+        assert!(
+            manager
+                .inspect_teardown_disk("operation-b")
+                .unwrap_err()
+                .to_string()
+                .contains("both exist")
+        );
+    }
+
+    #[test]
+    fn teardown_disk_purge_repairs_an_already_missing_tombstone() {
+        let tmp = tempfile::tempdir().unwrap();
+        let manager = VolumeManager::new(tmp.path());
+        manager.ensure_disk_image(Some(64)).unwrap();
+
+        assert_eq!(
+            manager
+                .stage_teardown_disk("operation-purge-retry")
+                .unwrap(),
+            TeardownPathState::Tombstone
+        );
+        assert!(
+            manager
+                .purge_teardown_disk("operation-purge-retry")
+                .unwrap()
+        );
+        assert!(
+            !manager
+                .purge_teardown_disk("operation-purge-retry")
+                .unwrap(),
+            "retry after unlink-before-database-CAS must repair directory durability"
+        );
+        assert_eq!(
+            manager
+                .inspect_teardown_disk("operation-purge-retry")
+                .unwrap(),
+            TeardownPathState::Missing
+        );
+    }
 
     #[test]
     fn resolve_bind_mount() {

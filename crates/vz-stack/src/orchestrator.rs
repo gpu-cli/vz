@@ -413,7 +413,14 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
             // while journal/runtime transitions remain the sole observed-state
             // authority for each exact replica.
             let apply_result = plan_apply(spec, &self.reconcile_store, &health_statuses)?;
-            self.reconcile_store.save_desired_state(&spec.name, spec)?;
+            if let Some(scope) = self.executor.workload_scope() {
+                // Desired intent and even a zero-action apply must respect an
+                // already-prepared teardown for this exact Machine workload.
+                self.reconcile_store
+                    .save_desired_state_unless_prepared_teardown(scope, spec)?;
+            } else {
+                self.reconcile_store.save_desired_state(&spec.name, spec)?;
+            }
             self.reconcile_store.emit_event(
                 &spec.name,
                 &StackEvent::StackApplyStarted {

@@ -3820,7 +3820,85 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
             )
         }
     };
-    let result = executor.commit_claimed_teardown_batch(*replay).unwrap();
+    let prepared = crate::state_store::TeardownFinalizer {
+        schema_version: crate::state_store::TEARDOWN_FINALIZER_SCHEMA_VERSION,
+        operation_key: "req:request-finalize".to_string(),
+        request_id: "request-finalize".to_string(),
+        idempotency_key: None,
+        request_digest: "vztr3-sha256:executor-finalizer".to_string(),
+        session_id: replay.session_id.clone(),
+        reconcile_operation_id: replay.operation_id.clone(),
+        scope: executor.scoped_authority.as_ref().unwrap().scope.clone(),
+        remove_volumes: false,
+        changed_actions: 1,
+        actions_hash: crate::reconcile::compute_actions_hash(&replay.actions),
+        desired_state_digest: "vzs1-sha256:executor-finalizer".to_string(),
+        initial_volumes: Vec::new(),
+        initial_disk_image: false,
+        initial_runtime_present: true,
+        runtime_shutdown: false,
+        staged_volumes: Vec::new(),
+        purged_volumes: Vec::new(),
+        disk_staged: false,
+        disk_purged: false,
+        status: crate::state_store::TeardownFinalizerStatus::Prepared,
+        receipt: None,
+        response_json: None,
+        created_at: 100,
+        updated_at: 100,
+        completed_at: None,
+    };
+    executor
+        .store()
+        .reserve_teardown_finalizer(&prepared)
+        .unwrap();
+    let mut progressed = prepared.clone();
+    progressed.runtime_shutdown = true;
+    progressed.updated_at = 101;
+    executor
+        .store()
+        .save_teardown_finalizer_progress(&progressed)
+        .unwrap();
+    let mut completed = progressed;
+    completed.status = crate::state_store::TeardownFinalizerStatus::Completed;
+    completed.updated_at = 102;
+    completed.completed_at = Some(102);
+    completed.response_json = Some(
+        serde_json::json!({
+            "request_id": "request-finalize",
+            "stack_name": teardown_spec.name.clone(),
+            "changed_actions": 1,
+            "removed_volumes": 0,
+        })
+        .to_string(),
+    );
+    completed.receipt = Some(crate::state_store::Receipt {
+        receipt_id: crate::state_store::teardown_receipt_id(
+            &completed.operation_key,
+            &completed.request_digest,
+        ),
+        operation: "teardown_stack".to_string(),
+        entity_id: teardown_spec.name.clone(),
+        entity_type: "stack".to_string(),
+        request_id: "request-finalize".to_string(),
+        status: "success".to_string(),
+        created_at: 102,
+        metadata: serde_json::json!({
+            "request_digest": completed.request_digest.clone(),
+            "changed_actions": 1,
+            "removed_volumes": 0
+        }),
+    });
+    let result = executor
+        .commit_claimed_teardown_finalized(
+            *replay,
+            &completed,
+            None,
+            &StackEvent::StackDestroyed {
+                stack_name: teardown_spec.name.clone(),
+            },
+        )
+        .unwrap();
     assert!(result.all_succeeded());
     let session = executor
         .store()
@@ -3831,18 +3909,42 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
         session.status,
         crate::state_store::ReconcileSessionStatus::Completed
     );
+    assert_eq!(
+        executor
+            .store()
+            .load_teardown_finalizer("req:request-finalize")
+            .unwrap(),
+        Some(completed)
+    );
+    assert_eq!(executor.store().list_receipts().unwrap().len(), 1);
+    assert_eq!(
+        executor
+            .store()
+            .load_events_since(&teardown_spec.name, 0)
+            .unwrap()
+            .into_iter()
+            .filter(|record| matches!(record.event, StackEvent::StackDestroyed { .. }))
+            .count(),
+        1
+    );
 }
 
 #[test]
-fn scoped_claimed_teardown_failed_remove_is_not_ready_and_commits_failed() {
+fn scoped_claimed_teardown_failed_remove_keeps_exact_claim_active_for_retry() {
     let tmp = tempfile::tempdir().unwrap();
-    let store = StateStore::in_memory().unwrap();
+    let state_path = tmp.path().join("state.db");
+    let store = StateStore::open(&state_path).unwrap();
     let spec = stack("scoped-teardown-failure", vec![svc("web", "nginx:latest")]);
     let (project, scope) = scoped_topology(&spec.name);
     store.save_project_state(&project).unwrap();
     store.reserve_stack_workload_owner(&scope, 1).unwrap();
     store.save_desired_state(&spec.name, &spec).unwrap();
-    let mut executor = make_scoped_executor(MockContainerRuntime::new(), store, tmp.path(), scope);
+    let mut executor = make_scoped_executor(
+        MockContainerRuntime::new(),
+        store,
+        tmp.path(),
+        scope.clone(),
+    );
     let initial = planned_actions(&executor, &spec);
     assert!(
         executor
@@ -3886,9 +3988,57 @@ fn scoped_claimed_teardown_failed_remove_is_not_ready_and_commits_failed() {
         .unwrap();
     assert_eq!(
         session.status,
-        crate::state_store::ReconcileSessionStatus::Failed
+        crate::state_store::ReconcileSessionStatus::Active
     );
     assert_eq!(session.next_action_index, 0);
+    let progress = executor
+        .store()
+        .load_reconcile_progress(&spec.name)
+        .unwrap()
+        .expect("failed teardown retains exact retry progress");
+    assert_eq!(progress.operation_id, session.operation_id);
+    assert_eq!(progress.next_action_index, 0);
+    let audits = executor
+        .store()
+        .load_audit_log_for_session(&session.session_id)
+        .unwrap();
+    assert_eq!(audits.len(), remove_actions.len());
+    assert!(audits.iter().all(|audit| audit.status == "started"));
+
+    drop(executor);
+    let reopened = StateStore::open(&state_path).unwrap();
+    let mut executor =
+        make_scoped_executor(MockContainerRuntime::new(), reopened, tmp.path(), scope);
+    executor.scoped_cleanup_only = true;
+    let retry = executor
+        .begin_claimed_teardown_batch(
+            &spec,
+            &remove_actions,
+            "session-teardown-failure",
+            "operation-teardown-failure",
+            0,
+        )
+        .unwrap();
+    let pending = match retry {
+        ClaimedTeardownAdmission::Ready(pending) => pending,
+        ClaimedTeardownAdmission::Failed(result) => {
+            panic!("exact retry should become ready: {:?}", result.errors)
+        }
+    };
+    assert!(pending.execution_result().all_succeeded());
+
+    let completed = executor.commit_claimed_teardown_batch(*pending).unwrap();
+    assert!(completed.all_succeeded());
+    let terminal = executor
+        .store()
+        .load_reconcile_session("session-teardown-failure")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        terminal.status,
+        crate::state_store::ReconcileSessionStatus::Completed
+    );
+    assert_eq!(terminal.next_action_index, remove_actions.len());
 }
 
 fn assert_claimed_successor_crash_replay(reserve_before_replay: bool) {

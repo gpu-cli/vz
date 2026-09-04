@@ -20,8 +20,9 @@ use crate::network::{PublishedPort, resolve_ports};
 use crate::reconcile::Action;
 use crate::spec::{SecretDef, SecretSource, ServiceSpec, StackSpec};
 use crate::state_store::{
-    ReconcileActionClaim, ReconcileSession, ReconcileSessionStatus, ServiceObservedState,
-    ServicePhase, ServiceReplicaKey, StateStore,
+    IdempotencyRecord, ReconcileActionClaim, ReconcileBatchCommit, ReconcileSession,
+    ReconcileSessionStatus, ServiceObservedState, ServicePhase, ServiceReplicaKey, StateStore,
+    TeardownFinalizer,
 };
 use crate::volume::VolumeManager;
 
@@ -36,7 +37,8 @@ pub(crate) fn is_claimed_teardown_operation(operation_id: &str) -> bool {
     operation_id.starts_with(crate::state_store::CLAIMED_TEARDOWN_OPERATION_PREFIX)
 }
 
-fn claimed_teardown_operation_id(operation_id: &str) -> Result<String, StackError> {
+/// Qualify a caller operation identity for the reserved teardown-finalizer namespace.
+pub fn claimed_teardown_operation_id(operation_id: &str) -> Result<String, StackError> {
     if operation_id.trim().is_empty() || is_claimed_teardown_operation(operation_id) {
         return Err(StackError::InvalidSpec(
             "teardown operation identity must be non-empty and caller-unqualified".to_string(),
@@ -625,7 +627,8 @@ pub struct ExecutionResult {
 ///
 /// The owner may finish stack-wide teardown while the reconcile claims remain
 /// active, then consume this token with
-/// [`StackExecutor::commit_claimed_teardown_batch`].
+/// [`StackExecutor::commit_claimed_teardown_finalized`] so the claims, finalizer,
+/// event, receipt, and idempotency result become terminal atomically.
 #[must_use = "an admitted teardown must be committed only after broad teardown succeeds"]
 pub struct PendingClaimedTeardown {
     stack_name: String,
@@ -642,7 +645,7 @@ pub struct PendingClaimedTeardown {
 pub enum ClaimedTeardownAdmission {
     /// Every remove succeeded; broad teardown may run while this token keeps claims active.
     Ready(Box<PendingClaimedTeardown>),
-    /// At least one remove failed and the failed outcomes were already committed.
+    /// At least one remove failed; the exact claims remain active for retry.
     Failed(ExecutionResult),
 }
 
@@ -862,6 +865,13 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     /// Mutably access the underlying state store.
     pub fn store_mut(&mut self) -> &mut StateStore {
         &mut self.store
+    }
+
+    /// Exact Machine workload scope authorizing this executor, when scoped.
+    pub(crate) fn workload_scope(&self) -> Option<&vz_runtime_contract::MachineWorkloadScope> {
+        self.scoped_authority
+            .as_ref()
+            .map(|authority| &authority.scope)
     }
 
     /// Access the volume manager.

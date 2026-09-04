@@ -4086,6 +4086,7 @@ version = "0.1.0"
 dependencies = [
  "criterion",
  "rusqlite",
+ "rustix 1.1.3",
  "serde",
  "serde_json",
  "serde_yml",

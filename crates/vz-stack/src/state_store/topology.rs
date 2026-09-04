@@ -17,9 +17,10 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 7;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 8;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
 const REPLICA_SCHEMA_VERSION: u32 = 5;
+const CLAIM_SCHEMA_VERSION: u32 = 7;
 
 const REPLICA_SCHEMA_V5_DDL: &str = r#"
 ALTER TABLE stack_container_create_intents
@@ -411,6 +412,120 @@ BEGIN
 END;
 "#;
 
+const TEARDOWN_FINALIZER_SCHEMA_V8_DDL: &str = r#"
+CREATE TABLE teardown_finalizers (
+    operation_key TEXT PRIMARY KEY CHECK(length(trim(operation_key)) BETWEEN 1 AND 512),
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    request_id TEXT NOT NULL CHECK(length(trim(request_id)) BETWEEN 1 AND 256),
+    idempotency_key TEXT UNIQUE
+        CHECK(idempotency_key IS NULL OR length(trim(idempotency_key)) BETWEEN 1 AND 256),
+    request_digest TEXT NOT NULL CHECK(length(trim(request_digest)) > 0),
+    session_id TEXT NOT NULL UNIQUE CHECK(length(trim(session_id)) BETWEEN 1 AND 256),
+    reconcile_operation_id TEXT NOT NULL CHECK(length(trim(reconcile_operation_id)) > 0),
+    project_id TEXT NOT NULL CHECK(length(trim(project_id)) BETWEEN 1 AND 128),
+    environment_id TEXT NOT NULL CHECK(length(trim(environment_id)) BETWEEN 1 AND 128),
+    machine_id TEXT NOT NULL CHECK(length(trim(machine_id)) BETWEEN 1 AND 128),
+    machine_incarnation_id TEXT NOT NULL
+        CHECK(length(trim(machine_incarnation_id)) BETWEEN 1 AND 128),
+    stack_name TEXT NOT NULL CHECK(length(trim(stack_name)) BETWEEN 1 AND 128),
+    remove_volumes INTEGER NOT NULL CHECK(remove_volumes IN (0, 1)),
+    changed_actions INTEGER NOT NULL CHECK(changed_actions >= 0),
+    actions_hash TEXT NOT NULL CHECK(length(trim(actions_hash)) > 0),
+    desired_state_digest TEXT NOT NULL CHECK(length(trim(desired_state_digest)) > 0),
+    initial_volumes_json TEXT NOT NULL CHECK(json_valid(initial_volumes_json)),
+    initial_disk_image INTEGER NOT NULL CHECK(initial_disk_image IN (0, 1)),
+    initial_runtime_present INTEGER NOT NULL CHECK(initial_runtime_present IN (0, 1)),
+    runtime_shutdown INTEGER NOT NULL CHECK(runtime_shutdown IN (0, 1)),
+    staged_volumes_json TEXT NOT NULL CHECK(json_valid(staged_volumes_json)),
+    purged_volumes_json TEXT NOT NULL CHECK(json_valid(purged_volumes_json)),
+    disk_staged INTEGER NOT NULL CHECK(disk_staged IN (0, 1)),
+    disk_purged INTEGER NOT NULL CHECK(disk_purged IN (0, 1)),
+    status TEXT NOT NULL CHECK(status IN ('prepared', 'completed')),
+    receipt_id TEXT UNIQUE,
+    finalizer_json TEXT NOT NULL CHECK(json_valid(finalizer_json)),
+    created_at INTEGER NOT NULL CHECK(created_at >= 0),
+    updated_at INTEGER NOT NULL CHECK(updated_at >= created_at),
+    completed_at INTEGER,
+    FOREIGN KEY(receipt_id) REFERENCES receipt_state(receipt_id) ON DELETE RESTRICT,
+    CHECK(
+        (status = 'prepared' AND receipt_id IS NULL AND completed_at IS NULL) OR
+        (status = 'completed' AND receipt_id IS NOT NULL AND completed_at IS NOT NULL
+            AND completed_at >= updated_at)
+    )
+);
+CREATE INDEX idx_teardown_finalizer_stack
+    ON teardown_finalizers(project_id, environment_id, machine_id, stack_name, status);
+CREATE UNIQUE INDEX teardown_one_active_workload
+    ON teardown_finalizers(
+        project_id, environment_id, machine_id, machine_incarnation_id, stack_name
+    )
+    WHERE status = 'prepared';
+
+CREATE TRIGGER teardown_finalizer_identity_immutable
+BEFORE UPDATE OF
+    operation_key, schema_version, request_id, idempotency_key, request_digest,
+    session_id, reconcile_operation_id, project_id, environment_id, machine_id,
+    machine_incarnation_id, stack_name, remove_volumes, changed_actions,
+    actions_hash, desired_state_digest, initial_volumes_json, initial_disk_image,
+    initial_runtime_present, created_at
+ON teardown_finalizers
+WHEN
+    NEW.operation_key IS NOT OLD.operation_key OR
+    NEW.schema_version IS NOT OLD.schema_version OR
+    NEW.request_id IS NOT OLD.request_id OR
+    NEW.idempotency_key IS NOT OLD.idempotency_key OR
+    NEW.request_digest IS NOT OLD.request_digest OR
+    NEW.session_id IS NOT OLD.session_id OR
+    NEW.reconcile_operation_id IS NOT OLD.reconcile_operation_id OR
+    NEW.project_id IS NOT OLD.project_id OR
+    NEW.environment_id IS NOT OLD.environment_id OR
+    NEW.machine_id IS NOT OLD.machine_id OR
+    NEW.machine_incarnation_id IS NOT OLD.machine_incarnation_id OR
+    NEW.stack_name IS NOT OLD.stack_name OR
+    NEW.remove_volumes IS NOT OLD.remove_volumes OR
+    NEW.changed_actions IS NOT OLD.changed_actions OR
+    NEW.actions_hash IS NOT OLD.actions_hash OR
+    NEW.desired_state_digest IS NOT OLD.desired_state_digest OR
+    NEW.initial_volumes_json IS NOT OLD.initial_volumes_json OR
+    NEW.initial_disk_image IS NOT OLD.initial_disk_image OR
+    NEW.initial_runtime_present IS NOT OLD.initial_runtime_present OR
+    NEW.created_at IS NOT OLD.created_at
+BEGIN
+    SELECT RAISE(ABORT, 'teardown finalizer identity and original inventory are immutable');
+END;
+
+CREATE TRIGGER teardown_finalizer_completed_immutable
+BEFORE UPDATE ON teardown_finalizers
+WHEN OLD.status = 'completed'
+BEGIN
+    SELECT RAISE(ABORT, 'completed teardown finalizer is immutable');
+END;
+
+CREATE TRIGGER teardown_finalizer_delete_restricted
+BEFORE DELETE ON teardown_finalizers
+BEGIN
+    SELECT RAISE(ABORT, 'teardown finalizer is durable replay evidence');
+END;
+
+CREATE TRIGGER teardown_finalizer_receipt_update_restricted
+BEFORE UPDATE ON receipt_state
+WHEN EXISTS (
+    SELECT 1 FROM teardown_finalizers WHERE receipt_id = OLD.receipt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'teardown finalizer receipt is immutable');
+END;
+
+CREATE TRIGGER teardown_finalizer_receipt_delete_restricted
+BEFORE DELETE ON receipt_state
+WHEN EXISTS (
+    SELECT 1 FROM teardown_finalizers WHERE receipt_id = OLD.receipt_id
+)
+BEGIN
+    SELECT RAISE(ABORT, 'teardown finalizer receipt is durable replay evidence');
+END;
+"#;
+
 /// Result of atomically selecting or reserving an Environment for `up`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvironmentUpReservation {
@@ -722,6 +837,11 @@ enum ClaimV7MigrationStage {
     ImmutabilityGuardsCreated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TeardownFinalizerV8MigrationStage {
+    FinalizerSchemaCreated,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -759,6 +879,12 @@ pub(super) enum ReconcileV6MigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum ClaimV7MigrationFailpoint {
     AfterImmutabilityGuardsCreated,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum TeardownFinalizerV8MigrationFailpoint {
+    AfterFinalizerSchemaCreated,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -1070,6 +1196,22 @@ impl StateStore {
         self.validate_schema_against(7, &reference.conn)
     }
 
+    pub(super) fn validate_v8_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+        reference.create_teardown_finalizer_schema_v8()?;
+
+        self.validate_schema_against(8, &reference.conn)
+    }
+
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
         self.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
         self.conn
@@ -1081,6 +1223,11 @@ impl StateStore {
 
     pub(super) fn create_claim_schema_v7(&self) -> Result<(), StackError> {
         self.conn.execute_batch(CLAIM_SCHEMA_V7_DDL)?;
+        Ok(())
+    }
+
+    pub(super) fn create_teardown_finalizer_schema_v8(&self) -> Result<(), StackError> {
+        self.conn.execute_batch(TEARDOWN_FINALIZER_SCHEMA_V8_DDL)?;
         Ok(())
     }
 
@@ -3816,6 +3963,55 @@ impl StateStore {
         self.migrate_claim_v6_to_v7_with_hook(|_| Ok(()))
     }
 
+    pub(super) fn migrate_teardown_finalizer_v7_to_v8(&self) -> Result<(), StackError> {
+        self.migrate_teardown_finalizer_v7_to_v8_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_teardown_finalizer_v7_to_v8_with_hook(
+        &self,
+        mut hook: impl FnMut(TeardownFinalizerV8MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 7 {
+                return Err(StackError::InvalidSpec(format!(
+                    "teardown-finalizer migration requires state schema version 7, found {schema_version}"
+                )));
+            }
+            store.validate_v7_schema()?;
+            store.validate_v7_teardown_finalizer_migration()?;
+            store.create_teardown_finalizer_schema_v8()?;
+            hook(TeardownFinalizerV8MigrationStage::FinalizerSchemaCreated)?;
+            store.validate_v8_schema()?;
+            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
+    fn validate_v7_teardown_finalizer_migration(&self) -> Result<(), StackError> {
+        let mut statement = self.conn.prepare(
+            "SELECT session_id, operation_id, status
+             FROM reconcile_sessions
+             WHERE operation_id LIKE ?1 AND status = 'active'
+             ORDER BY session_id",
+        )?;
+        let pattern = format!("{}%", super::CLAIMED_TEARDOWN_OPERATION_PREFIX);
+        let mut rows = statement.query_map(params![pattern], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?;
+        if let Some(row) = rows.next() {
+            let (session_id, _operation_id, status) = row?;
+            return Err(StackError::InvalidSpec(format!(
+                "v7 teardown session `{session_id}` is {status} without reconstructable finalizer evidence; explicit recovery is required before v8 migration"
+            )));
+        }
+        Ok(())
+    }
+
     fn migrate_claim_v6_to_v7_with_hook(
         &self,
         mut hook: impl FnMut(ClaimV7MigrationStage) -> Result<(), StackError>,
@@ -3832,7 +4028,7 @@ impl StateStore {
             store.create_claim_schema_v7()?;
             hook(ClaimV7MigrationStage::ImmutabilityGuardsCreated)?;
             store.validate_v7_schema()?;
-            store.set_schema_version(STORE_SCHEMA_VERSION)?;
+            store.set_schema_version(CLAIM_SCHEMA_VERSION)?;
             Ok(())
         })
     }
@@ -4334,6 +4530,28 @@ impl StateStore {
             ) {
                 return Err(StackError::InvalidSpec(
                     "injected v6-to-v7 migration failure after immutability guards".to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_teardown_finalizer_v7_to_v8_with_failpoint(
+        &self,
+        failpoint: TeardownFinalizerV8MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_teardown_finalizer_v7_to_v8_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    TeardownFinalizerV8MigrationFailpoint::AfterFinalizerSchemaCreated,
+                    TeardownFinalizerV8MigrationStage::FinalizerSchemaCreated
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v7-to-v8 migration failure after finalizer schema creation"
+                        .to_string(),
                 ));
             }
             Ok(())

@@ -10,10 +10,11 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use vz_stack::{
-    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, OrchestrationConfig,
-    ServiceObservedState, ServicePhase, ServiceReplicaKey, StackExecutor, StackOrchestrator,
-    StackSpec, TargetedActionKind, VolumeManager, collect_compose_build_specs_with_dir,
-    parse_compose_with_dir, plan_apply,
+    Action, ComposeBuildSpec, ContainerLogs, ContainerRuntime, IdempotencyRecord,
+    OrchestrationConfig, Receipt, ServiceObservedState, ServicePhase, ServiceReplicaKey,
+    StackExecutor, StackOrchestrator, StackSpec, TargetedActionKind, TeardownFinalizer,
+    TeardownFinalizerStatus, TeardownPathState, VolumeManager,
+    collect_compose_build_specs_with_dir, parse_compose_with_dir, plan_apply,
 };
 
 const STACK_BUILD_POLL_INTERVAL: Duration = Duration::from_millis(250);
@@ -1587,20 +1588,18 @@ fn targeted_reconcile_session_id(
 fn teardown_request_digest(
     stack_name: &str,
     workload_scope: &vz_runtime_contract::MachineWorkloadScope,
-    request_id: &str,
     dry_run: bool,
     remove_volumes: bool,
 ) -> String {
     let mut hasher = Sha256::new();
     for value in [
-        "vz-teardown-request-v2",
+        "vz-teardown-request-v3",
         stack_name,
         workload_scope.project_id.as_str(),
         workload_scope.environment_id.as_str(),
         workload_scope.machine_id.as_str(),
         workload_scope.machine_incarnation_id.as_str(),
         workload_scope.stack_id.as_str(),
-        request_id,
         if dry_run { "dry-run" } else { "mutating" },
         if remove_volumes {
             "remove-volumes"
@@ -1611,14 +1610,69 @@ fn teardown_request_digest(
         hasher.update((value.len() as u64).to_be_bytes());
         hasher.update(value.as_bytes());
     }
-    format!("vztr2-sha256:{:x}", hasher.finalize())
+    format!("vztr3-sha256:{:x}", hasher.finalize())
 }
 
-fn teardown_reconcile_session_id(request_digest: &str) -> String {
+fn teardown_reconcile_session_id(operation_key: &str, request_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in ["vz-teardown-session-v3", operation_key, request_digest] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("rs-teardown-{:x}", hasher.finalize())
+}
+
+fn teardown_operation_key(idempotency_key: Option<&str>, request_id: &str) -> String {
+    idempotency_key.map_or_else(|| format!("req:{request_id}"), |key| format!("idem:{key}"))
+}
+
+fn teardown_reconcile_operation_input(operation_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"vz-teardown-operation-v1");
+    hasher.update((operation_key.len() as u64).to_be_bytes());
+    hasher.update(operation_key.as_bytes());
+    format!("op-{:x}", hasher.finalize())
+}
+
+fn teardown_filesystem_token(operation_key: &str, request_digest: &str) -> String {
+    let mut hasher = Sha256::new();
+    for value in ["vz-teardown-filesystem-v1", operation_key, request_digest] {
+        hasher.update((value.len() as u64).to_be_bytes());
+        hasher.update(value.as_bytes());
+    }
+    format!("teardown-{:x}", hasher.finalize())
+}
+
+fn teardown_scope_lock_key(scope: &vz_runtime_contract::MachineWorkloadScope) -> String {
     format!(
-        "rs-teardown-{}",
-        request_digest.trim_start_matches("vztr2-sha256:")
+        "{}\u{1f}{}\u{1f}{}\u{1f}{}\u{1f}{}",
+        scope.project_id.as_str(),
+        scope.environment_id.as_str(),
+        scope.machine_id.as_str(),
+        scope.machine_incarnation_id.as_str(),
+        scope.stack_id
     )
+}
+
+fn teardown_desired_state_digest(desired: Option<&StackSpec>) -> Result<String, StackError> {
+    let bytes = serde_json::to_vec(&desired)?;
+    let mut hasher = Sha256::new();
+    hasher.update(b"vz-teardown-desired-state-v1");
+    hasher.update((bytes.len() as u64).to_be_bytes());
+    hasher.update(bytes);
+    Ok(format!("vztds1-sha256:{:x}", hasher.finalize()))
+}
+
+fn teardown_response_json(
+    response: &runtime_v2::TeardownStackResponse,
+) -> Result<String, StackError> {
+    serde_json::to_string(&serde_json::json!({
+        "request_id": response.request_id,
+        "stack_name": response.stack_name,
+        "changed_actions": response.changed_actions,
+        "removed_volumes": response.removed_volumes,
+    }))
+    .map_err(Into::into)
 }
 
 fn action_matches_targeted_intent(

@@ -151,7 +151,16 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             &metadata,
             &request_id,
         )?;
+        // Serialize apply with teardown for this exact workload before the
+        // first durable or external mutation. The database fence below makes
+        // the same admission decision survive daemon restarts.
+        let apply_finalizer_lock = self
+            .daemon
+            .teardown_finalizer_lock(&teardown_scope_lock_key(&workload_scope))
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let _apply_finalizer_guard = apply_finalizer_lock.lock_owned().await;
         if let Err(error) = self.daemon.with_state_store(|store| {
+            store.ensure_no_prepared_teardown(&workload_scope)?;
             store.reserve_stack_workload_owner(&workload_scope, current_unix_secs())?;
             Ok(())
         }) {
@@ -341,15 +350,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 BTreeMap::new(),
             )));
         }
-        // Hold one daemon-wide per-stack lease across admission, stack-wide
-        // finalizer effects, claimed commit, and receipt persistence. Exact
-        // duplicate requests wait here and observe the first request's durable
-        // receipt instead of concurrently consuming the same active claim.
-        let teardown_finalizer_lock = self
-            .daemon
-            .teardown_finalizer_lock(&stack_name)
-            .map_err(|error| status_from_stack_error(error, &request_id))?;
-        let _teardown_finalizer_guard = teardown_finalizer_lock.lock_owned().await;
         let workload_scope = validate_stack_cleanup_request_scope(
             self.daemon.as_ref(),
             request.scope.as_ref(),
@@ -372,15 +372,91 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             )?;
         }
 
+        // The lock is qualified by exact workload scope, not a display-only
+        // stack name that may be reused by another Machine or Environment.
+        let teardown_finalizer_lock = self
+            .daemon
+            .teardown_finalizer_lock(&teardown_scope_lock_key(&workload_scope))
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let _teardown_finalizer_guard = teardown_finalizer_lock.lock_owned().await;
+
+        let idempotency_key =
+            normalize_idempotency_key(metadata.idempotency_key.as_deref()).map(ToString::to_string);
+        let operation_key = teardown_operation_key(idempotency_key.as_deref(), &request_id);
+
         let teardown_request_digest = teardown_request_digest(
             &stack_name,
             &workload_scope,
-            &request_id,
             request.dry_run,
             request.remove_volumes,
         );
-        let teardown_session_id = teardown_reconcile_session_id(&teardown_request_digest);
-        let (existing_teardown_session, existing_receipt) = self
+        let computed_teardown_session_id =
+            teardown_reconcile_session_id(&operation_key, &teardown_request_digest);
+        let existing_finalizer = if request.dry_run {
+            None
+        } else {
+            self.daemon
+                .with_state_store(|store| store.load_teardown_finalizer(&operation_key))
+                .map_err(|error| status_from_stack_error(error, &request_id))?
+        };
+        if let Some(finalizer) = &existing_finalizer {
+            if finalizer.operation_key != operation_key
+                || finalizer.request_digest != teardown_request_digest
+                || finalizer.scope != workload_scope
+                || finalizer.remove_volumes != request.remove_volumes
+                || finalizer.idempotency_key != idempotency_key
+            {
+                return Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::StateConflict,
+                    format!(
+                        "teardown operation key `{operation_key}` is bound to different parameters"
+                    ),
+                    Some(request_id),
+                    BTreeMap::new(),
+                )));
+            }
+            if finalizer.status == TeardownFinalizerStatus::Completed {
+                let receipt = finalizer.receipt.as_ref().ok_or_else(|| {
+                    status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        "completed teardown finalizer has no receipt".to_string(),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))
+                })?;
+                let response = runtime_v2::TeardownStackResponse {
+                    request_id: finalizer.request_id.clone(),
+                    stack_name: finalizer.scope.stack_id.clone(),
+                    changed_actions: finalizer.changed_actions,
+                    removed_volumes: u32::try_from(finalizer.initial_volumes.len()).map_err(
+                        |_| {
+                            status_from_machine_error(MachineError::new(
+                                MachineErrorCode::StateConflict,
+                                "persisted teardown volume count exceeds response range"
+                                    .to_string(),
+                                Some(request_id.clone()),
+                                BTreeMap::new(),
+                            ))
+                        },
+                    )?,
+                };
+                return Ok(stack_stream_response(
+                    vec![Ok(teardown_stack_completion_event(
+                        &finalizer.request_id,
+                        1,
+                        response,
+                        &receipt.receipt_id,
+                    ))],
+                    Some(&receipt.receipt_id),
+                ));
+            }
+        }
+        let teardown_session_id = existing_finalizer
+            .as_ref()
+            .map_or(computed_teardown_session_id, |record| {
+                record.session_id.clone()
+            });
+        let existing_teardown_session = self
             .daemon
             .with_state_store(|store| {
                 let exact = if request.dry_run {
@@ -388,15 +464,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 } else {
                     store.load_reconcile_session(&teardown_session_id)?
                 };
-                let receipt = store
-                    .list_receipts_for_entity("stack", &stack_name)?
-                    .into_iter()
-                    .find(|receipt| {
-                        receipt.operation == "teardown_stack" && receipt.request_id == request_id
-                    });
-                if receipt.is_some() {
-                    return Ok((exact, receipt));
-                }
                 let active = store.load_active_reconcile_session(&stack_name)?;
                 if let Some(active) = active
                     && exact
@@ -415,7 +482,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     && (session.stack_name != stack_name
                         || !vz_stack::matches_claimed_teardown_operation(
                             &session.operation_id,
-                            &request_id,
+                            &teardown_reconcile_operation_input(&operation_key),
                         ))
                 {
                     return Err(StackError::Machine {
@@ -425,70 +492,12 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                         ),
                     });
                 }
-                Ok((exact, receipt))
+                Ok(exact)
             })
             .map_err(|error| status_from_stack_error(error, &request_id))?;
-        if let Some(receipt) = existing_receipt {
-            if receipt.entity_type != "stack"
-                || receipt.entity_id != stack_name
-                || receipt.status != "success"
-                || receipt
-                    .metadata
-                    .get("request_digest")
-                    .and_then(serde_json::Value::as_str)
-                    != Some(teardown_request_digest.as_str())
-            {
-                return Err(status_from_machine_error(MachineError::new(
-                    MachineErrorCode::StateConflict,
-                    format!("request `{request_id}` is already bound to a different receipt"),
-                    Some(request_id),
-                    BTreeMap::new(),
-                )));
-            }
-            let changed_actions = receipt
-                .metadata
-                .get("changed_actions")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| {
-                    status_from_machine_error(MachineError::new(
-                        MachineErrorCode::StateConflict,
-                        "persisted teardown receipt has invalid changed_actions".to_string(),
-                        Some(request_id.clone()),
-                        BTreeMap::new(),
-                    ))
-                })?;
-            let removed_volumes = receipt
-                .metadata
-                .get("removed_volumes")
-                .and_then(serde_json::Value::as_u64)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| {
-                    status_from_machine_error(MachineError::new(
-                        MachineErrorCode::StateConflict,
-                        "persisted teardown receipt has invalid removed_volumes".to_string(),
-                        Some(request_id.clone()),
-                        BTreeMap::new(),
-                    ))
-                })?;
-            let event = teardown_stack_completion_event(
-                &request_id,
-                1,
-                runtime_v2::TeardownStackResponse {
-                    request_id: request_id.clone(),
-                    stack_name,
-                    changed_actions,
-                    removed_volumes,
-                },
-                &receipt.receipt_id,
-            );
-            return Ok(stack_stream_response(
-                vec![Ok(event)],
-                Some(&receipt.receipt_id),
-            ));
-        }
         if let Some(session) = &existing_teardown_session
             && session.status != vz_stack::ReconcileSessionStatus::Active
+            && existing_finalizer.is_none()
         {
             return Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::StateConflict,
@@ -510,7 +519,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 ))
             })
             .map_err(|error| status_from_stack_error(error, &request_id))?;
-        if desired.is_none() && observed.is_empty() {
+        if desired.is_none() && observed.is_empty() && existing_finalizer.is_none() {
             return Err(status_from_machine_error(MachineError::new(
                 MachineErrorCode::NotFound,
                 format!("stack not found: {stack_name}"),
@@ -565,6 +574,14 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
         };
 
         if request.dry_run {
+            let changed_actions = u32::try_from(teardown_actions.len()).map_err(|_| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    "teardown action count exceeds response range".to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
             sequence += 1;
             events.push(Ok(teardown_stack_completion_event(
                 &request_id,
@@ -572,7 +589,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 runtime_v2::TeardownStackResponse {
                     request_id: request_id.clone(),
                     stack_name,
-                    changed_actions: teardown_actions.len() as u32,
+                    changed_actions,
                     removed_volumes: 0,
                 },
                 "",
@@ -580,16 +597,83 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             return Ok(stack_stream_response(events, None));
         }
 
-        if teardown_actions.is_empty() {
-            events.push(Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::StateConflict,
-                "non-dry teardown with no service actions requires a durable stack-level finalizer claim"
-                    .to_string(),
+        let changed_actions = u32::try_from(teardown_actions.len()).map_err(|_| {
+            status_from_machine_error(MachineError::new(
+                MachineErrorCode::InternalError,
+                "teardown action count exceeds durable counter range".to_string(),
                 Some(request_id.clone()),
                 BTreeMap::new(),
-            ))));
-            return Ok(stack_stream_response(events, None));
-        }
+            ))
+        })?;
+        let reconcile_operation_input = teardown_reconcile_operation_input(&operation_key);
+        let reconcile_operation_id =
+            vz_stack::claimed_teardown_operation_id(&reconcile_operation_input)
+                .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
+        let volume_manager = VolumeManager::new(&stack_dir);
+        let mut finalizer = if let Some(finalizer) = existing_finalizer {
+            if finalizer.changed_actions != changed_actions
+                || finalizer.actions_hash != vz_stack::compute_actions_hash(&teardown_actions)
+                || finalizer.reconcile_operation_id != reconcile_operation_id
+            {
+                events.push(Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::StateConflict,
+                    "stored teardown finalizer does not match its exact action plan".to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))));
+                return Ok(stack_stream_response(events, None));
+            }
+            finalizer
+        } else {
+            let (initial_volumes, initial_disk_image) = if request.remove_volumes {
+                volume_manager
+                    .strict_teardown_inventory()
+                    .map_err(|error| status_from_stack_error(error, &request_id))?
+            } else {
+                (Vec::new(), false)
+            };
+            let now = current_unix_secs();
+            let prepared = TeardownFinalizer {
+                schema_version: vz_stack::TEARDOWN_FINALIZER_SCHEMA_VERSION,
+                operation_key: operation_key.clone(),
+                request_id: request_id.clone(),
+                idempotency_key: idempotency_key.clone(),
+                request_digest: teardown_request_digest.clone(),
+                session_id: teardown_session_id.clone(),
+                reconcile_operation_id: reconcile_operation_id.clone(),
+                scope: workload_scope.clone(),
+                remove_volumes: request.remove_volumes,
+                changed_actions,
+                actions_hash: vz_stack::compute_actions_hash(&teardown_actions),
+                desired_state_digest: teardown_desired_state_digest(desired.as_ref())
+                    .map_err(|error| status_from_stack_error(error, &request_id))?,
+                initial_volumes,
+                initial_disk_image,
+                initial_runtime_present: self.daemon.manager().has_stack_runtime(&stack_name),
+                runtime_shutdown: false,
+                staged_volumes: Vec::new(),
+                purged_volumes: Vec::new(),
+                disk_staged: false,
+                disk_purged: false,
+                status: TeardownFinalizerStatus::Prepared,
+                receipt: None,
+                response_json: None,
+                created_at: now,
+                updated_at: now,
+                completed_at: None,
+            };
+            match self
+                .daemon
+                .with_state_store(|store| store.reserve_teardown_finalizer(&prepared))
+            {
+                Ok(record) => record,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            }
+        };
 
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
@@ -598,7 +682,12 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             "executing",
             "executing stack teardown actions",
         )));
-        let pending_teardown = {
+        let pending_teardown = if teardown_actions.is_empty()
+            || existing_teardown_session.as_ref().is_some_and(|session| {
+                session.status == vz_stack::ReconcileSessionStatus::Completed
+            }) {
+            None
+        } else {
             let exec_store = match self.daemon.open_dedicated_state_store() {
                 Ok(store) => store,
                 Err(error) => {
@@ -625,7 +714,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 &empty_spec,
                 &teardown_actions,
                 &teardown_session_id,
-                &request_id,
+                &reconcile_operation_input,
                 0,
             ) {
                 Ok(result) => result,
@@ -634,7 +723,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     return Ok(stack_stream_response(events, None));
                 }
             };
-            match admission {
+            Some(match admission {
                 vz_stack::ClaimedTeardownAdmission::Ready(pending) => pending,
                 vz_stack::ClaimedTeardownAdmission::Failed(execution_result) => {
                     events.push(Err(status_from_machine_error(MachineError::new(
@@ -652,7 +741,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     ))));
                     return Ok(stack_stream_response(events, None));
                 }
-            }
+            })
         };
 
         if let Err(error) = self
@@ -665,85 +754,200 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
 
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
-            &request_id,
+            &finalizer.request_id,
             sequence,
             "shutting_down_runtime",
             "shutting down stack runtime",
         )));
-        if let Err(error) =
-            shutdown_stack_runtime_for_teardown(self.daemon.clone(), stack_name.clone()).await
-        {
-            events.push(Err(status_from_stack_error(error, &request_id)));
-            return Ok(stack_stream_response(events, None));
+        if !finalizer.runtime_shutdown {
+            if self.daemon.manager().has_stack_runtime(&stack_name)
+                && let Err(error) =
+                    shutdown_stack_runtime_for_teardown(self.daemon.clone(), stack_name.clone())
+                        .await
+            {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
+            if self.daemon.manager().has_stack_runtime(&stack_name) {
+                events.push(Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::StateConflict,
+                    "stack runtime still exists after teardown shutdown".to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))));
+                return Ok(stack_stream_response(events, None));
+            }
+            finalizer.runtime_shutdown = true;
+            finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
+            if let Err(error) = self
+                .daemon
+                .with_state_store(|store| store.save_teardown_finalizer_progress(&finalizer))
+            {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
         }
 
-        if request.remove_volumes {
+        if finalizer.remove_volumes {
             sequence += 1;
             events.push(Ok(teardown_stack_progress_event(
-                &request_id,
+                &finalizer.request_id,
                 sequence,
                 "removing_volumes",
                 "removing stack volumes",
             )));
         }
-        let removed_volumes = if request.remove_volumes {
-            let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-            let volume_manager = VolumeManager::new(&stack_dir);
-            match volume_manager.remove_all() {
-                Ok(count) => count,
+        let filesystem_token =
+            teardown_filesystem_token(&finalizer.operation_key, &finalizer.request_digest);
+        for volume in finalizer.initial_volumes.clone() {
+            if finalizer.staged_volumes.binary_search(&volume).is_err() {
+                match volume_manager.stage_teardown_volume(&filesystem_token, &volume) {
+                    Ok(TeardownPathState::Tombstone) => {}
+                    Ok(TeardownPathState::Missing) => {
+                        events.push(Err(status_from_machine_error(MachineError::new(
+                            MachineErrorCode::StateConflict,
+                            format!(
+                                "original teardown volume `{volume}` is missing without a durable detach milestone"
+                            ),
+                            Some(request_id.clone()),
+                            BTreeMap::new(),
+                        ))));
+                        return Ok(stack_stream_response(events, None));
+                    }
+                    Ok(TeardownPathState::Source) => unreachable!("stage returns a post-state"),
+                    Err(error) => {
+                        events.push(Err(status_from_stack_error(error, &request_id)));
+                        return Ok(stack_stream_response(events, None));
+                    }
+                }
+                finalizer.staged_volumes.push(volume.clone());
+                finalizer.staged_volumes.sort();
+                finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
+                if let Err(error) = self
+                    .daemon
+                    .with_state_store(|store| store.save_teardown_finalizer_progress(&finalizer))
+                {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            }
+            if finalizer.purged_volumes.binary_search(&volume).is_err() {
+                match volume_manager.inspect_teardown_volume(&filesystem_token, &volume) {
+                    Ok(TeardownPathState::Tombstone | TeardownPathState::Missing) => {
+                        // Purge also fsyncs the tombstone parent when the entry is
+                        // already absent. That repairs the crash window between
+                        // unlink and directory durability before we persist the
+                        // database milestone.
+                        if let Err(error) =
+                            volume_manager.purge_teardown_volume(&filesystem_token, &volume)
+                        {
+                            events.push(Err(status_from_stack_error(error, &request_id)));
+                            return Ok(stack_stream_response(events, None));
+                        }
+                    }
+                    Ok(TeardownPathState::Source) => {
+                        events.push(Err(status_from_machine_error(MachineError::new(
+                            MachineErrorCode::StateConflict,
+                            format!("detached teardown volume `{volume}` reappeared"),
+                            Some(request_id.clone()),
+                            BTreeMap::new(),
+                        ))));
+                        return Ok(stack_stream_response(events, None));
+                    }
+                    Err(error) => {
+                        events.push(Err(status_from_stack_error(error, &request_id)));
+                        return Ok(stack_stream_response(events, None));
+                    }
+                }
+                finalizer.purged_volumes.push(volume);
+                finalizer.purged_volumes.sort();
+                finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
+                if let Err(error) = self
+                    .daemon
+                    .with_state_store(|store| store.save_teardown_finalizer_progress(&finalizer))
+                {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            }
+        }
+        if finalizer.initial_disk_image && !finalizer.disk_staged {
+            match volume_manager.stage_teardown_disk(&filesystem_token) {
+                Ok(TeardownPathState::Tombstone) => {}
+                Ok(TeardownPathState::Missing) => {
+                    events.push(Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        "original teardown disk is missing without a durable detach milestone"
+                            .to_string(),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))));
+                    return Ok(stack_stream_response(events, None));
+                }
+                Ok(TeardownPathState::Source) => unreachable!("stage returns a post-state"),
                 Err(error) => {
                     events.push(Err(status_from_stack_error(error, &request_id)));
                     return Ok(stack_stream_response(events, None));
                 }
             }
-        } else {
-            0
-        };
-
-        let commit_store = match self.daemon.open_dedicated_state_store() {
-            Ok(store) => store,
-            Err(error) => {
+            finalizer.disk_staged = true;
+            finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
+            if let Err(error) = self
+                .daemon
+                .with_state_store(|store| store.save_teardown_finalizer_progress(&finalizer))
+            {
                 events.push(Err(status_from_stack_error(error, &request_id)));
                 return Ok(stack_stream_response(events, None));
             }
-        };
-        let commit_runtime = DaemonContainerRuntime::new(self.daemon.clone());
-        let stack_dir = stack_runtime_dir(self.daemon.as_ref(), &stack_name);
-        let mut commit_executor = match StackExecutor::new_scoped_for_cleanup(
-            commit_runtime,
-            commit_store,
-            &stack_dir,
-            workload_scope,
-        ) {
-            Ok(executor) => executor,
-            Err(error) => {
-                events.push(Err(status_from_stack_error(error, &request_id)));
-                return Ok(stack_stream_response(events, None));
-            }
-        };
-        let execution_result =
-            match commit_executor.commit_claimed_teardown_batch(*pending_teardown) {
-                Ok(result) => result,
+        }
+        if finalizer.initial_disk_image && !finalizer.disk_purged {
+            match volume_manager.inspect_teardown_disk(&filesystem_token) {
+                Ok(TeardownPathState::Tombstone | TeardownPathState::Missing) => {
+                    // As with volumes, an absent tombstone still requires the
+                    // parent-directory durability repair before the DB claims
+                    // that purge completed.
+                    if let Err(error) = volume_manager.purge_teardown_disk(&filesystem_token) {
+                        events.push(Err(status_from_stack_error(error, &request_id)));
+                        return Ok(stack_stream_response(events, None));
+                    }
+                }
+                Ok(TeardownPathState::Source) => {
+                    events.push(Err(status_from_machine_error(MachineError::new(
+                        MachineErrorCode::StateConflict,
+                        "detached teardown disk reappeared".to_string(),
+                        Some(request_id.clone()),
+                        BTreeMap::new(),
+                    ))));
+                    return Ok(stack_stream_response(events, None));
+                }
                 Err(error) => {
                     events.push(Err(status_from_stack_error(error, &request_id)));
                     return Ok(stack_stream_response(events, None));
                 }
-            };
-        if !execution_result.all_succeeded()
-            || execution_result.outcomes.len() != teardown_actions.len()
-        {
-            events.push(Err(status_from_machine_error(MachineError::new(
-                MachineErrorCode::StateConflict,
-                "claimed teardown commit did not preserve every successful remove outcome"
-                    .to_string(),
-                Some(request_id.clone()),
-                BTreeMap::new(),
-            ))));
-            return Ok(stack_stream_response(events, None));
+            }
+            finalizer.disk_purged = true;
+            finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
+            if let Err(error) = self
+                .daemon
+                .with_state_store(|store| store.save_teardown_finalizer_progress(&finalizer))
+            {
+                events.push(Err(status_from_stack_error(error, &request_id)));
+                return Ok(stack_stream_response(events, None));
+            }
         }
 
-        let changed_actions = teardown_actions.len() as u32;
-        let removed_volumes = removed_volumes as u32;
+        let removed_volumes = match u32::try_from(finalizer.initial_volumes.len()) {
+            Ok(count) => count,
+            Err(_) => {
+                events.push(Err(status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    "teardown volume count exceeds response range".to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))));
+                return Ok(stack_stream_response(events, None));
+            }
+        };
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
             &request_id,
@@ -751,50 +955,96 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             "persisting",
             "persisting stack teardown receipt",
         )));
-        let now = current_unix_secs();
-        let receipt_id = generate_receipt_id();
-        let persist_result = self
-            .daemon
-            .with_state_store(|store| {
-                store.with_immediate_transaction(|tx| {
-                    tx.emit_event(
-                        &stack_name,
-                        &StackEvent::StackDestroyed {
-                            stack_name: stack_name.clone(),
-                        },
-                    )?;
-                    tx.save_receipt(&Receipt {
-                        receipt_id: receipt_id.clone(),
-                        operation: "teardown_stack".to_string(),
-                        entity_id: stack_name.clone(),
-                        entity_type: "stack".to_string(),
-                        request_id: request_id.clone(),
-                        status: "success".to_string(),
-                        created_at: now,
-                        metadata: receipt_stack_teardown_metadata(
-                            &teardown_request_digest,
-                            changed_actions,
-                            removed_volumes,
-                        )?,
-                    })?;
-                    Ok(())
-                })
+        let now = current_unix_secs().max(finalizer.updated_at);
+        let response = runtime_v2::TeardownStackResponse {
+            request_id: finalizer.request_id.clone(),
+            stack_name: finalizer.scope.stack_id.clone(),
+            changed_actions: finalizer.changed_actions,
+            removed_volumes,
+        };
+        let response_json = teardown_response_json(&response)
+            .map_err(|error| status_from_stack_error(error, &request_id))?;
+        let receipt_id =
+            vz_stack::teardown_receipt_id(&finalizer.operation_key, &finalizer.request_digest);
+        finalizer.status = TeardownFinalizerStatus::Completed;
+        finalizer.updated_at = now;
+        finalizer.completed_at = Some(now);
+        finalizer.response_json = Some(response_json.clone());
+        finalizer.receipt = Some(Receipt {
+            receipt_id: receipt_id.clone(),
+            operation: "teardown_stack".to_string(),
+            entity_id: finalizer.scope.stack_id.clone(),
+            entity_type: "stack".to_string(),
+            request_id: finalizer.request_id.clone(),
+            status: "success".to_string(),
+            created_at: now,
+            metadata: receipt_stack_teardown_metadata(
+                &finalizer.request_digest,
+                finalizer.changed_actions,
+                removed_volumes,
+            )
+            .map_err(|error| status_from_stack_error(error, &request_id))?,
+        });
+        let idempotency = finalizer
+            .idempotency_key
+            .as_ref()
+            .map(|key| IdempotencyRecord {
+                key: key.clone(),
+                operation: "teardown_stack".to_string(),
+                request_hash: finalizer.request_digest.clone(),
+                response_json,
+                status_code: 200,
+                created_at: finalizer.created_at,
+                expires_at: now.saturating_add(vz_stack::IDEMPOTENCY_TTL_SECS),
+            });
+        let terminal_event = StackEvent::StackDestroyed {
+            stack_name: finalizer.scope.stack_id.clone(),
+        };
+        let persist_result = if let Some(pending_teardown) = pending_teardown {
+            let commit_store = self.daemon.open_dedicated_state_store();
+            commit_store.and_then(|store| {
+                let runtime = DaemonContainerRuntime::new(self.daemon.clone());
+                let mut executor = StackExecutor::new_scoped_for_cleanup(
+                    runtime,
+                    store,
+                    &stack_dir,
+                    workload_scope,
+                )?;
+                executor.commit_claimed_teardown_finalized(
+                    *pending_teardown,
+                    &finalizer,
+                    idempotency.as_ref(),
+                    &terminal_event,
+                )?;
+                Ok(())
             })
-            .map_err(|error| status_from_stack_error(error, &request_id));
+        } else if finalizer.changed_actions == 0 {
+            self.daemon.with_state_store(|store| {
+                store.complete_effect_only_teardown_finalizer(
+                    &finalizer,
+                    idempotency.as_ref(),
+                    &terminal_event,
+                )
+            })
+        } else {
+            self.daemon.with_state_store(|store| {
+                store.complete_terminal_teardown_finalizer(
+                    &finalizer,
+                    idempotency.as_ref(),
+                    &terminal_event,
+                )
+            })
+        }
+        .map_err(|error| status_from_stack_error(error, &request_id));
         if let Err(status) = persist_result {
             events.push(Err(status));
             return Ok(stack_stream_response(events, None));
         }
         sequence += 1;
         events.push(Ok(teardown_stack_completion_event(
-            &request_id,
+            &finalizer.request_id,
             sequence,
-            runtime_v2::TeardownStackResponse {
-                request_id: request_id.clone(),
-                stack_name,
-                changed_actions,
-                removed_volumes,
-            },
+            response,
             receipt_id.as_str(),
         )));
         Ok(stack_stream_response(events, Some(receipt_id.as_str())))
@@ -1883,7 +2133,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn zero_action_teardown_refuses_unfenced_runtime_and_volume_mutation() {
+    async fn zero_action_teardown_uses_durable_effect_only_finalizer() {
         let (tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-failure";
         let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
@@ -1930,7 +2180,7 @@ mod tests {
         )
         .await
         .unwrap_or_else(|error| panic!("teardown stream should start: {error}"));
-        assert!(response.metadata().get("x-receipt-id").is_none());
+        assert!(response.metadata().get("x-receipt-id").is_some());
 
         let mut stream = response.into_inner();
         let mut phases = Vec::new();
@@ -1951,19 +2201,15 @@ mod tests {
             }
         }
 
-        let error = terminal_error
-            .unwrap_or_else(|| panic!("unfenced zero-action teardown must terminate the stream"));
-        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        assert!(error.message().contains("stack-level finalizer claim"));
-        assert!(error.message().contains("req-shutdown-failure"));
-        assert!(!phases.iter().any(|phase| phase == "shutting_down_runtime"));
-        assert!(!phases.iter().any(|phase| phase == "removing_volumes"));
-        assert!(!phases.iter().any(|phase| phase == "persisting"));
-        assert!(!completion_seen);
-        assert!(volume_path.exists(), "volume deletion must not run");
+        assert!(terminal_error.is_none());
+        assert!(phases.iter().any(|phase| phase == "shutting_down_runtime"));
+        assert!(phases.iter().any(|phase| phase == "removing_volumes"));
+        assert!(phases.iter().any(|phase| phase == "persisting"));
+        assert!(completion_seen);
+        assert!(!volume_path.exists(), "volume deletion must complete");
         assert!(
-            daemon.manager().has_stack_runtime(stack_name),
-            "unfenced teardown must leave the runtime active"
+            !daemon.manager().has_stack_runtime(stack_name),
+            "effect-only teardown must stop the runtime"
         );
 
         let (receipts, stack_events) = daemon
@@ -1974,15 +2220,19 @@ mod tests {
                 ))
             })
             .unwrap_or_else(|error| panic!("inspect teardown persistence: {error}"));
-        assert!(
+        assert_eq!(
             receipts
                 .iter()
-                .all(|receipt| receipt.operation != "teardown_stack")
+                .filter(|receipt| receipt.operation == "teardown_stack")
+                .count(),
+            1
         );
-        assert!(
+        assert_eq!(
             stack_events
                 .iter()
-                .all(|event| !matches!(event, StackEvent::StackDestroyed { .. }))
+                .filter(|event| matches!(event, StackEvent::StackDestroyed { .. }))
+                .count(),
+            1
         );
     }
 
@@ -2042,7 +2292,10 @@ mod tests {
         assert!(
             vz_stack::matches_claimed_teardown_operation(
                 &active.operation_id,
-                "req-shutdown-retry"
+                &teardown_reconcile_operation_input(&teardown_operation_key(
+                    None,
+                    "req-shutdown-retry"
+                ))
             ),
             "durable teardown operation must remain correlated to its request"
         );
@@ -2085,14 +2338,154 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn teardown_remove_failure_keeps_active_claim_and_exact_retry_completes() {
+        let (_tmp, daemon) = stack_test_daemon();
+        let stack_name = "remove-retry";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
+        let service = StackServiceImpl::new(daemon.clone());
+        seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
+        daemon.manager().backend().fail_next_generation_cleanup();
+
+        let request = || runtime_v2::TeardownStackRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-remove-retry".to_string(),
+                idempotency_key: String::new(),
+                trace_id: String::new(),
+            }),
+            stack_name: stack_name.to_string(),
+            remove_volumes: false,
+            dry_run: false,
+            scope: Some(wire_scope.clone()),
+        };
+
+        let first = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request()),
+        )
+        .await
+        .expect("first teardown stream");
+        let mut first_stream = first.into_inner();
+        let mut first_error = None;
+        while let Some(item) = first_stream.next().await {
+            if let Err(error) = item {
+                first_error = Some(error);
+            }
+        }
+        let first_error = first_error.expect("injected remove failure");
+        assert_eq!(first_error.code(), tonic::Code::Unavailable);
+
+        let (active, finalizer, desired, receipts, events) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_active_reconcile_session(stack_name)?,
+                    store.load_teardown_finalizer(&teardown_operation_key(
+                        None,
+                        "req-remove-retry",
+                    ))?,
+                    store.load_desired_state(stack_name)?,
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                    store.load_events(stack_name)?,
+                ))
+            })
+            .expect("inspect retry state");
+        let active = active.expect("failed remove must retain active reconcile claim");
+        assert_eq!(active.status, vz_stack::ReconcileSessionStatus::Active);
+        let audits = daemon
+            .with_state_store(|store| store.load_audit_log_for_session(&active.session_id))
+            .expect("load retained teardown audits");
+        assert_eq!(audits.len(), 1);
+        assert!(audits.iter().all(|audit| audit.status == "started"));
+        let finalizer = finalizer.expect("failed remove must retain prepared finalizer");
+        assert_eq!(finalizer.status, TeardownFinalizerStatus::Prepared);
+        assert!(finalizer.receipt.is_none());
+        assert_eq!(
+            desired
+                .expect("failed remove keeps desired state")
+                .services
+                .len(),
+            1
+        );
+        assert!(daemon.manager().has_stack_runtime(stack_name));
+        assert!(
+            receipts
+                .iter()
+                .all(|receipt| receipt.operation != "teardown_stack")
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| !matches!(event, StackEvent::StackDestroyed { .. }))
+        );
+
+        let retry = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request()),
+        )
+        .await
+        .expect("exact teardown retry stream");
+        let mut retry_stream = retry.into_inner();
+        let mut completion = None;
+        while let Some(item) = retry_stream.next().await {
+            let event = item.expect("exact retry must succeed");
+            if let Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) = event.payload
+            {
+                completion = done.response;
+            }
+        }
+        let completion = completion.expect("exact retry completion");
+        assert_eq!(completion.request_id, "req-remove-retry");
+        assert_eq!(completion.changed_actions, 1);
+
+        let (active, finalizer, receipts, events) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_active_reconcile_session(stack_name)?,
+                    store.load_teardown_finalizer(&teardown_operation_key(
+                        None,
+                        "req-remove-retry",
+                    ))?,
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                    store.load_events(stack_name)?,
+                ))
+            })
+            .expect("inspect terminal teardown state");
+        assert!(active.is_none());
+        assert_eq!(
+            finalizer.expect("completed finalizer").status,
+            TeardownFinalizerStatus::Completed
+        );
+        assert_eq!(
+            receipts
+                .iter()
+                .filter(|receipt| receipt.operation == "teardown_stack")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, StackEvent::StackDestroyed { .. }))
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn concurrent_identical_teardowns_serialize_the_finalizer_and_replay_receipt() {
         let (_tmp, daemon) = stack_test_daemon();
         let stack_name = "concurrent-shutdown";
         let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
         seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
 
+        let workload_scope = validate_stack_cleanup_request_scope(
+            daemon.as_ref(),
+            Some(&wire_scope),
+            stack_name,
+            "test",
+        )
+        .expect("wire scope must validate as the exact cleanup scope");
         let held_finalizer = daemon
-            .teardown_finalizer_lock(stack_name)
+            .teardown_finalizer_lock(&teardown_scope_lock_key(&workload_scope))
             .expect("stack finalizer lock")
             .lock_owned()
             .await;
@@ -2247,22 +2640,47 @@ mod tests {
         assert!(!stack_dir.exists());
     }
 
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread")]
     async fn teardown_receipt_replay_is_read_only_even_with_newer_active_apply() {
         let (_tmp, daemon) = stack_test_daemon();
         let stack_name = "shutdown-success";
         let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
-        let workload_scope =
-            vz_runtime_translate::machine_workload_scope_from_proto(&wire_scope).unwrap();
+        seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
+        let service = StackServiceImpl::new(daemon.clone());
+        let request = |request_id: &str, remove_volumes: bool| runtime_v2::TeardownStackRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: request_id.to_string(),
+                idempotency_key: "idem-shutdown-success".to_string(),
+                trace_id: String::new(),
+            }),
+            stack_name: stack_name.to_string(),
+            remove_volumes,
+            dry_run: false,
+            scope: Some(wire_scope.clone()),
+        };
+        let first = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request("req-shutdown-success", false)),
+        )
+        .await
+        .expect("initial teardown stream");
+        let receipt_id = first
+            .metadata()
+            .get("x-receipt-id")
+            .and_then(|value| value.to_str().ok())
+            .expect("durable teardown receipt")
+            .to_string();
+        let mut first_stream = first.into_inner();
+        while let Some(item) = first_stream.next().await {
+            item.expect("initial teardown succeeds");
+        }
+
         let spec = parse_stack_spec(
             stack_name,
             "services:\n  web:\n    image: ghcr.io/acme/web:dev\n",
             ".",
         )
         .unwrap();
-        let request_id = "req-shutdown-success";
-        let request_digest =
-            teardown_request_digest(stack_name, &workload_scope, request_id, false, false);
         daemon
             .with_state_store(|store| {
                 store.save_desired_state(stack_name, &spec)?;
@@ -2279,17 +2697,7 @@ mod tests {
                     updated_at: 10,
                     completed_at: None,
                 };
-                store.create_reconcile_batch(&session, &actions)?;
-                store.save_receipt(&Receipt {
-                    receipt_id: "receipt-shutdown-success".to_string(),
-                    operation: "teardown_stack".to_string(),
-                    entity_id: stack_name.to_string(),
-                    entity_type: "stack".to_string(),
-                    request_id: request_id.to_string(),
-                    status: "success".to_string(),
-                    created_at: 9,
-                    metadata: receipt_stack_teardown_metadata(&request_digest, 2, 0)?,
-                })
+                store.create_reconcile_batch(&session, &actions)
             })
             .unwrap_or_else(|error| panic!("persist desired stack: {error}"));
         daemon
@@ -2298,39 +2706,17 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
 
-        let service = StackServiceImpl::new(daemon.clone());
-        for (dry_run, remove_volumes) in [(false, true), (true, false)] {
-            let error = runtime_v2::stack_service_server::StackService::teardown_stack(
-                &service,
-                tonic::Request::new(runtime_v2::TeardownStackRequest {
-                    metadata: Some(runtime_v2::RequestMetadata {
-                        request_id: request_id.to_string(),
-                        idempotency_key: String::new(),
-                        trace_id: String::new(),
-                    }),
-                    stack_name: stack_name.to_string(),
-                    remove_volumes,
-                    dry_run,
-                    scope: Some(wire_scope.clone()),
-                }),
-            )
-            .await
-            .expect_err("receipt replay requires the exact teardown option tuple");
-            assert_eq!(error.code(), tonic::Code::FailedPrecondition);
-        }
+        let error = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(request("req-conflicting-retry", true)),
+        )
+        .await
+        .expect_err("idempotency replay requires the exact teardown option tuple");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+
         let response = runtime_v2::stack_service_server::StackService::teardown_stack(
             &service,
-            tonic::Request::new(runtime_v2::TeardownStackRequest {
-                metadata: Some(runtime_v2::RequestMetadata {
-                    request_id: request_id.to_string(),
-                    idempotency_key: String::new(),
-                    trace_id: String::new(),
-                }),
-                stack_name: stack_name.to_string(),
-                remove_volumes: false,
-                dry_run: false,
-                scope: Some(wire_scope),
-            }),
+            tonic::Request::new(request("req-replay-correlation", false)),
         )
         .await
         .unwrap_or_else(|error| panic!("teardown stream should start: {error}"));
@@ -2339,7 +2725,7 @@ mod tests {
                 .metadata()
                 .get("x-receipt-id")
                 .and_then(|value| value.to_str().ok()),
-            Some("receipt-shutdown-success")
+            Some(receipt_id.as_str())
         );
 
         let mut stream = response.into_inner();
@@ -2352,7 +2738,8 @@ mod tests {
             }
         }
         let completion = completion.expect("stored completion response");
-        assert_eq!(completion.changed_actions, 2);
+        assert_eq!(completion.request_id, "req-shutdown-success");
+        assert_eq!(completion.changed_actions, 1);
         assert_eq!(completion.removed_volumes, 0);
         assert!(daemon.manager().has_stack_runtime(stack_name));
 
@@ -2371,7 +2758,13 @@ mod tests {
                 .count(),
             1
         );
-        assert!(stack_events.is_empty());
+        assert_eq!(
+            stack_events
+                .iter()
+                .filter(|event| matches!(event, StackEvent::StackDestroyed { .. }))
+                .count(),
+            1
+        );
         let active = daemon
             .with_state_store(|store| store.load_active_reconcile_session(stack_name))
             .unwrap()
@@ -2511,30 +2904,34 @@ services:
     }
 
     #[test]
-    fn teardown_session_identity_binds_stack_and_request() {
+    fn teardown_payload_digest_excludes_correlation_but_session_binds_operation_key() {
         let (_, daemon) = stack_test_daemon();
         let scope = seed_owned_stack_topology(daemon.as_ref(), "demo");
         let scope = vz_runtime_translate::machine_workload_scope_from_proto(&scope).unwrap();
-        let expected = teardown_request_digest("demo", &scope, "req-1", false, false);
+        let expected = teardown_request_digest("demo", &scope, false, false);
         assert_eq!(
-            teardown_request_digest("demo", &scope, "req-1", false, false),
-            expected
-        );
-        assert_ne!(
-            teardown_request_digest("demo", &scope, "req-2", false, false),
-            expected
-        );
-        assert_ne!(
-            teardown_request_digest("demo", &scope, "req-1", false, true),
-            expected
-        );
-        assert_ne!(
-            teardown_request_digest("demo", &scope, "req-1", true, false),
+            teardown_request_digest("demo", &scope, false, false),
             expected
         );
         assert_eq!(
-            teardown_reconcile_session_id(&expected),
-            teardown_reconcile_session_id(&expected)
+            teardown_request_digest("demo", &scope, false, false),
+            expected
+        );
+        assert_ne!(
+            teardown_request_digest("demo", &scope, false, true),
+            expected
+        );
+        assert_ne!(
+            teardown_request_digest("demo", &scope, true, false),
+            expected
+        );
+        assert_eq!(
+            teardown_reconcile_session_id("req:req-1", &expected),
+            teardown_reconcile_session_id("req:req-1", &expected)
+        );
+        assert_ne!(
+            teardown_reconcile_session_id("req:req-2", &expected),
+            teardown_reconcile_session_id("req:req-1", &expected)
         );
     }
 
@@ -2644,6 +3041,108 @@ services:
         assert_eq!(run_service.mounts.len(), 1);
         assert_eq!(run_service.resources.cpus, Some(2.0));
         assert_eq!(run_service.resources.memory_bytes, Some(512 * 1024 * 1024));
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn prepared_teardown_fences_apply_before_desired_state_and_build_phase() {
+        let (_tmp, daemon) = stack_test_daemon();
+        let stack_name = "apply-during-prepared-teardown";
+        let wire_scope = seed_owned_stack_topology(daemon.as_ref(), stack_name);
+        seed_running_stack_service(daemon.clone(), stack_name, &wire_scope).await;
+        daemon.manager().backend().fail_next_shared_vm_shutdown();
+        let service = StackServiceImpl::new(daemon.clone());
+
+        let teardown = runtime_v2::stack_service_server::StackService::teardown_stack(
+            &service,
+            tonic::Request::new(runtime_v2::TeardownStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-prepare-teardown-fence".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                remove_volumes: false,
+                dry_run: false,
+                scope: Some(wire_scope.clone()),
+            }),
+        )
+        .await
+        .expect("teardown stream");
+        let mut teardown_stream = teardown.into_inner();
+        let mut teardown_failed = false;
+        while let Some(item) = teardown_stream.next().await {
+            teardown_failed |= item.is_err();
+        }
+        assert!(
+            teardown_failed,
+            "injected shutdown failure must leave a prepared fence"
+        );
+
+        let (desired_before, events_before, receipts_before) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_desired_state(stack_name)?,
+                    store.load_events(stack_name)?,
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                ))
+            })
+            .unwrap();
+        let shutdowns_before = daemon.manager().backend().shared_vm_shutdown_count();
+
+        let apply = runtime_v2::stack_service_server::StackService::apply_stack(
+            &service,
+            tonic::Request::new(runtime_v2::ApplyStackRequest {
+                metadata: Some(runtime_v2::RequestMetadata {
+                    request_id: "req-apply-while-teardown-prepared".to_string(),
+                    idempotency_key: String::new(),
+                    trace_id: String::new(),
+                }),
+                stack_name: stack_name.to_string(),
+                compose_yaml: "services:\n  replacement:\n    image: alpine:latest\n".to_string(),
+                compose_dir: ".".to_string(),
+                dry_run: false,
+                detach: true,
+                scope: Some(wire_scope),
+            }),
+        )
+        .await
+        .expect("apply returns a progress stream");
+        let mut apply_stream = apply.into_inner();
+        let mut phases = Vec::new();
+        let mut terminal_error = None;
+        while let Some(item) = apply_stream.next().await {
+            match item {
+                Ok(event) => {
+                    if let Some(runtime_v2::apply_stack_event::Payload::Progress(progress)) =
+                        event.payload
+                    {
+                        phases.push(progress.phase);
+                    }
+                }
+                Err(error) => terminal_error = Some(error),
+            }
+        }
+        let error = terminal_error.expect("prepared teardown must reject apply");
+        assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert!(error.message().contains("fenced by prepared teardown"));
+        assert!(!phases.iter().any(|phase| phase == "building_images"));
+
+        let (desired_after, events_after, receipts_after) = daemon
+            .with_state_store(|store| {
+                Ok((
+                    store.load_desired_state(stack_name)?,
+                    store.load_events(stack_name)?,
+                    store.list_receipts_for_entity("stack", stack_name)?,
+                ))
+            })
+            .unwrap();
+        assert_eq!(desired_after, desired_before);
+        assert_eq!(events_after, events_before);
+        assert_eq!(receipts_after, receipts_before);
+        assert_eq!(
+            daemon.manager().backend().shared_vm_shutdown_count(),
+            shutdowns_before
+        );
     }
 
     struct TestBuildRunner {

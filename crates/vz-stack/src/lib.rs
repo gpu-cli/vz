@@ -38,7 +38,8 @@ pub use events::{
 pub use executor::{
     ActionOutcomeResult, ClaimedTeardownAdmission, ContainerLogs, ContainerRuntime,
     ExecutionResult, IndexedActionOutcome, LogLine, LogStream, PendingClaimedTeardown, PortTracker,
-    ReconcileActionKind, StackExecutor, matches_claimed_teardown_operation,
+    ReconcileActionKind, StackExecutor, claimed_teardown_operation_id,
+    matches_claimed_teardown_operation,
 };
 pub use health::{
     DependencyCheck, HealthPollResult, HealthPoller, HealthStatus, check_dependencies,
@@ -73,8 +74,10 @@ pub use state_store::{
     StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
     StackContainerGenerationBinding, StackContainerRecoveryDisposition,
     StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
+    TEARDOWN_FINALIZER_SCHEMA_VERSION, TeardownFinalizer, TeardownFinalizerStatus,
+    teardown_receipt_id,
 };
 pub use volume::{
-    ResolvedMount, ResolvedMountKind, SkippedMount, VolumeManager, mounts_changed,
-    orphaned_volumes, referenced_volume_names, resolve_mounts,
+    ResolvedMount, ResolvedMountKind, SkippedMount, TeardownPathState, VolumeManager,
+    mounts_changed, orphaned_volumes, referenced_volume_names, resolve_mounts,
 };
