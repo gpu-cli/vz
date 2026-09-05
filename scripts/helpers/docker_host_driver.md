@@ -46,7 +46,8 @@ Required JSON keys (unknown keys fail):
 | `docker_config` | Canonical absolute disposable directory, mode `0700`, not the user's `.docker` |
 | `clients` | `docker`, `compose`, `buildx`, each `{ "path": <canonical installed binary path>, "sha256": <actual digest> }` |
 | `images` | `base` and `compose`, each `{ "reference": <immutable reference>, "id": <verified sha256 image config ID>, "platform": "linux/arm64" }` |
-| `builder` | Exact `name`, `node`, `container_id` and `image_id` of a fresh, already-running owned docker-container buildx builder |
+| `builder` | Required for `build`/`all`; optional (not null) for `compose`. Exact `name`, `node`, `container_id` and `image_id` of a fresh, already-running owned docker-container buildx builder |
+| `runtime_evidence` | Optional exact `receipt_path`, `receipt_sha256`, `inventory_path`, `inventory_sha256`, `youki_sha256`; required when Engine advertises inert stock runc metadata |
 
 `images.base.reference` must be a repository `@sha256:` digest and provide Python
 3 and `/bin/sh`. `images.compose` is built from the fixture `compose/Dockerfile`;
@@ -59,13 +60,37 @@ verified **youki-only** image. The stock BuildKit image is not automatically an
 acceptable input. The driver does not bootstrap or create a builder, attach one
 to another endpoint, or remove the caller's builder/cache. The surrounding gate
 owns its provisioning, recursive runtime inventory and final destruction.
+Compose-only execution neither requires nor inspects a builder. The Python API
+admits inputs with `Inputs(raw, suite="compose")`; the default remains `all` and
+requires a builder. Switching suite after admission is rejected before commands.
+
+Runtime evidence paths must be canonical, bounded regular files with their exact
+SHA-256 digests. The completed immutable operational-probe receipt and adjacent
+post-probe inventory must bind the input Project, Environment, Machine,
+`machine_incarnation` (the exact incarnation ID), Engine, managed context,
+Docker executable and pinned youki digest. They are re-read and rehashed on every
+guard. Stock `runc`/`io.containerd.runc.v2` entries are accepted only as exact
+`{"path":"runc"}` metadata alongside this verified executable-absence evidence;
+the selected default must remain youki at `/mnt/linux-bin/youki`. This is the
+normal startup executable-path/pinned-mount inventory, **not** a recursive cache
+audit or full release runtime attestation. The parent must independently bind the
+receipt to the actual current status and signed release; supplying JSON alone
+does not authenticate ownership or runtime identity.
 
 The private client directory must already contain the managed Machine context.
 Its `config.json` allows only `currentContext` and `cliPluginsExtraDirs`; the
 latter is the sorted unique parent directories of the pinned Compose/buildx
-binary paths. Credential helpers, auths, proxies, shadow plugins and unknown
+binary paths. Alternatively, the installed harness may supply mode-0700
+`config/cli-plugins` containing exactly the pinned regular executable bytes under
+`docker-compose` and `docker-buildx`; this layout forbids `cliPluginsExtraDirs`.
+Mixed layouts, unknown discovery plugins, redirects and changed bytes fail.
+Credential helpers, auths, proxies, shadow plugins and unknown
 client settings are rejected. The driver never changes `currentContext`, and
 every invocation includes the same explicit `--config` and `--context`.
+The real host `HOME` is preserved (or remains unset); only `TMPDIR` selects a fresh
+owned directory. Docker/Compose/buildx and SSH-agent environment variables are not
+inherited. Canonical multicall Docker bytes are executed with logical argv0
+`docker`; plugin copies retain their exact required discovery basenames.
 
 Calculate the fixture digest with the driver's `tree_digest(Path(...))` (the
 contract's sorted `[relative_path, mode, size, SHA256]` JSON inventory algorithm).
@@ -96,7 +121,8 @@ executable, logical `argv[0] = docker`, arguments, fixture environment additions
 stream observations, exit, timeout and wall/monotonic timing. stdout and stderr
 are drained concurrently with a **4 MiB retained bound per stream**. At most one
 additional byte is read to detect overflow. Excess output is a failure: the
-owned CLI/plugin process group is killed and reaped, bounded prefixes and their
+owned CLI/plugin process group is killed and given a bounded five-second reap;
+a failed reap remains uncertain. Bounded prefixes and their
 hashes are retained, and `capture_complete` / `raw_streams_retained` are false.
 Full raw-stream hashes are null when capture is incomplete; retained-prefix
 hashes never masquerade as hashes of discarded or unobserved output.
@@ -107,6 +133,26 @@ its daemon-side operation stopped mutating. Automatic destructive cleanup is
 withheld whenever any command has uncertain effects, including uncertainty that
 arises during an earlier project's cleanup. The result identifies owned projects
 requiring topology-level reconciliation. There are no test-case retries.
+Normal nonzero exits from potentially mutating commands also remain uncertain.
+Only an exact expected-negative semantic proof can write a separate durable
+`command-NNNNN.acknowledgement.json` binding the unchanged terminal receipt hash.
+The terminal receipt itself retains its original uncertainty; consumers must
+verify the acknowledgement and replay its proof, never treat host exit alone as
+daemon-side quiescence.
+
+Compose admission and cleanup inspect exact generated volume/network names even
+without labels, reject collisions, and reconcile actual mounts/network IDs to
+captured owned resources before `down --volumes`.
+After down, exact generated names must also be absent independently of labels,
+and every container ID observed immediately before down must return the exact
+missing-container response. Empty label queries alone cannot prove cleanup.
+Persistence uses an exclusive
+host-written marker, not the startup-recreated database sentinel. Every denied
+name/IP transport probe is bracketed by exact source/destination healthy-byte
+controls; HTTP errors and unclassified failures cannot prove isolation. Blocked
+health requires four concrete created identities and positive Engine creation,
+database-start and unhealthy history; empty event windows cannot pass. Failure
+propagation requires the observed failure exit and no service left running.
 
 The fresh mode-0700 output directory contains numbered command receipts, raw
 streams, owner overlay, local exports, `inputs.json`, `result.json` and recursive
@@ -114,7 +160,7 @@ streams, owner overlay, local exports, `inputs.json`, `result.json` and recursiv
 streams are withheld with an explicit failure and original hash. This only
 protects command streams; exported image/cache blob scanning remains required.
 Treat this private DEV evidence as untrusted until the aggregate's comprehensive
-secret and provenance validators pass. Private-home state is not public evidence.
+secret and provenance validators pass. Private temporary state is not public evidence.
 
 Validate `result.json` with `docker_host_results.schema.json` **and** the driver's
 `validate_result` semantic checks. The latter checks exact suite order and

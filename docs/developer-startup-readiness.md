@@ -101,7 +101,92 @@ The passing workload results do not certify every stream-close condition,
 named-volume/workspace semantics, native macOS, the 63-scenario Docker contract,
 or the mixed-target 0.4 aggregate. Nothing was installed over the daily binaries.
 
+## Installed Compose gate development
+
+The [host Compose entry point](../scripts/helpers/linux_docker_e2e.md) now binds
+normal public Up activation identities, installed configuration/artifact pins,
+startup runtime inventories and exact host contexts before fixture mutations.
+It implements an eight-recipe DEV slice with independent raw-evidence replay;
+`--suite all` rejects before provisioning because the full63 dispatcher is not
+implemented. The standalone Python image input pins actual ARM64 registry
+metadata; physical suitability still requires pull/inspection/execution in each
+selected Machine. Offline assertions alone do not establish compatibility.
+
+The first physical attempt, `.artifacts/linux-docker-compose-candidate-1/`,
+failed during initial Machine boot, before any Compose fixture ran. Guest exec
+timed out after30s. The fresh private64GiB disk retained its format-intent and
+substantial formatting writes, strongly implicating first-format work, but the
+old error lacked a phase label and does not conclusively identify the command.
+The implementation now separates a bounded30s filesystem probe from180s
+first-format work and reports phase/device/purpose/budget/elapsed diagnostics.
+The second candidate booted all four Machines with this change; that does not
+conclusively identify the earlier timeout or prove formatting under pressure.
+It does not turn the failed run into a pass or authorize reuse/reformatting of
+its retained disk.
+
+Public Stop was not admitted: the failed Up retained its fence and Running
+lifecycle. Early boot also discards VM-stop results before registering the VM,
+so the retained Runtime does not establish a recoverable exact early-boot VM
+handle. This separate recovery gap remains in `vz-ehz`. The twice-fingerprinted
+test daemon received SIGTERM and exited with socket/PID removal and a graceful
+shutdown log. `.artifacts/linux-docker-compose-candidate-1-reconciliation/`
+records only that host-process disposition: **not** public Stop, guest
+quiescence, journal reconciliation or Delete. All failed state/storage remains.
+
+The second candidate, `.artifacts/linux-docker-compose-candidate-2/`, passed
+normal Up for four Developer Machines, authenticated startup/activation proofs
+and four independent sentinel containers. The first immutable Python image pull
+then failed TLS verification (`x509: certificate signed by unknown authority`).
+The Linux builder had public roots but neither guest initramfs nor overlay root
+included them. No Compose recipe ran. The new pinned public
+[CA payload](../linux/ca-trust/README.md) is verified during assembly and boot;
+the third physical candidate below verifies actual HTTPS behavior.
+
+Separate `.artifacts/linux-docker-compose-candidate-2-reconciliation/` evidence
+records positive public Stop for all four Machines and graceful shutdown of the
+exact test daemon, with both Docker defaults unchanged. Failed-pull uncertainty,
+all Docker objects and stopped Machine storage remain retained. This is runtime
+quiescence, not successful Docker cleanup, Delete, or a retried passing test.
+
+The third candidate, `.artifacts/linux-docker-compose-candidate-3/`, passed
+normal Up and exact public CA-hash checks on all four Machines. The first
+Machine's unmodified host Docker client successfully pulled the immutable
+Python ARM64 image over verified HTTPS, inspected its manifest and platform,
+executed Python and a POSIX shell, and built the Compose fixture through its
+private embedded builder. All eight first-Machine recipe assertions completed.
+The run nevertheless **failed** cleanup: never-started dependency-blocked
+containers have configured network names but empty Engine network/endpoint IDs;
+the ownership check rejected those unmaterialized attachments. The second and
+third Machine slices did not run, and no successful independent slice replay or
+Docker parity is claimed. All 9,319 original evidence checksums were independently
+verified. A narrowly guarded ownership-check correction is in progress.
+
+Separate `.artifacts/linux-docker-compose-candidate-3-reconciliation/` receipts
+positively stopped the four exact Machines and gracefully shut down their
+fingerprinted daemon. Host and private Docker defaults were unchanged. Failed
+cleanup evidence, Docker resources and stopped Machine storage remain retained;
+this separate disposition does not turn the candidate into a passing run.
+
 ## Backend regression checkpoint
+
+The subsequent fresh run `20260905T201331Z` failed its runtime lane (7 passed,
+12 failed). Alpine smoke-test serial output directly identified a CA-placement
+regression: the initial installer compared its pin to Alpine's existing distro
+bundle, rejected the difference, and exited init before agent startup. Minimal
+root, Hardened, and normal Developer shared-VM readiness paths passed. The
+correction uses a separate `/etc/vz/ca-certificates.crt` control-plane trust path
+and preserves distro certificates. Neither longer boot timeouts nor reuse of
+the failed run can certify the correction.
+Exact failed guest bundles are retained under that run's `failed-guest-bundles/`.
+
+The corrected fresh run `20260905T205453Z` passed all seven backend lanes:
+runtime19, runtime-generation crash/reopen1, StateStore crash/reopen1, daemon
+teardown1 (18 exact child/socket dispositions), Machine registry1, stack24 and
+BuildKit3. All selected tests passed with none ignored; all required evidence
+flags were validated. `raw-evidence.sha256` additionally binds 107 raw logs,
+summaries and supporting files, independently verified after completion.
+This is the current backend regression checkpoint, not Docker63 or aggregate
+0.4 certification. The separate installed Compose candidate remains required.
 
 The required `scripts/run-sandbox-vm-e2e.sh --suite all --profile release` run
 passed at `.artifacts/sandbox-vm-e2e/20260905T183551Z/summary.txt`, with raw logs

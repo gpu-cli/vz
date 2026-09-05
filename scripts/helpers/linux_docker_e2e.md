@@ -1,0 +1,74 @@
+# Installed local-Mac Compose slice (DEV)
+
+`scripts/run-linux-docker-e2e.sh` is the host entry point. Only `--suite compose`
+is implemented. `--suite all` rejects before client execution, state creation,
+or VM provisioning; it never aliases the full 63-scenario contract to a subset.
+
+Pass absolute paths for every artifact/client and a fresh evidence directory:
+
+```sh
+scripts/run-linux-docker-e2e.sh --suite compose \
+  --release-dir /absolute/signed-release/bin --release-version 0.4.0-dev \
+  --developer-bundle /absolute/developer-bundle \
+  --hardened-bundle /absolute/hardened-bundle \
+  --docker /absolute/docker --compose-plugin /absolute/docker-compose \
+  --buildx-plugin /absolute/docker-buildx \
+  --evidence-dir /absolute/fresh-evidence --run-id compose-unique-candidate
+```
+
+The optional `--fixture` and `--image-input` default to the repository fixture
+and `python-image-input.json`. The latter contains exact raw registry index,
+ARM64 manifest and config metadata with independently checked SHA-256 links.
+It is metadata provenance, not prior image execution evidence. The runner must
+pull the immutable digest into each selected vz Machine, inspect its config and
+platform, and execute its Python/shell before building the Compose image.
+For the selected containerd-backed Engine, the expected image ID is the exact
+ARM64 manifest digest, not its config digest. Inspection must match the manifest
+descriptor, repository digest, platform, config fields and ordered diff IDs.
+The separately recorded config digest is verified registry provenance, not a
+claim that raw config bytes were independently fetched from the live Engine.
+Before fixture mutation, public Exec verifies the pinned public CA bundle hash
+at `/etc/vz/ca-certificates.crt` inside every exact Machine, without replacing
+the image's distro trust store. Before each pull, host Engine info binds the Engine
+ID to secure Docker Hub configuration with no mirrors or insecure ranges beyond
+Moby's loopback defaults. This does not claim a complete effective-trust audit;
+the immutable HTTPS pull must still succeed. Host keychains are not imported.
+
+The runner stages byte-identical signed CLI/daemon and host plugins into a fresh
+private prefix. Normal public Up launches the installed daemon and four
+Developer-profile Linux Machines: two named Environments, two Machines each,
+one project/worktree. It does not modify the daily installation, HOME, or daily
+Docker default. All Docker operations name the exact private config and Machine
+context; there is no global daemon fallback. The public Up activation binds the
+real runtime identity and incarnation to public status, the installed catalog,
+startup receipt, post-startup inventory, context endpoint and Engine identity.
+These checks precede fixture mutation.
+
+Eight real Compose recipes run on both primary Machines and one neighboring
+Machine. Three separate driver outputs retain all stdout/stderr, exit codes,
+timestamps, pre-dispatch intents, semantic acknowledgements for expected
+negative mutations, input pins and checksums. Independent replay requires the
+actual create/start/health events, exit37 streams, complete network denial
+matrix with paired destination controls, a host-written persistence sentinel,
+scale identities, blocked dependencies, failure propagation and owned cleanup.
+Missing history or observations fail; no test retries are performed.
+
+Four additional containers are started once before workload execution. A
+separate recorder continuously checks their Engine identity, unchanged start
+time/ID, zero restarts and unique host-written marker. These are contemporaneous
+container liveness observations, **not** public-network service conformance.
+
+Cleanup removes only positively inspected owned workload objects and images,
+then obtains public Stop receipts and graceful daemon shutdown. Unknown command
+effects withhold cleanup; they are retained durably, including normal nonzero
+mutation failures. A monitor is positively reaped before removals begin. Outer
+cleanup also requires each Compose driver's successful cleanup and
+independent raw-evidence replay; certain command exits alone cannot certify
+that volumes or networks disappeared. Missing or failed replay retains resources.
+The owned installation, stopped Machine disks/contexts and BuildKit cache remain
+for inspection. This is not Delete acceptance or a complete leak audit.
+
+No result certifies Docker parity or emits release-scenario PASS. Full fixture
+freezing, all63 scenarios, full OCI/cache/runtime audits, host binds/forwarding,
+recovery, native macOS, the five-verb Delete path, and the canonical three-phase
+aggregate with measured hardware sleep remain separate required work.

@@ -1,12 +1,18 @@
 """Offline structural/content tests; not runtime acceptance."""
 import importlib.util
+import errno
+import io
 import json
 import os
 from pathlib import Path
 import shlex
+import socket
+import signal
 import tempfile
+import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from urllib.error import HTTPError, URLError
 
 from validate import ROOT, validate, validate_inputs
 
@@ -78,6 +84,120 @@ class FixtureTests(unittest.TestCase):
         with patch.dict(os.environ, {"FIXTURE_OWNER": "../foreign"}):
             with self.assertRaises(ValueError):
                 service.owner()
+
+    def test_transport_http_errors_and_redirects_are_reachability_not_denial(self):
+        service = module("fixture_transport_http", ROOT / "compose/service.py")
+        url = "http://db:8080/health"
+        for code in (200, 302, 401, 403, 404, 503):
+            opener = Mock()
+            if code == 200:
+                response = Mock(status=code)
+                opener.open.return_value.__enter__ = Mock(return_value=response)
+                opener.open.return_value.__exit__ = Mock(return_value=False)
+            else:
+                opener.open.side_effect = HTTPError(url, code, "HTTP response", {}, io.BytesIO())
+            with self.subTest(code=code), patch.object(service, "build_opener", return_value=opener) as build:
+                value = service.transport(url)
+                self.assertEqual(value, {"schema_version": 1, "url": url, "outcome": "http_response",
+                                         "status": code, "errno": None, "exception": None})
+                opener.open.assert_called_once_with(url, timeout=2)
+                self.assertIsInstance(build.call_args.args[0], service.ProxyHandler)
+                self.assertEqual(build.call_args.args[0].proxies, {})
+                handler = build.call_args.args[1]
+                self.assertIsInstance(handler, service.NoTransportRedirects)
+                self.assertIsNone(handler.redirect_request(None, None, 302, "redirect", {}, "http://foreign/"))
+                if code == 200:
+                    response.read.assert_not_called()
+
+    def test_transport_only_typed_network_errors_are_classified(self):
+        service = module("fixture_transport_errors", ROOT / "compose/service.py")
+        url = "http://172.18.0.2:8080/health"
+        cases = [
+            (socket.gaierror(socket.EAI_NONAME, "DNS absent"), "dns_failure"),
+            (ConnectionRefusedError(errno.ECONNREFUSED, "refused"), "connection_refused"),
+            (TimeoutError("deadline"), "timeout"),
+            (OSError(errno.ETIMEDOUT, "deadline"), "timeout"),
+            (OSError(errno.ENETUNREACH, "unreachable"), "network_unreachable"),
+            (OSError(errno.EHOSTUNREACH, "unreachable"), "network_unreachable"),
+            (PermissionError(errno.EACCES, "not network proof"), "probe_error"),
+            (FileNotFoundError(errno.ENOENT, "not network proof"), "probe_error"),
+            (ValueError("application bug"), "probe_error"),
+            ("timed out", "probe_error"),
+        ]
+        for error, outcome in cases:
+            opener = Mock()
+            opener.open.side_effect = URLError(error)
+            with self.subTest(error=error), patch.object(service, "build_opener", return_value=opener):
+                value = service.transport(url)
+                self.assertEqual(value["outcome"], outcome)
+                self.assertEqual(value["url"], url)
+                self.assertIsNone(value["status"])
+                self.assertEqual(value["errno"], getattr(error, "errno", None))
+                self.assertEqual(value["exception"], type(error).__name__)
+
+    def test_transport_late_close_error_cannot_erase_observed_http_response(self):
+        service = module("fixture_transport_late_error", ROOT / "compose/service.py")
+        opener = Mock()
+        opener.open.return_value.__enter__ = Mock(return_value=Mock(status=503))
+        opener.open.return_value.__exit__ = Mock(side_effect=OSError(errno.ENETUNREACH, "late close"))
+        with patch.object(service, "build_opener", return_value=opener):
+            value = service.transport("http://db:8080/health")
+        self.assertEqual(value["outcome"], "http_response")
+        self.assertEqual(value["status"], 503)
+        self.assertIsNone(value["errno"])
+        self.assertIsNone(value["exception"])
+
+    def test_transport_rejects_unscoped_urls_before_any_attempt(self):
+        service = module("fixture_transport_urls", ROOT / "compose/service.py")
+        for url in ("file:///etc/passwd", "https://db:8080/health", "http://db/health",
+                    "http://db:8080/value", "http://user:secret@db:8080/health",
+                    "http://db:8080/health?query", "http://db:8080/health#fragment",
+                    "http://DB:8080/health", "http://db:8080/health\n", "x" * 321):
+            with self.subTest(url=url), patch.object(service, "build_opener") as opener:
+                self.assertEqual(service.transport(url)["outcome"], "probe_error")
+                opener.assert_not_called()
+
+    def test_transport_output_and_existing_positive_probe_are_distinct(self):
+        service = module("fixture_transport_output", ROOT / "compose/service.py")
+        url = "http://db:8080/health"
+        for outcome, code in (("http_response", 0), ("dns_failure", 0), ("probe_error", 2)):
+            value = {"schema_version": 1, "url": url, "outcome": outcome,
+                     "status": 200 if outcome == "http_response" else None,
+                     "errno": None, "exception": None}
+            output = io.StringIO()
+            with patch.object(service, "transport", return_value=value), patch.object(service.sys, "stdout", output):
+                self.assertEqual(service.main(["transport", url]), code)
+            self.assertEqual(output.getvalue(), json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n")
+        output = Mock(buffer=io.BytesIO())
+        with patch.object(service, "fetch", return_value=b"exact payload\x00\n"), patch.object(service.sys, "stdout", output):
+            self.assertEqual(service.main(["probe", url]), 0)
+        self.assertEqual(output.buffer.getvalue(), b"exact payload\x00\n")
+
+    def test_transport_total_deadline_bounds_even_a_blocked_resolver(self):
+        service = module("fixture_transport_deadline", ROOT / "compose/service.py")
+        previous = signal.getsignal(signal.SIGALRM)
+        opener = Mock()
+        opener.open.side_effect = lambda *_args, **_kwargs: time.sleep(20)
+        started = time.monotonic()
+        with patch.object(service, "build_opener", return_value=opener):
+            value = service.transport("http://db:8080/health")
+        self.assertLess(time.monotonic() - started, 5)
+        self.assertEqual(value["outcome"], "timeout")
+        self.assertEqual(value["exception"], "TimeoutError")
+        self.assertEqual(signal.getsignal(signal.SIGALRM), previous)
+        self.assertEqual(signal.getitimer(signal.ITIMER_REAL), (0.0, 0.0))
+
+    def test_transport_foreign_alarm_is_not_overwritten_or_network_denial(self):
+        service = module("fixture_transport_foreign_alarm", ROOT / "compose/service.py")
+        with patch.object(service.signal, "getitimer", return_value=(1.0, 0.0)), \
+                patch.object(service.signal, "signal") as handler, \
+                patch.object(service.signal, "setitimer") as timer, \
+                patch.object(service, "build_opener") as opener:
+            value = service.transport("http://db:8080/health")
+        self.assertEqual(value["outcome"], "probe_error")
+        opener.return_value.open.assert_not_called()
+        handler.assert_not_called()
+        timer.assert_not_called()
 
     def test_cache_mount_rejects_cold_reuse_and_foreign_warm_owner(self):
         tools = module("fixture_cache_tools", ROOT / "build/tools.py")

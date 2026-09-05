@@ -166,15 +166,27 @@ def execute_observer(argv, **kwargs):
     """
     timeout, limit = kwargs.pop("timeout"), kwargs.pop("max_stream_bytes")
     kwargs.pop("check")
-    with subprocess.Popen(argv, start_new_session=True, **kwargs) as process:
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    try:
         try:
             stdout, stderr = collect_output(process, timeout, limit)
-        except BaseException:
+        except BaseException as error:
             if process.returncode is None:
                 process.kill()
-            process.wait()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as reap_error:
+                reap_error.stdout = getattr(error, "stdout", b"")
+                reap_error.stderr = getattr(error, "stderr", b"")
+                raise reap_error from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    finally:
+        # Popen.__exit__ would wait without a deadline even after a failed reap.
+        # Do not abandon uncertainty or signal the autospawned daemon's group.
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 class Recorder:

@@ -147,7 +147,22 @@ class InstalledStartupTests(unittest.TestCase):
              self.assertRaises(subprocess.TimeoutExpired):
             driver.execute_observer(["vz"], timeout=1, max_stream_bytes=64, check=False)
         process.kill.assert_called_once_with()
-        process.wait.assert_called_once_with()
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_cli_observer_reap_failure_remains_bounded_and_preserves_prefix(self):
+        process = MagicMock()
+        process.returncode = None
+        process.wait.side_effect = subprocess.TimeoutExpired(["vz"], 5)
+        original = subprocess.TimeoutExpired(["vz"], 1, output=b"retained", stderr=b"diagnostic")
+        with patch.object(driver.subprocess, "Popen", return_value=process), \
+             patch.object(driver, "collect_output", side_effect=original), \
+             patch.object(driver.os, "killpg", side_effect=AssertionError("daemon group killed")), \
+             self.assertRaises(subprocess.TimeoutExpired) as failure:
+            driver.execute_observer(["vz"], timeout=1, max_stream_bytes=64, check=False)
+        self.assertEqual(failure.exception.stdout, b"retained")
+        self.assertEqual(failure.exception.stderr, b"diagnostic")
+        process.wait.assert_called_once_with(timeout=5)
+        process.__exit__.assert_not_called()
 
     def test_uncertain_cleanup_cannot_stop_or_signal(self):
         harness = object.__new__(driver.Harness)

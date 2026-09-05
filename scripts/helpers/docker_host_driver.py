@@ -53,11 +53,11 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def regular(path: Path) -> bytes:
+def regular(path: Path, limit: int = 512 * 1024 * 1024) -> bytes:
     descriptor = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
     with os.fdopen(descriptor, "rb") as stream:
         before = os.fstat(stream.fileno())
-        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= 512 * 1024 * 1024,
+        require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and before.st_size <= limit,
                 f"not a bounded single-link regular file: {path}")
         data = stream.read(before.st_size + 1)
         after = os.fstat(stream.fileno())
@@ -107,11 +107,18 @@ def immutable_image(value: Any) -> str:
 @dataclasses.dataclass(frozen=True)
 class Inputs:
     raw: dict[str, Any]
+    suite: str = "all"
 
     def __post_init__(self) -> None:
         required = {"schema_version", "run_id", "release_sha256", "fixture_sha256",
-                    "scope", "docker_config", "clients", "images", "builder"}
-        require(set(self.raw) == required, "unknown or missing input keys")
+                    "scope", "docker_config", "clients", "images"}
+        require(self.suite in SUITE_RECIPES, "unknown input suite")
+        optional = {"runtime_evidence"}
+        if self.suite == "compose":
+            optional.add("builder")
+        else:
+            required.add("builder")
+        require(required <= set(self.raw) <= required | optional, "unknown or missing input keys")
         require(self.raw["schema_version"] == 1, "unknown input schema")
         checked_text(self.raw["run_id"], r"[a-z0-9][a-z0-9-]{7,39}", "unique run ID")
         digest(self.raw["release_sha256"])
@@ -151,13 +158,24 @@ class Inputs:
             checked_text(pin["id"], r"sha256:[0-9a-f]{64}", "image configuration ID")
             require(pin["platform"] == "linux/arm64", "wrong image platform")
         require("@sha256:" in images["base"]["reference"], "base must pin repository digest")
-        builder = self.raw["builder"]
-        require(set(builder) == {"name", "node", "container_id", "image_id"},
-                "exact pre-provisioned builder identity required")
-        for key in ("name", "node"):
-            checked_text(builder[key], r"[a-z0-9][a-z0-9-]{0,62}", "owned builder name")
-        checked_text(builder["container_id"], r"[0-9a-f]{64}", "builder container ID")
-        checked_text(builder["image_id"], r"sha256:[0-9a-f]{64}", "builder image ID")
+        if "builder" in self.raw:
+            builder = self.raw["builder"]
+            require(isinstance(builder, dict) and set(builder) == {"name", "node", "container_id", "image_id"},
+                    "exact pre-provisioned builder identity required")
+            for key in ("name", "node"):
+                checked_text(builder[key], r"[a-z0-9][a-z0-9-]{0,62}", "owned builder name")
+            checked_text(builder["container_id"], r"[0-9a-f]{64}", "builder container ID")
+            checked_text(builder["image_id"], r"sha256:[0-9a-f]{64}", "builder image ID")
+        if "runtime_evidence" in self.raw:
+            proof = self.raw["runtime_evidence"]
+            require(isinstance(proof, dict) and set(proof) == {
+                "receipt_path", "receipt_sha256", "inventory_path", "inventory_sha256", "youki_sha256"},
+                "exact startup runtime evidence pins required")
+            for name in ("receipt", "inventory"):
+                path = absolute(proof[name + "_path"])
+                require(sha256(regular(path, MAX_STREAM_BYTES)) == digest(proof[name + "_sha256"]),
+                        "startup runtime evidence digest mismatch")
+            digest(proof["youki_sha256"])
 
     @property
     def scope(self) -> dict[str, str]:
@@ -167,6 +185,46 @@ class Inputs:
     def owner(self) -> str:
         material = json.dumps([self.raw["run_id"], self.scope], sort_keys=True).encode()
         return "vz04-" + sha256(material)[:24]
+
+    def verify_runtime_evidence(self) -> dict[str, Any] | None:
+        """Recheck parent-authenticated startup receipts, not a live cache audit."""
+        proof = self.raw.get("runtime_evidence")
+        if proof is None:
+            return None
+        evidence = {}
+        for name in ("receipt", "inventory"):
+            data = regular(absolute(proof[name + "_path"]), MAX_STREAM_BYTES)
+            require(sha256(data) == proof[name + "_sha256"], "startup runtime proof changed")
+            evidence[name] = json.loads(data)
+        receipt, after = evidence["receipt"], evidence["inventory"]
+        owner = {name: self.scope[name] for name in ("project_id", "environment_id", "machine_id")}
+        incarnation = receipt["incarnation"]
+        require(receipt["schema_version"] == 1 and receipt["state"] == "completed" and receipt["failure"] is None and
+                receipt["owner"] == owner and receipt["context"] == self.scope["docker_context"] and
+                receipt["client_sha256"] == self.raw["clients"]["docker"]["sha256"], "foreign/incomplete startup receipt")
+        require(incarnation["schema_version"] == 1 and incarnation["machine_id"] == owner["machine_id"] and
+                incarnation["incarnation_id"] == self.scope["machine_incarnation"] and
+                type(incarnation["generation"]) is int and incarnation["generation"] > 0, "stale startup incarnation")
+        resources = receipt["resources"]
+        require(resources["engine_id"] == self.scope["engine_id"] and
+                resources["cleanup_scope"] == "disposable_probe_containers_compose_objects_and_images" and
+                resources["retained_buildkit_cache"] is True, "startup Engine/cleanup scope mismatch")
+        require(set(after) == {"schema_version", "probe_receipt_sha256", "runtime_inventory"} and
+                after["schema_version"] == 1 and after["probe_receipt_sha256"] == proof["receipt_sha256"],
+                "post-startup inventory does not bind this receipt")
+        inventory = after["runtime_inventory"]
+        require(inventory == resources["runtime_inventory"] and
+                set(inventory) == {"owner", "incarnation", "youki_sha256", "scope", "stdout"} and
+                inventory["owner"] == owner and inventory["incarnation"] == incarnation and
+                inventory["youki_sha256"] == proof["youki_sha256"] and
+                inventory["scope"] == "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit",
+                "startup runtime inventory identity differs")
+        output = inventory["stdout"]
+        require(isinstance(output, str) and len(output.encode()) <= 8192 and
+                output.startswith("vz-startup-runtime-inventory-v1\nyouki-sha256=" + proof["youki_sha256"] + "\n") and
+                output.endswith("\nalternate-runtime-binaries=absent\n") and "\nyouki version: " in output,
+                "startup executable inventory does not establish pinned youki and absence of alternates")
+        return inventory
 
 
 @dataclasses.dataclass
@@ -228,7 +286,8 @@ def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
     limit = kwargs.pop("max_stream_bytes", MAX_STREAM_BYTES)
     require(type(limit) is int and 1 <= limit <= MAX_STREAM_BYTES, "invalid per-stream output bound")
     kwargs.pop("check")
-    with subprocess.Popen(argv, start_new_session=True, **kwargs) as process:
+    process = subprocess.Popen(argv, start_new_session=True, **kwargs)
+    try:
         try:
             stdout, stderr = collect_output(process, timeout, limit)
         except BaseException as error:
@@ -239,11 +298,28 @@ def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
                     os.killpg(process.pid, signal.SIGKILL)
                 except ProcessLookupError:
                     pass
+                except OSError as kill_error:
+                    kill_error.stdout = getattr(error, "stdout", b"")
+                    kill_error.stderr = getattr(error, "stderr", b"")
+                    kill_error.observed_bytes = getattr(error, "observed_bytes", {})
+                    raise kill_error from error
             # Never communicate() here: that could allocate an unlimited tail.
             # collect_output attached only its bounded observed prefixes.
-            process.wait()
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired as reap_error:
+                reap_error.stdout = getattr(error, "stdout", b"")
+                reap_error.stderr = getattr(error, "stderr", b"")
+                reap_error.observed_bytes = getattr(error, "observed_bytes", {})
+                raise reap_error from error
             raise
         return subprocess.CompletedProcess(argv, process.returncode, stdout, stderr)
+    finally:
+        # Popen.__exit__ performs an unbounded wait; close pipes ourselves and
+        # leave a failed bounded reap explicitly uncertain for the caller.
+        for pipe in (process.stdin, process.stdout, process.stderr):
+            if pipe is not None:
+                pipe.close()
 
 
 def contains_canary(streams: tuple[bytes, ...], canaries: list[bytes]) -> bool:
@@ -286,7 +362,7 @@ class Recorder:
             os.close(directory)
 
     def run(self, argv: list[str], *, executable: str, timeout: int = 120,
-            extra_env: dict[str, str] | None = None) -> Command:
+            extra_env: dict[str, str] | None = None, mutation: bool = True) -> Command:
         self.count += 1
         index = self.count
         start_wall, start = time.time_ns(), time.monotonic_ns()
@@ -298,7 +374,7 @@ class Recorder:
         stem = f"command-{index:05d}"
         receipt = {"index": index, "executable": executable, "argv": argv, "argv0": argv[0],
                    "environment": extra_env or {}, "started_unix_ns": start_wall,
-                   "host_outcome": "inflight", "effects_uncertain": True,
+                   "host_outcome": "inflight", "effects_uncertain": True, "mutation": mutation,
                    "max_stream_bytes": self.max_stream_bytes,
                    "timed_out": False, "interrupted": False, "exit_code": None}
         # Register uncertainty in memory first, then fsync intent before spawn.
@@ -344,7 +420,8 @@ class Recorder:
                    "interrupted": interrupted, "host_outcome": "interrupted" if interrupted else
                    "output_limit_exceeded" if output_limit_exceeded else
                    "timed_out" if timed_out else "unknown" if pending_error or code < 0 else "exited",
-                   "effects_uncertain": timed_out or pending_error is not None or code < 0,
+                   "mutation": mutation,
+                   "effects_uncertain": timed_out or pending_error is not None or code < 0 or (mutation and code != 0),
                    "max_stream_bytes": self.max_stream_bytes, "output_limit_exceeded": output_limit_exceeded,
                    "capture_complete": not timed_out and pending_error is None,
                    "observed_bytes": observed_bytes or {"stdout": len(stdout), "stderr": len(stderr)},
@@ -366,6 +443,20 @@ class Recorder:
         require(not leaked, "secret canary appeared in command output; bytes withheld")
         return Command(index, argv, code, stdout, stderr, timed_out)
 
+    def acknowledge_negative(self, command: Command, assertion: str) -> None:
+        """Clear failed mutation uncertainty only after its semantic proof."""
+        receipt = self.receipts[command.index - 1]
+        require(receipt["index"] == command.index and receipt["host_outcome"] == "exited" and
+                receipt["exit_code"] == command.returncode and command.returncode > 0 and
+                receipt["capture_complete"] and not receipt["secret_leak_detected"] and bool(assertion),
+                "cannot reconcile incomplete/unknown host command")
+        acknowledgement = {"command_index": command.index, "assertion": assertion,
+                           "terminal_receipt_sha256": sha256(regular(self.root / f"command-{command.index:05d}.json")),
+                           "effects_uncertain": False}
+        self.persist(self.root / f"command-{command.index:05d}.acknowledgement.json", acknowledgement, create=True)
+        receipt["effects_uncertain"] = False
+        receipt["semantic_acknowledgement"] = acknowledgement
+
 
 class Driver:
     def __init__(self, inputs: Inputs, fixture: Path, output: Path):
@@ -375,10 +466,12 @@ class Driver:
         require(not output.exists() and output.is_absolute(), "fresh absolute output directory required")
         require(output.parent == output.parent.resolve(), "output ancestor symlink rejected")
         output.mkdir(mode=0o700)
-        self.home = output / "private-home"
-        self.home.mkdir(mode=0o700)
-        self.env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(self.home),
-                    "TMPDIR": str(self.home), "LC_ALL": "C", "NO_COLOR": "1"}
+        self.temporary = output / "private-tmp"
+        self.temporary.mkdir(mode=0o700)
+        self.env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+                    "TMPDIR": str(self.temporary), "LC_ALL": "C", "NO_COLOR": "1"}
+        if "HOME" in os.environ:
+            self.env["HOME"] = os.environ["HOME"]
         secret = regular(fixture / "inputs/secret.txt")
         self.record = Recorder(output, self.env, [secret, secret.rstrip(b"\n")])
         self.fixture_spec = json.loads(regular(fixture / "fixture.json"))
@@ -404,14 +497,30 @@ class Driver:
                 "credentials, proxies, helpers and unknown client settings rejected")
         clients = self.inputs.raw["clients"]
         directories = sorted({str(Path(clients[name]["path"]).parent) for name in ("compose", "buildx")})
-        require(parsed.get("cliPluginsExtraDirs") == directories,
-                "plugin directories must exactly match pinned installed clients")
+        installed = config / "cli-plugins"
+        if os.path.lexists(installed):
+            require(installed.is_dir() and not installed.is_symlink() and
+                    stat.S_IMODE(installed.stat().st_mode) == 0o700 and
+                    directories == [str(installed)] and "cliPluginsExtraDirs" not in parsed,
+                    "mixed or foreign installed plugin layout")
+            require({path.name for path in installed.iterdir()} == {"docker-compose", "docker-buildx"},
+                    "unknown/shadow installed plugin")
+        else:
+            require(parsed.get("cliPluginsExtraDirs") == directories,
+                    "plugin directories must exactly match pinned installed clients")
         for directory in directories:
-            for name in ("compose", "buildx"):
-                candidate = Path(directory) / ("docker-" + name)
-                if candidate.exists():
+            directory_path = absolute(directory)
+            for candidate in directory_path.iterdir():
+                if candidate.name.startswith("docker-"):
+                    require(candidate.name in {"docker-compose", "docker-buildx"}, "unknown discovery plugin")
+                    name = candidate.name[len("docker-"):]
                     require(candidate == Path(clients[name]["path"]), "shadow plugin rejected")
-        require(not (config / "cli-plugins").exists(), "shadow config plugins rejected")
+            for name in ("compose", "buildx"):
+                candidate = directory_path / ("docker-" + name)
+                if os.path.lexists(candidate):
+                    require(candidate == Path(clients[name]["path"]) and
+                            absolute(str(candidate)) == candidate and os.access(candidate, os.X_OK) and
+                            sha256(regular(candidate)) == clients[name]["sha256"], "changed or redirected plugin executable")
         return sha256(data)
 
     def command(self, args: list[str], *, expected: int | None = 0, timeout: int = 120,
@@ -422,7 +531,11 @@ class Driver:
         executable = self.inputs.raw["clients"]["docker"]["path"]
         argv = ["docker", "--config",
                 self.inputs.raw["docker_config"], "--context", self.inputs.scope["docker_context"], *args]
-        result = self.record.run(argv, executable=executable, timeout=timeout, extra_env=env)
+        readonly = args[0] in {"version", "info", "events", "logs"} or args[:2] in [
+            ["context", "inspect"], ["image", "inspect"], ["container", "inspect"], ["container", "ls"],
+            ["network", "inspect"], ["network", "ls"], ["volume", "inspect"], ["volume", "ls"],
+            ["buildx", "inspect"], ["compose", "version"]]
+        result = self.record.run(argv, executable=executable, timeout=timeout, extra_env=env, mutation=not readonly)
         if expected is not None:
             require(not result.timed_out and result.returncode == expected,
                     f"command {result.index} exit {result.returncode}, expected {expected}")
@@ -446,8 +559,14 @@ class Driver:
         require(info["ID"] == scope["engine_id"] and info["OSType"] == "linux" and
                 info["Architecture"] in {"aarch64", "arm64"}, "wrong Engine identity or target")
         require(info["DefaultRuntime"] == "youki", "Engine default runtime is not youki")
-        require(set(info["Runtimes"]) <= {"youki", "io.containerd.youki.v2"},
-                "unexpected OCI runtime registered")
+        runtimes = info["Runtimes"]
+        require(isinstance(runtimes, dict) and runtimes.get("youki", {}).get("path") == "/mnt/linux-bin/youki",
+                "Engine does not select the pinned youki path")
+        inert = {"runc", "io.containerd.runc.v2"} & set(runtimes)
+        require(set(runtimes) <= {"youki", "io.containerd.youki.v2", "runc", "io.containerd.runc.v2"} and
+                all(runtimes[name] == {"path": "runc"} for name in inert), "unexpected or executable alternate runtime metadata")
+        inventory = self.inputs.verify_runtime_evidence()
+        require(not inert or inventory is not None, "inert stock runtime metadata requires authenticated startup executable inventory")
 
     def verify_images(self) -> None:
         for pin in self.inputs.raw["images"].values():
@@ -509,8 +628,50 @@ class Driver:
         self.guard()
         inventory = self.inspect_project(project)
         require(not any(inventory.values()), "project name already exists; adoption forbidden")
+        self.verify_named_resources(project, inventory)
         self.projects[project] = {kind: set() for kind in inventory}
         return project
+
+    def verify_named_resources(self, project: str, inventory: dict[str, list[dict[str, Any]]]) -> None:
+        """Exact names are collision authority even when owner labels are absent."""
+        for kind, suffixes in (("volume", ("state",)), ("network", ("frontend", "backend", "isolated"))):
+            names = {project + "_" + suffix for suffix in suffixes}
+            existing = set(self.command([kind, "ls", "--format", "{{.Name}}"]).stdout.decode().splitlines()) & names
+            owned = {item["Name"] for item in inventory[kind]}
+            require(owned <= names and existing == owned, "unlabelled/foreign exact-name resource collision")
+        volumes = {item["Name"] for item in inventory["volume"]}
+        networks = {item["Name"]: item for item in inventory["network"]}
+        require(len(networks) == len(inventory["network"]) and
+                len({network["Id"] for network in networks.values()}) == len(networks),
+                "ambiguous owned network names or identities")
+        for container in inventory["container"]:
+            for mount in container.get("Mounts", []):
+                require(mount["Type"] == "volume" and mount["Name"] in volumes,
+                        "container mounts a resource outside the owned inventory")
+            declared = container["NetworkSettings"]["Networks"]
+            for name, network in declared.items():
+                require(name in networks, "container declares a network outside the owned inventory")
+                if network["NetworkID"] != "":
+                    require(network["NetworkID"] == networks[name]["Id"],
+                            "container network name and owned identity disagree")
+                    continue
+                # Moby leaves IDs empty for Compose's never-started dependency
+                # containers. A declaration is not yet an attached endpoint;
+                # authenticate its exact owned name and prove the narrow state.
+                state = container["State"]
+                require(state.get("Status") == "created" and
+                        all(state.get(flag) is False for flag in ("Running", "Paused", "Restarting")) and
+                        type(state.get("Pid")) is int and state["Pid"] == 0 and
+                        state.get("StartedAt") == "0001-01-01T00:00:00Z" and
+                        state.get("FinishedAt") == "0001-01-01T00:00:00Z" and
+                        container["HostConfig"].get("NetworkMode") in declared and
+                        all(network.get(field) == "" for field in (
+                            "EndpointID", "Gateway", "IPAddress", "MacAddress", "IPv6Gateway", "GlobalIPv6Address")) and
+                        all(type(network.get(field)) is int and network[field] == 0
+                            for field in ("IPPrefixLen", "GlobalIPv6PrefixLen")) and
+                        all(isinstance(owned.get("Containers"), dict) and container["Id"] not in owned["Containers"]
+                            for owned in networks.values()),
+                        "empty network identity lacks exact never-started unattached ownership proof")
 
     def capture(self, project: str) -> dict[str, list[dict[str, Any]]]:
         inventory = self.inspect_project(project)
@@ -537,11 +698,21 @@ class Driver:
                 break
             try:
                 self.guard()
-                self.capture(project)
+                inventory = self.capture(project)
+                self.verify_named_resources(project, inventory)
                 require(not uncertain(), "cleanup observations do not establish a safe destructive dispatch")
                 self.compose(project, ["--profile", "failure", "down", "--volumes", "--remove-orphans"])
                 remaining = self.inspect_project(project)
                 require(not any(remaining.values()), "owned Compose resources survived down")
+                self.verify_named_resources(project, remaining)
+                for container in inventory["container"]:
+                    container_id = container["Id"]
+                    missing = self.command(["container", "inspect", container_id], expected=1)
+                    require(json.loads(missing.stdout) == [] and missing.stderr.decode().strip() in {
+                        "Error response from daemon: No such container: " + container_id,
+                        "Error: No such container: " + container_id,
+                        "Error: No such object: " + container_id},
+                        "exact pre-down container absence was not proven")
             except (Rejected, KeyError, OSError, ValueError) as error:
                 errors.append(f"{project}: {type(error).__name__}: {error}")
         return errors
@@ -557,6 +728,28 @@ class Driver:
     def exec_container(self, item: dict[str, Any], args: list[str], *, expected: int | None = 0) -> Command:
         self.guard()
         return self.command(["exec", item["Id"], *args], expected=expected)
+
+    def volume_persistence(self, project: str) -> list[str]:
+        before = self.capture(project)
+        db = self.by_service(before)["db"][0]
+        mounts = [mount for mount in db["Mounts"] if mount["Destination"] == "/data"]
+        require(len(mounts) == 1 and mounts[0]["Type"] == "volume" and mounts[0]["RW"] and
+                mounts[0]["Name"] == project + "_state", "wrong database volume binding")
+        # Startup only reconstructs sentinel.txt. This exclusive host-written
+        # marker is never an input to service startup and cannot be recreated.
+        marker = "/data/host-persistence-" + self.inputs.owner + ".txt"
+        payload = f"vz04|host-written|{self.inputs.owner}|{self.inputs.raw['run_id']}|persisted\n".encode()
+        code = "import os,sys;f=open(sys.argv[1],'xb');f.write(sys.argv[2].encode());f.flush();os.fsync(f.fileno());f.close()"
+        self.exec_container(db, ["python3", "-c", code, marker, payload.decode()])
+        read = ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", marker]
+        require(self.exec_container(db, read).stdout == payload, "host persistence marker was not written exactly")
+        self.compose(project, ["stop"])
+        self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"], timeout=40)
+        after = self.capture(project)
+        require(self.identities(before) == self.identities(after), "Compose stop/up changed resource identity")
+        require(self.exec_container(self.by_service(after)["db"][0], read).stdout == payload,
+                "host-written persistence marker changed after Compose stop/up")
+        return ["exact owned named volume mount", "Compose stop/up preserved IDs and exclusive host-written marker bytes; Machine recovery still required"]
 
     def compose_workloads(self) -> None:
         project = self.new_project("compose")
@@ -594,6 +787,7 @@ class Driver:
             result = self.compose(project, ["exec", "--no-TTY", "api", "python3", "/fixture/service.py", "exec"], expected=37)
             require(result.stdout == f"vz04|api|{self.inputs.owner}|exec-stdout\n".encode() and
                     result.stderr == f"vz04|api|{self.inputs.owner}|exec-stderr\n".encode(), "exec stream mismatch")
+            self.record.acknowledge_negative(result, "exact Compose exec stdout/stderr and exit 37")
             return ["Compose exec API stdout/stderr exact; exit 37"]
 
         self.observe("compose-exec", ["docker.compose.exec"], execute)
@@ -612,34 +806,23 @@ class Driver:
                 addresses = [destination, *[network["IPAddress"] for network in services[destination]["NetworkSettings"]["Networks"].values()]]
                 require(all(addresses), "destination IP evidence absent")
                 for address in addresses:
-                    response = self.exec_container(services[source], ["python3", "/fixture/service.py", "probe",
-                                                                      f"http://{address}:{port}/health"], expected=1)
-                    require(response.stdout == b"" and response.stderr.endswith(b": fixture operation failed\n"),
-                            "network negative control did not execute fixture probe")
+                    url = f"http://{address}:{port}/health"
+                    def controls():
+                        for role, target in ((source, "127.0.0.1"), (destination, address)):
+                            live = self.exec_container(services[role], ["python3", "/fixture/service.py", "probe",
+                                                                      f"http://{target}:{port}/health"])
+                            require(live.stdout == f"vz04|{role}|{self.inputs.owner}|ready\n".encode() and not live.stderr,
+                                    "denial control source/destination is not healthy")
+                    controls()
+                    response = self.exec_container(services[source], ["python3", "/fixture/service.py", "transport", url])
+                    assert_transport_denied(response, url, dns_name=address == destination)
+                    controls()
             return ["exact network memberships", "declared paths returned exact database bytes",
                     "forbidden paths denied by DNS name and every inspected destination IP"]
 
         self.observe("compose-network-paths", ["docker.compose.networks"], networks)
 
-        def volumes() -> list[str]:
-            before = self.capture(project)
-            db = self.by_service(before)["db"][0]
-            mounts = [mount for mount in db["Mounts"] if mount["Destination"] == "/data"]
-            require(len(mounts) == 1 and mounts[0]["Type"] == "volume" and mounts[0]["RW"] and
-                    mounts[0]["Name"] == project + "_state", "wrong database volume binding")
-            payload = f"vz04|db|{self.inputs.owner}|persisted\n".encode()
-            result = self.exec_container(db, ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path('/data/sentinel.txt').read_bytes())"])
-            require(result.stdout == payload, "initial persistence bytes differ")
-            self.compose(project, ["stop"])
-            self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"], timeout=40)
-            after = self.capture(project)
-            require(self.identities(before) == self.identities(after), "Compose stop/up changed resource identity")
-            result = self.exec_container(self.by_service(after)["db"][0],
-                                         ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path('/data/sentinel.txt').read_bytes())"])
-            require(result.stdout == payload, "persistence sentinel changed after Compose stop/up")
-            return ["exact owned named volume mount", "Compose stop/up preserved IDs and exact sentinel bytes; Machine recovery still required"]
-
-        self.observe("compose-volume-persistence", ["docker.compose.volumes"], volumes)
+        self.observe("compose-volume-persistence", ["docker.compose.volumes"], lambda: self.volume_persistence(project))
 
         def scale() -> list[str]:
             self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--scale", "worker=3",
@@ -671,36 +854,41 @@ class Driver:
                                                     "--wait-timeout", "30"], blocked=True, expected=None, timeout=40)
             require(not result.timed_out and result.returncode > 0, "blocked dependency must fail normally")
             services = self.by_service(self.capture(blocked_project))
-            require(services.get("db") and services["db"][0]["State"].get("Health", {}).get("Status") == "unhealthy",
+            require(set(services) == {"db", "api", "worker", "isolated"} and
+                    all(len(items) == 1 for items in services.values()) and
+                    services["db"][0]["State"].get("Health", {}).get("Status") == "unhealthy",
                     "negative control never observed unhealthy database")
             for role in ("api", "worker"):
                 require(all(x["State"]["Status"] == "created" and not x["State"]["Running"]
-                            for x in services.get(role, [])), "dependent started despite unhealthy database")
+                            for x in services[role]), "dependent started despite unhealthy database")
             events = self.command(["events", "--since", began, "--until", str(int(time.time()) + 1),
                                    "--filter", "label=com.docker.compose.project=" + blocked_project,
                                    "--format", "{{json .}}"], timeout=10)
-            for line in events.stdout.splitlines():
-                event = json.loads(line)
-                if event.get("Type") == "container" and event.get("Action") == "start":
-                    require(event["Actor"]["Attributes"]["com.docker.compose.service"] not in {"api", "worker"},
-                            "Engine recorded forbidden dependent start")
+            assert_blocked_events([json.loads(line) for line in events.stdout.splitlines() if line],
+                                  {role: items[0]["Id"] for role, items in services.items()}, blocked_project)
+            self.record.acknowledge_negative(result, "exact created dependents and Engine create/start/unhealthy history prove blocked dependency")
             return ["unhealthy database observed; dependent containers never started"]
 
         self.observe("compose-blocked-health", ["docker.compose.health_ordering"], blocked)
 
         def failure() -> list[str]:
             failing_project = self.new_project("failure")
-            self.compose(failing_project, ["--profile", "failure", "up", "--no-build", "--pull", "never",
+            result = self.compose(failing_project, ["--profile", "failure", "up", "--no-build", "--pull", "never",
                                             "--abort-on-container-exit", "--exit-code-from", "failure"], expected=37, timeout=40)
             services = self.by_service(self.capture(failing_project))
             require(len(services.get("failure", [])) == 1, "failure container evidence missing")
             job = services["failure"][0]
             require(job["State"]["Status"] == "exited" and job["State"]["ExitCode"] == 37,
                     "failure job exit mismatch")
+            require(set(services) == {"db", "api", "worker", "isolated", "failure"} and
+                    all(len(items) == 1 and not items[0]["State"]["Running"] and
+                        items[0]["State"]["Status"] in {"exited", "created"} for items in services.values()),
+                    "abort-on-container-exit left a service running or missing")
             logs = self.command(["logs", job["Id"]])
             require(logs.stdout == f"vz04|failure|{self.inputs.owner}|exit-37\n".encode() and not logs.stderr,
                     "failure job log mismatch")
-            return ["Compose and exact failure job exit 37; partial resources captured"]
+            self.record.acknowledge_negative(result, "exact failure job and Compose exit 37, exact logs, all other services stopped")
+            return ["Compose and exact failure job exit 37; all five services captured and none running"]
 
         self.observe("compose-failure", ["docker.compose.failure_propagation"], failure)
 
@@ -782,6 +970,7 @@ class Driver:
             require(any("secret" in error and "fixture" in error and
                         ("not found" in error or "required" in error) for error in errors),
                     "negative build failed for an unproven reason, not the required secret mount")
+            self.record.acknowledge_negative(result, "terminal BuildKit required fixture secret mount error")
             return ["secret digest checked inside mount; next RUN lacks mount; exact public payload",
                     "uncached missing-secret build rejected; image/cache blob scanning still required"]
 
@@ -789,6 +978,7 @@ class Driver:
 
     def run(self, suite: str) -> dict[str, Any]:
         require(suite in SUITE_RECIPES, "unknown selected suite")
+        require(suite == self.inputs.suite, "run suite differs from admitted input suite")
         failure = None
         try:
             self.guard()
@@ -822,13 +1012,53 @@ class Driver:
         (self.output / "inputs.json").write_text(json.dumps(self.inputs.raw, sort_keys=True, indent=2) + "\n")
         rows = []
         for path in sorted(self.output.rglob("*")):
-            if self.home in path.parents or path == self.home:
+            if self.temporary in path.parents or path == self.temporary:
                 continue
             require(not path.is_symlink(), "evidence symlink rejected")
             if path.is_file():
                 rows.append(f"{sha256(regular(path))}  {path.relative_to(self.output).as_posix()}\n")
         (self.output / "checksums.sha256").write_text("".join(rows))
         return result
+
+
+def assert_transport_denied(command: Command, url: str, *, dns_name: bool) -> None:
+    require(command.returncode == 0 and not command.timed_out and not command.stderr and len(command.stdout) <= 2048,
+            "transport probe did not complete a bounded observation")
+    row = json.loads(command.stdout)
+    require(set(row) == {"schema_version", "url", "outcome", "status", "errno", "exception"} and
+            row["schema_version"] == 1 and row["url"] == url and row["status"] is None and
+            (row["errno"] is None or type(row["errno"]) is int) and
+            isinstance(row["exception"], str) and len(row["exception"]) <= 64 and
+            row["outcome"] in ({"timeout", "network_unreachable", "connection_refused", "dns_failure"} if dns_name else
+                               {"timeout", "network_unreachable", "connection_refused"}),
+            "HTTP/application errors and unclassified observations are not isolation evidence")
+
+
+def assert_blocked_events(events: list[dict[str, Any]], ids: dict[str, str], project: str) -> None:
+    require(set(ids) == {"db", "api", "worker", "isolated"} and len(set(ids.values())) == 4,
+            "four distinct blocked service identities required")
+    times: dict[tuple[str, str], list[int]] = {}
+    for event in events:
+        if event.get("Type") != "container":
+            continue
+        actor = event["Actor"]
+        require(actor["ID"] in ids.values() and actor["Attributes"]["com.docker.compose.project"] == project,
+                "foreign blocked event identity")
+        stamp = event["timeNano"]
+        require(type(stamp) is int and stamp > 0, "missing Engine event timestamp")
+        times.setdefault((actor["ID"], event["Action"]), []).append(stamp)
+    # Positive create history establishes that the bounded event window reaches
+    # back to the exact containers' birth; empty or tail-only history fails.
+    for role, actor in ids.items():
+        require(len(times.get((actor, "create"), [])) == 1, "incomplete blocked creation history")
+        if role in {"api", "worker"}:
+            require(not any(times.get((actor, action)) for action in ("start", "die", "destroy", "restart")),
+                    "dependent has a forbidden lifecycle event")
+    created = times[(ids["db"], "create")]
+    started = times.get((ids["db"], "start"), [])
+    unhealthy = times.get((ids["db"], "health_status: unhealthy"), [])
+    require(len(started) == len(unhealthy) == 1 and created[0] < started[0] < unhealthy[0],
+            "missing or invalid database create/start/unhealthy Engine sequence")
 
 
 def assert_health_order(events: list[dict[str, Any]], ids: dict[str, str], project: str) -> None:
@@ -934,7 +1164,7 @@ def main() -> int:
     parser.add_argument("--suite", choices=("compose", "build", "all"), required=True)
     args = parser.parse_args()
     try:
-        inputs = Inputs(json.loads(regular(args.inputs)))
+        inputs = Inputs(json.loads(regular(args.inputs)), suite=args.suite)
         result = Driver(inputs, absolute(str(args.fixture)), args.output).run(args.suite)
         print(json.dumps({"outcome": result["outcome"], "compatibility_certified": False,
                           "evidence": str(args.output / "result.json")}))

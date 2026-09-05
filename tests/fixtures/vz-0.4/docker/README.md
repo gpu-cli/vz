@@ -1,17 +1,36 @@
 # Docker fixture subset for vz 0.4
 
-These are executable workload inputs for a future host-client harness. They have
-not run in Docker. They do not freeze the complete fixture bundle, certify any
+These are executable workload inputs for the host-client harness. Physical
+execution is tracked per candidate, not asserted by this fixture document.
+They do not freeze the complete fixture bundle, certify any
 scenario, or cover the full 63-scenario requirement catalog. The authoritative
 requirement input remains [the draft contract](../../../../config/docker-compatibility-v0.4.json).
 `fixture.json` names exact payloads, templates, negative controls, and outstanding
 work. No test result belongs in that manifest.
+
+The standalone `python-image-input.json` pins actual ARM64 registry metadata
+for the Compose integration slice. It does not claim the image was pulled or
+executed; the installed [host gate](../../../../scripts/helpers/linux_docker_e2e.md)
+must prove that on each selected Machine. The complete fixture catalog remains
+unfrozen, including the separate SSH-capable base and remaining full-lane inputs.
+
+The offline Python input loader returns `id` as the selected ARM64 **manifest**
+digest, matching the current containerd-backed Engine's image-target identity
+for this single-manifest pull. `config_digest` separately retains the verified
+raw OCI configuration digest; it is not interchangeable with that Engine ID.
+`manifest_descriptor`, `platform_detail`, `image_config`, and `rootfs` expose
+hash-verified registry metadata for exact descriptor/platform and semantic
+inspection comparisons. The manifest cryptographically binds the configuration,
+but comparing Docker inspect's Config/RootFS projections does not constitute a
+raw configuration fetch from the running Engine. A real pull and workload probe
+on each selected Machine remain mandatory; there is no tag or index fallback.
 
 Run the offline checks from the repository root:
 
 ```sh
 PYTHONDONTWRITEBYTECODE=1 python3 tests/fixtures/vz-0.4/docker/validate.py
 PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s tests/fixtures/vz-0.4/docker -p test_fixture.py
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s scripts/helpers -p test_linux_docker_image_input.py
 ```
 
 The validator emits actual SHA-256 values for the four fixed output payloads and
@@ -42,9 +61,9 @@ Build with context `build/`, `compose/`, or `ssh/` respectively, never this
 parent directory. Credentials are outside those contexts. Store secrets, caches,
 local output, builder state, and receipts in distinct owned temporary paths.
 Use only the installed Mac Docker/Compose/buildx clients, an explicit selected
-Machine context and exact run-owned resource identities. There is no lane
-driver here; commands below describe workload parameters, not permission to
-connect to a default daemon.
+Machine context and exact run-owned resource identities. Commands below describe
+workload parameters, not permission to connect to a default daemon. The host
+entry point currently implements a focused Compose DEV slice, not the full lane.
 
 ## BuildKit workloads
 

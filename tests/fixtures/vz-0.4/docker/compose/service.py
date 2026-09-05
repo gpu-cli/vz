@@ -1,12 +1,17 @@
 """Deterministic fixture service; observations still require the host harness."""
 import json
+import errno
 import os
 from pathlib import Path
 import re
+import signal
 import socket
 import sys
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from urllib.request import ProxyHandler, build_opener
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlsplit
+from urllib.request import HTTPRedirectHandler, ProxyHandler, build_opener
 
 
 def owner():
@@ -24,6 +29,87 @@ def fetch(url):
     # Fixture paths never inherit a proxy from a base image or caller environment.
     with build_opener(ProxyHandler({})).open(url, timeout=2) as response:
         return response.read(4097)
+
+
+class NoTransportRedirects(HTTPRedirectHandler):
+    """A reachable redirect is HTTP evidence, never a second network attempt."""
+
+    def redirect_request(self, *_args, **_kwargs):
+        return None
+
+
+@contextmanager
+def transport_deadline():
+    """Bound DNS resolution as well as connect/header reads in this CLI mode."""
+    if signal.getitimer(signal.ITIMER_REAL) != (0.0, 0.0):
+        raise ValueError("foreign process timer present")
+
+    def expired(_signal, _frame):
+        raise TimeoutError("fixture transport deadline")
+
+    previous = signal.signal(signal.SIGALRM, expired)
+    try:
+        signal.setitimer(signal.ITIMER_REAL, 2.5)
+        yield
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous)
+
+
+def transport(url):
+    """Observe one bounded HTTP connection; the host must interpret controls.
+
+    These are transport observations, not an assertion that isolation works.
+    In particular, refusal may mean a stopped service and a DNS error may mean
+    an unavailable resolver. The host brackets negative attempts with exact
+    live-source and live-destination payload controls.
+    """
+    result = {"schema_version": 1, "url": url, "outcome": "probe_error",
+              "status": None, "errno": None, "exception": None}
+    try:
+        if not isinstance(url, str) or not 1 <= len(url) <= 320:
+            raise ValueError("bounded URL required")
+        parsed = urlsplit(url)
+        if (parsed.scheme != "http" or parsed.port != 8080 or
+                parsed.username is not None or parsed.password is not None or
+                parsed.path != "/health" or parsed.query or parsed.fragment or
+                not re.fullmatch(r"[a-z0-9][a-z0-9.-]{0,252}", parsed.hostname or "") or
+                url != f"http://{parsed.hostname}:8080/health"):
+            raise ValueError("exact fixture HTTP health URL required")
+        opener = build_opener(ProxyHandler({}), NoTransportRedirects())
+        try:
+            with transport_deadline():
+                with opener.open(url, timeout=2) as response:
+                    result["status"] = response.status
+        except HTTPError as error:
+            # HTTPError proves an HTTP response, including denied/redirect/error
+            # statuses. Never report it as a network-denied observation.
+            result["status"] = error.code
+            error.close()
+        if type(result["status"]) is not int or not 100 <= result["status"] <= 599:
+            raise ValueError("invalid HTTP response status")
+        result["outcome"] = "http_response"
+    except Exception as error:
+        # Once valid HTTP headers arrived, a later close/deadline error cannot
+        # erase that positive reachability observation.
+        if type(result["status"]) is int and 100 <= result["status"] <= 599:
+            result["outcome"] = "http_response"
+            return result
+        result["status"] = None
+        underlying = error.reason if isinstance(error, URLError) else error
+        result["exception"] = type(underlying).__name__[:64]
+        number = getattr(underlying, "errno", None)
+        result["errno"] = number if type(number) is int else None
+        if isinstance(underlying, socket.gaierror):
+            result["outcome"] = "dns_failure"
+        elif isinstance(underlying, TimeoutError) or (
+                isinstance(underlying, OSError) and number == errno.ETIMEDOUT):
+            result["outcome"] = "timeout"
+        elif isinstance(underlying, OSError) and number == errno.ECONNREFUSED:
+            result["outcome"] = "connection_refused"
+        elif isinstance(underlying, OSError) and number in (errno.ENETUNREACH, errno.EHOSTUNREACH):
+            result["outcome"] = "network_unreachable"
+    return result
 
 
 def serve(role):
@@ -90,6 +176,10 @@ def main(args):
         return 37
     elif mode == "probe":
         sys.stdout.buffer.write(fetch(args[1]))
+    elif mode == "transport":
+        result = transport(args[1])
+        sys.stdout.write(json.dumps(result, sort_keys=True, separators=(",", ":")) + "\n")
+        return 2 if result["outcome"] == "probe_error" else 0
     else:
         raise ValueError("unknown workload")
     return 0

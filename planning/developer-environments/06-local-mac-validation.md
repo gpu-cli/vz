@@ -30,7 +30,8 @@ guest-side substitutes, ad-hoc SSH, or external hosts.
 - Networking/storage: DNS, TCP/UDP/HTTPS egress, host reachability, ports, named volumes, approved Mac bind mounts, Unicode/spaces/symlinks/RO, large/many files, disk-full recovery.
 - Reliability: cold/warm boots, at least 20 containers, parallel Machines and
   Environments, daemon/adapter crash, abrupt VM stop, interrupted operations,
-  sleep/wake where automatable, and leak checks.
+  one measured real hardware sleep/wake cycle, and leak checks. CI that cannot
+  perform host sleep cannot certify this lane.
 
 ## Step 3: Prove isolation and runtime invariants
 
@@ -42,7 +43,13 @@ BuildKit, Docker, and containerd invoke pinned youki only.
 
 ## Step 4: Release-built repeatability
 
-Run all focused suites and `--suite all` twice against release-built artifacts: first from clean environment state, then reusing images/cache/volumes after stop/restart. Run workspace fmt/build/strict clippy/nextest and existing local VM regression lanes.
+Run all focused suites and `--suite all` within the canonical single staged
+`clean-provision` → `persisted-recovery` → `final-cleanup` invocation in
+[GOAL-0.4.0.md](GOAL-0.4.0.md). Keep the same candidate digest tuple and exact
+content-addressed handoff between phases; do not clean up between the clean and
+persisted phases. Each test process starts once, with zero test-case retries.
+Retain failed candidates. Run workspace fmt/build/strict clippy/nextest and
+existing local VM regression lanes.
 
 ## Evidence contract
 
@@ -55,4 +62,19 @@ malformed, skipped, or inconsistent.
 
 ## Validation
 
-No Linux-target Docker claim becomes ACTIVE until the complete release-built gate passes twice on the current Mac and every intentional incompatibility is documented.
+No Linux-target Docker claim becomes ACTIVE until the complete release-built
+staged gate passes on the current Mac and every intentional incompatibility is
+documented. Focused DEV slices cannot substitute for the full lane or aggregate.
+
+## Implementation checkpoint
+
+`scripts/run-linux-docker-e2e.sh --suite compose` now provisions isolated installed
+Developer Machines through public Up, then connects the host Docker clients to
+their exact authenticated contexts. Its bounded DEV scope is eight Compose
+recipes on three Machines across two Environments, with four continuous sibling
+container sentinels and independent raw-receipt replay. Physical results must be
+read from the retained candidate evidence; implementation alone is not a pass.
+
+`--suite all` fails before provisioning: the 63-scenario dispatcher, full cache
+runtime inventory, and remaining target/aggregate acceptance are unfinished.
+See [runner usage and evidence limits](../../scripts/helpers/linux_docker_e2e.md).

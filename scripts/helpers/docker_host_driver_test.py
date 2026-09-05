@@ -47,11 +47,11 @@ class BoundaryTests(unittest.TestCase):
     def bare_driver(self):
         item = driver.Driver.__new__(driver.Driver)
         item.inputs = driver.Inputs(copy.deepcopy(self.raw))
-        item.home = self.root / "private-home"
-        item.home.mkdir(exist_ok=True)
+        item.temporary = self.root / "private-tmp"
+        item.temporary.mkdir(exist_ok=True)
         item.output = self.root
         item.config_snapshot = item.validate_config()
-        item.record = driver.Recorder(self.root, {"HOME": str(item.home), "PATH": "/usr/bin:/bin"}, [])
+        item.record = driver.Recorder(self.root, {"HOME": os.environ.get("HOME", ""), "PATH": "/usr/bin:/bin"}, [])
         item.observations = []
         item.projects = {}
         return item
@@ -61,6 +61,278 @@ class BoundaryTests(unittest.TestCase):
             inputs = driver.Inputs(self.raw)
         process.assert_not_called()
         self.assertTrue(inputs.owner.startswith("vz04-"))
+
+    def test_compose_only_omits_builder_but_build_all_and_suite_switch_reject(self):
+        raw = copy.deepcopy(self.raw)
+        del raw["builder"]
+        driver.Inputs(raw, suite="compose")
+        for suite in ("all", "build"):
+            with self.subTest(suite=suite), self.assertRaises(driver.Rejected):
+                driver.Inputs(raw, suite=suite)
+        with self.assertRaises(driver.Rejected):
+            driver.Inputs(raw | {"builder": None}, suite="compose")
+        item = self.bare_driver()
+        item.inputs = driver.Inputs(raw, suite="compose")
+        with patch.object(item, "guard") as guard, self.assertRaises(driver.Rejected):
+            item.run("all")
+        guard.assert_not_called()
+
+    def test_real_home_preserved_with_owned_temporary_directory(self):
+        fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"
+        self.raw["fixture_sha256"] = driver.tree_digest(fixture)
+        with patch.dict(os.environ, {"HOME": "/actual-user-home", "SSH_AUTH_SOCK": "forbidden"}), \
+                patch.object(driver.sys, "platform", "darwin"), patch.object(driver.os, "uname") as uname:
+            uname.return_value.machine = "arm64"
+            item = driver.Driver(driver.Inputs(self.raw), fixture, self.root / "evidence")
+        self.assertEqual(item.env["HOME"], "/actual-user-home")
+        self.assertEqual(item.env["TMPDIR"], str(item.output / "private-tmp"))
+        self.assertNotIn("SSH_AUTH_SOCK", item.env)
+        self.assertFalse((item.output / "private-home").exists())
+
+    def test_installed_exact_pinned_plugins_and_shadow_rejection(self):
+        config = Path(self.raw["docker_config"])
+        plugins = config / "cli-plugins"
+        plugins.mkdir(mode=0o700)
+        for name in ("compose", "buildx"):
+            old = Path(self.raw["clients"][name]["path"])
+            new = plugins / old.name
+            new.write_bytes(old.read_bytes())
+            new.chmod(0o700)
+            self.raw["clients"][name]["path"] = str(new)
+        (config / "config.json").write_text('{"currentContext":"unused-decoy"}')
+        item = self.bare_driver()
+        item.validate_config()
+        unknown = plugins / "docker-unknown"
+        unknown.write_bytes(b"unknown")
+        with self.assertRaises(driver.Rejected):
+            item.validate_config()
+        unknown.unlink()
+        (config / "config.json").write_text(json.dumps({"cliPluginsExtraDirs": [str(plugins)]}))
+        with self.assertRaises(driver.Rejected):
+            item.validate_config()
+
+    def startup_proof(self):
+        owner = {name: self.raw["scope"][name] for name in ("project_id", "environment_id", "machine_id")}
+        incarnation = {"schema_version": 1, "machine_id": owner["machine_id"], "incarnation_id": "i", "generation": 1}
+        inventory = {"owner": owner, "incarnation": incarnation, "youki_sha256": "1" * 64,
+                     "scope": "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit",
+                     "stdout": "vz-startup-runtime-inventory-v1\nyouki-sha256=" + "1" * 64 +
+                     "\nyouki version: 0.7.0\nalternate-runtime-binaries=absent\n"}
+        receipt = {"schema_version": 1, "state": "completed", "failure": None, "owner": owner,
+                   "incarnation": incarnation, "context": self.raw["scope"]["docker_context"],
+                   "client_sha256": self.raw["clients"]["docker"]["sha256"],
+                   "resources": {"engine_id": "owned-engine", "runtime_inventory": inventory,
+                                 "cleanup_scope": "disposable_probe_containers_compose_objects_and_images",
+                                 "retained_buildkit_cache": True}}
+        receipt_path = self.root / "receipt.json"
+        receipt_path.write_text(json.dumps(receipt))
+        after_path = self.root / "inventory.json"
+        after_path.write_text(json.dumps({"schema_version": 1, "probe_receipt_sha256": driver.sha256(receipt_path.read_bytes()),
+                                         "runtime_inventory": inventory}))
+        self.raw["runtime_evidence"] = {"receipt_path": str(receipt_path), "receipt_sha256": driver.sha256(receipt_path.read_bytes()),
+                                        "inventory_path": str(after_path), "inventory_sha256": driver.sha256(after_path.read_bytes()),
+                                        "youki_sha256": "1" * 64}
+
+    def test_runtime_proof_rehash_owner_incarnation_and_inventory_binding(self):
+        self.startup_proof()
+        inputs = driver.Inputs(self.raw)
+        self.assertEqual(inputs.verify_runtime_evidence()["youki_sha256"], "1" * 64)
+        for field in ("machine_id", "machine_incarnation", "engine_id", "docker_context"):
+            raw = copy.deepcopy(self.raw)
+            raw["scope"][field] = "foreign"
+            with self.subTest(field=field), self.assertRaises(driver.Rejected):
+                driver.Inputs(raw).verify_runtime_evidence()
+        Path(self.raw["runtime_evidence"]["inventory_path"]).write_text('{}')
+        with self.assertRaises(driver.Rejected):
+            inputs.verify_runtime_evidence()
+
+    def test_inert_runc_metadata_requires_verified_runtime_proof(self):
+        self.startup_proof()
+        item = self.bare_driver()
+        context = [{"Name": "vz-owned-machine", "Endpoints": {"docker": {"Host": self.raw["scope"]["docker_endpoint"]}}}]
+        info = {"ID": "owned-engine", "OSType": "linux", "Architecture": "aarch64", "DefaultRuntime": "youki",
+                "Runtimes": {"youki": {"path": "/mnt/linux-bin/youki"}, "runc": {"path": "runc"}}}
+        for proof, allowed in ((True, True), (False, False)):
+            raw = copy.deepcopy(self.raw)
+            if not proof:
+                del raw["runtime_evidence"]
+            item.inputs = driver.Inputs(raw)
+            with patch.object(item, "json_command", side_effect=[context, info]), \
+                    patch.object(driver.stat, "S_ISSOCK", return_value=True), patch.object(Path, "stat"):
+                if allowed:
+                    # Avoid mocking canonical-path resolution used by proof reads.
+                    with patch.object(driver.Inputs, "verify_runtime_evidence", return_value={"verified": True}):
+                        item.guard()
+                else:
+                    with self.assertRaises(driver.Rejected):
+                        item.guard()
+
+    def test_failed_mutation_keeps_uncertainty_until_durable_semantic_ack(self):
+        item = self.bare_driver()
+        with patch.object(driver, "execute", return_value=subprocess.CompletedProcess([], 37, b"out", b"err")):
+            result = item.command(["exec", "exact-container", "fixture"], expected=37)
+        self.assertTrue(item.record.receipts[0]["effects_uncertain"])
+        self.assertTrue(item.cleanup())
+        item.record.acknowledge_negative(result, "test exact expected output/exit proof")
+        self.assertFalse(item.record.receipts[0]["effects_uncertain"])
+        self.assertTrue((self.root / "command-00001.acknowledgement.json").is_file())
+
+    def test_unexpected_failed_mutation_never_runs_cleanup(self):
+        item = self.bare_driver()
+        with patch.object(driver, "execute", return_value=subprocess.CompletedProcess([], 1, b"", b"request deadline")), \
+                self.assertRaises(driver.Rejected):
+            item.command(["compose", "up"])
+        with patch.object(item, "compose") as cleanup:
+            self.assertTrue(item.cleanup())
+        cleanup.assert_not_called()
+
+    def test_unlabelled_exact_resource_collision_rejected_before_admission(self):
+        item = self.bare_driver()
+        project = item.inputs.owner + "-compose"
+        empty = {kind: [] for kind in ("container", "network", "volume")}
+        with patch.object(item, "guard"), patch.object(item, "inspect_project", return_value=empty), \
+                patch.object(item, "command", return_value=driver.Command(1, [], 0, (project + "_state\n").encode(), b"")), \
+                self.assertRaises(driver.Rejected):
+            item.new_project("compose")
+        self.assertFalse(item.projects)
+
+    def test_cleanup_rejects_mount_outside_captured_owned_inventory(self):
+        item = self.bare_driver()
+        project = "owned"
+        item.projects[project] = {kind: set() for kind in ("container", "network", "volume")}
+        inventory = {"container": [{"Id": "c", "Mounts": [{"Type": "volume", "Name": "foreign"}]}],
+                     "volume": [], "network": []}
+        with patch.object(item, "guard"), patch.object(item, "capture", return_value=inventory), \
+                patch.object(item, "command", return_value=driver.Command(1, [], 0, b"", b"")), \
+                patch.object(item, "compose") as destructive:
+            self.assertTrue(item.cleanup())
+        destructive.assert_not_called()
+
+    @staticmethod
+    def unattached_inventory():
+        # Shape observed in candidate3 command266/268: blocked dependency
+        # containers exist, but Moby has not allocated their network endpoints.
+        return {"volume": [], "network": [
+            {"Name": "owned_frontend", "Id": "a" * 64, "Containers": {}},
+            {"Name": "owned_backend", "Id": "b" * 64, "Containers": {}}],
+            "container": [{"Id": "c" * 64, "Mounts": [],
+                           "State": {"Status": "created", "Running": False, "Paused": False,
+                                     "Restarting": False, "Pid": 0,
+                                     "StartedAt": "0001-01-01T00:00:00Z",
+                                     "FinishedAt": "0001-01-01T00:00:00Z"},
+                           "HostConfig": {"NetworkMode": "owned_frontend"},
+                           "NetworkSettings": {"Networks": {"owned_frontend": {
+                               "NetworkID": "", "EndpointID": "", "Gateway": "", "IPAddress": "",
+                               "MacAddress": "", "IPv6Gateway": "", "GlobalIPv6Address": "",
+                               "IPPrefixLen": 0, "GlobalIPv6PrefixLen": 0}}}}]}
+
+    def verify_network_inventory(self, inventory):
+        item = self.bare_driver()
+        def command(args, **kwargs):
+            names = b"owned_frontend\nowned_backend\n" if args[0] == "network" else b""
+            return driver.Command(1, [], 0, names, b"")
+        with patch.object(item, "command", side_effect=command):
+            item.verify_named_resources("owned", inventory)
+
+    def test_never_started_owned_network_declaration_without_endpoint_is_safe(self):
+        self.verify_network_inventory(self.unattached_inventory())
+
+    def test_empty_network_identity_rejects_started_or_materialized_endpoint(self):
+        changes = [("State", key, value) for key, value in (
+            ("Status", "exited"), ("Running", True), ("Paused", True), ("Restarting", True),
+            ("Pid", 1), ("Pid", False), ("StartedAt", "2026-09-05T00:00:00Z"),
+            ("FinishedAt", "2026-09-05T00:00:00Z"))]
+        changes += [("network", key, "nonempty") for key in (
+            "EndpointID", "Gateway", "IPAddress", "MacAddress", "IPv6Gateway", "GlobalIPv6Address")]
+        changes += [("network", key, 1) for key in ("IPPrefixLen", "GlobalIPv6PrefixLen")]
+        changes += [("network", "IPPrefixLen", False), ("HostConfig", "NetworkMode", "foreign")]
+        changes += [("network", "NetworkID", value) for value in (None, False, 0)]
+        for section, key, value in changes:
+            with self.subTest(section=section, key=key, value=value):
+                inventory = self.unattached_inventory()
+                container = inventory["container"][0]
+                target = (container["NetworkSettings"]["Networks"]["owned_frontend"]
+                          if section == "network" else container[section])
+                target[key] = value
+                with self.assertRaises(driver.Rejected):
+                    self.verify_network_inventory(inventory)
+
+    def test_network_empty_id_rejects_foreign_name_and_reverse_attachment(self):
+        for case in ("foreign-name", "reverse-attachment", "duplicate-name", "duplicate-id",
+                     "list-instead-of-containers-map", "missing-containers-map"):
+            with self.subTest(case=case):
+                inventory = self.unattached_inventory()
+                if case == "foreign-name":
+                    networks = inventory["container"][0]["NetworkSettings"]["Networks"]
+                    networks["foreign"] = networks.pop("owned_frontend")
+                elif case == "reverse-attachment":
+                    inventory["network"][1]["Containers"]["c" * 64] = {"EndpointID": "foreign-endpoint"}
+                elif case == "duplicate-name":
+                    inventory["network"].append(copy.deepcopy(inventory["network"][0]))
+                elif case == "duplicate-id":
+                    inventory["network"][1]["Id"] = inventory["network"][0]["Id"]
+                elif case == "list-instead-of-containers-map":
+                    inventory["network"][1]["Containers"] = []
+                else:
+                    del inventory["network"][1]["Containers"]
+                with self.assertRaises(driver.Rejected):
+                    self.verify_network_inventory(inventory)
+
+    def test_attached_network_requires_exact_name_to_id_binding(self):
+        for network_id, allowed in (("a" * 64, True), ("b" * 64, False), ("f" * 64, False)):
+            with self.subTest(network_id=network_id):
+                inventory = self.unattached_inventory()
+                inventory["container"][0]["NetworkSettings"]["Networks"]["owned_frontend"]["NetworkID"] = network_id
+                if allowed:
+                    self.verify_network_inventory(inventory)
+                else:
+                    with self.assertRaises(driver.Rejected):
+                        self.verify_network_inventory(inventory)
+
+    def test_cleanup_requires_exact_post_down_names_and_container_absence(self):
+        for survivor in ("container", "volume", None):
+            with self.subTest(survivor=survivor):
+                item = self.bare_driver()
+                item.projects = {"owned": {kind: set() for kind in ("container", "network", "volume")}}
+                before = {"container": [{"Id": "c" * 64}], "volume": [], "network": []}
+                empty = {kind: [] for kind in before}
+                checks = []
+                def command(args, **kwargs):
+                    checks.append(args)
+                    if args[:2] == ["container", "inspect"]:
+                        return driver.Command(1, [], 0 if survivor == "container" else 1,
+                                              b'[{}]' if survivor == "container" else b'[]\n',
+                                              b'' if survivor == "container" else
+                                              ("Error response from daemon: No such container: " + "c" * 64 + "\n").encode())
+                    return driver.Command(1, [], 0, b"", b"")
+                def names(project, inventory):
+                    if not inventory["container"] and survivor == "volume":
+                        raise driver.Rejected("exact unlabelled volume survived")
+                with patch.object(item, "guard"), patch.object(item, "capture", return_value=before), \
+                        patch.object(item, "inspect_project", return_value=empty), patch.object(item, "compose"), \
+                        patch.object(item, "verify_named_resources", side_effect=names) as verified, \
+                        patch.object(item, "command", side_effect=command):
+                    errors = item.cleanup()
+                self.assertEqual(bool(errors), survivor is not None)
+                self.assertEqual(verified.call_count, 2)
+                if survivor != "volume":
+                    self.assertIn(["container", "inspect", "c" * 64], checks)
+
+    def test_recreated_startup_sentinel_cannot_pass_host_volume_persistence(self):
+        item = self.bare_driver()
+        project = "owned"
+        db = {"Id": "db", "Config": {"Labels": {"com.docker.compose.service": "db"}},
+              "Mounts": [{"Destination": "/data", "Type": "volume", "RW": True, "Name": "owned_state"}]}
+        inventory = {"container": [db], "volume": [{"Name": "owned_state"}], "network": []}
+        marker = f"vz04|host-written|{item.inputs.owner}|{item.inputs.raw['run_id']}|persisted\n".encode()
+        old_sentinel = f"vz04|db|{item.inputs.owner}|persisted\n".encode()
+        with patch.object(item, "capture", return_value=inventory), patch.object(item, "compose"), \
+                patch.object(item, "exec_container", side_effect=[driver.Command(1, [], 0, b"", b""),
+                    driver.Command(2, [], 0, marker, b""), driver.Command(3, [], 0, old_sentinel, b"")]) as executed, \
+                self.assertRaises(driver.Rejected):
+            item.volume_persistence(project)
+        self.assertIn("'xb'", executed.call_args_list[0].args[1][2])
+        self.assertIn("host-persistence-", executed.call_args_list[-1].args[1][-1])
 
     def test_mutable_images_rejected_before_process(self):
         for reference in ("python:latest", "python:3.13", "sha256:" + "f" * 63,
@@ -131,7 +403,8 @@ class BoundaryTests(unittest.TestCase):
         # A compiled local fixture actually sees kernel-provided argv[0]. A
         # shebang script cannot establish this because its interpreter rewrites
         # argv. This invokes neither the user's Docker binary nor any daemon.
-        binary = self.root / "docker-tools"
+        (self.root / "bin").mkdir()
+        binary = self.root / "bin/docker-tools"
         source = b'''#include <stdio.h>
 #include <string.h>
 int main(int argc, char **argv) {
@@ -176,7 +449,7 @@ int main(int argc, char **argv) {
         interrupted.stdout, interrupted.stderr = b"dispatched-before-interrupt", b"partial"
         with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg") as kill, \
                 patch.object(driver, "collect_output", side_effect=interrupted):
-            process = popen.return_value.__enter__.return_value
+            process = popen.return_value
             process.pid = 45678
             process.returncode = None
             with self.assertRaises(KeyboardInterrupt):
@@ -281,8 +554,19 @@ int main(int argc, char **argv) {
         root = self.root / "partial-timeout"
         root.mkdir()
         record = driver.Recorder(root, {"PATH": "/usr/bin:/bin"}, [], max_stream_bytes=1024)
-        result = record.run([sys.executable, "-c", "import os,time;os.write(1,b'partial');time.sleep(10)"],
-                            executable=sys.executable, timeout=0.2)
+        collect = driver.collect_output
+        def ready_capture(process, timeout, limit):
+            # Bootstrap scheduling is not the timeout behavior under test.
+            # Observe readiness without consuming either stream, then start
+            # the real bounded collector with stdout already in its pipe.
+            with driver.selectors.DefaultSelector() as selector:
+                selector.register(process.stderr, driver.selectors.EVENT_READ)
+                self.assertTrue(selector.select(10), "synthetic child did not become ready")
+            return collect(process, timeout, limit)
+        with patch.object(driver, "collect_output", side_effect=ready_capture):
+            result = record.run([sys.executable, "-c",
+                                 "import os,time;os.write(1,b'partial');os.write(2,b'ready\\n');time.sleep(10)"],
+                                executable=sys.executable, timeout=0.2)
         self.assertTrue(result.timed_out)
         self.assertEqual(result.stdout, b"partial")
         self.assertIsNone(record.receipts[0]["raw_stdout_sha256"])
@@ -357,10 +641,60 @@ int main(int argc, char **argv) {
 
 
 class AssertionTests(unittest.TestCase):
+    def test_denied_group_signal_retains_prefix_without_broad_fallback(self):
+        original = driver.OutputLimitExceeded("bounded output")
+        original.stdout, original.stderr, original.observed_bytes = b"prefix", b"", {"stdout": 7, "stderr": 0}
+        with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg", side_effect=PermissionError("denied")) as kill, \
+                patch.object(driver, "collect_output", side_effect=original):
+            process = popen.return_value
+            process.pid, process.returncode = 12345, None
+            with self.assertRaises(PermissionError) as raised:
+                driver.execute(["owned"], timeout=2, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            kill.assert_called_once_with(12345, driver.signal.SIGKILL)
+            process.wait.assert_not_called()
+            process.__exit__.assert_not_called()
+            self.assertEqual(raised.exception.stdout, b"prefix")
+
+    def test_failed_sigkill_reap_is_bounded_without_context_manager_wait(self):
+        original = driver.OutputLimitExceeded("bounded output")
+        original.stdout, original.stderr = b"prefix", b""
+        with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg"), \
+                patch.object(driver, "collect_output", side_effect=original):
+            process = popen.return_value
+            process.pid, process.returncode = 12345, None
+            process.wait.side_effect = subprocess.TimeoutExpired(["owned"], 5)
+            with self.assertRaises(subprocess.TimeoutExpired) as raised:
+                driver.execute(["owned"], timeout=2, check=False, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            process.wait.assert_called_once_with(timeout=5)
+            process.__exit__.assert_not_called()
+            self.assertEqual(raised.exception.stdout, b"prefix")
+
+    def test_blocked_events_require_positive_complete_actor_history(self):
+        ids = {role: role for role in ("db", "api", "worker", "isolated")}
+        events = [self.event(role, "create", 1) for role in ids]
+        events += [self.event("db", "start", 2), self.event("db", "health_status: unhealthy", 3)]
+        driver.assert_blocked_events(events, ids, "owned")
+        for bad in ([], events[1:], events + [self.event("worker", "start", 4)],
+                    events + [self.event("foreign", "create", 5)], events[:-1]):
+            with self.subTest(events=bad), self.assertRaises(driver.Rejected):
+                driver.assert_blocked_events(bad, ids, "owned")
+
+    def test_transport_http_errors_unclassified_and_ip_dns_are_not_denials(self):
+        url = "http://172.18.0.2:8080/health"
+        row = {"schema_version": 1, "url": url, "outcome": "timeout", "status": None,
+               "errno": None, "exception": "TimeoutError"}
+        def command(value):
+            return driver.Command(1, [], 0, json.dumps(value).encode(), b"")
+        driver.assert_transport_denied(command(row), url, dns_name=False)
+        for bad in (row | {"outcome": "http_response", "status": 503}, row | {"outcome": "probe_error"},
+                    row | {"outcome": "dns_failure"}, row | {"url": "http://foreign:8080/health"}):
+            with self.subTest(row=bad), self.assertRaises(driver.Rejected):
+                driver.assert_transport_denied(command(bad), url, dns_name=False)
+
     def test_owned_process_group_is_killed_on_timeout(self):
         with patch.object(subprocess, "Popen") as popen, patch.object(os, "killpg") as kill, \
                 patch.object(driver, "collect_output", side_effect=subprocess.TimeoutExpired(["owned"], 2)):
-            process = popen.return_value.__enter__.return_value
+            process = popen.return_value
             process.pid = 12345
             process.returncode = None
             with self.assertRaises(subprocess.TimeoutExpired):
