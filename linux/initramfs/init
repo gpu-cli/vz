@@ -95,6 +95,25 @@ install_iptables_binary() {
   return 0
 }
 
+# Developer trust is a pinned public bundle in this verified initramfs, not
+# host trust or the build container's CA directory. Hardened has neither the
+# Developer xtables marker nor CA payload. Integrity failure is terminal.
+if [ -x /sbin/xtables-legacy-multi ]; then
+  if [ ! -f /etc/vz/install-ca-trust.sh ] || [ -L /etc/vz/install-ca-trust.sh ]; then
+    echo "[vz-init] missing or redirected Developer CA installer"
+    exit 1
+  fi
+  . /etc/vz/install-ca-trust.sh
+  if ! verify_developer_ca_trust; then
+    echo "[vz-init] Developer CA trust integrity failed"
+    exit 1
+  fi
+  # Go otherwise scans additional conventional trust directories even after
+  # loading the pinned bundle. Select only this bundle and a verified empty dir.
+  export SSL_CERT_FILE=/etc/vz/ca-certificates.crt
+  export SSL_CERT_DIR=/etc/vz/empty-ca-directory
+fi
+
 # Ensure loopback works for localhost services and port forwarding.
 /bin/ip link set dev lo up >/dev/console 2>&1 || true
 
@@ -155,6 +174,11 @@ switch_root_into_overlay_rootfs() {
   mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin"
   cp /bin/busybox "$ROOTFS/bin/busybox" || return 1
   install_iptables_binary "$ROOTFS" || return 1
+  if [ -x /sbin/xtables-legacy-multi ] && ! install_developer_ca_trust "$ROOTFS"; then
+    # Do not fall back to a different rootfs after rejecting unsafe trust paths.
+    echo "[vz-init] Developer overlay CA trust installation failed"
+    exit 1
+  fi
   # Install applet symlinks using busybox's built-in mechanism.
   # Manual `ln -sf` fails on some overlayfs configurations.
   chroot "$ROOTFS" /bin/busybox --install -s /bin 2>/dev/null || \

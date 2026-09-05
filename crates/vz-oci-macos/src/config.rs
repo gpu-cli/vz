@@ -341,9 +341,7 @@ mod tests {
             security_profile: Some(profile.security_profile().to_string()),
             busybox: "1.37.0".to_string(),
             agent: env!("CARGO_PKG_VERSION").to_string(),
-            // Keep this fixture explicit so a guest protocol revision change
-            // requires its pinned metadata to be regenerated deliberately.
-            agent_protocol_revision: Some(7),
+            agent_protocol_revision: Some(vz_agent_proto::AGENT_PROTOCOL_REVISION),
             youki: "0.5.7".to_string(),
             built: None,
             sha256_vmlinux: Some(sha256(KERNEL_BYTES)),
@@ -377,6 +375,30 @@ mod tests {
                 )
             })
             .collect()
+    }
+
+    #[tokio::test]
+    async fn pinned_bundle_rejects_previous_agent_protocol_revision() {
+        let bundle = tempdir().unwrap();
+        write_pinned_bundle(bundle.path(), KernelProfile::Developer).await;
+        let version_path = bundle.path().join(VERSION_FILE);
+        let mut version: KernelVersion =
+            serde_json::from_slice(&tokio::fs::read(&version_path).await.unwrap()).unwrap();
+        let stale = vz_agent_proto::AGENT_PROTOCOL_REVISION - 1;
+        version.agent_protocol_revision = Some(stale);
+        tokio::fs::write(&version_path, serde_json::to_vec_pretty(&version).unwrap())
+            .await
+            .unwrap();
+        let before = source_snapshot(bundle.path());
+        let error = verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            LinuxError::ProtocolRevisionMismatch { expected, found }
+                if expected == vz_agent_proto::AGENT_PROTOCOL_REVISION && found == stale
+        ));
+        assert_eq!(source_snapshot(bundle.path()), before);
     }
 
     #[tokio::test]

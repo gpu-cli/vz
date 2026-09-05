@@ -1128,7 +1128,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        let ownership = failure.cleanup.expect("reservation must issue ownership");
+        let ownership = failure
+            .cleanup
+            .unwrap_or_else(|| panic!("reservation must issue ownership"));
         assert_eq!(ownership.container_id, "post-reservation-failure");
         assert_eq!(ownership.generation, 1);
         assert_eq!(ownership.stack_id, "missing-stack");

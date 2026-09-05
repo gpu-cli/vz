@@ -32,6 +32,8 @@ TRUST_EXISTING_KERNEL_IMAGE ?= 0
 
 INITRAMFS_TEMPLATE_DIR := $(ROOT_DIR)/initramfs
 INITRAMFS_ROOT := $(OUT_DIR)/initramfs-root
+CA_TRUST_SOURCE := $(ROOT_DIR)/ca-trust
+CA_TRUST_HELPER := $(ROOT_DIR)/ca-trust.py
 
 ARCH ?= arm64
 CROSS_COMPILE ?= aarch64-linux-gnu-
@@ -85,7 +87,9 @@ IPTABLES_CPPFLAGS ?= -idirafter /usr/include/$(shell $(IPTABLES_CC) -dumpmachine
 endif
 
 ifeq ($(KERNEL_PROFILE),developer)
-INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY)
+INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY) $(CA_TRUST_HELPER) \
+	$(CA_TRUST_SOURCE)/inputs.json $(CA_TRUST_SOURCE)/cacert.pem \
+	$(CA_TRUST_SOURCE)/LICENSE $(CA_TRUST_SOURCE)/install.sh
 IPTABLES_VERSION_JSON := "$(IPTABLES_VERSION)"
 else
 INITRAMFS_PROFILE_INPUTS :=
@@ -306,6 +310,7 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) $(INITRAMFS_PROFILE_INPUTS) guest-agent $(
 	ln -sf /bin/busybox "$(INITRAMFS_ROOT)/sbin/udhcpc"
 
 ifeq ($(KERNEL_PROFILE),developer)
+	python3 "$(CA_TRUST_HELPER)" --source "$(CA_TRUST_SOURCE)" --install-root "$(INITRAMFS_ROOT)"
 	cp "$(IPTABLES_BINARY)" "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	chmod +x "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	for cmd in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \

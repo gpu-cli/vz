@@ -80,7 +80,9 @@ fn build_request(context_dir: PathBuf, tag: String) -> BuildRequest {
 async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
     let inventory = vz_oci_macos::buildkit::buildkit_runtime_inventory(config)
         .await
-        .expect("inspect retained BuildKit guest runtime inventory");
+        .unwrap_or_else(|error| {
+            panic!("inspect retained BuildKit guest runtime inventory: {error:?}")
+        });
 
     assert_eq!(inventory.oci_worker_binary, "/tmp/vz-buildkit-oci-runtime");
     assert_eq!(inventory.shim_target, "/usr/bin/vz-guest-agent");
@@ -126,7 +128,8 @@ async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
     assert_eq!(inventory.cgroup_filesystem, "cgroup2");
 
     if let Some(path) = std::env::var_os("VZ_BUILDKIT_RUNTIME_INVENTORY_EVIDENCE") {
-        let mut evidence = serde_json::to_string_pretty(&inventory).expect("serialize inventory");
+        let mut evidence = serde_json::to_string_pretty(&inventory)
+            .unwrap_or_else(|error| panic!("serialize inventory: {error:?}"));
         evidence.push('\n');
         std::fs::write(&path, evidence).unwrap_or_else(|error| {
             panic!(
@@ -141,9 +144,12 @@ async fn assert_and_retain_runtime_inventory(config: &RuntimeConfig) {
 #[ignore = "requires Apple Silicon + Linux kernel artifacts + network"]
 async fn buildkit_builds_dockerfile_and_run_uses_built_image() {
     if !has_virtualization_entitlement() {
-        eprintln!(
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!("{}\n", format_args!(
             "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
-        );
+        )),
+        ).unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return;
     }
 
@@ -167,7 +173,7 @@ CMD ["cat", "/message.txt"]
         .unwrap();
     let image_id = build_result
         .image_id
-        .expect("vz store output should produce local image ID");
+        .unwrap_or_else(|| panic!("vz store output should produce local image ID"));
     assert!(!image_id.0.is_empty());
 
     assert_and_retain_runtime_inventory(&config).await;
@@ -185,9 +191,12 @@ CMD ["cat", "/message.txt"]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts + network"]
 async fn buildkit_cache_disk_usage_health_smoke() {
     if !has_virtualization_entitlement() {
-        eprintln!(
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!("{}\n", format_args!(
             "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
-        );
+        )),
+        ).unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return;
     }
 
@@ -210,9 +219,12 @@ async fn buildkit_cache_disk_usage_health_smoke() {
 #[ignore = "requires Apple Silicon + Linux kernel artifacts + network"]
 async fn buildkit_cache_survives_context_switch_vm_restart() {
     if !has_virtualization_entitlement() {
-        eprintln!(
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!("{}\n", format_args!(
             "VZ_E2E_REQUIRED_SKIP: buildkit_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite buildkit"
-        );
+        )),
+        ).unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return;
     }
 

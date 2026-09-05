@@ -21,6 +21,52 @@ const NAMED_VOLUME_DEVICE_WITH_DOCKER: &str = "/dev/vdb";
 const NAMED_VOLUME_DEVICE_WITHOUT_DOCKER: &str = "/dev/vda";
 const DOCKER_DATA_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DOCKER_FORMAT_INTENT_VERSION: &str = "vz-private-docker-disk-format-v1";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum GuestDiskPhase {
+    Probe,
+    Format,
+}
+
+impl GuestDiskPhase {
+    pub(super) const fn timeout(self) -> Duration {
+        match self {
+            Self::Probe => Duration::from_secs(30),
+            // BusyBox mke2fs eagerly initializes metadata on the 64 GiB
+            // private disk. That write workload needs a separate bounded
+            // budget from read-only blkid, especially under host I/O load.
+            // The outer Up supervisor/fence retains unresolved boot uncertainty;
+            // this does not establish a recoverable early-boot VM handle. The
+            // local bound never authorizes a retry or proves quiescence.
+            Self::Format => Duration::from_secs(180),
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Probe => "probe",
+            Self::Format => "format",
+        }
+    }
+}
+
+pub(super) fn guest_disk_phase_error(
+    phase: GuestDiskPhase,
+    purpose: &str,
+    device: &str,
+    elapsed: Duration,
+    reason: &str,
+) -> OciError {
+    let message = format!(
+        "guest disk {} failed: purpose={purpose}, device={device}, budget={:.3}s, elapsed={:.3}s: {reason}; disk preparation completion is not proven",
+        phase.label(),
+        phase.timeout().as_secs_f64(),
+        elapsed.as_secs_f64(),
+    );
+    tracing::warn!(phase = phase.label(), purpose, device, "{message}");
+    OciError::InvalidConfig(message)
+}
+
 pub(super) const DOCKER_DISK_BOOTSTRAP_SCRIPT: &str = r#"
 set -eu
 umask 077
@@ -981,14 +1027,39 @@ impl Runtime {
         purpose: &str,
         allow_unformatted: bool,
     ) -> Result<(), OciError> {
-        let timeout = Duration::from_secs(30);
+        let phase = GuestDiskPhase::Probe;
+        let started = std::time::Instant::now();
+        tracing::info!(
+            phase = phase.label(),
+            purpose,
+            device,
+            budget_seconds = phase.timeout().as_secs(),
+            "guest disk phase started"
+        );
         let inspection = vm
             .exec_collect(
                 "/bin/busybox".to_string(),
                 vec!["blkid".to_string(), device.to_string()],
-                timeout,
+                phase.timeout(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                guest_disk_phase_error(
+                    phase,
+                    purpose,
+                    device,
+                    started.elapsed(),
+                    &error.to_string(),
+                )
+            })?;
+        tracing::info!(
+            phase = phase.label(),
+            purpose,
+            device,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            exit_code = inspection.exit_code,
+            "guest disk phase returned"
+        );
         match classify_guest_disk_probe(
             inspection.exit_code,
             &inspection.stdout,
@@ -998,24 +1069,60 @@ impl Runtime {
             Ok(GuestDiskProbe::ExtFilesystem) => return Ok(()),
             Ok(GuestDiskProbe::Unformatted) => {}
             Err(reason) => {
-                return Err(OciError::InvalidConfig(format!(
-                    "cannot initialize {purpose} disk {device}: {reason}"
-                )));
+                return Err(guest_disk_phase_error(
+                    phase,
+                    purpose,
+                    device,
+                    started.elapsed(),
+                    &reason,
+                ));
             }
         }
 
+        let phase = GuestDiskPhase::Format;
+        let started = std::time::Instant::now();
+        tracing::info!(
+            phase = phase.label(),
+            purpose,
+            device,
+            budget_seconds = phase.timeout().as_secs(),
+            "guest disk phase started"
+        );
         let output = vm
             .exec_collect(
                 "/bin/busybox".to_string(),
                 vec!["mke2fs".to_string(), "-F".to_string(), device.to_string()],
-                timeout,
+                phase.timeout(),
             )
-            .await?;
+            .await
+            .map_err(|error| {
+                guest_disk_phase_error(
+                    phase,
+                    purpose,
+                    device,
+                    started.elapsed(),
+                    &error.to_string(),
+                )
+            })?;
+        tracing::info!(
+            phase = phase.label(),
+            purpose,
+            device,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            exit_code = output.exit_code,
+            "guest disk phase returned"
+        );
         if output.exit_code != 0 {
-            return Err(OciError::InvalidConfig(format!(
-                "failed to format {purpose} disk {device}: {}{}",
-                output.stdout, output.stderr
-            )));
+            return Err(guest_disk_phase_error(
+                phase,
+                purpose,
+                device,
+                started.elapsed(),
+                &format!(
+                    "exit {}: {}{}",
+                    output.exit_code, output.stdout, output.stderr
+                ),
+            ));
         }
         Ok(())
     }

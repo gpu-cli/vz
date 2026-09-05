@@ -460,7 +460,10 @@ mod tests {
     async fn port_forwarding_shutdown_joins_clean_listener_task() {
         let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
         let listener_task = tokio::spawn(async move {
-            shutdown_rx.changed().await.unwrap();
+            shutdown_rx
+                .changed()
+                .await
+                .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"));
             assert!(*shutdown_rx.borrow());
             Ok(())
         });
@@ -469,7 +472,10 @@ mod tests {
             listener_tasks: vec![listener_task],
         };
 
-        forwarding.shutdown().await.unwrap();
+        forwarding
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"));
     }
 
     #[tokio::test]
@@ -485,7 +491,10 @@ mod tests {
             listener_tasks: vec![listener_task],
         };
 
-        let error = forwarding.shutdown().await.unwrap_err();
+        let error = forwarding.shutdown().await.map_or_else(
+            |error| error,
+            |value| panic!("expected cleanup failure, got success: {value:?}"),
+        );
         assert!(
             error
                 .to_string()
@@ -493,7 +502,10 @@ mod tests {
         );
         assert!(error.to_string().contains("deterministic listener failure"));
 
-        forwarding.shutdown().await.unwrap();
+        forwarding
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"));
     }
 
     #[tokio::test]
@@ -508,9 +520,15 @@ mod tests {
             listener_tasks: vec![listener_task],
         };
 
-        let error = forwarding.shutdown().await.unwrap_err();
+        let error = forwarding.shutdown().await.map_or_else(
+            |error| error,
+            |value| panic!("expected cleanup failure, got success: {value:?}"),
+        );
         assert!(error.to_string().contains("did not stop within"));
-        forwarding.shutdown().await.unwrap();
+        forwarding
+            .shutdown()
+            .await
+            .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"));
     }
 
     #[tokio::test]
@@ -553,13 +571,16 @@ mod tests {
 
         shutdown_port_forwarding_registry_entry(&registry, "stack")
             .await
-            .unwrap_err();
+            .map_or_else(
+                |error| error,
+                |value| panic!("expected cleanup failure, got success: {value:?}"),
+            );
         assert!(registry.lock().await.contains_key("stack"));
 
         assert!(
             shutdown_port_forwarding_registry_entry(&registry, "stack")
                 .await
-                .unwrap()
+                .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"))
         );
         assert!(!registry.lock().await.contains_key("stack"));
     }
@@ -581,13 +602,16 @@ mod tests {
 
         shutdown_port_forwarding_registry_entry(&registry, "container")
             .await
-            .unwrap_err();
+            .map_or_else(
+                |error| error,
+                |value| panic!("expected cleanup failure, got success: {value:?}"),
+            );
         assert!(registry.lock().await.contains_key("container"));
 
         assert!(
             shutdown_port_forwarding_registry_entry(&registry, "container")
                 .await
-                .unwrap()
+                .unwrap_or_else(|error| panic!("test shutdown operation failed: {error:?}"))
         );
         assert!(!registry.lock().await.contains_key("container"));
     }

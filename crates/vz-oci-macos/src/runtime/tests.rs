@@ -12,14 +12,14 @@ use super::exec::{
     pending_control_error,
 };
 use super::stack_vm::{
-    DOCKER_DISK_BOOTSTRAP_SCRIPT, GuestDiskProbe, PrivateDiskDisposition,
+    DOCKER_DISK_BOOTSTRAP_SCRIPT, GuestDiskPhase, GuestDiskProbe, PrivateDiskDisposition,
     activation_error_with_rollback, classify_guest_disk_probe, classify_stack_runtime_shutdown,
     clear_recovery_route_last, commit_stack_cleanup_batch, complete_private_disk_format,
-    ensure_private_sparse_disk, hosts_write_command, kernel_profile_from_metadata,
-    publish_recovery_route_first, require_docker_provisioned_developer_profile,
-    require_exact_stack_runtime, require_explicit_verified_profile,
-    require_matching_shared_vm_boot_request, require_running_pid, require_successful_hosts_write,
-    shutdown_container_cleanup_transition,
+    ensure_private_sparse_disk, guest_disk_phase_error, hosts_write_command,
+    kernel_profile_from_metadata, publish_recovery_route_first,
+    require_docker_provisioned_developer_profile, require_exact_stack_runtime,
+    require_explicit_verified_profile, require_matching_shared_vm_boot_request,
+    require_running_pid, require_successful_hosts_write, shutdown_container_cleanup_transition,
 };
 use super::*;
 use vz_linux::KernelVersion;
@@ -288,7 +288,7 @@ async fn shared_vm_lifecycle_lease_blocks_exact_shutdown_until_drop() {
     assert_eq!(
         tokio::time::timeout(Duration::from_secs(1), shutdown)
             .await
-            .expect("shutdown stayed blocked after lease drop")
+            .unwrap_or_else(|error| panic!("shutdown stayed blocked after lease drop: {error:?}"))
             .unwrap()
             .unwrap(),
         vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent
@@ -312,6 +312,67 @@ fn docker_readiness_requires_actual_developer_profile_and_boot_provisioning() {
             .unwrap(),
         KernelProfile::Developer
     );
+}
+
+#[test]
+fn guest_disk_probe_and_first_format_have_distinct_bounded_budgets() {
+    assert_eq!(GuestDiskPhase::Probe.timeout(), Duration::from_secs(30));
+    assert_eq!(GuestDiskPhase::Format.timeout(), Duration::from_secs(180));
+    assert!(GuestDiskPhase::Probe.timeout() < GuestDiskPhase::Format.timeout());
+    assert!(GuestDiskPhase::Format.timeout() < Duration::from_secs(600));
+}
+
+#[test]
+fn guest_disk_failure_identifies_phase_device_budget_and_unproven_completion() {
+    for (phase, expected_phase, budget) in [
+        (GuestDiskPhase::Probe, "probe", "30.000s"),
+        (GuestDiskPhase::Format, "format", "180.000s"),
+    ] {
+        let error = guest_disk_phase_error(
+            phase,
+            "private Docker data",
+            "/dev/vda",
+            Duration::from_millis(180_123),
+            "agent protocol error: exec timed out",
+        );
+        let OciError::InvalidConfig(message) = error else {
+            panic!("disk failure must retain contextual configuration error");
+        };
+        for expected in [
+            format!("guest disk {expected_phase} failed"),
+            "purpose=private Docker data".into(),
+            "device=/dev/vda".into(),
+            format!("budget={budget}"),
+            "elapsed=180.123s".into(),
+            "agent protocol error: exec timed out".into(),
+            "completion is not proven".into(),
+        ] {
+            assert!(message.contains(&expected), "missing {expected}: {message}");
+        }
+    }
+}
+
+#[test]
+fn guest_disk_format_error_preserves_intent_until_explicit_positive_completion() {
+    let root = tempfile::tempdir().unwrap();
+    let disk = root.path().join("machine/data.img");
+    let disposition = ensure_private_sparse_disk(&disk, 4096).unwrap();
+    let intent = disk.with_file_name("data.img.format-intent");
+    let original = fs::read(&intent).unwrap();
+    let error = guest_disk_phase_error(
+        GuestDiskPhase::Format,
+        "private Docker data",
+        "/dev/vda",
+        Duration::from_secs(180),
+        "agent protocol error: exec timed out",
+    );
+    assert!(matches!(error, OciError::InvalidConfig(_)));
+    assert_eq!(fs::read(&intent).unwrap(), original);
+    assert_eq!(fs::metadata(&disk).unwrap().len(), 4096);
+    // Error reporting never commits a format. The unchanged explicit positive
+    // completion boundary remains the only place that removes its intent.
+    complete_private_disk_format(&disk, 4096, disposition).unwrap();
+    assert!(!intent.exists());
 }
 
 #[test]
@@ -918,7 +979,14 @@ async fn generation_ownership_sigkill_crash_reopen() {
         "boundaries": boundaries,
     });
     let rendered = serde_json::to_string_pretty(&evidence).unwrap();
-    eprintln!("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE={rendered}");
+    std::io::Write::write_fmt(
+        &mut std::io::stderr().lock(),
+        format_args!(
+            "{}\n",
+            format_args!("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE={rendered}")
+        ),
+    )
+    .unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
     if let Some(path) = env::var_os("VZ_RUNTIME_CRASH_REOPEN_EVIDENCE") {
         fs::write(path, format!("{rendered}\n")).unwrap();
     }
@@ -1016,20 +1084,20 @@ fn one_shot_run_resolves_all_fallible_config_before_publishing_created_metadata(
     let source = include_str!("mod.rs");
     let body = source
         .split_once("async fn run_in_transaction(")
-        .expect("run transaction implementation")
+        .unwrap_or_else(|| panic!("run transaction implementation"))
         .1;
     let image_config = body
         .find("parse_image_config_summary_from_store")
-        .expect("image config resolution");
+        .unwrap_or_else(|| panic!("image config resolution"));
     let run_config = body
         .find("resolve_run_config(")
-        .expect("run config resolution");
+        .unwrap_or_else(|| panic!("run config resolution"));
     let lifecycle = body
         .find("resolve_container_lifecycle(")
-        .expect("lifecycle resolution");
+        .unwrap_or_else(|| panic!("lifecycle resolution"));
     let first_persist = body
         .find("self.persist_owned(transaction, container.clone())?")
-        .expect("Created metadata persistence");
+        .unwrap_or_else(|| panic!("Created metadata persistence"));
 
     assert!(image_config < first_persist);
     assert!(run_config < first_persist);
@@ -1041,11 +1109,11 @@ fn public_rootfs_run_transfers_lifecycle_and_arms_cleanup_before_vm_start() {
     let source = include_str!("run_rootfs.rs");
     let public = source
         .split_once("pub async fn run_rootfs(")
-        .expect("public rootfs entrypoint")
+        .unwrap_or_else(|| panic!("public rootfs entrypoint"))
         .1;
     let owned_marker = public
         .find("async fn run_rootfs_owned(")
-        .expect("owned rootfs worker");
+        .unwrap_or_else(|| panic!("owned rootfs worker"));
     assert!(
         public[..owned_marker].contains("tokio::spawn(async move"),
         "the public future must transfer lifecycle ownership before awaiting VM work"
@@ -1054,23 +1122,25 @@ fn public_rootfs_run_transfers_lifecycle_and_arms_cleanup_before_vm_start() {
     let owned = &public[owned_marker..];
     let validation = owned
         .find("validate_container_id(&registered_container_id)?")
-        .expect("recovery-route identity validation");
+        .unwrap_or_else(|| panic!("recovery-route identity validation"));
     let create = owned
         .find("Arc::new(LinuxVm::create(vm_config).await?)")
-        .expect("Arc-owned VM creation");
+        .unwrap_or_else(|| panic!("Arc-owned VM creation"));
     let cleanup = owned
         .find("TransientVmCleanupGuard::new(")
-        .expect("transient cleanup guard");
+        .unwrap_or_else(|| panic!("transient cleanup guard"));
     let route = owned
         .find("vm_handles.insert(registered_container_id.clone(), Arc::clone(&vm))")
-        .expect("recoverable VM route");
-    let start = owned.find("vm.start().await").expect("VM start");
+        .unwrap_or_else(|| panic!("recoverable VM route"));
+    let start = owned
+        .find("vm.start().await")
+        .unwrap_or_else(|| panic!("VM start"));
     let forwarding_shutdown = owned
         .find("port_forwards.shutdown().await")
-        .expect("port-forward shutdown");
+        .unwrap_or_else(|| panic!("port-forward shutdown"));
     let stop = owned
         .rfind("vm_cleanup.stop().await")
-        .expect("terminal VM cleanup");
+        .unwrap_or_else(|| panic!("terminal VM cleanup"));
 
     assert!(validation < create && create < cleanup && cleanup < route && route < start);
     assert!(forwarding_shutdown < stop);
@@ -2124,7 +2194,11 @@ async fn shared_vm_snapshots_fail_closed_without_waiting_or_mutating_paths() {
         ),
     ] {
         let error = result
-            .expect("unsupported snapshot operation must not wait for lifecycle writer")
+            .unwrap_or_else(|error| {
+                panic!(
+                    "unsupported snapshot operation must not wait for lifecycle writer: {error:?}"
+                )
+            })
             .unwrap_err();
         match error {
             OciError::UnsupportedOperation { operation, reason } => {
@@ -2184,13 +2258,13 @@ fn exec_before_guest_rpc_observer_fires_after_control_registration() {
     let source = include_str!("exec.rs");
     let registration = source
         .find(".register_exec_session(")
-        .expect("exec path must register its control session");
+        .unwrap_or_else(|| panic!("exec path must register its control session"));
     let observer = source
         .find("RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc")
-        .expect("exec path must retain its pre-RPC observer");
+        .unwrap_or_else(|| panic!("exec path must retain its pre-RPC observer"));
     let first_guest_spawn = source
         .find("let start_task = tokio::spawn")
-        .expect("exec path must own its readiness task");
+        .unwrap_or_else(|| panic!("exec path must own its readiness task"));
     assert!(registration < observer);
     assert!(observer < first_guest_spawn);
     assert_eq!(
@@ -2207,13 +2281,13 @@ fn container_exec_dispatch_gate_covers_preflight_and_fast_undispatched_cleanup()
     let source = include_str!("exec.rs");
     let gate_install = source
         .find(".install_dispatch_gate(dispatch_gate.clone())")
-        .expect("registered session must own the gate before preflight");
+        .unwrap_or_else(|| panic!("registered session must own the gate before preflight"));
     let observer = source
         .find("RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc")
-        .expect("preflight observer");
+        .unwrap_or_else(|| panic!("preflight observer"));
     let first_start = source
         .find("let start_task = tokio::spawn")
-        .expect("owned start task");
+        .unwrap_or_else(|| panic!("owned start task"));
     assert!(gate_install < observer && observer < first_start);
     assert_eq!(
         source.matches("start_dispatch_gate,").count(),
@@ -2223,17 +2297,17 @@ fn container_exec_dispatch_gate_covers_preflight_and_fast_undispatched_cleanup()
 
     let interrupted = source
         .split_once("async fn finish_interrupted_exec_start(")
-        .expect("interrupted start cleanup")
+        .unwrap_or_else(|| panic!("interrupted start cleanup"))
         .1
         .split_once("fn non_empty(")
-        .expect("interrupted cleanup boundary")
+        .unwrap_or_else(|| panic!("interrupted cleanup boundary"))
         .0;
     let fast_proof = interrupted
         .find("finish_if_dispatch_prevented().await")
-        .expect("undispatched proof branch");
+        .unwrap_or_else(|| panic!("undispatched proof branch"));
     let bounded_wait = interrupted
         .find("tokio::time::timeout(EXEC_TERMINATION_WAIT")
-        .expect("authorized start cleanup wait");
+        .unwrap_or_else(|| panic!("authorized start cleanup wait"));
     assert!(fast_proof < bounded_wait);
 }
 
@@ -2283,10 +2357,10 @@ fn ambiguous_exec_start_failure_reconciles_or_retains_lifecycle_authority() {
     let source = include_str!("exec.rs");
     let resolution = source
         .split_once("async fn resolve_exec_start_failure")
-        .expect("classified start failures must have an ownership resolver")
+        .unwrap_or_else(|| panic!("classified start failures must have an ownership resolver"))
         .1
         .split_once("impl Drop for StartingExecLease")
-        .expect("resolver must precede the starting lease Drop")
+        .unwrap_or_else(|| panic!("resolver must precede the starting lease Drop"))
         .0;
 
     assert!(resolution.contains("ContainerExecStartError::Definite"));
@@ -2364,7 +2438,9 @@ async fn activation_locks_serialize_one_stack_but_not_distinct_stacks() {
 
     // A different stack lock remains independently acquirable while stack-a
     // is held.
-    let stack_b_guard = stack_b.try_lock().expect("distinct stack must not wait");
+    let stack_b_guard = stack_b
+        .try_lock()
+        .unwrap_or_else(|error| panic!("distinct stack must not wait: {error:?}"));
     drop(stack_b_guard);
     drop(first_guard);
     entered_rx.await.unwrap();
@@ -2437,7 +2513,9 @@ async fn caller_selected_id_is_serialized_and_duplicate_is_rejected() {
         waiter_runtime.begin_container_create(&mut run, None).await
     })
     .await
-    .expect("duplicate create admission must fail without waiting for the owner");
+    .unwrap_or_else(|error| {
+        panic!("duplicate create admission must fail without waiting for the owner: {error:?}")
+    });
     let error = match duplicate {
         Ok(_) => panic!("duplicate generation unexpectedly reserved"),
         Err(error) => error,
@@ -2746,9 +2824,9 @@ async fn raw_stack_create_compatibility_reserves_a_synthetic_scoped_generation()
         .generation_diagnostic("raw-stack-scoped")
         .unwrap()
         .unwrap();
-    let scope = diagnostic
-        .scope
-        .expect("raw compatibility create must never reserve an unscoped generation");
+    let scope = diagnostic.scope.unwrap_or_else(|| {
+        panic!("raw compatibility create must never reserve an unscoped generation")
+    });
     assert_eq!(scope.stack_id, "actual-stack");
     assert_eq!(
         scope.project_id.as_str(),
@@ -3039,7 +3117,7 @@ async fn unpublished_activation_route_rolls_back_and_durable_replacement_repairs
         )
         .await
         .unwrap()
-        .expect("durable replacement must be admitted");
+        .unwrap_or_else(|| panic!("durable replacement must be admitted"));
     assert_eq!(
         runtime
             .container_stack
@@ -3178,7 +3256,7 @@ async fn exact_cleanup_admission_accepts_created_running_and_stopped_publication
             )
             .await
             .unwrap()
-            .expect("exact published ownership must remain valid for cleanup");
+            .unwrap_or_else(|| panic!("exact published ownership must remain valid for cleanup"));
         assert_eq!(cleanup.container_id(), container_id);
         assert_eq!(
             cleanup.generation(),
@@ -3299,7 +3377,7 @@ async fn corrupt_generation_index_quarantines_runtime_without_startup_or_lifecyc
             .begin_container_create(&mut new_run, None)
             .await
             .err()
-            .expect("quarantine must reject create admission"),
+            .unwrap_or_else(|| panic!("quarantine must reject create admission")),
         runtime
             .stop_container("quarantined", true, None, None)
             .await
@@ -3364,7 +3442,7 @@ fn malformed_persisted_scope_quarantines_runtime_without_reconciliation() {
         .ownership_mutation_quarantine
         .as_ref()
         .as_ref()
-        .expect("malformed scope must quarantine startup");
+        .unwrap_or_else(|| panic!("malformed scope must quarantine startup"));
     assert!(quarantine.contains("invalid persisted generation scope"));
     assert_eq!(
         runtime
@@ -3493,7 +3571,7 @@ async fn cached_stack_route_cannot_adopt_legacy_unscoped_generation() {
         .begin_existing_container("legacy-route")
         .await
         .err()
-        .expect("cached stack route must reject legacy generation adoption");
+        .unwrap_or_else(|| panic!("cached stack route must reject legacy generation adoption"));
     assert!(matches!(error, OciError::ContainerOwnershipMismatch { .. }));
     assert!(error.to_string().contains("legacy-unscoped"));
     assert!(
@@ -4773,7 +4851,7 @@ fn parse_compose_log_rotation_accepts_json_file_max_size_and_max_file() {
 
     let rotation = parse_compose_log_rotation(&annotations)
         .unwrap()
-        .expect("rotation config should be present");
+        .unwrap_or_else(|| panic!("rotation config should be present"));
     assert_eq!(rotation.max_size_bytes, 10 * 1024 * 1024);
     assert_eq!(rotation.max_files, 3);
 }
@@ -4793,7 +4871,7 @@ fn parse_compose_log_rotation_defaults_max_file_to_one() {
 
     let rotation = parse_compose_log_rotation(&annotations)
         .unwrap()
-        .expect("rotation config should be present");
+        .unwrap_or_else(|| panic!("rotation config should be present"));
     assert_eq!(rotation.max_size_bytes, 1024 * 1024);
     assert_eq!(rotation.max_files, 1);
 }
@@ -5050,7 +5128,7 @@ async fn oci_runtime_lifecycle_uses_create_start_exec_delete_sequence() {
         },
     )
     .await
-    .expect("OCI lifecycle should succeed");
+    .unwrap_or_else(|error| panic!("OCI lifecycle should succeed: {error:?}"));
 
     assert_eq!(
         output,
@@ -5097,7 +5175,10 @@ async fn oci_runtime_lifecycle_attempts_delete_on_start_failure() {
         OciExecOptions::default(),
     )
     .await
-    .expect_err("start failure should surface");
+    .map_or_else(
+        |error| error,
+        |value| panic!("start failure should surface; unexpected success: {value:?}"),
+    );
     assert!(matches!(error, OciError::InvalidConfig(ref msg) if msg == "mock start failure"));
     assert_eq!(
         *mock.calls.lock().unwrap(),
@@ -5163,7 +5244,12 @@ async fn run_rootfs_with_oci_runtime_rejects_nonexistent_rootfs() {
             "test-container",
         )
         .await
-        .expect_err("missing rootfs should fail before VM wiring");
+        .map_or_else(
+            |error| error,
+            |value| {
+                panic!("missing rootfs should fail before VM wiring; unexpected success: {value:?}")
+            },
+        );
 
     assert!(matches!(err, OciError::InvalidRootfs { .. }));
 }

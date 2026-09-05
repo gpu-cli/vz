@@ -252,7 +252,7 @@ impl BuildPipeline for ScriptedBuildPipeline {
             .lock()
             .unwrap()
             .pop_front()
-            .expect("missing scripted build run");
+            .unwrap_or_else(|| panic!("missing scripted build run"));
 
         Box::pin(async move {
             for event in run.events {
@@ -453,14 +453,28 @@ fn buildkit_e2e_registry_push_ref() -> Option<String> {
 #[cfg(target_os = "macos")]
 fn ensure_buildkit_e2e_preconditions(test_name: &str) -> bool {
     if !buildkit_e2e_opted_in() {
-        eprintln!("skipping {test_name}: set VZ_TEST_BUILDKIT_E2E=1 to opt in");
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!(
+                "{}\n",
+                format_args!("skipping {test_name}: set VZ_TEST_BUILDKIT_E2E=1 to opt in")
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return false;
     }
     if std::env::consts::ARCH != "aarch64" {
-        eprintln!(
-            "skipping {test_name}: requires Apple Silicon (found architecture {})",
-            std::env::consts::ARCH
-        );
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!(
+                "{}\n",
+                format_args!(
+                    "skipping {test_name}: requires Apple Silicon (found architecture {})",
+                    std::env::consts::ARCH
+                )
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return false;
     }
     true
@@ -538,7 +552,16 @@ async fn buildkit_e2e_registry_push_mode_supports_auth_and_push_flow() {
         return;
     }
     let Some(push_ref) = buildkit_e2e_registry_push_ref() else {
-        eprintln!("skipping {test_name}: set VZ_TEST_BUILDKIT_E2E_PUSH_REF=<registry/ref:tag>");
+        std::io::Write::write_fmt(
+            &mut std::io::stderr().lock(),
+            format_args!(
+                "{}\n",
+                format_args!(
+                    "skipping {test_name}: set VZ_TEST_BUILDKIT_E2E_PUSH_REF=<registry/ref:tag>"
+                )
+            ),
+        )
+        .unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
         return;
     };
 

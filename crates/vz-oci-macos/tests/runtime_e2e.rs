@@ -31,6 +31,14 @@ use vz_oci_macos::{
 };
 use vz_runtime_contract::RuntimeBackend as _;
 
+/// Preserve the strict harness's raw stderr markers without depending on tracing.
+fn write_test_stderr(arguments: std::fmt::Arguments<'_>) {
+    use std::io::Write as _;
+
+    writeln!(std::io::stderr().lock(), "{arguments}")
+        .unwrap_or_else(|error| panic!("write test diagnostic to stderr: {error}"));
+}
+
 /// Set up tracing for test diagnostics.
 fn init_tracing() {
     let _ = tracing_subscriber::fmt()
@@ -87,9 +95,9 @@ fn require_virtualization_entitlement() -> bool {
         return true;
     }
 
-    eprintln!(
+    write_test_stderr(format_args!(
         "VZ_E2E_REQUIRED_SKIP: runtime_e2e test binary is missing com.apple.security.virtualization entitlement; run ./scripts/run-sandbox-vm-e2e.sh --suite runtime"
-    );
+    ));
     false
 }
 
@@ -247,13 +255,13 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
         .inspect_shared_vm_identity(stack_id)
         .await
         .unwrap()
-        .expect("shared VM identity");
+        .unwrap_or_else(|| panic!("shared VM identity"));
 
     let stale = vz_runtime_contract::StackRuntimeIdentity::new(stack_id).unwrap();
     let stale_error = runtime
         .ensure_shared_vm_docker_ready_exact(&stale)
         .await
-        .expect_err("replacement identity must fail before Docker activation");
+        .map_or_else(|error| error, |value| panic!("replacement identity must fail before Docker activation; unexpected success: {value:?}"));
     let before = runtime
         .exec_in_shared_vm(
             stack_id,
@@ -295,7 +303,7 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
     let replay = runtime
         .ensure_shared_vm_docker_ready_exact(&identity)
         .await
-        .expect("Docker readiness replay");
+        .unwrap_or_else(|error| panic!("Docker readiness replay: {error:?}"));
     let current = runtime.inspect_shared_vm_identity(stack_id).await.unwrap();
 
     let persisted = runtime
@@ -309,27 +317,27 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
             Duration::from_secs(10),
         )
         .await
-        .expect("write persistent Docker state");
+        .unwrap_or_else(|error| panic!("write persistent Docker state: {error:?}"));
     assert_eq!(persisted.exit_code, 0, "persist Docker state failed");
 
     runtime.shutdown_shared_vm(stack_id).await.unwrap();
     runtime
         .boot_shared_vm(stack_id, vec![], Default::default())
         .await
-        .expect("reboot Developer shared VM");
+        .unwrap_or_else(|error| panic!("reboot Developer shared VM: {error:?}"));
     let reboot_identity = runtime
         .inspect_shared_vm_identity(stack_id)
         .await
         .unwrap()
-        .expect("reboot shared VM identity");
+        .unwrap_or_else(|| panic!("reboot shared VM identity"));
     let old_identity_error = runtime
         .ensure_shared_vm_docker_ready_exact(&identity)
         .await
-        .expect_err("old identity must not activate Docker after reboot");
+        .map_or_else(|error| error, |value| panic!("old identity must not activate Docker after reboot; unexpected success: {value:?}"));
     let reboot_readiness = runtime
         .ensure_shared_vm_docker_ready_exact(&reboot_identity)
         .await
-        .expect("Docker readiness after reboot");
+        .unwrap_or_else(|error| panic!("Docker readiness after reboot: {error:?}"));
     let persisted_probe = runtime
         .exec_in_shared_vm(
             stack_id,
@@ -342,7 +350,7 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
             Duration::from_secs(10),
         )
         .await
-        .expect("read persistent Docker state after reboot");
+        .unwrap_or_else(|error| panic!("read persistent Docker state after reboot: {error:?}"));
     runtime.shutdown_shared_vm(stack_id).await.unwrap();
 
     assert!(matches!(
@@ -435,12 +443,14 @@ async fn capture_ready_generation(rt: &Runtime, container_id: &str) -> Container
         .lock()
         .unwrap()
         .take()
-        .expect("container exec omitted guest readiness generation")
+        .unwrap_or_else(|| panic!("container exec omitted guest readiness generation"))
 }
 
 fn write_container_id_ownership_evidence(evidence: &serde_json::Value) {
     let rendered = serde_json::to_string_pretty(evidence).unwrap();
-    eprintln!("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE={rendered}");
+    write_test_stderr(format_args!(
+        "VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE={rendered}"
+    ));
     let Ok(path) = std::env::var("VZ_CONTAINER_ID_OWNERSHIP_EVIDENCE") else {
         return;
     };
@@ -571,7 +581,9 @@ async fn smoke_pull_and_run_alpine() {
     // Print serial log on failure for diagnostics.
     if output.is_err() {
         if let Ok(log) = std::fs::read_to_string(&serial_log) {
-            eprintln!("=== Serial log ===\n{log}\n=== End serial log ===");
+            write_test_stderr(format_args!(
+                "=== Serial log ===\n{log}\n=== End serial log ==="
+            ));
         }
     }
 
@@ -821,8 +833,10 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     let first_create_admission =
         tokio::time::timeout(Duration::from_secs(10), standalone_admissions.recv())
             .await
-            .expect("first standalone create never reached ID admission")
-            .expect("standalone lifecycle observer closed unexpectedly");
+            .unwrap_or_else(|error| {
+                panic!("first standalone create never reached ID admission: {error:?}")
+            })
+            .unwrap_or_else(|| panic!("standalone lifecycle observer closed unexpectedly"));
     assert_eq!(
         first_create_admission.kind(),
         RuntimeLifecycleAdmissionKind::CreateBeforeReservation
@@ -833,7 +847,9 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
         rt.create_container(IMAGE, standalone_config("standalone-duplicate")),
     )
     .await
-    .expect("concurrent standalone duplicate queued instead of failing closed");
+    .unwrap_or_else(|error| {
+        panic!("concurrent standalone duplicate queued instead of failing closed: {error:?}")
+    });
     let in_flight_standalone_duplicate_rejected =
         standalone_duplicate_id_was_rejected(&in_flight_standalone_duplicate);
     first_create_admission.resume();
@@ -846,9 +862,11 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     first_create_reserved.resume();
     let first_standalone_id = tokio::time::timeout(Duration::from_secs(120), first_standalone)
         .await
-        .expect("first standalone create timed out after admission release")
-        .expect("first standalone create task panicked")
-        .expect("first standalone create failed");
+        .unwrap_or_else(|error| {
+            panic!("first standalone create timed out after admission release: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("first standalone create task panicked: {error:?}"))
+        .unwrap_or_else(|error| panic!("first standalone create failed: {error:?}"));
     assert_eq!(first_standalone_id, CONTAINER_ID);
     drop(standalone_admissions);
 
@@ -858,7 +876,9 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
         rt.create_container(IMAGE, standalone_config("standalone-active-duplicate")),
     )
     .await
-    .expect("active standalone duplicate queued instead of failing closed");
+    .unwrap_or_else(|error| {
+        panic!("active standalone duplicate queued instead of failing closed: {error:?}")
+    });
     let active_standalone_duplicate_rejected =
         standalone_duplicate_id_was_rejected(&active_standalone_duplicate);
     let standalone_after_duplicate = container_generation_evidence(&rt, CONTAINER_ID).await;
@@ -970,7 +990,7 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
             Duration::from_secs(90),
         )
         .await
-        .expect("first stack create never entered its gated setup transaction");
+        .unwrap_or_else(|error| panic!("first stack create never entered its gated setup transaction: {error:?}"));
     assert_eq!(entered.exit_code, 0, "setup entry observer failed");
     let failed_stack_generation =
         guest_container_generation_evidence(&rt, STACK_ID, CONTAINER_ID).await;
@@ -998,7 +1018,9 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     // must not wait and become a surprise create after the first rolls back.
     let duplicate_result = tokio::time::timeout(Duration::from_secs(10), &mut duplicate_create)
         .await
-        .expect("duplicate stack create queued instead of failing closed");
+        .unwrap_or_else(|error| {
+            panic!("duplicate stack create queued instead of failing closed: {error:?}")
+        });
     let duplicate_completed_before_release = true;
     let loser_probe = rt
         .exec_in_shared_vm(
@@ -1011,7 +1033,7 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
             Duration::from_secs(10),
         )
         .await
-        .expect("failed to inspect duplicate setup marker");
+        .unwrap_or_else(|error| panic!("failed to inspect duplicate setup marker: {error:?}"));
     let loser_setup_absent = loser_probe.exit_code == 0;
 
     let release = rt
@@ -1029,8 +1051,10 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     assert_eq!(release.exit_code, 0, "failed to release setup gate");
     let first_result = tokio::time::timeout(Duration::from_secs(90), first_create)
         .await
-        .expect("first stack create did not finish after setup gate release")
-        .expect("first stack create task panicked");
+        .unwrap_or_else(|error| {
+            panic!("first stack create did not finish after setup gate release: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("first stack create task panicked: {error:?}"));
     if duplicate_result.is_ok() {
         let _ = rt.stop_container(CONTAINER_ID, true, None, None).await;
         let _ = rt.remove_container(CONTAINER_ID).await;
@@ -1054,7 +1078,7 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
             Duration::from_secs(15),
         )
         .await
-        .expect("failed to inspect failed-setup guest cleanup");
+        .unwrap_or_else(|error| panic!("failed to inspect failed-setup guest cleanup: {error:?}"));
     let failed_setup_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
     let failed_generation_released = failed_setup_diagnostics
         .generations
@@ -1240,14 +1264,18 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
             Duration::from_secs(30),
         )
         .await
-        .expect("generation-A exec did not reach its command gate");
+        .unwrap_or_else(|error| panic!("generation-A exec did not reach its command gate: {error:?}"));
     assert_eq!(exec_marker.exit_code, 0);
     guest_ready_boundary.resume();
 
     let stack_a_ready = tokio::time::timeout(Duration::from_secs(30), ready_receiver)
         .await
-        .expect("exec never published guest target-ready acknowledgement")
-        .expect("exec ended before reporting its pinned generation");
+        .unwrap_or_else(|error| {
+            panic!("exec never published guest target-ready acknowledgement: {error:?}")
+        })
+        .unwrap_or_else(|error| {
+            panic!("exec ended before reporting its pinned generation: {error:?}")
+        });
     let stop_acquired = tokio::select! {
         event = expect_lifecycle_admission(
             &mut lifecycle_observer,
@@ -1258,8 +1286,10 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     };
     tokio::time::timeout(Duration::from_secs(30), stdout_receiver)
         .await
-        .expect("generation-A exec did not emit its owner sentinel")
-        .expect("generation-A stdout observer closed");
+        .unwrap_or_else(|error| {
+            panic!("generation-A exec did not emit its owner sentinel: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("generation-A stdout observer closed: {error:?}"));
     let ready_a_matches_probe = ready_matches_process_probe(&stack_a_ready, &stack_a);
     stop_acquired.resume();
 
@@ -1310,8 +1340,8 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     overlay_setup_starting.resume();
     let replacement_id = tokio::time::timeout(Duration::from_secs(120), &mut replacement)
         .await
-        .expect("stop/remove/recreate transaction timed out")
-        .expect("stop/remove/recreate transaction failed");
+        .unwrap_or_else(|error| panic!("stop/remove/recreate transaction timed out: {error:?}"))
+        .unwrap_or_else(|error| panic!("stop/remove/recreate transaction failed: {error:?}"));
     assert_eq!(replacement_id, CONTAINER_ID);
     drop(lifecycle_observer);
 
@@ -1323,8 +1353,10 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
         .await;
     let raced_exec = tokio::time::timeout(Duration::from_secs(30), exec_during_recreate)
         .await
-        .expect("old generation exec did not terminate after recreate")
-        .expect("old generation exec task panicked");
+        .unwrap_or_else(|error| {
+            panic!("old generation exec did not terminate after recreate: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("old generation exec task panicked: {error:?}"));
     let stack_b = guest_container_generation_evidence(&rt, STACK_ID, CONTAINER_ID).await;
     let stack_b_ready = capture_ready_generation(&rt, CONTAINER_ID).await;
     let ready_b_matches_probe = ready_matches_process_probe(&stack_b_ready, &stack_b);
@@ -1785,7 +1817,7 @@ done"#
     let cgroup_path = fields
         .get("cgroup_path")
         .cloned()
-        .expect("cgroup probe omitted cgroup_path");
+        .unwrap_or_else(|| panic!("cgroup probe omitted cgroup_path"));
     let members = output
         .stdout
         .replace('\r', "")
@@ -2033,9 +2065,10 @@ async fn await_exec_supervision_cleanup(
 
 fn write_exec_supervision_evidence(evidence: &serde_json::Value) {
     let rendered = serde_json::to_string_pretty(evidence).unwrap();
-    eprintln!("VZ_EXEC_SUPERVISION_EVIDENCE={rendered}");
-    let path = std::env::var("VZ_EXEC_SUPERVISION_EVIDENCE")
-        .expect("VZ_EXEC_SUPERVISION_EVIDENCE must be set by the strict VM harness");
+    write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_EVIDENCE={rendered}"));
+    let path = std::env::var("VZ_EXEC_SUPERVISION_EVIDENCE").unwrap_or_else(|error| {
+        panic!("VZ_EXEC_SUPERVISION_EVIDENCE must be set by the strict VM harness: {error:?}")
+    });
     assert!(
         Path::new(&path).is_absolute(),
         "exec supervision evidence path must be absolute"
@@ -2044,8 +2077,9 @@ fn write_exec_supervision_evidence(evidence: &serde_json::Value) {
 }
 
 fn exec_supervision_build_identity() -> serde_json::Value {
-    let profile = std::env::var("VZ_EXEC_SUPERVISION_BUILD_PROFILE")
-        .expect("VZ_EXEC_SUPERVISION_BUILD_PROFILE must be set by the strict VM harness");
+    let profile = std::env::var("VZ_EXEC_SUPERVISION_BUILD_PROFILE").unwrap_or_else(|error| {
+        panic!("VZ_EXEC_SUPERVISION_BUILD_PROFILE must be set by the strict VM harness: {error:?}")
+    });
     assert_eq!(
         profile, "release",
         "exec supervision release evidence cannot be emitted by a non-release build"
@@ -2083,7 +2117,7 @@ async fn assert_exec_supervision_lifecycle_writer_available(
     let error = tokio::time::timeout(Duration::from_secs(10), rt.remove_container(container_id))
         .await
         .unwrap_or_else(|_| panic!("{context} left the lifecycle writer blocked"))
-        .expect_err("lifecycle writer unexpectedly removed a running container");
+        .map_or_else(|error| error, |value| panic!("lifecycle writer unexpectedly removed a running container; unexpected success: {value:?}"));
     let expected = format!("cannot remove running container '{container_id}'; stop it first");
     assert!(
         matches!(
@@ -2159,7 +2193,9 @@ async fn runtime_exec_supervision() {
     // with transport ambiguity or retain either exec or lifecycle authority.
     const PRE_SPAWN_CASE: &str = "pre-spawn-rejection";
     const PRE_SPAWN_EXECUTION_ID: &str = "exec-supervision-pre-spawn-rejection";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={PRE_SPAWN_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={PRE_SPAWN_CASE}"
+    ));
     let pre_spawn_sessions_before = rt.lifecycle_diagnostics().await.unwrap().exec_sessions;
     let (_, pre_spawn_members_before) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let pre_spawn_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
@@ -2179,8 +2215,8 @@ async fn runtime_exec_supervision() {
         ),
     )
     .await
-    .expect("authenticated pre-spawn rejection did not become definite")
-    .expect_err("invalid environment key unexpectedly spawned an exec")
+    .unwrap_or_else(|error| panic!("authenticated pre-spawn rejection did not become definite: {error:?}"))
+    .map_or_else(|error| error, |value| panic!("invalid environment key unexpectedly spawned an exec; unexpected success: {value:?}"))
     .to_string();
     assert!(
         pre_spawn_error.contains("invalid key"),
@@ -2248,7 +2284,9 @@ async fn runtime_exec_supervision() {
     const EXEC_EVENT_CHANNEL_CAPACITY: usize = 64;
     const EXEC_EVENT_MAX_CHUNK_BYTES: usize = 65_536;
     const SLOW_CONSUMER_STDOUT_BYTES: usize = 5 * 1024 * 1024;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={SLOW_CONSUMER_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={SLOW_CONSUMER_CASE}"
+    ));
     const {
         assert!(
             SLOW_CONSUMER_STDOUT_BYTES > EXEC_EVENT_CHANNEL_CAPACITY * EXEC_EVENT_MAX_CHUNK_BYTES
@@ -2283,8 +2321,8 @@ async fn runtime_exec_supervision() {
         ),
     )
     .await
-    .expect("slow live consumer did not terminate within its outer bound")
-    .expect("slow live consumer was treated as abandoned");
+    .unwrap_or_else(|error| panic!("slow live consumer did not terminate within its outer bound: {error:?}"))
+    .unwrap_or_else(|error| panic!("slow live consumer was treated as abandoned: {error:?}"));
     assert_eq!(slow_output.exit_code, 0);
     assert!(slow_output.stderr.is_empty());
     let (slow_ready_events, slow_exit_events, slow_stderr_bytes, slow_stdout, slow_exit_last) = {
@@ -2383,7 +2421,7 @@ async fn runtime_exec_supervision() {
     for adapter in ExecSupervisionAdapter::ALL {
         for termination in ExecSupervisionTermination::ALL {
             let case_name = format!("{}-{}", adapter.name(), termination.name());
-            eprintln!("VZ_EXEC_SUPERVISION_CASE_START={case_name}");
+            write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_CASE_START={case_name}"));
             let execution_id = format!("exec-supervision-{case_name}");
             let timeout = if termination == ExecSupervisionTermination::Timeout {
                 Duration::from_millis(TIMEOUT_MS)
@@ -2438,7 +2476,7 @@ while :; do wait "$child_pid"; done"#
             };
 
             let marker = exec_supervision_marker(&rt, CONTAINER_ID, &case_name).await;
-            eprintln!("VZ_EXEC_SUPERVISION_CASE_MARKER={case_name}");
+            write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_CASE_MARKER={case_name}"));
             let (_, active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
             assert!(
                 active_members.len() > baseline_members.len(),
@@ -2492,7 +2530,9 @@ while :; do wait "$child_pid"; done"#
                 .unwrap_or_else(|error| {
                     panic!("{case_name} was not control-registered at process readiness: {error}")
                 });
-                eprintln!("VZ_EXEC_SUPERVISION_CASE_SIGNALLED={case_name}");
+                write_test_stderr(format_args!(
+                    "VZ_EXEC_SUPERVISION_CASE_SIGNALLED={case_name}"
+                ));
             }
 
             let result = tokio::time::timeout(Duration::from_secs(10), task)
@@ -2500,7 +2540,9 @@ while :; do wait "$child_pid"; done"#
                 .unwrap_or_else(|_| panic!("{case_name} did not terminate and reap within 10s"))
                 .unwrap_or_else(|error| panic!("{case_name} exec task panicked: {error}"));
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            eprintln!("VZ_EXEC_SUPERVISION_CASE_TERMINAL={case_name}:{elapsed_ms}");
+            write_test_stderr(format_args!(
+                "VZ_EXEC_SUPERVISION_CASE_TERMINAL={case_name}:{elapsed_ms}"
+            ));
             let (observed_exit_code, timed_out) = match termination.expected_exit_code() {
                 Some(expected) => {
                     let output = result.unwrap_or_else(|error| {
@@ -2515,7 +2557,7 @@ while :; do wait "$child_pid"; done"#
                 }
                 None => {
                     let error =
-                        result.expect_err("deadline cancellation unexpectedly returned output");
+                        result.map_or_else(|error| error, |value| panic!("deadline cancellation unexpectedly returned output; unexpected success: {value:?}"));
                     let rendered = error.to_string();
                     assert!(
                         rendered.contains("timed out"),
@@ -2626,7 +2668,9 @@ while :; do wait "$child_pid"; done"#
     // A normal leader exit is also terminal ownership: a retained background
     // child must be killed and reaped before the successful result is exposed.
     const NORMAL_CASE: &str = "normal-exit";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={NORMAL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={NORMAL_CASE}"
+    ));
     let normal_execution_id = "exec-supervision-normal-exit".to_string();
     let normal_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let normal_callback_events = std::sync::Arc::clone(&normal_events);
@@ -2665,7 +2709,9 @@ exit 0"#
             .await
     });
     let normal_marker = exec_supervision_marker(&rt, CONTAINER_ID, NORMAL_CASE).await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={NORMAL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_MARKER={NORMAL_CASE}"
+    ));
     let (_, normal_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let normal_identity = assert_exec_supervision_identity_live(
         &rt,
@@ -2684,13 +2730,19 @@ exit 0"#
         ),
     )
     .await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_RELEASED={NORMAL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_RELEASED={NORMAL_CASE}"
+    ));
     let normal_output = tokio::time::timeout(Duration::from_secs(10), normal_task)
         .await
-        .expect("normal leader exit did not synchronously reap its child")
-        .expect("normal leader-exit task panicked")
-        .expect("normal leader-exit exec failed");
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={NORMAL_CASE}");
+        .unwrap_or_else(|error| {
+            panic!("normal leader exit did not synchronously reap its child: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("normal leader-exit task panicked: {error:?}"))
+        .unwrap_or_else(|error| panic!("normal leader-exit exec failed: {error:?}"));
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_TERMINAL={NORMAL_CASE}"
+    ));
     assert_eq!(normal_output.exit_code, 0);
     assert!(matches!(
         normal_events.lock().unwrap().last(),
@@ -2766,7 +2818,9 @@ exit 0"#
     // Exercise the explicit CancelExec receipt path independently of host
     // deadline cancellation. It must carry the same descendant-reap proof.
     const CANCEL_CASE: &str = "cancel";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={CANCEL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={CANCEL_CASE}"
+    ));
     let cancel_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let cancel_callback_events = std::sync::Arc::clone(&cancel_events);
     let cancel_rt = rt.clone();
@@ -2804,7 +2858,9 @@ while :; do wait "$child_pid"; done"#
             .await
     });
     let cancel_marker = exec_supervision_marker(&rt, CONTAINER_ID, CANCEL_CASE).await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={CANCEL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_MARKER={CANCEL_CASE}"
+    ));
     let (_, cancel_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let cancel_identity = assert_exec_supervision_identity_live(
         &rt,
@@ -2820,15 +2876,21 @@ while :; do wait "$child_pid"; done"#
         rt.cancel_exec("exec-supervision-cancel"),
     )
     .await
-    .expect("explicit cancellation receipt timed out")
+    .unwrap_or_else(|error| panic!("explicit cancellation receipt timed out: {error:?}"))
     .unwrap();
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CANCELLED={CANCEL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_CANCELLED={CANCEL_CASE}"
+    ));
     let cancel_output = tokio::time::timeout(Duration::from_secs(10), cancel_task)
         .await
-        .expect("explicit cancellation did not synchronously reap its child")
-        .expect("explicit cancellation task panicked")
-        .expect("explicit cancellation exec failed");
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={CANCEL_CASE}");
+        .unwrap_or_else(|error| {
+            panic!("explicit cancellation did not synchronously reap its child: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("explicit cancellation task panicked: {error:?}"))
+        .unwrap_or_else(|error| panic!("explicit cancellation exec failed: {error:?}"));
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_TERMINAL={CANCEL_CASE}"
+    ));
     assert_eq!(cancel_output.exit_code, 143);
     assert!(matches!(
         cancel_events.lock().unwrap().last(),
@@ -2906,7 +2968,9 @@ while :; do wait "$child_pid"; done"#
     // Pause after host registration but before any guest RPC, queue cancel,
     // and prove that readiness and the target process never become observable.
     const CANCEL_BEFORE_READY_ID: &str = "exec-supervision-cancel-before-ready";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START=cancel-before-ready");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START=cancel-before-ready"
+    ));
     let mut pre_ready_observer = rt.install_lifecycle_observer();
     let pre_ready_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let pre_ready_callback_events = std::sync::Arc::clone(&pre_ready_events);
@@ -2933,14 +2997,18 @@ while :; do wait "$child_pid"; done"#
     let pre_ready_admission =
         tokio::time::timeout(Duration::from_secs(10), pre_ready_observer.recv())
             .await
-            .expect("pre-ready exec did not reach deterministic admission")
-            .expect("pre-ready lifecycle observer closed");
+            .unwrap_or_else(|error| {
+                panic!("pre-ready exec did not reach deterministic admission: {error:?}")
+            })
+            .unwrap_or_else(|| panic!("pre-ready lifecycle observer closed"));
     assert_eq!(
         pre_ready_admission.kind(),
         RuntimeLifecycleAdmissionKind::ExecBeforeGuestRpc
     );
     assert_eq!(pre_ready_admission.container_id(), CONTAINER_ID);
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_ADMITTED=cancel-before-ready");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_ADMITTED=cancel-before-ready"
+    ));
     assert!(
         pre_ready_events.lock().unwrap().is_empty(),
         "ContainerReady was published before ExecBeforeGuestRpc cancellation"
@@ -2955,17 +3023,21 @@ while :; do wait "$child_pid"; done"#
     pre_ready_admission.resume();
     tokio::time::timeout(Duration::from_secs(10), &mut pre_ready_cancel)
         .await
-        .expect("pre-ready cancellation receipt timed out")
-        .expect("pre-ready cancellation failed");
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CANCELLED=cancel-before-ready");
+        .unwrap_or_else(|error| panic!("pre-ready cancellation receipt timed out: {error:?}"))
+        .unwrap_or_else(|error| panic!("pre-ready cancellation failed: {error:?}"));
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_CANCELLED=cancel-before-ready"
+    ));
     let pre_ready_result = tokio::time::timeout(Duration::from_secs(10), pre_ready_task)
         .await
-        .expect("pre-ready exec did not become terminal")
-        .expect("pre-ready exec task panicked");
+        .unwrap_or_else(|error| panic!("pre-ready exec did not become terminal: {error:?}"))
+        .unwrap_or_else(|error| panic!("pre-ready exec task panicked: {error:?}"));
     let pre_ready_error = pre_ready_result
-        .expect_err("pre-ready cancellation unexpectedly launched and returned command output")
+        .map_or_else(|error| error, |value| panic!("pre-ready cancellation unexpectedly launched and returned command output; unexpected success: {value:?}"))
         .to_string();
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL=cancel-before-ready");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_TERMINAL=cancel-before-ready"
+    ));
     assert!(pre_ready_error.contains("cancelled during startup"));
     assert!(pre_ready_events.lock().unwrap().is_empty());
     // The observer deliberately pauses every exec admission. Remove it before
@@ -3018,7 +3090,7 @@ while :; do wait "$child_pid"; done"#
     // Dropping the host execution future models abrupt transport ownership
     // loss. The registration drop guard must retain cleanup authority.
     const DROP_CASE: &str = "dropped-future";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={DROP_CASE}");
+    write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_START={DROP_CASE}"));
     let drop_rt = rt.clone();
     let drop_container_id = container_id.clone();
     let drop_task = tokio::spawn(async move {
@@ -3053,7 +3125,7 @@ while :; do wait "$child_pid"; done"#
             .await
     });
     let drop_marker = exec_supervision_marker(&rt, CONTAINER_ID, DROP_CASE).await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={DROP_CASE}");
+    write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_MARKER={DROP_CASE}"));
     let (_, drop_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let drop_identity = assert_exec_supervision_identity_live(
         &rt,
@@ -3065,11 +3137,16 @@ while :; do wait "$child_pid"; done"#
     )
     .await;
     drop_task.abort();
-    let drop_join = drop_task
-        .await
-        .expect_err("aborted execution future unexpectedly completed");
+    let drop_join = drop_task.await.map_or_else(
+        |error| error,
+        |value| {
+            panic!("aborted execution future unexpectedly completed; unexpected success: {value:?}")
+        },
+    );
     assert!(drop_join.is_cancelled());
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_ABORTED={DROP_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_ABORTED={DROP_CASE}"
+    ));
     let drop_identities = [
         (
             drop_identity["host_pid"].as_u64().unwrap() as u32,
@@ -3088,7 +3165,7 @@ while :; do wait "$child_pid"; done"#
         DROP_CASE,
     )
     .await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={DROP_CASE}");
+    write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={DROP_CASE}"));
     let drop_marker_removed = exec_supervision_host_command(
         &rt,
         CONTAINER_ID,
@@ -3139,14 +3216,20 @@ while :; do wait "$child_pid"; done"#
         "test-injected container exec response loss before readiness";
     let response_loss_selector =
         std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_BEFORE_READY_COMMAND")
-            .expect("strict exec-supervision harness must provide the exact response-loss command");
+            .unwrap_or_else(|error| panic!("strict exec-supervision harness must provide the exact response-loss command: {error:?}"));
     assert_eq!(response_loss_selector, RESPONSE_LOSS_COMMAND);
     let response_loss_dwell_ms = std::env::var("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS")
-        .expect("strict exec-supervision harness must provide the response-loss dwell")
+        .unwrap_or_else(|error| {
+            panic!(
+                "strict exec-supervision harness must provide the response-loss dwell: {error:?}"
+            )
+        })
         .parse::<u64>()
-        .expect("response-loss dwell must be an integer");
+        .unwrap_or_else(|error| panic!("response-loss dwell must be an integer: {error:?}"));
     assert_eq!(response_loss_dwell_ms, 5_000);
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={RESPONSE_LOSS_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={RESPONSE_LOSS_CASE}"
+    ));
     let response_loss_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let response_loss_callback_events = std::sync::Arc::clone(&response_loss_events);
     let response_loss_rt = rt.clone();
@@ -3187,7 +3270,9 @@ while :; do wait "$child_pid"; done"#
         .get("start_time")
         .is_some_and(|value| !value.is_empty());
     assert!(response_loss_marker_observed);
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={RESPONSE_LOSS_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_MARKER={RESPONSE_LOSS_CASE}"
+    ));
     let (_, response_loss_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     assert!(response_loss_active_members.len() > baseline_members.len());
     let response_loss_identity = assert_exec_supervision_identity_live(
@@ -3201,10 +3286,19 @@ while :; do wait "$child_pid"; done"#
     .await;
     let response_loss_result = tokio::time::timeout(Duration::from_secs(15), response_loss_task)
         .await
-        .expect("response-loss exec did not return its injected error")
-        .expect("response-loss exec task panicked");
+        .unwrap_or_else(|error| {
+            panic!("response-loss exec did not return its injected error: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("response-loss exec task panicked: {error:?}"));
     let response_loss_error = response_loss_result
-        .expect_err("response-loss exec unexpectedly returned output")
+        .map_or_else(
+            |error| error,
+            |value| {
+                panic!(
+                    "response-loss exec unexpectedly returned output; unexpected success: {value:?}"
+                )
+            },
+        )
         .to_string();
     let response_loss_injected_error_observed =
         response_loss_error.contains(RESPONSE_LOSS_ERROR_MARKER);
@@ -3244,7 +3338,9 @@ while :; do wait "$child_pid"; done"#
         RESPONSE_LOSS_CASE,
     )
     .await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={RESPONSE_LOSS_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_CLEAN={RESPONSE_LOSS_CASE}"
+    ));
     let response_loss_diagnostics = rt.lifecycle_diagnostics().await.unwrap();
     let (_, response_loss_restored_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let response_loss_leader_absent = exec_supervision_identity_absent(
@@ -3337,7 +3433,7 @@ while :; do wait "$child_pid"; done"#
         ),
         ("ready-before-owner-anonymous", None),
     ] {
-        eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={case_name}");
+        write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_START={case_name}"));
         let mut observer = rt.install_lifecycle_observer();
         let abort_rt = rt.clone();
         let abort_container_id = container_id.clone();
@@ -3392,7 +3488,7 @@ while :; do wait "$child_pid"; done"#
         )
         .await;
         let marker = exec_supervision_marker(&rt, CONTAINER_ID, case_name).await;
-        eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={case_name}");
+        write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_MARKER={case_name}"));
         let (_, active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
         assert!(
             active_members.len() > baseline_members.len(),
@@ -3417,7 +3513,7 @@ while :; do wait "$child_pid"; done"#
         abort_task.abort();
         let abort_join = abort_task
             .await
-            .expect_err("ready-before-owner execution unexpectedly completed");
+            .map_or_else(|error| error, |value| panic!("ready-before-owner execution unexpectedly completed; unexpected success: {value:?}"));
         assert!(abort_join.is_cancelled());
         ready_before_owner.resume();
         drop(observer);
@@ -3439,7 +3535,7 @@ while :; do wait "$child_pid"; done"#
             case_name,
         )
         .await;
-        eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={case_name}");
+        write_test_stderr(format_args!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={case_name}"));
         let stale_control_rejected = if let Some(execution_id) = execution_id.as_deref() {
             Some(matches!(
                 rt.signal_exec(execution_id, "SIGTERM").await,
@@ -3515,7 +3611,9 @@ while :; do wait "$child_pid"; done"#
     // Killing the exact outer trampoline exercises the sentinel PDEATHSIG
     // path rather than any cooperative control-plane cancellation.
     const OUTER_KILL_CASE: &str = "outer-trampoline-kill";
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_START={OUTER_KILL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_START={OUTER_KILL_CASE}"
+    ));
     let outer_events = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
     let outer_callback_events = std::sync::Arc::clone(&outer_events);
     let outer_rt = rt.clone();
@@ -3552,7 +3650,9 @@ while :; do wait "$child_pid"; done"#
             .await
     });
     let outer_marker = exec_supervision_marker(&rt, CONTAINER_ID, OUTER_KILL_CASE).await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_MARKER={OUTER_KILL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_MARKER={OUTER_KILL_CASE}"
+    ));
     let (_, outer_active_members) = exec_supervision_cgroup(&rt, CONTAINER_ID).await;
     let outer_target_identity = assert_exec_supervision_identity_live(
         &rt,
@@ -3588,13 +3688,21 @@ while :; do wait "$child_pid"; done"#
         ),
     )
     .await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_KILLED={OUTER_KILL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_KILLED={OUTER_KILL_CASE}"
+    ));
     let outer_output = tokio::time::timeout(Duration::from_secs(10), outer_task)
         .await
-        .expect("outer trampoline death did not terminate the host task")
-        .expect("outer trampoline task panicked")
-        .expect("outer trampoline death did not preserve terminal output");
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_TERMINAL={OUTER_KILL_CASE}");
+        .unwrap_or_else(|error| {
+            panic!("outer trampoline death did not terminate the host task: {error:?}")
+        })
+        .unwrap_or_else(|error| panic!("outer trampoline task panicked: {error:?}"))
+        .unwrap_or_else(|error| {
+            panic!("outer trampoline death did not preserve terminal output: {error:?}")
+        });
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_TERMINAL={OUTER_KILL_CASE}"
+    ));
     assert_eq!(outer_output.exit_code, 137);
     assert!(matches!(
         outer_events.lock().unwrap().last(),
@@ -3622,7 +3730,9 @@ while :; do wait "$child_pid"; done"#
         OUTER_KILL_CASE,
     )
     .await;
-    eprintln!("VZ_EXEC_SUPERVISION_STAGE_CLEAN={OUTER_KILL_CASE}");
+    write_test_stderr(format_args!(
+        "VZ_EXEC_SUPERVISION_STAGE_CLEAN={OUTER_KILL_CASE}"
+    ));
     let outer_marker_removed = exec_supervision_host_command(
         &rt,
         CONTAINER_ID,
@@ -3852,7 +3962,9 @@ async fn port_forwarding_tcp() {
                 break;
             }
             Err(e) if attempt < 5 => {
-                eprintln!("port forward connect attempt {attempt}/5 failed: {e}, retrying...");
+                write_test_stderr(format_args!(
+                    "port forward connect attempt {attempt}/5 failed: {e}, retrying..."
+                ));
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
             Err(e) => panic!("port forwarding connection failed after 5 attempts: {e}"),
@@ -3862,8 +3974,8 @@ async fn port_forwarding_tcp() {
     let mut buf = vec![0u8; 64];
     let n = tokio::time::timeout(Duration::from_secs(10), conn.read(&mut buf))
         .await
-        .expect("port forward read timed out")
-        .expect("port forward read failed");
+        .unwrap_or_else(|error| panic!("port forward read timed out: {error:?}"))
+        .unwrap_or_else(|error| panic!("port forward read failed: {error:?}"));
     let response = String::from_utf8_lossy(&buf[..n]);
     assert!(
         response.contains("pong"),
@@ -4501,7 +4613,7 @@ async fn container_exec_user_environment_semantics() {
     );
 
     for (adapter, sentinel_name, (result, events)) in missing_identity_results {
-        let error = result.expect_err("container setup failure must fail before readiness");
+        let error = result.map_or_else(|error| error, |value| panic!("container setup failure must fail before readiness; unexpected success: {value:?}"));
         let vz_oci_macos::MacosOciError::Linux(vz_linux::LinuxError::Protocol(diagnostic)) = error
         else {
             panic!(
@@ -4967,7 +5079,9 @@ async fn shared_vm_inter_service_connectivity() {
 
     // Pull alpine (skip if already cached to avoid Docker Hub rate limits).
     if rt.pull("alpine:3.20").await.is_err() {
-        eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
+        write_test_stderr(format_args!(
+            "WARN: pull failed (rate limit?), assuming image is cached"
+        ));
     }
 
     let stack_id = "e2e-net";
@@ -5080,7 +5194,10 @@ async fn shared_vm_inter_service_connectivity() {
         )
         .await
         .unwrap();
-    eprintln!("db /etc/hosts evidence:\n{}", hosts_evidence.stdout);
+    write_test_stderr(format_args!(
+        "db /etc/hosts evidence:\n{}",
+        hosts_evidence.stdout
+    ));
     assert_eq!(hosts_evidence.exit_code, 0);
     assert!(
         hosts_evidence.stdout.lines().any(|line| {
@@ -5148,7 +5265,9 @@ async fn undeclared_host_import_does_not_inject_host_vz_internal() {
     let rt = test_runtime(&data_dir);
 
     if rt.pull("alpine:3.20").await.is_err() {
-        eprintln!("WARN: pull failed (rate limit?), assuming image is cached");
+        write_test_stderr(format_args!(
+            "WARN: pull failed (rate limit?), assuming image is cached"
+        ));
     }
 
     let stack_id = "e2e-undeclared-host-import";

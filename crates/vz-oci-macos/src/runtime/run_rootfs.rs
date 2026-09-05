@@ -942,7 +942,10 @@ mod tests {
                 "injected VM stop failure".to_string(),
             )),
         )
-        .unwrap_err();
+        .map_or_else(
+            |error| error,
+            |value| panic!("expected cleanup failure, got success: {value:?}"),
+        );
 
         assert!(error.to_string().contains("injected forwarding failure"));
         assert!(error.to_string().contains("injected VM stop failure"));
@@ -957,7 +960,10 @@ mod tests {
             Ok(()),
             Ok(()),
         )
-        .unwrap_err();
+        .map_or_else(
+            |error| error,
+            |value| panic!("expected cleanup failure, got success: {value:?}"),
+        );
 
         assert!(matches!(
             error,

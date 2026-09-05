@@ -3891,6 +3891,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "vz",
+ "vz-agent-proto",
  "vz-image",
  "vz-linux",
  "vz-oci",

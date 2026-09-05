@@ -1,0 +1,16 @@
+{
+  "schema_version": 1,
+  "source": "certifi",
+  "version": "2026.7.22",
+  "metadata_url": "https://pypi.org/pypi/certifi/2026.7.22/json",
+  "archive_url": "https://files.pythonhosted.org/packages/0b/a7/71ac2cff56fec219ed242bb11b8efb69fcc4bec75db06fb7bfe35de520e6/certifi-2026.7.22-py3-none-any.whl",
+  "archive_sha256": "62f22742b58a1a33014a2b6b706588a8d7e2a88ae7bd1a6ebe8c992928483775",
+  "bundle_member": "certifi/cacert.pem",
+  "bundle_sha256": "9cc2a774b5198dcff14d9be1e66091f538975d867ce029a96bce15a55dfd730f",
+  "bundle_bytes": 240216,
+  "certificate_count": 121,
+  "license_member": "certifi-2026.7.22.dist-info/licenses/LICENSE",
+  "license_sha256": "e93716da6b9c0d5a4a1df60fe695b370f0695603d21f6f83f053e42cfc10caf7",
+  "license": "MPL-2.0",
+  "scope": "public_Mozilla_roots_only_no_host_trust"
+}
