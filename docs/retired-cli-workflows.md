@@ -41,9 +41,11 @@ guest client, old binary, or adjacent green test.
 The current DEV CLI exposes `up`, `exec`, `status`, `stop`, and `delete`.
 Delete's ownership-safe Linux-on-macOS adapter is DEV; native targets and
 additional topology cleanup adapters remain unsupported. Complete Up
-reconciliation/readiness and aggregate lifecycle conformance remain unfinished. Up's
-Linux-on-macOS adapter requires an explicitly configured verified catalog and
-never promotes Engine-only evidence to Developer readiness. Bare `vz` prints
+reconciliation and aggregate lifecycle conformance remain unfinished. Up's
+Linux-on-macOS adapter discovers the verified installed catalog during normal
+daemon autostart; its scoped [operational readiness gate](developer-startup-readiness.md)
+measures host Engine, Compose and buildx execution, not Engine-only readiness.
+This does not certify full Docker compatibility. Bare `vz` prints
 static help without state discovery. The
 [product contract](developer-environments.md) defines the completed five-verb
 workflow, and the [release goal](../planning/developer-environments/GOAL-0.4.0.md)
