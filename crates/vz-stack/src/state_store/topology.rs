@@ -2883,6 +2883,9 @@ impl StateStore {
                 &environment,
                 &acknowledgement.machine_id,
             )?;
+            if let Some(machine) = machine_after.as_ref() {
+                store.persist_machine_docker_context_ownership(&environment_before, machine)?;
+            }
             if let (Some(before), Some(after)) = (machine_before, machine_after)
                 && before != after
             {
@@ -3903,6 +3906,49 @@ impl StateStore {
                 ),
             })
         }
+    }
+
+    /// Insert context ownership within the same transaction as its activation.
+    /// Historical descriptor-less context rows are neither adopted nor removed.
+    fn persist_machine_docker_context_ownership(
+        &self,
+        before: &EnvironmentInstance,
+        machine: &MachineInstance,
+    ) -> Result<(), StackError> {
+        let Some(context) = &machine.docker_context else {
+            return Ok(());
+        };
+        let requested = OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::DockerContext,
+            resource_id: context.name.clone(),
+            environment_id: machine.environment_id.clone(),
+            machine_id: Some(machine.machine_id.clone()),
+        };
+        if before.ownership.contains(&requested) {
+            self.require_exact_owned_resource_row(&requested)?;
+            return Ok(());
+        }
+        let kind = serde_json::to_string(&requested.resource_kind)?;
+        let collision: Option<(String, Option<String>)> = self.conn.query_row(
+            "SELECT environment_id, machine_id FROM topology_ownership WHERE resource_kind = ?1 AND resource_id = ?2",
+            params![kind, requested.resource_id], |row| Ok((row.get(0)?, row.get(1)?)),
+        ).optional()?;
+        if let Some((existing_environment_id, existing_machine_id)) = collision {
+            return Err(StackError::OwnedResourceCollision(Box::new(
+                OwnedResourceCollisionError {
+                    resource_kind: kind,
+                    resource_id: requested.resource_id,
+                    existing_environment_id,
+                    existing_machine_id,
+                },
+            )));
+        }
+        self.conn.execute(
+            "INSERT INTO topology_ownership (resource_kind, resource_id, environment_id, machine_id, schema_version, record_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![kind,requested.resource_id,requested.environment_id.as_str(),machine.machine_id.as_str(),requested.schema_version,serde_json::to_string(&requested)?],
+        )?;
+        Ok(())
     }
 
     fn update_machine_incarnation_ownership_cas(

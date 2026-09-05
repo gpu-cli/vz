@@ -99,12 +99,12 @@ guest paths, hosts or ports. Bounded data frames, directional EOF and a guest
 write-completion acknowledgement preserve both orders of half-close without
 discarding queued input. This is not the older generic TCP forwarding path.
 
-The transport does not yet publish managed contexts, translate host bind paths,
-recover endpoint ownership after a daemon crash, or integrate with production
-`vz up`. Same-UID host processes and directory ACL configuration remain trusted;
-there is no new cross-user authorization claim. The public interface remains
-the planned per-Machine context returned by status, not a user-constructed path
-or global `DOCKER_HOST`.
+The transport is now connected to the DEV public `vz up` path through a separate
+managed-context and [operational readiness adapter](developer-startup-readiness.md).
+Status returns an exact per-Machine descriptor, not a user-constructed path or
+global `DOCKER_HOST`. Host bind-path translation and endpoint ownership recovery
+after a daemon crash remain unfinished. Same-UID host processes and directory
+ACL configuration remain trusted; there is no new cross-user authorization claim.
 
 ## Pending integration and evidence
 

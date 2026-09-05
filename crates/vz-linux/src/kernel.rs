@@ -7,6 +7,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
 use crate::LinuxError;
+use crate::developer_probe::{
+    DeveloperProbeMetadata, VerifiedDeveloperProbe, verify_developer_probe,
+};
 
 const KERNEL_FILE: &str = "vmlinux";
 const INITRAMFS_FILE: &str = "initramfs.img";
@@ -56,6 +59,10 @@ pub struct KernelVersion {
     pub sha256_initramfs: Option<String>,
     /// Optional SHA256 of `youki`.
     pub sha256_youki: Option<String>,
+    /// Optional digest-bound offline Developer startup rootfs; absent in legacy
+    /// and Hardened bundles. Absence never certifies Developer readiness.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub developer_probe: Option<DeveloperProbeMetadata>,
     /// Optional capability declarations for this kernel bundle.
     ///
     /// Older bundles predate this field; callers that use
@@ -250,6 +257,9 @@ pub struct KernelBundleArtifactIdentity {
     /// This is SHA256 over `vz.linux.kernel-bundle.v1\0`, followed in order by
     /// `kernel`, `initramfs`, `youki`, and `version`; each field is framed as
     /// its ASCII name, NUL, its 64-byte lowercase hexadecimal hash, then NUL.
+    /// An optional Developer startup-probe archive is verified against its
+    /// checksum in those exact version bytes, so it is transitively bound
+    /// without changing the identity framing of legacy four-file bundles.
     pub digest: String,
 }
 
@@ -264,6 +274,8 @@ pub struct VerifiedKernelBundle {
     pub capabilities: BTreeSet<KernelCapability>,
     /// Artifact-level and aggregate content identity.
     pub artifact_identity: KernelBundleArtifactIdentity,
+    /// Optional extra archive authenticated by the exact version metadata hash.
+    pub developer_probe: Option<VerifiedDeveloperProbe>,
 }
 
 /// Options for resolving kernel artifacts.
@@ -462,6 +474,7 @@ pub async fn verify_kernel_bundle_read_only(
     let youki_sha256 = sha256_file(&youki).await?;
     require_matching_checksum(YOUKI_FILE, &youki, expected_youki, &youki_sha256)?;
     let version_sha256 = sha256_bytes(&raw_version);
+    let developer_probe = verify_developer_probe(bundle_dir, &version).await?;
     let digest = verified_bundle_digest(
         &kernel_sha256,
         &initramfs_sha256,
@@ -485,6 +498,7 @@ pub async fn verify_kernel_bundle_read_only(
             version_sha256,
             digest,
         },
+        developer_probe,
     })
 }
 
@@ -885,6 +899,9 @@ async fn install_from_bundle(bundle_dir: &Path, install_dir: &Path) -> Result<()
     tokio::fs::copy(&bundle.kernel, staging.join(KERNEL_FILE)).await?;
     tokio::fs::copy(&bundle.initramfs, staging.join(INITRAMFS_FILE)).await?;
     tokio::fs::copy(&bundle.youki, staging.join(YOUKI_FILE)).await?;
+    if let Some(probe) = verify_developer_probe(bundle_dir, &bundle.version).await? {
+        tokio::fs::copy(probe.archive, staging.join(probe.metadata.archive)).await?;
+    }
     tokio::fs::copy(version_path, staging.join(VERSION_FILE)).await?;
 
     if tokio::fs::metadata(install_dir).await.is_ok() {
@@ -971,6 +988,10 @@ async fn validate_artifact_checksums(paths: &KernelPaths) -> Result<(), LinuxErr
     if let Some(expected) = paths.version.sha256_youki.as_deref() {
         validate_file_checksum(&paths.youki, YOUKI_FILE, expected).await?;
     }
+    let directory = paths.kernel.parent().ok_or_else(|| {
+        LinuxError::InvalidConfig("kernel artifact lacks a bundle directory".to_string())
+    })?;
+    verify_developer_probe(directory, &paths.version).await?;
 
     Ok(())
 }
@@ -1060,6 +1081,7 @@ mod tests {
             sha256_vmlinux: None,
             sha256_initramfs: None,
             sha256_youki: None,
+            developer_probe: None,
             capabilities: None,
         }
     }
@@ -1148,6 +1170,114 @@ mod tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
             .collect()
+    }
+
+    async fn add_developer_probe(dir: &Path) {
+        let archive = b"fixture-only-rootfs-tar-bytes";
+        tokio::fs::write(dir.join(crate::DEVELOPER_PROBE_ARCHIVE), archive)
+            .await
+            .unwrap();
+        let mut version = version_value(dir).await;
+        version["developer_probe"] = serde_json::json!({
+            "schema_version": 1, "archive": crate::DEVELOPER_PROBE_ARCHIVE,
+            "sha256": sha256(archive), "busybox_sha256": "a".repeat(64),
+            "busybox_version": version["busybox"], "source_archive_sha256": "b".repeat(64),
+            "source_inventory_sha256": "c".repeat(64), "build_provenance_sha256": "d".repeat(64),
+            "marker_sha256": sha256(crate::DEVELOPER_PROBE_MARKER)
+        });
+        write_version_value(dir, &version).await;
+    }
+
+    #[tokio::test]
+    async fn developer_probe_is_digest_bound_verified_and_copied_on_install() {
+        let root = tempdir().unwrap();
+        let source = root.path().join("source");
+        write_verified_bundle(&source, KernelProfile::Developer).await;
+        let before = verify_kernel_bundle_read_only(&source, KernelProfile::Developer)
+            .await
+            .unwrap();
+        assert!(before.developer_probe.is_none());
+        add_developer_probe(&source).await;
+        let verified = verify_kernel_bundle_read_only(&source, KernelProfile::Developer)
+            .await
+            .unwrap();
+        let probe = verified.developer_probe.as_ref().unwrap();
+        assert_eq!(probe.archive, source.join(crate::DEVELOPER_PROBE_ARCHIVE));
+        assert_ne!(
+            before.artifact_identity.digest,
+            verified.artifact_identity.digest
+        );
+        assert_eq!(
+            before.artifact_identity.kernel_sha256,
+            verified.artifact_identity.kernel_sha256
+        );
+        let installed = root.path().join("installed");
+        install_from_bundle(&source, &installed).await.unwrap();
+        let copied = verify_kernel_bundle_read_only(&installed, KernelProfile::Developer)
+            .await
+            .unwrap();
+        assert_eq!(verified.artifact_identity, copied.artifact_identity);
+        assert_eq!(copied.developer_probe.unwrap().metadata, probe.metadata);
+    }
+
+    #[tokio::test]
+    async fn developer_probe_missing_tampered_or_redirected_inputs_fail_closed() {
+        for kind in [
+            "missing",
+            "tampered",
+            "redirected",
+            "uppercase",
+            "marker",
+            "hardened",
+            "undeclared",
+        ] {
+            let root = tempdir().unwrap();
+            write_verified_bundle(root.path(), KernelProfile::Developer).await;
+            add_developer_probe(root.path()).await;
+            let archive = root.path().join(crate::DEVELOPER_PROBE_ARCHIVE);
+            let mut version = version_value(root.path()).await;
+            match kind {
+                "missing" => tokio::fs::remove_file(&archive).await.unwrap(),
+                "tampered" => tokio::fs::write(&archive, b"foreign").await.unwrap(),
+                "redirected" => version["developer_probe"]["archive"] = "../foreign.tar".into(),
+                "uppercase" => version["developer_probe"]["sha256"] = "A".repeat(64).into(),
+                "marker" => version["developer_probe"]["marker_sha256"] = "e".repeat(64).into(),
+                "hardened" => version["profile"] = "container".into(),
+                "undeclared" => {
+                    version.as_object_mut().unwrap().remove("developer_probe");
+                }
+                _ => unreachable!(),
+            }
+            write_version_value(root.path(), &version).await;
+            assert!(
+                verify_kernel_bundle_read_only(root.path(), KernelProfile::Developer)
+                    .await
+                    .is_err(),
+                "{kind}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn developer_probe_symlink_and_hardlink_are_rejected() {
+        for hard in [false, true] {
+            let root = tempdir().unwrap();
+            write_verified_bundle(root.path(), KernelProfile::Developer).await;
+            add_developer_probe(root.path()).await;
+            let archive = root.path().join(crate::DEVELOPER_PROBE_ARCHIVE);
+            let original = root.path().join("original.tar");
+            tokio::fs::rename(&archive, &original).await.unwrap();
+            if hard {
+                std::fs::hard_link(&original, &archive).unwrap();
+            } else {
+                std::os::unix::fs::symlink(&original, &archive).unwrap();
+            }
+            assert!(
+                verify_kernel_bundle_read_only(root.path(), KernelProfile::Developer)
+                    .await
+                    .is_err()
+            );
+        }
     }
 
     #[tokio::test]

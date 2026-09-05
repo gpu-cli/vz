@@ -341,6 +341,7 @@ fn successful_completion_requires_the_exact_persisted_workspace_binding() {
                     expected_incarnation: step.expected_incarnation.clone(),
                     resulting_incarnation: Some(incarnation.clone()),
                     resulting_activation: Some(MachineActivationEvidence {
+                        docker_context: None,
                         schema_version: 1,
                         backend: MachineBackend::MacosVirtualizationLinux,
                         negotiated_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),

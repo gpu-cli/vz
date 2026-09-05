@@ -9,7 +9,6 @@ mod observability;
 mod support;
 
 use thiserror::Error;
-use tokio::net::UnixListener;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::metadata::MetadataValue;
 use tonic::transport::Server;
@@ -417,16 +416,7 @@ where
 {
     let socket_path = socket_path.as_ref();
 
-    if socket_path.exists() {
-        std::fs::remove_file(socket_path)?;
-    }
-
-    let listener = UnixListener::bind(socket_path)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(socket_path, std::fs::Permissions::from_mode(0o600))?;
-    }
+    let (listener, _socket_guard) = socket_ownership::bind(socket_path)?;
 
     let incoming = UnixListenerStream::new(listener);
     let grpc_observability = Arc::new(GrpcObservability::default());
@@ -533,5 +523,6 @@ where
     Ok(())
 }
 
+mod socket_ownership;
 #[cfg(test)]
 mod tests;

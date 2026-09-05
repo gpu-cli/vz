@@ -19,6 +19,7 @@ from machine_registry_evidence import (
     validate,
     validate_host_endpoint,
     validate_live_sessions,
+    validate_probe_pin,
     verify_serial_files,
 )
 
@@ -117,9 +118,20 @@ def fixture():
     for index, name in enumerate(["developer_a", "developer_b", "hardened"]):
         owner = {"project_id": "prj_fixture", "environment_id": "env_fixture", "machine_id": "mch_" + name}
         profile = "developer" if index < 2 else "container"
+        version = {"profile": profile, "busybox": "1.37.0", "sha256_vmlinux": "6" * 64,
+                   "sha256_initramfs": build["developer_initramfs_sha256" if index < 2 else "container_initramfs_sha256"],
+                   "sha256_youki": "7" * 64}
+        if index < 2:
+            version["developer_probe"] = {"schema_version": 1, "archive": "developer-probe-rootfs.tar",
+                "sha256": "a" * 64, "busybox_sha256": "b" * 64, "busybox_version": "1.37.0",
+                "source_archive_sha256": "c" * 64, "source_inventory_sha256": "d" * 64,
+                "build_provenance_sha256": "e" * 64,
+                "marker_sha256": hashlib.sha256(b"vz-developer-probe-v1\n").hexdigest()}
+        version_json = json.dumps(version, sort_keys=True, separators=(",", ":"))
+        artifact_names = ["vmlinux", "initramfs.img", "youki", "version.json"] + (["developer-probe-rootfs.tar"] if index < 2 else [])
         artifact = {"profile": profile, "kernel_sha256": "6" * 64,
                     "initramfs_sha256": build["developer_initramfs_sha256" if index < 2 else "container_initramfs_sha256"],
-                    "youki_sha256": "7" * 64, "version_sha256": "8" * 64}
+                    "youki_sha256": "7" * 64, "version_sha256": hashlib.sha256(version_json.encode()).hexdigest()}
         artifact_identity = {key: value for key, value in artifact.items() if key != "profile"}
         artifact_identity["digest"] = bundle_digest(artifact_identity)
         resources = {"cpus": 2, "memory_mb": 4096 if index < 2 else 1024}
@@ -175,10 +187,12 @@ def fixture():
             pin_directory_identity=immutable(300 + index * 10, 0o700, 128, links=3),
             bundle_directory_identity=immutable(301 + index * 10, 0o500, 256, links=2),
             configuration_identity=immutable(302 + index * 10, 0o400, len(configuration_bytes)),
+            version_json=version_json,
+            developer_probe_sha256="a" * 64 if index < 2 else None,
             artifact_identities={file: immutable(303 + index * 10 + offset,
                                                  0o500 if file == "youki" else 0o400,
-                                                 1024 + offset)
-                                 for offset, file in enumerate(["vmlinux", "initramfs.img", "youki", "version.json"])},
+                                                 len(version_json.encode()) if file == "version.json" else 1024 + offset)
+                                 for offset, file in enumerate(artifact_names)},
         )
         if index < 2:
             disk_key = hashlib.sha256(machine["vm_reservation"]["resource_id"].encode()).hexdigest()
@@ -321,6 +335,41 @@ class EvidenceTests(unittest.TestCase):
         value = fixture()
         validate(value, copy.deepcopy(value["build"]))
 
+    def test_probe_metadata_is_strictly_bound_to_raw_version_and_actual_digest(self):
+        original = fixture()["storage"]["first"]["installed_artifacts"]["developer-a"]
+        self.assertEqual(len(validate_probe_pin(original)), 5)
+        for field, changed in [("schema_version", True), ("archive", "../foreign.tar"),
+                               ("sha256", "f" * 64), ("busybox_version", "1.36.0"),
+                               ("source_inventory_sha256", "G" * 64), ("marker_sha256", "0" * 64),
+                               ("unexpected", True)]:
+            pin = copy.deepcopy(original)
+            version = json.loads(pin["version_json"])
+            version["developer_probe"][field] = changed
+            pin["version_json"] = json.dumps(version)
+            pin["version_sha256"] = hashlib.sha256(pin["version_json"].encode()).hexdigest()
+            with self.subTest(field=field), self.assertRaises(InvalidEvidence):
+                validate_probe_pin(pin)
+        pin = copy.deepcopy(original)
+        pin["version_json"] += " "
+        with self.assertRaises(InvalidEvidence):
+            validate_probe_pin(pin)
+
+    def test_hardened_and_legacy_probe_absence_is_not_optional_file_adoption(self):
+        pin = copy.deepcopy(fixture()["storage"]["first"]["installed_artifacts"]["developer-a"])
+        version = json.loads(pin["version_json"])
+        version["profile"] = pin["profile"] = "container"
+        pin["version_json"] = json.dumps(version)
+        pin["version_sha256"] = hashlib.sha256(pin["version_json"].encode()).hexdigest()
+        with self.assertRaises(InvalidEvidence):
+            validate_probe_pin(pin)
+        version.pop("developer_probe")
+        pin["version_json"] = json.dumps(version)
+        pin["version_sha256"] = hashlib.sha256(pin["version_json"].encode()).hexdigest()
+        with self.assertRaises(InvalidEvidence):
+            validate_probe_pin(pin)
+        pin["developer_probe_sha256"] = None
+        self.assertEqual(validate_probe_pin(pin), ["vmlinux", "initramfs.img", "youki", "version.json"])
+
     def test_missing_fields_and_extra_fields_fail_at_every_object(self):
         baseline = fixture()
         expected = copy.deepcopy(baseline["build"])
@@ -413,7 +462,8 @@ class EvidenceTests(unittest.TestCase):
             json.loads('{"schema_version":1,"schema_version":1}', object_pairs_hook=unique_object)
 
     def test_pinned_artifact_permissions_are_exact(self):
-        for artifact, replacement in [("youki", 0o400), ("youki", 0o700), ("vmlinux", 0o500)]:
+        for artifact, replacement in [("youki", 0o400), ("youki", 0o700), ("vmlinux", 0o500),
+                                      ("developer-probe-rootfs.tar", 0o500)]:
             value = fixture()
             expected = copy.deepcopy(value["build"])
             installed_sets = [value["storage"][phase]["installed_artifacts"]

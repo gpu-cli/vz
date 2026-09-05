@@ -5,6 +5,7 @@
 
 mod benchmark;
 mod config;
+mod developer_probe;
 mod docker_stream;
 mod error;
 pub mod grpc_client;
@@ -16,6 +17,10 @@ pub use benchmark::{
     run_boot_benchmark_with_progress,
 };
 pub use config::LinuxVmConfig;
+pub use developer_probe::{
+    DEVELOPER_PROBE_ARCHIVE, DEVELOPER_PROBE_MARKER, DeveloperProbeMetadata,
+    MAX_DEVELOPER_PROBE_BYTES, VerifiedDeveloperProbe,
+};
 pub use docker_stream::GrpcDockerStream;
 pub use error::LinuxError;
 pub use grpc_client::{

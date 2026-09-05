@@ -14,8 +14,9 @@ use vz_cli::project_definition::{DefinitionDiscoveryError, discover_project_defi
 use vz_runtime_contract::{
     CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSelectionContext,
     EnvironmentSelectionSource, EnvironmentSelector, EnvironmentState,
-    MAX_TOPOLOGY_SELECTION_CANDIDATES, MachineBackend, MachineId, MachineProfile, MachineState,
-    TargetSpec, TopologyCandidate, TopologyResolutionError,
+    MAX_TOPOLOGY_SELECTION_CANDIDATES, MachineBackend, MachineCapability,
+    MachineDockerContextDescriptor, MachineId, MachineProfile, MachineState, TargetSpec,
+    TopologyCandidate, TopologyResolutionError,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, ProjectStateSnapshot};
@@ -98,6 +99,11 @@ struct EnvironmentStatus {
 
 #[derive(Debug, Serialize)]
 struct MachineStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docker_context: Option<MachineDockerContextDescriptor>,
+    /// A persisted lifecycle/capability projection, never a live Engine probe.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    docker_context_availability: Option<&'static str>,
     machine_id: String,
     name: String,
     state: MachineState,
@@ -127,6 +133,20 @@ impl From<EnvironmentInstance> for EnvironmentStatus {
                 .machines
                 .into_iter()
                 .map(|machine| MachineStatus {
+                    docker_context_availability: machine.docker_context.as_ref().map(|_| {
+                        if machine.state == MachineState::Stopped {
+                            "stopped_unavailable"
+                        } else if machine.state == MachineState::Ready
+                            && machine
+                                .negotiated_capabilities
+                                .contains(MachineCapability::DockerEngine)
+                        {
+                            "persisted_ready_not_live_probed"
+                        } else {
+                            "persisted_unavailable"
+                        }
+                    }),
+                    docker_context: machine.docker_context,
                     machine_id: machine.machine_id.to_string(),
                     name: machine.name,
                     state: machine.state,
@@ -617,6 +637,19 @@ fn print_text_status(output: &StatusOutput) {
             for (capability, reason) in &machine.negotiated_capabilities.unsupported {
                 println!("    Unsupported {capability:?}: {reason}");
             }
+            if let Some(context) = &machine.docker_context {
+                println!(
+                    "    Docker context (persisted, not live health): {} [{}]",
+                    context.name,
+                    machine
+                        .docker_context_availability
+                        .unwrap_or("persisted_unavailable")
+                );
+                println!(
+                    "    Docker configuration: {} endpoint={}",
+                    context.config_dir, context.endpoint
+                );
+            }
         }
     }
 }
@@ -634,6 +667,7 @@ mod tests {
     fn environment_with_machines(id: &str, name: &str) -> EnvironmentInstance {
         let environment_id = EnvironmentId::new(id).unwrap();
         let machine = |id: &str, name: &str| MachineInstance {
+            docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: MachineId::new(id).unwrap(),
             environment_id: environment_id.clone(),
@@ -674,6 +708,54 @@ mod tests {
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn docker_context_status_is_exact_and_explicitly_persisted_not_live_health() {
+        let mut environment = environment_with_machines("env-context", "one");
+        let machine = &mut environment.machines[0];
+        machine.docker_context = Some(MachineDockerContextDescriptor {
+            schema_version: 1,
+            owner: vz_runtime_contract::ResourceOwner {
+                project_id: environment.project_id.clone(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            },
+            name: "exact-context".into(),
+            endpoint: "unix:///private/exact.sock".into(),
+            config_dir: "/private/exact-client".into(),
+            engine_id: "exact-engine".into(),
+            incarnation_id: vz_runtime_contract::MachineIncarnationId::generate(),
+            incarnation_generation: 1,
+        });
+        machine.negotiated_capabilities = CapabilitySet::new([MachineCapability::DockerEngine]);
+        let ready = serde_json::to_value(EnvironmentStatus::from(environment.clone())).unwrap();
+        assert_eq!(
+            ready["machines"][0]["docker_context"]["engine_id"],
+            "exact-engine"
+        );
+        assert_eq!(
+            ready["machines"][0]["docker_context_availability"],
+            "persisted_ready_not_live_probed"
+        );
+        assert!(ready["machines"][1].get("docker_context").is_none());
+        environment.machines[0].state = MachineState::Stopped;
+        let stopped = serde_json::to_value(EnvironmentStatus::from(environment.clone())).unwrap();
+        assert_eq!(
+            stopped["machines"][0]["docker_context"],
+            ready["machines"][0]["docker_context"]
+        );
+        assert_eq!(
+            stopped["machines"][0]["docker_context_availability"],
+            "stopped_unavailable"
+        );
+        environment.machines[0].state = MachineState::Ready;
+        environment.machines[0].negotiated_capabilities = CapabilitySet::default();
+        let unverified = serde_json::to_value(EnvironmentStatus::from(environment)).unwrap();
+        assert_eq!(
+            unverified["machines"][0]["docker_context_availability"],
+            "persisted_unavailable"
+        );
     }
 
     fn status_args(environment: Option<&str>, machine: Option<&str>, all: bool) -> DevStatusArgs {

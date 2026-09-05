@@ -45,3 +45,16 @@ not collapse onto a shared engine even if lower-level infrastructure is pooled.
   Environment's Docker service.
 - Two Linux Machines in one Environment pass independent Engine/state/context
   tests from the host Docker CLI.
+
+## Startup versus release certification
+
+Normal Developer Up must measure bounded offline Engine, Compose and buildx
+operations through the exact Machine's managed host context. It must not require
+the full release-wide compatibility suite on every startup. Engine metadata or
+installed binaries alone are insufficient to publish Ready. The version-bound
+probe rootfs, original VM runtime inventory, command journal, scoped cleanup and
+immutable operational receipts are described in
+[startup readiness](../../docs/developer-startup-readiness.md).
+
+This is a DEV implementation path. The complete host-client scenario matrix and
+single-digest aggregate Environment gate remain separate release obligations.

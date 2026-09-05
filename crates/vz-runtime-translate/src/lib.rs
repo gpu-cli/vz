@@ -11,6 +11,10 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+#[cfg(test)]
+#[path = "docker_context_tests.rs"]
+mod docker_context_tests;
+
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vz_runtime_contract::{
@@ -21,16 +25,17 @@ use vz_runtime_contract::{
     EnvironmentTombstone, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec,
     Lease, LeaseState, LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult,
     LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence,
-    MachineBackend, MachineCapability, MachineError, MachineErrorCode, MachineId,
-    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
-    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineRuntimeIdentity,
-    MachineSpec, MachineState, MachineWorkloadScope, NetworkId, NetworkInstance, NetworkKind,
-    NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipCleanupStep,
-    OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectId,
-    ProjectState, RequestMetadata, RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF,
-    SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState, TargetSpec,
-    TopologyCandidate, TopologyLifecycleError, TopologyResolutionError, TopologyValidationError,
-    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
+    MachineBackend, MachineCapability, MachineDockerContextDescriptor, MachineError,
+    MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources,
+    MachineRuntimeIdentity, MachineSpec, MachineState, MachineWorkloadScope, NetworkId,
+    NetworkInstance, NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind,
+    OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
+    ProjectId, ProjectState, RequestMetadata, ResourceOwner, RuntimeCapabilities,
+    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyLifecycleError,
+    TopologyResolutionError, TopologyValidationError, WorkspaceBinding, WorkspaceBindingId,
+    WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -482,6 +487,51 @@ pub fn machine_runtime_identity_from_proto(
     Ok(decoded)
 }
 
+/// Convert exact-owner host Docker client selection without granting readiness.
+pub fn machine_docker_context_to_proto(
+    context: &MachineDockerContextDescriptor,
+) -> runtime_v2::MachineDockerContextDescriptor {
+    runtime_v2::MachineDockerContextDescriptor {
+        schema_version: context.schema_version,
+        project_id: context.owner.project_id.to_string(),
+        environment_id: context.owner.environment_id.to_string(),
+        machine_id: context
+            .owner
+            .machine_id
+            .as_ref()
+            .map(ToString::to_string)
+            .unwrap_or_default(),
+        name: context.name.clone(),
+        endpoint: context.endpoint.clone(),
+        config_dir: context.config_dir.clone(),
+        engine_id: context.engine_id.clone(),
+        incarnation_id: context.incarnation_id.to_string(),
+        incarnation_generation: context.incarnation_generation,
+    }
+}
+
+/// Decode bounded, exact-owner host client selection without granting readiness.
+pub fn machine_docker_context_from_proto(
+    context: &runtime_v2::MachineDockerContextDescriptor,
+) -> Result<MachineDockerContextDescriptor, TranslationError> {
+    let decoded = MachineDockerContextDescriptor {
+        schema_version: context.schema_version,
+        owner: ResourceOwner {
+            project_id: ProjectId::new(context.project_id.clone())?,
+            environment_id: EnvironmentId::new(context.environment_id.clone())?,
+            machine_id: Some(MachineId::new(context.machine_id.clone())?),
+        },
+        name: context.name.clone(),
+        endpoint: context.endpoint.clone(),
+        config_dir: context.config_dir.clone(),
+        engine_id: context.engine_id.clone(),
+        incarnation_id: MachineIncarnationId::new(context.incarnation_id.clone())?,
+        incarnation_generation: context.incarnation_generation,
+    };
+    decoded.validate()?;
+    Ok(decoded)
+}
+
 /// Convert the complete evidence produced by one successful Machine activation.
 pub fn machine_activation_evidence_to_proto(
     evidence: &MachineActivationEvidence,
@@ -496,6 +546,10 @@ pub fn machine_activation_evidence_to_proto(
             &evidence.runtime_identity,
         )),
         incarnation: Some(machine_incarnation_to_proto(&evidence.incarnation)),
+        docker_context: evidence
+            .docker_context
+            .as_ref()
+            .map(machine_docker_context_to_proto),
     }
 }
 
@@ -530,6 +584,11 @@ pub fn machine_activation_evidence_from_proto(
             &machine_id,
         )?,
         incarnation,
+        docker_context: evidence
+            .docker_context
+            .as_ref()
+            .map(machine_docker_context_from_proto)
+            .transpose()?,
     };
     decoded.validate_shape_for_machine(&machine_id)?;
     Ok(decoded)
@@ -580,6 +639,10 @@ pub fn machine_workload_scope_from_proto(
 pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::MachineInstance {
     let (backend, other_backend) = machine_backend_to_proto(machine.backend.as_ref());
     runtime_v2::MachineInstance {
+        docker_context: machine
+            .docker_context
+            .as_ref()
+            .map(machine_docker_context_to_proto),
         schema_version: machine.schema_version,
         machine_id: machine.machine_id.to_string(),
         environment_id: machine.environment_id.to_string(),
@@ -610,6 +673,11 @@ pub fn machine_instance_from_proto(
 ) -> Result<MachineInstance, TranslationError> {
     let machine_id = MachineId::new(machine.machine_id.clone())?;
     let decoded = MachineInstance {
+        docker_context: machine
+            .docker_context
+            .as_ref()
+            .map(machine_docker_context_from_proto)
+            .transpose()?,
         schema_version: machine.schema_version,
         machine_id: machine_id.clone(),
         environment_id: EnvironmentId::new(machine.environment_id.clone())?,
@@ -3056,6 +3124,7 @@ mod tests {
             }],
             machines: vec![
                 MachineInstance {
+                    docker_context: None,
                     schema_version: V,
                     machine_id: linux_id.clone(),
                     environment_id: environment_id.clone(),
@@ -3088,6 +3157,7 @@ mod tests {
                     legacy_sandbox_id: Some(format!("legacy-{suffix}")),
                 },
                 MachineInstance {
+                    docker_context: None,
                     schema_version: V,
                     machine_id: macos_id.clone(),
                     environment_id: environment_id.clone(),
@@ -3270,6 +3340,7 @@ mod tests {
             expected_incarnation: step.expected_incarnation.clone(),
             resulting_incarnation: Some(resulting_incarnation.clone()),
             resulting_activation: Some(MachineActivationEvidence {
+                docker_context: None,
                 schema_version: V,
                 backend: machine.backend.expect("stopped Machine backend"),
                 negotiated_capabilities: machine.negotiated_capabilities,

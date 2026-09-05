@@ -122,6 +122,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),
                 environment_id: environment_id.clone(),
@@ -629,6 +630,7 @@ fn environment_lifecycle_machine_activation(
         created_at,
     };
     MachineActivationEvidence {
+        docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         backend: MachineBackend::MacosVirtualizationLinux,
         negotiated_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),
@@ -5718,6 +5720,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),
                 environment_id: environment_id.clone(),

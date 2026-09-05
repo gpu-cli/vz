@@ -29,6 +29,10 @@ use vz_stack::{StackEvent, StackSpec, StateStore, TeardownFinalizerStatus};
 mod committed_json;
 use committed_json::{read_committed_json, write_committed_json, write_json};
 
+#[path = "support/reaped_helper_socket.rs"]
+mod reaped_helper_socket;
+use reaped_helper_socket::CapturedHelperSocket;
+
 const HELPER_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_HELPER";
 const ROOT_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_ROOT";
 const BOOT_STACK_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_BOOT_STACK";
@@ -215,6 +219,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
         active_operation_id: None,
         bindings: Vec::new(),
         machines: vec![MachineInstance {
+            docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: machine_id.clone(),
             environment_id: environment_id.clone(),
@@ -484,10 +489,15 @@ async fn run_helper() {
     }
 }
 
-struct HelperChild(Option<Child>);
+struct HelperChild(Option<Child>, Option<CapturedHelperSocket>);
 
 impl HelperChild {
     fn command(root: &Path, stop_path: &Path) -> Command {
+        assert!(
+            std::fs::symlink_metadata(config(root).socket_path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound),
+            "helper restart requires a fresh control socket name; never adopt a stale path"
+        );
         let mut command = Command::new(std::env::current_exe().expect("current test executable"));
         command
             .arg("--ignored")
@@ -530,7 +540,10 @@ impl HelperChild {
                 .env("VZ_TEST_TEARDOWN_FINALIZER_MARKER", path)
                 .env("VZ_TEST_TEARDOWN_FINALIZER_STACK", STACK_ID);
         }
-        Self(Some(command.spawn().expect("spawn runtimed E2E helper")))
+        Self(
+            Some(command.spawn().expect("spawn runtimed E2E helper")),
+            None,
+        )
     }
 
     fn spawn_for_boundary(
@@ -551,16 +564,33 @@ impl HelperChild {
             .env("VZ_TEST_TEARDOWN_FINALIZER_MARKER", marker_path)
             .env("VZ_TEST_TEARDOWN_FINALIZER_AUDIT_LOG", audit_path)
             .env("VZ_TEST_TEARDOWN_FINALIZER_STACK", stack_id);
-        Self(Some(
-            command.spawn().expect("spawn runtimed boundary helper"),
-        ))
+        Self(
+            Some(command.spawn().expect("spawn runtimed boundary helper")),
+            None,
+        )
+    }
+
+    fn capture_live_socket(&mut self, path: &Path) {
+        assert!(self.1.is_none(), "socket authority already captured");
+        self.1 = Some(
+            CapturedHelperSocket::capture(self.0.as_mut().expect("live helper child"), path)
+                .expect("capture exact live helper socket"),
+        );
     }
 
     fn sigkill_and_wait(&mut self) {
-        let mut child = self.0.take().expect("live helper child");
-        child.kill().expect("SIGKILL helper process");
-        let status = child.wait().expect("wait for SIGKILLed helper");
-        assert!(!status.success(), "SIGKILLed helper unexpectedly succeeded");
+        let captured = self
+            .1
+            .take()
+            .expect("live socket authority captured before crash");
+        let receipt = captured
+            .kill_reap_and_remove(self.0.as_mut().expect("live helper child"))
+            .expect("positively reap exact helper and remove only captured stale socket");
+        self.0 = None;
+        println!(
+            "VZ_TEST_REAPED_SOCKET_CLEANUP={}",
+            serde_json::to_string(&receipt).expect("cleanup receipt")
+        );
     }
 
     async fn wait_success(&mut self, timeout: Duration) {
@@ -1012,6 +1042,7 @@ async fn run_teardown_boundary_matrix(
         );
         wait_for_socket(&cfg.socket_path).await;
         let mut crash_client = connect_stack_client(&cfg.socket_path).await;
+        crashing.capture_live_socket(&cfg.socket_path);
         let apply = successful_apply_with(
             &mut crash_client,
             &scope,
@@ -1486,6 +1517,7 @@ async fn teardown_finalizer_sigkill_restart_replacement_refusal() {
         read_committed_json(&original_identity_path, Duration::from_secs(90)).await;
 
     let mut first_client = connect_stack_client(&cfg.socket_path).await;
+    first.capture_live_socket(&cfg.socket_path);
     let first_scope = scope.clone();
     let first_request =
         tokio::spawn(async move { terminal_teardown_error(&mut first_client, &first_scope).await });

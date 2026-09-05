@@ -190,7 +190,15 @@ impl RuntimeDaemon {
         if environment.legacy_migration.is_some() || !environment.networks.is_empty() || !environment.endpoints.is_empty()
             || environment.ownership.iter().any(|record| !matches!(&record.resource_kind,
                 OwnedResourceKind::Machine | OwnedResourceKind::Incarnation | OwnedResourceKind::Disk)
-                && !matches!(&record.resource_kind,OwnedResourceKind::Other(kind) if kind=="machine_runtime_store" || kind=="runtime_vm")) {
+                && !matches!(&record.resource_kind,OwnedResourceKind::Other(kind) if kind=="machine_runtime_store" || kind=="runtime_vm")
+                && !(record.resource_kind == OwnedResourceKind::DockerContext
+                    && environment.machines.iter().any(|machine| machine.docker_context.as_ref().is_some_and(|context|
+                        context.name == record.resource_id
+                        && context.owner.environment_id == record.environment_id
+                        && context.owner.machine_id == record.machine_id
+                        && context.owner.project_id == environment.project_id
+                        && context.owner.environment_id == environment.environment_id
+                        && context.owner.machine_id.as_ref() == Some(&machine.machine_id))))) {
             return Err(StackError::Machine {code:MachineErrorCode::UnsupportedOperation,
                 message:"Up cannot apply unknown or unsupported existing topology resources".into()});
         }

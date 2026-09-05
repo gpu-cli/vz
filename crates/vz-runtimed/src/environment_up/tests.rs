@@ -177,6 +177,69 @@ async fn failed_admission_releases_controller_without_fabricating_live_session()
     drop(lease);
 }
 
+#[tokio::test]
+async fn context_ownership_authorization_requires_the_exact_persisted_machine_descriptor() {
+    let (_root, daemon, request, metadata) = fixture();
+    let completion = terminal(
+        daemon
+            .up_environment(request, metadata.clone())
+            .await
+            .unwrap(),
+    )
+    .await;
+    let project = daemon
+        .with_state_store(|store| {
+            store.load_project_state(completion.admission.project_id.as_str())
+        })
+        .unwrap()
+        .unwrap();
+    let mut environment = project.environments[0].clone();
+    let machine = &environment.machines[0];
+    let context = MachineDockerContextDescriptor {
+        schema_version: 1,
+        owner: ResourceOwner {
+            project_id: environment.project_id.clone(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(machine.machine_id.clone()),
+        },
+        name: "exact-machine-context".into(),
+        endpoint: "unix:///private/tmp/exact-unused.sock".into(),
+        config_dir: "/private/tmp/exact-client".into(),
+        engine_id: "exact-engine".into(),
+        incarnation_id: MachineIncarnationId::generate(),
+        incarnation_generation: 1,
+    };
+    let record = OwnershipRecord {
+        schema_version: 1,
+        resource_kind: OwnedResourceKind::DockerContext,
+        resource_id: context.name.clone(),
+        environment_id: context.owner.environment_id.clone(),
+        machine_id: context.owner.machine_id.clone(),
+    };
+    environment.ownership.push(record);
+    assert!(daemon.authorize_up(&metadata, &environment).is_err());
+    environment.machines[0].docker_context = Some(context.clone());
+    daemon.authorize_up(&metadata, &environment).unwrap();
+    let last = environment.ownership.len() - 1;
+    for variant in 0..4 {
+        let mut changed = environment.clone();
+        match variant {
+            0 => changed.ownership[last].resource_id = "foreign-context".into(),
+            1 => changed.ownership[last].machine_id = Some(MachineId::generate()),
+            2 => changed.ownership[last].environment_id = EnvironmentId::generate(),
+            _ => {
+                changed.machines[0]
+                    .docker_context
+                    .as_mut()
+                    .unwrap()
+                    .owner
+                    .project_id = ProjectId::generate()
+            }
+        }
+        assert!(daemon.authorize_up(&metadata, &changed).is_err());
+    }
+}
+
 #[test]
 fn request_identity_ignores_diagnostic_path_and_shadowed_process_selector() {
     let (_root, _daemon, mut request, _metadata) = fixture();

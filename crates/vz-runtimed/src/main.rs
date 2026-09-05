@@ -35,6 +35,17 @@ struct Cli {
     #[arg(long, value_name = "ABSOLUTE_FILE")]
     machine_target_catalog: Option<PathBuf>,
 
+    /// Offline installer operation: verify selected profile bundles and atomically write the catalog.
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires_all = ["installed_release_version", "installed_linux_profile"], conflicts_with = "machine_target_catalog")]
+    write_installed_machine_target_catalog: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires = "write_installed_machine_target_catalog")]
+    installed_release_version: Option<String>,
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires = "write_installed_machine_target_catalog", value_parser = ["developer", "container"])]
+    installed_linux_profile: Vec<String>,
+
     /// Maximum retained untagged checkpoints in daemon GC loop.
     #[arg(long, default_value_t = 128)]
     checkpoint_retention_max_untagged_count: usize,
@@ -47,6 +58,26 @@ struct Cli {
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    #[cfg(target_os = "macos")]
+    if let Some(prefix) = cli.write_installed_machine_target_catalog.as_deref() {
+        let version = cli
+            .installed_release_version
+            .as_deref()
+            .context("installed release version required")?;
+        let path = tokio::time::timeout(
+            std::time::Duration::from_secs(120),
+            vz_runtimed::installed_machine_catalog::write_installed_catalog(
+                prefix,
+                version,
+                &cli.installed_linux_profile,
+            ),
+        )
+        .await
+        .context("installed catalog verification exceeded its 120-second deadline")??;
+        use std::io::Write;
+        writeln!(std::io::stdout().lock(), "{}", path.display())?;
+        return Ok(());
+    }
 
     #[cfg(target_os = "macos")]
     let machine_target_catalog = match cli.machine_target_catalog.as_deref() {
@@ -96,7 +127,8 @@ async fn main() -> Result<()> {
 
     let socket_path = daemon.socket_path().to_path_buf();
 
-    // Write PID file so the client can find us for version-mismatch restarts.
+    // Diagnostic process identity for the exact supervising owner. A PID file
+    // is not authority for a client to replace a version-mismatched daemon.
     let pid_path = socket_path.with_extension("pid");
     std::fs::write(&pid_path, std::process::id().to_string())
         .context("failed to write daemon PID file")?;

@@ -110,6 +110,7 @@ pub(super) fn seed_stack_topology(
         active_operation_id: None,
         bindings: Vec::new(),
         machines: vec![MachineInstance {
+            docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: machine_id.clone(),
             environment_id: environment_id.clone(),

@@ -60,6 +60,34 @@ def bundle_digest(value):
     return "sha256:" + hasher.hexdigest()
 
 
+def validate_probe_pin(installed):
+    """Bind the exact optional file inventory to the retained version bytes."""
+    raw = installed["version_json"]
+    require(type(raw) is str and 0 < len(raw.encode()) <= 1024 * 1024, "bounded raw version metadata required")
+    require(hashlib.sha256(raw.encode()).hexdigest() == installed["version_sha256"], "raw version bytes do not match artifact pin")
+    version = json.loads(raw, object_pairs_hook=unique_object)
+    require(type(version) is dict and version.get("profile") == installed["profile"], "version profile mismatch")
+    for source, target in [("sha256_vmlinux", "kernel_sha256"), ("sha256_initramfs", "initramfs_sha256"), ("sha256_youki", "youki_sha256")]:
+        require(version.get(source) == installed[target], "version artifact checksum mismatch")
+    names = ["vmlinux", "initramfs.img", "youki", "version.json"]
+    probe = version.get("developer_probe")
+    if probe is None:
+        require(installed["developer_probe_sha256"] is None, "undeclared startup archive")
+        return names
+    keys(probe, ["schema_version", "archive", "sha256", "busybox_sha256", "busybox_version",
+                 "source_archive_sha256", "source_inventory_sha256", "build_provenance_sha256", "marker_sha256"])
+    require(installed["profile"] == "developer" and type(probe["schema_version"]) is int
+            and probe["schema_version"] == 1 and probe["archive"] == "developer-probe-rootfs.tar", "foreign probe profile/schema/path")
+    for field in ["sha256", "busybox_sha256", "source_archive_sha256", "source_inventory_sha256", "build_provenance_sha256", "marker_sha256"]:
+        sha(probe[field])
+    require(type(probe["busybox_version"]) is str and re.fullmatch(r"[0-9]+\.[0-9]+\.[0-9]+", probe["busybox_version"])
+            and probe["busybox_version"] == version.get("busybox"), "probe BusyBox provenance mismatch")
+    require(probe["marker_sha256"] == hashlib.sha256(b"vz-developer-probe-v1\n").hexdigest(), "probe marker substituted")
+    require(installed["developer_probe_sha256"] == probe["sha256"], "probe bytes do not match declared digest")
+    names.append(probe["archive"])
+    return names
+
+
 def path(value):
     require(type(value) is str, "path is not a string")
     result = PurePosixPath(value)
@@ -245,6 +273,7 @@ def validate(value, expected):
         keys(section["installed_artifacts"], machine_names)
         namespaces, root_inodes, disk_inodes, uids = [], [], [], []
         pin_inodes, artifact_inodes = [], []
+        expected_artifact_count = 0
         for index, name in enumerate(names):
             machine = value["machines"][name]
             root = path(section["data_roots"][index])
@@ -259,7 +288,7 @@ def validate(value, expected):
             keys(installed, ["pin_dir", "dir", "profile", "kernel_sha256", "initramfs_sha256",
                              "youki_sha256", "version_sha256", "configuration_path",
                              "configuration_sha256", "pin_directory_identity", "bundle_directory_identity",
-                             "configuration_identity", "artifact_identities"])
+                             "configuration_identity", "artifact_identities", "version_json", "developer_probe_sha256"])
             pin_dir = path(installed["pin_dir"])
             bundle_dir = path(installed["dir"])
             configuration_path = path(installed["configuration_path"])
@@ -277,7 +306,12 @@ def validate(value, expected):
             validate_immutable_identity(installed["configuration_identity"], 0o400)
             require(installed["configuration_identity"]["size"] == len(encoded_configuration),
                     "pinned configuration size mismatch")
-            keys(installed["artifact_identities"], ["vmlinux", "initramfs.img", "youki", "version.json"])
+            artifact_names = validate_probe_pin(installed)
+            keys(installed["artifact_identities"], artifact_names)
+            expected_artifact_count += len(artifact_names)
+            require(installed["artifact_identities"]["version.json"]["size"] == len(installed["version_json"].encode()), "version file size mismatch")
+            if installed["developer_probe_sha256"] is not None:
+                require(0 < installed["artifact_identities"]["developer-probe-rootfs.tar"]["size"] <= 32 * 1024 * 1024, "unbounded probe archive")
             for artifact_name, identity in installed["artifact_identities"].items():
                 validate_immutable_identity(identity, 0o500 if artifact_name == "youki" else 0o400)
                 require(identity["uid"] == metadata["uid"], "pinned artifact owner differs")
@@ -297,7 +331,7 @@ def validate(value, expected):
                 require(disk_metadata["uid"] == metadata["uid"], "Docker disk owner differs")
                 disk_inodes.append((disk_metadata["device"], disk_metadata["inode"]))
         require(len(set(namespaces)) == 1 and len(set(root_inodes)) == 3 and len(set(disk_inodes)) == 2
-                and len(set(uids)) == 1 and len(set(pin_inodes)) == 9 and len(set(artifact_inodes)) == 12,
+                and len(set(uids)) == 1 and len(set(pin_inodes)) == 9 and len(set(artifact_inodes)) == expected_artifact_count,
                 "shared storage/pin inode or inconsistent namespace/owner")
     for field in ["data_roots", "developer_docker_disks", "installed_artifacts"]:
         require(storage["first"][field] == storage["reopened"][field], "persistent paths/artifacts changed on reopen")

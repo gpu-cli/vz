@@ -9,6 +9,8 @@ The `developer` profile is the primary product profile:
 
 - `out/vmlinux` for the default `developer` profile
 - matching `initramfs.img`, `youki`, and `version.json`
+- `developer-probe-rootfs.tar`, whose exact checksum/provenance is embedded in
+  `version.json` for new Developer builds
 
 The secondary hardened profile is built under `out/container/`. It exists for
 constrained workloads and compatibility while the product converges on
@@ -169,3 +171,38 @@ artifact sets and verifies SHA256 checksums when present.
 `vz-linux::ensure_kernel_bundle()` additionally lets external callers choose
 the install directory and require specific kernel capabilities before booting
 their own rootfs.
+
+## Offline Developer startup input
+
+Normal Developer builds also run `developer-probe.py` against the exact pinned,
+provenance-verified static Linux/arm64 BusyBox binary. It creates a deterministic
+USTAR rootfs with UID/GID/mtime zero, only BusyBox and fixed relative applet links,
+a writable temporary directory, and the public marker
+`/etc/vz-developer-probe` (`vz-developer-probe-v1\n`). It contains no OCI runtime,
+Docker daemon, package manager downloads, credentials, or mutable image reference.
+
+The build's `developer-probe.json` sidecar is embedded as `developer_probe` in
+`version.json`, recording the rootfs checksum, BusyBox checksum/version, pinned
+source archive/inventory digests, exact build-provenance checksum and marker
+checksum. The existing appliance digest already hashes the exact version bytes;
+the read-only bundle verifier additionally verifies the declared archive.
+Normal installation and exactly-owned Machine artifact pinning copy it and
+verify it again. Recovery uses only the retained pin, not the original catalog
+or another Machine's files. A typed `VerifiedDeveloperProbe` exposes the pinned
+archive path and expected hash to the startup adapter.
+
+The primary use is an offline, Machine-scoped startup usability check driven by
+the host's unmodified Docker/Compose/buildx clients. The rootfs can be imported
+through the exact Machine endpoint, after which workloads use that import's
+returned immutable image ID. BuildKit can use `FROM scratch` and a checked public
+payload without pulling a base. This small probe does **not** certify full
+Docker compatibility, cross-Machine isolation, or the 63-scenario release lane.
+Legacy bundles may lack this declaration; they do not thereby gain successful
+Developer readiness. Hardened bundles omit the startup-probe declaration and
+must not acquire Developer/Docker behavior through it.
+
+Offline packaging tests:
+
+```sh
+PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s linux -p test_developer_probe.py
+```

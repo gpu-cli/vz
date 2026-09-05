@@ -121,31 +121,11 @@ fn file_sha(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
 }
 
-fn copy_fixture_bundle(source: &Path, destination: &Path) -> Result<()> {
-    fs::DirBuilder::new()
-        .mode(0o700)
-        .create(destination)
-        .with_context(|| format!("create private fixture bundle {}", destination.display()))?;
-    for name in ["vmlinux", "initramfs.img", "youki", "version.json"] {
-        let source_path = source.join(name);
-        let metadata = fs::symlink_metadata(&source_path)?;
-        ensure!(metadata.is_file() && metadata.nlink() == 1);
-        let mut input = File::open(&source_path)?;
-        let target_path = destination.join(name);
-        let mut output = OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&target_path)?;
-        io::copy(&mut input, &mut output)?;
-        output.sync_all()?;
-        ensure!(file_sha(&source_path)? == file_sha(&target_path)?);
-    }
-    File::open(destination)?.sync_all()?;
-    Ok(())
-}
+#[path = "support/registry_fixture_bundle.rs"]
+mod registry_fixture_bundle;
+use registry_fixture_bundle::{artifact_names, copy_fixture_bundle};
 
-fn create_fixture_sources(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+async fn create_fixture_sources(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     let original_developer = fs::canonicalize(PathBuf::from(
         std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?,
     ))?;
@@ -156,8 +136,8 @@ fn create_fixture_sources(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
     fs::DirBuilder::new().mode(0o700).create(&source_root)?;
     let developer = source_root.join("developer");
     let hardened = source_root.join("hardened");
-    copy_fixture_bundle(&original_developer, &developer)?;
-    copy_fixture_bundle(&original_hardened, &hardened)?;
+    copy_fixture_bundle(&original_developer, &developer, KernelProfile::Developer).await?;
+    copy_fixture_bundle(&original_hardened, &hardened, KernelProfile::Container).await?;
     File::open(&source_root)?.sync_all()?;
     Ok((source_root, developer, hardened))
 }
@@ -555,6 +535,7 @@ fn activation(
     };
     ensure!(step.machine_id == incarnation.machine_id);
     Ok(MachineActivationEvidence {
+        docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         backend: MachineBackend::MacosVirtualizationLinux,
         negotiated_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),
@@ -1400,14 +1381,37 @@ fn installed(data_path: &Path) -> Result<Value> {
     let profile = configuration["kernel_profile"]
         .as_str()
         .context("pinned kernel profile")?;
-    let artifacts = [
-        ("vmlinux", 0o400),
-        ("initramfs.img", 0o400),
-        ("youki", 0o500),
-        ("version.json", 0o400),
-    ];
+    let version_path = dir.join("version.json");
+    ensure!(fs::symlink_metadata(&version_path)?.len() <= 1024 * 1024);
+    let version_json = fs::read_to_string(&version_path)?;
+    let version: vz_linux::KernelVersion = serde_json::from_str(&version_json)?;
+    ensure!(version.profile.as_deref() == Some(profile));
+    let artifacts = artifact_names(&version)?;
+    let mut observed_names = fs::read_dir(&dir)?
+        .map(|entry| Ok(entry?.file_name().to_string_lossy().into_owned()))
+        .collect::<Result<Vec<_>>>()?;
+    observed_names.sort();
+    let mut expected_names = artifacts.clone();
+    expected_names.sort();
+    ensure!(
+        observed_names == expected_names,
+        "unexpected pinned bundle file inventory"
+    );
+    let developer_probe_sha256 = version
+        .developer_probe
+        .as_ref()
+        .map(|probe| {
+            let actual = file_sha(&dir.join(vz_linux::DEVELOPER_PROBE_ARCHIVE))?;
+            ensure!(
+                actual == probe.sha256,
+                "pinned Developer probe digest mismatch"
+            );
+            Ok::<_, anyhow::Error>(actual)
+        })
+        .transpose()?;
     let mut artifact_identities = BTreeMap::new();
-    for (name, expected_mode) in artifacts {
+    for name in artifacts {
+        let expected_mode = if name == "youki" { 0o500 } else { 0o400 };
         let path = dir.join(name);
         let metadata = fs::symlink_metadata(&path)?;
         ensure!(
@@ -1428,6 +1432,8 @@ fn installed(data_path: &Path) -> Result<Value> {
         "initramfs_sha256": file_sha(&dir.join("initramfs.img"))?,
         "youki_sha256": file_sha(&dir.join("youki"))?,
         "version_sha256": file_sha(&dir.join("version.json"))?,
+        "version_json": version_json,
+        "developer_probe_sha256": developer_probe_sha256,
         "configuration_path": configuration_path,
         "configuration_sha256": format!("{:x}", Sha256::digest(&configuration_bytes)),
         "pin_directory_identity": immutable_identity(&pin_dir)?,
@@ -1554,7 +1560,7 @@ async fn run_inner(
     cleanup_targets: &mut Vec<CleanupTarget>,
     pin_cleanup_directories: &mut Vec<PathBuf>,
 ) -> Result<Value> {
-    let (source_root, developer_bundle, hardened_bundle) = create_fixture_sources(root)?;
+    let (source_root, developer_bundle, hardened_bundle) = create_fixture_sources(root).await?;
     let developer_verified =
         vz_linux::verify_kernel_bundle_read_only(&developer_bundle, KernelProfile::Developer)
             .await?;

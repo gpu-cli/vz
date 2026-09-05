@@ -192,6 +192,30 @@ pub struct MachineRuntimeIdentity {
     #[prost(string, tag = "2")]
     pub opaque_id: ::prost::alloc::string::String,
 }
+/// Exact-owner host client selection; presence does not imply live readiness.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineDockerContextDescriptor {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub endpoint: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub config_dir: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub engine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "9")]
+    pub incarnation_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "10")]
+    pub incarnation_generation: u64,
+}
 /// Backend result atomically published by a successful Machine Up step.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineActivationEvidence {
@@ -208,6 +232,8 @@ pub struct MachineActivationEvidence {
     pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
     #[prost(message, optional, tag = "6")]
     pub incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(message, optional, tag = "7")]
+    pub docker_context: ::core::option::Option<MachineDockerContextDescriptor>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineInstance {
@@ -243,6 +269,8 @@ pub struct MachineInstance {
     /// Absent on historical instances persisted before exact runtime identity.
     #[prost(message, optional, tag = "15")]
     pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
+    #[prost(message, optional, tag = "16")]
+    pub docker_context: ::core::option::Option<MachineDockerContextDescriptor>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkInstance {

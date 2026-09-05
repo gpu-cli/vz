@@ -266,3 +266,28 @@ The subsequent required backend regression run
 release-profile runtime, recovery, runtimed, Machine registry, stack and BuildKit
 stage. Its pinned runtime inventory and logs remain backend evidence, not the
 missing host-Docker compatibility or mixed-target aggregate release gate.
+
+### Installed Developer operational startup checkpoint
+
+The subsequent candidate in `.artifacts/installed-developer-startup-candidate-2/`
+passed normal installed `vz up` autostart/catalog discovery on the local Mac.
+It created two named Environments in one worktree, each with two Developer Linux
+Machines and distinct managed Docker contexts. Host Engine, Compose and uncached
+buildx execution measured readiness; status returned exact persisted descriptors.
+Stop/Up preserved context/Machine/Engine identity and advanced incarnations while
+the neighboring Environment remained usable. A sequential Hardened Machine
+provided POSIX execution without Docker. Final positive Stop and graceful daemon
+cleanup preserved both Docker defaults. All 1,124 evidence hashes were verified.
+
+This supersedes the earlier Engine-only/missing-context readiness boundary for
+this DEV path. It does not complete Delete, native macOS lifecycle, declared
+workspace/network/volume/secret behavior, mutating-failure recovery or the full
+Docker/mixed-target release gate. See
+[operational readiness and retained failures](../../docs/developer-startup-readiness.md).
+
+The subsequent full backend regression gate passed at
+`.artifacts/sandbox-vm-e2e/20260905T183551Z/summary.txt`, including runtime,
+generation recovery, daemon teardown, Machine registry, stack and BuildKit.
+Crash-fixture socket ownership and digest-declared probe propagation corrections
+are verified; their preceding failed candidates remain retained. Public daemon
+crash recovery (`vz-ehz`) is still open and is not certified by fixture cleanup.

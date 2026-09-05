@@ -14,6 +14,28 @@ const DAEMON_SOCKET_PATH_ENV: &str = "VZ_RUNTIME_DAEMON_SOCKET";
 const RUNTIME_DATA_DIR_ENV: &str = "VZ_RUNTIME_DATA_DIR";
 /// Optional runtime state DB path override.
 const RUNTIME_STATE_DB_ENV: &str = "VZ_RUNTIME_STATE_DB";
+/// Explicit trusted operator catalog; never resolved relative to a project.
+const MACHINE_TARGET_CATALOG_ENV: &str = "VZ_MACHINE_TARGET_CATALOG";
+
+fn parse_machine_target_catalog(raw: Option<OsString>) -> anyhow::Result<Option<PathBuf>> {
+    raw.map(|value| {
+        let path = PathBuf::from(value);
+        if !path.is_absolute()
+            || path.components().any(|part| {
+                matches!(
+                    part,
+                    std::path::Component::ParentDir | std::path::Component::CurDir
+                )
+            })
+        {
+            bail!(
+                "{MACHINE_TARGET_CATALOG_ENV} requires an absolute catalog path without traversal"
+            );
+        }
+        Ok(path)
+    })
+    .transpose()
+}
 
 /// CLI control-plane transport for runtime mutations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -125,12 +147,15 @@ pub async fn connect_up_daemon_for_state_db(state_db: &Path) -> anyhow::Result<D
     if parse_env_control_plane_transport()? != ControlPlaneTransport::DaemonGrpc {
         bail!("Developer Environment Up requires daemon-grpc transport; no HTTP fallback");
     }
-    let config = daemon_client_config_with_overrides(
+    let mut config = daemon_client_config_with_overrides(
         state_db,
         parse_env_daemon_socket_override(),
         parse_env_runtime_data_dir_override(),
         true,
     );
+    config.machine_target_catalog =
+        parse_machine_target_catalog(std::env::var_os(MACHINE_TARGET_CATALOG_ENV))?;
+    config.discover_installed_machine_target_catalog = true;
     DaemonClient::connect_with_config(config)
         .await
         .context("connect managed Up daemon")
@@ -185,6 +210,18 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;
+
+    #[test]
+    fn machine_catalog_override_never_treats_invalid_as_absent() {
+        assert_eq!(parse_machine_target_catalog(None).expect("absent"), None);
+        for value in ["", "relative.json", "/private/../catalog.json"] {
+            assert!(parse_machine_target_catalog(Some(value.into())).is_err());
+        }
+        assert_eq!(
+            parse_machine_target_catalog(Some("/private/catalog.json".into())).expect("absolute"),
+            Some(PathBuf::from("/private/catalog.json"))
+        );
+    }
 
     #[test]
     fn parse_control_plane_transport_accepts_aliases() {

@@ -35,6 +35,7 @@ const V0_3_20_MALFORMED_FIXTURE_SHA256: &str =
 // Unit-test backend receipt, deliberately not release/runtime evidence.
 fn test_activation(incarnation: MachineIncarnation) -> MachineActivationEvidence {
     MachineActivationEvidence {
+        docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         backend: MachineBackend::MacosVirtualizationLinux,
         negotiated_capabilities: CapabilitySet::new([
@@ -300,6 +301,7 @@ fn topology_project_state(
                     path_hint: Some(path_hint.to_string()),
                 }],
                 machines: vec![MachineInstance {
+                    docker_context: None,
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     machine_id: machine_id.clone(),
                     environment_id: environment_id.clone(),

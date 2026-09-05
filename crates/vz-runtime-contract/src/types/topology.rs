@@ -419,6 +419,88 @@ pub struct MachineActivationEvidence {
     pub negotiated_capabilities: CapabilitySet,
     pub runtime_identity: MachineRuntimeIdentity,
     pub incarnation: MachineIncarnation,
+    /// Host-managed, exact-owner client selection, not implicit readiness evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context: Option<MachineDockerContextDescriptor>,
+}
+
+/// Host Docker selection material bound to one Developer Linux Machine boot.
+///
+/// Transport and configuration paths are host-owned diagnostics, not selectors
+/// that authorize another Machine. Stop retains logical context identity while
+/// making it unavailable; this descriptor alone never grants a capability or
+/// certifies an Engine is live. It contains no credentials.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MachineDockerContextDescriptor {
+    pub schema_version: u32,
+    pub owner: ResourceOwner,
+    pub name: String,
+    pub endpoint: String,
+    pub config_dir: String,
+    pub engine_id: String,
+    pub incarnation_id: MachineIncarnationId,
+    pub incarnation_generation: u64,
+}
+
+impl MachineDockerContextDescriptor {
+    /// Validate bounded opaque connection material and complete immutable owner.
+    pub fn validate(&self) -> Result<(), TopologyValidationError> {
+        validate_schema(self.schema_version)?;
+        self.owner.project_id.validate()?;
+        self.owner.environment_id.validate()?;
+        let invalid = |reason: &str| TopologyValidationError::InvalidIdentifier {
+            kind: "machine.docker_context".into(),
+            value: self.name.clone(),
+            reason: reason.into(),
+        };
+        self.owner
+            .machine_id
+            .as_ref()
+            .ok_or_else(|| invalid("exact Machine owner is required"))?
+            .validate()?;
+        self.incarnation_id.validate()?;
+        if self.incarnation_generation == 0 {
+            return Err(invalid("incarnation generation must be positive"));
+        }
+        for (value, limit) in [
+            (&self.name, 256),
+            (&self.endpoint, 4096),
+            (&self.config_dir, 4096),
+            (&self.engine_id, 256),
+        ] {
+            if value.is_empty()
+                || value.len() > limit
+                || value.trim() != value
+                || value.chars().any(char::is_control)
+            {
+                return Err(invalid(
+                    "fields must be bounded, nonempty, control-free, without surrounding whitespace",
+                ));
+            }
+        }
+        // The serving host adapter validates its canonical local transport and
+        // configuration paths. Portable readers never reinterpret opaque paths
+        // using their own host's path rules or authorize a connection from them.
+        Ok(())
+    }
+
+    fn validate_incarnation(
+        &self,
+        incarnation: &MachineIncarnation,
+    ) -> Result<(), TopologyValidationError> {
+        self.validate()?;
+        if self.owner.machine_id.as_ref() != Some(&incarnation.machine_id)
+            || self.incarnation_id != incarnation.incarnation_id
+            || self.incarnation_generation != incarnation.generation
+        {
+            return Err(TopologyValidationError::OwnershipMismatch {
+                kind: "docker_context.incarnation".into(),
+                value: self.name.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Persisted logical Machine identity and negotiated target state.
@@ -444,6 +526,8 @@ pub struct MachineInstance {
     /// omit it; every newly successful Up records it through activation evidence.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime_identity: Option<MachineRuntimeIdentity>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub docker_context: Option<MachineDockerContextDescriptor>,
     pub state: MachineState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_sandbox_id: Option<String>,
@@ -1064,6 +1148,7 @@ impl ProjectDefinition {
             .machines
             .iter()
             .map(|machine| MachineInstance {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: MachineId::generate(),
                 environment_id: environment_id.clone(),
@@ -1586,6 +1671,16 @@ impl EnvironmentInstance {
         let mut machine_names = BTreeSet::new();
         for machine in &self.machines {
             machine.validate()?;
+            if machine
+                .docker_context
+                .as_ref()
+                .is_some_and(|context| context.owner.project_id != self.project_id)
+            {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "docker_context.project".into(),
+                    value: machine.machine_id.to_string(),
+                });
+            }
             if machine.environment_id != self.environment_id {
                 return Err(TopologyValidationError::OwnershipMismatch {
                     kind: "machine.environment".to_string(),
@@ -1981,6 +2076,15 @@ impl EnvironmentLifecycleOperation {
             validate_lifecycle_incarnation(&step.machine_id, step.resulting_incarnation.as_ref())?;
             if let Some(activation) = &step.resulting_activation {
                 validate_activation_evidence_shape(&step.machine_id, activation)?;
+                if activation.docker_context.as_ref().is_some_and(|context| {
+                    context.owner.project_id != self.project_id
+                        || context.owner.environment_id != self.environment_id
+                }) {
+                    return Err(TopologyLifecycleError::InvalidOperation {
+                        reason: "Docker context activation belongs to another Project/Environment"
+                            .into(),
+                    });
+                }
                 if step.resulting_incarnation.as_ref() != Some(&activation.incarnation) {
                     return Err(TopologyLifecycleError::InvalidOperation {
                         reason: format!(
@@ -2439,6 +2543,21 @@ impl EnvironmentLifecycleOperation {
                             machine_id: acknowledgement.machine_id.to_string(),
                         });
                     };
+                    if activation.docker_context.as_ref().is_some_and(|context| {
+                        context.owner.project_id != self.project_id
+                            || context.owner.environment_id != self.environment_id
+                    }) {
+                        return Err(TopologyLifecycleError::InvalidOperation {
+                            reason:
+                                "Docker context activation belongs to another Project/Environment"
+                                    .into(),
+                        });
+                    }
+                    apply_docker_context_ownership(
+                        machine,
+                        &mut environment.ownership,
+                        activation,
+                    )?;
                     apply_up_incarnation(
                         machine,
                         &mut environment.ownership,
@@ -2448,6 +2567,7 @@ impl EnvironmentLifecycleOperation {
                     machine.backend = Some(activation.backend.clone());
                     machine.negotiated_capabilities = activation.negotiated_capabilities.clone();
                     machine.runtime_identity = Some(activation.runtime_identity.clone());
+                    machine.docker_context = activation.docker_context.clone();
                     step.resulting_incarnation = Some(resulting.clone());
                     step.resulting_activation = Some(activation.clone());
                 }
@@ -2958,6 +3078,7 @@ fn validate_activation_evidence_for_machine(
     activated.backend = Some(evidence.backend.clone());
     activated.negotiated_capabilities = evidence.negotiated_capabilities.clone();
     activated.runtime_identity = Some(evidence.runtime_identity.clone());
+    activated.docker_context = evidence.docker_context.clone();
     activated.incarnation = Some(evidence.incarnation.clone());
     activated.state = MachineState::Ready;
     activated
@@ -2978,6 +3099,52 @@ fn machine_matches_activation(
         && machine.negotiated_capabilities == evidence.negotiated_capabilities
         && machine.runtime_identity.as_ref() == Some(&evidence.runtime_identity)
         && machine.incarnation.as_ref() == Some(&evidence.incarnation)
+        && machine.docker_context == evidence.docker_context
+}
+
+fn apply_docker_context_ownership(
+    machine: &MachineInstance,
+    ownership: &mut Vec<OwnershipRecord>,
+    evidence: &MachineActivationEvidence,
+) -> Result<(), TopologyLifecycleError> {
+    let invalid = |reason: &str| TopologyLifecycleError::InvalidOperation {
+        reason: reason.into(),
+    };
+    if let Some(previous) = &machine.docker_context {
+        if evidence
+            .docker_context
+            .as_ref()
+            .is_none_or(|next| next.owner != previous.owner || next.name != previous.name)
+        {
+            return Err(invalid(
+                "Up cannot drop or rename an established logical Machine Docker context",
+            ));
+        }
+    }
+    let Some(context) = &evidence.docker_context else {
+        return Ok(());
+    };
+    let expected = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::DockerContext,
+        resource_id: context.name.clone(),
+        environment_id: machine.environment_id.clone(),
+        machine_id: Some(machine.machine_id.clone()),
+    };
+    if let Some(existing) = ownership.iter().find(|row| {
+        row.resource_kind == OwnedResourceKind::DockerContext
+            && row.resource_id == expected.resource_id
+    }) {
+        if existing != &expected {
+            return Err(invalid(
+                "Docker context name is already owned by another Machine",
+            ));
+        }
+    } else {
+        ownership.push(expected);
+        ownership.sort_by_key(ownership_sort_key);
+    }
+    Ok(())
 }
 
 fn validate_up_incarnation_transition(
@@ -3251,6 +3418,19 @@ impl MachineActivationEvidence {
                     .to_string(),
             });
         }
+        if let Some(context) = &self.docker_context {
+            context.validate_incarnation(&self.incarnation)?;
+            if matches!(
+                self.backend,
+                MachineBackend::MacosNative | MachineBackend::WindowsNative
+            ) {
+                return Err(TopologyValidationError::InvalidMachineBackend {
+                    machine_id: machine_id.to_string(),
+                    reason: "native non-Linux backend cannot provide an implicit Docker context"
+                        .into(),
+                });
+            }
+        }
         Ok(())
     }
 }
@@ -3292,6 +3472,7 @@ impl MachineInstance {
             && self.backend.is_none()
             && self.incarnation.is_none()
             && self.runtime_identity.is_none()
+            && self.docker_context.is_none()
             && self.negotiated_capabilities.capabilities.is_empty()
             && self.negotiated_capabilities.unsupported.is_empty()
     }
@@ -3303,6 +3484,25 @@ impl MachineInstance {
         validate_name("machine", &self.name)?;
         validate_target(&self.target)?;
         validate_requested_capabilities(&self.name, &self.requested_capabilities)?;
+        if let Some(context) = &self.docker_context {
+            if self.profile != MachineProfile::Developer
+                || self.target.os != OperatingSystem::Linux
+                || context.owner.environment_id != self.environment_id
+                || self.runtime_identity.is_none()
+            {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "docker_context.machine_profile_target_owner".into(),
+                    value: self.machine_id.to_string(),
+                });
+            }
+            let incarnation = self.incarnation.as_ref().ok_or_else(|| {
+                TopologyValidationError::InvalidMachineIncarnation {
+                    machine_id: self.machine_id.to_string(),
+                    reason: "Docker context requires incarnation evidence".into(),
+                }
+            })?;
+            context.validate_incarnation(incarnation)?;
+        }
         if let Some(runtime_identity) = &self.runtime_identity {
             runtime_identity.validate_for_machine(&self.machine_id)?;
             if self.backend.is_none() || self.incarnation.is_none() {
@@ -3398,6 +3598,24 @@ fn validate_exact_topology_ownership(
         };
 
     for machine in &environment.machines {
+        if let Some(context) = &machine.docker_context {
+            let expected = OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::DockerContext,
+                resource_id: context.name.clone(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            };
+            if environment
+                .ownership
+                .iter()
+                .filter(|row| *row == &expected)
+                .count()
+                != 1
+            {
+                return Err(ownership_mismatch("docker_context", context.name.clone()));
+            }
+        }
         let exact_machine = environment.ownership.iter().filter(|record| {
             record.resource_kind == OwnedResourceKind::Machine
                 && record.resource_id == machine.machine_id.as_str()
@@ -3872,6 +4090,7 @@ pub fn migrate_legacy_developer_sandbox(
         path_hint: sandbox.labels.get(SANDBOX_LABEL_PROJECT_DIR).cloned(),
     };
     let machine = MachineInstance {
+        docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         machine_id: machine_id.clone(),
         environment_id: environment_id.clone(),
@@ -4103,6 +4322,10 @@ fn legacy_state(state: SandboxState) -> (EnvironmentState, MachineState) {
         SandboxState::Failed => (EnvironmentState::Failed, MachineState::Failed),
     }
 }
+
+#[cfg(test)]
+#[path = "topology_docker_context_tests.rs"]
+mod docker_context_tests;
 
 #[cfg(test)]
 mod tests {
@@ -4344,6 +4567,7 @@ mod tests {
                 .expect("fixture Machine");
             let backend = fixture_backend(machine);
             Some(MachineActivationEvidence {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 backend: backend.clone(),
                 negotiated_capabilities: machine.requested_capabilities.clone(),

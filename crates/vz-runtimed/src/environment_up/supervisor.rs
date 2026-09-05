@@ -245,12 +245,12 @@ impl RuntimeDaemon {
                 self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                 let entry=prepared.attach_machine(&self.state_store,&self.machine_runtime_registry,&operation,&step.machine_id)
                     .map_err(|error|backend_error(error.to_string()))?;
+                let pin=prepared.pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id))
+                    .ok_or_else(||backend_error("prepared Machine pin missing".into()))?;
                 let activation=if let Some(activation)=existing.get(&step.machine_id) {
                     if !Arc::ptr_eq(activation.entry(),&entry) { return Err(backend_error("Up attachment changed original Runtime object".into())); }
                     Arc::clone(activation)
                 } else {
-                    let pin=prepared.pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id))
-                        .ok_or_else(||backend_error("prepared Machine pin missing".into()))?;
                     let resources=&pin.configuration().resources;
                     let reservation=MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(entry.owner()).map_err(|error|backend_error(error.to_string()))?;
                     if let Some(observer)=&self.environment_up_observer {
@@ -286,7 +286,10 @@ impl RuntimeDaemon {
                     machine_id:machine.machine_id.clone(),generation:machine.incarnation.as_ref().map_or(Some(1),|value|value.generation.checked_add(1))
                         .ok_or_else(||backend_error("Machine incarnation generation overflow".into()))?,created_at:current_unix_secs()
                 }};
-                super::readiness::await_readiness(MeasuredLinuxReadiness.verify(&activation,machine,incarnation,&metadata),deadline,&metadata).await
+                let docker_endpoint=self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
+                    .map_err(|error|backend_error(error.to_string()))?;
+                let readiness=MeasuredLinuxReadiness {pin,docker_endpoint:docker_endpoint.as_deref(),deadline};
+                super::readiness::await_readiness(readiness.verify(&activation,machine,incarnation,&metadata),deadline,&metadata).await
             }.await;
             let (activation, result) = match result {
                 Ok(activation) => (Some(activation), LifecycleStepResult::Succeeded),

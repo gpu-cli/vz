@@ -26,6 +26,51 @@ mod tests {
     use prost::Message;
 
     #[test]
+    fn machine_docker_context_optional_wire_roundtrip() {
+        use super::runtime_v2::*;
+        let context = MachineDockerContextDescriptor {
+            schema_version: 1,
+            project_id: "prj_one".into(),
+            environment_id: "env_one".into(),
+            machine_id: "mch_one".into(),
+            name: "vz-one".into(),
+            endpoint: "unix:///private/one.sock".into(),
+            config_dir: "/private/client".into(),
+            engine_id: "engine-one".into(),
+            incarnation_id: "inc_one".into(),
+            incarnation_generation: 7,
+        };
+        let machine = MachineInstance {
+            docker_context: Some(context.clone()),
+            ..Default::default()
+        };
+        assert_eq!(
+            MachineInstance::decode(machine.encode_to_vec().as_slice()).unwrap(),
+            machine
+        );
+        let activation = MachineActivationEvidence {
+            docker_context: Some(context),
+            ..Default::default()
+        };
+        assert_eq!(
+            MachineActivationEvidence::decode(activation.encode_to_vec().as_slice()).unwrap(),
+            activation
+        );
+        assert!(
+            MachineInstance::decode([].as_slice())
+                .unwrap()
+                .docker_context
+                .is_none()
+        );
+        assert!(
+            MachineActivationEvidence::decode([].as_slice())
+                .unwrap()
+                .docker_context
+                .is_none()
+        );
+    }
+
+    #[test]
     fn up_environment_wire_roundtrips_nonempty_request_and_terminal_receipt() {
         use super::runtime_v2::*;
         let request = UpEnvironmentRequest {
@@ -861,6 +906,21 @@ mod tests {
                 &[("schema_version", 1), ("opaque_id", 2)],
             ),
             (
+                "MachineDockerContextDescriptor",
+                &[
+                    ("schema_version", 1),
+                    ("project_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("name", 5),
+                    ("endpoint", 6),
+                    ("config_dir", 7),
+                    ("engine_id", 8),
+                    ("incarnation_id", 9),
+                    ("incarnation_generation", 10),
+                ],
+            ),
+            (
                 "MachineActivationEvidence",
                 &[
                     ("schema_version", 1),
@@ -869,6 +929,7 @@ mod tests {
                     ("negotiated_capabilities", 4),
                     ("runtime_identity", 5),
                     ("incarnation", 6),
+                    ("docker_context", 7),
                 ],
             ),
             (
@@ -889,6 +950,7 @@ mod tests {
                     ("legacy_sandbox_id", 13),
                     ("profile", 14),
                     ("runtime_identity", 15),
+                    ("docker_context", 16),
                 ],
             ),
             (
@@ -1521,6 +1583,7 @@ mod tests {
             name: "checkout".into(),
         };
         let machine = MachineInstance {
+            docker_context: None,
             schema_version: 1,
             machine_id: "mac_api".into(),
             environment_id: "env_agent_a".into(),
@@ -1625,6 +1688,7 @@ mod tests {
             ..incarnation.clone()
         };
         let resulting_activation = MachineActivationEvidence {
+            docker_context: None,
             schema_version: 1,
             backend: MachineBackend::MacosVirtualizationLinux as i32,
             other_backend: None,

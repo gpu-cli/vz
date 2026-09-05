@@ -133,6 +133,7 @@ fn seed_stack_topology(
         active_operation_id: None,
         bindings: Vec::new(),
         machines: vec![MachineInstance {
+            docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: machine_id.clone(),
             environment_id: environment_id.clone(),
@@ -272,6 +273,7 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
             active_operation_id: None,
             bindings: Vec::new(),
             machines: vec![MachineInstance {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),
                 environment_id: environment_id.clone(),
@@ -1011,6 +1013,66 @@ async fn version_mismatch_returns_incompatible_version() {
     ));
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn autostart_version_mismatch_preserves_original_daemon_and_decoys() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let original = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("original");
+    let identity = original.handshake().daemon_id.clone();
+    let mut config = client_config(&tmp, true);
+    config.expected_daemon_version = Some("999.999.999".into());
+    config.daemon_binary = Some(tmp.path().join("must-not-launch"));
+    let pid = config.socket_path.with_extension("pid");
+    let log = config.socket_path.with_extension("log");
+    std::fs::write(&pid, "untrusted-pid-decoy").expect("pid");
+    std::fs::write(&log, "retained-log-decoy").expect("log");
+    assert!(matches!(
+        DaemonClient::connect_with_config(config).await,
+        Err(DaemonClientError::IncompatibleVersion { .. })
+    ));
+    let after = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("still live");
+    assert_eq!(after.handshake().daemon_id, identity);
+    assert_eq!(
+        std::fs::read_to_string(pid).expect("pid retained"),
+        "untrusted-pid-decoy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(log).expect("log retained"),
+        "retained-log-decoy"
+    );
+    daemon.stop().await;
+}
+
+#[test]
+fn autostart_never_removes_existing_socket_or_store_lock() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = DaemonClientConfig {
+        socket_path: tmp.path().join("occupied.sock"),
+        state_store_path: Some(tmp.path().join("state.db")),
+        daemon_binary: Some(tmp.path().join("must-not-launch")),
+        ..Default::default()
+    };
+    std::fs::write(&config.socket_path, "foreign socket-path decoy").expect("socket decoy");
+    let lock = tmp.path().join("state.db.lock");
+    std::fs::write(&lock, "owned lock").expect("lock");
+    assert!(matches!(
+        DaemonClient::spawn_daemon(&config),
+        Err(DaemonClientError::Unavailable { .. })
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&config.socket_path).expect("retained"),
+        "foreign socket-path decoy"
+    );
+    assert_eq!(
+        std::fs::read_to_string(lock).expect("retained"),
+        "owned lock"
+    );
 }
 
 #[tokio::test]

@@ -2334,6 +2334,7 @@ mod tests {
                 sha256_vmlinux: None,
                 sha256_initramfs: None,
                 sha256_youki,
+                developer_probe: None,
                 capabilities: Some(
                     [KernelCapability::CgroupBpf, KernelCapability::UserNs]
                         .into_iter()

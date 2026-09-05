@@ -17,6 +17,7 @@ INSTALL_DIR="${VZ_INSTALL_DIR:-$HOME/.vz}"
 BIN_DIR="$INSTALL_DIR/bin"
 LINUX_DIR="$INSTALL_DIR/linux"
 VERSION_FILE="$INSTALL_DIR/.installed-version"
+INSTALLED_LINUX_PROFILES=()
 
 # --- Preflight checks ---
 
@@ -167,6 +168,18 @@ install_linux_artifacts() {
             exit 1
             ;;
     esac
+
+    # Only profiles downloaded by this transaction are catalogued. In particular,
+    # an unavailable optional profile must not adopt an older directory on disk.
+    local catalog_args=()
+    local installed_profile
+    for installed_profile in "${INSTALLED_LINUX_PROFILES[@]}"; do
+        catalog_args+=(--installed-linux-profile "$installed_profile")
+    done
+    local canonical_prefix
+    canonical_prefix="$(cd "$INSTALL_DIR" && pwd -P)"
+    "$BIN_DIR/vz-runtimed" --write-installed-machine-target-catalog "$canonical_prefix" \
+        --installed-release-version "$version" "${catalog_args[@]}"
 }
 
 install_linux_profile_artifacts() {
@@ -205,16 +218,69 @@ install_linux_profile_artifacts() {
     rm "$dest_dir/$tarball_name"
 
     echo "  installed ${profile}: $dest_dir"
+    INSTALLED_LINUX_PROFILES+=("$profile")
+}
+
+legacy_developer_probe_sha() {
+    local metadata="$1" probe_type profile archive schema digest parsed
+    [ -f "$metadata" ] && [ ! -L "$metadata" ] || return 1
+    # plutil's plist-only lint rejects JSON on some macOS releases. Conversion
+    # to stdout validates JSON (including null) without rewriting the input.
+    parsed="$(/usr/bin/plutil -convert json -o - "$metadata")" || return 1
+    [[ "$parsed" == \{* ]] || return 1
+    profile="$(/usr/bin/plutil -extract profile raw -expect string "$metadata" 2>/dev/null)" || profile=""
+    [ -z "$profile" ] || [ "$profile" = developer ] || return 1
+    probe_type="$(/usr/bin/plutil -type developer_probe "$metadata" 2>/dev/null)" || return 0
+    # plutil reports JSON null as (any); an absent key also means no probe.
+    [ "$probe_type" != '(any)' ] || return 0
+    [ "$probe_type" = dictionary ] && [ "$profile" = developer ] || return 1
+    archive="$(/usr/bin/plutil -extract developer_probe.archive raw -expect string "$metadata")" || return 1
+    schema="$(/usr/bin/plutil -extract developer_probe.schema_version raw -expect integer "$metadata")" || return 1
+    digest="$(/usr/bin/plutil -extract developer_probe.sha256 raw -expect string "$metadata")" || return 1
+    [ "$archive" = developer-probe-rootfs.tar ] && [ "$schema" = 1 ] || return 1
+    [[ "$digest" =~ ^[0-9a-f]{64}$ ]] || return 1
+    printf '%s' "$digest"
+}
+
+legacy_probe_file_matches() {
+    local path="$1" expected="$2" measured
+    [ -n "$expected" ] && [ -f "$path" ] && [ ! -L "$path" ] || return 1
+    [ "$(/usr/bin/stat -f %l "$path")" = 1 ] || return 1
+    measured="$(shasum -a 256 -- "$path")" || return 1
+    [ "${measured%% *}" = "$expected" ]
 }
 
 copy_linux_profile_to_legacy_default() {
-    local source_dir="$1"
-    local artifact
-
+    local source_dir="$1" artifact probe_sha previous_sha
+    local probe_name=developer-probe-rootfs.tar
+    probe_sha="$(legacy_developer_probe_sha "$source_dir/version.json")" || {
+        echo "error: invalid Developer probe metadata for legacy alias" >&2; return 1;
+    }
+    if [ -n "$probe_sha" ]; then
+        legacy_probe_file_matches "$source_dir/$probe_name" "$probe_sha" || {
+            echo "error: declared Developer probe is missing, redirected, or corrupt" >&2; return 1;
+        }
+    elif [ -e "$source_dir/$probe_name" ] || [ -L "$source_dir/$probe_name" ]; then
+        echo "error: source bundle has an undeclared Developer probe" >&2; return 1
+    fi
+    # Capture old authority before replacing version.json. A basename alone is
+    # not permission to remove or overwrite a foreign optional artifact.
+    if [ -e "$LINUX_DIR/$probe_name" ] || [ -L "$LINUX_DIR/$probe_name" ]; then
+        previous_sha="$(legacy_developer_probe_sha "$LINUX_DIR/version.json")" || return 1
+        legacy_probe_file_matches "$LINUX_DIR/$probe_name" "$previous_sha" || {
+            echo "error: existing legacy probe does not match its prior declaration; preserved" >&2; return 1;
+        }
+    fi
     mkdir -p "$LINUX_DIR"
-    for artifact in vmlinux initramfs.img youki version.json; do
+    for artifact in vmlinux initramfs.img youki; do
         cp "$source_dir/$artifact" "$LINUX_DIR/$artifact"
     done
+    if [ -n "$probe_sha" ]; then
+        cp "$source_dir/$probe_name" "$LINUX_DIR/$probe_name"
+    elif [ -e "$LINUX_DIR/$probe_name" ]; then
+        rm -- "$LINUX_DIR/$probe_name"
+    fi
+    cp "$source_dir/version.json" "$LINUX_DIR/version.json"
     echo "  updated legacy default: $LINUX_DIR"
 }
 
@@ -276,11 +342,8 @@ main() {
         echo "Upgrading vz from v${prev_version} to v${version}..."
     fi
 
-    # Stop running daemon before upgrading binaries.
-    if [ -n "$prev_version" ] && command -v "$BIN_DIR/vz-runtimed" >/dev/null 2>&1; then
-        pkill -f "$BIN_DIR/vz-runtimed" 2>/dev/null || true
-        sleep 1
-    fi
+    # A live daemon can own running Machines. Installation never kills it or
+    # adopts its locks/sockets; incompatible clients fail with an explicit error.
 
     install_binaries "$version"
     install_linux_artifacts "$version"

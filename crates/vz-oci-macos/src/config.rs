@@ -349,6 +349,7 @@ mod tests {
             sha256_vmlinux: Some(sha256(KERNEL_BYTES)),
             sha256_initramfs: Some(sha256(INITRAMFS_BYTES)),
             sha256_youki: Some(sha256(YOUKI_BYTES)),
+            developer_probe: None,
             capabilities: Some(profile.default_capabilities()),
         };
         tokio::fs::write(

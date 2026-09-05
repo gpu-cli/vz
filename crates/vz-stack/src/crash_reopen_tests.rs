@@ -439,6 +439,7 @@ fn install_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope
         active_operation_id: None,
         bindings: vec![],
         machines: vec![MachineInstance {
+            docker_context: None,
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machine_id: scope.machine_id.clone(),
             environment_id: scope.environment_id.clone(),

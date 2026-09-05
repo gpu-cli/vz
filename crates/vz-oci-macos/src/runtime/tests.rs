@@ -82,6 +82,7 @@ fn docker_profile_is_derived_from_actual_kernel_metadata() {
         sha256_vmlinux: None,
         sha256_initramfs: None,
         sha256_youki: None,
+        developer_probe: None,
         capabilities: None,
     };
     assert_eq!(
@@ -5505,6 +5506,7 @@ fn make_kernel_paths_with_youki(path: PathBuf) -> KernelPaths {
             sha256_vmlinux: None,
             sha256_initramfs: None,
             sha256_youki: None,
+            developer_probe: None,
             capabilities: None,
         },
     }

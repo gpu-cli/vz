@@ -87,6 +87,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             active_operation_id: None,
             bindings: vec![],
             machines: vec![MachineInstance {
+                docker_context: None,
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 machine_id: machine_id.clone(),
                 environment_id: environment_id.clone(),

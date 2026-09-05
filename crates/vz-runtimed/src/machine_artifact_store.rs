@@ -16,7 +16,9 @@ use rustix::fs::{
 };
 use sha2::{Digest, Sha256};
 use thiserror::Error;
-use vz_linux::verify_kernel_bundle_read_only;
+use vz_linux::{
+    DEVELOPER_PROBE_ARCHIVE, KernelVersion, VerifiedDeveloperProbe, verify_kernel_bundle_read_only,
+};
 use vz_runtime_contract::{HostSpec, LifecycleOperationId, MachineSpec};
 
 use crate::machine_runtime_registry::{MachineRuntimeRegistryError, MachineRuntimeStoreLease};
@@ -68,6 +70,7 @@ pub struct PinnedMachineArtifacts {
     configuration: ResolvedMachineConfiguration,
     directory: File,
     bundle: File,
+    developer_probe: Option<VerifiedDeveloperProbe>,
 }
 
 impl PinnedMachineArtifacts {
@@ -85,6 +88,12 @@ impl PinnedMachineArtifacts {
             directory: self.bundle_dir(),
             artifact_identity: self.configuration.artifact.clone(),
         }
+    }
+    /// Exact digest-bound archive copied into this Machine's retained pin.
+    /// Legacy and Hardened pins return None; callers must not fall back to an
+    /// arbitrary host file, mutable image, or another Machine's probe input.
+    pub fn developer_probe(&self) -> Option<&VerifiedDeveloperProbe> {
+        self.developer_probe.as_ref()
     }
     pub fn validate_current(&self) -> Result<(), MachineArtifactStoreError> {
         self.store.validate_current()?;
@@ -206,8 +215,9 @@ fn copy_pin(
     // Inspect every source before creating a pending destination. Copies are
     // hashed again and the completed destination is independently verified.
     let source_dir = open_absolute_dir(source)?;
+    let declared = declared_artifacts(configuration, &source_dir)?;
     let mut sources = Vec::new();
-    for name in FILES {
+    for (name, expected) in declared {
         let file = File::from(openat(&source_dir, name, FILE_FLAGS, Mode::empty())?);
         let metadata = file.metadata()?;
         use std::os::unix::fs::MetadataExt;
@@ -216,12 +226,14 @@ fn copy_pin(
             || metadata.len() == 0
             || metadata.len() > MAX_ARTIFACT
             || (name == "version.json" && metadata.len() > 64 * 1024)
+            || (name == DEVELOPER_PROBE_ARCHIVE
+                && metadata.len() > vz_linux::MAX_DEVELOPER_PROBE_BYTES)
         {
             return Err(conflict(
                 "source must be a bounded nonempty single-link regular artifact",
             ));
         }
-        sources.push((name, file, metadata.len()));
+        sources.push((name, file, metadata.len(), expected));
     }
     let pending = format!(".pending-linux-target-{}", LifecycleOperationId::generate());
     mkdirat(
@@ -248,7 +260,7 @@ fn copy_pin(
         .bundle
         .as_ref()
         .ok_or_else(|| conflict("missing staging bundle"))?;
-    for (name, mut input, size) in sources {
+    for (name, mut input, size, expected) in sources {
         let mut output = create_file(bundle, name)?;
         let mut hasher = Sha256::new();
         let mut bytes = [0_u8; 64 * 1024];
@@ -267,9 +279,7 @@ fn copy_pin(
             output.write_all(&bytes[..count])?;
             hasher.update(&bytes[..count]);
         }
-        if copied != size
-            || format!("{:x}", hasher.finalize()) != expected_hash(configuration, name)
-        {
+        if copied != size || format!("{:x}", hasher.finalize()) != expected {
             return Err(conflict(
                 "copied source does not match the resolved artifact identity",
             ));
@@ -281,6 +291,7 @@ fn copy_pin(
             "vmlinux" => "vmlinux_synced",
             "initramfs.img" => "initramfs_synced",
             "youki" => "youki_synced",
+            DEVELOPER_PROBE_ARCHIVE => "developer_probe_synced",
             _ => "version_synced",
         });
     }
@@ -325,7 +336,6 @@ async fn load_inner(
     validate_directory(&directory, 0o700)?;
     let bundle = open_dir(&directory, BUNDLE, 0o500)?;
     exact_inventory(&directory, &[CONFIG, BUNDLE])?;
-    exact_inventory(&bundle, &FILES)?;
     let file = readonly_file(&directory, CONFIG)?;
     if file.metadata()?.len() > MAX_CONFIG {
         return Err(conflict("pin configuration exceeds size bound"));
@@ -351,7 +361,10 @@ async fn load_inner(
             "persisted pin configuration differs from owner manifest",
         ));
     }
-    for name in FILES {
+    let declared = declared_artifacts(&configuration, &bundle)?;
+    let inventory: Vec<_> = declared.iter().map(|(name, _)| *name).collect();
+    exact_inventory(&bundle, &inventory)?;
+    for (name, _) in declared {
         readonly_file(&bundle, name)?;
     }
     let verified = verify_kernel_bundle_read_only(
@@ -368,6 +381,7 @@ async fn load_inner(
         configuration,
         directory,
         bundle,
+        developer_probe: verified.developer_probe,
     };
     pin.validate_current()?;
     Ok(pin)
@@ -383,6 +397,59 @@ fn expected_hash<'a>(configuration: &'a ResolvedMachineConfiguration, name: &str
         "youki" => &configuration.artifact.youki_sha256,
         _ => &configuration.artifact.version_sha256,
     }
+}
+
+/// An extra file is admitted only by the version bytes already authenticated
+/// in this exact resolved configuration. Never choose files from an unverified
+/// source manifest or let its archive field redirect the owner-scoped copy.
+fn declared_artifacts(
+    configuration: &ResolvedMachineConfiguration,
+    directory: &File,
+) -> Result<Vec<(&'static str, String)>, MachineArtifactStoreError> {
+    let version = File::from(openat(
+        directory,
+        "version.json",
+        FILE_FLAGS,
+        Mode::empty(),
+    )?);
+    use std::os::unix::fs::MetadataExt;
+    let metadata = version.metadata()?;
+    if !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() == 0
+        || metadata.len() > 64 * 1024
+    {
+        return Err(conflict(
+            "bounded single-link version metadata required before artifact selection",
+        ));
+    }
+    let mut bytes = Vec::new();
+    version.take(64 * 1024 + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 != metadata.len()
+        || format!("{:x}", Sha256::digest(&bytes)) != configuration.artifact.version_sha256
+    {
+        return Err(conflict(
+            "version metadata differs from the exact resolved identity",
+        ));
+    }
+    let version: KernelVersion =
+        serde_json::from_slice(&bytes).map_err(|error| conflict(error.to_string()))?;
+    let mut files: Vec<_> = FILES
+        .into_iter()
+        .map(|name| (name, expected_hash(configuration, name).to_owned()))
+        .collect();
+    if let Some(probe) = version.developer_probe {
+        probe
+            .validate()
+            .map_err(|error| conflict(error.to_string()))?;
+        if configuration.kernel_profile != vz_linux::KernelProfile::Developer {
+            return Err(conflict(
+                "Hardened Machine cannot acquire a Developer startup probe",
+            ));
+        }
+        files.push((DEVELOPER_PROBE_ARCHIVE, probe.sha256));
+    }
+    Ok(files)
 }
 fn open_dir_raw(parent: &File, name: &str) -> Result<File, MachineArtifactStoreError> {
     Ok(File::from(openat(parent, name, DIR_FLAGS, Mode::empty())?))
@@ -513,6 +580,7 @@ impl Drop for PendingPin {
             for name in FILES {
                 let _ = unlinkat(bundle, name, AtFlags::empty());
             }
+            let _ = unlinkat(bundle, DEVELOPER_PROBE_ARCHIVE, AtFlags::empty());
             let _ = unlinkat(&self.directory, BUNDLE, AtFlags::REMOVEDIR);
         }
         let _ = unlinkat(&self.directory, CONFIG, AtFlags::empty());

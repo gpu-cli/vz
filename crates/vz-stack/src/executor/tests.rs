@@ -177,6 +177,7 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
     };
     let definition_digest = definition.digest().unwrap();
     let machine = MachineInstance {
+        docker_context: None,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         machine_id: machine_id.clone(),
         environment_id: environment_id.clone(),

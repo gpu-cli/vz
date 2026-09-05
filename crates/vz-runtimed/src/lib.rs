@@ -11,9 +11,19 @@ pub mod environment_up;
 mod execution_sessions;
 mod grpc;
 #[cfg(target_os = "macos")]
+pub mod installed_machine_catalog;
+#[cfg(target_os = "macos")]
 pub mod machine_artifact_store;
 #[cfg(target_os = "macos")]
+pub mod machine_docker_context;
+#[cfg(target_os = "macos")]
 pub mod machine_docker_endpoint;
+#[cfg(target_os = "macos")]
+pub mod machine_docker_host;
+#[cfg(target_os = "macos")]
+pub mod machine_docker_operational_probe;
+#[cfg(target_os = "macos")]
+pub mod machine_docker_runtime_inventory;
 #[cfg(target_os = "macos")]
 pub mod machine_exec;
 #[cfg(target_os = "macos")]

@@ -103,12 +103,15 @@ Environment topology is part of the 0.4 goal, not a completed CLI capability.
 The implemented topology CLI currently exposes:
 
 - `vz up`: streamed whole-Environment admission and retained Linux-on-macOS
-  startup, using an explicitly configured verified artifact catalog. Developer
-  boots retain private Engine endpoints but fail readiness until full host
-  Docker/Compose/buildx and managed-context evidence exists; they are not Ready.
+  startup, discovering a verified installed artifact catalog or using an exact
+  operator override. Developer readiness requires measured host Engine, Compose
+  and buildx operations through each Machine's managed context and digest-bound
+  offline probe. This DEV path does not certify full Docker compatibility; see
+  [startup readiness](docs/developer-startup-readiness.md).
 - `vz status`: read-only persisted Project/Environment/Machine state, definition
-  drift, and recorded capabilities. It does not turn persisted data into a live
-  health probe or infer Docker readiness from a Developer profile.
+  drift, recorded capabilities and Machine-specific Docker contexts. It does not
+  turn persisted data into a live health probe or infer Docker readiness from a
+  Developer profile.
 - `vz exec`: streamed execution in an already Ready, exactly owned Linux Machine
   through the Linux-on-macOS DEV adapter. Automatic startup/dependency
   reconciliation and native-target execution are still unfinished.

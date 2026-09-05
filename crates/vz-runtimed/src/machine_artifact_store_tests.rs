@@ -39,13 +39,17 @@ struct Fixture {
 
 impl Fixture {
     async fn new(profile: MachineProfile) -> Self {
+        Self::with_probe(profile, false).await
+    }
+
+    async fn with_probe(profile: MachineProfile, probe: bool) -> Self {
         let temp = TempDir::new().expect("temporary artifact store");
         let root = temp
             .path()
             .canonicalize()
             .expect("canonical temporary root");
         let source = root.join("catalog-bundle");
-        let entry = write_catalog_bundle(&source, profile).await;
+        let entry = write_catalog_bundle(&source, profile, probe).await;
         let host = HostSpec {
             os: OperatingSystem::Macos,
             arch: Architecture::Aarch64,
@@ -174,7 +178,11 @@ impl Drop for Fixture {
     }
 }
 
-async fn write_catalog_bundle(root: &Path, profile: MachineProfile) -> LinuxTargetCatalogEntry {
+async fn write_catalog_bundle(
+    root: &Path,
+    profile: MachineProfile,
+    probe: bool,
+) -> LinuxTargetCatalogEntry {
     fs::create_dir_all(root).expect("bundle directory");
     let kernel_profile = match profile {
         MachineProfile::Developer => KernelProfile::Developer,
@@ -184,7 +192,7 @@ async fn write_catalog_bundle(root: &Path, profile: MachineProfile) -> LinuxTarg
         fs::write(root.join(name), name.as_bytes()).expect("artifact");
     }
     let hash = |value: &str| format!("{:x}", Sha256::digest(value.as_bytes()));
-    let metadata = json!({
+    let mut metadata = json!({
         "kernel": "test-kernel",
         "busybox": "test-busybox",
         "agent": env!("CARGO_PKG_VERSION"),
@@ -197,6 +205,17 @@ async fn write_catalog_bundle(root: &Path, profile: MachineProfile) -> LinuxTarg
         "sha256_initramfs": hash("initramfs.img"),
         "sha256_youki": hash("youki"),
     });
+    if probe {
+        fs::write(root.join(DEVELOPER_PROBE_ARCHIVE), b"probe-rootfs").unwrap();
+        metadata["busybox"] = "1.37.0".into();
+        metadata["developer_probe"] = json!({
+            "schema_version": 1, "archive": DEVELOPER_PROBE_ARCHIVE,
+            "sha256": hash("probe-rootfs"), "busybox_sha256": "a".repeat(64),
+            "busybox_version": "1.37.0", "source_archive_sha256": "b".repeat(64),
+            "source_inventory_sha256": "c".repeat(64), "build_provenance_sha256": "d".repeat(64),
+            "marker_sha256": format!("{:x}", Sha256::digest(vz_linux::DEVELOPER_PROBE_MARKER))
+        });
+    }
     fs::write(
         root.join("version.json"),
         serde_json::to_vec(&metadata).expect("version metadata"),
@@ -213,6 +232,63 @@ async fn write_catalog_bundle(root: &Path, profile: MachineProfile) -> LinuxTarg
         digest: verified.artifact_identity.digest,
         channels: BTreeSet::from(["test".into()]),
     }
+}
+
+#[tokio::test]
+async fn developer_probe_pin_copies_verified_archive_and_recovers_without_source() {
+    let mut fixture = Fixture::with_probe(MachineProfile::Developer, true).await;
+    let pin = pin_machine_artifacts(fixture.store(), &fixture.target)
+        .await
+        .unwrap();
+    let probe = pin.developer_probe().unwrap();
+    assert_eq!(
+        probe.archive,
+        pin.bundle_dir().join(DEVELOPER_PROBE_ARCHIVE)
+    );
+    assert_eq!(fs::read(&probe.archive).unwrap(), b"probe-rootfs");
+    assert_eq!(
+        fs::metadata(&probe.archive).unwrap().permissions().mode() & 0o777,
+        0o400
+    );
+    let metadata = probe.metadata.clone();
+    fs::remove_file(fixture.source().join(DEVELOPER_PROBE_ARCHIVE)).unwrap();
+    drop(pin);
+    let store = fixture.reopen_store();
+    let recovered = load_machine_artifacts(store, fixture.host, &fixture.machine)
+        .await
+        .unwrap();
+    assert_eq!(recovered.developer_probe().unwrap().metadata, metadata);
+}
+
+#[tokio::test]
+async fn developer_probe_pin_rejects_changed_source_and_recovery_archive() {
+    let fixture = Fixture::with_probe(MachineProfile::Developer, true).await;
+    fs::write(
+        fixture.source().join(DEVELOPER_PROBE_ARCHIVE),
+        b"changed-source",
+    )
+    .unwrap();
+    assert!(
+        pin_machine_artifacts(fixture.store(), &fixture.target)
+            .await
+            .is_err()
+    );
+    assert!(!fixture.pin_path().exists());
+
+    let fixture = Fixture::with_probe(MachineProfile::Developer, true).await;
+    let pin = pin_machine_artifacts(fixture.store(), &fixture.target)
+        .await
+        .unwrap();
+    let archive = pin.developer_probe().unwrap().archive.clone();
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o600)).unwrap();
+    fs::write(&archive, b"changed-pinned-content").unwrap();
+    fs::set_permissions(&archive, fs::Permissions::from_mode(0o400)).unwrap();
+    drop(pin);
+    assert!(
+        load_machine_artifacts(fixture.store(), fixture.host, &fixture.machine)
+            .await
+            .is_err()
+    );
 }
 
 fn make_tree_owner_writable(path: &Path) {

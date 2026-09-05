@@ -278,14 +278,21 @@ jobs:
           jq -e '
             .profile == "developer" and
             .security_profile == "developer-nested-virt" and
+            .developer_probe.schema_version == 1 and
+            .developer_probe.archive == "developer-probe-rootfs.tar" and
+            (.developer_probe.sha256 | test("^[0-9a-f]{64}$")) and
+            .developer_probe.busybox_version == .busybox and
             ((.capabilities // []) | index("user_ns")) and
             ((.capabilities // []) | index("nested_virt")) and
             ((.capabilities // []) | index("tun"))
           ' linux/out/version.json >/dev/null
+          probe_sha="$(jq -er '.developer_probe.sha256' linux/out/version.json)"
+          test "$probe_sha" = "$(sha256sum linux/out/developer-probe-rootfs.tar | cut -d' ' -f1)"
 
           jq -e '
             .profile == "container" and
             .security_profile == "container-hardened" and
+            .developer_probe == null and
             (((.capabilities // []) | index("user_ns")) == null) and
             ((.capabilities // []) | index("nfsd")) and
             ((.capabilities // []) | index("container_sandbox"))
@@ -298,6 +305,7 @@ jobs:
           path: |
             linux/out/vmlinux.build.json
             linux/out/busybox.build.json
+            linux/out/developer-probe.json
             linux/out/container/vmlinux.build.json
             linux/out/container/busybox.build.json
           if-no-files-found: error
@@ -314,13 +322,13 @@ jobs:
           # so existing installers continue to work.
           tar czf "dist/vz-linux-v${VERSION}-arm64.tar.gz" \
             -C linux/out \
-            vmlinux initramfs.img youki version.json
+            vmlinux initramfs.img youki version.json developer-probe-rootfs.tar
 
           sha256sum "dist/vz-linux-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-v${VERSION}-arm64.tar.gz.sha256"
 
           tar czf "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz" \
             -C linux/out \
-            vmlinux initramfs.img youki version.json
+            vmlinux initramfs.img youki version.json developer-probe-rootfs.tar
 
           sha256sum "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz" > "dist/vz-linux-developer-v${VERSION}-arm64.tar.gz.sha256"
 

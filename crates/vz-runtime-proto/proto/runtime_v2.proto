@@ -242,6 +242,20 @@ message MachineRuntimeIdentity {
   string opaque_id = 2;
 }
 
+// Exact-owner host client selection; presence does not imply live readiness.
+message MachineDockerContextDescriptor {
+  uint32 schema_version = 1;
+  string project_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string name = 5;
+  string endpoint = 6;
+  string config_dir = 7;
+  string engine_id = 8;
+  string incarnation_id = 9;
+  uint64 incarnation_generation = 10;
+}
+
 // Backend result atomically published by a successful Machine Up step.
 message MachineActivationEvidence {
   uint32 schema_version = 1;
@@ -251,6 +265,7 @@ message MachineActivationEvidence {
   CapabilitySet negotiated_capabilities = 4;
   MachineRuntimeIdentity runtime_identity = 5;
   MachineIncarnation incarnation = 6;
+  optional MachineDockerContextDescriptor docker_context = 7;
 }
 
 message MachineInstance {
@@ -271,6 +286,7 @@ message MachineInstance {
   MachineProfile profile = 14;
   // Absent on historical instances persisted before exact runtime identity.
   optional MachineRuntimeIdentity runtime_identity = 15;
+  optional MachineDockerContextDescriptor docker_context = 16;
 }
 
 message NetworkInstance {

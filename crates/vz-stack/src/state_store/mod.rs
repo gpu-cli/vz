@@ -29,6 +29,8 @@ use crate::reconcile::Action;
 
 mod environment_up;
 pub mod machine_boot_non_dispatch;
+#[cfg(test)]
+mod machine_docker_context_tests;
 mod machine_execution;
 mod stack_journal;
 pub use stack_journal::{
