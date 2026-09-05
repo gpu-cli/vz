@@ -361,7 +361,53 @@ offline driver validators passed. Strict all-target Clippy remains red on
 pre-existing contract-test lints tracked in `vz-1ff`.
 
 These are scoped DEV passes, not full Docker compatibility or 0.4 certification.
-`vz-mzs.3.1.3` stays open: physical observer-disconnect and crash/ack-loss tests,
-foreign path/context replacement scenarios, other ownership adapters and the
-applicable aggregate Environment gate still require evidence. Native macOS
-and future host/target combinations need their own conformance runs.
+`vz-mzs.3.1.3` stays open: physical crash/ack-loss tests, foreign path/context
+replacement scenarios, other ownership adapters and the applicable aggregate
+Environment gate still require evidence. Observer disconnect is covered by the
+subsequent checkpoint below. Native macOS and future host/target combinations
+need their own conformance runs.
+
+### Delete observer-disconnect checkpoint (2026-09-05, DEV)
+
+The [separate installed disconnect driver](../../scripts/helpers/installed_delete_disconnect_e2e.md)
+passed its first local-Mac candidate at
+`.artifacts/installed-delete-disconnect-candidate-1/`. It used the same signed
+CLI/daemon and guest artifacts as the preceding Delete wave; this checkpoint
+adds harness/evidence coverage, not a runtime binary change. Forty offline
+Delete/reader/quiescence tests passed before the physical run.
+
+Normal public Up created two named Environments with two Developer Linux
+Machines each. The harness observed the primary's admitted Delete, sent SIGTERM
+only to its exact unreaped CLI child (PID 41905), and observed exit -15. A fresh
+read-only live-WAL transaction started after reap still found that exact
+operation Running with its Environment Deleting and its original active
+generation. Five subsequent read-only samples reached the exact completed
+tombstone; its positive record was fsynced before any replay. The sole replay
+returned that already-completed operation, not newly initiated cleanup.
+
+Both Environments were positively deleted, all four private Machine stores,
+contexts and endpoint sockets were removed, and exact original-runtime
+quiescence receipts were validated. Four background neighbor samples (two per
+Machine), plus explicit bracketing probes, passed; this remains sampled
+liveness/non-restart, not continuous availability. Host project/worktree bytes
+and Docker defaults survived, the exact daemon shut down gracefully, and there
+were zero test-case retries, unresolved requests or cleanup errors.
+
+Result SHA256:
+`9a9b7fb303ff1f92fe4b792792a40d781ae33cc8645cf7028447484036985bb3`.
+Evidence manifest SHA256:
+`a72adc3514e2d25332066be47e09c1331c09f4b520cc0151b9f49542028d41df`.
+Independent audit verified all 901 evidence hashes, 119 ordinary command
+receipts, the separately captured interrupted observer, four deletion proofs
+and both persisted tombstones. Autonomous success was observed 436 ms after
+observer reap and 80 ms before replay dispatch. Each neighbor had a successful
+background observation overlapping that interval.
+Host fixture, database and outside-store journals remain at
+`/private/tmp/vzdev-w8krvyvo`; the daily installation remains unchanged.
+
+This proves observer-disconnect continuation only. Daemon/adapter crash recovery
+(`vz-ehz`), physical acknowledgement-loss and adversarial replacement cases,
+mixed-target topology, full Docker compatibility and aggregate release
+certification remain open. In particular, a stale control socket or missing
+live-session handle is still not authoritative permission to recover/delete a
+Machine.
