@@ -1831,6 +1831,21 @@ impl StateStore {
         Ok(Some(state))
     }
 
+    /// Load one complete Project aggregate from a single deferred read snapshot.
+    ///
+    /// Unlike [`Self::load_project_state`], this entry point owns its transaction
+    /// boundary so separate SQLite writers cannot commit between the aggregate's
+    /// definition and Environment reads.
+    pub fn load_project_state_snapshot(
+        &self,
+        project_id: &str,
+    ) -> Result<Option<ProjectState>, StackError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let state = self.load_project_state(project_id)?;
+        transaction.commit()?;
+        Ok(state)
+    }
+
     /// List all complete Project aggregates in stable ID order.
     pub fn list_project_states(&self) -> Result<Vec<ProjectState>, StackError> {
         let mut stmt = self

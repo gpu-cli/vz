@@ -201,6 +201,166 @@ fn seed_stack_topology(
     })
 }
 
+fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contract::ProjectState {
+    use vz_runtime_contract::{
+        Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
+        EnvironmentState, MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId,
+        MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState,
+        OperatingSystem, OwnedResourceKind, OwnershipRecord, ProjectDefinition, ProjectId,
+        TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    };
+
+    let project_id = ProjectId::new("prj_status_roundtrip").expect("valid project id");
+    let target = TargetSpec {
+        os: OperatingSystem::Linux,
+        arch: Architecture::Aarch64,
+        image: "ubuntu:24.04".to_string(),
+        version: Some("24.04".to_string()),
+        channel: Some("lts".to_string()),
+        digest: Some("sha256:status-roundtrip".to_string()),
+    };
+    let capabilities = CapabilitySet::new([
+        MachineCapability::PosixExec,
+        MachineCapability::DockerEngine,
+        MachineCapability::Compose,
+        MachineCapability::Buildx,
+    ]);
+    let definition = ProjectDefinition {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        project_id: project_id.clone(),
+        name: "status-roundtrip".to_string(),
+        environment: EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![MachineSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources {
+                    cpus: Some(4),
+                    memory_mb: Some(8192),
+                    disk_bytes: Some(64 * 1024 * 1024 * 1024),
+                },
+                requested_capabilities: capabilities.clone(),
+                workspace: None,
+            }],
+            networks: Vec::new(),
+            endpoints: Vec::new(),
+        },
+    };
+    let definition_digest = definition.digest().expect("definition digest");
+    let environment = |environment_id: &str,
+                       environment_name: &str,
+                       machine_id: &str,
+                       incarnation_id: &str,
+                       timestamp: u64| {
+        let environment_id = EnvironmentId::new(environment_id).expect("valid environment id");
+        let machine_id = MachineId::new(machine_id).expect("valid machine id");
+        let incarnation_id =
+            MachineIncarnationId::new(incarnation_id).expect("valid incarnation id");
+        EnvironmentInstance {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environment_id: environment_id.clone(),
+            project_id: project_id.clone(),
+            name: environment_name.to_string(),
+            definition_digest: definition_digest.clone(),
+            state: EnvironmentState::Ready,
+            lifecycle_generation: 3,
+            active_operation_id: None,
+            bindings: Vec::new(),
+            machines: vec![MachineInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machine_id: machine_id.clone(),
+                environment_id: environment_id.clone(),
+                name: "linux".to_string(),
+                profile: MachineProfile::Developer,
+                target: target.clone(),
+                resources: MachineResources {
+                    cpus: Some(4),
+                    memory_mb: Some(8192),
+                    disk_bytes: Some(64 * 1024 * 1024 * 1024),
+                },
+                requested_capabilities: capabilities.clone(),
+                negotiated_capabilities: capabilities.clone(),
+                backend: None,
+                incarnation: Some(MachineIncarnation {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    incarnation_id: incarnation_id.clone(),
+                    machine_id: machine_id.clone(),
+                    generation: 3,
+                    created_at: timestamp,
+                }),
+                state: MachineState::Ready,
+                legacy_sandbox_id: None,
+            }],
+            networks: Vec::new(),
+            endpoints: Vec::new(),
+            ownership: vec![
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Machine,
+                    resource_id: machine_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::Incarnation,
+                    resource_id: incarnation_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(machine_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::DockerContext,
+                    resource_id: format!("docker-{environment_name}"),
+                    environment_id,
+                    machine_id: Some(machine_id),
+                },
+            ],
+            legacy_migration: None,
+            created_at: timestamp,
+            updated_at: timestamp,
+        }
+    };
+    let state = vz_runtime_contract::ProjectState {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        definition,
+        environments: vec![
+            environment(
+                "env_status_alpha",
+                "alpha",
+                "mch_status_alpha",
+                "inc_status_alpha",
+                101,
+            ),
+            environment(
+                "env_status_beta",
+                "beta",
+                "mch_status_beta",
+                "inc_status_beta",
+                202,
+            ),
+        ],
+    };
+
+    std::fs::create_dir_all(
+        config
+            .state_store_path
+            .parent()
+            .expect("state store path has a parent"),
+    )
+    .expect("create state store directory");
+    let store = vz_stack::StateStore::open(&config.state_store_path).expect("open state store");
+    store
+        .save_project_state(&state)
+        .expect("seed multi-Environment topology");
+    store
+        .load_project_state_snapshot(state.definition.project_id.as_str())
+        .expect("load canonical seeded topology")
+        .expect("seeded topology must exist")
+}
+
 fn required_sandbox_labels(tmp: &tempfile::TempDir) -> HashMap<String, String> {
     HashMap::from([("project_dir".to_string(), tmp.path().display().to_string())])
 }
@@ -359,6 +519,123 @@ async fn explicit_socket_path_override_connects_successfully() {
     assert!(!client.handshake().daemon_id.is_empty());
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn get_project_state_round_trips_exact_multi_environment_snapshot_without_mutation() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon_config = runtimed_config(&tmp);
+    let expected = seed_multi_environment_topology(&daemon_config);
+    let daemon = start_daemon(daemon_config.clone()).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    let snapshot = client
+        .get_project_state(runtime_v2::GetProjectStateRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-project-status".to_string(),
+                idempotency_key: String::new(),
+                trace_id: "trace-project-status".to_string(),
+            }),
+            project_id: expected.definition.project_id.to_string(),
+        })
+        .await
+        .expect("get exact Project topology");
+
+    assert_eq!(snapshot.request_id, "req-project-status");
+    assert_eq!(snapshot.project, expected);
+    assert_eq!(snapshot.project.environments.len(), 2);
+    assert_eq!(snapshot.project.environments[0].name, "alpha");
+    assert_eq!(snapshot.project.environments[1].name, "beta");
+
+    daemon.stop().await;
+    let store = vz_stack::StateStore::open(&daemon_config.state_store_path)
+        .expect("reopen state store after read-only RPC");
+    assert_eq!(
+        store
+            .load_project_state_snapshot(expected.definition.project_id.as_str())
+            .expect("reload Project snapshot"),
+        Some(expected)
+    );
+    assert!(
+        store
+            .list_receipts()
+            .expect("list receipts")
+            .iter()
+            .all(|receipt| receipt.entity_type == "maintenance"),
+        "read-only topology lookup must not create non-maintenance receipts"
+    );
+    assert!(store.list_sandboxes().expect("list sandboxes").is_empty());
+    assert!(store.list_containers().expect("list containers").is_empty());
+    assert!(store.list_executions().expect("list executions").is_empty());
+}
+
+#[tokio::test]
+async fn get_project_state_rejects_invalid_id_and_reports_missing_project_over_uds() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon_config = runtimed_config(&tmp);
+    let expected = seed_multi_environment_topology(&daemon_config);
+    let daemon = start_daemon(daemon_config.clone()).await;
+    let mut typed_client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("typed client connect");
+
+    let channel = connect_channel(&daemon_config.socket_path, Duration::from_millis(300))
+        .await
+        .expect("connect raw topology channel");
+    let mut raw_client = runtime_v2::topology_service_client::TopologyServiceClient::new(channel);
+    let invalid = raw_client
+        .get_project_state(runtime_v2::GetProjectStateRequest {
+            metadata: None,
+            project_id: "not valid/id".to_string(),
+        })
+        .await
+        .expect_err("daemon must reject malformed Project identity");
+    assert_eq!(invalid.code(), Code::InvalidArgument);
+
+    let missing = raw_client
+        .get_project_state(runtime_v2::GetProjectStateRequest {
+            metadata: Some(runtime_v2::RequestMetadata {
+                request_id: "req-project-missing".to_string(),
+                ..Default::default()
+            }),
+            project_id: "prj_missing".to_string(),
+        })
+        .await
+        .expect_err("daemon must report missing Project identity");
+    assert_eq!(missing.code(), Code::NotFound);
+    assert!(missing.message().contains("req-project-missing"));
+
+    daemon.stop().await;
+    let locally_rejected = typed_client
+        .get_project_state(runtime_v2::GetProjectStateRequest {
+            metadata: None,
+            project_id: "not valid/id".to_string(),
+        })
+        .await
+        .expect_err("client must reject malformed identity before using the stopped transport");
+    assert_grpc_status_in(locally_rejected, &[Code::InvalidArgument]);
+
+    let store = vz_stack::StateStore::open(&daemon_config.state_store_path)
+        .expect("reopen state store after rejected reads");
+    assert_eq!(
+        store
+            .load_project_state_snapshot(expected.definition.project_id.as_str())
+            .expect("reload Project snapshot"),
+        Some(expected)
+    );
+    assert!(
+        store
+            .list_receipts()
+            .expect("list receipts")
+            .iter()
+            .all(|receipt| receipt.entity_type == "maintenance"),
+        "rejected topology lookups must not create non-maintenance receipts"
+    );
+    assert!(store.list_sandboxes().expect("list sandboxes").is_empty());
+    assert!(store.list_containers().expect("list containers").is_empty());
+    assert!(store.list_executions().expect("list executions").is_empty());
 }
 
 #[tokio::test]

@@ -248,6 +248,40 @@ async fn connect_daemon_grpc_for_state_db(state_db: &Path) -> anyhow::Result<Dae
         })
 }
 
+/// Connect to an already-running daemon without creating runtime state.
+///
+/// Read-only Developer Environment commands use this path so observing status
+/// cannot spawn a daemon, create its runtime directory, or wait through the
+/// normal cold-start retry budget.
+pub(crate) async fn connect_existing_daemon_for_state_db(
+    state_db: &Path,
+) -> anyhow::Result<DaemonClient> {
+    match configured_control_plane_transport()? {
+        ControlPlaneTransport::DaemonGrpc => {
+            let socket_override = parse_env_daemon_socket_override();
+            let runtime_data_dir_override = parse_env_runtime_data_dir_override();
+            let mut config = daemon_client_config_with_overrides(
+                state_db,
+                socket_override,
+                runtime_data_dir_override,
+                false,
+            );
+            config.startup_timeout = config.connect_timeout;
+            DaemonClient::connect_with_config(config)
+                .await
+                .with_context(|| {
+                    format!(
+                        "failed to connect to an existing vz-runtimed for state db {}",
+                        state_db.display()
+                    )
+                })
+        }
+        ControlPlaneTransport::ApiHttp => bail!(
+            "api-http transport cannot use direct daemon gRPC connector; route through runtime API HTTP client helpers"
+        ),
+    }
+}
+
 /// Connect to the configured runtime control-plane transport.
 pub(crate) async fn connect_control_plane_for_state_db(
     state_db: &Path,

@@ -64,7 +64,7 @@ impl IsolatedInvocation {
             .env("VZ_RUNTIME_STATE_DB", &self.state_db)
             .env("VZ_RUNTIME_DATA_DIR", &self.runtime_dir)
             .env("VZ_RUNTIME_DAEMON_SOCKET", &self.socket)
-            .env("VZ_RUNTIME_DAEMON_AUTOSTART", "0")
+            .env("VZ_RUNTIME_DAEMON_AUTOSTART", "1")
             .output()
             .unwrap()
     }

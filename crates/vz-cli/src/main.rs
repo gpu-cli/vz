@@ -173,6 +173,7 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(LEGACY_COMMAND_REMOVED_EXIT_CODE);
     }
     let cli = Cli::parse_from(args);
+    let json = cli.json;
     if let Some(transport) = cli.control_plane {
         commands::runtime_daemon::set_control_plane_transport(transport)?;
     }
@@ -271,7 +272,15 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::Run(args)) => commands::dev::cmd_run(args).await,
             #[cfg(target_os = "macos")]
             Some(Commands::Stop(args)) => commands::dev::cmd_stop(args).await,
-            Some(Commands::Status(args)) => commands::dev_status::cmd_dev_status(args).await,
+            Some(Commands::Status(args)) => {
+                match commands::dev_status::cmd_dev_status(args, json).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        eprintln!("{}", error.to_json());
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
             Some(Commands::Logs(args)) => commands::dev_logs::cmd_dev_logs(args).await,
 
             // Image management
@@ -359,6 +368,34 @@ mod tests {
     fn parse_ephemeral_sandbox() {
         let cli = Cli::try_parse_from(["vz", "--ephemeral"]).expect("parse");
         assert!(cli.ephemeral);
+    }
+
+    #[test]
+    fn parse_status_topology_selectors() {
+        let cli = Cli::try_parse_from(["vz", "status", "--environment", "dev", "--machine", "app"])
+            .expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Status(commands::dev_status::DevStatusArgs {
+                environment: Some(ref environment),
+                machine: Some(ref machine),
+                all: false,
+            })) if environment == "dev" && machine == "app"
+        ));
+    }
+
+    #[test]
+    fn parse_status_all_and_reject_mixed_selectors() {
+        let cli = Cli::try_parse_from(["vz", "status", "--all"]).expect("parse");
+        assert!(matches!(
+            cli.command,
+            Some(Commands::Status(commands::dev_status::DevStatusArgs {
+                all: true,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from(["vz", "status", "--all", "--environment", "dev"]).is_err());
+        assert!(Cli::try_parse_from(["vz", "status", "--all", "--machine", "app"]).is_err());
     }
 
     #[test]

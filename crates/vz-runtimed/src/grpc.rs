@@ -47,6 +47,7 @@ use handlers::linux_vm::LinuxVmServiceImpl;
 use handlers::receipt::ReceiptServiceImpl;
 use handlers::sandbox::SandboxServiceImpl;
 use handlers::stack::StackServiceImpl;
+use handlers::topology::TopologyServiceImpl;
 use observability::{GrpcMetricsLayer, GrpcObservability};
 use support::*;
 
@@ -498,6 +499,11 @@ where
         StackServiceImpl::new(daemon.clone()),
         request_metadata_interceptor,
     );
+    let topology_service =
+        runtime_v2::topology_service_server::TopologyServiceServer::with_interceptor(
+            TopologyServiceImpl::new(daemon.clone()),
+            request_metadata_interceptor,
+        );
 
     debug!(socket_path = %socket_path.display(), "starting runtime UDS gRPC server");
     let server_result = Server::builder()
@@ -514,6 +520,7 @@ where
         .add_service(event_service)
         .add_service(receipt_service)
         .add_service(stack_service)
+        .add_service(topology_service)
         .add_service(capability_service)
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;

@@ -25,7 +25,10 @@ mod linux_vm;
 mod sandbox;
 mod stack;
 mod stream_completion;
+mod topology;
 mod transport;
+
+pub use topology::ProjectStateSnapshot;
 
 #[cfg(test)]
 mod tests;
@@ -151,6 +154,7 @@ pub struct DaemonClient {
     stack_client: runtime_v2::stack_service_client::StackServiceClient<Channel>,
     file_client: runtime_v2::file_service_client::FileServiceClient<Channel>,
     capability_client: runtime_v2::capability_service_client::CapabilityServiceClient<Channel>,
+    topology_client: runtime_v2::topology_service_client::TopologyServiceClient<Channel>,
 }
 
 impl DaemonClient {
@@ -282,6 +286,8 @@ impl DaemonClient {
         let stack_client =
             runtime_v2::stack_service_client::StackServiceClient::new(channel.clone());
         let file_client = runtime_v2::file_service_client::FileServiceClient::new(channel.clone());
+        let topology_client =
+            runtime_v2::topology_service_client::TopologyServiceClient::new(channel.clone());
         let mut capability_client =
             runtime_v2::capability_service_client::CapabilityServiceClient::new(channel);
         let handshake = handshake_via_capabilities(config, &mut capability_client).await?;
@@ -302,6 +308,7 @@ impl DaemonClient {
             stack_client,
             file_client,
             capability_client,
+            topology_client,
         })
     }
 

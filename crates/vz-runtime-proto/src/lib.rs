@@ -196,6 +196,7 @@ mod tests {
             ("ChmodPath", RpcMode::Unary),
             ("ChownPath", RpcMode::Unary),
             ("GetCapabilities", RpcMode::Unary),
+            ("GetProjectState", RpcMode::Unary),
             ("ValidateLinuxVm", RpcMode::ServerStreaming),
             ("ListLinuxVmBases", RpcMode::Unary),
             ("GetLinuxVmBase", RpcMode::Unary),
@@ -232,6 +233,7 @@ mod tests {
         let _ = MachineWorkloadScope::default();
         let _ = StackRunContainerRequest::default();
         let _ = GetCapabilitiesRequest::default();
+        let _ = GetProjectStateRequest::default();
 
         // Verify response types.
         let _ = SandboxResponse::default();
@@ -251,6 +253,7 @@ mod tests {
         let _ = StackServiceActionResponse::default();
         let _ = StackRunContainerResponse::default();
         let _ = GetCapabilitiesResponse::default();
+        let _ = GetProjectStateResponse::default();
 
         // Verify payload types used in responses.
         let _ = SandboxPayload::default();
@@ -937,6 +940,14 @@ mod tests {
                     ("definition", 2),
                     ("environments", 3),
                 ],
+            ),
+            (
+                "GetProjectStateRequest",
+                &[("metadata", 1), ("project_id", 2)],
+            ),
+            (
+                "GetProjectStateResponse",
+                &[("request_id", 1), ("project", 2)],
             ),
             ("TopologyCandidate", &[("id", 1), ("name", 2)]),
             ("TopologyNotFoundDetail", &[("kind", 1), ("selector", 2)]),

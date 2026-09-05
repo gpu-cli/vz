@@ -1,6 +1,7 @@
 // Runtime V2 gRPC service definitions for the vz control plane.
 //
-// Nine service groups covering the full runtime API:
+// Runtime V2 service groups include:
+//   - TopologyService:   read-only Developer Environment topology lookup
 //   - SandboxService:    sandbox lifecycle (create, get, list, terminate)
 //   - LeaseService:      lease management (open, heartbeat, close)
 //   - ContainerService:  container lifecycle (create, get, list, remove)
@@ -425,6 +426,22 @@ message ProjectState {
   uint32 schema_version = 1;
   ProjectDefinition definition = 2;
   repeated EnvironmentInstance environments = 3;
+}
+
+// Read-only Developer Environment topology queries. Lifecycle mutations are
+// intentionally excluded until the daemon owns their backend execution path.
+service TopologyService {
+  rpc GetProjectState(GetProjectStateRequest) returns (GetProjectStateResponse);
+}
+
+message GetProjectStateRequest {
+  RequestMetadata metadata = 1;
+  string project_id = 2;
+}
+
+message GetProjectStateResponse {
+  string request_id = 1;
+  ProjectState project = 2;
 }
 
 message TopologyCandidate {

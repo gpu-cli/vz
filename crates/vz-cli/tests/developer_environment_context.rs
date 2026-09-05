@@ -7,7 +7,8 @@ use std::sync::{Arc, Barrier};
 
 use tempfile::TempDir;
 use vz_cli::developer_environment_context::{
-    ProcessTopologySelectors, VZ_ENVIRONMENT_ID, VZ_MACHINE_ID, discover_git_workspace,
+    ProcessTopologySelectors, VZ_ENVIRONMENT_ID, VZ_MACHINE_ID, discover_existing_git_workspace,
+    discover_git_workspace,
 };
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentSelectionContext, EnvironmentSelectionSource,
@@ -19,6 +20,64 @@ use vz_runtime_contract::{
 use vz_stack::{StackError, StateStore};
 
 const SELECTOR_PROBE: &str = "VZ_TEST_PROCESS_TOPOLOGY_SELECTORS";
+
+#[test]
+fn read_only_workspace_discovery_does_not_create_a_token() {
+    let fixture = GitFixture::new();
+    let metadata = fixture.repo.join(".git/vz");
+    assert!(!metadata.exists());
+    assert!(
+        discover_existing_git_workspace(&fixture.repo)
+            .unwrap()
+            .is_none()
+    );
+    assert!(!metadata.exists());
+}
+
+#[test]
+fn read_only_workspace_discovery_preserves_existing_token() {
+    let fixture = GitFixture::new();
+    let expected = discover_git_workspace(&fixture.repo).unwrap();
+    let token_path = expected.git_dir.join("vz/workspace-id");
+    let before = std::fs::metadata(&token_path).unwrap().modified().unwrap();
+    let token = std::fs::read(&token_path).unwrap();
+    assert_eq!(
+        discover_existing_git_workspace(&fixture.repo).unwrap(),
+        Some(expected)
+    );
+    assert_eq!(
+        std::fs::metadata(&token_path).unwrap().modified().unwrap(),
+        before
+    );
+    assert_eq!(std::fs::read(token_path).unwrap(), token);
+}
+
+#[test]
+fn read_only_workspace_discovery_rejects_corruption_without_replacing_it() {
+    let fixture = GitFixture::new();
+    let expected = discover_git_workspace(&fixture.repo).unwrap();
+    let token_path = expected.git_dir.join("vz/workspace-id");
+    std::fs::write(&token_path, "corrupt token").unwrap();
+    assert!(discover_existing_git_workspace(&fixture.repo).is_err());
+    assert_eq!(
+        std::fs::read_to_string(token_path).unwrap(),
+        "corrupt token"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn read_only_workspace_discovery_rejects_dangling_token_symlink() {
+    let fixture = GitFixture::new();
+    let metadata = fixture.repo.join(".git/vz");
+    std::fs::create_dir(&metadata).unwrap();
+    let token_path = metadata.join("workspace-id");
+    let missing = metadata.join("missing-token");
+    std::os::unix::fs::symlink(&missing, &token_path).unwrap();
+    assert!(discover_existing_git_workspace(&fixture.repo).is_err());
+    assert_eq!(std::fs::read_link(token_path).unwrap(), missing);
+    assert!(!missing.exists());
+}
 
 struct GitFixture {
     _temporary: TempDir,

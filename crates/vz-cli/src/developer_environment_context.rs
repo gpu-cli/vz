@@ -96,6 +96,42 @@ pub fn discover_git_workspace(cwd: &Path) -> Result<GitWorkspace> {
     })
 }
 
+/// Read an existing worktree binding token without creating or syncing files.
+///
+/// Read-only commands must not call `discover_git_workspace`: an unbound
+/// checkout is a selection input, not permission to create workspace metadata.
+/// A corrupt/unreadable token fails closed, rather than looking unbound.
+pub fn discover_existing_git_workspace(cwd: &Path) -> Result<Option<GitWorkspace>> {
+    let git_dir = git_path(cwd, "--git-dir")?;
+    let path_hint = git_path(cwd, "--show-toplevel")?;
+    let token_path = git_dir
+        .join(WORKSPACE_METADATA_DIRECTORY)
+        .join(WORKSPACE_ID_FILE);
+    let workspace_key = match read_workspace_key(&token_path) {
+        Ok(token) => token,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match fs::symlink_metadata(&token_path) {
+                Err(missing) if missing.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                _ => {
+                    return Err(error).with_context(|| {
+                        format!("failed to read workspace token {}", token_path.display())
+                    });
+                }
+            }
+        }
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("failed to read workspace token {}", token_path.display())
+            });
+        }
+    };
+    Ok(Some(GitWorkspace {
+        workspace_key,
+        git_dir,
+        path_hint,
+    }))
+}
+
 fn git_path(cwd: &Path, selector: &str) -> Result<PathBuf> {
     let output = Command::new("git")
         .arg("-C")

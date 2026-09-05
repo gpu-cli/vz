@@ -103,6 +103,22 @@ native Windows Machines complement it; they do not replace it. On macOS, Linux
 and native macOS Machines may participate in the same declared Environment
 topology.
 
+## Current 0.4 CLI development status
+
+`vz status` is the first public lifecycle verb wired to the topology model. It
+reads the nearest checked-in `vz.json` as a typed `ProjectDefinition`, connects
+only to an already-running runtime daemon, and reports a persisted Project,
+Environment, and Machine snapshot. JSON output distinguishes the host and
+daemon backend from each Machine target and reports desired-versus-persisted
+definition drift. It does not claim live Docker health or create a Docker
+context.
+
+The other four 0.4 lifecycle verbs and the final exactly-five-command surface
+are still in development. The currently shipped `vz init` remains a legacy 0.3
+authoring command and does not produce the topology `ProjectDefinition` required
+by the new status path; no mutating fallback is performed. The repository does
+not yet ship a stable schema/example authoring bundle.
+
 ## Quick start (current legacy macOS/Linux-target workflow)
 
 The commands below document the shipped 0.3 single-Linux-VM surface. They are
@@ -127,9 +143,6 @@ vz run cargo test
 # Open an interactive shell
 vz run -i bash
 
-# Check VM status
-vz status
-
 # Stop the VM when done
 vz stop
 ```
@@ -137,6 +150,9 @@ vz stop
 The first `vz run` boots the environment's Linux VM (~3s), pulls the base
 image, and runs setup commands from `vz.json`. Subsequent runs reuse that
 environment and skip setup when the setup hash is unchanged.
+
+This legacy sequence no longer includes `vz status`: that spelling now uses the
+0.4 topology-backed behavior described above.
 
 The intended Developer Environment UX will also start each declared Linux
 Machine's private Docker service and report its managed context. Until the Docker roadmap is
