@@ -159,13 +159,48 @@ containers have configured network names but empty Engine network/endpoint IDs;
 the ownership check rejected those unmaterialized attachments. The second and
 third Machine slices did not run, and no successful independent slice replay or
 Docker parity is claimed. All 9,319 original evidence checksums were independently
-verified. A narrowly guarded ownership-check correction is in progress.
+verified. The correction accepts only exact owned network names on proven
+never-started containers with no endpoint state or network membership; attached
+networks still require matching names and IDs. Driver and independent-validator
+adversarial regressions passed before the next candidate.
 
 Separate `.artifacts/linux-docker-compose-candidate-3-reconciliation/` receipts
 positively stopped the four exact Machines and gracefully shut down their
 fingerprinted daemon. Host and private Docker defaults were unchanged. Failed
 cleanup evidence, Docker resources and stopped Machine storage remain retained;
 this separate disposition does not turn the candidate into a passing run.
+
+### Passing installed Compose DEV checkpoint
+
+The fresh `.artifacts/linux-docker-compose-candidate-4/` run passed with zero
+test-case retries. Normal installed public Up booted four Developer Linux
+Machines across two named Environments in one worktree. Eight Compose recipes
+ran on each of three Machines, with 307 raw commands per slice independently
+replayed: create, health/dependency ordering, exact Exec streams/exit37, network
+paths and denials, host-written volume persistence, scaling, blocked unhealthy
+dependencies, and failure propagation. Each selected Machine independently
+pulled/inspected/executed the pinned HTTPS Python image and built its fixture
+through its own private embedded builder.
+
+Four continuously observed sentinels (350 observations each) retained Engine/container identities,
+zero restart counts and host-written marker bytes. Their observations cover
+each slice's sibling/neighbor interval; they are not network-service conformance.
+Owned Compose fixtures, sentinels and input images were removed, both public
+Environment Stops succeeded, all four endpoints became unavailable, and the
+fingerprinted daemon shut down gracefully. Daily and isolated Docker defaults
+remained unchanged. Stopped Machine disks, contexts and BuildKit cache remain
+for inspection: this is not Delete or a complete leak audit.
+
+All 27,190 evidence checksums and the three raw slice replays were independently
+verified after completion. Evidence anchors:
+
+- `result.json`: `de760ba1b73668540723cb10d5f8c803822114123d10b9031c1fc8848e23fef5`.
+- `checksums.sha256`: `2a972283f58f4337e13b73b17a267e9d8d3975083abbaec32568f02fd18b8ad2`.
+
+The signed artifacts are local DEV candidates, not a published/notarized 0.4
+release. The full 63-scenario Docker dispatcher, additional Buildx/interactive/
+image-roundtrip coverage, native macOS, public Delete and the three-phase mixed
+Environment release gate remain unfinished. No release-scenario PASS is emitted.
 
 ## Backend regression checkpoint
 
@@ -186,7 +221,8 @@ BuildKit3. All selected tests passed with none ignored; all required evidence
 flags were validated. `raw-evidence.sha256` additionally binds 107 raw logs,
 summaries and supporting files, independently verified after completion.
 This is the current backend regression checkpoint, not Docker63 or aggregate
-0.4 certification. The separate installed Compose candidate remains required.
+0.4 certification. The passing installed Compose DEV candidate above supplies
+separate host-client workload evidence, not the remaining full release gate.
 
 The required `scripts/run-sandbox-vm-e2e.sh --suite all --profile release` run
 passed at `.artifacts/sandbox-vm-e2e/20260905T183551Z/summary.txt`, with raw logs
