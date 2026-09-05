@@ -134,7 +134,7 @@ enum Commands {
     #[cfg(target_os = "macos")]
     Stop(commands::dev::DevStopArgs),
 
-    /// Show the current project's VM status.
+    /// Show the project's persisted Developer Environment topology.
     Status(commands::dev_status::DevStatusArgs),
 
     /// Show daemon logs for debugging.
