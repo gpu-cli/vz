@@ -278,6 +278,9 @@ pub struct EndpointSpec {
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentSpec {
     pub schema_version: u32,
+    /// Topology-local Machine name used only when no explicit/process selector exists.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_machine: Option<String>,
     pub machines: Vec<MachineSpec>,
     #[serde(default)]
     pub networks: Vec<NetworkSpec>,
@@ -1171,6 +1174,15 @@ impl EnvironmentSpec {
         }
         let machine_names =
             validate_unique_names("machine", self.machines.iter().map(|m| &m.name))?;
+        if let Some(name) = &self.default_machine {
+            validate_name("default_machine", name)?;
+            if !machine_names.contains(name.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "environment.default_machine".to_string(),
+                    value: name.clone(),
+                });
+            }
+        }
         let network_names =
             validate_unique_names("network", self.networks.iter().map(|n| &n.name))?;
         validate_unique_names("endpoint", self.endpoints.iter().map(|e| &e.name))?;
@@ -3838,6 +3850,7 @@ pub fn migrate_legacy_developer_sandbox(
     };
     let environment_spec = EnvironmentSpec {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
+        default_machine: None,
         machines: vec![machine_spec],
         networks: Vec::new(),
         endpoints: Vec::new(),
@@ -4137,6 +4150,7 @@ mod tests {
             name: "shop".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![
                     linux_spec("api"),
                     MachineSpec {
@@ -4175,6 +4189,35 @@ mod tests {
                     hostname: Some("api.shop.test".to_string()),
                 }],
             },
+        }
+    }
+
+    #[test]
+    fn default_machine_is_an_exact_declared_name_and_part_of_the_definition_digest() {
+        let mut definition = project_definition();
+        let original_digest = definition.digest().unwrap();
+        let original_json = serde_json::to_value(&definition).unwrap();
+        assert!(
+            original_json["environment"]
+                .get("default_machine")
+                .is_none()
+        );
+        let old: ProjectDefinition = serde_json::from_value(original_json).unwrap();
+        assert_eq!(old.environment.default_machine, None);
+        assert_eq!(old.digest().unwrap(), original_digest);
+        definition.environment.default_machine = Some("api".into());
+        definition.validate().unwrap();
+        assert_ne!(definition.digest().unwrap(), original_digest);
+        let state = ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            environments: vec![definition.instantiate_environment("one", 1).unwrap()],
+            definition: definition.clone(),
+        };
+        state.validate().unwrap();
+        for invalid in ["", " ", "missing", "API", "api "] {
+            definition.environment.default_machine = Some(invalid.into());
+            assert!(definition.validate().is_err(), "accepted {invalid:?}");
+            assert!(definition.instantiate_environment("invalid", 1).is_err());
         }
     }
 

@@ -27,12 +27,18 @@ findmnt -T "${VZ_TEST_BTRFS_WORKSPACE:-/mnt/vz-btrfs}"
 btrfs filesystem usage "${VZ_TEST_BTRFS_WORKSPACE:-/mnt/vz-btrfs}"
 ```
 
-For test evidence:
+The former `scripts/run-vz-linux-vm-e2e-hostboot.sh` test generator is
+[retired](../retired-cli-workflows.md), including its portability option. It
+cannot be used as a current recovery or evidence workflow.
 
-```bash
-VZ_BIN=/tmp/vz-target-e2e/debug/vz \
-scripts/run-vz-linux-vm-e2e-hostboot.sh --profile debug --run-btrfs-portability
-```
+For portability evidence, use the dedicated Linux btrfs tests described in
+[the backend guide](../sandbox-vm-e2e.md#linux-btrfs-portability-gate) against an
+already established, exactly owned Linux target and real btrfs workspace.
+Provisioning that target must not revive the retired VM CLI. If no supported
+typed target driver is available, leave this gate incomplete. The supported
+local-Mac sandbox command is
+`scripts/run-sandbox-vm-e2e.sh --profile release --suite all`; its success is not
+a substitute for the send/receive portability assertions below.
 
 ## Recovery Steps
 

@@ -9,9 +9,10 @@ Machines inside Developer Environment topologies on macOS, Linux, and Windows:
 | Linux | **DEV:** the partial `linux-native` OCI backend exists, but complete Developer Environment parity is not shipped | Native namespaces and cgroup v2 |
 | Windows | **PLANNED:** no shipped backend yet | Windows virtualization appropriate for a Linux guest |
 
-Native macOS Machines are also immediate on macOS; native Windows Machines come
-later. Native Machines do not inherit Docker: it is an implicit, private
-capability of each **Linux Machine** only.
+Native macOS Machine integration is also part of the immediate macOS roadmap;
+native Windows Machines come later. Native Machines do not inherit Docker: it
+is an implicit, private capability of each **Developer-profile Linux Machine**
+only, not a Hardened Machine.
 
 The sections below document the current experimental Linux-host backend. They
 are not a declaration of full cross-host or Docker compatibility.
@@ -63,16 +64,11 @@ OS:
 - macOS -> `macos-vz` (Virtualization.framework)
 - Linux -> `linux-native`
 
-Override with the `VZ_BACKEND` environment variable:
-
-```bash
-VZ_BACKEND=linux-native vz oci run alpine:latest -- echo ok
-VZ_BACKEND=macos-vz    vz oci run alpine:latest -- echo ok
-```
-
-Accepted values: `linux`, `linux-native`, `native`, `macos`, `macos-vz`, `vm`.
-This is an implementation control, not the intended Developer Environment UX;
-environment creation should eventually select the host backend automatically.
+`VZ_BACKEND` is an implementation/testing control for callers that actually
+construct that runtime backend. It does not add an OCI or VM command to the
+public CLI. The old `vz oci run` examples and infrastructure command workflows
+are not executable current onboarding. Use typed runtime APIs with explicit
+target/ownership checks; see [retired workflows](retired-cli-workflows.md).
 
 ## Capability Probes
 
@@ -100,7 +96,7 @@ supported fallback.
 
 | Feature | macOS host, Linux target (`macos-vz`) | Linux host, Linux target (`linux-native`) |
 | --- | --- | --- |
-| Status | Shipped environment workflow; Docker parity in progress | Experimental/partial |
+| Status | ACTIVE backend primitives; unified lifecycle and Docker parity are DEV | Experimental/partial |
 | Isolation | Full VM (Virtualization.framework) | Namespaces + cgroups |
 | Container runtime | Pinned youki inside VM | youki on host today; pinned artifact integration planned |
 | Networking | Guest agent + vsock bridge | Linux bridge + veth pairs |
@@ -140,9 +136,12 @@ authenticated import relay.
    rules and bridge interfaces may become orphaned. Teardown through the topology-scoped
    typed API before exiting; the legacy `vz stack down` CLI is retired.
 
-5. **Developer Environment parity is incomplete on Linux hosts** -- `vz init`, `vz run`, `vz exec`, `vz save`,
-   `vz restore`, `vz list`, `vz stop`, `vz cache`, `vz provision`, `vz cleanup`,
-   `vz self-sign`, and `vz validate` are only available on macOS.
+5. **Developer Environment parity is incomplete on Linux hosts** -- the current
+   topology CLI has DEV `up`, `exec`, `status`, and `stop` adapters; `delete`
+   is absent and complete Up reconciliation remains unfinished. Up and live
+   execution currently target Linux-on-macOS, not the Linux host backend.
+   An unsupported backend fails explicitly. Retired `init`, `run`, VM, image,
+   and debug families are absent on all hosts, not macOS-only alternatives.
 
 ## Troubleshooting
 

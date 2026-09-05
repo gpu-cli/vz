@@ -238,6 +238,7 @@ pub(crate) fn install_test_planning_authority(store: &StateStore, stack_id: &str
             name: "stack-unit-fixture".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![MachineSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),

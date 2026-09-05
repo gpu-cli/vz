@@ -8,6 +8,7 @@ pub(super) fn fixture() -> (EnvironmentInstance, MachineExecInput, MachineExecut
         name: "execution-tests".into(),
         environment: EnvironmentSpec {
             schema_version: 1,
+            default_machine: None,
             machines: ["app", "worker"]
                 .into_iter()
                 .map(|name| MachineSpec {
@@ -84,13 +85,58 @@ pub(super) fn fixture() -> (EnvironmentInstance, MachineExecInput, MachineExecut
 fn explicit_machine_precedence_and_cross_environment_process_ids_fail_closed() {
     let (environment, mut input, _) = fixture();
     input.process_machine_id = Some(MachineId::generate());
-    assert_eq!(select_machine(&input, &environment).unwrap().name, "app");
+    assert_eq!(
+        select_machine(&input, &environment, None).unwrap().name,
+        "app"
+    );
     input.machine = None;
-    assert!(select_machine(&input, &environment).is_err());
+    assert!(select_machine(&input, &environment, None).is_err());
     input.process_machine_id = None;
-    assert!(select_machine(&input, &environment).is_err());
+    assert!(select_machine(&input, &environment, None).is_err());
     input.machine = Some(String::new());
-    assert!(select_machine(&input, &environment).is_err());
+    assert!(select_machine(&input, &environment, None).is_err());
+}
+
+#[test]
+fn declared_default_is_only_used_after_explicit_and_process_selectors() {
+    let (mut environment, mut input, _) = fixture();
+    let worker = environment.machines[1].machine_id.clone();
+    assert_eq!(
+        select_machine(&input, &environment, Some("worker"))
+            .unwrap()
+            .name,
+        "app"
+    );
+    input.machine = Some("missing".into());
+    assert!(select_machine(&input, &environment, Some("worker")).is_err());
+    input.machine = None;
+    input.process_machine_id = Some(environment.machines[0].machine_id.clone());
+    assert_eq!(
+        select_machine(&input, &environment, Some("worker"))
+            .unwrap()
+            .name,
+        "app"
+    );
+    input.process_machine_id = Some(MachineId::generate());
+    assert!(select_machine(&input, &environment, Some("worker")).is_err());
+    input.process_machine_id = None;
+    assert_eq!(
+        select_machine(&input, &environment, Some("worker"))
+            .unwrap()
+            .machine_id,
+        worker
+    );
+    assert!(select_machine(&input, &environment, None).is_err());
+    assert!(select_machine(&input, &environment, Some("missing")).is_err());
+    // Defaults are names, never guessed IDs, and a stale default never falls
+    // back even when only one Machine remains.
+    assert!(select_machine(&input, &environment, Some(worker.as_str())).is_err());
+    environment.machines.pop();
+    assert!(select_machine(&input, &environment, Some("worker")).is_err());
+    assert_eq!(
+        select_machine(&input, &environment, None).unwrap().name,
+        "app"
+    );
 }
 
 #[test]
@@ -157,13 +203,26 @@ fn daemon_fixture(
     MachineExecInput,
     MachineExecutionReceipt,
 ) {
-    let (mut environment, input, scope) = fixture();
+    daemon_fixture_with_default(hook, None)
+}
+
+fn daemon_fixture_with_default(
+    hook: Option<Arc<dyn RuntimePolicyHook>>,
+    default_machine: Option<&str>,
+) -> (
+    tempfile::TempDir,
+    Arc<RuntimeDaemon>,
+    MachineExecInput,
+    MachineExecutionReceipt,
+) {
+    let (mut environment, input, mut scope) = fixture();
     let definition = ProjectDefinition {
         schema_version: 1,
         project_id: input.project_id.clone(),
         name: "execution-tests".into(),
         environment: EnvironmentSpec {
             schema_version: 1,
+            default_machine: default_machine.map(str::to_owned),
             machines: environment
                 .machines
                 .iter()
@@ -181,6 +240,8 @@ fn daemon_fixture(
             endpoints: vec![],
         },
     };
+    environment.definition_digest = definition.digest().unwrap();
+    scope.definition_digest = environment.definition_digest.clone();
     environment.state = EnvironmentState::Failed;
     environment.lifecycle_generation = 1;
     for machine in &mut environment.machines {
@@ -227,6 +288,31 @@ fn daemon_fixture(
         updated_at: 2,
     };
     (root, daemon, input, receipt)
+}
+
+#[tokio::test]
+async fn execution_selection_uses_the_validated_persisted_definition_default() {
+    let (_root, daemon, mut input, _) = daemon_fixture_with_default(None, Some("worker"));
+    let project = daemon
+        .with_state_store(|store| store.load_project_state_snapshot(input.project_id.as_str()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        project.definition.environment.default_machine.as_deref(),
+        Some("worker")
+    );
+    let digest = project.definition.digest().unwrap();
+    input.machine = None;
+    let (environment, selected) = daemon.select_execution(&input).unwrap();
+    assert_eq!(selected.name, "worker");
+    assert_eq!(selected.environment_id, environment.environment_id);
+    assert_eq!(selected.state, MachineState::Stopped);
+    assert_eq!(environment.definition_digest, digest);
+    // The fact another Machine is Ready must not override the declared default.
+    input.process_machine_id = Some(MachineId::generate());
+    assert!(daemon.select_execution(&input).is_err());
+    input.machine = Some("app".into());
+    assert_eq!(daemon.select_execution(&input).unwrap().1.name, "app");
 }
 
 #[tokio::test]

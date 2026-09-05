@@ -31,17 +31,21 @@ Defaults:
 - max RSS growth: `131072` KiB (128 MiB)
 - max FD growth: `256`
 
-## Suggested Workloads
+## Workload status after CLI retirement
 
-1. Linux daemon lifecycle loop:
-```bash
-VZ_BIN=/tmp/vz-target-e2e/debug/vz scripts/run-vz-linux-vm-e2e-hostboot.sh --profile debug
-```
+The formerly suggested lifecycle and portability loops used
+`scripts/run-vz-linux-vm-e2e-hostboot.sh`, which is now a retired migration-error
+entry point, not a workload generator. Do not point `VZ_BIN` at an older CLI or
+count its rejection as a successful soak iteration. See
+[retired workflows](retired-cli-workflows.md).
 
-2. Portability stress loop:
-```bash
-VZ_BIN=/tmp/vz-target-e2e/debug/vz scripts/run-vz-linux-vm-e2e-hostboot.sh --profile debug --run-btrfs-portability
-```
+Supply an actual, exactly scoped typed API/test-driver workload for the selected
+Linux daemon and retain its raw operation/cleanup receipts. Until that workload
+is implemented and exercised, the corresponding soak gate remains incomplete.
+The current local-Mac sandbox backend gate is
+`scripts/run-sandbox-vm-e2e.sh --profile release --suite all`; follow its
+[prerequisites](sandbox-vm-e2e.md). A passing sandbox run does not certify this
+long-duration Linux-daemon or portability soak.
 
 ## Readiness Gate Contract
 

@@ -146,6 +146,7 @@ async fn write_bundle_and_resolve(source: &Path) -> (ResolvedLinuxMachineTarget,
         name: "artifact-crash".into(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![machine.clone()],
             networks: Vec::new(),
             endpoints: Vec::new(),

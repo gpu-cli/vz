@@ -1,5 +1,10 @@
 # Game Day Log: 2026-03-04
 
+> Historical evidence, preserved as recorded. The hostboot helper and legacy
+> CLI paths below are now [retired](../retired-cli-workflows.md) and are not
+> executable current workflows. These dated observations do not certify the
+> 0.4 Developer Environment lifecycle or its replacement API/test-driver lanes.
+
 ## Session Metadata
 
 - Date: 2026-03-04

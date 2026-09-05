@@ -108,6 +108,7 @@ fn seed_stack_topology(
         name: "runtimed-client".to_string(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![MachineSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
@@ -232,6 +233,7 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
         name: "status-roundtrip".to_string(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![MachineSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),

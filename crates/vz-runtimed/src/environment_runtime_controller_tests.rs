@@ -151,6 +151,7 @@ impl Fixture {
             name: "controller-prepare".into(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![MachineSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "main".into(),

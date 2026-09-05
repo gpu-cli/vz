@@ -5,6 +5,48 @@ use crate::{
     EnvironmentLifecycleStatus, MachineError, MachineId, ProjectId, WorkspaceBinding,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
+/// Desired Up input; path_hint is diagnostic and excluded from mutation identity.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentUpRequest {
+    pub definition: super::ProjectDefinition,
+    pub selection: super::EnvironmentSelectionContext,
+    pub path_hint: Option<String>,
+    pub timeout_millis: u64,
+}
+
+impl EnvironmentUpRequest {
+    pub fn request_hash(&self) -> Result<String, String> {
+        self.definition
+            .validate()
+            .map_err(|error| error.to_string())?;
+        if !(1_000..=600_000).contains(&self.timeout_millis) {
+            return Err("Up deadline must be 1..600 seconds".into());
+        }
+        let mut selection = self.selection.clone();
+        if selection.explicit.is_some() {
+            selection.process_environment_id = None;
+        }
+        let bytes = serde_json::to_vec(&(&self.definition, selection, self.timeout_millis))
+            .map_err(|error| error.to_string())?;
+        Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
+    }
+}
+
+/// Coalescing snapshots have strictly increasing sequence numbers. Intermediate
+/// snapshots may be omitted by a slow observer; the terminal receipt may not.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentUpProgress {
+    pub schema_version: u32,
+    pub sequence: u64,
+    pub admission: EnvironmentUpAdmission,
+    pub phase: String,
+    pub operation: Option<EnvironmentLifecycleOperation>,
+    pub completion: Option<EnvironmentUpCompletion>,
+}
 
 /// Immutable intent reserved in the same transaction as a newly named instance.
 /// It survives a crash before lifecycle begin, so an unbound default-creation

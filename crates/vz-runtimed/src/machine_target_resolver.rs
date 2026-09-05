@@ -225,6 +225,7 @@ impl ResolvedMachineConfiguration {
         }
         EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![machine.clone()],
             networks: Vec::new(),
             endpoints: Vec::new(),
@@ -649,6 +650,7 @@ mod tests {
             name: "resolution".into(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 networks: Vec::new(),
                 endpoints: Vec::new(),
                 machines: entries

@@ -699,6 +699,7 @@ mod tests {
             name: "status-project".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: ["app", "worker"]
                     .into_iter()
                     .map(|name| MachineSpec {

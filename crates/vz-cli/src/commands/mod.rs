@@ -4,4 +4,5 @@
 pub mod dev_exec;
 pub mod dev_status;
 pub mod dev_stop;
+pub mod dev_up;
 pub(crate) mod runtime_daemon;

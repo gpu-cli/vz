@@ -94,6 +94,170 @@ pub struct MachineLiveSessions {
 }
 
 impl MachineLiveSessions {
+    /// Resolve every sibling before Up effects. Only fresh never-started or
+    /// positively stopped Machines may lack an original activation.
+    pub(crate) fn activations_for_up(
+        &self,
+        lease: &EnvironmentControllerLease,
+        environment: &vz_runtime_contract::EnvironmentInstance,
+        non_dispatched: &std::collections::BTreeSet<MachineId>,
+    ) -> Result<HashMap<MachineId, Arc<MachineRuntimeActivation>>, MachineLiveSessionError> {
+        let mut sessions = self.sessions.lock().map_err(error)?;
+        require_controller(&mut sessions.controller, lease.controller_identity())?;
+        let mut result = HashMap::new();
+        for machine in &environment.machines {
+            let owner = ResourceOwner {
+                project_id: environment.project_id.clone(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            };
+            lease.require_owner(&owner).map_err(error)?;
+            let fresh = environment.lifecycle_generation == 0
+                && machine.incarnation.is_none()
+                && machine.runtime_identity.is_none();
+            let Some(session) = sessions.machines.get(&machine.machine_id) else {
+                if non_dispatched.contains(&machine.machine_id) {
+                    continue;
+                }
+                if fresh || machine.state == vz_runtime_contract::MachineState::Stopped {
+                    continue;
+                }
+                return Err(error(
+                    "Up cannot reconstruct an unknown previously active Machine after restart",
+                ));
+            };
+            if session.owner != owner {
+                return Err(error("Up session owner mismatch"));
+            }
+            let attempt = session.attempt.lock().map_err(error)?;
+            let resources = session.resources.lock().map_err(error)?;
+            if non_dispatched.contains(&machine.machine_id) {
+                if resources.is_some()
+                    || !attempt.as_ref().is_some_and(|attempt| {
+                        attempt
+                            .result
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|result| result.is_ok())
+                    })
+                {
+                    return Err(error(
+                        "boot non-dispatch proof conflicts with retained session effects",
+                    ));
+                }
+                continue;
+            }
+            if machine.state == vz_runtime_contract::MachineState::Stopped {
+                if resources.is_some()
+                    || !attempt.as_ref().is_some_and(|attempt| {
+                        attempt
+                            .result
+                            .borrow()
+                            .as_ref()
+                            .is_some_and(|result| result.is_ok())
+                    })
+                {
+                    return Err(error(
+                        "Up cannot restart a Machine with uncertain Stop effects",
+                    ));
+                }
+                continue;
+            }
+            if attempt.is_some() {
+                return Err(error("Up session is owned by a Stop attempt"));
+            }
+            let resources = resources
+                .as_ref()
+                .ok_or_else(|| error("Up session has no original activation"))?;
+            resources.entry.validate_current().map_err(error)?;
+            if let Some(identity) = &machine.runtime_identity {
+                let persisted: StackRuntimeIdentity =
+                    serde_json::from_str(&identity.opaque_id).map_err(error)?;
+                if persisted != session.identity {
+                    return Err(error(
+                        "Up persisted runtime identity differs from live owner",
+                    ));
+                }
+            } else if machine.incarnation.is_some() {
+                return Err(error("Up incarnation has no persisted runtime identity"));
+            }
+            result.insert(
+                machine.machine_id.clone(),
+                Arc::clone(&resources.activation),
+            );
+        }
+        Ok(result)
+    }
+
+    /// Install a private endpoint only onto its already registered exact boot.
+    pub(crate) fn attach_docker_endpoint(
+        &self,
+        lease: &EnvironmentControllerLease,
+        activation: &Arc<MachineRuntimeActivation>,
+        endpoint: &mut Option<MachineDockerEndpoint>,
+    ) -> Result<(), MachineLiveSessionError> {
+        lease.require_owner(activation.owner()).map_err(error)?;
+        let mut sessions = self.sessions.lock().map_err(error)?;
+        require_controller(&mut sessions.controller, lease.controller_identity())?;
+        let machine = activation
+            .owner()
+            .machine_id
+            .as_ref()
+            .ok_or_else(|| error("Machine owner required"))?;
+        let session = sessions
+            .machines
+            .get(machine)
+            .ok_or_else(|| error("endpoint has no registered owner"))?;
+        if session.attempt.lock().map_err(error)?.is_some() {
+            return Err(error("endpoint owner is stopping"));
+        }
+        let mut resources = session.resources.lock().map_err(error)?;
+        let resources = resources
+            .as_mut()
+            .ok_or_else(|| error("endpoint owner resources absent"))?;
+        if !Arc::ptr_eq(&resources.activation, activation)
+            || resources.endpoint.is_some()
+            || !endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.belongs_to(activation))
+        {
+            return Err(error(
+                "endpoint is duplicate or belongs to a different activation object",
+            ));
+        }
+        resources.endpoint = endpoint.take();
+        Ok(())
+    }
+
+    pub(crate) fn docker_endpoint_path(
+        &self,
+        lease: &EnvironmentControllerLease,
+        activation: &Arc<MachineRuntimeActivation>,
+    ) -> Result<Option<std::path::PathBuf>, MachineLiveSessionError> {
+        lease.require_owner(activation.owner()).map_err(error)?;
+        let mut sessions = self.sessions.lock().map_err(error)?;
+        require_controller(&mut sessions.controller, lease.controller_identity())?;
+        let machine = activation
+            .owner()
+            .machine_id
+            .as_ref()
+            .ok_or_else(|| error("Machine owner required"))?;
+        let session = sessions
+            .machines
+            .get(machine)
+            .ok_or_else(|| error("endpoint has no registered owner"))?;
+        let resources = session.resources.lock().map_err(error)?;
+        let resources = resources
+            .as_ref()
+            .ok_or_else(|| error("endpoint owner resources absent"))?;
+        if !Arc::ptr_eq(&resources.activation, activation) {
+            return Err(error("endpoint activation mismatch"));
+        }
+        Ok(resources
+            .endpoint
+            .as_ref()
+            .map(|endpoint| endpoint.socket_path().to_path_buf()))
+    }
     /// Acquire the exact registered incarnation while the shared controller
     /// fence excludes Stop admission. No Runtime reconstruction or name lookup.
     pub(crate) fn admit_execution(
@@ -155,6 +319,18 @@ impl MachineLiveSessions {
         environment: &vz_runtime_contract::EnvironmentInstance,
         operation: Option<&EnvironmentLifecycleOperation>,
     ) -> Result<(), MachineLiveSessionError> {
+        self.preflight_stop_with_non_dispatch(lease, environment, operation, &Default::default())
+    }
+
+    /// The set is supplied only after same-fence durable proof validation by
+    /// the topology controller. No public caller may assert absence by ID.
+    pub(crate) fn preflight_stop_with_non_dispatch(
+        &self,
+        lease: &EnvironmentControllerLease,
+        environment: &vz_runtime_contract::EnvironmentInstance,
+        operation: Option<&EnvironmentLifecycleOperation>,
+        non_dispatched: &std::collections::BTreeSet<MachineId>,
+    ) -> Result<(), MachineLiveSessionError> {
         let mut sessions = self.sessions.lock().map_err(error)?;
         require_controller(&mut sessions.controller, lease.controller_identity())?;
         for machine in &environment.machines {
@@ -165,6 +341,34 @@ impl MachineLiveSessions {
             };
             lease.require_owner(&owner).map_err(error)?;
             let session = sessions.machines.get(&machine.machine_id);
+            if non_dispatched.contains(&machine.machine_id) {
+                if let Some(session) = session {
+                    if session.owner != owner || session.resources.lock().map_err(error)?.is_some()
+                    {
+                        return Err(error(
+                            "boot non-dispatch proof conflicts with a live/foreign session",
+                        ));
+                    }
+                    if !session
+                        .attempt
+                        .lock()
+                        .map_err(error)?
+                        .as_ref()
+                        .is_some_and(|attempt| {
+                            attempt
+                                .result
+                                .borrow()
+                                .as_ref()
+                                .is_some_and(|result| result.is_ok())
+                        })
+                    {
+                        return Err(error(
+                            "boot non-dispatch proof cannot override uncertain session teardown",
+                        ));
+                    }
+                }
+                continue;
+            }
             if machine.state == vz_runtime_contract::MachineState::Stopped {
                 if let Some(session) = session {
                     if session.owner != owner || session.resources.lock().map_err(error)?.is_some()

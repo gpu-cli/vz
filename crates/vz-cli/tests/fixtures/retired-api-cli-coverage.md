@@ -31,17 +31,25 @@ case are explicit coverage handoffs, not waived acceptance criteria. The parent
 implementation session owns tracking them against the broader 0.4 API/backend
 gate. Source presence of another test is not a claim that it passed.
 
-## Script consumers requiring separate migration
+## Retired script consumers
 
-These existing helper scripts still reference retired public commands and must
-be migrated to typed test drivers/APIs or explicitly retired before being
-advertised as executable workflows:
+These pre-0.4 helpers are now self-contained retirement entry points. Every
+invocation, including help, returns exit 2 and a structured
+`legacy_workflow_removed` error before state discovery, builds, provisioning,
+network access, or command delegation:
 
 - `scripts/run-vz-linux-vm-e2e.sh`: `vz create` / sandbox CLI path.
 - `scripts/run-vz-linux-vm-e2e-local.sh`: `vz vm mac ...` control/exec path.
 - `scripts/run-vz-linux-hostboot-command.sh`: `vz vm linux ...` path.
-- `scripts/install.sh`: old `vz run echo hello` completion guidance.
+- `scripts/run-vz-linux-vm-e2e-hostboot.sh`: outer host-boot wrapper.
+- `scripts/run-linux-daemon-release-gate.sh`: outer daemon-gate wrapper.
 
-This change does not execute or silently claim to repair those scripts. The
-current sandbox physical harness invokes signed test drivers directly and is a
-separate lane; its results must not be inferred from these retirement tests.
+Installer guidance now points to the exact installed binary's help; it no longer
+prints a legacy sandbox definition or removed command. Process tests in
+`scripts/helpers/test_legacy_workflow_retirement.py` check all five entry points,
+adversarial old flags, absence of dependency calls, and unchanged sentinels.
+
+The current sandbox physical harness invokes signed test drivers directly and
+is a separate lane, not an equivalent replacement for these old workflows or
+the full release gate. Positive topology API coverage listed above remains
+required. Prior script implementations are recoverable at commit `98d870c0`.

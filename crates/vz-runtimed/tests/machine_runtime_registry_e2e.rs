@@ -251,6 +251,7 @@ fn definition(
         name: "machine-runtime-registry-e2e".into(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![
                 spec(
                     "developer-a",

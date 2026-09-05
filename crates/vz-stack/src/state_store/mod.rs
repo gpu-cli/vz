@@ -28,6 +28,7 @@ use crate::network::PublishedPort;
 use crate::reconcile::Action;
 
 mod environment_up;
+pub mod machine_boot_non_dispatch;
 mod machine_execution;
 mod stack_journal;
 pub use stack_journal::{

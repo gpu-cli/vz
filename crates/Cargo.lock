@@ -3976,6 +3976,7 @@ version = "0.1.0"
 dependencies = [
  "hyper-util",
  "prost",
+ "serde_json",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

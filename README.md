@@ -25,7 +25,7 @@ The target model is deliberately asymmetric:
 - **Networking can be realistic without being public.** Machines use declared
   private paths or an Environment-local simulated-public DNS/TLS/ingress/NAT
   edge. Separate Environments are default-deny.
-- **Hardened environments are secondary.** The constrained `container` kernel
+- **Hardened Machines are secondary.** The constrained `container` kernel
   profile remains available for locked-down workloads, but it is not a peer
   product or the default Developer Environment.
 
@@ -55,38 +55,35 @@ host/Machine-target combinations below are roadmap work, not shipped functionali
 curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh | sh
 ```
 
-This installs pre-built binaries (signed + notarized) and the Linux kernel to `~/.vz/bin/`.
-Requires macOS on Apple Silicon.
+The installer selects published binaries and Linux artifacts for Apple-silicon
+macOS. A published release can have a different CLI from this development
+checkout; always inspect the installed `vz --help`. This README describes the
+current **DEV** surface, not a completed or certified 0.4 distribution.
 
 Options:
-- `VZ_VERSION=0.3.0` — pin a specific version
-- `VZ_NO_LINUX=1` — skip Linux kernel download
 
-### Install from source
+- `VZ_VERSION=<published-version>` — select a specific release.
+- `VZ_NO_LINUX=1` — skip Linux kernel download.
 
-```bash
-# Requires Rust 1.85+
-cargo install --git https://github.com/gpu-cli/vz.git vz-cli
-vz self-sign  # apply Virtualization.framework entitlements
-```
+### Build from source
 
-### Build the Linux kernel (for source installs)
+From the checkout, use the workspace's Rust toolchain and lockfile:
 
 ```bash
-cd linux && make docker-build  # requires Docker
-mkdir -p ~/.vz/linux && cp linux/out/{vmlinux,initramfs.img,youki,version.json} ~/.vz/linux/
+cargo build --manifest-path crates/Cargo.toml --locked --release \
+  -p vz-cli -p vz-runtimed
 ```
 
-The default kernel profile is `developer` and keeps nested virtualization for
-Virgil-style Firecracker host VMs. To build the constrained container sandbox
-bundle, use:
+Source builds are development artifacts. Virtualization.framework tests require
+signed binaries with the appropriate entitlements; the supported sandbox harness
+below builds and signs its own test drivers. The old `self-sign` CLI command is
+retired, not an installation prerequisite.
 
-```bash
-cd linux && make docker-build KERNEL_PROFILE=container
-```
-
-Release CI caches the developer/container kernel images by kernel inputs, then
-rebuilds the initramfs and metadata for each `vz` release.
+Build the primary Developer and secondary Hardened Linux bundles using the
+explicit local Docker context and case-sensitive source pipeline documented in
+[linux/README.md](linux/README.md). Docker is build infrastructure here, not a
+substitute runtime or Docker compatibility evidence. Both profiles use the
+pinned youki runtime, with verified source/artifact provenance.
 
 ## Host and Machine-target roadmap
 
@@ -94,310 +91,137 @@ Status describes backend maturity, not complete product parity.
 
 | Host | Linux target | Native macOS target | Native Windows target |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon) | **ACTIVE** primitives: Virtualization.framework Linux VM, OCI, and BuildKit; unified lifecycle and private Docker are **DEV** | **ACTIVE** `vz vm ...` provisioning and automation; unified lifecycle is **DEV** | Not applicable |
+| macOS (Apple Silicon) | **ACTIVE** Virtualization.framework Linux VM/OCI/BuildKit primitives; unified lifecycle and private Docker are **DEV** | **ACTIVE** provisioning/automation primitives; unified Machine lifecycle is **DEV** | Not applicable |
 | Linux | **DEV:** partial `linux-native` backend; complete Developer Environment parity remains in progress | Not applicable | Not applicable |
-| Windows | **PLANNED:** Linux Developer Environments using the appropriate Windows virtualization backend | Not applicable | **PLANNED later:** native Windows Developer Environments |
+| Windows | **PLANNED:** Linux Machines using the selected Windows virtualization backend | Not applicable | **PLANNED later:** native Windows Machines |
 
-Linux is the universal Machine target across all three hosts. Native macOS and
-native Windows Machines complement it; they do not replace it. On macOS, Linux
-and native macOS Machines may participate in the same declared Environment
-topology.
+Linux is the universal target; native targets complement it. Mixed Linux/macOS
+Environment topology is part of the 0.4 goal, not a completed CLI capability.
 
-## Current 0.4 CLI development status
+## Current CLI: DEV, not the complete five-verb lifecycle
 
-`vz status` is the first public lifecycle verb wired to the topology model. It
-reads the nearest checked-in `vz.json` as a typed `ProjectDefinition`, connects
-only to an already-running runtime daemon, and reports a persisted Project,
-Environment, and Machine snapshot. JSON output distinguishes the host and
-daemon backend from each Machine target and reports desired-versus-persisted
-definition drift, requested and negotiated capabilities, and persisted
-unsupported-capability reasons. These are persisted results, not a live health
-probe. Status does not infer Docker availability from a Developer profile or
-create a Docker context.
+The implemented topology CLI currently exposes:
 
-Bare `vz` now prints static top-level help without discovering or mutating
-runtime state. The implicit create/continue/resume path and its root mutation
-flags are removed, as is the `--control-plane` flag. Removed entries return
-structured migration errors; they are not hidden aliases. Explicit legacy
-command families remain except for the already-retired `stack` family.
+- `vz up`: streamed whole-Environment admission and retained Linux-on-macOS
+  startup, using an explicitly configured verified artifact catalog. Developer
+  boots retain private Engine endpoints but fail readiness until full host
+  Docker/Compose/buildx and managed-context evidence exists; they are not Ready.
+- `vz status`: read-only persisted Project/Environment/Machine state, definition
+  drift, and recorded capabilities. It does not turn persisted data into a live
+  health probe or infer Docker readiness from a Developer profile.
+- `vz exec`: streamed execution in an already Ready, exactly owned Linux Machine
+  through the Linux-on-macOS DEV adapter. Automatic startup/dependency
+  reconciliation and native-target execution are still unfinished.
+- `vz stop`: selected-Environment Stop with exact ownership and positive
+  execution reaping. Unsupported resources and unknown live ownership fail
+  closed; it is not the former single-VM Stop path.
 
-The other four 0.4 lifecycle verbs and the final exactly-five-command surface
-are still in development. The currently shipped `vz init` remains a legacy 0.3
-authoring command and does not produce the topology `ProjectDefinition` required
-by the new status path; no mutating fallback is performed. The repository does
-not yet ship a stable schema/example authoring bundle.
+`delete` is absent; complete Up reconciliation, installed-catalog bootstrap,
+and physical lifecycle acceptance remain unfinished. There is no compatibility
+alias to make the command count look complete. The release goal remains exactly
+`up`, `exec`, `status`, `stop`, and `delete`.
 
-## Quick start (current legacy macOS/Linux-target workflow)
+Bare `vz` prints static help, exits zero, and performs no project/state discovery
+or mutation. All 16 retired infrastructure roots—including `run`, `vm`,
+`create`, `init`, `image`, `stack`, and hidden `debug`—and old bare-mode
+mutation flags return structured `legacy_command_removed` errors before state
+or transport access. No hidden old parser or fallback binary remains. See the
+[removal inventory](planning/developer-environments/legacy-cli-removal.md) and
+[machine-readable DEV inventory](config/cli-removal-v0.4.json).
 
-The commands below document the shipped 0.3 single-Linux-VM surface. They are
-being replaced for 0.4 by `vz up`, `vz exec`, `vz status`, `vz stop`, and
-`vz delete`; they do not define the future product object model.
+### Work with an existing Developer Environment
 
-### 1. Run commands in a Linux VM
-
-```bash
-cd your-project
-
-# Generate a vz.json config (auto-detects Rust, Node, Python, Go)
-vz init
-
-# Run any command inside the Linux VM
-vz run echo "hello from Linux"
-
-# Compile and run a Rust project
-vz run cargo build
-vz run cargo test
-
-# Open an interactive shell
-vz run -i bash
-
-# Stop the VM when done
-vz stop
-```
-
-The first `vz run` boots the environment's Linux VM (~3s), pulls the base
-image, and runs setup commands from `vz.json`. Subsequent runs reuse that
-environment and skip setup when the setup hash is unchanged.
-
-This legacy sequence no longer includes `vz status`: that spelling now uses the
-0.4 topology-backed behavior described above.
-
-The intended Developer Environment UX will also start each declared Linux
-Machine's private Docker service and report its managed context. Until the Docker roadmap is
-complete, do not assume that host `docker`, Compose, or buildx commands have
-full compatibility merely because the OCI workflows below are available.
-
-#### vz.json
-
-```json
-{
-  "image": "ubuntu:24.04",
-  "workspace": "/workspace",
-  "mounts": [{ "source": ".", "target": "/workspace" }],
-  "setup": [
-    "apt-get update",
-    "apt-get install -y build-essential curl"
-  ],
-  "env": { "PATH": "/root/.cargo/bin:/usr/local/bin:/usr/bin:/bin" },
-  "resources": { "cpus": 4, "memory": "8G" }
-}
-```
-
-### 2. Stack CLI retirement on the 0.4 development line
-
-The former `vz stack ...` command family is no longer executable. Calls fail
-before daemon or state access with the structured `legacy_command_removed`
-response and migration guidance. Multi-service topology belongs in `vz.json`;
-lower-level topology operations remain available through typed APIs while the
-five-verb 0.4 CLI is implemented.
-
-#### Reaching macOS host services from inside a container
-
-Developer Environments do not expose the macOS host through an unconditional
-gateway alias. In particular, an undeclared Machine must not receive
-`host.vz.internal` in `/etc/hosts`, and external egress does not authorize host
-access.
-
-The 0.4 design requires an explicit Environment/Machine-owned host import for
-one host-loopback protocol and port, carried over a private authenticated relay.
-That relay is still under development; do not bind a host service to a wildcard
-or LAN address as a substitute. See
-[`docs/developer-environments.md`](docs/developer-environments.md) for the
-normative network contract.
-
-### 3. Manage macOS VMs (macOS only)
+These commands require a valid nearest `vz.json`, an already-running runtime
+daemon, and an existing, exactly owned topology. Execution additionally requires
+a Ready Linux Machine; this is **not** a clean-install bootstrap sequence.
 
 ```bash
-# Create a pinned base image from the stable channel
-vz vm init --base stable
-
-# Provision account + guest agent after fingerprint verification (system mode is default)
-sudo vz vm provision --image ~/.vz/images/base.img --base-id stable
-
-# No-local-sudo local path (opt-in runtime policy)
-vz vm provision --image ~/.vz/images/base.img --base-id stable --agent-mode user
-
-# Verify a local image against the stable channel pin
-vz vm base verify --image ~/.vz/images/base.img --base-id stable
-
-# Start headless VM
-vz vm run --image ~/.vz/images/base.img --name dev --headless &
-
-# Execute in guest over vsock
-vz vm exec dev -- sw_vers
-
-# Save state and stop
-vz vm save dev --stop
-
-# Restore fast from saved state
-vz vm run --image ~/.vz/images/base.img --name dev --restore ~/.vz/state/dev.vzsave --headless &
+vz status --environment dev --json
+vz exec --environment dev --machine app -- uname -s
+vz stop --environment dev
 ```
 
-### 4. Pinned-base automation policy (macOS VM flows)
+Author definitions using the repository's
+[ProjectDefinition schema](schemas/vz-project-definition-v1.schema.json) and
+[example](examples/developer-environment/vz.json), or the typed authoring API.
+The example does not invent a downloadable appliance digest. Definition
+authoring does not create a Machine, and there is no mutating `init` fallback.
+The DEV Up path requires a daemon configured with a verified target catalog;
+automatic installed-catalog discovery and the complete bootstrap gate remain work.
 
-- `vz vm init --base <selector>`, `vz vm provision --base-id <selector>`, and `vz vm base verify --base-id <selector>` accept immutable base IDs plus channel aliases (`stable`, `previous`).
-- Base descriptors include support lifecycle metadata (`active` or `retired`); selecting a retired or unknown base fails with explicit fallback guidance.
-- Retirement guidance always includes `vz vm init --base stable` and, when available, a concrete replacement selector/base.
-- `vz vm patch verify` and `vz vm patch apply` reject bundles targeting retired or unsupported base descriptors.
-- Unpinned flows require explicit `--allow-unpinned`.
-- In CI (`CI=true`), unpinned flows are blocked unless `VZ_ALLOW_UNPINNED_IN_CI=1` is set.
-- Runtime policy: `--agent-mode system` is the default for reliability; `--agent-mode user` is opt-in for no-local-sudo workflows.
+Host Docker, Compose, and buildx must select the exact Developer Linux Machine's
+context when its capability is actually available. Never assume a global
+`~/.vz/docker.sock`, Environment-wide daemon, or Docker Desktop fallback.
+The [Docker compatibility contract](docs/docker-compatibility-contract.md)
+remains unverified until its full installed-host-client lane passes.
 
-```bash
-# Explicit unpinned local flow
-vz vm init --allow-unpinned --ipsw ~/Downloads/restore.ipsw
-sudo vz vm provision --image ~/.vz/images/base.img --allow-unpinned
-```
+### Host services and isolation
 
-### 5. Create signed patch bundles
+An explicit Environment/Machine-owned import authorizes one host-loopback
+protocol/port through a private authenticated relay. An undeclared Machine must
+not receive `host.vz.internal` or another implicit host gateway. External
+egress does not authorize host access, and wildcard/LAN binding is not a
+substitute. The complete network contract remains **DEV**; see
+[Developer Environments](docs/developer-environments.md).
 
-```bash
-# Generate an Ed25519 signing key (PKCS#8 PEM)
-openssl genpkey -algorithm Ed25519 -out /tmp/vz-patch-signing-key.pem
+## Runtime daemon connectivity
 
-# One-command inline patch creation (no operations.json or payload directory required)
-vz vm patch create \
-  --bundle /tmp/patch-1.vzpatch \
-  --base-id stable \
-  --mkdir /usr/local/libexec:755 \
-  --write-file /path/to/vz-agent:/usr/local/libexec/vz-agent:755 \
-  --symlink /usr/local/bin/vz-agent:/usr/local/libexec/vz-agent \
-  --set-owner /usr/local/libexec/vz-agent:0:0 \
-  --set-mode /usr/local/libexec/vz-agent:755 \
-  --signing-key /tmp/vz-patch-signing-key.pem
+The current lifecycle adapters use the typed runtime daemon over gRPC/UDS.
+They connect only to an already-running daemon and do not autostart one.
 
-vz vm patch verify --bundle /tmp/patch-1.vzpatch
-sudo vz vm patch apply --bundle /tmp/patch-1.vzpatch --image ~/.vz/images/base.img
-```
-
-For advanced CI workflows, `vz vm patch create` also supports `--operations <json>` + `--payload-dir <dir>`.
-
-### 6. Primary image-delta patch flow (sudo once, then sudoless apply)
-
-```bash
-# 1) Create a binary image delta from a signed bundle (runs bundle apply on a temp image copy)
-sudo vz vm patch create-delta \
-  --bundle /tmp/patch-1.vzpatch \
-  --base-image ~/.vz/images/base.img \
-  --delta /tmp/patch-1.vzdelta
-
-# 2) Apply the binary delta without sudo to produce a new bootable image
-vz vm patch apply-delta \
-  --base-image ~/.vz/images/base.img \
-  --delta /tmp/patch-1.vzdelta \
-  --output-image ~/.vz/images/base-patched.img
-
-# 3) Boot-test the patched image
-vz vm run --image ~/.vz/images/base-patched.img --name delta-test --headless
-```
-
-## Current 0.3 command groups
-
-### Dev environments
-
-`init`, `run`, `run -i`, `stop`, `status`, `logs`
-
-These are the shipped legacy lifecycle commands. They and the infrastructure
-groups below are removed from the 0.4 public surface in favor of `up`, `exec`,
-`status`, `stop`, and `delete`; advanced operations move to typed APIs.
-
-### OCI workloads
-
-`pull`, `run`, `create`, `exec`, `images`, `prune`, `ps`, `stop`, `rm`, `logs`
-
-### vz-managed stacks
-
-The former `stack` command family is retired on the 0.4 development line; it
-returns `legacy_command_removed` and is not retained as a hidden alias.
-
-### VMs (macOS)
-
-`vm init`, `vm run`, `vm exec`, `vm save`, `vm restore`, `vm list`, `vm stop`, `vm cache`, `vm provision`, `vm cleanup`, `vm self-sign`, `vm validate`, `vm base`, `vm patch`
-
-## Runtime Daemon Connectivity
-
-Runtime-mutating CLI surfaces (`sandbox`, `image`, `file`, `lease`, `execution`, `checkpoint`, `build`) use `vz-runtimed` over gRPC/UDS.
-
-- Default socket path is derived from the state DB directory:
-  - `<state-db-parent>/.vz-runtime/runtimed.sock`
-- Endpoint override:
-  - `VZ_RUNTIME_DAEMON_SOCKET=/absolute/path/to/runtimed.sock`
-- Autostart policy:
-  - `VZ_RUNTIME_DAEMON_AUTOSTART=1` (default) enables daemon cold-start
-  - `VZ_RUNTIME_DAEMON_AUTOSTART=0` disables autostart and fails fast when unreachable
-- Transport selector:
-  - `VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc` (default)
-  - `VZ_CONTROL_PLANE_TRANSPORT=api-http` is accepted; current CLI execution path uses a compatibility connector while full HTTP control-plane routing is tracked in bead `vz-pip6`
-- Sandbox startup defaults (daemon policy):
-  - `VZ_SANDBOX_DEFAULT_BASE_IMAGE=<image-ref>`
-  - `VZ_SANDBOX_DEFAULT_MAIN_CONTAINER=<command-or-container-hint>`
-  - `VZ_SANDBOX_DISABLE_LEGACY_DEFAULT_BASE_IMAGE=1` disables compatibility fallback (`debian:bookworm`)
-- Retention policy defaults (daemon-owned GC):
-  - Untagged checkpoints: max `128` retained, max age `30` days
-  - Tagged checkpoints (`--tag`): retained until explicit deletion
-  - Receipts: max `20_000` retained, max age `14` days
+- Default socket: `<state-db-parent>/.vz-runtime/runtimed.sock`.
+- Explicit paths: `VZ_RUNTIME_STATE_DB`, `VZ_RUNTIME_DATA_DIR`, and
+  `VZ_RUNTIME_DAEMON_SOCKET`.
+- `VZ_CONTROL_PLANE_TRANSPORT=daemon-grpc` is the supported CLI transport.
+  `api-http` fails closed for these adapters; it does not trigger a compatibility
+  connector or daemon fallback.
+- Richer topology, artifact, snapshot, file, and diagnostic operations belong to
+  typed APIs, not retired CLI command families.
 
 ## Architecture
 
-```
-vz-cli
-  |
-  +-- container commands --> vz-oci --> vz-runtime-contract
-  |                              |-> macOS backend (vz-oci-macos, VM-backed)
-  |                              '-- Linux backend (vz-linux-native)
-  '-- vm commands (macOS) -> vz (Virtualization.framework wrapper) + vz-guest-agent
+```text
+vz lifecycle CLI → typed daemon API → Environment/Machine ownership
+                                      ├─ Linux-on-macOS backend
+                                      ├─ native macOS integration (DEV)
+                                      └─ later host/target backends
 ```
 
-## Development
+Identity, authorization, execution, lifecycle, and evidence stay scoped to the
+selected Environment and Machine. A backend primitive is not a second public
+product lifecycle.
+
+## Development and verification
 
 ```bash
-cd crates
-cargo build --workspace
-cargo clippy --workspace -- -D warnings
-cargo nextest run --workspace
+cargo build --manifest-path crates/Cargo.toml --workspace
+cargo clippy --manifest-path crates/Cargo.toml --workspace -- -D warnings
+cargo nextest run --manifest-path crates/Cargo.toml --workspace
 ```
 
-Runtime API adapter local smoke test:
+The supported local Apple-silicon sandbox backend gate uses signed test drivers,
+not retired public VM commands:
 
 ```bash
-cd crates
-cargo run -p vz-api -- \
-  --bind 127.0.0.1:8181 \
-  --state-store-path /tmp/vz-api-state.db \
-  --daemon-auto-spawn true \
-  --stack-baseline \
-  --capability fs_quick_checkpoint
-
-# in another shell
-curl -s http://127.0.0.1:8181/v1/capabilities
-curl -s http://127.0.0.1:8181/openapi.json
+./scripts/run-sandbox-vm-e2e.sh --profile release --suite all
 ```
 
-`vz-api` daemon lifecycle behavior can be tuned for local/dev/operator scenarios:
+See the [sandbox harness guide](docs/sandbox-vm-e2e.md) for prerequisites,
+case-sensitive guest builds, selected scenarios, and retained artifacts.
+The old Linux-VM/hostboot/daemon-release helper workflows are
+[retired](docs/retired-cli-workflows.md); they cannot be revived by pointing
+`VZ_BIN` at an older executable.
 
-- `VZ_RUNTIME_DAEMON_AUTOSTART=1` (default) enables cold-start of `vz-runtimed`
-- `VZ_RUNTIME_DAEMON_AUTOSTART=0` disables auto-start and returns `daemon_unavailable` if daemon is not already running
-- `VZ_RUNTIME_DAEMON_SOCKET=/absolute/path/to/runtimed.sock` overrides daemon socket target
-- `VZ_RUNTIME_DAEMON_RUNTIME_DIR=/absolute/path/to/.vz-runtime` overrides runtime data directory used during daemon spawn
+A passing sandbox backend gate does **not** certify the complete five-verb
+lifecycle, host-Docker compatibility, native macOS Machines, mixed topologies,
+migration, or the aggregate 0.4 release. Those remain separate requirements in
+[GOAL-0.4.0](planning/developer-environments/GOAL-0.4.0.md) and
+[backend verification](docs/agent-verification.md).
 
-Sandbox-specific real VM integration validation (macOS ARM64):
-
-```bash
-./scripts/run-sandbox-vm-e2e.sh --suite sandbox
-```
-
-Full VM lanes (runtime + stack + buildkit):
-
-```bash
-./scripts/run-sandbox-vm-e2e.sh --suite all
-```
-
-See `docs/sandbox-vm-e2e.md` for reproducible debug workflow and artifact paths.
-
-Conformance and parity coverage:
+Additional references:
 
 - [Runtime primitive conformance matrix](docs/runtime-primitive-conformance.md)
-- [Daemon-only guardrails and fail-close policy](docs/daemon-only-guardrails.md)
+- [Daemon-only guardrails and fail-closed policy](docs/daemon-only-guardrails.md)
 
 ## License
 

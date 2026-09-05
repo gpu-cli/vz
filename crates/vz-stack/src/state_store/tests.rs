@@ -252,6 +252,7 @@ fn topology_project_state(
         name: "shop".to_string(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![machine_spec],
             networks: vec![TopologyNetworkSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,

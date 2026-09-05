@@ -3,6 +3,7 @@ vz — reproducible, parallel Developer Environments
 Usage: vz [OPTIONS] [COMMAND]
 
 Commands:
+  up      Create/reconcile the selected Environment (Linux-on-macOS DEV adapter)
   stop    Stop the selected Developer Environment, preserving identities and state
   exec    Execute in one selected Ready Machine (Linux-on-macOS DEV adapter)
   status  Show the project's persisted Developer Environment topology

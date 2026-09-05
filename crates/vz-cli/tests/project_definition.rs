@@ -19,6 +19,38 @@ fn write_definition(directory: &Path, name: &str) {
 }
 
 #[test]
+fn default_machine_is_validated_before_any_state_mutation() {
+    let fixture = tempfile::tempdir().unwrap();
+    let mut definition: serde_json::Value = serde_json::from_str(include_str!(
+        "../../../examples/developer-environment/vz.json"
+    ))
+    .unwrap();
+    for default in [
+        serde_json::Value::Null,
+        serde_json::json!("dev"),
+        serde_json::json!("missing"),
+        serde_json::json!(""),
+    ] {
+        definition["environment"]["default_machine"] = default.clone();
+        let bytes = serde_json::to_vec(&definition).unwrap();
+        let path = fixture.path().join("vz.json");
+        std::fs::write(&path, &bytes).unwrap();
+        let result = discover_project_definition(fixture.path());
+        if default.is_null() || default == "dev" {
+            let discovered = result.unwrap();
+            assert_eq!(
+                discovered.definition.environment.default_machine.as_deref(),
+                default.as_str()
+            );
+        } else {
+            assert_eq!(result.unwrap_err().code(), "invalid_definition");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        assert_eq!(std::fs::read_dir(fixture.path()).unwrap().count(), 1);
+    }
+}
+
+#[test]
 fn discovers_nearest_valid_definition_without_mutating_it() {
     let fixture = tempfile::tempdir().unwrap();
     write_definition(fixture.path(), "outer");

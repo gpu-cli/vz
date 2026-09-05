@@ -137,6 +137,9 @@ pub struct EnvironmentSpec {
     pub networks: ::prost::alloc::vec::Vec<NetworkSpec>,
     #[prost(message, repeated, tag = "4")]
     pub endpoints: ::prost::alloc::vec::Vec<EndpointSpec>,
+    /// Topology-local name; explicit and process Machine selectors take precedence.
+    #[prost(string, optional, tag = "5")]
+    pub default_machine: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectDefinition {
@@ -620,6 +623,74 @@ pub mod machine_exec_event {
         #[prost(message, tag = "8")]
         Receipt(super::MachineExecutionReceipt),
     }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpEnvironmentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(message, optional, tag = "2")]
+    pub definition: ::core::option::Option<ProjectDefinition>,
+    #[prost(string, optional, tag = "3")]
+    pub environment: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub process_environment_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub path_hint: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "7")]
+    pub timeout_millis: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentUpAdmission {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "4")]
+    pub machine_ids: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "5")]
+    pub definition_digest: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub request_hash: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "9")]
+    pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "10")]
+    pub created_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentUpCompletion {
+    #[prost(message, optional, tag = "1")]
+    pub admission: ::core::option::Option<EnvironmentUpAdmission>,
+    #[prost(message, optional, tag = "2")]
+    pub operation: ::core::option::Option<EnvironmentLifecycleOperation>,
+    #[prost(message, optional, tag = "3")]
+    pub workspace_binding: ::core::option::Option<WorkspaceBinding>,
+    #[prost(message, optional, tag = "4")]
+    pub error: ::core::option::Option<ErrorDetail>,
+    #[prost(uint64, tag = "5")]
+    pub completed_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct UpEnvironmentEvent {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "3")]
+    pub admission: ::core::option::Option<EnvironmentUpAdmission>,
+    #[prost(string, tag = "4")]
+    pub phase: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "5")]
+    pub operation: ::core::option::Option<EnvironmentLifecycleOperation>,
+    #[prost(message, optional, tag = "6")]
+    pub completion: ::core::option::Option<EnvironmentUpCompletion>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StopEnvironmentRequest {
@@ -3558,6 +3629,28 @@ pub mod topology_service_client {
             ));
             self.inner.unary(req, path, codec).await
         }
+        /// Bounded coalescing snapshots; disconnect ends observation, not boot effects.
+        pub async fn up_environment(
+            &mut self,
+            request: impl tonic::IntoRequest<super::UpEnvironmentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::UpEnvironmentEvent>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.TopologyService/UpEnvironment",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "vz.runtime.v2.TopologyService",
+                "UpEnvironment",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Disconnect cancels observation, not the admitted Stop. Replay with the
         /// same request/idempotency IDs resumes the durable operation or its receipt.
         pub async fn stop_environment(
@@ -6140,6 +6233,16 @@ pub mod topology_service_server {
             &self,
             request: tonic::Request<super::GetProjectStateRequest>,
         ) -> std::result::Result<tonic::Response<super::GetProjectStateResponse>, tonic::Status>;
+        /// Server streaming response type for the UpEnvironment method.
+        type UpEnvironmentStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::UpEnvironmentEvent, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Bounded coalescing snapshots; disconnect ends observation, not boot effects.
+        async fn up_environment(
+            &self,
+            request: tonic::Request<super::UpEnvironmentRequest>,
+        ) -> std::result::Result<tonic::Response<Self::UpEnvironmentStream>, tonic::Status>;
         /// Server streaming response type for the StopEnvironment method.
         type StopEnvironmentStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::StopEnvironmentEvent, tonic::Status>,
@@ -6275,6 +6378,50 @@ pub mod topology_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.TopologyService/UpEnvironment" => {
+                    #[allow(non_camel_case_types)]
+                    struct UpEnvironmentSvc<T: TopologyService>(pub Arc<T>);
+                    impl<T: TopologyService>
+                        tonic::server::ServerStreamingService<super::UpEnvironmentRequest>
+                        for UpEnvironmentSvc<T>
+                    {
+                        type Response = super::UpEnvironmentEvent;
+                        type ResponseStream = T::UpEnvironmentStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::UpEnvironmentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TopologyService>::up_environment(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = UpEnvironmentSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

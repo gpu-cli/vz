@@ -1,6 +1,11 @@
 # Sandbox VM E2E Harness
 
-Use `scripts/run-sandbox-vm-e2e.sh` to run sandbox-focused integration tests that boot real VMs.
+Use `scripts/run-sandbox-vm-e2e.sh` to run sandbox-focused integration tests that boot real VMs through signed test drivers, not retired public CLI commands.
+
+This is a backend prerequisite, not certification of the complete five-verb
+Developer Environment lifecycle, native macOS target, host-Docker compatibility,
+or aggregate 0.4 release. The former CLI/hostboot helper workflows are
+[retired](retired-cli-workflows.md).
 
 ## What It Does
 
@@ -54,13 +59,16 @@ Capability matrix:
 - `stack-user-journey-checkpoint` → `complex_stack_snapshot_restore_rewinds_shared_vm_state`
 - `buildkit-roundtrip` → `buildkit_builds_dockerfile_and_run_uses_built_image`
 
-Before any VM starts, the harness cross-builds the current Linux guest agent
-with `cargo zigbuild`, rebuilds both Developer and Hardened/container
-initramfs bundles, and records their SHA-256 digests in `run-info.txt`. Each
-test lane is pinned to those workspace bundles. This prevents a freshly built
-macOS host binary from being tested against a stale guest agent embedded in an
-older initramfs. Set `VZ_E2E_GUEST_AGENT_BUILD_TOOL` only when deliberately
-using another compatible cross-build tool.
+Before any VM starts, the harness builds both current Developer and
+Hardened/container guest bundles using `linux/Makefile`'s Docker wrapper and
+case-sensitive Linux source/build storage. Set the local
+`LINUX_DOCKER_CONTEXT`, `YOUKI_DOCKER_CONTEXT`, and
+`IPTABLES_DOCKER_CONTEXT` explicitly as described in
+[linux/README.md](../linux/README.md). It records profile build logs and exact
+bundle digests; each lane uses those selected bundles. This prevents a new host
+binary from silently testing a stale guest agent. The old
+`VZ_E2E_GUEST_AGENT_BUILD_TOOL` cross-build override accepts only `cargo`;
+host `zigbuild` or arbitrary source/build substitutes are rejected.
 
 The complete `runtime` suite also includes
 `undeclared_host_import_does_not_inject_host_vz_internal`. This real-VM
@@ -420,103 +428,26 @@ Artifacts are written under:
 .artifacts/linux-btrfs-e2e/<timestamp>/
 ```
 
-## High-Level `vz` on Linux VM Gate (No SSH)
+## Retired high-level CLI and hostboot gates
 
-Use this to validate high-level `vz` CLI/API behavior against real daemon-owned
-Linux runtime orchestration inside the local `vz` Linux VM environment.
+The old high-level Linux CLI/API, local-VM, hostboot, and daemon-release
+one-liners are no longer executable workflows. All five helper scripts and
+their migration boundaries are listed in
+[Retired CLI helper workflows](retired-cli-workflows.md). Their former
+`create`, `vm`, `list`, and attach/exec paths are not hidden aliases, and
+`VZ_BIN`/PATH overrides cannot reinstate them.
 
-Run from inside the Linux VM:
+Historical artifacts under `.artifacts/vz-linux-vm-e2e/` or
+`.artifacts/release-gates/linux-daemon/` describe their original run only.
+Do not use an old CLI success summary or a retired helper's migration response
+as current CLI/API acceptance.
 
-```bash
-./scripts/run-vz-linux-vm-e2e.sh --workspace /mnt/vz-btrfs --profile release
-```
-
-Or run from macOS host into a local `vz` VM (no SSH) using VM control socket:
-
-```bash
-./scripts/run-vz-linux-vm-e2e-local.sh \
-  --vm-name vz-linux-test \
-  --guest-repo /workspace/vz \
-  --auto-start \
-  --vm-image ~/.vz/images/<mac-vm-image>.img \
-  --mount repo:/Users/$USER/workspace/jl/vz \
-  --workspace /mnt/vz-btrfs \
-  --profile release
-```
-
-Notes:
-
-- `--mount` is forwarded to `vz vm mac run` during auto-start.
-- ensure `--guest-repo` matches the in-guest mount path for your VM image.
-- wrapper can provision btrfs workspace in-guest automatically before running harness.
-- local wrapper fails fast when guest OS is not Linux (for example, macOS base images).
-- set `VZ_BIN=/path/to/vz` to force a specific host `vz` binary; otherwise it auto-detects PATH or repo-built binaries.
-
-What this flow validates:
-
-- `vz-runtimed` starts and owns runtime state.
-- `vz-api` routes to daemon over UDS.
-- high-level `vz` CLI (`create`, `ls`, `inspect`) works via `api-http` transport.
-- `vz vm linux` daemon lifecycle flows (`list`, `inspect`, streamed `exec`, `stop`, `rm`) work via daemon gRPC transport.
-- streamed exec output and non-zero exit code propagation are validated (`exit 7` test case).
-- final sandbox state is `terminated`.
-
-Artifacts are written under:
-
-```text
-.artifacts/vz-linux-vm-e2e/<timestamp>/
-```
-
-## Release-Gate One-Liner
-
-Run from repo root:
-
-```bash
-./scripts/run-linux-daemon-release-gate.sh \
-  --workspace /mnt/vz-btrfs \
-  --profile release
-```
-
-On macOS this delegates to the local VM wrapper (`run-vz-linux-vm-e2e-local.sh`).
-On Linux it runs the harness directly (`run-vz-linux-vm-e2e.sh`).
-
-Deterministic artifact root:
-
-```text
-.artifacts/release-gates/linux-daemon/
-```
-
-Gate checklist:
-
-- Latest run summary exists at:
-  `.artifacts/release-gates/linux-daemon/latest/summary.txt`
-- `summary.txt` contains:
-  - `passed=vz_cli_api_daemon_linux_happy_path,vz_vm_linux_daemon_lifecycle`
-  - `failed=none`
-- Artifacts include:
-  - `vm-linux-list.json`
-  - `vm-linux-inspect.json`
-  - `vm-linux-exec-success.log`
-  - `vm-linux-exec-fail.log`
-
-## Host-Boot Linux Bootstrap Runner
-
-For direct host-boot Linux guest command execution (no pre-existing VM image), use:
-
-```bash
-VZ_BIN=/tmp/vz-target-e2e/debug/vz \
-./scripts/run-vz-linux-hostboot-command.sh \
-  --name bootstrap-smoke \
-  --output-dir .artifacts/vm-linux-hostboot-smoke \
-  --command 'echo guest_ok; /bin/busybox uname -s'
-```
-
-This bootstrap path:
-
-- initializes descriptor + persistent disk (`vz vm linux init`)
-- boots Linux guest (`vz vm linux run`)
-- executes command in guest with streamed output and propagated exit code
-- stops VM automatically after command completion
+For the currently supported local sandbox backend, use the release-profile
+`run-sandbox-vm-e2e.sh --suite all` command above. This does not replace the
+retired high-level lane's coverage. Its future equivalent must use exactly
+owned topology APIs and the implemented lifecycle, with its own required
+evidence. Full public bootstrap, native-target lifecycle, and aggregate release
+acceptance remain governed by the [0.4 goal](../planning/developer-environments/GOAL-0.4.0.md).
 
 ## Signing Behavior
 

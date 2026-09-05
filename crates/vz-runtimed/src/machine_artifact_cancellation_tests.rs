@@ -126,6 +126,7 @@ async fn target(source: &Path) -> ResolvedLinuxMachineTarget {
         name: "cancel-pin".into(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![machine],
             networks: Vec::new(),
             endpoints: Vec::new(),

@@ -1,5 +1,13 @@
 # Linux VM Save/Restore Contract
 
+> **Archived pre-0.4 CLI mapping; not an executable workflow.** All direct VM
+> command spellings, hidden aliases, command examples, and CLI status claims
+> below are historical. The current parser rejects them before effects.
+> Backend/API design details may inform future typed implementations, but do
+> not restore those commands or certify their replacement. See
+> [retired workflows](retired-cli-workflows.md) and the
+> [Developer Environment contract](developer-environments.md).
+
 > **0.4 interpretation:** Machine-backend capability contract. Public lifecycle
 > is the Environment model in [`developer-environments.md`](developer-environments.md);
 > direct VM commands in this document are legacy diagnostics.

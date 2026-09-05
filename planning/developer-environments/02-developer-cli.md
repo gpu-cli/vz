@@ -47,6 +47,13 @@ ownership-checked against the selected Environment. A present invalid, stale,
 or foreign value fails at the process tier without falling through. There is no
 mutable global current Environment, Machine, socket, or Docker context.
 
+The optional `environment.default_machine` field names an exact declared Machine
+in `vz.json`; it is not an immutable runtime ID. It participates in the definition
+digest and survives typed API round-trips. Missing or null means no declared
+default. A present unknown name is invalid, and a stale explicit/process selector
+never falls through to it. With no default, the sole Machine may be selected;
+several Machines require an explicit selection.
+
 ## Step 3: Discover definitions and create instances deterministically
 
 The checked-in portable project definition remains `vz.json` for 0.4 and is
@@ -171,8 +178,8 @@ terminal-receipt replay (including a nonzero command exit) and unknown-runtime
 refusal, not live command execution. Its checksums bind the copied executables,
 test drivers, and raw logs. The daily installation remains unchanged.
 
-`up` and `delete` remain absent. Exec's automatic dependency reconciliation,
-declared-default Machine support, and native adapter remain required, as do
+`delete` remains absent. Exec's automatic dependency reconciliation,
+physical declared-default Machine coverage, and native adapter remain required, as do
 full live status/contexts and the complete installed mixed-target lifecycle gate.
 
 All 16 retired roots, including hidden `debug`, have now been removed from the
@@ -188,8 +195,18 @@ in `crates/vz-cli/tests/fixtures/retired-api-cli-coverage.md`.
 The Up prerequisite now reserves exact prospective ownership and a non-expiring
 idempotency receipt in one transaction, after authorization. Seven tests cover
 denied-creation rollback, retry/reopen identity, sibling preservation, and
-durable workspace-binding truth. This is not an executable `vz up`; its retained
-boot/reconciliation supervisor and public transport remain to be implemented.
+durable workspace-binding truth. A subsequent DEV `vz up` now connects the CLI,
+typed client, streaming RPC and retained original-Machine startup supervisor.
+Exact non-dispatch proofs let Stop account for failed siblings that never booted;
+consumption precedes boot and a crash after consumption remains uncertain.
+Developer boot/private Engine endpoint is not full readiness: missing host
+Docker/Compose/buildx conformance and managed-context evidence yields failure,
+with original live ownership retained for Stop. Hardened readiness measures its
+exact guest POSIX execution. A configured verified catalog is required; automatic
+installed-catalog discovery, full reconciliation, native/topology adapters and
+physical public lifecycle acceptance remain open. Three CLI/private-socket tests
+at `.artifacts/up-host-St0qWY/up-cli-uds.log` prove admission/replay/refusal, not VM
+boot or Developer readiness.
 
 The post-retirement signed CLI/daemon run at
 `.artifacts/topology-cli-installed-9JFtJP/` passed 19 checks: Exec 2, Stop 3,
@@ -198,3 +215,54 @@ modes 2. Its checksum manifest binds executables, test drivers, and raw logs.
 These are installed-artifact control-plane and retirement checks, including
 seeded topology and terminal receipts, not live execution or the complete
 five-verb lifecycle. The daily installation remains unchanged.
+
+The repeatable DEV installed-artifact control-plane runner is
+`bash scripts/run-installed-topology-cli-tests.sh`. It stages signed release
+CLI/daemon files, selects exact Cargo-built test drivers, rejects empty,
+ignored or filtered test runs, and retains checksummed build/test/daemon logs.
+It is not the physical Developer Environment or aggregate release-gate entry
+point and does not replace the daily installation.
+
+The runner's current signed CLI/external-daemon run at
+`.artifacts/topology-cli-installed-YCnECh/` passed 23 checks: Up 3, Exec 3,
+Stop 3, status 4, bare help 2, retirement 6, and transport rejection 2.
+The checksum manifest was reverified. This adds streamed Up admission and
+declared-default Machine selection evidence, still at the control-plane
+boundary; it does not prove physical Developer readiness or Docker parity.
+
+The next signed candidate at `.artifacts/topology-cli-installed-7zd8qA/` also
+passed all 23 checks, including a regression for raw Exec output: fresh commands
+no longer prepend receipt guidance to stderr. JSON mode retains structured
+identity reporting; replay still discloses unavailable historical output.
+
+The checked-in [physical runner](../../docs/topology-up-machine-e2e.md) passed
+on the local Mac at `.artifacts/topology-up-physical-backing-store/`, using those
+exact signed CLI/daemon files. Public Up booted two Developer Linux Machines;
+the Mac's existing Docker client reached distinct Engines at their private
+endpoints. Public Hardened Up/Exec/Stop/re-Up proved Linux execution, exact
+stdout/stderr/exit 23, stable Environment/Machine IDs and a sentinel persisted
+on the positively identified `/vz-rootfs` VirtioFS backing share. Six host
+Engine probes proved the same two Engines remained usable across the neighboring
+Hardened Stop/re-Up. Final Stop removed their sockets, both Environments were
+stopped, and the daemon exited zero. The nested checksum manifest was verified.
+
+Two preceding failures remain retained: `topology-up-physical-d8zdOX` exposed
+the raw stderr banner; `topology-up-physical-raw-streams` exposed the fixture's
+incorrect pre-switch-root sentinel path. Both performed successful exact Stop
+cleanup. The passing candidate includes the corresponding source/harness fixes;
+it is not a test-case retry or a complete release-gate run.
+
+Developer Ready remains unsupported in this candidate. The next implementation
+must package/discover a trusted installed catalog, manage exact Machine-owned
+Docker contexts, and measure bounded Engine/Compose/buildx operation through
+those contexts with digest-bound offline probe artifacts. Full release-wide
+compatibility certification is separate: users must not run the entire release
+suite on each Up. Native topology, full reconciliation, declared workspace/volume
+semantics, interrupted partial startup, and Delete remain required; the backing
+share sentinel does not certify those features.
+
+The subsequent required backend regression run
+`.artifacts/sandbox-vm-e2e/20260905T144809Z/summary.txt` passed every selected
+release-profile runtime, recovery, runtimed, Machine registry, stack and BuildKit
+stage. Its pinned runtime inventory and logs remain backend evidence, not the
+missing host-Docker compatibility or mixed-target aggregate release gate.

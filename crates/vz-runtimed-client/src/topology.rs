@@ -52,7 +52,7 @@ fn stop_protocol_error(reason: impl Into<String>) -> DaemonClientError {
 
 // Retain all immutable journal fields, including every exact Machine step.
 // Only progress and acknowledgement evidence may evolve between frames.
-fn immutable_stop_scope(
+pub(crate) fn immutable_stop_scope(
     operation: &vz_runtime_contract::EnvironmentLifecycleOperation,
 ) -> vz_runtime_contract::EnvironmentLifecycleOperation {
     let mut scope = operation.clone();

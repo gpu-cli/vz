@@ -29,6 +29,7 @@ impl Fixture {
             name: "stop-tests".into(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: ["app", "worker"]
                     .map(|name| MachineSpec {
                         schema_version: TOPOLOGY_SCHEMA_VERSION,

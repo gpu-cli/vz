@@ -51,6 +51,11 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    /// Create/reconcile the selected Environment (Linux-on-macOS DEV adapter).
+    ///
+    /// Developer boots retain private Engine endpoints but are not Ready until
+    /// complete Docker/Compose/buildx readiness evidence is available.
+    Up(commands::dev_up::DevUpArgs),
     /// Stop the selected Developer Environment, preserving identities and state.
     Stop(commands::dev_stop::DevStopArgs),
 
@@ -106,6 +111,15 @@ fn main() -> anyhow::Result<()> {
             // Bare and read-only-global-only invocations returned before setup.
             None => unreachable!("command absence handled before runtime setup"),
 
+            Some(Commands::Up(args)) => match commands::dev_up::cmd_dev_up(args, json).await {
+                Ok(()) => Ok(()),
+                Err(error) => {
+                    if !error.already_emitted() {
+                        eprintln!("{}", error.to_json());
+                    }
+                    std::process::exit(error.exit_code());
+                }
+            },
             Some(Commands::Stop(args)) => {
                 match commands::dev_stop::cmd_dev_stop(args, json).await {
                     Ok(()) => Ok(()),
@@ -225,7 +239,7 @@ mod tests {
             .map(|child| child.get_name())
             .collect::<Vec<_>>();
         // Transitional DEV assertion, not the five-verb release acceptance gate.
-        assert_eq!(names, ["stop", "exec", "status", "help"]);
+        assert_eq!(names, ["up", "stop", "exec", "status", "help"]);
         for child in command.get_subcommands() {
             assert!(!child.is_hide_set());
             assert_eq!(child.get_all_aliases().count(), 0);

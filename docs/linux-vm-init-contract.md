@@ -1,5 +1,13 @@
 # Linux VM Init Contract
 
+> **Archived pre-0.4 CLI mapping; not an executable workflow.** All direct VM
+> command spellings, hidden aliases, command examples, and CLI status claims
+> below are historical. The current parser rejects them before effects.
+> Backend/API design details may inform future typed implementations, but do
+> not restore those commands or certify their replacement. See
+> [retired workflows](retired-cli-workflows.md) and the
+> [Developer Environment contract](developer-environments.md).
+
 > **0.4 interpretation:** backend provisioning contract only. Any `vz vm` or
 > single-VM product workflow here is legacy; Developer Environment lifecycle is
 > defined by [`developer-environments.md`](developer-environments.md).

@@ -11,6 +11,7 @@ fn fixture() -> (tempfile::TempDir, StateStore, MachineExecutionReceipt) {
         name: "exec-test".into(),
         environment: EnvironmentSpec {
             schema_version: 1,
+            default_machine: None,
             machines: vec![MachineSpec {
                 schema_version: 1,
                 name: "worker".into(),

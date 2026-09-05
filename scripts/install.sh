@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Install script for vz — instant sandboxed Linux environments on macOS.
+# Install script for vz — Developer Environments on Apple-silicon macOS.
 #
 # Usage:
 #   curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh | sh
@@ -250,6 +250,15 @@ setup_path() {
 
 # --- Main ---
 
+print_getting_started() {
+    echo "Get started with the installed version:"
+    printf '  %q --help\n' "$BIN_DIR/vz"
+    echo ""
+    echo "The 0.4 Developer Environment design uses a project topology in vz.json."
+    echo "Commands and capabilities depend on the installed version; consult its help."
+    echo "Do not reuse the pre-0.4 sandbox configuration as a topology definition."
+}
+
 main() {
     check_platform
     check_dependencies
@@ -282,16 +291,7 @@ main() {
     echo ""
     echo "vz v${version} installed successfully!"
     echo ""
-    echo "Get started:"
-    echo "  cd your-project"
-    echo "  cat > vz.json << 'EOF'"
-    echo '  {'
-    echo '    "image": "ubuntu:24.04",'
-    echo '    "workspace": "/workspace",'
-    echo '    "mounts": [{ "source": ".", "target": "/workspace" }]'
-    echo '  }'
-    echo "  EOF"
-    echo "  vz run echo hello"
+    print_getting_started
 }
 
 main "$@"

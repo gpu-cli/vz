@@ -97,6 +97,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             name: "stack-fixture".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![MachineSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),
@@ -5681,6 +5682,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         name: "environment-lifecycle-e2e".to_string(),
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
+            default_machine: None,
             machines: vec![MachineSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),

@@ -36,6 +36,8 @@ use vz_runtime_proto::runtime_v2;
 
 mod machine_execution;
 pub use machine_execution::*;
+mod environment_up;
+pub use environment_up::*;
 
 /// Conversion failures between Runtime V2 wire messages and domain entities.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
@@ -125,6 +127,7 @@ pub fn project_definition_from_proto(
 pub fn environment_spec_to_proto(spec: &EnvironmentSpec) -> runtime_v2::EnvironmentSpec {
     runtime_v2::EnvironmentSpec {
         schema_version: spec.schema_version,
+        default_machine: spec.default_machine.clone(),
         machines: spec.machines.iter().map(machine_spec_to_proto).collect(),
         networks: spec.networks.iter().map(network_spec_to_proto).collect(),
         endpoints: spec.endpoints.iter().map(endpoint_spec_to_proto).collect(),
@@ -137,6 +140,7 @@ pub fn environment_spec_from_proto(
 ) -> Result<EnvironmentSpec, TranslationError> {
     Ok(EnvironmentSpec {
         schema_version: spec.schema_version,
+        default_machine: spec.default_machine.clone(),
         machines: spec
             .machines
             .iter()
@@ -2988,6 +2992,7 @@ mod tests {
             name: "roundtrip".to_string(),
             environment: EnvironmentSpec {
                 schema_version: V,
+                default_machine: None,
                 machines: vec![
                     machine_spec("linux", OperatingSystem::Linux),
                     machine_spec("macos", OperatingSystem::Macos),
@@ -3798,6 +3803,22 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn default_machine_round_trips_through_protobuf_without_changing_absent_defaults() {
+        for default in [None, Some("linux".to_string())] {
+            let mut domain = project_definition();
+            domain.environment.default_machine = default.clone();
+            domain.validate().expect("valid default");
+            let bytes = project_definition_to_proto(&domain).encode_to_vec();
+            let wire =
+                runtime_v2::ProjectDefinition::decode(bytes.as_slice()).expect("wire decode");
+            assert_eq!(wire.environment.as_ref().unwrap().default_machine, default);
+            let decoded = project_definition_from_proto(&wire).expect("domain decode");
+            assert_eq!(decoded, domain);
+            assert_eq!(decoded.digest().unwrap(), domain.digest().unwrap());
+        }
     }
 
     #[test]

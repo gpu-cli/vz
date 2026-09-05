@@ -6,6 +6,8 @@ pub mod btrfs_portability;
 pub mod environment_runtime_controller;
 #[cfg(target_os = "macos")]
 pub mod environment_stop;
+#[cfg(target_os = "macos")]
+pub mod environment_up;
 mod execution_sessions;
 mod grpc;
 #[cfg(target_os = "macos")]
@@ -121,6 +123,13 @@ type PlatformBackend = vz_linux_native::LinuxNativeBackend;
 #[cfg(all(not(any(test, feature = "test-backend")), target_os = "macos"))]
 type PlatformBackend = vz_oci_macos::MacosRuntimeBackend;
 
+// Topology Linux-on-macOS always owns the real backend, including host unit
+// builds. Legacy test-manager selection must not manufacture Machine readiness.
+#[cfg(target_os = "macos")]
+type TopologyBackend = vz_oci_macos::MacosRuntimeBackend;
+#[cfg(all(unix, not(target_os = "macos")))]
+type TopologyBackend = PlatformBackend;
+
 /// Configuration for booting `vz-runtimed`.
 #[derive(Debug, Clone)]
 pub struct RuntimedConfig {
@@ -167,11 +176,15 @@ pub struct RuntimeDaemon {
     #[cfg(target_os = "macos")]
     machine_target_resolver: machine_target_resolver::MachineTargetResolver,
     #[cfg(unix)]
-    machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend>,
+    machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<TopologyBackend>,
     #[cfg(target_os = "macos")]
     environment_runtime_controller: environment_runtime_controller::EnvironmentRuntimeController,
     #[cfg(target_os = "macos")]
     machine_live_sessions: machine_live_sessions::MachineLiveSessions,
+    #[cfg(target_os = "macos")]
+    environment_up_runs: environment_up::EnvironmentUpRuns,
+    #[cfg(target_os = "macos")]
+    environment_up_observer: Option<Arc<dyn environment_up::EnvironmentUpBootObserver>>,
     state_store: Mutex<StateStore>,
     teardown_finalizer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     execution_sessions: ExecutionSessionRegistry,
@@ -465,6 +478,10 @@ impl RuntimeDaemon {
             environment_runtime_controller: Default::default(),
             #[cfg(target_os = "macos")]
             machine_live_sessions: Default::default(),
+            #[cfg(target_os = "macos")]
+            environment_up_runs: Default::default(),
+            #[cfg(target_os = "macos")]
+            environment_up_observer: None,
             state_store: Mutex::new(state_store),
             teardown_finalizer_locks: Mutex::new(HashMap::new()),
             execution_sessions: ExecutionSessionRegistry::default(),
@@ -594,7 +611,7 @@ impl RuntimeDaemon {
     #[cfg(unix)]
     pub fn machine_runtime_registry(
         &self,
-    ) -> &machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend> {
+    ) -> &machine_runtime_registry::MachineRuntimeRegistry<TopologyBackend> {
         &self.machine_runtime_registry
     }
 
@@ -633,7 +650,7 @@ impl RuntimeDaemon {
     /// Prepare private runtime stores/pins under a retained Environment fence.
     /// This trusted-library method does not authorize a request, boot a Machine,
     /// advertise Developer readiness, or replace the future streamed Up supervisor.
-    #[cfg(all(target_os = "macos", not(any(test, feature = "test-backend"))))]
+    #[cfg(target_os = "macos")]
     pub async fn prepare_environment_machine_runtimes(
         &self,
         lease: environment_runtime_controller::EnvironmentControllerLease,
@@ -1582,6 +1599,7 @@ mod tests {
             name: "startup-catalog".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![MachineSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),

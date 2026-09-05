@@ -14,9 +14,12 @@ what was verified and what remains blocked.
 ## Evidence boundaries
 
 - On macOS, Linux-target verification runs in a local **vz-managed Linux
-  Machine**, not an ad-hoc external SSH host. Until the five-verb surface lands,
-  focused backend harnesses may use `vz vm ...`. Release 0.4 evidence must use the
-  installed public CLI/API and prove `vz vm` is no longer executable.
+  Machine**, not an ad-hoc external SSH host. Focused backend harnesses use
+  signed test drivers and exactly owned APIs; `vz vm` is retired and must not
+  be restored through an old binary or hidden alias. The obsolete CLI/hostboot
+  helpers are listed in [retired workflows](retired-cli-workflows.md).
+  Release 0.4 evidence must use the installed public CLI/API and prove the
+  complete five-verb lifecycle, not infer it from a backend-only test.
 - Native macOS changes need the native macOS-on-macOS gate. Docker evidence from
   a neighboring Linux Machine does not certify a native macOS target.
 - Linux-on-Linux, Linux-on-Windows, and Windows-on-Windows claims each require
@@ -28,7 +31,7 @@ Run from the repository root and attach artifact paths and logs to the issue:
 
 | Change | Required evidence |
 | --- | --- |
-| Container/stack runtime | `scripts/run-sandbox-vm-e2e.sh --suite all` and artifact logs |
+| Container/stack runtime | `scripts/run-sandbox-vm-e2e.sh --profile release --suite all` and artifact logs |
 | Linux-target Docker | Ship and run `scripts/run-linux-docker-e2e.sh --suite all` from the host when the Docker wave lands; prove youki is the only OCI runtime binary present in the target |
 | btrfs portability | `scripts/run-linux-btrfs-e2e.sh`, with `.artifacts/linux-btrfs-e2e/<timestamp>/summary.txt` and logs |
 

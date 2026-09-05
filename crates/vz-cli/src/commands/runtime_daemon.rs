@@ -119,6 +119,23 @@ fn daemon_client_config_with_overrides(
     config
 }
 
+/// Up deliberately permits managed daemon startup. Read-only status and Stop/
+/// Exec keep their existing-daemon-only path; there is no HTTP/runtime fallback.
+pub async fn connect_up_daemon_for_state_db(state_db: &Path) -> anyhow::Result<DaemonClient> {
+    if parse_env_control_plane_transport()? != ControlPlaneTransport::DaemonGrpc {
+        bail!("Developer Environment Up requires daemon-grpc transport; no HTTP fallback");
+    }
+    let config = daemon_client_config_with_overrides(
+        state_db,
+        parse_env_daemon_socket_override(),
+        parse_env_runtime_data_dir_override(),
+        true,
+    );
+    DaemonClient::connect_with_config(config)
+        .await
+        .context("connect managed Up daemon")
+}
+
 /// Connect to an already-running daemon without creating runtime state.
 ///
 /// Read-only Developer Environment commands use this path so observing status

@@ -12,16 +12,17 @@ This runbook validates runtime observability before release gates are signed off
 
 ## Step 1: Generate Control-Plane Activity
 
-Run the Linux VM host-boot E2E happy path to exercise API + daemon flows:
+The former `scripts/run-vz-linux-vm-e2e-hostboot.sh` activity generator is
+[retired](retired-cli-workflows.md). It cannot exercise the API/daemon or produce
+current observability evidence. Do not substitute an old CLI via `VZ_BIN`.
 
-```bash
-VZ_BIN=/tmp/vz-target-e2e/debug/vz \
-scripts/run-vz-linux-vm-e2e-hostboot.sh \
-  --profile debug \
-  --run-btrfs-portability
-```
-
-Expected: summary contains `failed=none`.
+This step requires a current typed API/test-driver workload against the exact
+staging daemon, with retained command, identity, timing, and terminal receipts.
+Until that generator exists and succeeds, this runbook cannot receive readiness
+sign-off. The supported local-Mac sandbox backend gate,
+`scripts/run-sandbox-vm-e2e.sh --profile release --suite all`, is documented
+[separately](sandbox-vm-e2e.md); it does not by itself establish the HTTP metrics,
+storage activity, or observability assertions below.
 
 ## Step 2: Verify API Metrics Families
 
@@ -89,7 +90,7 @@ Archive:
 - API metrics snapshot (`/tmp/vz-api-metrics.prom`)
 - daemon metrics snapshot (`runtimed-grpc-metrics.prom`)
 - Grafana screenshots for both dashboards
-- output of host-boot E2E command
+- exact current workload commands and their raw operation/cleanup receipts
 
 Store under:
 
@@ -99,6 +100,8 @@ Store under:
 
 ## Exit Criteria
 
+- Current scoped activity generator is implemented and its retained run succeeds;
+  a retired-helper rejection or historical hostboot summary is not evidence.
 - Metrics families present and populated.
 - Dashboard queries return expected series.
 - Alert expressions evaluate cleanly and baseline is green.

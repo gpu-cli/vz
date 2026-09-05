@@ -11,6 +11,7 @@
     "delete"
   ],
   "implemented_dev_roots": [
+    "up",
     "stop",
     "exec",
     "status"

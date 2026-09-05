@@ -1,6 +1,10 @@
 use super::super::*;
 
+mod environment_up;
 mod machine_exec;
+type UpEnvironmentStream = std::pin::Pin<
+    Box<dyn tokio_stream::Stream<Item = Result<runtime_v2::UpEnvironmentEvent, Status>> + Send>,
+>;
 
 pub(in crate::grpc) struct TopologyServiceImpl {
     daemon: Arc<RuntimeDaemon>,
@@ -14,6 +18,13 @@ impl TopologyServiceImpl {
 
 #[tonic::async_trait]
 impl runtime_v2::topology_service_server::TopologyService for TopologyServiceImpl {
+    type UpEnvironmentStream = UpEnvironmentStream;
+    async fn up_environment(
+        &self,
+        request: Request<runtime_v2::UpEnvironmentRequest>,
+    ) -> Result<Response<Self::UpEnvironmentStream>, Status> {
+        environment_up::handle(Arc::clone(&self.daemon), request).await
+    }
     type ExecMachineStream = std::pin::Pin<
         Box<dyn tokio_stream::Stream<Item = Result<runtime_v2::MachineExecEvent, Status>> + Send>,
     >;

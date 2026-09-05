@@ -162,8 +162,27 @@ impl RuntimeDaemon {
             .is_none_or(|operation| !terminal(operation))
         {
             validate_supported_topology(&input, &environment)?;
+            let non_dispatched = self
+                .with_state_store(|store| {
+                    let mut ids = std::collections::BTreeSet::new();
+                    for machine in &environment.machines {
+                        if store
+                            .require_machine_boot_non_dispatch(&environment, &machine.machine_id)?
+                            .is_some()
+                        {
+                            ids.insert(machine.machine_id.clone());
+                        }
+                    }
+                    Ok(ids)
+                })
+                .map_err(|error| state_error(&input, error))?;
             self.machine_live_sessions()
-                .preflight_stop_replay(&lease, &environment, existing.as_ref())
+                .preflight_stop_with_non_dispatch(
+                    &lease,
+                    &environment,
+                    existing.as_ref(),
+                    &non_dispatched,
+                )
                 .map_err(|error| {
                     failure(&input, MachineErrorCode::StateConflict, error.to_string())
                 })?;
@@ -342,16 +361,41 @@ impl RuntimeDaemon {
             {
                 continue;
             }
-            let result = self
-                .machine_live_sessions()
-                .stop(
-                    &lease,
-                    &self.state_store,
-                    &operation,
-                    &step.machine_id,
-                    input.machine_timeout,
-                )
-                .await;
+            let non_dispatched = self.with_state_store(|store| {
+                let project = store
+                    .load_project_state_snapshot(operation.project_id.as_str())?
+                    .ok_or_else(|| StackError::Machine {
+                        code: MachineErrorCode::StateConflict,
+                        message: "Stop Project disappeared".into(),
+                    })?;
+                let environment = project
+                    .environments
+                    .iter()
+                    .find(|environment| environment.environment_id == operation.environment_id)
+                    .ok_or_else(|| StackError::Machine {
+                        code: MachineErrorCode::StateConflict,
+                        message: "Stop Environment disappeared".into(),
+                    })?;
+                store
+                    .require_machine_boot_non_dispatch(environment, &step.machine_id)
+                    .map(|proof| proof.is_some())
+            });
+            let result = match non_dispatched {
+                Ok(true) => Ok(()),
+                Err(error) => Err(error.to_string()),
+                Ok(false) => self
+                    .machine_live_sessions()
+                    .stop(
+                        &lease,
+                        &self.state_store,
+                        &operation,
+                        &step.machine_id,
+                        input.machine_timeout,
+                    )
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| error.to_string()),
+            };
             let acknowledgement = MachineLifecycleStepAcknowledgement {
                 operation_id: operation.operation_id.clone(),
                 generation: operation.generation,

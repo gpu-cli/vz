@@ -17,6 +17,7 @@ use crate::transport::{connect_channel, status_to_client_error};
 mod build;
 mod checkpoint;
 mod container;
+mod environment_up;
 mod events;
 mod execution;
 mod files;
@@ -27,6 +28,7 @@ mod sandbox;
 mod stack;
 mod stream_completion;
 mod topology;
+pub use environment_up::EnvironmentUpStream;
 pub use machine_exec::{MachineExecEvent, MachineExecOutput, MachineExecStream};
 mod transport;
 

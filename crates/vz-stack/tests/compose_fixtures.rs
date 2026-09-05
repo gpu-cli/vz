@@ -49,6 +49,7 @@ fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
             name: "compose-fixture".to_string(),
             environment: EnvironmentSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
+                default_machine: None,
                 machines: vec![MachineSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),

@@ -220,11 +220,10 @@ pub async fn cmd_dev_exec(args: DevExecArgs, json_output: bool) -> Result<i32, E
         std::io::stdout()
             .flush()
             .map_err(|error| local("output_failed", error.to_string()))?;
-    } else {
-        eprintln!(
-            "Exec receipt identity: --request-id {request_id} --idempotency-key {idempotency_key}"
-        );
     }
+    // Raw mode reserves stdout/stderr for the guest's streams. Agents needing
+    // receipt identities use --json or supply the explicit identity pair; a
+    // successful fresh execution must not inject control-plane banners.
     let mut client = connect_existing_daemon_for_state_db(&default_state_db_path())
         .await
         .map_err(|error| local("daemon_unavailable", error.to_string()))?;

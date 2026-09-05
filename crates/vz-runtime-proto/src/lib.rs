@@ -24,6 +24,67 @@ mod tests {
     #![allow(clippy::unwrap_used)]
 
     use prost::Message;
+
+    #[test]
+    fn up_environment_wire_roundtrips_nonempty_request_and_terminal_receipt() {
+        use super::runtime_v2::*;
+        let request = UpEnvironmentRequest {
+            metadata: Some(RequestMetadata {
+                request_id: "req-up".into(),
+                idempotency_key: "key-up".into(),
+                trace_id: "trace".into(),
+            }),
+            definition: Some(ProjectDefinition {
+                schema_version: 1,
+                project_id: "prj_fixture".into(),
+                name: "project".into(),
+                environment: Some(EnvironmentSpec {
+                    schema_version: 1,
+                    default_machine: Some("app".into()),
+                    ..Default::default()
+                }),
+            }),
+            environment: Some("named".into()),
+            process_environment_id: Some("env_ignored".into()),
+            workspace_key: Some("opaque".into()),
+            path_hint: Some("/diagnostic".into()),
+            timeout_millis: 300_000,
+        };
+        assert_eq!(
+            UpEnvironmentRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+        let admission = EnvironmentUpAdmission {
+            schema_version: 1,
+            project_id: "prj_fixture".into(),
+            environment_id: "env_fixture".into(),
+            machine_ids: vec!["mch_fixture".into()],
+            definition_digest: "sha256:definition".into(),
+            request_id: "req-up".into(),
+            idempotency_key: "key-up".into(),
+            request_hash: "sha256:request".into(),
+            workspace_key: Some("opaque".into()),
+            created_at: 7,
+        };
+        let event = UpEnvironmentEvent {
+            schema_version: 1,
+            sequence: 9,
+            admission: Some(admission.clone()),
+            phase: "terminal".into(),
+            operation: None,
+            completion: Some(EnvironmentUpCompletion {
+                admission: Some(admission),
+                operation: None,
+                workspace_binding: None,
+                error: Some(ErrorDetail::default()),
+                completed_at: 8,
+            }),
+        };
+        assert_eq!(
+            UpEnvironmentEvent::decode(event.encode_to_vec().as_slice()).unwrap(),
+            event
+        );
+    }
     use std::collections::BTreeMap;
 
     #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
@@ -207,6 +268,7 @@ mod tests {
             ("ChownPath", RpcMode::Unary),
             ("GetCapabilities", RpcMode::Unary),
             ("GetProjectState", RpcMode::Unary),
+            ("UpEnvironment", RpcMode::ServerStreaming),
             ("StopEnvironment", RpcMode::ServerStreaming),
             ("ExecMachine", RpcMode::BidirectionalStreaming),
             ("ValidateLinuxVm", RpcMode::ServerStreaming),
@@ -760,6 +822,7 @@ mod tests {
                     ("machines", 2),
                     ("networks", 3),
                     ("endpoints", 4),
+                    ("default_machine", 5),
                 ],
             ),
             (
@@ -983,6 +1046,54 @@ mod tests {
             (
                 "GetProjectStateResponse",
                 &[("request_id", 1), ("project", 2)],
+            ),
+            (
+                "UpEnvironmentRequest",
+                &[
+                    ("metadata", 1),
+                    ("definition", 2),
+                    ("environment", 3),
+                    ("process_environment_id", 4),
+                    ("workspace_key", 5),
+                    ("path_hint", 6),
+                    ("timeout_millis", 7),
+                ],
+            ),
+            (
+                "EnvironmentUpAdmission",
+                &[
+                    ("schema_version", 1),
+                    ("project_id", 2),
+                    ("environment_id", 3),
+                    ("machine_ids", 4),
+                    ("definition_digest", 5),
+                    ("request_id", 6),
+                    ("idempotency_key", 7),
+                    ("request_hash", 8),
+                    ("workspace_key", 9),
+                    ("created_at", 10),
+                ],
+            ),
+            (
+                "EnvironmentUpCompletion",
+                &[
+                    ("admission", 1),
+                    ("operation", 2),
+                    ("workspace_binding", 3),
+                    ("error", 4),
+                    ("completed_at", 5),
+                ],
+            ),
+            (
+                "UpEnvironmentEvent",
+                &[
+                    ("schema_version", 1),
+                    ("sequence", 2),
+                    ("admission", 3),
+                    ("phase", 4),
+                    ("operation", 5),
+                    ("completion", 6),
+                ],
             ),
             (
                 "StopEnvironmentRequest",
@@ -1394,6 +1505,7 @@ mod tests {
             name: "shop".into(),
             environment: Some(EnvironmentSpec {
                 schema_version: 1,
+                default_machine: None,
                 machines: vec![machine_spec],
                 networks: vec![network_spec],
                 endpoints: vec![endpoint_spec],

@@ -112,5 +112,14 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
             self.assertFalse(self.validator.is_valid(value))
 
 
+    def test_optional_default_machine_name_shape(self):
+        for default, expected in [(None, True), ("dev", True), ("", False), (" ", False), (False, False), (42, False)]:
+            value = copy.deepcopy(EXAMPLE)
+            value["environment"]["default_machine"] = default
+            self.assertEqual(self.validator.is_valid(value), expected)
+        # Cross-references are checked by the production semantic validator,
+        # covered separately in the Rust definition loader tests.
+
+
 if __name__ == "__main__":
     unittest.main()

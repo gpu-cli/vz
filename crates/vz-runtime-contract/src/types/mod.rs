@@ -16,7 +16,9 @@ mod events;
 mod io;
 mod isolation;
 mod machine_execution;
-pub use environment_up::{EnvironmentUpAdmission, EnvironmentUpCompletion};
+pub use environment_up::{
+    EnvironmentUpAdmission, EnvironmentUpCompletion, EnvironmentUpProgress, EnvironmentUpRequest,
+};
 mod operations;
 mod sandbox;
 mod shared_vm;

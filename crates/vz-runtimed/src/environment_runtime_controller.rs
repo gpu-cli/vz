@@ -86,7 +86,6 @@ pub struct EnvironmentRuntimeController {
 }
 
 impl EnvironmentRuntimeController {
-    #[cfg(any(test, not(feature = "test-backend")))]
     pub(crate) fn require_own_lease(
         &self,
         lease: &EnvironmentControllerLease,
@@ -373,6 +372,9 @@ pub struct PreparedEnvironmentMachines {
 }
 
 impl PreparedEnvironmentMachines {
+    pub(crate) fn lease(&self) -> &EnvironmentControllerLease {
+        &self._lease
+    }
     pub fn environment(&self) -> &EnvironmentInstance {
         &self.environment
     }

@@ -20,23 +20,27 @@ ls -l .vz-runtime/runtimed.sock
 
 1. Restart daemon with explicit paths:
 ```bash
-vz-runtimed --state-store .vz-runtime/stack-state.db --runtime-data-dir .vz-runtime --socket .vz-runtime/runtimed.sock
+vz-runtimed --state-store-path .vz-runtime/stack-state.db --runtime-data-dir .vz-runtime --socket-path .vz-runtime/runtimed.sock
 ```
 2. Restart API with explicit daemon socket:
 ```bash
-vz-api --state-db .vz-runtime/stack-state.db --daemon-socket .vz-runtime/runtimed.sock
+vz-api --state-store-path .vz-runtime/stack-state.db --daemon-socket-path .vz-runtime/runtimed.sock
 ```
 3. Re-run readiness probes:
 ```bash
-curl -fsS "${VZ_RUNTIME_API_BASE_URL:-http://127.0.0.1:8080}/v1/capabilities"
-curl -fsS "${VZ_RUNTIME_API_BASE_URL:-http://127.0.0.1:8080}/metrics" | rg "vz_api_http_requests_total"
+curl -fsS "${VZ_RUNTIME_API_BASE_URL:-http://127.0.0.1:8181}/v1/capabilities"
+curl -fsS "${VZ_RUNTIME_API_BASE_URL:-http://127.0.0.1:8181}/metrics" | rg "vz_api_http_requests_total"
 ```
 
 ## Validation Exit Criteria
 
 - Capabilities endpoint returns 200.
 - Metrics endpoint returns expected families.
-- `vz vm linux list --state-db ...` returns without daemon transport errors.
+- For an existing selected topology, `vz status --environment <name-or-id> --json`
+  can read its persisted state through the selected daemon. This is a
+  control-plane connectivity check, not proof that Machines or workloads are
+  healthy. `vz vm linux list` and the former hostboot helper gates are
+  [retired](../retired-cli-workflows.md), not recovery fallbacks.
 
 ## Escalation
 

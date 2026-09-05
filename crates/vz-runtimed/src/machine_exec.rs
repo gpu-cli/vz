@@ -90,6 +90,7 @@ fn valid_id(value: Option<&str>) -> bool {
 fn select_machine(
     input: &MachineExecInput,
     environment: &EnvironmentInstance,
+    default_machine: Option<&str>,
 ) -> Result<MachineInstance, MachineError> {
     let candidates: Vec<_> = if let Some(selector) = &input.machine {
         if !valid_id(Some(selector)) {
@@ -109,6 +110,12 @@ fn select_machine(
             .machines
             .iter()
             .filter(|machine| machine.machine_id == *id)
+            .collect()
+    } else if let Some(name) = default_machine {
+        environment
+            .machines
+            .iter()
+            .filter(|machine| machine.name == name)
             .collect()
     } else {
         environment.machines.iter().collect()
@@ -174,7 +181,11 @@ impl RuntimeDaemon {
                     "selected Environment disappeared",
                 )
             })?;
-        let machine = select_machine(input, &environment)?;
+        let machine = select_machine(
+            input,
+            &environment,
+            project.definition.environment.default_machine.as_deref(),
+        )?;
         Ok((environment, machine))
     }
 

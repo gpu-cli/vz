@@ -36,11 +36,20 @@ struct Fixture {
 }
 impl Fixture {
     fn new() -> Self {
+        Self::with_default(false)
+    }
+    fn with_default(multiple: bool) -> Self {
         let root = tempfile::Builder::new()
             .prefix("vz-exec-")
             .tempdir_in("/private/tmp")
             .unwrap();
-        let definition:ProjectDefinition=serde_json::from_value(json!({"schema_version":1,"project_id":ProjectId::generate(),"name":"exec-cli","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"app","profile":"hardened","target":{"os":"linux","arch":"aarch64","image":"fixture"},"requested_capabilities":{"capabilities":["posix_exec"]}}]}})).unwrap();
+        let mut definition:ProjectDefinition=serde_json::from_value(json!({"schema_version":1,"project_id":ProjectId::generate(),"name":"exec-cli","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"app","profile":"hardened","target":{"os":"linux","arch":"aarch64","image":"fixture"},"requested_capabilities":{"capabilities":["posix_exec"]}}]}})).unwrap();
+        if multiple {
+            let mut worker = definition.environment.machines[0].clone();
+            worker.name = "worker".into();
+            definition.environment.machines.push(worker);
+            definition.environment.default_machine = Some("worker".into());
+        }
         std::fs::write(
             root.path().join("vz.json"),
             serde_json::to_vec(&definition).unwrap(),
@@ -49,7 +58,11 @@ impl Fixture {
         let mut environment = definition.instantiate_environment("selected", 1).unwrap();
         environment.lifecycle_generation = 1;
         environment.state = EnvironmentState::Ready;
-        let machine = &mut environment.machines[0];
+        if multiple {
+            environment.state = EnvironmentState::Failed;
+            environment.machines[0].state = MachineState::Stopped;
+        }
+        let machine = &mut environment.machines[usize::from(multiple)];
         machine.state = MachineState::Ready;
         machine.backend = Some(MachineBackend::MacosVirtualizationLinux);
         machine.negotiated_capabilities = CapabilitySet::new([MachineCapability::PosixExec]);
@@ -167,6 +180,12 @@ impl Fixture {
         Server::InProcess(shutdown, task)
     }
     fn command(&self) -> tokio::process::Command {
+        self.command_select(Some("app"))
+    }
+    fn command_select(&self, machine: Option<&str>) -> tokio::process::Command {
+        self.command_format(machine, true)
+    }
+    fn command_format(&self, machine: Option<&str>, json_output: bool) -> tokio::process::Command {
         let binary = installed_binaries()
             .map(|(cli, _)| cli)
             .unwrap_or_else(|| PathBuf::from(env!("CARGO_BIN_EXE_vz")));
@@ -182,13 +201,14 @@ impl Fixture {
             .env_remove("RUST_LOG")
             .env_remove("VZ_ENVIRONMENT_ID")
             .env_remove("VZ_MACHINE_ID");
+        if json_output {
+            command.arg("--json");
+        }
+        command.args(["exec", "--environment", "selected"]);
+        if let Some(machine) = machine {
+            command.args(["--machine", machine]);
+        }
         command.args([
-            "--json",
-            "exec",
-            "--environment",
-            "selected",
-            "--machine",
-            "app",
             "--timeout",
             "1",
             "--request-id",
@@ -257,6 +277,67 @@ async fn cli_exec_uses_topology_and_explicit_selectors_without_runtime_fallback(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn cli_exec_uses_declared_default_without_masking_stale_or_explicit_selectors() {
+    let fixture = Fixture::with_default(true);
+    let store = StateStore::open(&fixture.database).unwrap();
+    store.claim_machine_execution(&fixture.receipt).unwrap();
+    let mut receipt = fixture.receipt.clone();
+    receipt.state = MachineExecutionState::Completed;
+    receipt.exit_code = Some(7);
+    receipt.updated_at = 3;
+    store
+        .finish_machine_execution(&receipt.scope, &receipt)
+        .unwrap();
+    drop(store);
+    let server = fixture.serve().await;
+    let output = tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture.command_select(None).output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(7),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let records: Vec<Value> = String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(
+        records[1]["receipt"]["scope"]["machine_id"],
+        receipt.scope.machine_id.as_str()
+    );
+    assert_eq!(records[1]["replayed"], true);
+    for machine in [None, Some("missing"), Some("app")] {
+        let output = tokio::time::timeout(
+            Duration::from_secs(10),
+            fixture
+                .command_select(machine)
+                .env("VZ_MACHINE_ID", MachineId::generate().as_str())
+                .output(),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(2),
+            "unexpected default fallback: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let error: Value = serde_json::from_slice(&output.stderr).unwrap();
+        assert!(error["error"]["code"].is_string());
+    }
+    fixture.assert_project_unchanged();
+    server.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn cli_exec_replays_only_exact_seeded_terminal_receipt_and_nonzero_exit() {
     let fixture = Fixture::new();
     let store = StateStore::open(&fixture.database).unwrap();
@@ -290,6 +371,21 @@ async fn cli_exec_replays_only_exact_seeded_terminal_receipt_and_nonzero_exit() 
     assert_eq!(records[1]["replayed"], true);
     assert_eq!(records[1]["receipt"]["exit_code"], 7);
     assert_eq!(records[1]["receipt"]["output_replay_available"], false);
+    let raw = tokio::time::timeout(
+        Duration::from_secs(10),
+        fixture.command_format(Some("app"), false).output(),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    assert_eq!(raw.status.code(), Some(7));
+    assert!(raw.stdout.is_empty());
+    // Receipt recovery must disclose unavailable historical output, but must
+    // not prepend an unconditional control-plane identity banner.
+    assert_eq!(
+        raw.stderr,
+        b"Recovered execution receipt only; historical stdout/stderr are not retained.\n"
+    );
     fixture.assert_project_unchanged();
     server.shutdown().await;
 }
