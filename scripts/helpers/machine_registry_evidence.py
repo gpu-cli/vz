@@ -90,7 +90,7 @@ def validate_immutable_identity(value, mode, directory=False):
 
 
 def validate(value, expected):
-    keys(value, ["schema_version", "scope", "build", "target_resolution", "artifact_pinning", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
+    keys(value, ["schema_version", "scope", "build", "target_resolution", "artifact_pinning", "controller", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
     require(type(value["schema_version"]) is int and value["schema_version"] == 1, "schema version")
     require(value["scope"] == "registry_and_boot_lease_infrastructure_only", "scope overclaim")
     require(expected["profile"] == "release", "physical registry gate requires release")
@@ -109,6 +109,10 @@ def validate(value, expected):
     keys(artifact_pinning, ["all_pins_before_runtime_construction", "source_bundles_removed_before_boot",
                             "recovery_without_catalog_or_source", "pin_replay_read_only"])
     require(all(flag is True for flag in artifact_pinning.values()), "artifact pin admission/recovery proof failed")
+    controller = value["controller"]
+    keys(controller, ["environment_scoped_serialization", "fresh_preparation_and_attachment", "stale_attachment_refused",
+                      "recovery_preparation_read_only", "recovery_attachment_without_catalog"])
+    require(all(flag is True for flag in controller.values()), "Environment controller proof failed")
 
     topology = value["topology"]
     read_flags = ["creating_owned_read_only", "failed_up_owned_read_only", "stopped_owned_read_only",

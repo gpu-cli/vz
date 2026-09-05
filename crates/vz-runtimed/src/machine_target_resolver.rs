@@ -342,6 +342,11 @@ pub struct MachineTargetResolver {
 }
 
 impl MachineTargetResolver {
+    /// Explicit host tuple used when validating catalog-independent private pins.
+    pub fn host(&self) -> HostSpec {
+        self.host
+    }
+
     /// Construction validates only the supplied catalog, without filesystem access.
     pub fn new(
         host: HostSpec,

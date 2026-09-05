@@ -107,6 +107,23 @@ pub async fn pin_machine_artifacts(
     pin_inner(store, configuration, source).await
 }
 
+/// Keep a controller fence alive through detached copying and staging cleanup
+/// if its async waiter is cancelled. The trusted caller retains its own fence
+/// through subsequent lifecycle effects.
+pub(crate) async fn pin_machine_artifacts_retaining_fence(
+    store: Arc<MachineRuntimeStoreLease>,
+    target: &ResolvedLinuxMachineTarget,
+    fence: Arc<dyn Send + Sync>,
+) -> Result<PinnedMachineArtifacts, MachineArtifactStoreError> {
+    pin_inner_with_fence(
+        store,
+        target.configuration().clone(),
+        target.bundle_dir().to_path_buf(),
+        Some(fence),
+    )
+    .await
+}
+
 /// Post-admission recovery. Missing, malformed or mismatched pins fail closed
 /// without consulting the original catalog, source bundle or ambient installer.
 pub async fn load_machine_artifacts(
@@ -121,6 +138,15 @@ async fn pin_inner(
     store: Arc<MachineRuntimeStoreLease>,
     configuration: ResolvedMachineConfiguration,
     source: PathBuf,
+) -> Result<PinnedMachineArtifacts, MachineArtifactStoreError> {
+    pin_inner_with_fence(store, configuration, source, None).await
+}
+
+async fn pin_inner_with_fence(
+    store: Arc<MachineRuntimeStoreLease>,
+    configuration: ResolvedMachineConfiguration,
+    source: PathBuf,
+    fence: Option<Arc<dyn Send + Sync>>,
 ) -> Result<PinnedMachineArtifacts, MachineArtifactStoreError> {
     configuration.validate_for_machine(configuration.host, &configuration.machine)?;
     if configuration.configuration_digest()? != store.configuration_digest() {
@@ -137,9 +163,10 @@ async fn pin_inner(
 
     let copy_store = Arc::clone(&store);
     let copy_configuration = configuration.clone();
-    let mut stage =
-        tokio::task::spawn_blocking(move || copy_pin(copy_store, &copy_configuration, &source))
-            .await??;
+    let mut stage = tokio::task::spawn_blocking(move || {
+        copy_pin(copy_store, &copy_configuration, &source, fence)
+    })
+    .await??;
     let pending_path = store.data_path().join(&stage.name).join(BUNDLE);
     let verified = verify_kernel_bundle_read_only(&pending_path, configuration.kernel_profile)
         .await
@@ -173,6 +200,7 @@ fn copy_pin(
     store: Arc<MachineRuntimeStoreLease>,
     configuration: &ResolvedMachineConfiguration,
     source: &Path,
+    fence: Option<Arc<dyn Send + Sync>>,
 ) -> Result<PendingPin, MachineArtifactStoreError> {
     store.validate_current()?;
     // Inspect every source before creating a pending destination. Copies are
@@ -208,11 +236,14 @@ fn copy_pin(
         directory,
         bundle: None,
         published: false,
+        _fence: fence,
     };
     #[cfg(test)]
     pin_checkpoint("pending_created");
     mkdirat(&stage.directory, BUNDLE, Mode::from_raw_mode(0o700))?;
     stage.bundle = Some(open_dir_raw(&stage.directory, BUNDLE)?);
+    #[cfg(test)]
+    cancellation_tests::pause_copy_worker(store.data_path());
     let bundle = stage
         .bundle
         .as_ref()
@@ -455,6 +486,9 @@ struct PendingPin {
     directory: File,
     bundle: Option<File>,
     published: bool,
+    // Fields are dropped only after Drop::drop completes. Keep this last so
+    // even detached-worker cleanup and release of its store remain fenced.
+    _fence: Option<Arc<dyn Send + Sync>>,
 }
 impl Drop for PendingPin {
     fn drop(&mut self) {
@@ -518,3 +552,7 @@ mod crash_tests;
 #[cfg(test)]
 #[path = "machine_artifact_store_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "machine_artifact_cancellation_tests.rs"]
+mod cancellation_tests;

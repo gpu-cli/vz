@@ -2,6 +2,8 @@
 
 mod btrfs_health;
 pub mod btrfs_portability;
+#[cfg(target_os = "macos")]
+pub mod environment_runtime_controller;
 mod execution_sessions;
 mod grpc;
 #[cfg(target_os = "macos")]
@@ -148,6 +150,8 @@ pub struct RuntimeDaemon {
     machine_target_resolver: machine_target_resolver::MachineTargetResolver,
     #[cfg(unix)]
     machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend>,
+    #[cfg(target_os = "macos")]
+    environment_runtime_controller: environment_runtime_controller::EnvironmentRuntimeController,
     state_store: Mutex<StateStore>,
     teardown_finalizer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     execution_sessions: ExecutionSessionRegistry,
@@ -437,6 +441,8 @@ impl RuntimeDaemon {
             machine_target_resolver,
             #[cfg(unix)]
             machine_runtime_registry,
+            #[cfg(target_os = "macos")]
+            environment_runtime_controller: Default::default(),
             state_store: Mutex::new(state_store),
             teardown_finalizer_locks: Mutex::new(HashMap::new()),
             execution_sessions: ExecutionSessionRegistry::default(),
@@ -577,6 +583,47 @@ impl RuntimeDaemon {
     #[cfg(target_os = "macos")]
     pub fn machine_target_resolver(&self) -> &machine_target_resolver::MachineTargetResolver {
         &self.machine_target_resolver
+    }
+
+    /// Acquire the daemon's shared Environment fence. All topology lifecycle
+    /// controllers must retain this through admission, effects and journal writes.
+    #[cfg(target_os = "macos")]
+    pub async fn acquire_environment_controller(
+        &self,
+        project_id: &vz_runtime_contract::ProjectId,
+        environment_id: &vz_runtime_contract::EnvironmentId,
+    ) -> Result<
+        environment_runtime_controller::EnvironmentControllerLease,
+        environment_runtime_controller::EnvironmentRuntimeControllerError,
+    > {
+        self.environment_runtime_controller
+            .acquire(project_id, environment_id)
+            .await
+    }
+
+    /// Prepare private runtime stores/pins under a retained Environment fence.
+    /// This trusted-library method does not authorize a request, boot a Machine,
+    /// advertise Developer readiness, or replace the future streamed Up supervisor.
+    #[cfg(all(target_os = "macos", not(any(test, feature = "test-backend"))))]
+    pub async fn prepare_environment_machine_runtimes(
+        &self,
+        lease: environment_runtime_controller::EnvironmentControllerLease,
+        expected: &vz_runtime_contract::EnvironmentInstance,
+    ) -> Result<
+        environment_runtime_controller::PreparedEnvironmentMachines,
+        environment_runtime_controller::EnvironmentRuntimeControllerError,
+    > {
+        self.environment_runtime_controller
+            .require_own_lease(&lease)?;
+        lease
+            .prepare(
+                &self.state_store,
+                &self.machine_runtime_registry,
+                &self.machine_target_resolver,
+                expected,
+                current_unix_secs(),
+            )
+            .await
     }
 
     pub(crate) fn enforce_policy_preflight(

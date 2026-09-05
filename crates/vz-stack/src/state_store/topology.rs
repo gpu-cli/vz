@@ -7,10 +7,10 @@ use vz_runtime_contract::types::{
     EnvironmentLifecycleStatus, EnvironmentSelection, EnvironmentSelectionContext,
     EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision, LegacyMigrationError,
     LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus, MachineInstance,
-    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, NetworkInstance, OwnedResourceKind,
-    OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectState,
-    TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError, WorkspaceBinding,
-    migrate_legacy_developer_sandbox,
+    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineState, NetworkInstance,
+    OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
+    ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError,
+    WorkspaceBinding, migrate_legacy_developer_sandbox,
 };
 
 use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
@@ -2254,6 +2254,82 @@ impl StateStore {
         })
     }
 
+    /// Require the exact, never-started Environment snapshot before admission.
+    ///
+    /// The complete Project aggregate and absence of any lifecycle history are
+    /// checked in one deferred read snapshot. A previously started Environment
+    /// cannot become eligible by resetting its visible state to Creating.
+    ///
+    /// This read assertion does not authorize later effects. The caller must
+    /// hold its per-Environment controller serialization across this check and
+    /// admission, and re-read after its own reservations change the aggregate.
+    /// Supply a persisted snapshot: child collections returned by the state
+    /// loader have canonical ordering, unlike an unpersisted instantiation.
+    pub fn require_environment_admission_fence(
+        &self,
+        expected: &EnvironmentInstance,
+    ) -> Result<EnvironmentInstance, StackError> {
+        let conflict = |reason: &str| StackError::Machine {
+            code: vz_runtime_contract::MachineErrorCode::StateConflict,
+            message: format!(
+                "Environment `{}` admission fence refused: {reason}",
+                expected.environment_id
+            ),
+        };
+        expected
+            .validate()
+            .map_err(|error| TopologyLifecycleError::InvalidOperation {
+                reason: format!("invalid expected admission snapshot: {error}"),
+            })?;
+        let transaction = self.conn.unchecked_transaction()?;
+        let project = self
+            .load_project_state(expected.project_id.as_str())?
+            .ok_or_else(|| conflict("owning Project is absent"))?;
+        let environment = project
+            .environments
+            .into_iter()
+            .find(|environment| environment.environment_id == expected.environment_id)
+            .ok_or_else(|| conflict("Environment is absent from its owning Project"))?;
+        if environment != *expected {
+            return Err(conflict(
+                "persisted aggregate differs from the expected snapshot",
+            ));
+        }
+        if environment.state != EnvironmentState::Creating
+            || environment.lifecycle_generation != 0
+            || environment.active_operation_id.is_some()
+            || environment.legacy_migration.is_some()
+        {
+            return Err(conflict(
+                "Environment is not a never-started Creating instance",
+            ));
+        }
+        if environment.machines.iter().any(|machine| {
+            machine.state != MachineState::Creating
+                || machine.backend.is_some()
+                || machine.incarnation.is_some()
+                || machine.runtime_identity.is_some()
+                || machine.legacy_sandbox_id.is_some()
+                || !machine.negotiated_capabilities.capabilities.is_empty()
+                || !machine.negotiated_capabilities.unsupported.is_empty()
+        }) {
+            return Err(conflict(
+                "a Machine retains activation or previous lifecycle state",
+            ));
+        }
+        let has_history: bool = self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM environment_lifecycle_operations
+             WHERE environment_id = ?1)",
+            params![environment.environment_id.as_str()],
+            |row| row.get(0),
+        )?;
+        if has_history {
+            return Err(conflict("Environment has persisted lifecycle history"));
+        }
+        transaction.commit()?;
+        Ok(environment)
+    }
+
     /// Require one exact persisted ownership edge without reserving or mutating it.
     ///
     /// The ownership row, its Environment aggregate, and any attached lifecycle
@@ -3055,7 +3131,13 @@ impl StateStore {
         Ok(Some(environment))
     }
 
-    fn load_environment_lifecycle_by_idempotency_key(
+    /// Read a validated lifecycle journal before performing admission effects.
+    ///
+    /// Journals survive Environment deletion, so callers must check this before
+    /// reserving a replacement by name. This lookup does not authorize replay:
+    /// compare the complete request identity and owning Project/Environment, then
+    /// fence any resumed effects under the Environment controller lock.
+    pub fn load_environment_lifecycle_by_idempotency_key(
         &self,
         idempotency_key: &str,
     ) -> Result<Option<EnvironmentLifecycleOperation>, StackError> {

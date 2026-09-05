@@ -6290,6 +6290,15 @@ fn lifecycle_delete_is_exact_durable_replayable_and_releases_name() {
         .unwrap();
     assert_eq!(finished.status, EnvironmentLifecycleStatus::Succeeded);
     assert_eq!(tombstone.environment_id, old_environment_id);
+    let changes_before_lookup = store.total_changes_for_test();
+    assert_eq!(
+        store
+            .load_environment_lifecycle_by_idempotency_key("idem-delete")
+            .unwrap(),
+        Some(finished.clone()),
+        "read-only replay lookup must retain the deleted Environment identity"
+    );
+    assert_eq!(store.total_changes_for_test(), changes_before_lookup);
     assert!(
         store
             .load_project_state("prj_delete")
@@ -7559,6 +7568,13 @@ fn lifecycle_bulk_and_journal_projection_drift_fail_closed() {
         .expect_err("journal JSON must agree with immutable normalized request hash")
         .to_string();
     assert!(error.contains("field=request_hash"));
+    let changes = store.total_changes_for_test();
+    let error = store
+        .load_environment_lifecycle_by_idempotency_key("idem-projection")
+        .expect_err("pre-admission replay lookup must validate the same immutable projections")
+        .to_string();
+    assert!(error.contains("field=request_hash"));
+    assert_eq!(store.total_changes_for_test(), changes);
 }
 
 #[test]
@@ -14071,6 +14087,283 @@ fn exact_owned_resource_requirement_validates_active_up_and_rejects_nonowners_wi
             ..
         }
     ));
+    assert_eq!(store.total_changes_for_test(), changes);
+}
+
+fn never_started_admission_project() -> ProjectState {
+    let mut template = topology_project_state("prj_admission_fence", &["template"], "/checkout");
+    template.definition.environment.machines[0].workspace = None;
+    template.definition.environment.networks.clear();
+    template.definition.environment.endpoints.clear();
+    let environment = template
+        .definition
+        .instantiate_environment("fresh", 100)
+        .unwrap();
+    ProjectState {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        definition: template.definition,
+        environments: vec![environment],
+    }
+}
+
+#[test]
+fn environment_admission_fence_is_exact_read_only_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("environment-admission-fence.db");
+    let project = never_started_admission_project();
+    let expected = project.environments[0].clone();
+    {
+        let store = StateStore::open(&path).unwrap();
+        store.save_project_state(&project).unwrap();
+        let changes = store.total_changes_for_test();
+        assert_eq!(
+            store
+                .require_environment_admission_fence(&expected)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(store.total_changes_for_test(), changes);
+    }
+    let store = StateStore::open(&path).unwrap();
+    let changes = store.total_changes_for_test();
+    assert_eq!(
+        store
+            .require_environment_admission_fence(&expected)
+            .unwrap(),
+        expected
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+    let mut stale = expected.clone();
+    stale.updated_at += 1;
+    assert!(matches!(
+        store
+            .require_environment_admission_fence(&stale)
+            .unwrap_err(),
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+    assert_eq!(
+        store
+            .load_project_state(expected.project_id.as_str())
+            .unwrap(),
+        Some(project)
+    );
+}
+
+#[test]
+fn environment_admission_fence_rejects_new_reservations_and_missing_owner_read_only() {
+    let store = StateStore::in_memory().unwrap();
+    let project = never_started_admission_project();
+    let expected = &project.environments[0];
+    let initial_changes = store.total_changes_for_test();
+    assert!(store.require_environment_admission_fence(expected).is_err());
+    assert_eq!(store.total_changes_for_test(), initial_changes);
+    store.save_project_state(&project).unwrap();
+    store
+        .reserve_owned_resource(
+            &OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Other("machine_runtime_store".into()),
+                resource_id: "private-admission-store".into(),
+                environment_id: expected.environment_id.clone(),
+                machine_id: Some(expected.machines[0].machine_id.clone()),
+            },
+            101,
+        )
+        .unwrap();
+    let current = store
+        .load_project_state(expected.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    let changes = store.total_changes_for_test();
+    assert!(store.require_environment_admission_fence(expected).is_err());
+    assert_eq!(
+        store
+            .require_environment_admission_fence(&current.environments[0])
+            .unwrap(),
+        current.environments[0]
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+}
+
+#[test]
+fn environment_admission_fence_rejects_all_machine_activation_dimensions_read_only() {
+    for dimension in [
+        "state",
+        "backend",
+        "incarnation",
+        "runtime",
+        "capabilities",
+        "unsupported",
+        "legacy",
+    ] {
+        let store = StateStore::in_memory().unwrap();
+        let mut project = never_started_admission_project();
+        let machine = &mut project.environments[0].machines[0];
+        match dimension {
+            "state" => machine.state = MachineState::Failed,
+            "backend" => machine.backend = Some(MachineBackend::MacosVirtualizationLinux),
+            "incarnation" | "runtime" => {
+                machine.incarnation = Some(MachineIncarnation {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    incarnation_id: MachineIncarnationId::new("inc_previous_admission").unwrap(),
+                    machine_id: machine.machine_id.clone(),
+                    generation: 1,
+                    created_at: 100,
+                });
+                if dimension == "runtime" {
+                    machine.backend = Some(MachineBackend::MacosVirtualizationLinux);
+                    machine.runtime_identity = Some(MachineRuntimeIdentity {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        opaque_id: "previous-runtime-token".into(),
+                    });
+                }
+            }
+            "capabilities" => {
+                machine.negotiated_capabilities =
+                    CapabilitySet::new([MachineCapability::DockerEngine])
+            }
+            "unsupported" => {
+                machine.negotiated_capabilities.unsupported.insert(
+                    MachineCapability::DockerEngine,
+                    "previous negotiation".into(),
+                );
+            }
+            "legacy" => machine.legacy_sandbox_id = Some("legacy-machine".into()),
+            _ => unreachable!(),
+        }
+        if let Some(incarnation) = &machine.incarnation {
+            let ownership = OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Incarnation,
+                resource_id: incarnation.incarnation_id.to_string(),
+                environment_id: machine.environment_id.clone(),
+                machine_id: Some(machine.machine_id.clone()),
+            };
+            project.environments[0].ownership.push(ownership);
+        }
+        if dimension == "legacy" {
+            // A legacy ID cannot be grafted onto fresh Machine ownership.
+            let changes = store.total_changes_for_test();
+            assert!(matches!(
+                store
+                    .require_environment_admission_fence(&project.environments[0])
+                    .unwrap_err(),
+                StackError::TopologyLifecycle(_)
+            ));
+            assert_eq!(store.total_changes_for_test(), changes);
+            continue;
+        }
+        store.save_project_state(&project).unwrap();
+        let current = store
+            .load_project_state(project.definition.project_id.as_str())
+            .unwrap()
+            .unwrap();
+        let changes = store.total_changes_for_test();
+        assert!(
+            matches!(
+                store
+                    .require_environment_admission_fence(&current.environments[0])
+                    .unwrap_err(),
+                StackError::Machine {
+                    code: MachineErrorCode::StateConflict,
+                    ..
+                }
+            ),
+            "dimension={dimension}"
+        );
+        assert_eq!(
+            store.total_changes_for_test(),
+            changes,
+            "dimension={dimension}"
+        );
+    }
+}
+
+#[test]
+fn environment_admission_fence_rejects_started_and_rolled_back_history_read_only() {
+    let store = StateStore::in_memory().unwrap();
+    let project = never_started_admission_project();
+    let expected = &project.environments[0];
+    store.save_project_state(&project).unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            expected.environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-admission",
+            "idem-admission",
+            "sha256:admission",
+            101,
+        )
+        .unwrap();
+    let current = store
+        .load_project_state(expected.project_id.as_str())
+        .unwrap()
+        .unwrap();
+    let changes = store.total_changes_for_test();
+    assert!(store.require_environment_admission_fence(expected).is_err());
+    assert!(
+        store
+            .require_environment_admission_fence(&current.environments[0])
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let step = &operation.machine_steps[0];
+    store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: operation.operation_id.clone(),
+                generation: operation.generation,
+                machine_id: step.machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: None,
+                resulting_incarnation: None,
+                resulting_activation: None,
+                result: LifecycleStepResult::Failed {
+                    reason: "admission fixture failure".into(),
+                },
+            },
+            102,
+        )
+        .unwrap();
+    let operation = store
+        .finish_environment_lifecycle(operation.operation_id.as_str(), operation.generation, 103)
+        .unwrap();
+    assert_eq!(operation.status, EnvironmentLifecycleStatus::Failed);
+
+    // Adversarially restore every aggregate projection while retaining even
+    // terminal history. Normal mutation APIs deliberately forbid this reset.
+    store
+        .with_immediate_transaction(|store| store.save_project_state_in_transaction(&project))
+        .unwrap();
+    assert_eq!(
+        store
+            .load_project_state(expected.project_id.as_str())
+            .unwrap(),
+        Some(project.clone())
+    );
+    let changes = store.total_changes_for_test();
+    let error = store
+        .require_environment_admission_fence(expected)
+        .unwrap_err();
+    assert!(error.to_string().contains("persisted lifecycle history"));
+    assert_eq!(
+        store
+            .load_environment_lifecycle_by_idempotency_key("idem-admission")
+            .unwrap(),
+        Some(operation)
+    );
+    assert_eq!(
+        store
+            .load_environment_lifecycle_by_idempotency_key("missing-key")
+            .unwrap(),
+        None
+    );
     assert_eq!(store.total_changes_for_test(), changes);
 }
 

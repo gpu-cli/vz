@@ -197,10 +197,51 @@ must occur only under the controller's lifecycle/resource fence, after the VM is
 stopped. The infrastructure alone does not authorize deletion or establish the
 full crash-resumable admission state machine.
 
+## Serialized runtime admission (DEV)
+
+`EnvironmentRuntimeController` is now daemon-owned and keys its retained async
+locks by immutable Environment ID, not by a worktree, name or caller-supplied
+Project/Environment pair. A different claimed Project cannot obtain a second
+lock for the same Environment. The daemon rejects leases from another controller.
+Different Environments can still prepare concurrently. The non-cloneable public
+lease is retained by `PreparedEnvironmentMachines` through lifecycle start,
+runtime attachment and the caller's subsequent effects and acknowledgements.
+
+Preparation reloads and checks the exact persisted aggregate under the lease.
+Fresh admission requires `require_environment_admission_fence`: Creating,
+generation zero, no active operation, no Machine activation/legacy evidence,
+and no lifecycle journal history, checked together in a read-only snapshot.
+Resetting visible state cannot erase the historical prohibition on creating
+missing resources. All fresh sibling targets resolve before ownership writes;
+all ownership rows precede store acquisition; all pins precede any runtime
+construction. Reservations remain individually transactional and resumable, not
+an all-or-nothing Environment plan transaction.
+
+Post-begin preparation validates existing ownership and opens stores/pins
+read-only, using persisted Machine specifications and the explicit host tuple
+without consulting a catalog. Attachment requires the prepared definition,
+Project/Environment identity and next (or exact resumed) lifecycle generation,
+the current Up step and both store/VM ownership records. It also rechecks every
+sibling pin directory before constructing a runtime.
+
+Cancellation retains the Environment fence inside the blocking artifact-copy
+worker and its pending pin until staging cleanup completes. A cancelled async
+waiter cannot let another controller overlap detached staging writes. This does
+not implement request-disconnect-independent lifecycle supervision: after
+admission, boot/effect tasks still need a daemon-owned supervisor and retained
+activation handles.
+
+The validated read-only lifecycle lookup by idempotency key is now public and
+survives Environment deletion. The future request controller must use it before
+any selection/reservation effects, verify the complete request identity and
+return or resume the original journal rather than recreate a deleted name.
+These runtime APIs remain trusted-library infrastructure, not an authorized
+public Up API or a Developer Ready certificate.
+
 ## Still required before production Up
 
-Wire the explicit resolver and pin store into a production Environment
-controller with the immutable artifact boundary above. The legacy shared-VM path remains separate;
+Wire the serialized runtime admission path into the production request/lifecycle
+supervisor with the immutable artifact boundary above. The legacy shared-VM path remains separate;
 its ambient artifact selection must never be used as a topology fallback.
 The pinning/recovery implementation is tracked by `vz-mzs.2.5.8.2`: acquire
 runtime-free owner store leases, pin every sibling, then attach runtimes.
@@ -210,13 +251,14 @@ begin must validate persisted pins without requiring the original catalog.
 The per-Environment controller lock must cover admission as well as lifecycle
 execution; a generation check without that serialization is insufficient.
 
-The supervisor also needs a proven durable admission phase for a crash between
-the ownership reservation and first directory publication. This may use a phase
-marker or an audited equivalent that proves no lifecycle has ever begun, rather
-than introducing new state unnecessarily. A missing directory must not be
-treated as an ordinary `ExistingOnly` recovery or silently recreated after
-lifecycle effects have begun. This policy and its exact operation/generation
-checks must land before crash-resumable production Up is claimed.
+The durable never-started fence permits completing missing resources before
+first lifecycle begin, but the supervisor still needs a complete immutable
+admission plan binding the request, policy receipt, workspace inputs, every
+selected sibling configuration and independent Docker/BuildKit tool artifacts.
+Partial pre-begin pins cannot substitute for that complete plan. A missing
+directory after lifecycle begin remains an error, never permission to recreate
+or silently select a replacement. Full admission/startup/response-loss recovery
+must be verified before crash-resumable production Up is claimed.
 
 The registry and boot lease also do not replace the Environment supervisor,
 streaming lifecycle API, native macOS adapter, endpoint manager or five-verb CLI.
@@ -362,3 +404,39 @@ companion's six checksummed artifacts were reverified, and workspace formatting
 and diff checks passed. These are scoped backend and test-protocol results;
 they do not certify the installed five-command lifecycle, host Docker clients,
 native macOS Machines or the aggregate 0.4 release gate.
+
+The controller-integrated focused three-Machine gate passed at
+`.artifacts/sandbox-vm-e2e/20260905T055345Z/summary.txt` (one physical test,
+zero failed/ignored/filtered). Its strict evidence proves same-Environment lock
+contention and different-Environment independence, exact owner attachment,
+stale-generation refusal, and source-free recovery through an empty catalog.
+Recovery aggregate equality and pin inode/mode/time/byte snapshots are checked;
+the aggregate comparison is not a SQLite write-counter measurement. An
+independent audit verified the evidence checksum, all six distinct single-link
+serial logs, actual test/probe digests and removal of the fixture root.
+
+Component regressions are retained at
+`.artifacts/environment-controller/run-zKtVEb/`: the copied release driver
+passed eight controller tests, the deterministic cancelled-copy exclusion and
+cleanup test, and all ten filesystem SIGKILL checkpoints. These are synthetic
+filesystem/controller tests, not VM/daemon crash certification. Its seven-file
+`evidence.sha256` also binds build output and the complete library log: OCI 235
+passed/four opt-in ignored, daemon 223 passed/two opt-in ignored, stack 941
+passed/two opt-in ignored. Python evidence tests passed 7/7, strict affected
+production libraries/binaries and Machine fixture Clippy passed, and workspace
+formatting/diff checks passed. The full release backend regression for this
+controller change is recorded below.
+
+The final full release backend run passed at
+`.artifacts/sandbox-vm-e2e/20260905T055617Z/summary.txt`: runtime 19, runtime
+crash/reopen, StateStore crash atomicity, daemon teardown/recovery (102.94s),
+Machine controller (18.80s), stack 24 and BuildKit 3. Every required validator
+reported success. The teardown and Machine lanes each ran one physical test
+with zero failed/ignored/filtered tests. The independent completed-lane audit
+verified all 17 teardown boundaries, exact test and installed default-feature
+daemon digests/signature, Machine controller assertions and six serial hashes,
+and both actual initramfs identities. Post-run process inspection found no
+matching runtime/stack/BuildKit/teardown/Machine or crash-test helpers and no
+`vz-runtimed`. The component evidence manifest was reverified after completion.
+These results do not close production request/lifecycle supervision, host
+Docker compatibility, native macOS or the aggregate 0.4 release requirements.

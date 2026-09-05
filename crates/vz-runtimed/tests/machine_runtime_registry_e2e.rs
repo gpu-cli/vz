@@ -16,9 +16,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use vz_oci_macos::{
-    KernelProfile, MacosRuntimeBackend, Runtime, RuntimeConfig, SharedVmDockerReadiness,
-};
+use vz_oci_macos::{KernelProfile, MacosRuntimeBackend, Runtime, SharedVmDockerReadiness};
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
     EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, HostSpec, LifecycleStepResult,
@@ -29,9 +27,8 @@ use vz_runtime_contract::{
     StackResourceHint, StackRuntimeIdentity, StackRuntimeShutdownOutcome,
     StackRuntimeShutdownRequest, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
-use vz_runtimed::machine_artifact_store::{
-    PinnedMachineArtifacts, load_machine_artifacts, pin_machine_artifacts,
-};
+use vz_runtimed::environment_runtime_controller::EnvironmentRuntimeController;
+use vz_runtimed::machine_artifact_store::{PinnedMachineArtifacts, pin_machine_artifacts};
 use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
 use vz_runtimed::machine_runtime_registry::{
     MachineRuntimeAdmission, MachineRuntimeEntry, MachineRuntimeRegistry,
@@ -388,48 +385,53 @@ fn fixtures(
     .collect()
 }
 
-fn attach_runtime(
-    registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
-    pin: &PinnedMachineArtifacts,
-) -> Result<Arc<MachineRuntimeEntry<MacosRuntimeBackend>>> {
-    let profile = pin.configuration().kernel_profile;
-    let memory_mb = pin.configuration().resources.memory_mb;
-    let bundle = pin.runtime_bundle();
-    Ok(
-        registry.attach_runtime(Arc::clone(pin.store()), move |data| {
-            Ok(MacosRuntimeBackend::new(Runtime::new(RuntimeConfig {
-                data_dir: data.into(),
-                linux_install_dir: None,
-                linux_bundle_dir: None,
-                linux_profile: Some(profile),
-                pinned_linux_bundle: Some(bundle),
-                require_exact_agent_version: true,
-                agent_ready_timeout: Duration::from_secs(35),
-                exec_timeout: Duration::from_secs(30),
-                default_memory_mb: memory_mb,
-                ..RuntimeConfig::default()
-            })))
-        })?,
-    )
-}
-
-fn acquire_stores(
-    registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
+fn prepared_stores(
+    pins: &[PinnedMachineArtifacts],
     fixtures: &[MachineFixture],
-    mode: MachineRuntimeAdmission,
-    require_digest: bool,
 ) -> Result<Vec<Arc<MachineRuntimeStoreLease>>> {
+    ensure!(pins.len() == fixtures.len());
     fixtures
         .iter()
         .map(|fixture| {
-            Ok(registry.acquire_store(
-                &fixture.owner,
-                &fixture.store_reservation,
-                require_digest.then_some(fixture.config_digest.as_str()),
-                mode,
-            )?)
+            let pin = pins
+                .iter()
+                .find(|pin| pin.configuration().machine.name == fixture.name)
+                .with_context(|| format!("prepared Machine {}", fixture.name))?;
+            ensure!(pin.store().owner() == &fixture.owner);
+            ensure!(pin.store().configuration_digest() == fixture.config_digest);
+            Ok(Arc::clone(pin.store()))
         })
         .collect()
+}
+
+/// Poll each acquisition exactly once: no sleeps or timing-based lock proof.
+async fn controller_serialization_proof(
+    controller: &EnvironmentRuntimeController,
+    project_id: &vz_runtime_contract::ProjectId,
+    environment_id: &vz_runtime_contract::EnvironmentId,
+) -> Result<bool> {
+    let mut same = Box::pin(controller.acquire(project_id, environment_id));
+    let same_pending = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(same.as_mut(), context).is_pending())
+    })
+    .await;
+    ensure!(
+        same_pending,
+        "prepared Environment did not retain its controller lock"
+    );
+    drop(same);
+    let sibling_id = vz_runtime_contract::EnvironmentId::generate();
+    let mut sibling = Box::pin(controller.acquire(project_id, &sibling_id));
+    let sibling_result = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(sibling.as_mut(), context))
+    })
+    .await;
+    let sibling_ready = matches!(sibling_result, std::task::Poll::Ready(Ok(_)));
+    ensure!(
+        sibling_ready,
+        "a different Environment was blocked by the controller lock"
+    );
+    Ok(same_pending && sibling_ready)
 }
 
 async fn pin_all(
@@ -450,25 +452,6 @@ async fn pin_all(
         cleanup_directories.push(bundle);
         cleanup_directories.push(directory);
         pins.push(pin);
-    }
-    Ok(pins)
-}
-
-async fn load_all(
-    stores: &[Arc<MachineRuntimeStoreLease>],
-    fixtures: &[MachineFixture],
-    state: &ProjectState,
-) -> Result<Vec<PinnedMachineArtifacts>> {
-    let mut pins = Vec::new();
-    for (store, fixture) in stores.iter().zip(fixtures) {
-        let machine = state
-            .definition
-            .environment
-            .machines
-            .iter()
-            .find(|machine| machine.name == fixture.name)
-            .with_context(|| format!("persisted MachineSpec {}", fixture.name))?;
-        pins.push(load_machine_artifacts(Arc::clone(store), host(), machine).await?);
     }
     Ok(pins)
 }
@@ -1109,20 +1092,30 @@ async fn run_inner(
         .load_project_state(project_id.as_str())?
         .context("Project state")?;
     let fixtures = fixtures(&state, &resolved)?;
-    for (offset, record) in all_reservations(&fixtures).into_iter().enumerate() {
-        store.reserve_owned_resource(record, 101 + offset as u64)?;
-    }
-    let creating_owned_read_only = require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
     let registry_root = root.join("registry");
     fs::DirBuilder::new().mode(0o700).create(&registry_root)?;
     let registry = MachineRuntimeRegistry::new(registry_root.clone())?;
-    let stores = acquire_stores(
-        &registry,
-        &fixtures,
-        MachineRuntimeAdmission::CreateOrOpen,
-        true,
-    )?;
-    let pins = pin_all(&stores, &fixtures, &resolved, pin_cleanup_directories).await?;
+    let controller = EnvironmentRuntimeController::default();
+    let prepared = controller
+        .acquire(&project_id, &environment_id)
+        .await?
+        .prepare(&store, &registry, &resolver, &state.environments[0], 101)
+        .await?;
+    ensure!(prepared.environment().environment_id == environment_id);
+    let environment_scoped_serialization =
+        controller_serialization_proof(&controller, &project_id, &environment_id).await?;
+    let stores = prepared_stores(prepared.pins(), &fixtures)?;
+    for fixture in &fixtures {
+        let pin = prepared
+            .pins()
+            .iter()
+            .find(|pin| pin.configuration().machine.name == fixture.name)
+            .context("prepared cleanup pin")?;
+        let bundle = pin.bundle_dir();
+        pin_cleanup_directories.push(bundle.clone());
+        pin_cleanup_directories.push(bundle.parent().context("pin parent")?.to_path_buf());
+    }
+    let creating_owned_read_only = require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
     let pin_snapshot_before_replay = pin_snapshot(&stores, &fixtures)?;
     let mut replay_cleanup_directories = Vec::new();
     let replay_pins = pin_all(
@@ -1158,18 +1151,40 @@ async fn run_inner(
         require_machine_fence(&store, &stale_first_up, &fixtures[0]).is_err(),
         "stale lifecycle generation authorized a Machine boot"
     );
+    let stale_controller_attachment_refused = prepared
+        .attach_machine(
+            &store,
+            &registry,
+            &stale_first_up,
+            fixtures[0].owner.machine_id.as_ref().unwrap(),
+        )
+        .is_err();
+    ensure!(
+        stale_controller_attachment_refused,
+        "controller attached a stale lifecycle generation"
+    );
     let mut entries = Vec::new();
-    for (fixture, pin) in fixtures.iter().zip(&pins) {
-        let entry = attach_runtime(&registry, pin)?;
+    for fixture in &fixtures {
+        let machine_id = fixture
+            .owner
+            .machine_id
+            .as_ref()
+            .context("fixture Machine ID")?;
+        let entry = prepared.attach_machine(&store, &registry, &first_up, machine_id)?;
         cleanup_targets.push(CleanupTarget {
             runtime: entry.runtime().inner().clone(),
             stack_id: fixture.stack_id().into(),
         });
-        let replay = attach_runtime(&registry, pin)?;
+        let replay = prepared.attach_machine(&store, &registry, &first_up, machine_id)?;
         ensure!(Arc::ptr_eq(&entry, &replay));
         entries.push(entry);
     }
-    drop(pins);
+    let entries_controller_verified = entries.len() == fixtures.len()
+        && entries
+            .iter()
+            .zip(&fixtures)
+            .all(|(entry, fixture)| entry.owner() == &fixture.owner);
+    ensure!(entries_controller_verified);
     drop(stores);
     let docker_probe = fs::canonicalize(PathBuf::from(
         std::env::var_os(DOCKER_PROBE_ENV).context(DOCKER_PROBE_ENV)?,
@@ -1281,6 +1296,10 @@ async fn run_inner(
     let retained_a = retained_a?;
     let retained_b = retained_b?;
     let retained_h = boot(&entries[2], &fixtures[2]).await?;
+    let first_up_proof = finish_failed_up(&store, first_up, &fixtures, &first, 1, 120)?;
+    let first_failed_up_owned_read_only =
+        require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
+    drop(prepared);
     drop(entries);
     drop(registry);
     let reopened_registry = MachineRuntimeRegistry::new(registry_root)?;
@@ -1292,13 +1311,11 @@ async fn run_inner(
     ensure!(guest(&retained_a, "printf retained-a").await? == "retained-a");
     ensure!(guest(&retained_b, "printf retained-b").await? == "retained-b");
     ensure!(guest(&retained_h, "printf retained-h").await? == "retained-h");
-    let first_up_proof = finish_failed_up(&store, first_up, &fixtures, &first, 1, 120)?;
-    let first_failed_up_owned_read_only =
-        require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
     drop(retained_a);
     drop(retained_b);
     drop(retained_h);
 
+    let first_stop_lease = controller.acquire(&project_id, &environment_id).await?;
     let first_stop = store.begin_environment_lifecycle(
         environment_id.as_str(),
         EnvironmentLifecycleKind::Stop,
@@ -1314,6 +1331,7 @@ async fn run_inner(
         );
     }
     finish_stop(&store, first_stop, 131)?;
+    drop(first_stop_lease);
     let stopped_owned_read_only = require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
     let serial_log_dir =
         PathBuf::from(std::env::var_os(SERIAL_LOG_DIR_ENV).context(SERIAL_LOG_DIR_ENV)?);
@@ -1327,16 +1345,32 @@ async fn run_inner(
     let reopened_stopped_owned_read_only =
         require_owned_read_only(&reopened_store, project_id.as_str(), &fixtures)?;
     ensure!(!source_root.exists());
-    let reopened_stores = acquire_stores(
-        &reopened_registry,
-        &fixtures,
-        MachineRuntimeAdmission::ExistingOnly,
-        false,
-    )?;
     // This recovery deliberately has no target catalog or source bundle. The
     // fixture still retains its expected owners/resources for assertions; the
     // runtime configuration itself is loaded only from persisted state + pins.
-    let reopened_pins = load_all(&reopened_stores, &fixtures, &reopened_state).await?;
+    let empty_resolver = MachineTargetResolver::new(host(), MachineTargetCatalog::default())?;
+    ensure!(matches!(
+        empty_resolver
+            .resolve_project(&reopened_state.definition)
+            .await,
+        Err(TargetResolutionError::TargetNotFound { .. })
+    ));
+    let recovery_state_before = reopened_store.load_project_state(project_id.as_str())?;
+    let reopened_prepared = controller
+        .acquire(&project_id, &environment_id)
+        .await?
+        .prepare(
+            &reopened_store,
+            &reopened_registry,
+            &empty_resolver,
+            &reopened_state.environments[0],
+            139,
+        )
+        .await?;
+    let recovery_preparation_read_only =
+        reopened_store.load_project_state(project_id.as_str())? == recovery_state_before;
+    ensure!(recovery_preparation_read_only);
+    let reopened_stores = prepared_stores(reopened_prepared.pins(), &fixtures)?;
     let recovered_pin_snapshot = pin_snapshot(&reopened_stores, &fixtures)?;
     ensure!(recovered_pin_snapshot == pin_snapshot_before_replay);
     let second_up = reopened_store.begin_environment_lifecycle(
@@ -1351,15 +1385,29 @@ async fn run_inner(
         require_machine_fence(&reopened_store, &second_up, fixture)?;
     }
     let mut reopened_entries = Vec::new();
-    for (fixture, pin) in fixtures.iter().zip(&reopened_pins) {
-        let entry = attach_runtime(&reopened_registry, pin)?;
+    for fixture in &fixtures {
+        let entry = reopened_prepared.attach_machine(
+            &reopened_store,
+            &reopened_registry,
+            &second_up,
+            fixture
+                .owner
+                .machine_id
+                .as_ref()
+                .context("fixture Machine ID")?,
+        )?;
         cleanup_targets.push(CleanupTarget {
             runtime: entry.runtime().inner().clone(),
             stack_id: fixture.stack_id().into(),
         });
         reopened_entries.push(entry);
     }
-    drop(reopened_pins);
+    let recovery_entries_controller_verified = reopened_entries.len() == fixtures.len()
+        && reopened_entries
+            .iter()
+            .zip(&fixtures)
+            .all(|(entry, fixture)| entry.owner() == &fixture.owner);
+    ensure!(recovery_entries_controller_verified);
     drop(reopened_stores);
     let (second_a, second_b) = tokio::join!(
         boot(&reopened_entries[0], &fixtures[0]),
@@ -1401,7 +1449,8 @@ async fn run_inner(
     drop(second_a);
     drop(second_b);
     drop(second_h);
-
+    drop(reopened_prepared);
+    let second_stop_lease = controller.acquire(&project_id, &environment_id).await?;
     let second_stop = reopened_store.begin_environment_lifecycle(
         environment_id.as_str(),
         EnvironmentLifecycleKind::Stop,
@@ -1425,6 +1474,7 @@ async fn run_inner(
         );
     }
     finish_stop(&reopened_store, second_stop, 161)?;
+    drop(second_stop_lease);
     let second_boot_serial_logs = second_boot_serial_logs(&serial_log_dir, &fixtures)?;
     let final_stopped_owned_read_only =
         require_owned_read_only(&reopened_store, project_id.as_str(), &fixtures)?;
@@ -1459,6 +1509,13 @@ async fn run_inner(
             "source_bundles_removed_before_boot": true,
             "recovery_without_catalog_or_source": true,
             "pin_replay_read_only": true,
+        },
+        "controller": {
+            "environment_scoped_serialization": environment_scoped_serialization,
+            "fresh_preparation_and_attachment": entries_controller_verified,
+            "stale_attachment_refused": stale_controller_attachment_refused,
+            "recovery_preparation_read_only": recovery_preparation_read_only,
+            "recovery_attachment_without_catalog": recovery_entries_controller_verified,
         },
         "topology": {
             "project_id": project_id, "environment_id": environment_id,
