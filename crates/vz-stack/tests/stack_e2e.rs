@@ -19,7 +19,7 @@ use std::io::ErrorKind;
 use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use vz_oci_macos::{
@@ -730,6 +730,7 @@ async fn stack_guest_generation_evidence(
 #[derive(Debug, Default)]
 struct StackOwnershipFaultState {
     inject_stack_id: Option<String>,
+    inject_expected_owner: Option<String>,
     injected: bool,
     injected_ownership: Option<ContainerGenerationOwnership>,
     failed_guest: Option<serde_json::Value>,
@@ -754,9 +755,10 @@ impl StackOwnershipE2eRuntime {
         }
     }
 
-    fn inject_once_after_publication(&self, stack_id: &str) {
+    fn inject_once_after_publication(&self, stack_id: &str, expected_owner: &str) {
         let mut faults = self.faults.lock().unwrap();
         faults.inject_stack_id = Some(stack_id.to_string());
+        faults.inject_expected_owner = Some(expected_owner.to_string());
         faults.injected = false;
         faults.injected_ownership = None;
         faults.failed_guest = None;
@@ -833,11 +835,18 @@ impl StackOwnershipE2eRuntime {
                         .successful_ownership
                         .push(ownership);
                 }
-                let should_inject = {
+                let expected_owner = {
                     let faults = self.faults.lock().unwrap();
-                    !faults.injected && faults.inject_stack_id.as_deref() == Some(stack_id)
+                    (!faults.injected && faults.inject_stack_id.as_deref() == Some(stack_id)).then(
+                        || {
+                            faults
+                                .inject_expected_owner
+                                .clone()
+                                .expect("owned fault omitted its expected guest owner")
+                        },
+                    )
                 };
-                if should_inject {
+                if let Some(expected_owner) = expected_owner {
                     let ownership = receipt.ownership.clone().unwrap_or_else(|| {
                         panic!("macOS runtime published a container without generation ownership")
                     });
@@ -845,17 +854,55 @@ impl StackOwnershipE2eRuntime {
                     // the published generation before returning to the caller.
                     // Capture the real guest identity at the injection boundary,
                     // while the runtime-issued generation is still running.
-                    let failed_guest = self
-                        .inner
-                        .try_stack_guest_generation_evidence(
-                            stack_id,
-                            &ownership.container_id,
-                        )
-                        .unwrap_or_else(|error| {
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    let mut published_identity: Option<(String, u64, String)> = None;
+                    let failed_guest = loop {
+                        let guest = self
+                            .inner
+                            .try_stack_guest_generation_evidence(stack_id, &ownership.container_id)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "failed to inspect the published generation before injecting its acknowledgement loss: {error}"
+                                )
+                            });
+                        let identity = (
+                            guest["boot_id"]
+                                .as_str()
+                                .expect("published generation omitted its guest boot ID")
+                                .to_string(),
+                            guest["guest_init_pid"]
+                                .as_u64()
+                                .expect("published generation omitted its guest init PID"),
+                            guest["start_time"]
+                                .as_str()
+                                .expect("published generation omitted its guest process start time")
+                                .to_string(),
+                        );
+                        if let Some(initial_identity) = &published_identity {
+                            assert_eq!(
+                                &identity, initial_identity,
+                                "published generation identity changed while waiting for its payload"
+                            );
+                        } else {
+                            published_identity = Some(identity);
+                        }
+                        let owner = guest["owner"]
+                            .as_str()
+                            .expect("published generation owner was not a string");
+                        if owner == expected_owner {
+                            break guest;
+                        }
+                        assert!(
+                            owner.is_empty(),
+                            "published generation exposed unexpected guest owner {owner:?}; expected {expected_owner:?}"
+                        );
+                        if Instant::now() >= deadline {
                             panic!(
-                                "failed to inspect the published generation before injecting its acknowledgement loss: {error}"
-                            )
-                        });
+                                "published generation did not expose expected guest owner {expected_owner:?} before acknowledgement-loss injection; last evidence: {guest}"
+                            );
+                        }
+                        std::thread::sleep(Duration::from_millis(25));
+                    };
                     let failed_cgroup_path = failed_guest["cgroup_path"]
                         .as_str()
                         .filter(|path| !path.is_empty())
@@ -1658,7 +1705,7 @@ async fn stack_container_generation_ownership() {
     // running generation. Action-v3 durably binds the returned ownership,
     // performs exact cleanup, and projects the cleaned service as Stopped
     // before returning to the caller.
-    bridge.inject_once_after_publication("owned");
+    bridge.inject_once_after_publication("owned", "owned-generation-a");
     let spec_owned_a = stack_ownership_spec("owned", "worker", "owned-generation-a", None);
     let mut owned_orchestrator = stack_ownership_orchestrator(bridge.clone(), tmp.path(), "owned");
     let first_owned = owned_orchestrator.run(&spec_owned_a, None).unwrap();
@@ -1692,6 +1739,11 @@ async fn stack_container_generation_ownership() {
         .ownership;
     assert_eq!(journal_token, failure_token);
     let failed_guest = bridge.injected_guest_evidence();
+    assert_eq!(
+        failed_guest["owner"].as_str(),
+        Some("owned-generation-a"),
+        "fault injection must capture the failed generation after its configured payload is ready"
+    );
     let failed_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
 
     let spec_owned_b = stack_ownership_spec("owned", "worker", "owned-generation-b", None);
@@ -1704,6 +1756,11 @@ async fn stack_container_generation_ownership() {
     let replacement_guest =
         stack_guest_generation_evidence(&raw_runtime, "owned", &replacement_token.container_id)
             .await;
+    assert_eq!(
+        replacement_guest["owner"].as_str(),
+        Some("owned-generation-b"),
+        "replacement evidence must identify the replacement payload"
+    );
     let replacement_lifecycle = raw_runtime.lifecycle_diagnostics().await.unwrap();
     evidence["owned_failure"] = serde_json::json!({
         "stack_id": "owned",

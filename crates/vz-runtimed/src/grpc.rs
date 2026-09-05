@@ -292,6 +292,13 @@ async fn run_maintenance_loop(
     }
 }
 
+fn signal_maintenance_shutdown(shutdown: &tokio::sync::Notify) {
+    // Retain a permit if the maintenance loop is between `select!` polls while
+    // finishing a ticker iteration. `notify_waiters` would lose that shutdown
+    // signal and leave server termination waiting for the next waiter forever.
+    shutdown.notify_one();
+}
+
 fn persist_btrfs_health_probe(
     daemon: &RuntimeDaemon,
     probe: &BtrfsHealthProbe,
@@ -511,7 +518,7 @@ where
         .serve_with_incoming_shutdown(incoming, shutdown)
         .await;
 
-    maintenance_shutdown.notify_waiters();
+    signal_maintenance_shutdown(maintenance_shutdown.as_ref());
     let _ = maintenance_task.await;
 
     server_result?;

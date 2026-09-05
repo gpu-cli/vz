@@ -3889,6 +3889,7 @@ fn scoped_claimed_teardown_stays_active_through_finalizer_and_retries_exactly() 
         status: "success".to_string(),
         created_at: 102,
         metadata: serde_json::json!({
+            "event_type": "stack_destroyed",
             "request_digest": completed.request_digest.clone(),
             "changed_actions": 1,
             "removed_volumes": 0

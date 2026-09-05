@@ -1687,13 +1687,12 @@ fn teardown_desired_state_digest(desired: Option<&StackSpec>) -> Result<String, 
 fn teardown_response_json(
     response: &runtime_v2::TeardownStackResponse,
 ) -> Result<String, StackError> {
-    serde_json::to_string(&serde_json::json!({
-        "request_id": response.request_id,
-        "stack_name": response.stack_name,
-        "changed_actions": response.changed_actions,
-        "removed_volumes": response.removed_volumes,
-    }))
-    .map_err(Into::into)
+    vz_stack::canonical_teardown_response_json(
+        &response.request_id,
+        &response.stack_name,
+        response.changed_actions,
+        response.removed_volumes,
+    )
 }
 
 fn action_matches_targeted_intent(

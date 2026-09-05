@@ -497,6 +497,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         first_action_index: usize,
     ) -> Result<ClaimedTeardownAdmission, StackError> {
         let durable_operation_id = super::claimed_teardown_operation_id(operation_id)?;
+        #[cfg(feature = "e2e-test-hooks")]
+        {
+            self.teardown_e2e_operation_id = Some(durable_operation_id.clone());
+        }
         if !self.scoped_cleanup_only {
             return Err(super::scope_state_conflict(
                 "claimed teardown batching requires cleanup-only authority",

@@ -7063,6 +7063,31 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
 }
 
 #[tokio::test]
+async fn maintenance_shutdown_is_retained_before_waiter_registration() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = Arc::new(
+        RuntimeDaemon::start(RuntimedConfig {
+            state_store_path: tmp.path().join("state").join("stack-state.db"),
+            runtime_data_dir: tmp.path().join("runtime"),
+            socket_path: tmp.path().join("runtime").join("runtimed.sock"),
+        })
+        .expect("daemon start"),
+    );
+    let shutdown = Arc::new(tokio::sync::Notify::new());
+
+    // Model server shutdown racing ahead of the maintenance task's first
+    // `shutdown.notified()` poll. A stored notify-one permit must make the
+    // loop terminate immediately instead of entering its periodic work.
+    signal_maintenance_shutdown(shutdown.as_ref());
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        run_maintenance_loop(daemon, Arc::new(GrpcObservability::default()), shutdown),
+    )
+    .await
+    .expect("pre-signaled maintenance shutdown must be retained");
+}
+
+#[tokio::test]
 async fn maintenance_loop_cleans_expired_idempotency_keys() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let config = RuntimedConfig {

@@ -9843,6 +9843,218 @@ fn teardown_finalizer_fixture(operation_key: &str) -> TeardownFinalizer {
     }
 }
 
+fn teardown_policy_audit_fixture(receipt_id: &str, request_id: &str, created_at: u64) -> Receipt {
+    Receipt {
+        receipt_id: receipt_id.to_string(),
+        operation: "policy_preflight:remove_container".to_string(),
+        entity_id: request_id.to_string(),
+        entity_type: "policy".to_string(),
+        request_id: request_id.to_string(),
+        status: "allow".to_string(),
+        created_at,
+        metadata: serde_json::json!({"decision": "allow"}),
+    }
+}
+
+fn completed_teardown_finalizer_fixture(operation_key: &str) -> TeardownFinalizer {
+    let mut record = teardown_finalizer_fixture(operation_key);
+    let removed_volumes = u32::try_from(record.initial_volumes.len()).unwrap();
+    record.runtime_shutdown = true;
+    record.staged_volumes = record.initial_volumes.clone();
+    record.purged_volumes = record.initial_volumes.clone();
+    record.disk_staged = true;
+    record.disk_purged = true;
+    record.status = TeardownFinalizerStatus::Completed;
+    record.updated_at = 101;
+    record.completed_at = Some(101);
+    record.response_json = Some(
+        canonical_teardown_response_json(
+            &record.request_id,
+            &record.scope.stack_id,
+            record.changed_actions,
+            removed_volumes,
+        )
+        .unwrap(),
+    );
+    record.receipt = Some(Receipt {
+        receipt_id: teardown_receipt_id(&record.operation_key, &record.request_digest),
+        operation: "teardown_stack".to_string(),
+        entity_id: record.scope.stack_id.clone(),
+        entity_type: "stack".to_string(),
+        request_id: record.request_id.clone(),
+        status: "success".to_string(),
+        created_at: 101,
+        metadata: canonical_teardown_receipt_metadata(
+            &record.request_digest,
+            record.changed_actions,
+            removed_volumes,
+        ),
+    });
+    record
+}
+
+#[test]
+fn teardown_policy_audit_reservation_replay_and_conflict_are_atomic() {
+    let store = StateStore::in_memory().unwrap();
+    let original = teardown_finalizer_fixture("req:policy-atomic-original");
+    let original_audit =
+        teardown_policy_audit_fixture("rcp-policy-original", &original.request_id, 100);
+
+    assert_eq!(
+        store
+            .reserve_teardown_finalizer_with_policy_audit(&original, &original_audit)
+            .unwrap(),
+        original
+    );
+    assert_eq!(
+        store.load_receipt(&original_audit.receipt_id).unwrap(),
+        Some(original_audit.clone())
+    );
+
+    let replay_audit =
+        teardown_policy_audit_fixture("rcp-policy-replay", &original.request_id, 101);
+    let receipts_before_replay = store.list_receipts().unwrap();
+    assert_eq!(
+        store
+            .reserve_teardown_finalizer_with_policy_audit(&original, &replay_audit)
+            .unwrap(),
+        original
+    );
+    assert_eq!(store.list_receipts().unwrap(), receipts_before_replay);
+    assert!(
+        store
+            .load_receipt(&replay_audit.receipt_id)
+            .unwrap()
+            .is_none()
+    );
+
+    let conflicting = teardown_finalizer_fixture("req:policy-atomic-conflict");
+    let conflicting_audit =
+        teardown_policy_audit_fixture("rcp-policy-conflict", &conflicting.request_id, 102);
+    let receipts_before_conflict = store.list_receipts().unwrap();
+    let error = store
+        .reserve_teardown_finalizer_with_policy_audit(&conflicting, &conflicting_audit)
+        .unwrap_err();
+    assert_eq!(error.machine_code(), MachineErrorCode::StateConflict);
+    assert_eq!(store.list_receipts().unwrap(), receipts_before_conflict);
+    assert!(
+        store
+            .load_receipt(&conflicting_audit.receipt_id)
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        store
+            .load_teardown_finalizer(&conflicting.operation_key)
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        store
+            .load_teardown_finalizer(&original.operation_key)
+            .unwrap(),
+        Some(original)
+    );
+}
+
+#[test]
+fn teardown_policy_audit_failure_rolls_back_finalizer_and_idempotency_claim() {
+    let store = StateStore::in_memory().unwrap();
+    let record = teardown_finalizer_fixture("idem:policy-audit-rollback");
+    let audit = teardown_policy_audit_fixture("rcp-policy-abort", &record.request_id, 100);
+    store
+        .conn
+        .execute_batch(
+            "CREATE TEMP TRIGGER abort_policy_audit
+             BEFORE INSERT ON receipt_state
+             WHEN NEW.receipt_id = 'rcp-policy-abort'
+             BEGIN
+                 SELECT RAISE(ABORT, 'injected policy audit failure');
+             END;",
+        )
+        .unwrap();
+
+    let error = store
+        .reserve_teardown_finalizer_with_policy_audit(&record, &audit)
+        .unwrap_err();
+    assert!(error.to_string().contains("injected policy audit failure"));
+    assert!(
+        store
+            .load_teardown_finalizer(&record.operation_key)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.load_receipt(&audit.receipt_id).unwrap().is_none());
+    assert!(
+        store
+            .find_idempotency_result(record.idempotency_key.as_deref().unwrap())
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn teardown_terminal_output_requires_canonical_response_bytes_and_exact_metadata() {
+    let store = StateStore::in_memory().unwrap();
+    let canonical = completed_teardown_finalizer_fixture("req:canonical-terminal-output");
+    let valid_error = store.reserve_teardown_finalizer(&canonical).unwrap_err();
+    assert!(
+        valid_error
+            .to_string()
+            .contains("new teardown finalizer must be prepared"),
+        "canonical terminal output should pass output validation: {valid_error}"
+    );
+
+    let mut noncanonical_response = canonical.clone();
+    noncanonical_response.response_json = Some(
+        serde_json::to_string_pretty(
+            &serde_json::from_str::<serde_json::Value>(
+                noncanonical_response.response_json.as_deref().unwrap(),
+            )
+            .unwrap(),
+        )
+        .unwrap(),
+    );
+    assert_ne!(
+        noncanonical_response.response_json, canonical.response_json,
+        "test fixture must preserve semantics while changing response bytes"
+    );
+    let error = store
+        .reserve_teardown_finalizer(&noncanonical_response)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("completed teardown finalizer output does not match its identity")
+    );
+
+    for metadata in [
+        serde_json::json!({
+            "event_type": "wrong_event",
+            "request_digest": canonical.request_digest.clone(),
+            "changed_actions": canonical.changed_actions,
+            "removed_volumes": canonical.initial_volumes.len(),
+        }),
+        {
+            let mut metadata = canonical.receipt.as_ref().unwrap().metadata.clone();
+            metadata
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".to_string(), serde_json::json!(true));
+            metadata
+        },
+    ] {
+        let mut malformed = canonical.clone();
+        malformed.receipt.as_mut().unwrap().metadata = metadata;
+        let error = store.reserve_teardown_finalizer(&malformed).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("completed teardown finalizer output does not match its identity")
+        );
+    }
+}
+
 #[test]
 fn teardown_finalizer_reservation_replays_exact_identity_and_rejects_key_reuse() {
     let store = StateStore::in_memory().unwrap();
@@ -14360,6 +14572,7 @@ fn terminal_claimed_teardown_reconstructs_one_atomic_finalizer_result() {
         status: "success".to_string(),
         created_at: 202,
         metadata: serde_json::json!({
+            "event_type": "stack_destroyed",
             "request_digest": finalizer.request_digest.clone(),
             "changed_actions": 2,
             "removed_volumes": 0

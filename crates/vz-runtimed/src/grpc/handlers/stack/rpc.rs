@@ -363,13 +363,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 &metadata,
                 &request_id,
             )?;
-        } else {
-            enforce_mutation_policy_preflight(
-                self.daemon.as_ref(),
-                RuntimeOperation::RemoveContainer,
-                &metadata,
-                &request_id,
-            )?;
         }
 
         // The lock is qualified by exact workload scope, not a display-only
@@ -597,6 +590,26 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             return Ok(stack_stream_response(events, None));
         }
 
+        // A prepared finalizer already proves that this exact request passed
+        // mutation policy admission before any teardown effect was reserved.
+        // Re-evaluating the policy hook here would append a second audit
+        // receipt on every crash replay. Keep completed replay and conflicts
+        // above read-only, and audit only a genuinely new mutation immediately
+        // before its durable reservation.
+        let policy_audit = if existing_finalizer.is_none() {
+            self.daemon
+                .with_state_store(|store| store.ensure_no_prepared_teardown(&workload_scope))
+                .map_err(|error| status_from_stack_error(error, &request_id))?;
+            Some(authorize_mutation_policy_preflight(
+                self.daemon.as_ref(),
+                RuntimeOperation::RemoveContainer,
+                &metadata,
+                &request_id,
+            )?)
+        } else {
+            None
+        };
+
         let changed_actions = u32::try_from(teardown_actions.len()).map_err(|_| {
             status_from_machine_error(MachineError::new(
                 MachineErrorCode::InternalError,
@@ -679,10 +692,17 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 updated_at: now,
                 completed_at: None,
             };
-            match self
-                .daemon
-                .with_state_store(|store| store.reserve_teardown_finalizer(&prepared))
-            {
+            let policy_audit = policy_audit.as_ref().ok_or_else(|| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::InternalError,
+                    "new teardown reservation has no policy admission audit".to_string(),
+                    Some(request_id.clone()),
+                    BTreeMap::new(),
+                ))
+            })?;
+            match self.daemon.with_state_store(|store| {
+                store.reserve_teardown_finalizer_with_policy_audit(&prepared, policy_audit)
+            }) {
                 Ok(record) => record,
                 Err(error) => {
                     events.push(Err(status_from_stack_error(error, &request_id)));
@@ -690,6 +710,19 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 }
             }
         };
+        #[cfg(feature = "e2e-test-hooks")]
+        vz_stack::teardown_e2e_boundary(
+            "finalizer_reserved",
+            &stack_name,
+            &finalizer.reconcile_operation_id,
+            None,
+            serde_json::json!({
+                "changed_actions": finalizer.changed_actions,
+                "initial_volumes": &finalizer.initial_volumes,
+                "initial_disk_image": finalizer.initial_disk_image,
+                "initial_runtime_present": finalizer.initial_runtime_present,
+            }),
+        );
 
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
@@ -762,6 +795,14 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             events.push(Err(status_from_stack_error(error, &request_id)));
             return Ok(stack_stream_response(events, None));
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        vz_stack::teardown_e2e_boundary(
+            "empty_desired_state_persisted",
+            &stack_name,
+            &finalizer.reconcile_operation_id,
+            None,
+            serde_json::json!({"desired_services": 0}),
+        );
 
         sequence += 1;
         events.push(Ok(teardown_stack_progress_event(
@@ -784,12 +825,18 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 .await
                 {
                     Ok(vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped) => {
-                        pause_after_exact_runtime_stop_for_e2e(
+                        #[cfg(feature = "e2e-test-hooks")]
+                        vz_stack::teardown_e2e_boundary(
+                            "runtime_shutdown_before_progress",
                             &stack_name,
                             &finalizer.reconcile_operation_id,
-                            &expected,
-                        )
-                        .await;
+                            None,
+                            serde_json::json!({
+                                "expected_runtime_identity": &expected,
+                                "outcome": "stopped",
+                                "finalizer_progress_persisted": false,
+                            }),
+                        );
                     }
                     Ok(vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent) => {}
                     Ok(vz_runtime_contract::StackRuntimeShutdownOutcome::ReplacementPresent {
@@ -838,6 +885,15 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             teardown_filesystem_token(&finalizer.operation_key, &finalizer.request_digest);
         for volume in finalizer.initial_volumes.clone() {
             if finalizer.staged_volumes.binary_search(&volume).is_err() {
+                #[cfg(feature = "e2e-test-hooks")]
+                let stage_state_before =
+                    match volume_manager.inspect_teardown_volume(&filesystem_token, &volume) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            events.push(Err(status_from_stack_error(error, &request_id)));
+                            return Ok(stack_stream_response(events, None));
+                        }
+                    };
                 match volume_manager.stage_teardown_volume(&filesystem_token, &volume) {
                     Ok(TeardownPathState::Tombstone) => {}
                     Ok(TeardownPathState::Missing) => {
@@ -857,6 +913,18 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                         return Ok(stack_stream_response(events, None));
                     }
                 }
+                #[cfg(feature = "e2e-test-hooks")]
+                vz_stack::teardown_e2e_boundary(
+                    "volume_staged",
+                    &stack_name,
+                    &finalizer.reconcile_operation_id,
+                    Some(&volume),
+                    serde_json::json!({
+                        "mutated": stage_state_before == TeardownPathState::Source,
+                        "state_before": format!("{stage_state_before:?}"),
+                        "finalizer_progress_persisted": false,
+                    }),
+                );
                 finalizer.staged_volumes.push(volume.clone());
                 finalizer.staged_volumes.sort();
                 finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
@@ -869,33 +937,46 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                 }
             }
             if finalizer.purged_volumes.binary_search(&volume).is_err() {
-                match volume_manager.inspect_teardown_volume(&filesystem_token, &volume) {
-                    Ok(TeardownPathState::Tombstone | TeardownPathState::Missing) => {
-                        // Purge also fsyncs the tombstone parent when the entry is
-                        // already absent. That repairs the crash window between
-                        // unlink and directory durability before we persist the
-                        // database milestone.
-                        if let Err(error) =
-                            volume_manager.purge_teardown_volume(&filesystem_token, &volume)
-                        {
+                let _purge_mutated =
+                    match volume_manager.inspect_teardown_volume(&filesystem_token, &volume) {
+                        Ok(TeardownPathState::Tombstone | TeardownPathState::Missing) => {
+                            // Purge also fsyncs the tombstone parent when the entry is
+                            // already absent. That repairs the crash window between
+                            // unlink and directory durability before we persist the
+                            // database milestone.
+                            match volume_manager.purge_teardown_volume(&filesystem_token, &volume) {
+                                Ok(mutated) => mutated,
+                                Err(error) => {
+                                    events.push(Err(status_from_stack_error(error, &request_id)));
+                                    return Ok(stack_stream_response(events, None));
+                                }
+                            }
+                        }
+                        Ok(TeardownPathState::Source) => {
+                            events.push(Err(status_from_machine_error(MachineError::new(
+                                MachineErrorCode::StateConflict,
+                                format!("detached teardown volume `{volume}` reappeared"),
+                                Some(request_id.clone()),
+                                BTreeMap::new(),
+                            ))));
+                            return Ok(stack_stream_response(events, None));
+                        }
+                        Err(error) => {
                             events.push(Err(status_from_stack_error(error, &request_id)));
                             return Ok(stack_stream_response(events, None));
                         }
-                    }
-                    Ok(TeardownPathState::Source) => {
-                        events.push(Err(status_from_machine_error(MachineError::new(
-                            MachineErrorCode::StateConflict,
-                            format!("detached teardown volume `{volume}` reappeared"),
-                            Some(request_id.clone()),
-                            BTreeMap::new(),
-                        ))));
-                        return Ok(stack_stream_response(events, None));
-                    }
-                    Err(error) => {
-                        events.push(Err(status_from_stack_error(error, &request_id)));
-                        return Ok(stack_stream_response(events, None));
-                    }
-                }
+                    };
+                #[cfg(feature = "e2e-test-hooks")]
+                vz_stack::teardown_e2e_boundary(
+                    "volume_purged",
+                    &stack_name,
+                    &finalizer.reconcile_operation_id,
+                    Some(&volume),
+                    serde_json::json!({
+                        "mutated": _purge_mutated,
+                        "finalizer_progress_persisted": false,
+                    }),
+                );
                 finalizer.purged_volumes.push(volume);
                 finalizer.purged_volumes.sort();
                 finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
@@ -909,6 +990,14 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             }
         }
         if finalizer.initial_disk_image && !finalizer.disk_staged {
+            #[cfg(feature = "e2e-test-hooks")]
+            let stage_state_before = match volume_manager.inspect_teardown_disk(&filesystem_token) {
+                Ok(state) => state,
+                Err(error) => {
+                    events.push(Err(status_from_stack_error(error, &request_id)));
+                    return Ok(stack_stream_response(events, None));
+                }
+            };
             match volume_manager.stage_teardown_disk(&filesystem_token) {
                 Ok(TeardownPathState::Tombstone) => {}
                 Ok(TeardownPathState::Missing) => {
@@ -927,6 +1016,18 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     return Ok(stack_stream_response(events, None));
                 }
             }
+            #[cfg(feature = "e2e-test-hooks")]
+            vz_stack::teardown_e2e_boundary(
+                "disk_staged",
+                &stack_name,
+                &finalizer.reconcile_operation_id,
+                None,
+                serde_json::json!({
+                    "mutated": stage_state_before == TeardownPathState::Source,
+                    "state_before": format!("{stage_state_before:?}"),
+                    "finalizer_progress_persisted": false,
+                }),
+            );
             finalizer.disk_staged = true;
             finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
             if let Err(error) = self
@@ -938,14 +1039,17 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             }
         }
         if finalizer.initial_disk_image && !finalizer.disk_purged {
-            match volume_manager.inspect_teardown_disk(&filesystem_token) {
+            let _purge_mutated = match volume_manager.inspect_teardown_disk(&filesystem_token) {
                 Ok(TeardownPathState::Tombstone | TeardownPathState::Missing) => {
                     // As with volumes, an absent tombstone still requires the
                     // parent-directory durability repair before the DB claims
                     // that purge completed.
-                    if let Err(error) = volume_manager.purge_teardown_disk(&filesystem_token) {
-                        events.push(Err(status_from_stack_error(error, &request_id)));
-                        return Ok(stack_stream_response(events, None));
+                    match volume_manager.purge_teardown_disk(&filesystem_token) {
+                        Ok(mutated) => mutated,
+                        Err(error) => {
+                            events.push(Err(status_from_stack_error(error, &request_id)));
+                            return Ok(stack_stream_response(events, None));
+                        }
                     }
                 }
                 Ok(TeardownPathState::Source) => {
@@ -961,7 +1065,18 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
                     events.push(Err(status_from_stack_error(error, &request_id)));
                     return Ok(stack_stream_response(events, None));
                 }
-            }
+            };
+            #[cfg(feature = "e2e-test-hooks")]
+            vz_stack::teardown_e2e_boundary(
+                "disk_purged",
+                &stack_name,
+                &finalizer.reconcile_operation_id,
+                None,
+                serde_json::json!({
+                    "mutated": _purge_mutated,
+                    "finalizer_progress_persisted": false,
+                }),
+            );
             finalizer.disk_purged = true;
             finalizer.updated_at = current_unix_secs().max(finalizer.updated_at);
             if let Err(error) = self
@@ -1077,6 +1192,17 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
             events.push(Err(status));
             return Ok(stack_stream_response(events, None));
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        vz_stack::teardown_e2e_boundary(
+            "terminal_transaction_committed",
+            &stack_name,
+            &finalizer.reconcile_operation_id,
+            None,
+            serde_json::json!({
+                "receipt_id": &receipt_id,
+                "response_json": &finalizer.response_json,
+            }),
+        );
         sequence += 1;
         events.push(Ok(teardown_stack_completion_event(
             &finalizer.request_id,
@@ -1971,60 +2097,6 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
         }
         Ok(response)
     }
-}
-
-#[cfg(feature = "e2e-test-hooks")]
-async fn pause_after_exact_runtime_stop_for_e2e(
-    stack_name: &str,
-    operation_id: &str,
-    expected: &vz_runtime_contract::StackRuntimeIdentity,
-) {
-    const MARKER_ENV: &str = "VZ_TEST_TEARDOWN_AFTER_EXACT_STOP_MARKER";
-    const STACK_ENV: &str = "VZ_TEST_TEARDOWN_AFTER_EXACT_STOP_STACK";
-
-    let Ok(marker_path) = std::env::var(MARKER_ENV) else {
-        return;
-    };
-    if std::env::var(STACK_ENV).is_ok_and(|configured| configured != stack_name) {
-        return;
-    }
-    let marker_path = std::path::PathBuf::from(marker_path);
-    if let Some(parent) = marker_path.parent() {
-        std::fs::create_dir_all(parent).unwrap_or_else(|error| {
-            panic!(
-                "could not create teardown crash-marker directory {}: {error}",
-                parent.display()
-            )
-        });
-    }
-    let payload = serde_json::json!({
-        "schema_version": 1,
-        "stack_id": stack_name,
-        "operation_id": operation_id,
-        "expected_runtime_identity": expected,
-        "outcome": "stopped",
-        "finalizer_progress_persisted": false,
-    })
-    .to_string();
-    std::fs::write(&marker_path, payload).unwrap_or_else(|error| {
-        panic!(
-            "could not write teardown crash marker {}: {error}",
-            marker_path.display()
-        )
-    });
-
-    // The black-box parent SIGKILLs this process. Remaining paused makes the
-    // crash boundary exact: backend stop returned, but finalizer progress has
-    // not yet been durably acknowledged.
-    std::future::pending::<()>().await;
-}
-
-#[cfg(not(feature = "e2e-test-hooks"))]
-async fn pause_after_exact_runtime_stop_for_e2e(
-    _stack_name: &str,
-    _operation_id: &str,
-    _expected: &vz_runtime_contract::StackRuntimeIdentity,
-) {
 }
 
 #[cfg(test)]
@@ -3009,9 +3081,16 @@ mod tests {
             .expect("durable teardown receipt")
             .to_string();
         let mut first_stream = first.into_inner();
+        let mut first_completion = None;
         while let Some(item) = first_stream.next().await {
-            item.expect("initial teardown succeeds");
+            let event = item.expect("initial teardown succeeds");
+            if let Some(runtime_v2::teardown_stack_event::Payload::Completion(done)) = event.payload
+            {
+                first_completion = done.response;
+            }
         }
+        let first_completion = first_completion.expect("initial teardown completion response");
+        let first_completion_bytes = first_completion.encode_to_vec();
 
         let spec = parse_stack_spec(
             stack_name,
@@ -3044,6 +3123,79 @@ mod tests {
             .await
             .unwrap_or_else(|error| panic!("boot test stack runtime: {error}"));
 
+        let logical_snapshot = || {
+            daemon.with_state_store(|store| {
+                let sessions = store.list_reconcile_sessions(stack_name, 100)?;
+                let plans = sessions
+                    .iter()
+                    .map(|session| {
+                        let actions = store.load_reconcile_session_actions(&session.session_id)?;
+                        Ok((
+                            session.session_id.clone(),
+                            (actions.len(), vz_stack::compute_actions_hash(&actions)),
+                        ))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, StackError>>()?;
+                let audits = sessions
+                    .iter()
+                    .map(|session| {
+                        Ok((
+                            session.session_id.clone(),
+                            store.load_audit_log_for_session(&session.session_id)?,
+                        ))
+                    })
+                    .collect::<Result<std::collections::BTreeMap<_, _>, StackError>>()?;
+                let progress = store.load_reconcile_progress(stack_name)?.map(|progress| {
+                    serde_json::json!({
+                        "operation_id": progress.operation_id,
+                        "next_action_index": progress.next_action_index,
+                        "actions_len": progress.actions.len(),
+                        "actions_hash": vz_stack::compute_actions_hash(&progress.actions),
+                    })
+                });
+                Ok(serde_json::json!({
+                    "owner": store.load_stack_workload_owner(stack_name)?,
+                    "desired": store.load_desired_state(stack_name)?,
+                    "observed": store.load_observed_state(stack_name)?,
+                    "events": store.load_events(stack_name)?,
+                    "receipts": store.list_receipts()?,
+                    "finalizer": store.load_teardown_finalizer(&teardown_operation_key(
+                        Some("idem-shutdown-success"),
+                        "ignored-for-idempotency-key",
+                    ))?,
+                    "idempotency": store.find_idempotency_result("idem-shutdown-success")?,
+                    "allocator": store.load_allocator_state(stack_name)?,
+                    "sessions": sessions,
+                    "plans": plans,
+                    "audits": audits,
+                    "progress": progress,
+                }))
+            })
+        };
+        let receipt_counts = || {
+            daemon.with_state_store(|store| {
+                let receipts = store.list_receipts()?;
+                Ok((
+                    receipts
+                        .iter()
+                        .filter(|receipt| receipt.entity_type == "policy")
+                        .count(),
+                    receipts
+                        .iter()
+                        .filter(|receipt| receipt.operation == "teardown_stack")
+                        .count(),
+                ))
+            })
+        };
+        let before_replays = logical_snapshot().expect("snapshot completed teardown state");
+        let receipt_counts_before = receipt_counts().expect("count receipts before replays");
+        assert!(
+            receipt_counts_before.0 >= 1,
+            "the initial mutation path must have durable policy audit evidence"
+        );
+        assert_eq!(receipt_counts_before.1, 1);
+        let shutdowns_before_replays = daemon.manager().backend().shared_vm_shutdown_count();
+
         let error = runtime_v2::stack_service_server::StackService::teardown_stack(
             &service,
             tonic::Request::new(request("req-conflicting-retry", true)),
@@ -3051,6 +3203,21 @@ mod tests {
         .await
         .expect_err("idempotency replay requires the exact teardown option tuple");
         assert_eq!(error.code(), tonic::Code::FailedPrecondition);
+        assert_eq!(
+            logical_snapshot().expect("snapshot state after conflicting replay"),
+            before_replays,
+            "same-key conflicting payload must fail without logical mutation"
+        );
+        assert_eq!(
+            receipt_counts().expect("count receipts after conflicting replay"),
+            receipt_counts_before,
+            "same-key conflict must not append policy or teardown receipts"
+        );
+        assert_eq!(
+            daemon.manager().backend().shared_vm_shutdown_count(),
+            shutdowns_before_replays,
+            "same-key conflict must not stop the newer runtime"
+        );
 
         let response = runtime_v2::stack_service_server::StackService::teardown_stack(
             &service,
@@ -3076,10 +3243,26 @@ mod tests {
             }
         }
         let completion = completion.expect("stored completion response");
+        assert_eq!(completion.encode_to_vec(), first_completion_bytes);
         assert_eq!(completion.request_id, "req-shutdown-success");
         assert_eq!(completion.changed_actions, 1);
         assert_eq!(completion.removed_volumes, 0);
         assert!(daemon.manager().has_stack_runtime(stack_name));
+        assert_eq!(
+            logical_snapshot().expect("snapshot state after identical replay"),
+            before_replays,
+            "completed identical replay must be a logical read"
+        );
+        assert_eq!(
+            receipt_counts().expect("count receipts after identical replay"),
+            receipt_counts_before,
+            "completed replay must not append policy or teardown receipts"
+        );
+        assert_eq!(
+            daemon.manager().backend().shared_vm_shutdown_count(),
+            shutdowns_before_replays,
+            "completed replay must not stop the newer runtime"
+        );
 
         let (receipts, stack_events) = daemon
             .with_state_store(|store| {

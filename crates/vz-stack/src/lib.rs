@@ -12,6 +12,8 @@ mod compose;
 mod convert;
 #[cfg(all(test, target_os = "macos"))]
 mod crash_reopen_tests;
+#[cfg(feature = "e2e-test-hooks")]
+mod e2e_hooks;
 mod error;
 mod events;
 mod executor;
@@ -30,7 +32,10 @@ pub use compose::{
     expand_variables, parse_compose, parse_compose_with_dir, parse_env_file_content,
 };
 pub use convert::service_to_run_config;
+#[cfg(feature = "e2e-test-hooks")]
+pub use e2e_hooks::teardown_boundary as teardown_e2e_boundary;
 pub use error::{OwnedResourceCollisionError, StackError};
+
 pub use events::{
     EventRecord, FnStackEventSink, StackEvent, StackEventSink, StackEventSinkError,
     emit_event_to_sink,
@@ -75,7 +80,7 @@ pub use state_store::{
     StackContainerGenerationBinding, StackContainerRecoveryDisposition,
     StackContainerRecoveryRecord, StackWorkloadOwner, StateStore, StateStorePragmas,
     TEARDOWN_FINALIZER_SCHEMA_VERSION, TeardownFinalizer, TeardownFinalizerStatus,
-    teardown_receipt_id,
+    canonical_teardown_receipt_metadata, canonical_teardown_response_json, teardown_receipt_id,
 };
 pub use volume::{
     ResolvedMount, ResolvedMountKind, SkippedMount, TeardownPathState, VolumeManager,

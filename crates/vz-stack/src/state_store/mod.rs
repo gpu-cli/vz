@@ -370,6 +370,36 @@ pub fn teardown_receipt_id(operation_key: &str, request_digest: &str) -> String 
     format!("rcp-teardown-{:x}", hasher.finalize())
 }
 
+/// Serialize the one canonical byte representation of a teardown response.
+pub fn canonical_teardown_response_json(
+    request_id: &str,
+    stack_name: &str,
+    changed_actions: u32,
+    removed_volumes: u32,
+) -> Result<String, StackError> {
+    serde_json::to_string(&serde_json::json!({
+        "request_id": request_id,
+        "stack_name": stack_name,
+        "changed_actions": changed_actions,
+        "removed_volumes": removed_volumes,
+    }))
+    .map_err(Into::into)
+}
+
+/// Build the exact canonical metadata object for a teardown receipt.
+pub fn canonical_teardown_receipt_metadata(
+    request_digest: &str,
+    changed_actions: u32,
+    removed_volumes: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "event_type": "stack_destroyed",
+        "request_digest": request_digest,
+        "changed_actions": changed_actions,
+        "removed_volumes": removed_volumes,
+    })
+}
+
 /// Durable phase of a stack-wide teardown finalizer.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]

@@ -2629,10 +2629,181 @@ validate_runtimed_teardown_evidence() {
         def exact_keys($keys): (keys | sort) == ($keys | sort);
         def nonempty: type == "string" and length > 0;
         def hex_sha256: type == "string" and test("^[0-9a-f]{64}$");
+        def nonnegative_integer: type == "number" and floor == . and . >= 0;
         def identity:
             exact_keys(["incarnation_id", "schema_version", "stack_id"]) and
             (.schema_version == 1) and (.stack_id | nonempty) and
             (.incarnation_id | nonempty);
+        def expected_cases: [
+            {"boundary_id":"finalizer_reserved","boundary":"finalizer_reserved","resource":null},
+            {"boundary_id":"service_runtime_cleanup:api#1","boundary":"service_runtime_cleanup","resource":"api#1"},
+            {"boundary_id":"service_cleanup_committed:api#1","boundary":"service_cleanup_committed","resource":"api#1"},
+            {"boundary_id":"service_runtime_cleanup:worker#1","boundary":"service_runtime_cleanup","resource":"worker#1"},
+            {"boundary_id":"service_cleanup_committed:worker#1","boundary":"service_cleanup_committed","resource":"worker#1"},
+            {"boundary_id":"allocator_released:api#1","boundary":"allocator_released","resource":"api#1"},
+            {"boundary_id":"allocator_released:worker#1","boundary":"allocator_released","resource":"worker#1"},
+            {"boundary_id":"empty_desired_state_persisted","boundary":"empty_desired_state_persisted","resource":null},
+            {"boundary_id":"runtime_shutdown_before_progress","boundary":"runtime_shutdown_before_progress","resource":null},
+            {"boundary_id":"volume_staged:cache","boundary":"volume_staged","resource":"cache"},
+            {"boundary_id":"volume_purged:cache","boundary":"volume_purged","resource":"cache"},
+            {"boundary_id":"volume_staged:data","boundary":"volume_staged","resource":"data"},
+            {"boundary_id":"volume_purged:data","boundary":"volume_purged","resource":"data"},
+            {"boundary_id":"disk_staged","boundary":"disk_staged","resource":null},
+            {"boundary_id":"disk_purged","boundary":"disk_purged","resource":null},
+            {"boundary_id":"terminal_transaction_before_commit","boundary":"terminal_transaction_before_commit","resource":null},
+            {"boundary_id":"terminal_transaction_committed","boundary":"terminal_transaction_committed","resource":null}
+        ];
+        def expected_selectors: expected_cases | map(.boundary_id);
+        def retried_boundary:
+            . == "finalizer_reserved" or
+            . == "service_runtime_cleanup" or
+            . == "allocator_released" or
+            . == "empty_desired_state_persisted" or
+            . == "volume_staged" or
+            . == "volume_purged" or
+            . == "disk_staged" or
+            . == "disk_purged" or
+            . == "terminal_transaction_before_commit";
+        def boundary_event($case):
+            type == "object" and
+            exact_keys([
+                "boundary_id", "details", "operation_id", "resource",
+                "schema_version", "stack_id"
+            ]) and
+            (.schema_version == 1) and
+            (.boundary_id == $case.boundary_id) and
+            (.stack_id == $case.stack_id) and
+            (.operation_id | nonempty) and
+            (.resource == $case.resource) and
+            (.details | type == "object");
+        def boundary_details($case; $event; $replay):
+            if $case.boundary == "finalizer_reserved" then
+                ($event.details | exact_keys([
+                    "changed_actions", "initial_disk_image", "initial_runtime_present",
+                    "initial_volumes"
+                ]) and .changed_actions == 2 and .initial_volumes == ["cache", "data"] and
+                .initial_disk_image == true and .initial_runtime_present == true)
+            elif $case.boundary == "service_runtime_cleanup" then
+                ($event.details | exact_keys([
+                    "cleanup_progress_persisted", "container_id", "outcome"
+                ]) and (.container_id | nonempty) and
+                .cleanup_progress_persisted == false and
+                .outcome == (if $replay then "already_absent" else "stopped_and_removed" end))
+            elif $case.boundary == "service_cleanup_committed" then
+                ($event.details | exact_keys([
+                    "cleanup_progress_persisted", "container_id"
+                ]) and (.container_id | nonempty) and .cleanup_progress_persisted == true)
+            elif $case.boundary == "allocator_released" then
+                ($event.details | exact_keys([
+                    "already_released", "released_network_ips", "released_ports",
+                    "released_service_ip"
+                ]) and .already_released == $replay and
+                (.released_network_ips | nonnegative_integer) and
+                (.released_ports | nonnegative_integer) and
+                (if $replay then
+                    .released_network_ips == 0 and .released_ports == 0 and
+                    .released_service_ip == null
+                 else true end))
+            elif $case.boundary == "empty_desired_state_persisted" then
+                ($event.details | exact_keys(["desired_services"]) and .desired_services == 0)
+            elif $case.boundary == "runtime_shutdown_before_progress" then
+                ($event.details | exact_keys([
+                    "expected_runtime_identity", "finalizer_progress_persisted", "outcome"
+                ]) and (.expected_runtime_identity | identity) and
+                .expected_runtime_identity.stack_id == $case.stack_id and
+                .finalizer_progress_persisted == false and .outcome == "stopped")
+            elif $case.boundary == "volume_staged" or $case.boundary == "disk_staged" then
+                ($event.details | exact_keys([
+                    "finalizer_progress_persisted", "mutated", "state_before"
+                ]) and .finalizer_progress_persisted == false and
+                .mutated == ($replay | not) and
+                .state_before == (if $replay then "Tombstone" else "Source" end))
+            elif $case.boundary == "volume_purged" or $case.boundary == "disk_purged" then
+                ($event.details | exact_keys([
+                    "finalizer_progress_persisted", "mutated"
+                ]) and .finalizer_progress_persisted == false and
+                .mutated == ($replay | not))
+            elif $case.boundary == "terminal_transaction_before_commit" then
+                ($event.details | exact_keys([
+                    "receipt_id", "response_json", "transaction_committed"
+                ]) and (.receipt_id | nonempty) and (.response_json | nonempty) and
+                .transaction_committed == false)
+            elif $case.boundary == "terminal_transaction_committed" then
+                ($event.details | exact_keys(["receipt_id", "response_json"]) and
+                (.receipt_id | nonempty) and (.response_json | nonempty))
+            else false end;
+        def stack_snapshot:
+            type == "object" and exact_keys([
+                "allocator", "desired", "events", "finalizer", "observed",
+                "receipts", "session"
+            ]) and (.events | type == "array") and (.receipts | type == "array");
+        def matrix_case($expected):
+            . as $case |
+            type == "object" and
+            exact_keys([
+                "boundary", "boundary_audit", "boundary_id", "changed_actions",
+                "completed_replay_zero_write", "conflicting_request_code",
+                "conflicting_request_zero_write", "crash_durable_receipt_sha256",
+                "crash_snapshot", "destroyed_event_count", "durable_receipt_sha256",
+                "marker", "receipt_count", "receipt_id", "removed_volumes",
+                "replay_durable_receipt_sha256", "replay_response_sha256", "request_id",
+                "resource", "response_sha256", "stack_id", "terminal_snapshot",
+                "transport_code"
+            ]) and
+            ({boundary_id, boundary, resource} == $expected) and
+            (.stack_id | nonempty) and (.request_id | nonempty) and
+            (.marker | boundary_event($case)) and
+            (.boundary_audit | type == "array") and
+            (.boundary_audit | length ==
+                (if ($case.boundary | retried_boundary) then 2 else 1 end)) and
+            (.boundary_audit[0] == .marker) and
+            (all(.boundary_audit[]; boundary_event($case))) and
+            (boundary_details($case; .boundary_audit[0]; false)) and
+            (if ($case.boundary | retried_boundary) then
+                boundary_details($case; .boundary_audit[1]; true)
+             else true end) and
+            (if .boundary == "terminal_transaction_before_commit" then
+                .boundary_audit[0].details == .boundary_audit[1].details
+             else true end) and
+            (.transport_code == "unavailable" or .transport_code == "cancelled" or
+                .transport_code == "unknown") and
+            (.conflicting_request_code == "state_conflict") and
+            (.conflicting_request_zero_write == true) and
+            (.completed_replay_zero_write == true) and
+            (.changed_actions == 2) and (.removed_volumes == 2) and
+            (.response_sha256 | hex_sha256) and
+            (.replay_response_sha256 == .response_sha256) and
+            (.durable_receipt_sha256 | hex_sha256) and
+            (.replay_durable_receipt_sha256 == .durable_receipt_sha256) and
+            (if .boundary == "terminal_transaction_committed" then
+                .crash_durable_receipt_sha256 == .durable_receipt_sha256
+             else .crash_durable_receipt_sha256 == null end) and
+            (.receipt_id | nonempty) and (.receipt_count == 1) and
+            (.destroyed_event_count == 1) and
+            (.crash_snapshot | stack_snapshot) and
+            (.terminal_snapshot | stack_snapshot) and
+            (.crash_snapshot.finalizer.changed_actions == 2) and
+            (.crash_snapshot.finalizer.initial_volumes == ["cache", "data"]) and
+            (.crash_snapshot.finalizer.initial_disk_image == true) and
+            (.crash_snapshot.finalizer.initial_runtime_present == true) and
+            (.crash_snapshot.finalizer.status ==
+                (if $case.boundary == "terminal_transaction_committed" then "completed" else "prepared" end)) and
+            ([.crash_snapshot.receipts[] | select(.operation == "teardown_stack")] | length ==
+                (if $case.boundary == "terminal_transaction_committed" then 1 else 0 end)) and
+            ([.crash_snapshot.events[] |
+                select(.event.type == "stack_destroyed")] | length ==
+                (if $case.boundary == "terminal_transaction_committed" then 1 else 0 end)) and
+            (.terminal_snapshot.finalizer.status == "completed") and
+            (.terminal_snapshot.finalizer.changed_actions == 2) and
+            (.terminal_snapshot.finalizer.initial_volumes == ["cache", "data"]) and
+            (.terminal_snapshot.finalizer.staged_volumes == ["cache", "data"]) and
+            (.terminal_snapshot.finalizer.purged_volumes == ["cache", "data"]) and
+            (.terminal_snapshot.finalizer.runtime_shutdown == true) and
+            (.terminal_snapshot.finalizer.disk_staged == true) and
+            (.terminal_snapshot.finalizer.disk_purged == true) and
+            ([.terminal_snapshot.receipts[] | select(.operation == "teardown_stack")] | length == 1) and
+            ([.terminal_snapshot.events[] |
+                select(.event.type == "stack_destroyed")] | length == 1);
         (type == "object") and
         (exact_keys([
             "backend", "build_identity", "host_os", "machine_target_os",
@@ -2640,9 +2811,10 @@ validate_runtimed_teardown_evidence() {
             "original_runtime_identity", "prepared_finalizer_reopened", "receipt_count",
             "replacement_refusal_code", "replacement_runtime_identity",
             "replacement_survived_refusal", "same_operation_completed_after_replacement_removal",
-            "scenario", "schema_version", "sigkill_after_stop_before_progress", "stop_boundary"
+            "scenario", "schema_version", "sigkill_after_stop_before_progress", "stop_boundary",
+            "teardown_boundary_matrix"
         ])) and
-        (.schema_version == 1) and
+        (.schema_version == 2) and
         (.scenario == "runtimed-teardown-finalizer-crash-reopen") and
         (.host_os == "macos") and (.machine_target_os == "linux") and
         (.backend == "macos-vz") and
@@ -2686,20 +2858,39 @@ validate_runtimed_teardown_evidence() {
         (.original_runtime_identity.incarnation_id != .replacement_runtime_identity.incarnation_id) and
         (.replacement_survived_refusal == .replacement_runtime_identity) and
         (.stop_boundary | exact_keys([
-            "expected_runtime_identity", "finalizer_progress_persisted", "operation_id",
-            "outcome", "schema_version", "stack_id"
+            "boundary_id", "details", "operation_id", "resource", "schema_version", "stack_id"
         ])) and
         (.stop_boundary.schema_version == 1) and
+        (.stop_boundary.boundary_id == "runtime_shutdown_before_progress") and
         (.stop_boundary.stack_id == .original_runtime_identity.stack_id) and
-        (.stop_boundary.expected_runtime_identity == .original_runtime_identity) and
         (.stop_boundary.operation_id | nonempty) and
-        (.stop_boundary.outcome == "stopped") and
-        (.stop_boundary.finalizer_progress_persisted == false) and
+        (.stop_boundary.resource == null) and
+        (.stop_boundary.details | exact_keys([
+            "expected_runtime_identity", "finalizer_progress_persisted", "outcome"
+        ])) and
+        (.stop_boundary.details.expected_runtime_identity == .original_runtime_identity) and
+        (.stop_boundary.details.outcome == "stopped") and
+        (.stop_boundary.details.finalizer_progress_persisted == false) and
         (.sigkill_after_stop_before_progress == true) and
         (.prepared_finalizer_reopened == true) and
         (.replacement_refusal_code == "state_conflict") and
         (.same_operation_completed_after_replacement_removal == true) and
-        (.receipt_count == 1)
+        (.receipt_count == 1) and
+        (.teardown_boundary_matrix | exact_keys([
+            "cases", "executed", "required_boundaries", "schema_version",
+            "shared_image_reference", "shared_runtime_data"
+        ])) and
+        (.teardown_boundary_matrix.schema_version == 1) and
+        (.teardown_boundary_matrix.executed == 17) and
+        (.teardown_boundary_matrix.required_boundaries == expected_selectors) and
+        (.teardown_boundary_matrix.shared_image_reference == "alpine:latest") and
+        (.teardown_boundary_matrix.shared_runtime_data | nonempty) and
+        (.teardown_boundary_matrix.cases | type == "array" and length == 17) and
+        ([.teardown_boundary_matrix.cases[].boundary_id] == expected_selectors) and
+        (. as $root | all(range(0; 17); . as $index |
+            $root.teardown_boundary_matrix.cases[$index] as $case |
+            expected_cases[$index] as $expected |
+            ($case | matrix_case($expected))))
     ' "$evidence_file" >/dev/null
 }
 

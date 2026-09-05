@@ -9,7 +9,7 @@ repository.workspace = true
 
 [features]
 test-backend = []
-e2e-test-hooks = []
+e2e-test-hooks = ["vz-stack/e2e-test-hooks"]
 
 [dependencies]
 fs2 = { workspace = true }

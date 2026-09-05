@@ -21,7 +21,7 @@ pub(super) use metadata::{
     daemon_backend, insert_health_headers, normalize_metadata, request_id_from_extensions,
     request_metadata_interceptor,
 };
-pub(super) use policy::enforce_mutation_policy_preflight;
+pub(super) use policy::{authorize_mutation_policy_preflight, enforce_mutation_policy_preflight};
 pub(super) use receipt_metadata::{
     receipt_event_metadata, receipt_execution_resized_metadata,
     receipt_execution_signaled_metadata, receipt_execution_stdin_metadata,

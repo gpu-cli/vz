@@ -169,13 +169,17 @@ fn validate_teardown_finalizer(record: &TeardownFinalizer) -> Result<(), StackEr
                     "completed teardown finalizer has no immutable response".to_string(),
                 )
             })?;
-            let response: serde_json::Value = serde_json::from_str(response_json)?;
-            let expected_response = serde_json::json!({
-                "request_id": record.request_id,
-                "stack_name": record.scope.stack_id,
-                "changed_actions": record.changed_actions,
-                "removed_volumes": removed_volumes,
-            });
+            let expected_response = canonical_teardown_response_json(
+                &record.request_id,
+                &record.scope.stack_id,
+                record.changed_actions,
+                removed_volumes,
+            )?;
+            let expected_metadata = canonical_teardown_receipt_metadata(
+                &record.request_digest,
+                record.changed_actions,
+                removed_volumes,
+            );
             if record.completed_at.is_none()
                 || receipt.request_id != record.request_id
                 || receipt.entity_id != record.scope.stack_id
@@ -184,22 +188,8 @@ fn validate_teardown_finalizer(record: &TeardownFinalizer) -> Result<(), StackEr
                 || receipt.status != "success"
                 || receipt.receipt_id
                     != teardown_receipt_id(&record.operation_key, &record.request_digest)
-                || receipt
-                    .metadata
-                    .get("request_digest")
-                    .and_then(|value| value.as_str())
-                    != Some(record.request_digest.as_str())
-                || receipt
-                    .metadata
-                    .get("changed_actions")
-                    .and_then(|value| value.as_u64())
-                    != Some(u64::from(record.changed_actions))
-                || receipt
-                    .metadata
-                    .get("removed_volumes")
-                    .and_then(|value| value.as_u64())
-                    != Some(u64::from(removed_volumes))
-                || response != expected_response
+                || receipt.metadata != expected_metadata
+                || response_json != expected_response
             {
                 return Err(StackError::InvalidSpec(
                     "completed teardown finalizer output does not match its identity".to_string(),
@@ -4236,104 +4226,152 @@ impl StateStore {
             ));
         }
         self.with_immediate_transaction(|store| {
-            if let Some(existing) = store.load_teardown_finalizer(&record.operation_key)? {
-                if existing.request_digest != record.request_digest
-                    || !teardown_finalizer_identity_matches(&existing, record)
-                {
-                    return Err(StackError::Machine {
-                        code: vz_runtime_contract::MachineErrorCode::StateConflict,
-                        message: format!(
-                            "teardown operation key `{}` is bound to different parameters",
-                            record.operation_key
-                        ),
-                    });
-                }
-                if let Some(key) = &existing.idempotency_key {
-                    let idempotency = store.find_idempotency_result(key)?.ok_or_else(|| {
-                        StackError::InvalidSpec(format!(
-                            "teardown finalizer `{}` lost its global idempotency claim",
-                            existing.operation_key
-                        ))
-                    })?;
-                    let valid_pending = existing.status == TeardownFinalizerStatus::Prepared
-                        && idempotency.response_json
-                            == teardown_idempotency_pending_value(&existing.operation_key)
-                        && idempotency.status_code == 102;
-                    let valid_completed = existing.status == TeardownFinalizerStatus::Completed
-                        && existing.response_json.as_deref()
-                            == Some(idempotency.response_json.as_str())
-                        && idempotency.status_code == 200;
-                    if idempotency.operation != "teardown_stack"
-                        || idempotency.request_hash != existing.request_digest
-                        || (!valid_pending && !valid_completed)
-                    {
-                        return Err(StackError::InvalidSpec(format!(
-                            "teardown finalizer `{}` idempotency projection mismatch",
-                            existing.operation_key
-                        )));
-                    }
-                }
-                return Ok(existing);
+            store.reserve_teardown_finalizer_in_transaction(record)
+        })
+    }
+
+    /// Atomically persist a new teardown's allow-policy audit and finalizer.
+    ///
+    /// An exact concurrent replay returns the winning finalizer without
+    /// appending a duplicate policy receipt. A conflicting finalizer causes
+    /// the surrounding transaction to roll back the audit completely.
+    pub fn reserve_teardown_finalizer_with_policy_audit(
+        &self,
+        record: &TeardownFinalizer,
+        policy_audit: &Receipt,
+    ) -> Result<TeardownFinalizer, StackError> {
+        validate_teardown_finalizer(record)?;
+        if record.status != TeardownFinalizerStatus::Prepared {
+            return Err(StackError::InvalidSpec(
+                "new teardown finalizer must be prepared".to_string(),
+            ));
+        }
+        if policy_audit.operation != "policy_preflight:remove_container"
+            || policy_audit.entity_type != "policy"
+            || policy_audit.entity_id != record.request_id
+            || policy_audit.request_id != record.request_id
+            || policy_audit.status != "allow"
+        {
+            return Err(StackError::InvalidSpec(
+                "teardown policy audit does not match its exact admitted request".to_string(),
+            ));
+        }
+        self.with_immediate_transaction(|store| {
+            let operation_already_reserved = store
+                .load_teardown_finalizer(&record.operation_key)?
+                .is_some();
+            let reserved = store.reserve_teardown_finalizer_in_transaction(record)?;
+            if !operation_already_reserved {
+                store.save_receipt(policy_audit)?;
             }
-            let active_operation = store
-                .conn
-                .query_row(
-                    "SELECT operation_key FROM teardown_finalizers
-                     WHERE project_id = ?1 AND environment_id = ?2 AND machine_id = ?3
-                       AND machine_incarnation_id = ?4 AND stack_name = ?5
-                       AND status = 'prepared'",
-                    params![
-                        record.scope.project_id.as_str(),
-                        record.scope.environment_id.as_str(),
-                        record.scope.machine_id.as_str(),
-                        record.scope.machine_incarnation_id.as_str(),
-                        record.scope.stack_id,
-                    ],
-                    |row| row.get::<_, String>(0),
-                )
-                .optional()?;
-            if let Some(active_operation) = active_operation {
+            Ok(reserved)
+        })
+    }
+
+    fn reserve_teardown_finalizer_in_transaction(
+        &self,
+        record: &TeardownFinalizer,
+    ) -> Result<TeardownFinalizer, StackError> {
+        let store = self;
+        if let Some(existing) = store.load_teardown_finalizer(&record.operation_key)? {
+            if existing.request_digest != record.request_digest
+                || !teardown_finalizer_identity_matches(&existing, record)
+            {
                 return Err(StackError::Machine {
                     code: vz_runtime_contract::MachineErrorCode::StateConflict,
                     message: format!(
-                        "workload already has active teardown finalizer `{active_operation}`"
+                        "teardown operation key `{}` is bound to different parameters",
+                        record.operation_key
                     ),
                 });
             }
-            if let Some(key) = &record.idempotency_key {
-                if let Some(existing) = store.find_idempotency_result(key)? {
-                    return Err(StackError::Machine {
-                        code: vz_runtime_contract::MachineErrorCode::StateConflict,
-                        message: format!(
-                            "idempotency key `{key}` is already bound to operation `{}`",
-                            existing.operation
-                        ),
-                    });
+            if let Some(key) = &existing.idempotency_key {
+                let idempotency = store.find_idempotency_result(key)?.ok_or_else(|| {
+                    StackError::InvalidSpec(format!(
+                        "teardown finalizer `{}` lost its global idempotency claim",
+                        existing.operation_key
+                    ))
+                })?;
+                let valid_pending = existing.status == TeardownFinalizerStatus::Prepared
+                    && idempotency.response_json
+                        == teardown_idempotency_pending_value(&existing.operation_key)
+                    && idempotency.status_code == 102;
+                let valid_completed = existing.status == TeardownFinalizerStatus::Completed
+                    && existing.response_json.as_deref()
+                        == Some(idempotency.response_json.as_str())
+                    && idempotency.status_code == 200;
+                if idempotency.operation != "teardown_stack"
+                    || idempotency.request_hash != existing.request_digest
+                    || (!valid_pending && !valid_completed)
+                {
+                    return Err(StackError::InvalidSpec(format!(
+                        "teardown finalizer `{}` idempotency projection mismatch",
+                        existing.operation_key
+                    )));
                 }
-                store.conn.execute(
-                    "INSERT INTO idempotency_keys (
+            }
+            return Ok(existing);
+        }
+        let active_operation = store
+            .conn
+            .query_row(
+                "SELECT operation_key FROM teardown_finalizers
+                     WHERE project_id = ?1 AND environment_id = ?2 AND machine_id = ?3
+                       AND machine_incarnation_id = ?4 AND stack_name = ?5
+                       AND status = 'prepared'",
+                params![
+                    record.scope.project_id.as_str(),
+                    record.scope.environment_id.as_str(),
+                    record.scope.machine_id.as_str(),
+                    record.scope.machine_incarnation_id.as_str(),
+                    record.scope.stack_id,
+                ],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?;
+        if let Some(active_operation) = active_operation {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "workload already has active teardown finalizer `{active_operation}`"
+                ),
+            });
+        }
+        if let Some(key) = &record.idempotency_key {
+            if let Some(existing) = store.find_idempotency_result(key)? {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "idempotency key `{key}` is already bound to operation `{}`",
+                        existing.operation
+                    ),
+                });
+            }
+            store.conn.execute(
+                "INSERT INTO idempotency_keys (
                         key, operation, request_hash, response_json, status_code,
                         created_at, expires_at
                      ) VALUES (?1, 'teardown_stack', ?2, ?3, 102, ?4, ?5)",
-                    params![
-                        key,
-                        record.request_digest,
-                        teardown_idempotency_pending_value(&record.operation_key),
-                        i64::try_from(record.created_at).map_err(|_| StackError::InvalidSpec(
-                            "teardown idempotency created_at exceeds SQLite range".to_string()
-                        ))?,
-                        i64::try_from(record.created_at.saturating_add(IDEMPOTENCY_TTL_SECS))
-                            .map_err(|_| StackError::InvalidSpec(
-                                "teardown idempotency expiry exceeds SQLite range".to_string()
-                            ))?,
-                    ],
-                )?;
-            }
-            let finalizer_json = serde_json::to_string(record)?;
-            let initial_volumes_json = serde_json::to_string(&record.initial_volumes)?;
-            let staged_volumes_json = serde_json::to_string(&record.staged_volumes)?;
-            let purged_volumes_json = serde_json::to_string(&record.purged_volumes)?;
-            store.conn.execute(
+                params![
+                    key,
+                    record.request_digest,
+                    teardown_idempotency_pending_value(&record.operation_key),
+                    i64::try_from(record.created_at).map_err(|_| StackError::InvalidSpec(
+                        "teardown idempotency created_at exceeds SQLite range".to_string()
+                    ))?,
+                    i64::try_from(record.created_at.saturating_add(IDEMPOTENCY_TTL_SECS)).map_err(
+                        |_| StackError::InvalidSpec(
+                            "teardown idempotency expiry exceeds SQLite range".to_string()
+                        )
+                    )?,
+                ],
+            )?;
+        }
+        let finalizer_json = serde_json::to_string(record)?;
+        let initial_volumes_json = serde_json::to_string(&record.initial_volumes)?;
+        let staged_volumes_json = serde_json::to_string(&record.staged_volumes)?;
+        let purged_volumes_json = serde_json::to_string(&record.purged_volumes)?;
+        store.conn.execute(
                 "INSERT INTO teardown_finalizers (
                     operation_key, schema_version, request_id, idempotency_key,
                     request_digest, session_id, reconcile_operation_id, project_id,
@@ -4388,8 +4426,7 @@ impl StateStore {
                     ))?,
                 ],
             )?;
-            Ok(record.clone())
-        })
+        Ok(record.clone())
     }
 
     /// Compare-and-swap monotonic runtime/filesystem milestones.
@@ -4602,6 +4639,18 @@ impl StateStore {
                 message: "teardown finalizer terminal compare-and-swap lost".to_string(),
             });
         }
+        #[cfg(feature = "e2e-test-hooks")]
+        crate::teardown_e2e_boundary(
+            "terminal_transaction_before_commit",
+            &record.scope.stack_id,
+            &record.reconcile_operation_id,
+            None,
+            serde_json::json!({
+                "receipt_id": receipt.receipt_id,
+                "response_json": response_json,
+                "transaction_committed": false,
+            }),
+        );
         Ok(())
     }
 

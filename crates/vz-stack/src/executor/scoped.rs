@@ -912,9 +912,46 @@ impl<R: ContainerRuntime> StackExecutor<R> {
     ) -> Result<(), StackError> {
         self.store
             .begin_claimed_predecessor_cleanup(claim, unix_now())?;
+        #[cfg(feature = "e2e-test-hooks")]
+        let cleanup_outcome = match &inspection {
+            ContainerGenerationInspection::Absent => "already_absent",
+            ContainerGenerationInspection::ReservedUnpublished(_) => "reservation_released",
+            ContainerGenerationInspection::Published(_) => "stopped_and_removed",
+            ContainerGenerationInspection::Foreign => "foreign",
+            ContainerGenerationInspection::Replacement => "replacement",
+            ContainerGenerationInspection::LegacyUnscoped => "legacy_unscoped",
+            ContainerGenerationInspection::Malformed(_) => "malformed",
+        };
         self.cleanup_exact_runtime_generation(intent, &binding.ownership, inspection)?;
+        #[cfg(feature = "e2e-test-hooks")]
+        crate::teardown_e2e_boundary(
+            "service_runtime_cleanup",
+            &intent.scope.stack_id,
+            self.teardown_e2e_operation_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            Some(&format!("{}#{}", intent.service_name, intent.replica_index)),
+            serde_json::json!({
+                "container_id": binding.ownership.container_id,
+                "outcome": cleanup_outcome,
+                "cleanup_progress_persisted": false,
+            }),
+        );
         self.store
             .complete_claimed_predecessor_cleanup(claim, unix_now())?;
+        #[cfg(feature = "e2e-test-hooks")]
+        crate::teardown_e2e_boundary(
+            "service_cleanup_committed",
+            &intent.scope.stack_id,
+            self.teardown_e2e_operation_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            Some(&format!("{}#{}", intent.service_name, intent.replica_index)),
+            serde_json::json!({
+                "container_id": binding.ownership.container_id,
+                "cleanup_progress_persisted": true,
+            }),
+        );
         Ok(())
     }
 
@@ -1133,7 +1170,25 @@ impl<R: ContainerRuntime> StackExecutor<R> {
         claim: &ReconcileActionClaim,
         target: &ServiceReplicaKey,
     ) -> Result<(), StackError> {
-        self.store.release_claimed_allocator_target(claim)?;
+        let release = self.store.release_claimed_allocator_target(claim)?;
+        #[cfg(feature = "e2e-test-hooks")]
+        crate::teardown_e2e_boundary(
+            "allocator_released",
+            self.workload_scope()
+                .map_or("unknown", |scope| scope.stack_id.as_str()),
+            self.teardown_e2e_operation_id
+                .as_deref()
+                .unwrap_or("unknown"),
+            Some(&format!("{}#{}", target.service_name, target.index())),
+            serde_json::json!({
+                "already_released": release.already_released,
+                "released_ports": release.released.ports.len(),
+                "released_service_ip": release.released.service_ip,
+                "released_network_ips": release.released.service_network_ips.len(),
+            }),
+        );
+        #[cfg(not(feature = "e2e-test-hooks"))]
+        let _ = release;
         self.ports.release_replica(target);
         self.service_ips.remove(target);
         self.service_network_ips.remove(target);

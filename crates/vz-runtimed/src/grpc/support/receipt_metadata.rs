@@ -54,14 +54,6 @@ struct StackApplyReceiptMetadata {
 }
 
 #[derive(Debug, Serialize)]
-struct StackTeardownReceiptMetadata<'a> {
-    event_type: &'static str,
-    request_digest: &'a str,
-    changed_actions: u32,
-    removed_volumes: u32,
-}
-
-#[derive(Debug, Serialize)]
 struct FileMutationReceiptMetadata<'a> {
     event_type: &'static str,
     sandbox_id: &'a str,
@@ -158,12 +150,11 @@ pub(in crate::grpc) fn receipt_stack_teardown_metadata(
     changed_actions: u32,
     removed_volumes: u32,
 ) -> Result<Value, StackError> {
-    metadata_value(StackTeardownReceiptMetadata {
-        event_type: "stack_destroyed",
+    Ok(vz_stack::canonical_teardown_receipt_metadata(
         request_digest,
         changed_actions,
         removed_volumes,
-    })
+    ))
 }
 
 pub(in crate::grpc) fn receipt_file_mutation_metadata(

@@ -543,6 +543,9 @@ pub struct StackExecutor<R: ContainerRuntime> {
     scoped_secret_dir: Option<PathBuf>,
     /// Recovery-only authority may clean exact journal ownership but never create.
     scoped_cleanup_only: bool,
+    /// Exact teardown operation exposed only to feature-gated crash hooks.
+    #[cfg(feature = "e2e-test-hooks")]
+    teardown_e2e_operation_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -747,6 +750,8 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             scoped_secret_digests: BTreeMap::new(),
             scoped_secret_dir: None,
             scoped_cleanup_only: false,
+            #[cfg(feature = "e2e-test-hooks")]
+            teardown_e2e_operation_id: None,
         }
     }
 
