@@ -29,6 +29,29 @@ preserving native macOS process and service semantics.
 
 Pin macOS image/build/channel and provisioning inputs. Treat saved state as an optional same-host, exact-configuration acceleration—not the portable source of reproducibility. Make update, retirement, repair, rollback, and destructive replacement explicit.
 
+## Required macOS 26+ happy path
+
+Ship at least one complete path for a specific macOS version and build with major
+version 26 or later. Pin the Apple restore IPSW source and digest, compatible
+base identity, authenticated published bootstrap patch and digest, guest agent,
+and Xcode/Swift toolchain in the release inputs. Select the exact version through
+implementation and physical verification; a moving channel or placeholder
+fingerprint is not a supported release entry.
+
+From a clean supported installation, the product must obtain the artifacts,
+verify and apply the matching patch, create the native Machine, and start its
+agent without manual host sudo, disk mounting, ownership repair, or agent
+injection. The patch must match the actual base obtained or produced by this
+flow, including any install-specific variability. Privileged artifact preparation
+must be handled before publication rather than left as a user setup step.
+
+Reuse the image patcher and guest loader behind typed provisioning APIs. The
+existing patch code in retired CLI modules and mac-agent's LoaderManifest
+selection are foundations; neither proves a complete clean bootstrap. Preserve
+the five public lifecycle verbs. Completion requires the available matching
+patch and the installed physical happy-path evidence, as specified in
+`GOAL-0.4.0.md` and `06-macos-target-validation.md`.
+
 ## Validation
 
 - Contract tests for macOS Machine TargetSpec, capabilities, lifecycle, and

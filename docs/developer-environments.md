@@ -170,6 +170,13 @@ declared in the same or another Environment when Linux containers are required.
 Existing macOS VM primitives are **ACTIVE**; their integration into the shared
 topology contract is **DEV**.
 
+The 0.4 native macOS release gate requires at least one exact macOS 26+ guest
+version/build with obtainable pinned restore media/base, an authenticated
+published matching bootstrap patch, and installed first-use evidence. Normal
+Machine creation must apply that patch and start the guest agent without manual
+host sudo, disk mounting, ownership repair, or agent injection. Patcher code or
+a manually prepared VM alone does not establish this supported path.
+
 Linux-on-Windows precedes Windows-on-Windows. Native Windows Machines will expose
 Windows process, service, console, NTFS, and isolation capabilities without
 inheriting Linux OCI/youki assumptions. Both Windows pairings are **PLANNED**.

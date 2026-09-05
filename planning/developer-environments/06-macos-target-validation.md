@@ -17,6 +17,23 @@ the CLI intentionally has no operation. Cover pinned image verification, native
 exec, PTY/signals, launchd, workspace projection, APFS, networking, persistence,
 stop/up/delete, update/retirement, and recovery.
 
+Include a required clean bootstrap scenario for at least one exact macOS 26+
+guest version/build. Start without a preconfigured guest or manually installed
+loader. Through supported installed product interfaces, obtain the pinned Apple
+restore media/base and published authenticated matching patch, verify their
+digests and compatibility, apply the patch, boot the selected Machine, and
+observe its agent becoming ready. No manual host sudo, disk mounting, ownership
+repair, or agent injection is permitted. Record artifact sources, authentication,
+digests, base production/selection, patch application, host compatibility, and
+guest `sw_vers` plus VM/process identity. Placeholder catalog entries, local-only
+unpublished patches, and a patcher unit test do not count as this scenario.
+
+Build/test the pinned native Swift fixture in that Machine, execute its expected
+protocol/version output, then prove Stop/Up persistence and ownership-safe Delete
+in the aggregate staged run. Wrong-base or tampered patches fail before Machine
+activation. The clean-path result must demonstrate that the distributed patch
+matches the base the user actually obtains or produces.
+
 ## Step 2: Run shared and target suites
 
 - `core.*`: identity, lifecycle, persistence, isolation, sharing authorization, networking, recovery, and concurrency.
@@ -34,7 +51,9 @@ select a sibling Linux Machine's Docker endpoint.
 
 ## Validation
 
-Run clean and persisted release-built gates twice on the current Mac and retain
-machine-readable evidence under
-`.artifacts/macos-developer-environment-e2e/<timestamp>/`. Missing or skipped
-required evidence is failure.
+Run the native lane in the canonical aggregate gate's clean-provision,
+persisted-recovery, and final-cleanup phases on the local Mac, using its one
+candidate tuple and run ID. Retain machine-readable evidence under
+`.artifacts/vz-0.4-e2e/<run-id>/native-macos/`. Required scenarios run once without
+test-case retries; missing or skipped required evidence is failure. Follow
+`GOAL-0.4.0.md` for candidate retention and the terminal release verdict.

@@ -141,7 +141,19 @@ required E2E scenario and retained evidence:
    images, volumes, networks, events, caches, and lifecycle operations in one
    context are absent from the other and from every other Environment.
 4. **Target-native execution:** Linux commands execute on Linux. The checked-in
-   native fixture `tests/fixtures/vz-0.4/native-macos-swift/` builds and tests
+   native macOS happy path pins at least one specific macOS version and build
+   with major version 26 or later, its Apple restore IPSW and digest, exact
+   compatible base identity, and a published, authenticated matching bootstrap
+   patch with digest. A clean vz installation on a supported Mac obtains them
+   through the supported product flow, verifies and applies the patch, boots the
+   selected macOS Machine, and starts its guest agent without manual host sudo,
+   disk mounting, ownership repair, or agent injection. The patch must apply to
+   the base produced or obtained by that clean flow; a manually prepared image,
+   placeholder hashes, a moving latest selector, or patcher code alone cannot
+   satisfy this criterion. Artifact availability and compatibility are exercised
+   by the installed release gate and retained in its evidence.
+   The checked-in native fixture
+   `tests/fixtures/vz-0.4/native-macos-swift/` builds and tests
    with the exact Xcode/Swift toolchain digest pinned by the release contract,
    then its release executable prints the expected fixture protocol/version.
    VM identity/process evidence proves it ran inside the selected separately
@@ -287,6 +299,13 @@ before its acceptance gate can close:
   pressure, network, and deterministic agent-driver fixtures; and
 - JSON schemas for the aggregate manifest, lane summaries, connectivity matrix,
   runtime provenance, resource inventories, and receipts.
+
+The gate contract binds the macOS 26+ happy path to an exact guest version/build,
+host compatibility requirements, IPSW source/digest, base identity, published
+bootstrap patch location/digest and authentication metadata, guest-agent digest,
+and Xcode/Swift toolchain digest. These must be real obtainable artifacts. The
+clean-provision phase verifies their availability and compatibility from fresh
+state; persisted-recovery and final-cleanup exercise that same native Machine.
 
 The contract initially requires the following measurable network/recovery
 checks; changing them requires a recorded product decision and updated manifest:
