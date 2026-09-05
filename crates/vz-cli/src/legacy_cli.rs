@@ -15,6 +15,7 @@ pub const LEGACY_COMMAND_REMOVED_EXIT_CODE: i32 = 2;
 pub const LEGACY_COMMAND_REMOVED_CODE: &str = "legacy_command_removed";
 
 const STACK_MIGRATION: &str = "Declare services and Machines in vz.json. The 0.4 public CLI is converging on five lifecycle verbs: vz up, vz exec, vz status, vz stop, and vz delete.";
+const BARE_FLAG_MIGRATION: &str = "The implicit sandbox mode was removed. Declare Developer Environment configuration in vz.json. The 0.4 public CLI is converging on explicit vz up, vz exec, vz status, vz stop, and vz delete lifecycle verbs.";
 const TYPED_API_MIGRATION: &str =
     "Use the topology-scoped typed API for operations outside the five lifecycle verbs.";
 
@@ -23,6 +24,28 @@ const TYPED_API_MIGRATION: &str =
 pub enum RemovedRootCommand {
     /// The pre-0.4 Compose/stack command family.
     Stack,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemovedCliEntry {
+    Root(RemovedRootCommand),
+    Flag(&'static str),
+}
+
+impl RemovedCliEntry {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Root(command) => command.as_str(),
+            Self::Flag(flag) => flag,
+        }
+    }
+
+    const fn migration(self) -> &'static str {
+        match self {
+            Self::Root(command) => command.migration(),
+            Self::Flag(_) => BARE_FLAG_MIGRATION,
+        }
+    }
 }
 
 impl RemovedRootCommand {
@@ -47,19 +70,19 @@ impl RemovedRootCommand {
     }
 }
 
-/// Deterministic structured rejection for one removed root command.
+/// Deterministic structured rejection for one removed root command or flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LegacyCommandRejection {
     /// Stable error payload.
     pub error: LegacyCommandError,
 }
 
-/// Stable fields describing how to migrate from a removed command.
+/// Stable fields describing how to migrate from a removed command or flag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LegacyCommandError {
     /// Stable machine-readable error code.
     pub code: &'static str,
-    /// Removed root command without the `vz` prefix.
+    /// Removed root command or flag without the `vz` prefix.
     pub command: &'static str,
     /// Human-readable summary.
     pub message: String,
@@ -70,16 +93,16 @@ pub struct LegacyCommandError {
 }
 
 impl LegacyCommandRejection {
-    fn new(command: RemovedRootCommand) -> Self {
+    fn new(entry: RemovedCliEntry) -> Self {
         Self {
             error: LegacyCommandError {
                 code: LEGACY_COMMAND_REMOVED_CODE,
-                command: command.as_str(),
+                command: entry.as_str(),
                 message: format!(
                     "`vz {}` was removed from the 0.4 public CLI",
-                    command.as_str()
+                    entry.as_str()
                 ),
-                migration: command.migration(),
+                migration: entry.migration(),
                 typed_api_migration: TYPED_API_MIGRATION,
             },
         }
@@ -102,12 +125,12 @@ impl LegacyCommandRejection {
     }
 }
 
-/// Inspect argv and return a rejection when its root command was removed.
+/// Inspect argv and return a rejection when a root command or flag was removed.
 ///
-/// Only the root command token is considered, except that clap's generated
-/// `help <command>` traversal is also recognized. Values belonging to global
-/// options are skipped so a value equal to `stack` cannot be mistaken for a
-/// command. Once an active root is found, none of its arguments are inspected.
+/// Removed root flags are recognized until an active command or `--` boundary.
+/// The root command token and clap's generated `help <command>` traversal are
+/// also recognized. Once an active root is found, none of its arguments are
+/// inspected.
 pub fn rejection_for_args<I, S>(args: I) -> Option<LegacyCommandRejection>
 where
     I: IntoIterator<Item = S>,
@@ -115,15 +138,9 @@ where
 {
     let mut args = args.into_iter().map(Into::into);
     let _program = args.next();
-    let mut consume_next_as_option_value = false;
     let mut options_ended = false;
 
     while let Some(argument) = args.next() {
-        if consume_next_as_option_value {
-            consume_next_as_option_value = false;
-            continue;
-        }
-
         let text = argument.to_str()?;
         if !options_ended && text == "--" {
             // Clap still accepts a subcommand after a root-level `--`. Keep
@@ -133,20 +150,20 @@ where
             continue;
         }
         if !options_ended && text.starts_with("--") {
-            if !text.contains('=') && long_option_takes_value(text) {
-                consume_next_as_option_value = true;
+            if let Some(flag) = removed_long_flag(text) {
+                return Some(LegacyCommandRejection::new(RemovedCliEntry::Flag(flag)));
             }
             continue;
         }
         if !options_ended && text.starts_with('-') && text != "-" {
-            if short_option_takes_separate_value(text) {
-                consume_next_as_option_value = true;
+            if let Some(flag) = removed_short_flag(text) {
+                return Some(LegacyCommandRejection::new(RemovedCliEntry::Flag(flag)));
             }
             continue;
         }
 
         if let Some(command) = RemovedRootCommand::from_root(&argument) {
-            return Some(LegacyCommandRejection::new(command));
+            return Some(LegacyCommandRejection::new(RemovedCliEntry::Root(command)));
         }
 
         if text == "help" {
@@ -160,15 +177,9 @@ where
 }
 
 fn rejection_for_help_path(args: impl Iterator<Item = OsString>) -> Option<LegacyCommandRejection> {
-    let mut consume_next_as_option_value = false;
     let mut options_ended = false;
 
     for argument in args {
-        if consume_next_as_option_value {
-            consume_next_as_option_value = false;
-            continue;
-        }
-
         let text = argument.to_str()?;
 
         if !options_ended && text == "--" {
@@ -176,52 +187,51 @@ fn rejection_for_help_path(args: impl Iterator<Item = OsString>) -> Option<Legac
             continue;
         }
         if !options_ended && text.starts_with("--") {
-            if !text.contains('=') && long_option_takes_value(text) {
-                consume_next_as_option_value = true;
+            if let Some(flag) = removed_long_flag(text) {
+                return Some(LegacyCommandRejection::new(RemovedCliEntry::Flag(flag)));
             }
             continue;
         }
         if !options_ended && text.starts_with('-') && text != "-" {
-            if short_option_takes_separate_value(text) {
-                consume_next_as_option_value = true;
+            if let Some(flag) = removed_short_flag(text) {
+                return Some(LegacyCommandRejection::new(RemovedCliEntry::Flag(flag)));
             }
             continue;
         }
 
-        return RemovedRootCommand::from_root(&argument).map(LegacyCommandRejection::new);
+        return RemovedRootCommand::from_root(&argument)
+            .map(RemovedCliEntry::Root)
+            .map(LegacyCommandRejection::new);
     }
 
     None
 }
 
-fn long_option_takes_value(option: &str) -> bool {
-    matches!(
-        option,
-        "--control-plane"
-            | "--resume"
-            | "--name"
-            | "--cpus"
-            | "--memory"
-            | "--base-image"
-            | "--main-container"
-    )
+fn removed_long_flag(option: &str) -> Option<&'static str> {
+    match option.split_once('=').map_or(option, |(name, _)| name) {
+        "--continue" => Some("--continue"),
+        "--resume" => Some("--resume"),
+        "--name" => Some("--name"),
+        "--ephemeral" => Some("--ephemeral"),
+        "--cpus" => Some("--cpus"),
+        "--memory" => Some("--memory"),
+        "--base-image" => Some("--base-image"),
+        "--main-container" => Some("--main-container"),
+        "--control-plane" => Some("--control-plane"),
+        _ => None,
+    }
 }
 
-fn short_option_takes_separate_value(option: &str) -> bool {
-    let Some(cluster) = option.strip_prefix('-') else {
-        return false;
-    };
-    let mut flags = cluster.chars().peekable();
-
-    while let Some(flag) = flags.next() {
+fn removed_short_flag(option: &str) -> Option<&'static str> {
+    let cluster = option.strip_prefix('-')?;
+    for flag in cluster.chars() {
         match flag {
-            'v' | 'q' | 'c' => {}
-            'r' => return flags.peek().is_none(),
-            _ => return false,
+            'c' => return Some("-c"),
+            'r' => return Some("-r"),
+            _ => {}
         }
     }
-
-    false
+    None
 }
 
 #[cfg(test)]
@@ -234,8 +244,7 @@ mod tests {
             vec!["vz", "stack"],
             vec!["vz", "stack", "up"],
             vec!["vz", "--json", "stack", "--help"],
-            vec!["vz", "--control-plane=daemon-grpc", "stack"],
-            vec!["vz", "--control-plane", "daemon-grpc", "stack", "unknown"],
+            vec!["vz", "-vq", "stack"],
             vec!["vz", "--", "stack"],
             vec!["vz", "help", "stack"],
             vec!["vz", "help", "stack", "up"],
@@ -249,18 +258,13 @@ mod tests {
     }
 
     #[test]
-    fn does_not_reinterpret_option_values_or_command_arguments_as_roots() {
+    fn explicit_command_arguments_and_tokens_after_double_dash_are_not_reinterpreted() {
         for args in [
-            vec!["vz", "--name", "stack"],
-            vec!["vz", "-r", "stack"],
-            vec!["vz", "-vr", "stack"],
-            vec!["vz", "-qr", "stack"],
-            vec!["vz", "-vqr", "stack"],
-            vec!["vz", "-rstack"],
             vec!["vz", "run", "--", "stack"],
             vec!["vz", "exec", "--", "stack"],
+            vec!["vz", "run", "--", "--name"],
+            vec!["vz", "exec", "--", "--resume"],
             vec!["vz", "help", "image", "stack"],
-            vec!["vz", "help", "--name", "stack"],
             vec!["vz", "--", "--name", "stack"],
         ] {
             assert!(rejection_for_args(args).is_none());
@@ -268,13 +272,39 @@ mod tests {
     }
 
     #[test]
-    fn recognizes_removed_root_after_inline_short_option_values() {
-        for args in [
-            vec!["vz", "-rresume-target", "stack"],
-            vec!["vz", "-vrresume-target", "stack"],
+    fn recognizes_every_removed_bare_mode_flag_and_alias() {
+        for (args, expected_flag) in [
+            (vec!["vz", "-c"], "-c"),
+            (vec!["vz", "-hc"], "-c"),
+            (vec!["vz", "-vc"], "-c"),
+            (vec!["vz", "-qc"], "-c"),
+            (vec!["vz", "--continue"], "--continue"),
+            (vec!["vz", "-r", "target"], "-r"),
+            (vec!["vz", "-vrtarget"], "-r"),
+            (vec!["vz", "-vrcandidate"], "-r"),
+            (vec!["vz", "-Vcr"], "-c"),
+            (vec!["vz", "--resume=target"], "--resume"),
+            (vec!["vz", "--name", "target"], "--name"),
+            (vec!["vz", "--ephemeral"], "--ephemeral"),
+            (vec!["vz", "--cpus", "4"], "--cpus"),
+            (vec!["vz", "--memory=4096"], "--memory"),
+            (vec!["vz", "--base-image", "alpine"], "--base-image"),
+            (vec!["vz", "--main-container=app"], "--main-container"),
+            (
+                vec!["vz", "--control-plane", "daemon-grpc"],
+                "--control-plane",
+            ),
         ] {
-            assert!(rejection_for_args(args).is_some());
+            let rejection = rejection_for_args(args).expect("flag must be rejected");
+            assert_eq!(rejection.error.command, expected_flag);
+            assert_eq!(rejection.error.migration, BARE_FLAG_MIGRATION);
         }
+    }
+
+    #[test]
+    fn recognizes_removed_flag_in_generated_help_traversal() {
+        let rejection = rejection_for_args(["vz", "help", "--name", "stack"]).unwrap();
+        assert_eq!(rejection.error.command, "--name");
     }
 
     #[test]

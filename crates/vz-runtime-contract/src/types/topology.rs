@@ -15,6 +15,7 @@ pub const TOPOLOGY_SCHEMA_VERSION: u32 = 1;
 
 const MAX_ID_LENGTH: usize = 128;
 const MAX_NAME_LENGTH: usize = 128;
+const MAX_MACHINE_RUNTIME_IDENTITY_LENGTH: usize = 4096;
 const LEGACY_DEVELOPER_MARKER: &str = "vz.run.workspace";
 /// Maximum number of candidates returned by a topology selection error.
 pub const MAX_TOPOLOGY_SELECTION_CANDIDATES: usize = 20;
@@ -376,6 +377,18 @@ pub enum MachineBackend {
     Other(String),
 }
 
+/// Complete backend-issued comparison token for one live Machine runtime.
+///
+/// This token is deliberately opaque and target-neutral. Backends must retain
+/// their complete stable identity representation (for example, canonical
+/// serialized `StackRuntimeIdentity`), not a shortened stack selector or a UUID
+/// extracted from it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineRuntimeIdentity {
+    pub schema_version: u32,
+    pub opaque_id: String,
+}
+
 /// Replaceable runtime incarnation of a stable logical Machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MachineIncarnation {
@@ -384,6 +397,16 @@ pub struct MachineIncarnation {
     pub machine_id: MachineId,
     pub generation: u64,
     pub created_at: u64,
+}
+
+/// Backend evidence required to publish a successful Machine activation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct MachineActivationEvidence {
+    pub schema_version: u32,
+    pub backend: MachineBackend,
+    pub negotiated_capabilities: CapabilitySet,
+    pub runtime_identity: MachineRuntimeIdentity,
+    pub incarnation: MachineIncarnation,
 }
 
 /// Persisted logical Machine identity and negotiated target state.
@@ -405,6 +428,10 @@ pub struct MachineInstance {
     pub backend: Option<MachineBackend>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub incarnation: Option<MachineIncarnation>,
+    /// Exact backend-issued runtime token. Historical persisted Machines may
+    /// omit it; every newly successful Up records it through activation evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_identity: Option<MachineRuntimeIdentity>,
     pub state: MachineState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub legacy_sandbox_id: Option<String>,
@@ -472,6 +499,10 @@ pub struct MachineLifecycleStep {
     /// Durable incarnation established by a successful Up acknowledgement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_incarnation: Option<MachineIncarnation>,
+    /// Complete evidence durably recorded by a successful Up. Absence on an
+    /// already-terminal step is reserved for historical journal compatibility.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_activation: Option<MachineActivationEvidence>,
     pub status: LifecycleStepStatus,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub failure_reason: Option<String>,
@@ -490,6 +521,9 @@ pub struct MachineLifecycleStepAcknowledgement {
     pub expected_incarnation: Option<MachineIncarnation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resulting_incarnation: Option<MachineIncarnation>,
+    /// Required for every newly applied successful Up acknowledgement.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resulting_activation: Option<MachineActivationEvidence>,
     pub result: LifecycleStepResult,
 }
 
@@ -920,6 +954,10 @@ pub enum TopologyValidationError {
     },
     #[error("invalid incarnation for Machine `{machine_id}`: {reason}")]
     InvalidMachineIncarnation { machine_id: String, reason: String },
+    #[error("invalid runtime identity for Machine `{machine_id}`: {reason}")]
+    InvalidMachineRuntimeIdentity { machine_id: String, reason: String },
+    #[error("invalid backend for Machine `{machine_id}`: {reason}")]
+    InvalidMachineBackend { machine_id: String, reason: String },
     #[error("failed to serialize canonical project definition: {details}")]
     CanonicalSerialization { details: String },
     #[error(
@@ -1025,6 +1063,7 @@ impl ProjectDefinition {
                 negotiated_capabilities: CapabilitySet::default(),
                 backend: None,
                 incarnation: None,
+                runtime_identity: None,
                 state: MachineState::Creating,
                 legacy_sandbox_id: None,
             })
@@ -1752,6 +1791,7 @@ impl EnvironmentLifecycleOperation {
                 target_state,
                 expected_incarnation: machine.incarnation.clone(),
                 resulting_incarnation: None,
+                resulting_activation: None,
                 status: LifecycleStepStatus::Pending,
                 failure_reason: None,
             })
@@ -1918,6 +1958,17 @@ impl EnvironmentLifecycleOperation {
             }
             validate_lifecycle_incarnation(&step.machine_id, step.expected_incarnation.as_ref())?;
             validate_lifecycle_incarnation(&step.machine_id, step.resulting_incarnation.as_ref())?;
+            if let Some(activation) = &step.resulting_activation {
+                validate_activation_evidence_shape(&step.machine_id, activation)?;
+                if step.resulting_incarnation.as_ref() != Some(&activation.incarnation) {
+                    return Err(TopologyLifecycleError::InvalidOperation {
+                        reason: format!(
+                            "Machine `{}` activation incarnation does not match its resulting incarnation",
+                            step.machine_id
+                        ),
+                    });
+                }
+            }
             match (self.kind, step.status, step.resulting_incarnation.as_ref()) {
                 (EnvironmentLifecycleKind::Up, LifecycleStepStatus::Succeeded, Some(resulting)) => {
                     validate_up_incarnation_transition(
@@ -1948,6 +1999,22 @@ impl EnvironmentLifecycleOperation {
                         reason: format!(
                             "{:?} step for Machine `{}` cannot carry a resulting incarnation",
                             self.kind, step.machine_id
+                        ),
+                    });
+                }
+            }
+            match (self.kind, step.status, step.resulting_activation.as_ref()) {
+                (EnvironmentLifecycleKind::Up, LifecycleStepStatus::Succeeded, _) => {
+                    // `None` is readable only for terminal journals created before
+                    // activation evidence was introduced. New acknowledgements
+                    // cannot enter this state.
+                }
+                (_, _, None) => {}
+                _ => {
+                    return Err(TopologyLifecycleError::InvalidOperation {
+                        reason: format!(
+                            "only a successful Up step may carry activation evidence for Machine `{}`",
+                            step.machine_id
                         ),
                     });
                 }
@@ -2150,6 +2217,12 @@ impl EnvironmentLifecycleOperation {
             };
             if machine.state != expected_current
                 || machine.incarnation.as_ref() != expected_incarnation
+                || (self.kind == EnvironmentLifecycleKind::Up
+                    && step.status == LifecycleStepStatus::Succeeded
+                    && match step.resulting_activation.as_ref() {
+                        Some(evidence) => !machine_matches_activation(machine, evidence),
+                        None => machine.runtime_identity.is_some(),
+                    })
             {
                 return Err(TopologyLifecycleError::MachineStepMismatch {
                     machine_id: machine.machine_id.to_string(),
@@ -2208,6 +2281,24 @@ impl EnvironmentLifecycleOperation {
         acknowledgement: &MachineLifecycleStepAcknowledgement,
         now: u64,
     ) -> Result<(), TopologyLifecycleError> {
+        let mut next_operation = self.clone();
+        let mut next_environment = environment.clone();
+        next_operation.apply_machine_step_acknowledgement_in_place(
+            &mut next_environment,
+            acknowledgement,
+            now,
+        )?;
+        *self = next_operation;
+        *environment = next_environment;
+        Ok(())
+    }
+
+    fn apply_machine_step_acknowledgement_in_place(
+        &mut self,
+        environment: &mut EnvironmentInstance,
+        acknowledgement: &MachineLifecycleStepAcknowledgement,
+        now: u64,
+    ) -> Result<(), TopologyLifecycleError> {
         self.ensure_fence(
             environment,
             &acknowledgement.operation_id,
@@ -2229,20 +2320,27 @@ impl EnvironmentLifecycleOperation {
                 machine_id: acknowledgement.machine_id.to_string(),
             });
         }
-        validate_machine_acknowledgement_incarnation(self.kind, step, acknowledgement)?;
-        if step_is_exact_terminal_replay(
+        let terminal_replay = step_is_exact_terminal_replay(
             step.status,
             step.failure_reason.as_deref(),
             &acknowledgement.result,
-        ) {
-            let machine = environment
-                .machines
-                .iter()
-                .find(|machine| machine.machine_id == acknowledgement.machine_id)
-                .ok_or_else(|| TopologyLifecycleError::MachineStepNotFound {
-                    operation_id: self.operation_id.to_string(),
-                    machine_id: acknowledgement.machine_id.to_string(),
-                })?;
+        );
+        let machine = environment
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == acknowledgement.machine_id)
+            .ok_or_else(|| TopologyLifecycleError::MachineStepNotFound {
+                operation_id: self.operation_id.to_string(),
+                machine_id: acknowledgement.machine_id.to_string(),
+            })?;
+        validate_machine_acknowledgement_activation(
+            self.kind,
+            step,
+            machine,
+            acknowledgement,
+            terminal_replay,
+        )?;
+        if terminal_replay {
             let expected_state = match step.status {
                 LifecycleStepStatus::Succeeded => step.target_state.unwrap_or(machine.state),
                 LifecycleStepStatus::Failed if step.target_state.is_some() => MachineState::Failed,
@@ -2256,9 +2354,22 @@ impl EnvironmentLifecycleOperation {
             } else {
                 step.expected_incarnation.as_ref()
             };
+            let activation_matches = match step.resulting_activation.as_ref() {
+                Some(evidence) => {
+                    step.resulting_activation == acknowledgement.resulting_activation
+                        && machine_matches_activation(machine, evidence)
+                }
+                None => {
+                    acknowledgement.resulting_activation.is_none()
+                        && (self.kind != EnvironmentLifecycleKind::Up
+                            || step.status != LifecycleStepStatus::Succeeded
+                            || machine.runtime_identity.is_none())
+                }
+            };
             return if step.resulting_incarnation == acknowledgement.resulting_incarnation
                 && machine.state == expected_state
                 && machine.incarnation.as_ref() == expected_incarnation
+                && activation_matches
             {
                 Ok(())
             } else {
@@ -2302,13 +2413,22 @@ impl EnvironmentLifecycleOperation {
                             machine_id: acknowledgement.machine_id.to_string(),
                         });
                     };
+                    let Some(activation) = acknowledgement.resulting_activation.as_ref() else {
+                        return Err(TopologyLifecycleError::MachineStepMismatch {
+                            machine_id: acknowledgement.machine_id.to_string(),
+                        });
+                    };
                     apply_up_incarnation(
                         machine,
                         &mut environment.ownership,
                         step.expected_incarnation.as_ref(),
                         resulting,
                     )?;
+                    machine.backend = Some(activation.backend.clone());
+                    machine.negotiated_capabilities = activation.negotiated_capabilities.clone();
+                    machine.runtime_identity = Some(activation.runtime_identity.clone());
                     step.resulting_incarnation = Some(resulting.clone());
+                    step.resulting_activation = Some(activation.clone());
                 }
                 step.status = LifecycleStepStatus::Succeeded;
                 step.failure_reason = None;
@@ -2325,6 +2445,7 @@ impl EnvironmentLifecycleOperation {
                 step.status = LifecycleStepStatus::Failed;
                 step.failure_reason = Some(reason.clone());
                 step.resulting_incarnation = None;
+                step.resulting_activation = None;
                 if step.target_state.is_some() {
                     machine.state = MachineState::Failed;
                 }
@@ -2791,6 +2912,53 @@ fn validate_lifecycle_incarnation(
     Ok(())
 }
 
+fn validate_activation_evidence_shape(
+    machine_id: &MachineId,
+    evidence: &MachineActivationEvidence,
+) -> Result<(), TopologyLifecycleError> {
+    evidence
+        .validate_shape_for_machine(machine_id)
+        .map_err(|error| TopologyLifecycleError::InvalidOperation {
+            reason: error.to_string(),
+        })
+}
+
+fn validate_activation_evidence_for_machine(
+    machine: &MachineInstance,
+    evidence: &MachineActivationEvidence,
+) -> Result<(), TopologyLifecycleError> {
+    validate_activation_evidence_shape(&machine.machine_id, evidence)?;
+    validate_machine_backend(&machine.machine_id, &machine.target, &evidence.backend).map_err(
+        |error| TopologyLifecycleError::InvalidOperation {
+            reason: error.to_string(),
+        },
+    )?;
+    let mut activated = machine.clone();
+    activated.backend = Some(evidence.backend.clone());
+    activated.negotiated_capabilities = evidence.negotiated_capabilities.clone();
+    activated.runtime_identity = Some(evidence.runtime_identity.clone());
+    activated.incarnation = Some(evidence.incarnation.clone());
+    activated.state = MachineState::Ready;
+    activated
+        .validate()
+        .map_err(|error| TopologyLifecycleError::InvalidOperation {
+            reason: format!(
+                "invalid activation evidence for Machine `{}`: {error}",
+                machine.machine_id
+            ),
+        })
+}
+
+fn machine_matches_activation(
+    machine: &MachineInstance,
+    evidence: &MachineActivationEvidence,
+) -> bool {
+    machine.backend.as_ref() == Some(&evidence.backend)
+        && machine.negotiated_capabilities == evidence.negotiated_capabilities
+        && machine.runtime_identity.as_ref() == Some(&evidence.runtime_identity)
+        && machine.incarnation.as_ref() == Some(&evidence.incarnation)
+}
+
 fn validate_up_incarnation_transition(
     machine_id: &MachineId,
     expected: Option<&MachineIncarnation>,
@@ -2817,10 +2985,12 @@ fn validate_up_incarnation_transition(
     }
 }
 
-fn validate_machine_acknowledgement_incarnation(
+fn validate_machine_acknowledgement_activation(
     kind: EnvironmentLifecycleKind,
     step: &MachineLifecycleStep,
+    machine: &MachineInstance,
     acknowledgement: &MachineLifecycleStepAcknowledgement,
+    terminal_replay: bool,
 ) -> Result<(), TopologyLifecycleError> {
     validate_lifecycle_incarnation(
         &acknowledgement.machine_id,
@@ -2830,25 +3000,61 @@ fn validate_machine_acknowledgement_incarnation(
         &acknowledgement.machine_id,
         acknowledgement.resulting_incarnation.as_ref(),
     )?;
+    if let Some(activation) = acknowledgement.resulting_activation.as_ref() {
+        validate_activation_evidence_for_machine(machine, activation)?;
+        if acknowledgement.resulting_incarnation.as_ref() != Some(&activation.incarnation) {
+            return Err(TopologyLifecycleError::MachineStepMismatch {
+                machine_id: step.machine_id.to_string(),
+            });
+        }
+    }
+    if !terminal_replay && step.resulting_activation.is_some() {
+        return Err(TopologyLifecycleError::MachineStepMismatch {
+            machine_id: step.machine_id.to_string(),
+        });
+    }
     match (
         &acknowledgement.result,
         kind,
         acknowledgement.resulting_incarnation.as_ref(),
+        acknowledgement.resulting_activation.as_ref(),
     ) {
-        (LifecycleStepResult::Succeeded, EnvironmentLifecycleKind::Up, Some(resulting)) => {
+        (
+            LifecycleStepResult::Succeeded,
+            EnvironmentLifecycleKind::Up,
+            Some(resulting),
+            Some(activation),
+        ) => {
+            validate_up_incarnation_transition(
+                &step.machine_id,
+                step.expected_incarnation.as_ref(),
+                resulting,
+            )?;
+            if step.expected_incarnation.as_ref() == Some(resulting)
+                && machine.runtime_identity.is_some()
+                && !machine_matches_activation(machine, activation)
+            {
+                return Err(TopologyLifecycleError::MachineStepMismatch {
+                    machine_id: step.machine_id.to_string(),
+                });
+            }
+            Ok(())
+        }
+        (LifecycleStepResult::Succeeded, EnvironmentLifecycleKind::Up, Some(resulting), None)
+            if terminal_replay
+                && step.resulting_activation.is_none()
+                && machine.runtime_identity.is_none() =>
+        {
             validate_up_incarnation_transition(
                 &step.machine_id,
                 step.expected_incarnation.as_ref(),
                 resulting,
             )
         }
-        (LifecycleStepResult::Succeeded, EnvironmentLifecycleKind::Up, None) => {
-            Err(TopologyLifecycleError::MachineStepMismatch {
-                machine_id: step.machine_id.to_string(),
-            })
+        (LifecycleStepResult::Failed { .. }, EnvironmentLifecycleKind::Up, None, None)
+        | (_, EnvironmentLifecycleKind::Stop | EnvironmentLifecycleKind::Delete, None, None) => {
+            Ok(())
         }
-        (LifecycleStepResult::Failed { .. }, EnvironmentLifecycleKind::Up, None)
-        | (_, EnvironmentLifecycleKind::Stop | EnvironmentLifecycleKind::Delete, None) => Ok(()),
         _ => Err(TopologyLifecycleError::MachineStepMismatch {
             machine_id: step.machine_id.to_string(),
         }),
@@ -2979,6 +3185,86 @@ fn canonical_ownership_digest(
     Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
 }
 
+impl MachineRuntimeIdentity {
+    pub fn validate_for_machine(
+        &self,
+        machine_id: &MachineId,
+    ) -> Result<(), TopologyValidationError> {
+        validate_schema(self.schema_version)?;
+        if self.opaque_id.trim().is_empty() {
+            return Err(TopologyValidationError::InvalidMachineRuntimeIdentity {
+                machine_id: machine_id.to_string(),
+                reason: "opaque_id must not be blank".to_string(),
+            });
+        }
+        if self.opaque_id.len() > MAX_MACHINE_RUNTIME_IDENTITY_LENGTH {
+            return Err(TopologyValidationError::InvalidMachineRuntimeIdentity {
+                machine_id: machine_id.to_string(),
+                reason: format!("opaque_id exceeds {MAX_MACHINE_RUNTIME_IDENTITY_LENGTH} bytes"),
+            });
+        }
+        if self.opaque_id.chars().any(char::is_control) {
+            return Err(TopologyValidationError::InvalidMachineRuntimeIdentity {
+                machine_id: machine_id.to_string(),
+                reason: "opaque_id must not contain control characters".to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+impl MachineActivationEvidence {
+    /// Validate target-independent evidence shape and exact Machine ownership.
+    pub fn validate_shape_for_machine(
+        &self,
+        machine_id: &MachineId,
+    ) -> Result<(), TopologyValidationError> {
+        validate_schema(self.schema_version)?;
+        self.runtime_identity.validate_for_machine(machine_id)?;
+        validate_schema(self.incarnation.schema_version)?;
+        self.incarnation.incarnation_id.validate()?;
+        if self.incarnation.machine_id != *machine_id || self.incarnation.generation == 0 {
+            return Err(TopologyValidationError::InvalidMachineIncarnation {
+                machine_id: machine_id.to_string(),
+                reason: "activation incarnation requires the exact Machine owner and a positive generation"
+                    .to_string(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn validate_machine_backend(
+    machine_id: &MachineId,
+    target: &TargetSpec,
+    backend: &MachineBackend,
+) -> Result<(), TopologyValidationError> {
+    let valid = match backend {
+        MachineBackend::MacosVirtualizationLinux
+        | MachineBackend::LinuxNative
+        | MachineBackend::WindowsLinux => target.os == OperatingSystem::Linux,
+        MachineBackend::MacosNative => target.os == OperatingSystem::Macos,
+        MachineBackend::WindowsNative => target.os == OperatingSystem::Windows,
+        MachineBackend::Other(name) => {
+            if name.trim().is_empty() || name.chars().any(char::is_control) {
+                return Err(TopologyValidationError::InvalidMachineBackend {
+                    machine_id: machine_id.to_string(),
+                    reason: "custom backend name must be non-blank and control-free".to_string(),
+                });
+            }
+            true
+        }
+    };
+    if valid {
+        Ok(())
+    } else {
+        Err(TopologyValidationError::InvalidMachineBackend {
+            machine_id: machine_id.to_string(),
+            reason: format!("backend {backend:?} cannot serve target OS {:?}", target.os),
+        })
+    }
+}
+
 impl MachineInstance {
     pub fn validate(&self) -> Result<(), TopologyValidationError> {
         validate_schema(self.schema_version)?;
@@ -2987,6 +3273,16 @@ impl MachineInstance {
         validate_name("machine", &self.name)?;
         validate_target(&self.target)?;
         validate_requested_capabilities(&self.name, &self.requested_capabilities)?;
+        if let Some(runtime_identity) = &self.runtime_identity {
+            runtime_identity.validate_for_machine(&self.machine_id)?;
+            if self.backend.is_none() || self.incarnation.is_none() {
+                return Err(TopologyValidationError::InvalidMachineRuntimeIdentity {
+                    machine_id: self.machine_id.to_string(),
+                    reason: "runtime identity requires backend and incarnation evidence"
+                        .to_string(),
+                });
+            }
+        }
         // Creation can fail before capability negotiation completes. Persist that
         // failure record so reconciliation can diagnose or resume it; operational
         // Ready/Stopped Machines still require a complete negotiation result.
@@ -3556,6 +3852,7 @@ pub fn migrate_legacy_developer_sandbox(
         negotiated_capabilities: requested,
         backend: Some(backend),
         incarnation: None,
+        runtime_identity: None,
         state: machine_state,
         legacy_sandbox_id: Some(sandbox.sandbox_id.clone()),
     };
@@ -3914,6 +4211,30 @@ mod tests {
         environment.ownership.extend(additions);
     }
 
+    fn fixture_backend(machine: &MachineInstance) -> MachineBackend {
+        match machine.target.os {
+            OperatingSystem::Linux => MachineBackend::MacosVirtualizationLinux,
+            OperatingSystem::Macos => MachineBackend::MacosNative,
+            OperatingSystem::Windows => MachineBackend::WindowsNative,
+        }
+    }
+
+    fn fixture_runtime_identity(
+        machine: &MachineInstance,
+        backend: &MachineBackend,
+        incarnation: &MachineIncarnation,
+    ) -> MachineRuntimeIdentity {
+        MachineRuntimeIdentity {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            opaque_id: serde_json::to_string(&(
+                backend,
+                machine.machine_id.as_str(),
+                incarnation.incarnation_id.as_str(),
+            ))
+            .unwrap(),
+        }
+    }
+
     fn operational_environment(state: EnvironmentState) -> EnvironmentInstance {
         let definition = project_definition();
         let mut environment = definition.instantiate_environment("agent", 42).unwrap();
@@ -3926,6 +4247,13 @@ mod tests {
             };
         }
         add_current_incarnations(&mut environment);
+        for machine in &mut environment.machines {
+            let backend = fixture_backend(machine);
+            let incarnation = machine.incarnation.clone().unwrap();
+            machine.runtime_identity =
+                Some(fixture_runtime_identity(machine, &backend, &incarnation));
+            machine.backend = Some(backend);
+        }
         environment.state = state;
         environment.validate().unwrap();
         environment
@@ -3933,10 +4261,33 @@ mod tests {
 
     fn machine_acknowledgement(
         operation: &EnvironmentLifecycleOperation,
+        environment: &EnvironmentInstance,
         step: &MachineLifecycleStep,
         result: LifecycleStepResult,
         resulting_incarnation: Option<MachineIncarnation>,
     ) -> MachineLifecycleStepAcknowledgement {
+        let resulting_activation = if operation.kind == EnvironmentLifecycleKind::Up
+            && matches!(&result, LifecycleStepResult::Succeeded)
+        {
+            let incarnation = resulting_incarnation
+                .as_ref()
+                .expect("successful Up fixture requires an incarnation");
+            let machine = environment
+                .machines
+                .iter()
+                .find(|machine| machine.machine_id == step.machine_id)
+                .expect("fixture Machine");
+            let backend = fixture_backend(machine);
+            Some(MachineActivationEvidence {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                backend: backend.clone(),
+                negotiated_capabilities: machine.requested_capabilities.clone(),
+                runtime_identity: fixture_runtime_identity(machine, &backend, incarnation),
+                incarnation: incarnation.clone(),
+            })
+        } else {
+            None
+        };
         MachineLifecycleStepAcknowledgement {
             operation_id: operation.operation_id.clone(),
             generation: operation.generation,
@@ -3945,6 +4296,7 @@ mod tests {
             target_state: step.target_state,
             expected_incarnation: step.expected_incarnation.clone(),
             resulting_incarnation,
+            resulting_activation,
             result,
         }
     }
@@ -4492,6 +4844,7 @@ mod tests {
             machine.state == MachineState::Creating
                 && machine.backend.is_none()
                 && machine.incarnation.is_none()
+                && machine.runtime_identity.is_none()
                 && machine.negotiated_capabilities == CapabilitySet::default()
         }));
         let endpoint = &first.endpoints[0];
@@ -5168,6 +5521,7 @@ mod tests {
                         target_state: step.target_state,
                         expected_incarnation: step.expected_incarnation,
                         resulting_incarnation: None,
+                        resulting_activation: None,
                         result: LifecycleStepResult::Succeeded,
                     },
                     102,
@@ -5241,6 +5595,7 @@ mod tests {
                         target_state: step.target_state,
                         expected_incarnation: step.expected_incarnation,
                         resulting_incarnation: None,
+                        resulting_activation: None,
                         result: LifecycleStepResult::Succeeded,
                     },
                     202,
@@ -5383,6 +5738,7 @@ mod tests {
                     target_state: failed.target_state,
                     expected_incarnation: failed.expected_incarnation.clone(),
                     resulting_incarnation: None,
+                    resulting_activation: None,
                     result: LifecycleStepResult::Failed {
                         reason: "guest boot failed".to_string(),
                     },
@@ -5398,21 +5754,15 @@ mod tests {
                 .unwrap(),
             &sibling_before
         );
+        let sibling_acknowledgement = machine_acknowledgement(
+            &operation,
+            &environment,
+            &sibling,
+            LifecycleStepResult::Succeeded,
+            sibling.expected_incarnation.clone(),
+        );
         operation
-            .apply_machine_step_acknowledgement(
-                &mut environment,
-                &MachineLifecycleStepAcknowledgement {
-                    operation_id: operation.operation_id.clone(),
-                    generation: operation.generation,
-                    machine_id: sibling.machine_id.clone(),
-                    initial_state: sibling.initial_state,
-                    target_state: sibling.target_state,
-                    expected_incarnation: sibling.expected_incarnation.clone(),
-                    resulting_incarnation: sibling.expected_incarnation.clone(),
-                    result: LifecycleStepResult::Succeeded,
-                },
-                303,
-            )
+            .apply_machine_step_acknowledgement(&mut environment, &sibling_acknowledgement, 303)
             .unwrap();
         assert_eq!(operation.status, EnvironmentLifecycleStatus::Running);
         assert_eq!(operation.completed_at, None);
@@ -5469,6 +5819,7 @@ mod tests {
             target_state: step.target_state,
             expected_incarnation: step.expected_incarnation,
             resulting_incarnation: None,
+            resulting_activation: None,
             result: LifecycleStepResult::Succeeded,
         };
         assert!(matches!(
@@ -5505,9 +5856,6 @@ mod tests {
                 .all(|step| step.expected_incarnation.is_none())
         );
         operation.begin(&mut environment, 502).unwrap();
-        for machine in &mut environment.machines {
-            machine.negotiated_capabilities = machine.requested_capabilities.clone();
-        }
         for (index, step) in operation.machine_steps.clone().into_iter().enumerate() {
             let resulting = MachineIncarnation {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -5518,6 +5866,7 @@ mod tests {
             };
             let acknowledgement = machine_acknowledgement(
                 &operation,
+                &environment,
                 &step,
                 LifecycleStepResult::Succeeded,
                 Some(resulting.clone()),
@@ -5525,15 +5874,32 @@ mod tests {
             operation
                 .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 503)
                 .unwrap();
+            let machine = environment
+                .machines
+                .iter()
+                .find(|machine| machine.machine_id == step.machine_id)
+                .unwrap();
+            let evidence = acknowledgement.resulting_activation.as_ref().unwrap();
+            assert_eq!(machine.incarnation.as_ref(), Some(&resulting));
+            assert_eq!(machine.backend.as_ref(), Some(&evidence.backend));
+            assert!(matches!(
+                (machine.target.os, machine.backend.as_ref()),
+                (
+                    OperatingSystem::Linux,
+                    Some(MachineBackend::MacosVirtualizationLinux)
+                ) | (OperatingSystem::Macos, Some(MachineBackend::MacosNative))
+            ));
             assert_eq!(
-                environment
-                    .machines
-                    .iter()
-                    .find(|machine| machine.machine_id == step.machine_id)
-                    .unwrap()
-                    .incarnation
-                    .as_ref(),
-                Some(&resulting)
+                machine.negotiated_capabilities,
+                evidence.negotiated_capabilities
+            );
+            assert_eq!(
+                machine.runtime_identity.as_ref(),
+                Some(&evidence.runtime_identity)
+            );
+            assert_eq!(
+                operation.machine_steps[index].resulting_activation.as_ref(),
+                Some(evidence)
             );
             assert!(environment.ownership.iter().any(|record| {
                 record.resource_kind == OwnedResourceKind::Incarnation
@@ -5548,6 +5914,307 @@ mod tests {
             EnvironmentState::Ready
         );
         environment.validate().unwrap();
+    }
+
+    #[test]
+    fn new_up_success_requires_complete_activation_evidence_without_partial_mutation() {
+        let mut environment = project_definition()
+            .instantiate_environment("missing-activation", 600)
+            .unwrap();
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-missing-activation",
+            "idem-missing-activation",
+            "sha256:missing-activation",
+            601,
+        )
+        .unwrap();
+        operation.begin(&mut environment, 602).unwrap();
+        let step = operation.machine_steps[0].clone();
+        let resulting = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new("inc_missing_activation").unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: 1,
+            created_at: 603,
+        };
+        let mut acknowledgement = machine_acknowledgement(
+            &operation,
+            &environment,
+            &step,
+            LifecycleStepResult::Succeeded,
+            Some(resulting),
+        );
+        acknowledgement.resulting_activation = None;
+        let operation_before = operation.clone();
+        let environment_before = environment.clone();
+
+        assert!(matches!(
+            operation.apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 603),
+            Err(TopologyLifecycleError::MachineStepMismatch { .. })
+        ));
+        assert_eq!(operation, operation_before);
+        assert_eq!(environment, environment_before);
+    }
+
+    #[test]
+    fn up_activation_exact_replay_compares_every_evidence_dimension() {
+        let mut environment = project_definition()
+            .instantiate_environment("activation-replay", 610)
+            .unwrap();
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-activation-replay",
+            "idem-activation-replay",
+            "sha256:activation-replay",
+            611,
+        )
+        .unwrap();
+        operation.begin(&mut environment, 612).unwrap();
+        let step = operation.machine_steps[0].clone();
+        let resulting = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new("inc_activation_replay").unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: 1,
+            created_at: 613,
+        };
+        let acknowledgement = machine_acknowledgement(
+            &operation,
+            &environment,
+            &step,
+            LifecycleStepResult::Succeeded,
+            Some(resulting),
+        );
+        operation
+            .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 613)
+            .unwrap();
+        let applied_operation = operation.clone();
+        let applied_environment = environment.clone();
+
+        operation
+            .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 614)
+            .unwrap();
+        assert_eq!(operation, applied_operation);
+        assert_eq!(environment, applied_environment);
+
+        let mut changed = Vec::new();
+        let mut backend = acknowledgement.clone();
+        backend.resulting_activation.as_mut().unwrap().backend =
+            MachineBackend::Other("different-backend".to_string());
+        changed.push(backend);
+        let mut capabilities = acknowledgement.clone();
+        capabilities
+            .resulting_activation
+            .as_mut()
+            .unwrap()
+            .negotiated_capabilities
+            .capabilities
+            .clear();
+        changed.push(capabilities);
+        let mut runtime = acknowledgement.clone();
+        runtime
+            .resulting_activation
+            .as_mut()
+            .unwrap()
+            .runtime_identity
+            .opaque_id
+            .push_str("-different");
+        changed.push(runtime);
+        let mut incarnation = acknowledgement.clone();
+        incarnation
+            .resulting_activation
+            .as_mut()
+            .unwrap()
+            .incarnation
+            .generation += 1;
+        changed.push(incarnation);
+
+        for changed_acknowledgement in changed {
+            assert!(
+                operation
+                    .apply_machine_step_acknowledgement(
+                        &mut environment,
+                        &changed_acknowledgement,
+                        615
+                    )
+                    .is_err()
+            );
+            assert_eq!(operation, applied_operation);
+            assert_eq!(environment, applied_environment);
+        }
+    }
+
+    #[test]
+    fn stale_or_target_incompatible_activation_is_atomic() {
+        let mut environment = project_definition()
+            .instantiate_environment("invalid-activation", 620)
+            .unwrap();
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-invalid-activation",
+            "idem-invalid-activation",
+            "sha256:invalid-activation",
+            621,
+        )
+        .unwrap();
+        operation.begin(&mut environment, 622).unwrap();
+        let step = operation
+            .machine_steps
+            .iter()
+            .find(|step| {
+                environment.machines.iter().any(|machine| {
+                    machine.machine_id == step.machine_id
+                        && machine.target.os == OperatingSystem::Linux
+                })
+            })
+            .unwrap()
+            .clone();
+        let resulting = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new("inc_invalid_activation").unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: 1,
+            created_at: 623,
+        };
+        let valid = machine_acknowledgement(
+            &operation,
+            &environment,
+            &step,
+            LifecycleStepResult::Succeeded,
+            Some(resulting),
+        );
+        let operation_before = operation.clone();
+        let environment_before = environment.clone();
+
+        let mut stale = valid.clone();
+        stale.resulting_incarnation.as_mut().unwrap().generation = 2;
+        stale
+            .resulting_activation
+            .as_mut()
+            .unwrap()
+            .incarnation
+            .generation = 2;
+        assert!(
+            operation
+                .apply_machine_step_acknowledgement(&mut environment, &stale, 623)
+                .is_err()
+        );
+        assert_eq!(operation, operation_before);
+        assert_eq!(environment, environment_before);
+
+        let mut wrong_backend = valid;
+        wrong_backend.resulting_activation.as_mut().unwrap().backend = MachineBackend::MacosNative;
+        assert!(
+            operation
+                .apply_machine_step_acknowledgement(&mut environment, &wrong_backend, 624)
+                .is_err()
+        );
+        assert_eq!(operation, operation_before);
+        assert_eq!(environment, environment_before);
+    }
+
+    #[test]
+    fn historical_terminal_up_without_activation_remains_exactly_replayable() {
+        let mut environment = project_definition()
+            .instantiate_environment("historical-activation", 630)
+            .unwrap();
+        let mut operation = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-historical-activation",
+            "idem-historical-activation",
+            "sha256:historical-activation",
+            631,
+        )
+        .unwrap();
+        operation.begin(&mut environment, 632).unwrap();
+        let step = operation.machine_steps[0].clone();
+        let resulting = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new("inc_historical_activation").unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: 1,
+            created_at: 633,
+        };
+        let acknowledgement = machine_acknowledgement(
+            &operation,
+            &environment,
+            &step,
+            LifecycleStepResult::Succeeded,
+            Some(resulting),
+        );
+        operation
+            .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 633)
+            .unwrap();
+
+        let mut operation_json = serde_json::to_value(&operation).unwrap();
+        operation_json["machine_steps"][0]
+            .as_object_mut()
+            .unwrap()
+            .remove("resulting_activation");
+        let mut environment_json = serde_json::to_value(&environment).unwrap();
+        let machine_index = environment
+            .machines
+            .iter()
+            .position(|machine| machine.machine_id == step.machine_id)
+            .unwrap();
+        environment_json["machines"][machine_index]
+            .as_object_mut()
+            .unwrap()
+            .remove("runtime_identity");
+        let mut historical_operation: EnvironmentLifecycleOperation =
+            serde_json::from_value(operation_json).unwrap();
+        let mut historical_environment: EnvironmentInstance =
+            serde_json::from_value(environment_json).unwrap();
+        historical_operation
+            .validate_against_environment(&historical_environment)
+            .unwrap();
+        let mut historical_acknowledgement = acknowledgement;
+        historical_acknowledgement.resulting_activation = None;
+        let operation_before = historical_operation.clone();
+        let environment_before = historical_environment.clone();
+        historical_operation
+            .apply_machine_step_acknowledgement(
+                &mut historical_environment,
+                &historical_acknowledgement,
+                634,
+            )
+            .unwrap();
+        assert_eq!(historical_operation, operation_before);
+        assert_eq!(historical_environment, environment_before);
+    }
+
+    #[test]
+    fn runtime_identity_shape_is_bounded_control_free_and_target_neutral() {
+        let machine_id = MachineId::new("mch_runtime_identity").unwrap();
+        let valid = MachineRuntimeIdentity {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            opaque_id: r#"{"native_vm":"complete-backend-token"}"#.to_string(),
+        };
+        valid.validate_for_machine(&machine_id).unwrap();
+
+        for opaque_id in [
+            " ".to_string(),
+            "runtime\nidentity".to_string(),
+            "x".repeat(MAX_MACHINE_RUNTIME_IDENTITY_LENGTH + 1),
+        ] {
+            assert!(matches!(
+                MachineRuntimeIdentity {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    opaque_id,
+                }
+                .validate_for_machine(&machine_id),
+                Err(TopologyValidationError::InvalidMachineRuntimeIdentity { .. })
+            ));
+        }
     }
 
     #[test]
@@ -5569,8 +6236,13 @@ mod tests {
             .unwrap();
             operation.begin(&mut environment, 511).unwrap();
             let step = operation.machine_steps[0].clone();
-            let mut acknowledgement =
-                machine_acknowledgement(&operation, &step, LifecycleStepResult::Succeeded, None);
+            let mut acknowledgement = machine_acknowledgement(
+                &operation,
+                &environment,
+                &step,
+                LifecycleStepResult::Succeeded,
+                None,
+            );
             acknowledgement
                 .expected_incarnation
                 .as_mut()
@@ -5592,6 +6264,52 @@ mod tests {
     }
 
     #[test]
+    fn stop_and_delete_exact_replay_preserve_activated_runtime_identity() {
+        for kind in [
+            EnvironmentLifecycleKind::Stop,
+            EnvironmentLifecycleKind::Delete,
+        ] {
+            let mut environment = operational_environment(EnvironmentState::Ready);
+            assert!(
+                environment
+                    .machines
+                    .iter()
+                    .all(|machine| machine.runtime_identity.is_some())
+            );
+            let mut operation = EnvironmentLifecycleOperation::plan(
+                &environment,
+                LifecycleOperationId::generate(),
+                kind,
+                format!("req-runtime-replay-{kind:?}"),
+                format!("idem-runtime-replay-{kind:?}"),
+                "sha256:runtime-replay",
+                515,
+            )
+            .unwrap();
+            operation.begin(&mut environment, 516).unwrap();
+            let step = operation.machine_steps[0].clone();
+            let acknowledgement = machine_acknowledgement(
+                &operation,
+                &environment,
+                &step,
+                LifecycleStepResult::Succeeded,
+                None,
+            );
+            operation
+                .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 517)
+                .unwrap();
+            let operation_after = operation.clone();
+            let environment_after = environment.clone();
+
+            operation
+                .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 518)
+                .unwrap();
+            assert_eq!(operation, operation_after);
+            assert_eq!(environment, environment_after);
+        }
+    }
+
+    #[test]
     fn lifecycle_up_restart_preserves_the_exact_incarnation() {
         let mut environment = operational_environment(EnvironmentState::Stopped);
         let before = environment.clone();
@@ -5609,6 +6327,7 @@ mod tests {
         for step in operation.machine_steps.clone() {
             let acknowledgement = machine_acknowledgement(
                 &operation,
+                &environment,
                 &step,
                 LifecycleStepResult::Succeeded,
                 step.expected_incarnation.clone(),
@@ -5660,6 +6379,7 @@ mod tests {
         };
         let acknowledgement = machine_acknowledgement(
             &operation,
+            &environment,
             &rebuilt_step,
             LifecycleStepResult::Succeeded,
             Some(replacement.clone()),
@@ -5698,7 +6418,13 @@ mod tests {
         .unwrap();
         old.begin(&mut environment, 541).unwrap();
         let old_step = old.machine_steps[0].clone();
-        let stale = machine_acknowledgement(&old, &old_step, LifecycleStepResult::Succeeded, None);
+        let stale = machine_acknowledgement(
+            &old,
+            &environment,
+            &old_step,
+            LifecycleStepResult::Succeeded,
+            None,
+        );
         old.supersede_for_delete(&mut environment, 542).unwrap();
         assert_eq!(old.status, EnvironmentLifecycleStatus::Superseded);
         assert_eq!(environment.state, EnvironmentState::Failed);

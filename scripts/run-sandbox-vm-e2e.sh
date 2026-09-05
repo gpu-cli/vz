@@ -489,6 +489,9 @@ ln -sfn "$RUN_NAME" "$OUTPUT_ROOT/latest"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
 CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
+DOCKER_READINESS_EVIDENCE="$RUN_DIR/runtime-docker-guest-readiness.json"
+DOCKER_READINESS_SHA256="$RUN_DIR/runtime-docker-guest-readiness.json.sha256"
+DOCKER_READINESS_VALIDATED=false
 STACK_TEARDOWN_EVIDENCE="$RUN_DIR/stack-port-forwarding-teardown.json"
 STACK_TEARDOWN_SHA256="$RUN_DIR/stack-port-forwarding-teardown.json.sha256"
 STACK_CONTAINER_OWNERSHIP_EVIDENCE="$RUN_DIR/stack-container-ownership.json"
@@ -895,6 +898,17 @@ validate_container_id_ownership_evidence() {
         (.final.rootfs_absent == true) and
         (.final.shared_vm_absent == true) and
         (.final.guest_resources_clean == true) and
+        (.final.base_network_precondition.exit_code == 0) and
+        (.final.base_network_precondition.stdout | type == "string") and
+        (.final.base_network_precondition.stdout | test("(?m)^default .* dev eth0(\\s|$)")) and
+        (.final.base_network_precondition.stdout | contains(" inet ")) and
+        (.final.guest_inventory_exit_code == 0) and
+        (.final.guest_inventory == "overlay=absent\nservice_netns=absent\nyouki_state=absent\ncgroup_a=absent\ncgroup_b=absent\n") and
+        (.final.baseline_network_inventory_exit_code == 0) and
+        (.final.final_network_inventory_exit_code == 0) and
+        (.final.baseline_network_inventory | type == "string") and
+        (.final.baseline_network_inventory | test("(?m)^default .* dev eth0(\\s|$)")) and
+        (.final.baseline_network_inventory == .final.final_network_inventory) and
         (.final.stale_exec_rejected == true) and
         (.final.generation_released == true) and
         (.final.host_maps_clean == true) and
@@ -2103,11 +2117,12 @@ validate_environment_lifecycle_evidence() {
         (.scenario == "environment-lifecycle-journal-linux-vm") and
 
         (.host_target | exact_keys([
-            "backend", "host_arch", "host_os", "machine_arch", "machine_os", "profile"
+            "backend", "host_arch", "host_os", "kernel_profile", "machine_arch",
+            "machine_os", "profile"
         ])) and
         (.host_target == {
             "host_os": "macos", "host_arch": "aarch64", "machine_os": "linux",
-            "machine_arch": "aarch64", "profile": "developer",
+            "machine_arch": "aarch64", "profile": "hardened", "kernel_profile": "container",
             "backend": "macos_virtualization_linux"
         }) and
 
@@ -2115,18 +2130,18 @@ validate_environment_lifecycle_evidence() {
         (.ids.project_id == "prj_lifecycle_mac_e2e") and
         (all([.ids.target, .ids.sibling][];
             exact_keys([
-                "backend_key", "disk_resource_id", "environment_id", "incarnation_id",
+                "backend_key", "disk_resource_id", "environment_id", "seed_incarnation_id",
                 "machine_id"
             ]) and
             (.environment_id | test("^env_")) and
             (.machine_id | test("^mch_")) and
-            (.incarnation_id | test("^inc_")) and
+            (.seed_incarnation_id | test("^inc_")) and
             (.backend_key | bounded_key) and
             (.disk_resource_id | bounded_key)
         )) and
         (.ids.target.environment_id != .ids.sibling.environment_id) and
         (.ids.target.machine_id != .ids.sibling.machine_id) and
-        (.ids.target.incarnation_id != .ids.sibling.incarnation_id) and
+        (.ids.target.seed_incarnation_id != .ids.sibling.seed_incarnation_id) and
         (.ids.target.backend_key != .ids.sibling.backend_key) and
         (.ids.target.disk_resource_id != .ids.sibling.disk_resource_id) and
 
@@ -2137,8 +2152,8 @@ validate_environment_lifecycle_evidence() {
         ((.operations | map(.idempotency_key) | unique | length) == 6) and
         (all(.operations[];
             exact_keys([
-                "definition_digest", "generation", "idempotency_key", "kind", "label",
-                "operation_id", "plan_digest", "request_hash", "request_id", "status"
+                "activation", "definition_digest", "generation", "idempotency_key", "kind",
+                "label", "operation_id", "plan_digest", "request_hash", "request_id", "status"
             ]) and
             (.operation_id | test("^lop_[A-Za-z0-9._:-]+$")) and
             (.generation | type == "number" and . > 0 and . == floor) and
@@ -2157,6 +2172,42 @@ validate_environment_lifecycle_evidence() {
             ["target_delete", "delete", 4],
             ["sibling_delete", "delete", 2]
         ]) and
+        ([.operations[0], .operations[1], .operations[3]] as $ups |
+            all($ups[];
+                (.activation | exact_keys([
+                    "backend", "incarnation", "negotiated_capabilities", "runtime_identity",
+                    "schema_version"
+                ])) and
+                (.activation.schema_version == 1) and
+                (.activation.backend == "macos_virtualization_linux") and
+                (.activation.negotiated_capabilities == {"capabilities": ["posix_exec"]}) and
+                (.activation.runtime_identity | exact_keys(["opaque_id", "schema_version"])) and
+                (.activation.runtime_identity.schema_version == 1) and
+                ((.activation.runtime_identity.opaque_id | fromjson) |
+                    exact_keys(["incarnation_id", "schema_version", "stack_id"]) and
+                    (.schema_version == 1) and (.incarnation_id | nonempty) and (.stack_id | bounded_key)) and
+                (.activation.incarnation | exact_keys([
+                    "created_at", "generation", "incarnation_id", "machine_id", "schema_version"
+                ])) and
+                (.activation.incarnation.schema_version == 1) and
+                (.activation.incarnation.incarnation_id | test("^inc_runtime_"))
+            )
+        ) and
+        (.operations[0].activation.incarnation.machine_id == .ids.target.machine_id) and
+        (.operations[0].activation.incarnation.generation == 2) and
+        (((.operations[0].activation.runtime_identity.opaque_id | fromjson).stack_id) ==
+            .ids.target.backend_key) and
+        (.operations[1].activation.incarnation.machine_id == .ids.sibling.machine_id) and
+        (.operations[1].activation.incarnation.generation == 2) and
+        (((.operations[1].activation.runtime_identity.opaque_id | fromjson).stack_id) ==
+            .ids.sibling.backend_key) and
+        (.operations[3].activation.incarnation.machine_id == .ids.target.machine_id) and
+        (.operations[3].activation.incarnation.generation == 3) and
+        (((.operations[3].activation.runtime_identity.opaque_id | fromjson).stack_id) ==
+            .ids.target.backend_key) and
+        (([.operations[0], .operations[1], .operations[3]] |
+            map(.activation.runtime_identity.opaque_id) | unique | length) == 3) and
+        (all([.operations[2], .operations[4], .operations[5]][]; .activation == null)) and
 
         ((.phases | type) == "array") and
         ((.phases | map(.name)) == [
@@ -3081,6 +3132,7 @@ run_and_log() {
     fi
 
     if [[ "$suite" == "runtime" ]]; then
+        cmd_env+=("VZ_DOCKER_READINESS_EVIDENCE=$DOCKER_READINESS_EVIDENCE")
         if [[ "$label" == "runtime" || "$label" == "runtime-container-id-ownership" ]]; then
             rm -f "$CONTAINER_ID_OWNERSHIP_EVIDENCE"
             rm -f "$CONTAINER_ID_OWNERSHIP_SHA256"
@@ -3207,10 +3259,38 @@ run_and_log() {
     if [[ $status -eq 0 && "$PROFILE" == "release" \
         && "$suite" == "runtime" && "$label" == "runtime" ]] \
         && ! grep -Fqx \
-            "test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished" \
+            "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished" \
             <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
-        echo "complete runtime suite did not report exactly 18/18 real-VM tests with zero ignored failures" >&2
+        echo "complete runtime suite did not report exactly 19/19 real-VM tests with zero ignored failures" >&2
         return 100
+    fi
+
+    if [[ $status -eq 0 && "$suite" == "runtime" && "$label" == "runtime" ]]; then
+        if ! jq -e '
+            .schema_version == 1 and
+            .scope == "guest_only" and
+            .runtime_identity.schema_version == 1 and
+            .runtime_identity.stack_id == "e2e-developer-docker-ready" and
+            (.runtime_identity.incarnation_id | type == "string" and length > 0) and
+            .verified_profile == "developer" and
+            .guest_socket_path == "/run/vz-docker/docker.sock" and
+            .engine_ping_proven == true and
+            .stale_identity_refused_before_socket == true and
+            .replay_same_identity == true and
+            .reboot_runtime_identity.schema_version == 1 and
+            .reboot_runtime_identity.stack_id == .runtime_identity.stack_id and
+            (.reboot_runtime_identity.incarnation_id | type == "string" and length > 0) and
+            .reboot_runtime_identity.incarnation_id != .runtime_identity.incarnation_id and
+            .old_identity_refused_after_reboot == true and
+            .persistent_machine_state_survived_reboot == true and
+            .bootstrap_preserved_daemon_config == true and
+            has("host_socket_or_context") and .host_socket_or_context == null
+        ' "$DOCKER_READINESS_EVIDENCE" > /dev/null; then
+            echo "private guest Docker readiness evidence is missing or invalid" >&2
+            return 115
+        fi
+        shasum -a 256 "$DOCKER_READINESS_EVIDENCE" > "$DOCKER_READINESS_SHA256"
+        DOCKER_READINESS_VALIDATED=true
     fi
 
     if [[ $status -eq 0 && "$PROFILE" == "release" \
@@ -3775,6 +3855,13 @@ action_summary="$RUN_DIR/summary.txt"
     else
         echo "container_id_ownership=none"
         echo "container_id_ownership_sha256=none"
+    fi
+    if [[ "$DOCKER_READINESS_VALIDATED" == "true" ]]; then
+        echo "docker_guest_readiness=$DOCKER_READINESS_EVIDENCE"
+        echo "docker_guest_readiness_sha256=$DOCKER_READINESS_SHA256"
+    else
+        echo "docker_guest_readiness=none"
+        echo "docker_guest_readiness_sha256=none"
     fi
     if [[ "$EXEC_SUPERVISION_EVIDENCE_VALIDATED" == "true" ]]; then
         echo "exec_supervision=$EXEC_SUPERVISION_EVIDENCE"

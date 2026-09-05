@@ -9,9 +9,9 @@ use std::time::{Duration, Instant};
 use serde_json::Value;
 use tempfile::TempDir;
 use vz_runtime_contract::{
-    Architecture, CapabilitySet, EnvironmentSpec, MachineProfile, MachineResources, MachineSpec,
-    OperatingSystem, ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION,
-    TargetSpec,
+    Architecture, CapabilitySet, EnvironmentSpec, MachineCapability, MachineProfile,
+    MachineResources, MachineSpec, OperatingSystem, ProjectDefinition, ProjectId, ProjectState,
+    TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
 use vz_stack::StateStore;
@@ -273,7 +273,7 @@ fn definition(project_name: &str, image: &str) -> ProjectDefinition {
                         digest: None,
                     },
                     resources: MachineResources::default(),
-                    requested_capabilities: CapabilitySet::default(),
+                    requested_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),
                     workspace: None,
                 },
                 MachineSpec {
@@ -497,6 +497,26 @@ async fn status_reads_exact_topology_reports_definition_drift_and_does_not_mutat
         status["environments"][0]["machines"][0]["machine_id"],
         app_id.as_str()
     );
+    let persisted_app = persisted_before_status.as_ref().unwrap().environments[0]
+        .machines
+        .iter()
+        .find(|machine| machine.machine_id == app_id)
+        .unwrap();
+    let reported_app = &status["environments"][0]["machines"][0];
+    assert_eq!(
+        reported_app["requested_capabilities"],
+        serde_json::to_value(&persisted_app.requested_capabilities).unwrap()
+    );
+    assert_eq!(
+        reported_app["negotiated_capabilities"],
+        serde_json::to_value(&persisted_app.negotiated_capabilities).unwrap()
+    );
+    // A Developer profile alone must not synthesize Docker availability before Up.
+    assert_eq!(
+        reported_app["negotiated_capabilities"]["capabilities"],
+        serde_json::json!([])
+    );
+    assert!(reported_app.get("docker_context").is_none());
 
     let reopened = StateStore::open(&invocation.state_db).unwrap();
     assert_eq!(

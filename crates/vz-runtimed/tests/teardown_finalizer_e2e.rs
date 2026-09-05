@@ -228,6 +228,7 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
                 created_at: 1,
             }),
             state: MachineState::Ready,
+            runtime_identity: None,
             legacy_sandbox_id: None,
         }],
         networks: Vec::new(),

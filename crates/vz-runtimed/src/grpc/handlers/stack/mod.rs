@@ -677,6 +677,7 @@ mod runtime_error_mapping_tests {
                     created_at: 1,
                 }),
                 state: MachineState::Ready,
+                runtime_identity: None,
                 legacy_sandbox_id: None,
             }],
             networks: Vec::new(),

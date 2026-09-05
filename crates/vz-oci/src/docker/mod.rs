@@ -7,6 +7,6 @@
 mod artifacts;
 
 pub use artifacts::{
-    DOCKER_ENGINE_VERSION, DockerArtifactError, DockerArtifacts, DockerVersionMetadata,
-    ensure_docker_artifacts,
+    DOCKER_ENGINE_VERSION, DockerArtifactError, DockerArtifacts, DockerBinaries,
+    DockerVersionMetadata, ensure_docker_artifacts, ensure_docker_binaries,
 };

@@ -20,8 +20,8 @@ pub use buildkit::{
 pub use bundle::CONTAINER_LOG_FILE;
 pub use container_store::{ContainerInfo, ContainerStatus, ContainerStore};
 pub use docker::{
-    DOCKER_ENGINE_VERSION, DockerArtifactError, DockerArtifacts, DockerVersionMetadata,
-    ensure_docker_artifacts,
+    DOCKER_ENGINE_VERSION, DockerArtifactError, DockerArtifacts, DockerBinaries,
+    DockerVersionMetadata, ensure_docker_artifacts, ensure_docker_binaries,
 };
 pub use error::OciError;
 

@@ -12,10 +12,10 @@ use vz_cli::developer_environment_context::{
 };
 use vz_cli::project_definition::{DefinitionDiscoveryError, discover_project_definition};
 use vz_runtime_contract::{
-    EnvironmentId, EnvironmentInstance, EnvironmentSelectionContext, EnvironmentSelectionSource,
-    EnvironmentSelector, EnvironmentState, MAX_TOPOLOGY_SELECTION_CANDIDATES, MachineBackend,
-    MachineId, MachineProfile, MachineState, TargetSpec, TopologyCandidate,
-    TopologyResolutionError,
+    CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSelectionContext,
+    EnvironmentSelectionSource, EnvironmentSelector, EnvironmentState,
+    MAX_TOPOLOGY_SELECTION_CANDIDATES, MachineBackend, MachineId, MachineProfile, MachineState,
+    TargetSpec, TopologyCandidate, TopologyResolutionError,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, ProjectStateSnapshot};
@@ -103,6 +103,10 @@ struct MachineStatus {
     state: MachineState,
     profile: MachineProfile,
     target: TargetSpec,
+    /// Persisted requests and negotiation results, never inferred from profile
+    /// or the capabilities of a neighboring Machine or the daemon itself.
+    requested_capabilities: CapabilitySet,
+    negotiated_capabilities: CapabilitySet,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<MachineBackend>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -128,6 +132,8 @@ impl From<EnvironmentInstance> for EnvironmentStatus {
                     state: machine.state,
                     profile: machine.profile,
                     target: machine.target,
+                    requested_capabilities: machine.requested_capabilities,
+                    negotiated_capabilities: machine.negotiated_capabilities,
                     backend: machine.backend,
                     incarnation_id: machine
                         .incarnation
@@ -603,6 +609,14 @@ fn print_text_status(output: &StatusOutput) {
                 machine.target.arch,
                 machine.profile
             );
+            println!(
+                "    Capabilities (persisted): requested={:?} negotiated={:?}",
+                machine.requested_capabilities.capabilities,
+                machine.negotiated_capabilities.capabilities
+            );
+            for (capability, reason) in &machine.negotiated_capabilities.unsupported {
+                println!("    Unsupported {capability:?}: {reason}");
+            }
         }
     }
 }
@@ -639,6 +653,7 @@ mod tests {
             backend: None,
             incarnation: None,
             state: MachineState::Ready,
+            runtime_identity: None,
             legacy_sandbox_id: None,
         };
         EnvironmentInstance {
@@ -742,6 +757,69 @@ mod tests {
             Some(MachineId::new("mch-two").unwrap())
         );
         assert_eq!(resolve_machine(&environment, None, None).unwrap(), None);
+    }
+
+    #[test]
+    fn status_preserves_per_machine_negotiation_without_inference_or_sibling_fallback() {
+        use vz_runtime_contract::MachineCapability;
+
+        let mut environment = environment_with_machines("env-status", "dev");
+        let developer = &mut environment.machines[0];
+        developer.requested_capabilities =
+            CapabilitySet::new([MachineCapability::PosixExec, MachineCapability::Suspend]);
+        developer.negotiated_capabilities = CapabilitySet::new([
+            MachineCapability::PosixExec,
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]);
+        developer.negotiated_capabilities.unsupported.insert(
+            MachineCapability::Suspend,
+            "shared devices cannot be suspended atomically".to_string(),
+        );
+        let requested = developer.requested_capabilities.clone();
+        let negotiated = developer.negotiated_capabilities.clone();
+
+        let mut native = environment.machines[1].clone();
+        native.machine_id = MachineId::new("mch-native").unwrap();
+        native.name = "native".to_string();
+        native.target.os = OperatingSystem::Macos;
+        native.negotiated_capabilities = CapabilitySet::new([MachineCapability::PosixExec]);
+        environment.machines.push(native);
+        environment.machines[1].profile = MachineProfile::Hardened;
+        environment.machines[1].negotiated_capabilities =
+            CapabilitySet::new([MachineCapability::PosixExec]);
+
+        let output = EnvironmentStatus::from(environment);
+        assert_eq!(output.machines[0].requested_capabilities, requested);
+        assert_eq!(output.machines[0].negotiated_capabilities, negotiated);
+        for machine in &output.machines[1..] {
+            assert_eq!(
+                machine.negotiated_capabilities,
+                CapabilitySet::new([MachineCapability::PosixExec])
+            );
+        }
+        let json = serde_json::to_value(&output).unwrap();
+        assert_eq!(
+            json["machines"][0]["negotiated_capabilities"]["unsupported"]["suspend"],
+            "shared devices cannot be suspended atomically"
+        );
+        assert!(json["machines"][1].get("docker_context").is_none());
+        assert!(json["machines"][2].get("docker_context").is_none());
+    }
+
+    #[test]
+    fn status_does_not_claim_implicit_docker_before_negotiation() {
+        let mut environment = environment_with_machines("env-status", "dev");
+        for machine in &mut environment.machines {
+            machine.state = MachineState::Creating;
+        }
+        let output = EnvironmentStatus::from(environment);
+        for machine in &output.machines {
+            assert_eq!(machine.profile, MachineProfile::Developer);
+            assert_eq!(machine.target.os, OperatingSystem::Linux);
+            assert_eq!(machine.negotiated_capabilities, CapabilitySet::default());
+        }
     }
 
     #[test]

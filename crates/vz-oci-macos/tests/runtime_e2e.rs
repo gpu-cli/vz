@@ -218,6 +218,179 @@ fn ready_generation_evidence(ready: &ContainerReadyGeneration) -> serde_json::Va
     })
 }
 
+/// Prove lazy Docker activation against one exact, vz-managed Developer Linux
+/// shared VM. This intentionally stops at the guest socket boundary: a host
+/// Docker proxy/context is a separate product layer.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "requires Apple Silicon + Developer Linux artifacts + Docker facade artifacts"]
+async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_backed() {
+    if !require_virtualization_entitlement() {
+        return;
+    }
+    init_tracing();
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: temp.path().join("runtime"),
+        linux_profile: Some(KernelProfile::Developer),
+        require_exact_agent_version: true,
+        agent_ready_timeout: Duration::from_secs(15),
+        exec_timeout: Duration::from_secs(30),
+        default_memory_mb: 4096,
+        ..RuntimeConfig::default()
+    });
+    let stack_id = "e2e-developer-docker-ready";
+    runtime
+        .boot_shared_vm(stack_id, vec![], Default::default())
+        .await
+        .unwrap();
+    let identity = runtime
+        .inspect_shared_vm_identity(stack_id)
+        .await
+        .unwrap()
+        .expect("shared VM identity");
+
+    let stale = vz_runtime_contract::StackRuntimeIdentity::new(stack_id).unwrap();
+    let stale_error = runtime
+        .ensure_shared_vm_docker_ready_exact(&stale)
+        .await
+        .expect_err("replacement identity must fail before Docker activation");
+    let before = runtime
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "test ! -S /run/vz-docker/docker.sock".to_string(),
+            ],
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap();
+
+    let readiness_result = tokio::time::timeout(
+        Duration::from_secs(90),
+        runtime.ensure_shared_vm_docker_ready_exact(&identity),
+    )
+    .await;
+    let readiness = match readiness_result {
+        Ok(Ok(readiness)) => readiness,
+        failure => {
+            let daemon_logs = runtime
+                .exec_in_shared_vm(
+                    stack_id,
+                    "/bin/sh".to_string(),
+                    vec![
+                        "-c".to_string(),
+                        "for log in /var/lib/docker/log/containerd.log /var/lib/docker/log/dockerd.log; do echo ===$log===; /bin/busybox tail -n 200 $log 2>&1 || true; done".to_string(),
+                    ],
+                    Duration::from_secs(10),
+                )
+                .await;
+            let shutdown = runtime.shutdown_shared_vm(stack_id).await;
+            panic!(
+                "Docker readiness failed: {failure:?}; guest daemon logs: {daemon_logs:?}; shutdown: {shutdown:?}"
+            );
+        }
+    };
+    let replay = runtime
+        .ensure_shared_vm_docker_ready_exact(&identity)
+        .await
+        .expect("Docker readiness replay");
+    let current = runtime.inspect_shared_vm_identity(stack_id).await.unwrap();
+
+    let persisted = runtime
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "printf 'machine-state-survives-reboot\\n' > /var/lib/docker/vz-e2e-marker && printf '{\"log-level\":\"warn\"}\\n' > /var/lib/docker/config/daemon.json && /bin/busybox sync".to_string(),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("write persistent Docker state");
+    assert_eq!(persisted.exit_code, 0, "persist Docker state failed");
+
+    runtime.shutdown_shared_vm(stack_id).await.unwrap();
+    runtime
+        .boot_shared_vm(stack_id, vec![], Default::default())
+        .await
+        .expect("reboot Developer shared VM");
+    let reboot_identity = runtime
+        .inspect_shared_vm_identity(stack_id)
+        .await
+        .unwrap()
+        .expect("reboot shared VM identity");
+    let old_identity_error = runtime
+        .ensure_shared_vm_docker_ready_exact(&identity)
+        .await
+        .expect_err("old identity must not activate Docker after reboot");
+    let reboot_readiness = runtime
+        .ensure_shared_vm_docker_ready_exact(&reboot_identity)
+        .await
+        .expect("Docker readiness after reboot");
+    let persisted_probe = runtime
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                "cat /var/lib/docker/vz-e2e-marker; cat /var/lib/docker/config/daemon.json"
+                    .to_string(),
+            ],
+            Duration::from_secs(10),
+        )
+        .await
+        .expect("read persistent Docker state after reboot");
+    runtime.shutdown_shared_vm(stack_id).await.unwrap();
+
+    assert!(matches!(
+        stale_error,
+        vz_oci_macos::MacosOciError::SharedRuntimeIdentityMismatch { .. }
+    ));
+    assert_eq!(before.exit_code, 0, "stale access started Docker");
+    assert_eq!(readiness.runtime_identity, identity);
+    assert_eq!(readiness.verified_profile, KernelProfile::Developer);
+    assert_eq!(readiness.guest_socket_path, "/run/vz-docker/docker.sock");
+    assert_eq!(replay, readiness);
+    assert_eq!(current.as_ref(), Some(&identity));
+    assert_ne!(reboot_identity, identity);
+    assert!(matches!(
+        old_identity_error,
+        vz_oci_macos::MacosOciError::SharedRuntimeIdentityMismatch { .. }
+    ));
+    assert_eq!(reboot_readiness.runtime_identity, reboot_identity);
+    assert_eq!(persisted_probe.exit_code, 0);
+    assert_eq!(
+        persisted_probe.stdout,
+        "machine-state-survives-reboot\n{\"log-level\":\"warn\"}\n"
+    );
+
+    if let Some(path) = std::env::var_os("VZ_DOCKER_READINESS_EVIDENCE") {
+        std::fs::write(
+            path,
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": 1,
+                "scope": "guest_only",
+                "runtime_identity": identity,
+                "verified_profile": "developer",
+                "guest_socket_path": readiness.guest_socket_path,
+                "engine_ping_proven": true,
+                "stale_identity_refused_before_socket": true,
+                "replay_same_identity": true,
+                "reboot_runtime_identity": reboot_identity,
+                "old_identity_refused_after_reboot": true,
+                "persistent_machine_state_survived_reboot": true,
+                "bootstrap_preserved_daemon_config": true,
+                "host_socket_or_context": null,
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+    }
+}
+
 fn ready_matches_process_probe(
     ready: &ContainerReadyGeneration,
     probe: &serde_json::Value,
@@ -285,6 +458,44 @@ echo __routes__
 echo __netns__
 /bin/busybox ls -1 /var/run/netns 2>/dev/null | /bin/busybox sort || true"#
         .to_string()
+}
+
+async fn wait_for_guest_base_network(
+    runtime: &Runtime,
+    stack_id: &str,
+) -> vz::protocol::ExecOutput {
+    const BASE_NETWORK_READY: &str = r#"set -eu
+address="$('/bin/busybox' ip -4 addr show dev eth0)"
+routes="$('/bin/busybox' ip -4 route show)"
+printf 'address:\n%s\nroutes:\n%s\n' "$address" "$routes"
+printf '%s\n' "$address" | /bin/busybox grep -q ' inet '
+printf '%s\n' "$routes" | /bin/busybox grep -Eq '^default .* dev eth0([[:space:]]|$)'"#;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let output = runtime
+            .exec_in_shared_vm(
+                stack_id,
+                "/bin/sh".into(),
+                vec!["-c".into(), BASE_NETWORK_READY.into()],
+                Duration::from_secs(5),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                panic!("base-network readiness probe failed before completion: {error}")
+            });
+        if output.exit_code == 0 {
+            return output;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "base eth0 did not acquire an IPv4 address and default route: exit={} stdout={:?} stderr={:?}",
+            output.exit_code,
+            output.stdout,
+            output.stderr
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
 }
 
 fn standalone_duplicate_id_was_rejected(
@@ -694,6 +905,10 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     rt.boot_shared_vm(STACK_ID, vec![], Default::default())
         .await
         .unwrap();
+    // Guest init starts DHCP asynchronously. Wait for the host-provided base
+    // network to converge before snapshotting it, so the cleanup oracle only
+    // compares topology owned by this test rather than DHCP timing.
+    let base_network_precondition = wait_for_guest_base_network(&rt, STACK_ID).await;
     let baseline_network_inventory = rt
         .exec_in_shared_vm(
             STACK_ID,
@@ -1173,7 +1388,8 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
         .await
         .unwrap();
     assert_eq!(final_network_inventory.exit_code, 0);
-    let guest_resources_clean = guest_inventory.stdout.contains("overlay=absent")
+    let guest_resources_clean = guest_inventory.exit_code == 0
+        && guest_inventory.stdout.contains("overlay=absent")
         && guest_inventory.stdout.contains("service_netns=absent")
         && guest_inventory.stdout.contains("youki_state=absent")
         && guest_inventory.stdout.contains("cgroup_a=absent")
@@ -1258,9 +1474,20 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
             "generation_released": generation_released,
             "host_maps_clean": host_maps_clean,
             "lifecycle_diagnostics": format!("{lifecycle_diagnostics:?}"),
+            "base_network_precondition": {
+                "exit_code": base_network_precondition.exit_code,
+                "stdout": base_network_precondition.stdout,
+                "stderr": base_network_precondition.stderr,
+            },
             "guest_inventory": guest_inventory.stdout,
+            "guest_inventory_exit_code": guest_inventory.exit_code,
+            "guest_inventory_stderr": guest_inventory.stderr,
             "baseline_network_inventory": baseline_network_inventory.stdout,
+            "baseline_network_inventory_exit_code": baseline_network_inventory.exit_code,
+            "baseline_network_inventory_stderr": baseline_network_inventory.stderr,
             "final_network_inventory": final_network_inventory.stdout,
+            "final_network_inventory_exit_code": final_network_inventory.exit_code,
+            "final_network_inventory_stderr": final_network_inventory.stderr,
             "orphan_setup_tmp": orphan_setup_tmp.clone(),
         },
     });
@@ -1329,8 +1556,16 @@ async fn container_id_lifecycle_serialization_and_generation_ownership() {
     );
     assert!(
         guest_resources_clean,
-        "guest resources leaked: {}",
-        guest_inventory.stdout
+        "guest cleanup mismatch: inventory(exit={} stdout={:?} stderr={:?}); baseline(exit={} stdout={:?} stderr={:?}); final(exit={} stdout={:?} stderr={:?})",
+        guest_inventory.exit_code,
+        guest_inventory.stdout,
+        guest_inventory.stderr,
+        baseline_network_inventory.exit_code,
+        baseline_network_inventory.stdout,
+        baseline_network_inventory.stderr,
+        final_network_inventory.exit_code,
+        final_network_inventory.stdout,
+        final_network_inventory.stderr,
     );
     assert!(
         orphan_setup_tmp.is_empty(),

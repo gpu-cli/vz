@@ -32,6 +32,10 @@ const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const ENGINE_PING_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENGINE_PING_RESPONSE_BYTES: u64 = 16 * 1024;
 const YOUKI_RUNTIME_NAME: &str = "youki";
+// Moby docker-v29.7.2 pins BuildKit v0.32.2. Its embedded builder reads this
+// variable and replaces the default runc/buildkit-runc candidate list with the
+// one exact command below. Re-audit this private Moby contract on every upgrade.
+const MOBY_BUILDKIT_OCI_RUNTIME_ENV: &str = "DOCKER_BUILDKIT_RUNC_COMMAND";
 const ENGINE_PING_REQUEST: &[u8] =
     b"GET /_ping HTTP/1.1\r\nHost: docker\r\nConnection: close\r\n\r\n";
 
@@ -128,7 +132,9 @@ fi
 
         let mounts = std::fs::read_to_string("/proc/mounts")
             .context("failed to inspect guest mounts after Docker setup")?;
-        validate_persistent_mount(&mounts, DOCKER_DATA_ROOT)
+        validate_persistent_mount(&mounts, DOCKER_DATA_ROOT)?;
+        validate_exact_mount(&mounts, DOCKER_BIN_DIR, "vz-docker-bin", "virtiofs")?;
+        validate_exact_mount(&mounts, YOUKI_BIN_DIR, "linux-bin", "virtiofs")
     }
 }
 
@@ -202,19 +208,29 @@ fn validate_dockerd_config_contents(config: &str) -> anyhow::Result<()> {
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn validate_persistent_mount(mounts: &str, expected_path: &str) -> anyhow::Result<()> {
-    let mount = mounts.lines().find_map(|line| {
+    validate_exact_mount(mounts, expected_path, "/dev/vda", "ext4")
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn validate_exact_mount(
+    mounts: &str,
+    expected_path: &str,
+    expected_source: &str,
+    expected_filesystem: &str,
+) -> anyhow::Result<()> {
+    let mut matching = mounts.lines().filter_map(|line| {
         let mut fields = line.split_whitespace();
         let source = fields.next()?;
         let mount_path = fields.next()?;
         let filesystem = fields.next()?;
         (mount_path == expected_path).then_some((source, filesystem))
     });
-    let Some((source, filesystem)) = mount else {
-        bail!("Docker state path {expected_path} is not a mount point");
+    let Some((source, filesystem)) = matching.next() else {
+        bail!("Docker prerequisite path {expected_path} is not a mount point");
     };
-    if filesystem != "ext4" || !source.starts_with("/dev/vd") {
+    if matching.next().is_some() || filesystem != expected_filesystem || source != expected_source {
         bail!(
-            "Docker state path {expected_path} must be an ext4 persistent virtio disk (found {source} {filesystem})"
+            "Docker prerequisite path {expected_path} requires exactly one {expected_source} {expected_filesystem} mount (found {source} {filesystem})"
         );
     }
     Ok(())
@@ -266,7 +282,17 @@ async fn run_daemons_once() -> anyhow::Result<()> {
 
 fn spawn_containerd() -> anyhow::Result<Child> {
     let (stdout, stderr) = daemon_logs("containerd")?;
-    Command::new(format!("{DOCKER_BIN_DIR}/containerd"))
+    containerd_command()
+        .stdout(stdout)
+        .stderr(stderr)
+        .kill_on_drop(true)
+        .spawn()
+        .context("failed to spawn Docker facade containerd")
+}
+
+fn containerd_command() -> Command {
+    let mut command = Command::new(format!("{DOCKER_BIN_DIR}/containerd"));
+    command
         .args([
             "--config",
             CONTAINERD_CONFIG,
@@ -277,24 +303,27 @@ fn spawn_containerd() -> anyhow::Result<Child> {
             "--address",
             CONTAINERD_SOCKET_PATH,
         ])
-        .env("PATH", daemon_path())
-        .stdout(stdout)
-        .stderr(stderr)
-        .kill_on_drop(true)
-        .spawn()
-        .context("failed to spawn Docker facade containerd")
+        .env("PATH", daemon_path());
+    command
 }
 
 fn spawn_dockerd() -> anyhow::Result<Child> {
     let (stdout, stderr) = daemon_logs("dockerd")?;
-    Command::new(format!("{DOCKER_BIN_DIR}/dockerd"))
-        .args(dockerd_args())
-        .env("PATH", daemon_path())
+    dockerd_command()
         .stdout(stdout)
         .stderr(stderr)
         .kill_on_drop(true)
         .spawn()
         .context("failed to spawn Docker facade dockerd")
+}
+
+fn dockerd_command() -> Command {
+    let mut command = Command::new(format!("{DOCKER_BIN_DIR}/dockerd"));
+    command
+        .args(dockerd_args())
+        .env("PATH", daemon_path())
+        .env(MOBY_BUILDKIT_OCI_RUNTIME_ENV, YOUKI_BINARY);
+    command
 }
 
 fn dockerd_args() -> Vec<String> {
@@ -461,6 +490,35 @@ mod tests {
         assert!(validate_persistent_mount(mounts, DOCKER_DATA_ROOT).is_ok());
         let initramfs = "rootfs / rootfs rw 0 0\nrootfs /var/lib/docker rootfs rw 0 0\n";
         assert!(validate_persistent_mount(initramfs, DOCKER_DATA_ROOT).is_err());
+        let named_volume = "/dev/vdb /var/lib/docker ext4 rw 0 0\n";
+        assert!(validate_persistent_mount(named_volume, DOCKER_DATA_ROOT).is_err());
+        let overmounted = format!("{mounts}{named_volume}");
+        assert!(validate_persistent_mount(&overmounted, DOCKER_DATA_ROOT).is_err());
+    }
+
+    #[test]
+    fn binary_mounts_require_exact_tags_and_no_overmount() {
+        let mounts = "vz-docker-bin /mnt/vz-docker-bin virtiofs ro 0 0\nlinux-bin /mnt/linux-bin virtiofs ro 0 0\n";
+        assert!(validate_exact_mount(mounts, DOCKER_BIN_DIR, "vz-docker-bin", "virtiofs").is_ok());
+        assert!(validate_exact_mount(mounts, YOUKI_BIN_DIR, "linux-bin", "virtiofs").is_ok());
+        for invalid in [
+            "rootfs /mnt/vz-docker-bin rootfs rw 0 0\n",
+            "other-machine /mnt/vz-docker-bin virtiofs ro 0 0\n",
+            "vz-docker-bin /mnt/vz-docker-bin ext4 rw 0 0\n",
+        ] {
+            assert!(
+                validate_exact_mount(invalid, DOCKER_BIN_DIR, "vz-docker-bin", "virtiofs").is_err()
+            );
+            assert!(
+                validate_exact_mount(
+                    &format!("{mounts}{invalid}"),
+                    DOCKER_BIN_DIR,
+                    "vz-docker-bin",
+                    "virtiofs"
+                )
+                .is_err()
+            );
+        }
     }
 
     #[tokio::test]
@@ -497,6 +555,28 @@ mod tests {
                 "--default-runtime",
                 "youki",
             ]
+        );
+    }
+
+    #[test]
+    fn embedded_buildkit_has_one_exact_youki_runtime_without_containerd_override() {
+        fn env_value(command: &Command, key: &str) -> Option<String> {
+            command
+                .as_std()
+                .get_envs()
+                .find_map(|(name, value)| {
+                    (name == key).then(|| value.map(|value| value.to_string_lossy().into_owned()))
+                })
+                .flatten()
+        }
+
+        assert_eq!(
+            env_value(&dockerd_command(), MOBY_BUILDKIT_OCI_RUNTIME_ENV).as_deref(),
+            Some(YOUKI_BINARY)
+        );
+        assert_eq!(
+            env_value(&containerd_command(), MOBY_BUILDKIT_OCI_RUNTIME_ENV),
+            None
         );
     }
 

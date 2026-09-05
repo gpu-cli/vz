@@ -268,6 +268,8 @@ mod tests {
         let _ = ReceiptPayload::default();
         let _ = StackServiceStatus::default();
         let _ = StackServiceLog::default();
+        let _ = MachineRuntimeIdentity::default();
+        let _ = MachineActivationEvidence::default();
         let _ = EnvironmentLifecycleOperation::default();
         let _ = MachineLifecycleStep::default();
         let _ = MachineLifecycleStepAcknowledgement::default();
@@ -777,6 +779,21 @@ mod tests {
                 ],
             ),
             (
+                "MachineRuntimeIdentity",
+                &[("schema_version", 1), ("opaque_id", 2)],
+            ),
+            (
+                "MachineActivationEvidence",
+                &[
+                    ("schema_version", 1),
+                    ("backend", 2),
+                    ("other_backend", 3),
+                    ("negotiated_capabilities", 4),
+                    ("runtime_identity", 5),
+                    ("incarnation", 6),
+                ],
+            ),
+            (
                 "MachineInstance",
                 &[
                     ("schema_version", 1),
@@ -793,6 +810,7 @@ mod tests {
                     ("state", 12),
                     ("legacy_sandbox_id", 13),
                     ("profile", 14),
+                    ("runtime_identity", 15),
                 ],
             ),
             (
@@ -839,6 +857,7 @@ mod tests {
                     ("failure_reason", 5),
                     ("expected_incarnation", 6),
                     ("resulting_incarnation", 7),
+                    ("resulting_activation", 8),
                 ],
             ),
             (
@@ -852,6 +871,7 @@ mod tests {
                     ("result", 6),
                     ("expected_incarnation", 7),
                     ("resulting_incarnation", 8),
+                    ("resulting_activation", 9),
                 ],
             ),
             (
@@ -1372,6 +1392,10 @@ mod tests {
             }),
             state: MachineState::Ready as i32,
             legacy_sandbox_id: Some("vz-run-shop-deadbeef".into()),
+            runtime_identity: Some(MachineRuntimeIdentity {
+                schema_version: 1,
+                opaque_id: "test-backend:runtime:api:7".into(),
+            }),
         };
         let environment = EnvironmentInstance {
             schema_version: 1,
@@ -1446,6 +1470,30 @@ mod tests {
             generation: 8,
             created_at: 1_700_000_200,
         };
+        let resulting_incarnation = MachineIncarnation {
+            incarnation_id: "inc_api_9".into(),
+            generation: 9,
+            ..incarnation.clone()
+        };
+        let resulting_activation = MachineActivationEvidence {
+            schema_version: 1,
+            backend: MachineBackend::MacosVirtualizationLinux as i32,
+            other_backend: None,
+            negotiated_capabilities: Some(CapabilitySet {
+                capabilities: vec![
+                    MachineCapability::PosixExec as i32,
+                    MachineCapability::DockerEngine as i32,
+                    MachineCapability::Compose as i32,
+                    MachineCapability::Buildx as i32,
+                ],
+                unsupported: Vec::new(),
+            }),
+            runtime_identity: Some(MachineRuntimeIdentity {
+                schema_version: 1,
+                opaque_id: r#"{"schema_version":1,"stack_id":"vzr1-machine","incarnation_id":"00000000-0000-4000-8000-000000000009"}"#.into(),
+            }),
+            incarnation: Some(resulting_incarnation.clone()),
+        };
         let operation = EnvironmentLifecycleOperation {
             schema_version: 1,
             operation_id: "lop_up_8".into(),
@@ -1466,6 +1514,7 @@ mod tests {
                 target_state: Some(MachineState::Ready as i32),
                 expected_incarnation: Some(incarnation.clone()),
                 resulting_incarnation: None,
+                resulting_activation: None,
                 status: LifecycleStepStatus::Pending as i32,
                 failure_reason: None,
             }],
@@ -1492,11 +1541,8 @@ mod tests {
             initial_state: MachineState::Stopped as i32,
             target_state: Some(MachineState::Ready as i32),
             expected_incarnation: Some(incarnation.clone()),
-            resulting_incarnation: Some(MachineIncarnation {
-                incarnation_id: "inc_api_9".into(),
-                generation: 9,
-                ..incarnation
-            }),
+            resulting_incarnation: Some(resulting_incarnation),
+            resulting_activation: Some(resulting_activation),
             result: Some(LifecycleStepResult {
                 result: Some(StepResult::Succeeded(LifecycleStepSucceeded::default())),
             }),
@@ -1512,6 +1558,16 @@ mod tests {
         let encoded = acknowledgement.encode_to_vec();
         let decoded = MachineLifecycleStepAcknowledgement::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded, acknowledgement);
+        assert_eq!(
+            decoded
+                .resulting_activation
+                .as_ref()
+                .and_then(|evidence| evidence.runtime_identity.as_ref())
+                .map(|identity| identity.opaque_id.as_str()),
+            Some(
+                r#"{"schema_version":1,"stack_id":"vzr1-machine","incarnation_id":"00000000-0000-4000-8000-000000000009"}"#
+            )
+        );
         assert!(matches!(
             decoded.result.and_then(|result| result.result),
             Some(StepResult::Succeeded(_))

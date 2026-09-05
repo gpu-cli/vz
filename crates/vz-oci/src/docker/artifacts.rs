@@ -63,7 +63,28 @@ const PINNED_BINARY_DIGESTS: [(&str, &str); 5] = [
     ),
 ];
 
-/// Installed Docker facade artifact locations and metadata.
+/// Verified immutable daemon binaries, without any Docker data disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DockerBinaries {
+    /// Directory containing only the verified allowlisted daemon executables.
+    pub bin_dir: PathBuf,
+    /// Pinned Engine release associated with the verified metadata.
+    pub version: String,
+}
+
+impl DockerBinaries {
+    /// Path to the verified Docker daemon.
+    pub fn dockerd_path(&self) -> PathBuf {
+        self.bin_dir.join("dockerd")
+    }
+
+    /// Path to the verified containerd daemon.
+    pub fn containerd_path(&self) -> PathBuf {
+        self.bin_dir.join("containerd")
+    }
+}
+
+/// Legacy Docker facade artifact locations and metadata.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DockerArtifacts {
     /// Directory containing the allowlisted daemon-side binaries.
@@ -206,6 +227,20 @@ pub fn ensure_docker_artifacts() -> Result<DockerArtifacts, DockerArtifactError>
     ensure_docker_artifacts_in_dir_with(&docker_dir, download_archive_bytes)
 }
 
+/// Ensure the pinned daemon binaries without creating or inspecting a global
+/// data disk. Developer Machines must provision their own private state.
+pub fn ensure_docker_binaries() -> Result<DockerBinaries, DockerArtifactError> {
+    let user_home_path =
+        std::env::var_os("HOME").ok_or(DockerArtifactError::HomeDirectoryUnavailable)?;
+    let docker_dir = PathBuf::from(user_home_path).join(DOCKER_ARTIFACT_SUBDIR);
+    ensure_docker_binaries_in_dir_with_pins(
+        &docker_dir,
+        download_archive_bytes,
+        DOCKER_ARCHIVE_SHA256_LINUX_ARM64,
+        &pinned_binary_digests(),
+    )
+}
+
 fn ensure_docker_artifacts_in_dir_with<F>(
     docker_dir: &Path,
     download: F,
@@ -233,10 +268,32 @@ where
     create_private_dir(docker_dir)?;
     let data_disk_path = docker_dir.join(DOCKER_DATA_DISK);
     ensure_sparse_disk_image(&data_disk_path, DOCKER_DATA_DISK_SIZE_BYTES)?;
+    let binaries = ensure_docker_binaries_in_dir_with_pins(
+        docker_dir,
+        download,
+        expected_archive_sha256,
+        expected_binary_digests,
+    )?;
+    Ok(DockerArtifacts {
+        bin_dir: binaries.bin_dir,
+        data_disk_path,
+        version: binaries.version,
+    })
+}
+
+fn ensure_docker_binaries_in_dir_with_pins<F>(
+    docker_dir: &Path,
+    download: F,
+    expected_archive_sha256: &str,
+    expected_binary_digests: &BTreeMap<String, String>,
+) -> Result<DockerBinaries, DockerArtifactError>
+where
+    F: FnOnce(&str) -> Result<Vec<u8>, DockerArtifactError>,
+{
+    create_private_dir(docker_dir)?;
 
     if let Some(existing) = load_existing_artifacts_with_pins(
         docker_dir,
-        &data_disk_path,
         expected_archive_sha256,
         expected_binary_digests,
     )? {
@@ -246,7 +303,6 @@ where
     let _install_lock = InstallLock::acquire(docker_dir, INSTALL_LOCK_TIMEOUT)?;
     if let Some(existing) = load_existing_artifacts_with_pins(
         docker_dir,
-        &data_disk_path,
         expected_archive_sha256,
         expected_binary_digests,
     )? {
@@ -257,7 +313,6 @@ where
     let archive_bytes = download(&archive_url)?;
     install_archive(
         docker_dir,
-        &data_disk_path,
         &archive_bytes,
         expected_archive_sha256,
         expected_binary_digests,
@@ -266,11 +321,10 @@ where
 
 fn install_archive(
     docker_dir: &Path,
-    data_disk_path: &Path,
     archive_bytes: &[u8],
     expected_archive_sha256: &str,
     expected_binary_digests: &BTreeMap<String, String>,
-) -> Result<DockerArtifacts, DockerArtifactError> {
+) -> Result<DockerBinaries, DockerArtifactError> {
     verify_archive_checksum(archive_bytes, expected_archive_sha256)?;
 
     let nonce = format!("{}-{}", std::process::id(), current_unix_nanos());
@@ -298,9 +352,8 @@ fn install_archive(
             &nonce,
         )?;
 
-        Ok(DockerArtifacts {
+        Ok(DockerBinaries {
             bin_dir: final_bin_dir,
-            data_disk_path: data_disk_path.to_path_buf(),
             version: DOCKER_ENGINE_VERSION.to_string(),
         })
     })();
@@ -313,10 +366,9 @@ fn install_archive(
 
 fn load_existing_artifacts_with_pins(
     docker_dir: &Path,
-    data_disk_path: &Path,
     expected_archive_sha256: &str,
     expected_binary_digests: &BTreeMap<String, String>,
-) -> Result<Option<DockerArtifacts>, DockerArtifactError> {
+) -> Result<Option<DockerBinaries>, DockerArtifactError> {
     let metadata_path = docker_dir.join(VERSION_FILE);
     if !regular_non_symlink(&metadata_path)? {
         return Ok(None);
@@ -358,9 +410,8 @@ fn load_existing_artifacts_with_pins(
         }
     }
 
-    Ok(Some(DockerArtifacts {
+    Ok(Some(DockerBinaries {
         bin_dir,
-        data_disk_path: data_disk_path.to_path_buf(),
         version: metadata.docker_engine,
     }))
 }
@@ -947,14 +998,8 @@ mod tests {
         let data_disk = temp.path().join(DOCKER_DATA_DISK);
         ensure_sparse_disk_image(&data_disk, 1024).unwrap();
 
-        let artifacts = install_archive(
-            temp.path(),
-            &data_disk,
-            &archive,
-            &digest,
-            &test_binary_digests(),
-        )
-        .unwrap();
+        let artifacts =
+            install_archive(temp.path(), &archive, &digest, &test_binary_digests()).unwrap();
 
         let installed: Vec<String> = std::fs::read_dir(&artifacts.bin_dir)
             .unwrap()
@@ -973,16 +1018,9 @@ mod tests {
     fn archive_checksum_is_verified_before_staging_or_extraction() {
         let temp = tempdir().unwrap();
         let archive = build_test_archive(false);
-        let data_disk = temp.path().join(DOCKER_DATA_DISK);
 
-        let error = install_archive(
-            temp.path(),
-            &data_disk,
-            &archive,
-            "00",
-            &test_binary_digests(),
-        )
-        .unwrap_err();
+        let error =
+            install_archive(temp.path(), &archive, "00", &test_binary_digests()).unwrap_err();
 
         assert!(matches!(
             error,
@@ -1006,19 +1044,61 @@ mod tests {
         let data_disk = temp.path().join(DOCKER_DATA_DISK);
         ensure_sparse_disk_image(&data_disk, 1024).unwrap();
         let test_digests = test_binary_digests();
-        let artifacts =
-            install_archive(temp.path(), &data_disk, &archive, &digest, &test_digests).unwrap();
+        let artifacts = install_archive(temp.path(), &archive, &digest, &test_digests).unwrap();
 
         assert!(
-            load_existing_artifacts_with_pins(temp.path(), &data_disk, &digest, &test_digests,)
+            load_existing_artifacts_with_pins(temp.path(), &digest, &test_digests,)
                 .unwrap()
                 .is_some()
         );
         std::fs::write(artifacts.dockerd_path(), b"tampered").unwrap();
         assert!(
-            load_existing_artifacts_with_pins(temp.path(), &data_disk, &digest, &test_digests,)
+            load_existing_artifacts_with_pins(temp.path(), &digest, &test_digests,)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn binary_only_install_and_cache_never_create_global_data_disk() {
+        let temp = tempdir().unwrap();
+        let archive = build_test_archive(false);
+        let archive_digest = sha256_hex(&archive);
+        let binary_digests = test_binary_digests();
+        let installed = ensure_docker_binaries_in_dir_with_pins(
+            temp.path(),
+            |_| Ok(archive),
+            &archive_digest,
+            &binary_digests,
+        )
+        .unwrap();
+        assert!(!temp.path().join(DOCKER_DATA_DISK).exists());
+        assert!(installed.dockerd_path().is_file());
+        assert!(installed.containerd_path().is_file());
+        let reused = ensure_docker_binaries_in_dir_with_pins(
+            temp.path(),
+            |_| panic!("verified binaries must not redownload"),
+            &archive_digest,
+            &binary_digests,
+        )
+        .unwrap();
+        assert_eq!(reused, installed);
+        assert!(!temp.path().join(DOCKER_DATA_DISK).exists());
+
+        // A legacy disk can exist, but is neither resized nor validated nor
+        // written as a side effect of requesting immutable binaries.
+        let disk = temp.path().join(DOCKER_DATA_DISK);
+        std::fs::write(&disk, b"legacy private data sentinel").unwrap();
+        ensure_docker_binaries_in_dir_with_pins(
+            temp.path(),
+            |_| panic!("verified binaries must not redownload"),
+            &archive_digest,
+            &binary_digests,
+        )
+        .unwrap();
+        assert_eq!(
+            std::fs::read(&disk).unwrap(),
+            b"legacy private data sentinel"
         );
     }
 
@@ -1033,14 +1113,8 @@ mod tests {
 
         // Use metadata shaped like the pinned artifact after installing the
         // synthetic archive with its own digest.
-        let artifacts = install_archive(
-            temp.path(),
-            &data_disk,
-            &archive,
-            &archive_digest,
-            &test_digests,
-        )
-        .unwrap();
+        let artifacts =
+            install_archive(temp.path(), &archive, &archive_digest, &test_digests).unwrap();
 
         let reused = ensure_docker_artifacts_in_dir_with_pins(
             temp.path(),
@@ -1087,25 +1161,14 @@ mod tests {
         let binary_digests = test_binary_digests();
         let disk = temp.path().join(DOCKER_DATA_DISK);
         ensure_sparse_disk_image(&disk, 1024).unwrap();
-        let artifacts = install_archive(
-            temp.path(),
-            &disk,
-            &archive,
-            &archive_digest,
-            &binary_digests,
-        )
-        .unwrap();
+        let artifacts =
+            install_archive(temp.path(), &archive, &archive_digest, &binary_digests).unwrap();
 
         std::fs::write(artifacts.bin_dir.join("crun"), b"extra runtime").unwrap();
         assert!(
-            load_existing_artifacts_with_pins(
-                temp.path(),
-                &disk,
-                &archive_digest,
-                &binary_digests,
-            )
-            .unwrap()
-            .is_none()
+            load_existing_artifacts_with_pins(temp.path(), &archive_digest, &binary_digests,)
+                .unwrap()
+                .is_none()
         );
         std::fs::remove_file(artifacts.bin_dir.join("crun")).unwrap();
 
@@ -1115,14 +1178,9 @@ mod tests {
             let dockerd = artifacts.dockerd_path();
             std::fs::set_permissions(&dockerd, std::fs::Permissions::from_mode(0o600)).unwrap();
             assert!(
-                load_existing_artifacts_with_pins(
-                    temp.path(),
-                    &disk,
-                    &archive_digest,
-                    &binary_digests,
-                )
-                .unwrap()
-                .is_none()
+                load_existing_artifacts_with_pins(temp.path(), &archive_digest, &binary_digests,)
+                    .unwrap()
+                    .is_none()
             );
         }
     }
@@ -1135,14 +1193,8 @@ mod tests {
         let binary_digests = test_binary_digests();
         let disk = temp.path().join(DOCKER_DATA_DISK);
         ensure_sparse_disk_image(&disk, 1024).unwrap();
-        let artifacts = install_archive(
-            temp.path(),
-            &disk,
-            &archive,
-            &archive_digest,
-            &binary_digests,
-        )
-        .unwrap();
+        let artifacts =
+            install_archive(temp.path(), &archive, &archive_digest, &binary_digests).unwrap();
         let tampered = fake_static_arm64_elf(200);
         std::fs::write(artifacts.dockerd_path(), &tampered).unwrap();
         mark_executable(&artifacts.dockerd_path()).unwrap();
@@ -1153,14 +1205,9 @@ mod tests {
         write_metadata_atomically(temp.path(), &metadata, "repin").unwrap();
 
         assert!(
-            load_existing_artifacts_with_pins(
-                temp.path(),
-                &disk,
-                &archive_digest,
-                &binary_digests,
-            )
-            .unwrap()
-            .is_none()
+            load_existing_artifacts_with_pins(temp.path(), &archive_digest, &binary_digests,)
+                .unwrap()
+                .is_none()
         );
     }
 
@@ -1209,14 +1256,7 @@ mod tests {
         });
 
         std::thread::sleep(Duration::from_millis(75));
-        install_archive(
-            temp.path(),
-            &disk,
-            &archive,
-            &archive_digest,
-            &binary_digests,
-        )
-        .unwrap();
+        install_archive(temp.path(), &archive, &archive_digest, &binary_digests).unwrap();
         drop(lock);
         assert!(waiter.join().unwrap().is_ok());
     }
@@ -1271,7 +1311,6 @@ mod tests {
 
         let artifacts = install_archive(
             temp.path(),
-            &disk,
             &archive,
             DOCKER_ARCHIVE_SHA256_LINUX_ARM64,
             &pinned_binary_digests(),

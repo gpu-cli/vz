@@ -386,10 +386,10 @@ fn drive_pending_pipe_cleanup<C: PendingPipeProcess>(
     let force_deadline = std::time::Instant::now();
     loop {
         request_pending_child_force_cancel(pid);
-        if std::time::Instant::now() >= force_deadline
-            && let Err(error) = child.start_kill()
-        {
-            warn!(?pid, %error, "grpc: pending pipe child kill failed; retaining and retrying");
+        if std::time::Instant::now() >= force_deadline {
+            if let Err(error) = child.start_kill() {
+                warn!(?pid, %error, "grpc: pending pipe child kill failed; retaining and retrying");
+            }
         }
         match child.try_wait_reaped() {
             Ok(true) => {
@@ -559,10 +559,10 @@ fn drive_pending_pty_cleanup(
     let force_deadline = std::time::Instant::now();
     loop {
         request_pending_child_force_cancel(pid);
-        if std::time::Instant::now() >= force_deadline
-            && let Err(error) = child.kill()
-        {
-            warn!(?pid, %error, "grpc: pending PTY child kill failed; retaining and retrying");
+        if std::time::Instant::now() >= force_deadline {
+            if let Err(error) = child.kill() {
+                warn!(?pid, %error, "grpc: pending PTY child kill failed; retaining and retrying");
+            }
         }
         match child.try_wait() {
             Ok(Some(_)) => {
@@ -1205,10 +1205,10 @@ async fn write_pipe_stdin(
     let write_result = tokio::time::timeout(STDIN_WRITE_TIMEOUT, stdin.write_all(data)).await;
     {
         let mut table = process_table.lock().await;
-        if let Some(entry) = table.get_mut(exec_id)
-            && entry.stdin.is_none()
-        {
-            entry.stdin = Some(stdin);
+        if let Some(entry) = table.get_mut(exec_id) {
+            if entry.stdin.is_none() {
+                entry.stdin = Some(stdin);
+            }
         }
     }
     match write_result {

@@ -18,24 +18,20 @@ mod ipsw;
 use vz_macos_provision as provision;
 mod registry;
 
-use clap::Parser;
+use clap::{CommandFactory, Parser};
 use tracing::error;
 use vz_cli::legacy_cli::{LEGACY_COMMAND_REMOVED_EXIT_CODE, rejection_for_args};
 
 const CLI_WORKFLOW_EXAMPLES: &str = "\
 Examples:
-  vz                  Create and attach to a new sandbox
-  vz -c               Continue the most recent sandbox
-  vz -r <name-or-id>  Resume a specific sandbox
+  vz                  Show this help without touching runtime state
   vz ls               List sandboxes
   vz <COMMAND>        Run an explicit subcommand";
 
 /// vz — instant sandboxed Linux environments.
 ///
-/// Run `vz` in a project with `vz.json` on btrfs-backed storage to create and
-/// attach to a new sandbox.
-/// Use `vz -c` to continue the most recent sandbox, or `vz -r <name>` to resume
-/// a specific one.
+/// Run `vz` without arguments to print top-level help without accessing runtime
+/// state. Legacy bare-mode mutation and configuration flags are rejected.
 #[derive(Parser, Debug)]
 #[command(
     name = "vz",
@@ -56,45 +52,6 @@ struct Cli {
     /// Output as JSON (for scripting).
     #[arg(long, global = true)]
     json: bool,
-
-    /// Control-plane transport (`daemon-grpc` or `api-http`).
-    #[arg(long, global = true, value_enum)]
-    control_plane: Option<commands::runtime_daemon::ControlPlaneTransport>,
-
-    /// Continue most recent sandbox for this directory.
-    #[arg(short = 'c', long = "continue", conflicts_with_all = ["resume", "name"])]
-    continue_last: bool,
-
-    /// Resume a specific sandbox by name or ID.
-    #[arg(short = 'r', long = "resume", conflicts_with_all = ["continue_last", "name"])]
-    resume: Option<String>,
-
-    /// Name the new sandbox.
-    #[arg(long, conflicts_with_all = ["continue_last", "resume"])]
-    name: Option<String>,
-
-    /// Create an explicit ephemeral sandbox that is auto-cleaned only when safe.
-    #[arg(
-        long,
-        conflicts_with_all = ["continue_last", "resume", "name"]
-    )]
-    ephemeral: bool,
-
-    /// Number of virtual CPUs for new sandboxes.
-    #[arg(long, default_value = "2")]
-    cpus: u8,
-
-    /// Memory in MB for new sandboxes.
-    #[arg(long, default_value = "2048")]
-    memory: u64,
-
-    /// Default image reference for sandbox startup workload.
-    #[arg(long)]
-    base_image: Option<String>,
-
-    /// Main container/workload identifier for sandbox startup.
-    #[arg(long)]
-    main_container: Option<String>,
 
     #[command(subcommand)]
     command: Option<Commands>,
@@ -168,20 +125,22 @@ enum Commands {
 
 fn main() -> anyhow::Result<()> {
     let args = std::env::args_os().collect::<Vec<_>>();
+    if args.len() == 1 {
+        Cli::command().print_help()?;
+        return Ok(());
+    }
     if let Some(rejection) = rejection_for_args(args.iter().cloned()) {
         eprintln!("{}", rejection.to_json());
         std::process::exit(LEGACY_COMMAND_REMOVED_EXIT_CODE);
     }
     let cli = Cli::parse_from(args);
-    let json = cli.json;
-    if let Some(transport) = cli.control_plane {
-        commands::runtime_daemon::set_control_plane_transport(transport)?;
+    if cli.command.is_none() {
+        Cli::command().print_help()?;
+        return Ok(());
     }
 
-    // Default sandbox mode should suppress info logs too.
-    let is_sandbox_mode = cli.command.is_none();
-
-    let filter = if cli.quiet || (is_sandbox_mode && cli.verbose == 0) {
+    let json = cli.json;
+    let filter = if cli.quiet {
         "error"
     } else {
         match cli.verbose {
@@ -243,20 +202,8 @@ fn main() -> anyhow::Result<()> {
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let result = match cli.command {
-            // No subcommand = default sandbox mode.
-            None => {
-                commands::sandbox::cmd_default_sandbox(
-                    cli.continue_last,
-                    cli.resume,
-                    cli.name,
-                    cli.ephemeral,
-                    cli.cpus,
-                    cli.memory,
-                    cli.base_image,
-                    cli.main_container,
-                )
-                .await
-            }
+            // Bare and read-only-global-only invocations returned before setup.
+            None => unreachable!("command absence handled before runtime setup"),
 
             // Sandbox management
             Some(Commands::Create(args)) => commands::sandbox::cmd_create(args).await,
@@ -321,7 +268,7 @@ mod tests {
     }
 
     #[test]
-    fn help_includes_sandbox_workflow_examples() {
+    fn help_includes_bare_nonmutating_workflow_example() {
         let mut command = Cli::command();
         let mut help = Vec::new();
         command
@@ -330,44 +277,15 @@ mod tests {
         let text = String::from_utf8(help).expect("help should be valid utf-8");
 
         assert!(text.contains("Examples:"));
-        assert!(text.contains("vz                  Create and attach to a new sandbox"));
-        assert!(text.contains("vz -c               Continue the most recent sandbox"));
-        assert!(text.contains("vz -r <name-or-id>  Resume a specific sandbox"));
+        assert!(text.contains("vz                  Show this help without touching runtime state"));
+        assert!(!text.contains("--continue"));
+        assert!(!text.contains("--resume"));
     }
 
     #[test]
-    fn parse_no_subcommand_creates_sandbox() {
+    fn parse_no_subcommand_has_no_command() {
         let cli = Cli::try_parse_from(["vz"]).expect("parse");
         assert!(cli.command.is_none());
-        assert!(!cli.continue_last);
-        assert!(cli.resume.is_none());
-        assert!(cli.name.is_none());
-        assert!(!cli.ephemeral);
-    }
-
-    #[test]
-    fn parse_continue_flag() {
-        let cli = Cli::try_parse_from(["vz", "-c"]).expect("parse");
-        assert!(cli.continue_last);
-        assert!(cli.command.is_none());
-    }
-
-    #[test]
-    fn parse_resume_flag() {
-        let cli = Cli::try_parse_from(["vz", "-r", "my-box"]).expect("parse");
-        assert_eq!(cli.resume.as_deref(), Some("my-box"));
-    }
-
-    #[test]
-    fn parse_named_sandbox() {
-        let cli = Cli::try_parse_from(["vz", "--name", "my-project"]).expect("parse");
-        assert_eq!(cli.name.as_deref(), Some("my-project"));
-    }
-
-    #[test]
-    fn parse_ephemeral_sandbox() {
-        let cli = Cli::try_parse_from(["vz", "--ephemeral"]).expect("parse");
-        assert!(cli.ephemeral);
     }
 
     #[test]
@@ -411,39 +329,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_sandbox_resources() {
-        let cli = Cli::try_parse_from(["vz", "--cpus", "4", "--memory", "4096"]).expect("parse");
-        assert_eq!(cli.cpus, 4);
-        assert_eq!(cli.memory, 4096);
-    }
-
-    #[test]
-    fn parse_sandbox_startup_selection_flags() {
-        let cli = Cli::try_parse_from([
-            "vz",
-            "--base-image",
-            "alpine:3.20",
-            "--main-container",
-            "workspace-main",
-        ])
-        .expect("parse");
-        assert_eq!(cli.base_image.as_deref(), Some("alpine:3.20"));
-        assert_eq!(cli.main_container.as_deref(), Some("workspace-main"));
-    }
-
-    #[test]
-    fn parse_continue_conflicts_with_resume() {
-        let result = Cli::try_parse_from(["vz", "-c", "-r", "foo"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn parse_ephemeral_conflicts_with_name() {
-        let result = Cli::try_parse_from(["vz", "--ephemeral", "--name", "feature"]);
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn parse_verbose_flag() {
         let cli = Cli::try_parse_from(["vz", "-v", "ls"]).expect("parse");
         assert_eq!(cli.verbose, 1);
@@ -459,16 +344,6 @@ mod tests {
     fn parse_json_flag() {
         let cli = Cli::try_parse_from(["vz", "--json", "ls"]).expect("parse");
         assert!(cli.json);
-    }
-
-    #[test]
-    fn parse_control_plane_flag() {
-        let cli =
-            Cli::try_parse_from(["vz", "--control-plane", "daemon-grpc", "ls"]).expect("parse");
-        assert_eq!(
-            cli.control_plane,
-            Some(commands::runtime_daemon::ControlPlaneTransport::DaemonGrpc)
-        );
     }
 
     #[test]

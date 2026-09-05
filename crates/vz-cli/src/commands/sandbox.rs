@@ -1,7 +1,7 @@
 //! `vz sandbox` — sandbox lifecycle management commands.
 //!
-//! Provides sandbox CRUD and the default `vz` instant-sandbox experience.
-//! Sandbox state persistence is routed through `vz-runtimed`.
+//! Provides explicit sandbox CRUD commands. Sandbox state persistence is routed
+//! through `vz-runtimed`.
 
 #![allow(clippy::print_stdout)]
 
@@ -28,8 +28,8 @@ use vz_runtime_contract::{
     SANDBOX_LABEL_SPACE_CONFIG_PATH, SANDBOX_LABEL_SPACE_LIFECYCLE, SANDBOX_LABEL_SPACE_MODE,
     SANDBOX_LABEL_SPACE_SECRET_ENV_PREFIX, SANDBOX_LABEL_SPACE_SERVICE_STATE_PREFIX,
     SANDBOX_LABEL_SPACE_WORKTREE_ID, SANDBOX_LABEL_SPACE_WORKTREE_NAMESPACE,
-    SANDBOX_SPACE_LIFECYCLE_EPHEMERAL, SANDBOX_SPACE_LIFECYCLE_PERSISTENT,
-    SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
+    SANDBOX_SPACE_LIFECYCLE_PERSISTENT, SANDBOX_SPACE_MODE_REQUIRED, Sandbox, SandboxBackend,
+    SandboxSpec, SandboxState,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::DaemonClientError;
@@ -103,29 +103,6 @@ struct WorktreeNamespaceCollision {
     namespace: String,
     existing_worktree_id: String,
     existing_project_dir: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SpaceLifecycleMode {
-    Persistent,
-    Ephemeral,
-}
-
-impl SpaceLifecycleMode {
-    const fn from_ephemeral_flag(ephemeral: bool) -> Self {
-        if ephemeral {
-            Self::Ephemeral
-        } else {
-            Self::Persistent
-        }
-    }
-
-    const fn as_label_value(self) -> &'static str {
-        match self {
-            Self::Persistent => SANDBOX_SPACE_LIFECYCLE_PERSISTENT,
-            Self::Ephemeral => SANDBOX_SPACE_LIFECYCLE_EPHEMERAL,
-        }
-    }
 }
 
 fn sandbox_backend_from_wire(backend: &str) -> SandboxBackend {
@@ -2014,127 +1991,6 @@ pub struct SandboxCloseShellArgs {
     state_db: Option<PathBuf>,
 }
 
-// ── Default sandbox command (no subcommand) ─────────────────────
-
-/// Handle the default `vz` command — create or resume a sandbox.
-///
-/// When invoked with no subcommand:
-/// - `vz -c`: continue most recent sandbox for the current directory
-/// - `vz -r <name>`: resume a specific sandbox by name or ID
-/// - `vz`: create a new sandbox bound to the current directory
-#[allow(clippy::too_many_arguments)]
-pub async fn cmd_default_sandbox(
-    continue_last: bool,
-    resume: Option<String>,
-    name: Option<String>,
-    ephemeral: bool,
-    cpus: u8,
-    memory: u64,
-    base_image_ref: Option<String>,
-    main_container: Option<String>,
-) -> anyhow::Result<()> {
-    let state_db = default_state_db_path();
-    let cwd = std::env::current_dir().context("failed to get current directory")?;
-
-    if (continue_last || resume.is_some()) && ephemeral {
-        bail!("--ephemeral is only valid when creating a new sandbox");
-    }
-    if (continue_last || resume.is_some()) && (base_image_ref.is_some() || main_container.is_some())
-    {
-        bail!("--base-image and --main-container are only valid when creating a new sandbox");
-    }
-
-    if continue_last {
-        return cmd_continue_sandbox(&state_db, &cwd).await;
-    }
-
-    if let Some(ref target) = resume {
-        return cmd_resume_sandbox(&state_db, target).await;
-    }
-
-    // Create a new sandbox in spaces mode.
-    let space_config = load_space_config(&cwd)?;
-    enforce_btrfs_workspace_preflight(&cwd)?;
-    cmd_create_sandbox(
-        &state_db,
-        &cwd,
-        &space_config,
-        name,
-        SpaceLifecycleMode::from_ephemeral_flag(ephemeral),
-        cpus,
-        memory,
-        base_image_ref,
-        main_container,
-    )
-    .await
-}
-
-/// Continue the most recent sandbox for the current directory.
-async fn cmd_continue_sandbox(state_db: &Path, cwd: &Path) -> anyhow::Result<()> {
-    let sandboxes = daemon_list_sandboxes(state_db).await?;
-    let cwd_str = cwd.to_string_lossy();
-
-    // Find sandbox matching this directory.
-    let matching: Vec<_> = sandboxes
-        .iter()
-        .filter(|s| {
-            s.labels.get(SANDBOX_LABEL_PROJECT_DIR).map(|d| d.as_str()) == Some(&*cwd_str)
-                && !s.state.is_terminal()
-        })
-        .collect();
-
-    if let Some(sandbox) = matching.last() {
-        println!("Resuming sandbox {}...", sandbox.sandbox_id);
-        return attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
-            .await
-            .map(|_| ());
-    }
-
-    // Fall back to most recent non-terminal sandbox.
-    let most_recent = sandboxes.iter().rev().find(|s| !s.state.is_terminal());
-
-    match most_recent {
-        Some(sandbox) => {
-            println!("Resuming sandbox {}...", sandbox.sandbox_id);
-            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
-                .await
-                .map(|_| ())
-        }
-        None => bail!("no active sandboxes found; run `vz` to create one"),
-    }
-}
-
-/// Resume a specific sandbox by name or ID.
-async fn cmd_resume_sandbox(state_db: &Path, target: &str) -> anyhow::Result<()> {
-    // Try exact ID match first.
-    if let Some(sandbox) = daemon_get_sandbox(state_db, target).await? {
-        if sandbox.state.is_terminal() {
-            bail!("sandbox {target} is in terminal state");
-        }
-        println!("Resuming sandbox {target}...");
-        return attach_to_sandbox_by_id(state_db, target).await.map(|_| ());
-    }
-
-    // Try name label match.
-    let sandboxes = daemon_list_sandboxes(state_db).await?;
-    let by_name: Vec<_> = sandboxes
-        .iter()
-        .filter(|s| {
-            s.labels.get("name").map(|n| n.as_str()) == Some(target) && !s.state.is_terminal()
-        })
-        .collect();
-
-    match by_name.last() {
-        Some(sandbox) => {
-            println!("Resuming sandbox {} ({target})...", sandbox.sandbox_id);
-            attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id)
-                .await
-                .map(|_| ())
-        }
-        None => bail!("sandbox {target} not found"),
-    }
-}
-
 /// Create a new sandbox in spaces mode.
 #[allow(clippy::too_many_arguments)]
 async fn create_space_sandbox(
@@ -2142,7 +1998,6 @@ async fn create_space_sandbox(
     cwd: &Path,
     space_config: &SpaceConfig,
     name: Option<String>,
-    lifecycle_mode: SpaceLifecycleMode,
     cpus: u8,
     memory: u64,
     base_image_ref: Option<String>,
@@ -2178,7 +2033,7 @@ async fn create_space_sandbox(
     apply_worktree_service_state_labels(&mut labels, &worktree_service_defaults);
     labels.insert(
         SANDBOX_LABEL_SPACE_LIFECYCLE.to_string(),
-        lifecycle_mode.as_label_value().to_string(),
+        SANDBOX_SPACE_LIFECYCLE_PERSISTENT.to_string(),
     );
     apply_space_external_secret_labels(&mut labels, &space_config.external_secret_env);
     labels.insert("source".to_string(), "standalone".to_string());
@@ -2248,78 +2103,6 @@ async fn create_space_sandbox(
     Ok((sandbox, display_name.to_string()))
 }
 
-/// Create a new sandbox and attach to it.
-#[allow(clippy::too_many_arguments)]
-async fn cmd_create_sandbox(
-    state_db: &Path,
-    cwd: &Path,
-    space_config: &SpaceConfig,
-    name: Option<String>,
-    lifecycle_mode: SpaceLifecycleMode,
-    cpus: u8,
-    memory: u64,
-    base_image_ref: Option<String>,
-    main_container: Option<String>,
-) -> anyhow::Result<()> {
-    let (sandbox, _display_name) = create_space_sandbox(
-        state_db,
-        cwd,
-        space_config,
-        name,
-        lifecycle_mode,
-        cpus,
-        memory,
-        base_image_ref,
-        main_container,
-    )
-    .await?;
-    println!("Sandbox {} ready. Launching shell...", sandbox.sandbox_id);
-    println!();
-    let attach_result = attach_to_sandbox_by_id(state_db, &sandbox.sandbox_id).await;
-
-    match lifecycle_mode {
-        SpaceLifecycleMode::Persistent => {
-            if let Err(error) = attach_result {
-                print_space_recovery_guidance(
-                    &sandbox.sandbox_id,
-                    "space preserved after attach failure",
-                );
-                return Err(error);
-            }
-            Ok(())
-        }
-        SpaceLifecycleMode::Ephemeral => {
-            let session_completion = match &attach_result {
-                Ok(SandboxAttachOutcome::ExitedClean) => EphemeralSessionCompletion::CleanExit,
-                Ok(SandboxAttachOutcome::Detached) => EphemeralSessionCompletion::Detached,
-                Err(_) => EphemeralSessionCompletion::Failed,
-            };
-            let sandbox_snapshot = if session_completion == EphemeralSessionCompletion::CleanExit {
-                daemon_get_sandbox(state_db, &sandbox.sandbox_id).await?
-            } else {
-                None
-            };
-            let decision =
-                evaluate_ephemeral_cleanup_decision(session_completion, sandbox_snapshot.as_ref());
-            match decision {
-                EphemeralCleanupDecision::AutoCleanup => {
-                    let _ = daemon_terminate_sandbox(state_db, &sandbox.sandbox_id).await?;
-                    println!("Ephemeral sandbox {} cleaned up.", sandbox.sandbox_id);
-                }
-                EphemeralCleanupDecision::Preserve { reason } => {
-                    eprintln!("Ephemeral cleanup skipped: {reason}");
-                    print_space_recovery_guidance(&sandbox.sandbox_id, "space preserved");
-                }
-            }
-
-            match attach_result {
-                Ok(_) => Ok(()),
-                Err(error) => Err(error),
-            }
-        }
-    }
-}
-
 /// Create a sandbox without attaching an interactive shell (`vz create`).
 pub async fn cmd_create(args: SandboxCreateArgs) -> anyhow::Result<()> {
     let state_db = args.state_db.unwrap_or_else(default_state_db_path);
@@ -2332,7 +2115,6 @@ pub async fn cmd_create(args: SandboxCreateArgs) -> anyhow::Result<()> {
         &cwd,
         &space_config,
         args.name,
-        SpaceLifecycleMode::Persistent,
         args.cpus,
         args.memory,
         args.base_image,
@@ -2360,57 +2142,6 @@ pub async fn cmd_create(args: SandboxCreateArgs) -> anyhow::Result<()> {
 enum SandboxAttachOutcome {
     ExitedClean,
     Detached,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum EphemeralSessionCompletion {
-    CleanExit,
-    Detached,
-    Failed,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum EphemeralCleanupDecision {
-    AutoCleanup,
-    Preserve { reason: String },
-}
-
-fn evaluate_ephemeral_cleanup_decision(
-    session_completion: EphemeralSessionCompletion,
-    sandbox: Option<&Sandbox>,
-) -> EphemeralCleanupDecision {
-    match session_completion {
-        EphemeralSessionCompletion::Detached => EphemeralCleanupDecision::Preserve {
-            reason: "session detached and remains active".to_string(),
-        },
-        EphemeralSessionCompletion::Failed => EphemeralCleanupDecision::Preserve {
-            reason: "session ended with an error".to_string(),
-        },
-        EphemeralSessionCompletion::CleanExit => match sandbox {
-            Some(sandbox) if !sandbox.state.is_terminal() => EphemeralCleanupDecision::AutoCleanup,
-            Some(_) => EphemeralCleanupDecision::Preserve {
-                reason: "sandbox is already terminal".to_string(),
-            },
-            None => EphemeralCleanupDecision::Preserve {
-                reason: "sandbox no longer exists".to_string(),
-            },
-        },
-    }
-}
-
-fn sandbox_recovery_commands(sandbox_id: &str) -> [String; 3] {
-    [
-        format!("vz attach {sandbox_id}"),
-        format!("vz inspect {sandbox_id}"),
-        format!("vz rm {sandbox_id}"),
-    ]
-}
-
-fn print_space_recovery_guidance(sandbox_id: &str, context: &str) {
-    eprintln!("Recovery ({context}):");
-    for command in sandbox_recovery_commands(sandbox_id) {
-        eprintln!("  {command}");
-    }
 }
 
 enum AttachInputEvent {
@@ -4012,26 +3743,6 @@ mod tests {
     }
 
     #[test]
-    fn space_lifecycle_mode_defaults_to_persistent() {
-        let lifecycle = SpaceLifecycleMode::from_ephemeral_flag(false);
-        assert_eq!(lifecycle, SpaceLifecycleMode::Persistent);
-        assert_eq!(
-            lifecycle.as_label_value(),
-            SANDBOX_SPACE_LIFECYCLE_PERSISTENT
-        );
-    }
-
-    #[test]
-    fn space_lifecycle_mode_maps_ephemeral_flag() {
-        let lifecycle = SpaceLifecycleMode::from_ephemeral_flag(true);
-        assert_eq!(lifecycle, SpaceLifecycleMode::Ephemeral);
-        assert_eq!(
-            lifecycle.as_label_value(),
-            SANDBOX_SPACE_LIFECYCLE_EPHEMERAL
-        );
-    }
-
-    #[test]
     fn sanitize_namespace_segment_normalizes_to_safe_ascii() {
         assert_eq!(sanitize_namespace_segment("Feature/Auth"), "feature_auth");
         assert_eq!(sanitize_namespace_segment("___"), "space");
@@ -4366,63 +4077,6 @@ mod tests {
             .join("abc123")
             .join("payload.tar.zst");
         assert!(!local_payload.exists());
-    }
-
-    #[test]
-    fn ephemeral_cleanup_decision_allows_clean_exit_for_non_terminal_space() {
-        let sandbox = Sandbox {
-            sandbox_id: "sandbox-ephemeral-clean".to_string(),
-            backend: SandboxBackend::MacosVz,
-            spec: SandboxSpec::default(),
-            state: SandboxState::Ready,
-            created_at: 1,
-            updated_at: 1,
-            labels: BTreeMap::new(),
-        };
-        let decision = evaluate_ephemeral_cleanup_decision(
-            EphemeralSessionCompletion::CleanExit,
-            Some(&sandbox),
-        );
-        assert_eq!(decision, EphemeralCleanupDecision::AutoCleanup);
-    }
-
-    #[test]
-    fn ephemeral_cleanup_decision_preserves_dirty_paths() {
-        let detached = evaluate_ephemeral_cleanup_decision(
-            EphemeralSessionCompletion::Detached,
-            Some(&Sandbox {
-                sandbox_id: "sandbox-ephemeral-detached".to_string(),
-                backend: SandboxBackend::MacosVz,
-                spec: SandboxSpec::default(),
-                state: SandboxState::Ready,
-                created_at: 1,
-                updated_at: 1,
-                labels: BTreeMap::new(),
-            }),
-        );
-        assert!(matches!(
-            detached,
-            EphemeralCleanupDecision::Preserve { reason } if reason.contains("detached")
-        ));
-
-        let failed = evaluate_ephemeral_cleanup_decision(EphemeralSessionCompletion::Failed, None);
-        assert!(matches!(
-            failed,
-            EphemeralCleanupDecision::Preserve { reason } if reason.contains("error")
-        ));
-    }
-
-    #[test]
-    fn sandbox_recovery_commands_are_deterministic() {
-        let commands = sandbox_recovery_commands("space-123");
-        assert_eq!(
-            commands,
-            [
-                "vz attach space-123".to_string(),
-                "vz inspect space-123".to_string(),
-                "vz rm space-123".to_string(),
-            ]
-        );
     }
 
     #[test]

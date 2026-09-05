@@ -8,6 +8,52 @@ use super::networking::{
 };
 use super::resolve::{current_unix_secs, resolve_container_lifecycle, resolve_run_config};
 use super::*;
+use sha2::{Digest, Sha256};
+use std::fs::{File, OpenOptions};
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
+
+const DOCKER_BIN_SHARE_TAG: &str = "vz-docker-bin";
+const DOCKER_YOUKI_SHARE_TAG: &str = "linux-bin";
+const DOCKER_DATA_DEVICE: &str = "/dev/vda";
+const DOCKER_GUEST_SOCKET: &str = "/run/vz-docker/docker.sock";
+const NAMED_VOLUME_DEVICE_WITH_DOCKER: &str = "/dev/vdb";
+const NAMED_VOLUME_DEVICE_WITHOUT_DOCKER: &str = "/dev/vda";
+const DOCKER_DATA_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
+const DOCKER_FORMAT_INTENT_VERSION: &str = "vz-private-docker-disk-format-v1";
+pub(super) const DOCKER_DISK_BOOTSTRAP_SCRIPT: &str = r#"
+set -eu
+umask 077
+device="$1"
+root=/run/vz-docker-bootstrap
+/bin/busybox mkdir -p "$root"
+/bin/busybox mount -t ext4 "$device" "$root"
+cleanup() { /bin/busybox umount "$root"; }
+trap cleanup EXIT
+/bin/busybox mkdir -p "$root/config" "$root/containerd" "$root/engine" "$root/log"
+mount_identity=$(/bin/busybox awk -v path="$root" '$2 == path { print $1 " " $3; count++ } END { if (count != 1) exit 1 }' /proc/mounts)
+test "$mount_identity" = "$device ext4"
+create_config_once() {
+  path="$1"
+  contents="$2"
+  if test -e "$path" || test -L "$path"; then
+    test -f "$path"
+    test ! -L "$path"
+    test "$(/bin/busybox stat -Lc '%h' "$path")" = 1
+    return
+  fi
+  (set -C; : > "$path")
+  printf '%s' "$contents" > "$path"
+}
+create_config_once "$root/config/containerd.toml" ''
+create_config_once "$root/config/daemon.json" '{}'
+test ! -s "$root/config/containerd.toml"
+/bin/busybox chmod 700 "$root" "$root/config" "$root/containerd" "$root/engine" "$root/log"
+/bin/busybox chmod 600 "$root/config/containerd.toml" "$root/config/daemon.json"
+/bin/busybox sync
+cleanup
+trap - EXIT
+"#;
 
 pub(super) const SHARED_VM_FULL_CHECKPOINT_UNSUPPORTED_REASON: &str = "vm_full_checkpoint=false: shared VM state depends on external VirtioFS/device state that is not captured atomically";
 
@@ -24,6 +70,276 @@ pub(super) fn classify_stack_runtime_shutdown(
             current: current.clone(),
         },
     }
+}
+
+pub(super) fn require_exact_stack_runtime(
+    current: Option<&vz_runtime_contract::StackRuntimeIdentity>,
+    expected: &vz_runtime_contract::StackRuntimeIdentity,
+) -> Result<(), OciError> {
+    match current {
+        None => Err(OciError::SharedRuntimeAbsent {
+            stack_id: expected.stack_id.clone(),
+        }),
+        Some(current) if current == expected => Ok(()),
+        Some(current) => Err(OciError::SharedRuntimeIdentityMismatch {
+            stack_id: expected.stack_id.clone(),
+            expected_incarnation_id: expected.incarnation_id.clone(),
+            current_incarnation_id: current.incarnation_id.clone(),
+        }),
+    }
+}
+
+pub(super) fn kernel_profile_from_metadata(
+    version: &vz_linux::KernelVersion,
+) -> Option<KernelProfile> {
+    match version.profile.as_deref() {
+        Some("developer") => Some(KernelProfile::Developer),
+        Some("container") => Some(KernelProfile::Container),
+        _ => None,
+    }
+}
+
+pub(super) fn require_docker_provisioned_developer_profile(
+    verified_profile: Option<KernelProfile>,
+    docker_provisioned: bool,
+    operation: &str,
+) -> Result<KernelProfile, OciError> {
+    if verified_profile != Some(KernelProfile::Developer) {
+        return Err(OciError::UnsupportedOperation {
+            operation: operation.to_string(),
+            reason: format!(
+                "Docker requires an actually verified Developer Linux boot; active profile is {verified_profile:?}"
+            ),
+        });
+    }
+    if !docker_provisioned {
+        return Err(OciError::UnsupportedOperation {
+            operation: operation.to_string(),
+            reason: "active Developer Linux boot has no private Docker disk and binary shares"
+                .to_string(),
+        });
+    }
+    Ok(KernelProfile::Developer)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum GuestDiskProbe {
+    ExtFilesystem,
+    Unformatted,
+}
+
+pub(super) fn classify_guest_disk_probe(
+    exit_code: i32,
+    stdout: &str,
+    stderr: &str,
+    allow_unformatted: bool,
+) -> Result<GuestDiskProbe, String> {
+    let output = stdout.trim();
+    if allow_unformatted && output.is_empty() && stderr.trim().is_empty() {
+        return Ok(GuestDiskProbe::Unformatted);
+    }
+    if exit_code == 0
+        && (output.contains("TYPE=\"ext2\"")
+            || output.contains("TYPE=\"ext3\"")
+            || output.contains("TYPE=\"ext4\""))
+    {
+        return Ok(GuestDiskProbe::ExtFilesystem);
+    }
+    Err(format!(
+        "refusing to format an existing or unrecognized disk: exit_code={exit_code}, stdout={output:?}, stderr={:?}",
+        stderr.trim()
+    ))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PrivateDiskDisposition {
+    FormatAuthorized,
+    Existing,
+}
+
+fn private_disk_format_intent_path(path: &Path) -> Result<PathBuf, OciError> {
+    let file_name = path.file_name().ok_or_else(|| {
+        OciError::InvalidConfig(format!(
+            "Docker data disk has no filename: {}",
+            path.display()
+        ))
+    })?;
+    let mut marker_name = file_name.to_os_string();
+    marker_name.push(".format-intent");
+    Ok(path.with_file_name(marker_name))
+}
+
+fn pending_private_disk_format_intent(size: u64) -> String {
+    format!("{DOCKER_FORMAT_INTENT_VERSION}\nsize={size}\nstate=pending\n")
+}
+
+fn bound_private_disk_format_intent(size: u64, metadata: &fs::Metadata) -> String {
+    format!(
+        "{DOCKER_FORMAT_INTENT_VERSION}\nsize={size}\ndev={}\nino={}\n",
+        metadata.dev(),
+        metadata.ino()
+    )
+}
+
+fn validate_private_disk_format_intent(
+    path: &Path,
+    size: u64,
+    disk_metadata: Option<&fs::Metadata>,
+) -> Result<bool, OciError> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    if !metadata.is_file()
+        || metadata.file_type().is_symlink()
+        || metadata.nlink() != 1
+        || metadata.len() > 128
+    {
+        return Err(OciError::InvalidConfig(format!(
+            "Docker disk format intent must be a small regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+    let expected = disk_metadata.map_or_else(
+        || pending_private_disk_format_intent(size),
+        |metadata| bound_private_disk_format_intent(size, metadata),
+    );
+    if fs::read_to_string(path)? != expected {
+        return Err(OciError::InvalidConfig(format!(
+            "Docker disk format intent is invalid: {}",
+            path.display()
+        )));
+    }
+    Ok(true)
+}
+
+fn write_private_disk_format_intent(
+    path: &Path,
+    contents: &str,
+    create_new: bool,
+) -> Result<(), OciError> {
+    let mut options = OpenOptions::new();
+    options.write(true);
+    if create_new {
+        options.create_new(true);
+    } else {
+        options.truncate(true);
+    }
+    let mut marker = options.open(path)?;
+    use std::io::Write;
+    marker.write_all(contents.as_bytes())?;
+    #[cfg(unix)]
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    marker.sync_all()?;
+    Ok(())
+}
+
+pub(super) fn ensure_private_sparse_disk(
+    path: &Path,
+    size: u64,
+) -> Result<PrivateDiskDisposition, OciError> {
+    let parent = path.parent().ok_or_else(|| {
+        OciError::InvalidConfig(format!(
+            "Docker data disk has no parent directory: {}",
+            path.display()
+        ))
+    })?;
+    let mut directory = fs::DirBuilder::new();
+    directory.recursive(true).mode(0o700);
+    directory.create(parent)?;
+    let parent_metadata = fs::symlink_metadata(parent)?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(OciError::InvalidConfig(format!(
+            "Docker data directory must be a non-symlink directory: {}",
+            parent.display()
+        )));
+    }
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))?;
+
+    let existing_metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => {
+            if !metadata.is_file() || metadata.file_type().is_symlink() || metadata.nlink() != 1 {
+                return Err(OciError::InvalidConfig(format!(
+                    "Docker data disk must be a single-link regular non-symlink file: {}",
+                    path.display()
+                )));
+            }
+            if metadata.len() != size {
+                return Err(OciError::InvalidConfig(format!(
+                    "existing Docker data disk has unexpected size: {}",
+                    path.display()
+                )));
+            }
+            Some(metadata)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+
+    let intent_path = private_disk_format_intent_path(path)?;
+    let mut format_authorized =
+        validate_private_disk_format_intent(&intent_path, size, existing_metadata.as_ref())?;
+    if existing_metadata.is_none() && !format_authorized {
+        write_private_disk_format_intent(
+            &intent_path,
+            &pending_private_disk_format_intent(size),
+            true,
+        )?;
+        File::open(parent)?.sync_all()?;
+        format_authorized = true;
+    }
+
+    let file = if existing_metadata.is_some() {
+        OpenOptions::new().read(true).write(true).open(path)?
+    } else {
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        if let Err(error) = file.set_len(size) {
+            drop(file);
+            let _ = fs::remove_file(path);
+            return Err(error.into());
+        }
+        let metadata = file.metadata()?;
+        write_private_disk_format_intent(
+            &intent_path,
+            &bound_private_disk_format_intent(size, &metadata),
+            false,
+        )?;
+        file
+    };
+    #[cfg(unix)]
+    {
+        fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    }
+    file.sync_all()?;
+    File::open(parent)?.sync_all()?;
+    Ok(if format_authorized {
+        PrivateDiskDisposition::FormatAuthorized
+    } else {
+        PrivateDiskDisposition::Existing
+    })
+}
+
+pub(super) fn complete_private_disk_format(
+    path: &Path,
+    size: u64,
+    disposition: PrivateDiskDisposition,
+) -> Result<(), OciError> {
+    if disposition != PrivateDiskDisposition::FormatAuthorized {
+        return Ok(());
+    }
+    let intent_path = private_disk_format_intent_path(path)?;
+    let disk_metadata = fs::symlink_metadata(path)?;
+    validate_private_disk_format_intent(&intent_path, size, Some(&disk_metadata))?;
+    fs::remove_file(intent_path)?;
+    if let Some(parent) = path.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
 }
 
 /// Owned proof that one stack's complete guest activation transaction is
@@ -513,6 +829,148 @@ impl Runtime {
         format!("{:x}", hasher.finalize())
     }
 
+    fn docker_data_disk_path(&self, stack_id: &str) -> PathBuf {
+        let digest = Sha256::digest(stack_id.as_bytes());
+        self.config
+            .data_dir
+            .join("docker-machines")
+            .join(format!("{digest:x}"))
+            .join("data.img")
+    }
+
+    async fn ensure_guest_ext4_disk(
+        vm: &LinuxVm,
+        device: &str,
+        purpose: &str,
+        allow_unformatted: bool,
+    ) -> Result<(), OciError> {
+        let timeout = Duration::from_secs(30);
+        let inspection = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec!["blkid".to_string(), device.to_string()],
+                timeout,
+            )
+            .await?;
+        match classify_guest_disk_probe(
+            inspection.exit_code,
+            &inspection.stdout,
+            &inspection.stderr,
+            allow_unformatted,
+        ) {
+            Ok(GuestDiskProbe::ExtFilesystem) => return Ok(()),
+            Ok(GuestDiskProbe::Unformatted) => {}
+            Err(reason) => {
+                return Err(OciError::InvalidConfig(format!(
+                    "cannot initialize {purpose} disk {device}: {reason}"
+                )));
+            }
+        }
+
+        let output = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec!["mke2fs".to_string(), "-F".to_string(), device.to_string()],
+                timeout,
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "failed to format {purpose} disk {device}: {}{}",
+                output.stdout, output.stderr
+            )));
+        }
+        Ok(())
+    }
+
+    async fn bootstrap_guest_docker_disk(vm: &LinuxVm) -> Result<(), OciError> {
+        let output = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    DOCKER_DISK_BOOTSTRAP_SCRIPT.to_string(),
+                    "vz-docker-bootstrap".to_string(),
+                    DOCKER_DATA_DEVICE.to_string(),
+                ],
+                Duration::from_secs(30),
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "failed to bootstrap private Docker data disk: {}{}",
+                output.stdout, output.stderr
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify_guest_docker_mounts(vm: &LinuxVm) -> Result<(), OciError> {
+        const SCRIPT: &str = r#"
+set -eu
+require_mount() {
+  expected_source="$1"
+  expected_target="$2"
+  expected_type="$3"
+  identity=$(/bin/busybox awk -v path="$expected_target" '$2 == path { print $1 " " $3; count++ } END { if (count != 1) exit 1 }' /proc/mounts)
+  test "$identity" = "$expected_source $expected_type"
+}
+require_mount vz-docker-bin /mnt/vz-docker-bin virtiofs
+require_mount linux-bin /mnt/linux-bin virtiofs
+require_mount /dev/vda /var/lib/docker ext4
+"#;
+        let output = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec!["sh".to_string(), "-c".to_string(), SCRIPT.to_string()],
+                Duration::from_secs(10),
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "Docker readiness mount proof failed: {}{}",
+                output.stdout, output.stderr
+            )));
+        }
+        Ok(())
+    }
+
+    async fn verify_guest_docker_prerequisites(vm: &LinuxVm) -> Result<(), OciError> {
+        const SCRIPT: &str = r#"
+set -eu
+fail() { echo "$1" >&2; exit 1; }
+test -x /sbin/xtables-legacy-multi || fail 'missing executable /sbin/xtables-legacy-multi'
+for tool in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do
+  test -L "/sbin/$tool" || fail "missing symlink /sbin/$tool"
+  target=$(/bin/busybox readlink "/sbin/$tool") || fail "cannot read /sbin/$tool"
+  test "$target" = /sbin/xtables-legacy-multi || fail "unexpected /sbin/$tool target: $target"
+done
+version=$(/sbin/iptables --version 2>&1) || fail 'iptables version probe failed'
+case "$version" in
+  'iptables v1.8.13 (legacy)') ;;
+  *) fail "unexpected iptables version: $version" ;;
+esac
+"#;
+        let output = vm
+            .exec_collect(
+                "/bin/busybox".to_string(),
+                vec!["sh".to_string(), "-c".to_string(), SCRIPT.to_string()],
+                Duration::from_secs(10),
+            )
+            .await?;
+        if output.exit_code != 0 {
+            return Err(OciError::UnsupportedOperation {
+                operation: "ensure_shared_vm_docker_ready_exact".to_string(),
+                reason: format!(
+                    "verified Developer Linux boot lacks the pinned iptables prerequisite: {}{}",
+                    output.stdout, output.stderr
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Boot a shared VM for a multi-service stack.
     ///
     /// The VM runs a single kernel with the guest agent, and multiple OCI
@@ -600,6 +1058,30 @@ impl Runtime {
         fs::create_dir_all(&setup_commits)?;
 
         let kernel = ensure_kernel_for_config(&self.config).await?;
+        let verified_linux_profile = kernel_profile_from_metadata(&kernel.version);
+        let docker_provisioning = if self.config.linux_profile == Some(KernelProfile::Developer) {
+            if verified_linux_profile != Some(KernelProfile::Developer) {
+                return Err(OciError::UnsupportedOperation {
+                    operation: "boot_shared_vm".to_string(),
+                    reason:
+                        "Docker provisioning requires a verified Developer Linux kernel profile"
+                            .to_string(),
+                });
+            }
+            let artifacts = tokio::task::spawn_blocking(vz_oci::ensure_docker_binaries)
+                .await
+                .map_err(|error| {
+                    OciError::InvalidConfig(format!(
+                        "Docker artifact validation worker failed: {error}"
+                    ))
+                })??;
+            let data_disk_path = self.docker_data_disk_path(stack_id);
+            let disposition =
+                ensure_private_sparse_disk(&data_disk_path, DOCKER_DATA_DISK_SIZE_BYTES)?;
+            Some((artifacts, data_disk_path, disposition))
+        } else {
+            None
+        };
 
         let runtime_binary = resolve_oci_runtime_binary_path(
             self.config.guest_oci_runtime,
@@ -617,6 +1099,31 @@ impl Runtime {
             source: setup_commits,
             read_only: false,
         });
+        if let Some((artifacts, data_disk_path, _)) = &docker_provisioning {
+            let youki_dir = runtime_binary.parent().ok_or_else(|| {
+                OciError::InvalidConfig(format!(
+                    "verified youki path has no parent directory: {}",
+                    runtime_binary.display()
+                ))
+            })?;
+            vm_config.shared_dirs.extend([
+                SharedDirConfig {
+                    tag: DOCKER_BIN_SHARE_TAG.to_string(),
+                    source: artifacts.bin_dir.clone(),
+                    read_only: true,
+                },
+                SharedDirConfig {
+                    tag: DOCKER_YOUKI_SHARE_TAG.to_string(),
+                    source: youki_dir.to_path_buf(),
+                    read_only: true,
+                },
+            ]);
+            vm_config.disks.push(DiskConfig {
+                id: "docker-data".to_string(),
+                path: data_disk_path.clone(),
+                read_only: false,
+            });
+        }
 
         // Add VirtioFS shares for per-service volume mounts. These must be
         // configured at VM creation time because VirtioFS shares are static.
@@ -641,7 +1148,7 @@ impl Runtime {
         vm_config.cpus = resources.cpus.unwrap_or(self.config.default_cpus);
         vm_config.memory_mb = resources.memory_mb.unwrap_or(self.config.default_memory_mb);
 
-        // Attach persistent disk image for named volumes.
+        // Attach a persistent named-volume disk after the private Docker disk.
         if let Some(ref disk_path) = resources.disk_image_path {
             vm_config.disk_image = Some(disk_path.clone());
         }
@@ -670,74 +1177,47 @@ impl Runtime {
             return Err(err.into());
         }
 
-        // Format and mount the persistent volume disk if attached.
+        if let Some((_, data_disk_path, disposition)) = &docker_provisioning {
+            if let Err(error) = Self::ensure_guest_ext4_disk(
+                &vm,
+                DOCKER_DATA_DEVICE,
+                "private Docker data",
+                *disposition == PrivateDiskDisposition::FormatAuthorized,
+            )
+            .await
+            {
+                let _ = vm.stop().await;
+                return Err(error);
+            }
+            if let Err(error) = complete_private_disk_format(
+                data_disk_path,
+                DOCKER_DATA_DISK_SIZE_BYTES,
+                *disposition,
+            ) {
+                let _ = vm.stop().await;
+                return Err(error);
+            }
+            if let Err(error) = Self::bootstrap_guest_docker_disk(&vm).await {
+                let _ = vm.stop().await;
+                return Err(error);
+            }
+        }
+
+        // Format and mount the persistent named-volume disk if attached.
         if resources.disk_image_path.is_some() {
             let timeout = Duration::from_secs(30);
-
-            // Check if disk already has a filesystem. If not, format it as ext4.
-            let blkid_result = vm
-                .exec_collect(
-                    "/bin/busybox".to_string(),
-                    vec!["blkid".to_string(), "/dev/vda".to_string()],
-                    timeout,
-                )
-                .await;
-
-            // Busybox blkid may return exit 0 even on empty disks (with
-            // no output). A disk with a filesystem produces output like
-            // "/dev/vda: TYPE="ext4"". Format only if there's no TYPE output.
-            let needs_format = match &blkid_result {
-                Ok(output) => {
-                    let has_fs = output.exit_code == 0 && output.stdout.contains("TYPE=");
-                    tracing::debug!(
-                        exit_code = output.exit_code,
-                        has_filesystem = has_fs,
-                        "blkid check result"
-                    );
-                    !has_fs
-                }
-                Err(err) => {
-                    tracing::warn!(error = %err, "blkid exec failed");
-                    true
-                }
+            let volume_device = if docker_provisioning.is_some() {
+                NAMED_VOLUME_DEVICE_WITH_DOCKER
+            } else {
+                NAMED_VOLUME_DEVICE_WITHOUT_DOCKER
             };
 
-            if needs_format {
-                tracing::info!("formatting persistent volume disk as ext4");
-                // Busybox mke2fs creates ext2 (no -t flag). The ext4 driver
-                // can mount ext2/ext3/ext4, so this is fine.
-                let format_result = vm
-                    .exec_collect(
-                        "/bin/busybox".to_string(),
-                        vec![
-                            "mke2fs".to_string(),
-                            "-F".to_string(),
-                            "/dev/vda".to_string(),
-                        ],
-                        timeout,
-                    )
-                    .await;
-                match &format_result {
-                    Ok(output) if output.exit_code != 0 => {
-                        let _ = vm.stop().await;
-                        return Err(OciError::InvalidConfig(format!(
-                            "failed to format persistent volume disk: {}{}",
-                            output.stdout, output.stderr
-                        )));
-                    }
-                    Err(err) => {
-                        let _ = vm.stop().await;
-                        return Err(OciError::InvalidConfig(format!(
-                            "failed to format persistent volume disk: {err}"
-                        )));
-                    }
-                    Ok(output) => {
-                        tracing::debug!(
-                            stdout = %output.stdout, stderr = %output.stderr,
-                            "mke2fs completed"
-                        );
-                    }
-                }
+            if let Err(error) =
+                Self::ensure_guest_ext4_disk(&vm, volume_device, "persistent named-volume", true)
+                    .await
+            {
+                let _ = vm.stop().await;
+                return Err(error);
             }
 
             // Mount the formatted disk.
@@ -747,7 +1227,9 @@ impl Runtime {
                     vec![
                         "sh".to_string(),
                         "-c".to_string(),
-                        "/bin/busybox mkdir -p /run/vz-oci/volumes && /bin/busybox mount -t ext4 /dev/vda /run/vz-oci/volumes".to_string(),
+                        format!(
+                            "/bin/busybox mkdir -p /run/vz-oci/volumes && /bin/busybox mount -t ext4 {volume_device} /run/vz-oci/volumes"
+                        ),
                     ],
                     timeout,
                 )
@@ -826,6 +1308,8 @@ impl Runtime {
             stack_id.to_string(),
             super::StackVmRecord {
                 identity: runtime_identity,
+                verified_linux_profile,
+                docker_provisioned: docker_provisioning.is_some(),
                 vm,
             },
         );
@@ -1901,6 +2385,47 @@ impl Runtime {
             .await
             .get(stack_id)
             .map(|record| record.identity.clone()))
+    }
+
+    /// Start and health-check the private Docker Engine in one exact shared VM.
+    ///
+    /// The returned socket path is guest-local. This method does not create a
+    /// host proxy or Docker context. The stack lifecycle reader is retained
+    /// through the guest Engine API health check, so a shutdown or replacement
+    /// cannot cross the generation check before the lazy-start effect.
+    pub async fn ensure_shared_vm_docker_ready_exact(
+        &self,
+        expected: &vz_runtime_contract::StackRuntimeIdentity,
+    ) -> Result<SharedVmDockerReadiness, OciError> {
+        expected.validate().map_err(OciError::InvalidConfig)?;
+        let stack_id = expected.stack_id.as_str();
+        let _stack_lifecycle_guard = self.stack_lifecycle_lock(stack_id).await.read_owned().await;
+        let current = self.stack_vms.lock().await.get(stack_id).cloned();
+        require_exact_stack_runtime(current.as_ref().map(|record| &record.identity), expected)?;
+        let Some(current) = current else {
+            return Err(OciError::SharedRuntimeAbsent {
+                stack_id: stack_id.to_string(),
+            });
+        };
+        let verified_profile = require_docker_provisioned_developer_profile(
+            current.verified_linux_profile,
+            current.docker_provisioned,
+            "ensure_shared_vm_docker_ready_exact",
+        )?;
+
+        Self::verify_guest_docker_prerequisites(&current.vm).await?;
+        let guest_socket_path = current.vm.ensure_docker_ready().await?;
+        if guest_socket_path != DOCKER_GUEST_SOCKET {
+            return Err(OciError::InvalidConfig(format!(
+                "Docker readiness returned unexpected guest socket path {guest_socket_path:?}"
+            )));
+        }
+        Self::verify_guest_docker_mounts(&current.vm).await?;
+        Ok(SharedVmDockerReadiness {
+            runtime_identity: current.identity,
+            verified_profile,
+            guest_socket_path,
+        })
     }
 
     /// Atomically compare and stop exactly one shared-runtime boot.

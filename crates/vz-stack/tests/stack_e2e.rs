@@ -23,8 +23,8 @@ use std::time::{Duration, Instant};
 
 use sha2::{Digest, Sha256};
 use vz_oci_macos::{
-    MacosOciError, MacosRuntimeBackend, Runtime, RuntimeConfig, RuntimeLifecycleAdmissionKind,
-    RuntimeLifecycleDiagnostics,
+    KernelProfile, MacosOciError, MacosRuntimeBackend, Runtime, RuntimeConfig,
+    RuntimeLifecycleAdmissionKind, RuntimeLifecycleDiagnostics,
 };
 use vz_runtime_contract::{
     Architecture, CapabilitySet, Container, ContainerCreateReceipt, ContainerGenerationInspection,
@@ -33,13 +33,14 @@ use vz_runtime_contract::{
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSpec, EnvironmentState, ExecConfig, GenerationCleanupOutcome, Lease, LeaseState,
     LifecycleStepResult, LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
-    MachineBackend, MachineCapability, MachineErrorCode, MachineId, MachineIncarnation,
-    MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement, MachineProfile,
-    MachineResources, MachineSpec, MachineState, MachineWorkloadScope, NetworkServiceConfig,
-    OperatingSystem, OwnedCreateError, OwnedResourceKind, OwnershipCleanupStepAcknowledgement,
-    OwnershipRecord, PortMapping, ProjectDefinition, ProjectId, ProjectState, ResourceOwner,
-    RunConfig, RuntimeBackend, Sandbox, SandboxBackend, SandboxSpec, SandboxState,
-    StackResourceHint, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    MachineActivationEvidence, MachineBackend, MachineCapability, MachineErrorCode, MachineId,
+    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement,
+    MachineProfile, MachineResources, MachineRuntimeIdentity, MachineSpec, MachineState,
+    MachineWorkloadScope, NetworkServiceConfig, OperatingSystem, OwnedCreateError,
+    OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, PortMapping,
+    ProjectDefinition, ProjectId, ProjectState, ResourceOwner, RunConfig, RuntimeBackend, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState, StackResourceHint, StackRuntimeIdentity,
+    TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 use vz_stack::{
     Action, ContainerRuntime, ImagePolicy, OrchestrationConfig, ServicePhase, StackError,
@@ -138,6 +139,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
                     created_at: 1,
                 }),
                 state: MachineState::Ready,
+                runtime_identity: None,
                 legacy_sandbox_id: None,
             }],
             networks: vec![],
@@ -252,8 +254,13 @@ struct OciContainerRuntime {
 
 impl OciContainerRuntime {
     fn new(data_dir: &Path) -> Self {
+        Self::new_with_linux_profile(data_dir, None)
+    }
+
+    fn new_with_linux_profile(data_dir: &Path, linux_profile: Option<KernelProfile>) -> Self {
         let config = RuntimeConfig {
             data_dir: data_dir.to_path_buf(),
+            linux_profile,
             require_exact_agent_version: false,
             agent_ready_timeout: Duration::from_secs(15),
             exec_timeout: Duration::from_secs(30),
@@ -261,6 +268,17 @@ impl OciContainerRuntime {
         };
         let runtime = Runtime::new(config);
         Self::from_runtime(runtime, data_dir)
+    }
+
+    fn inspect_shared_vm_identity(&self, stack_id: &str) -> StackRuntimeIdentity {
+        tokio::task::block_in_place(|| {
+            self.handle
+                .block_on(self.backend.inspect_shared_vm(stack_id))
+                .unwrap_or_else(|error| {
+                    panic!("shared VM identity for `{stack_id}` should be inspectable: {error}")
+                })
+                .unwrap_or_else(|| panic!("shared VM `{stack_id}` should be active"))
+        })
     }
 
     fn from_runtime(runtime: Runtime, data_dir: &Path) -> Self {
@@ -529,6 +547,10 @@ fn environment_lifecycle_operation_evidence(
     label: &str,
     operation: &EnvironmentLifecycleOperation,
 ) -> serde_json::Value {
+    let activation = operation
+        .machine_steps
+        .first()
+        .and_then(|step| step.resulting_activation.as_ref());
     serde_json::json!({
         "label": label,
         "kind": match operation.kind {
@@ -543,6 +565,7 @@ fn environment_lifecycle_operation_evidence(
         "request_hash": operation.request_hash,
         "definition_digest": operation.definition_digest,
         "plan_digest": environment_lifecycle_plan_digest(operation),
+        "activation": activation,
         "status": match operation.status {
             EnvironmentLifecycleStatus::Succeeded => "succeeded",
             EnvironmentLifecycleStatus::Failed => "failed",
@@ -557,12 +580,15 @@ fn environment_lifecycle_operation_evidence(
 #[allow(clippy::expect_used)]
 fn environment_lifecycle_machine_ack(
     operation: &EnvironmentLifecycleOperation,
-    resulting_incarnation: Option<MachineIncarnation>,
+    resulting_activation: Option<MachineActivationEvidence>,
 ) -> MachineLifecycleStepAcknowledgement {
     let step = operation
         .machine_steps
         .first()
         .expect("single-Machine lifecycle plan should have one step");
+    let resulting_incarnation = resulting_activation
+        .as_ref()
+        .map(|activation| activation.incarnation.clone());
     MachineLifecycleStepAcknowledgement {
         operation_id: operation.operation_id.clone(),
         generation: operation.generation,
@@ -571,7 +597,46 @@ fn environment_lifecycle_machine_ack(
         target_state: step.target_state,
         expected_incarnation: step.expected_incarnation.clone(),
         resulting_incarnation,
+        resulting_activation,
         result: LifecycleStepResult::Succeeded,
+    }
+}
+
+#[allow(clippy::expect_used)]
+fn environment_lifecycle_machine_activation(
+    operation: &EnvironmentLifecycleOperation,
+    runtime_identity: StackRuntimeIdentity,
+    generation: u64,
+    created_at: u64,
+) -> MachineActivationEvidence {
+    runtime_identity
+        .validate()
+        .expect("inspected shared VM identity should validate");
+    let step = operation
+        .machine_steps
+        .first()
+        .expect("single-Machine lifecycle plan should have one step");
+    let incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new(format!(
+            "inc_runtime_{}",
+            runtime_identity.incarnation_id
+        ))
+        .expect("runtime-qualified Machine incarnation ID should validate"),
+        machine_id: step.machine_id.clone(),
+        generation,
+        created_at,
+    };
+    MachineActivationEvidence {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        backend: MachineBackend::MacosVirtualizationLinux,
+        negotiated_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),
+        runtime_identity: MachineRuntimeIdentity {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            opaque_id: serde_json::to_string(&runtime_identity)
+                .expect("shared VM identity should serialize canonically"),
+        },
+        incarnation,
     }
 }
 
@@ -5524,8 +5589,9 @@ networks:
 }
 
 /// Prove a durable Environment journal fences real VM stop/up/delete work,
-/// survives store reopen, preserves the selected Machine incarnation and disk,
-/// and never mutates a sibling Environment in the same Project.
+/// survives store reopen, preserves disk ownership, advances the Machine
+/// incarnation on a replacement boot, and never mutates a sibling Environment
+/// in the same Project.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Apple Silicon + Linux kernel artifacts"]
 #[allow(clippy::expect_used)]
@@ -5600,20 +5666,15 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
     let target = TargetSpec {
         os: OperatingSystem::Linux,
         arch: Architecture::Aarch64,
-        image: "vz-linux-developer-bundle".to_string(),
+        image: "vz-linux-container-bundle".to_string(),
         version: Some("0.4.0-e2e".to_string()),
         channel: Some("local".to_string()),
         digest: Some("sha256:environment-lifecycle-e2e".to_string()),
     };
-    let capabilities = CapabilitySet::new([
-        MachineCapability::PosixExec,
-        MachineCapability::PosixPty,
-        MachineCapability::Signals,
-        MachineCapability::Files,
-        MachineCapability::DockerEngine,
-        MachineCapability::Compose,
-        MachineCapability::Buildx,
-    ]);
+    // This scenario directly proves bounded guest execution. Docker, Compose,
+    // buildx, PTY, and file-transfer behavior are covered by separate gates and
+    // must not be inferred from a successful VM boot.
+    let capabilities = CapabilitySet::new([MachineCapability::PosixExec]);
     let definition = ProjectDefinition {
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         project_id: project_id.clone(),
@@ -5623,7 +5684,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             machines: vec![MachineSpec {
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
-                profile: MachineProfile::Developer,
+                profile: MachineProfile::Hardened,
                 target: target.clone(),
                 resources: MachineResources {
                     cpus: Some(2),
@@ -5659,7 +5720,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
                 machine_id: machine_id.clone(),
                 environment_id: environment_id.clone(),
                 name: "linux".to_string(),
-                profile: MachineProfile::Developer,
+                profile: MachineProfile::Hardened,
                 target: target.clone(),
                 resources: MachineResources {
                     cpus: Some(2),
@@ -5671,6 +5732,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
                 backend: Some(MachineBackend::MacosVirtualizationLinux),
                 incarnation: Some(incarnation.clone()),
                 state: MachineState::Stopped,
+                runtime_identity: None,
                 legacy_sandbox_id: None,
             }],
             networks: vec![],
@@ -5730,7 +5792,8 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         .expect("E2E topology should validate");
 
     let oci_data = stack_e2e_oci_data_dir();
-    let runtime = OciContainerRuntime::new(&oci_data);
+    let runtime =
+        OciContainerRuntime::new_with_linux_profile(&oci_data, Some(KernelProfile::Container));
     let _physical_cleanup = EnvironmentLifecyclePhysicalCleanup {
         runtime: runtime.clone(),
         backend_keys: vec![target_backend_key.clone(), sibling_backend_key.clone()],
@@ -5778,12 +5841,16 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             },
         )
         .expect("target VM should boot");
+    let target_runtime_identity_initial = runtime.inspect_shared_vm_identity(&target_backend_key);
+    let target_activation_initial = environment_lifecycle_machine_activation(
+        &target_up,
+        target_runtime_identity_initial.clone(),
+        target_incarnation.generation + 1,
+        clock,
+    );
     let target_up = store
         .acknowledge_environment_machine_step(
-            &environment_lifecycle_machine_ack(
-                &target_up,
-                target_up.machine_steps[0].expected_incarnation.clone(),
-            ),
+            &environment_lifecycle_machine_ack(&target_up, Some(target_activation_initial.clone())),
             clock,
         )
         .expect("target Up Machine step should persist");
@@ -5821,11 +5888,18 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             },
         )
         .expect("sibling VM should boot");
+    let sibling_runtime_identity_initial = runtime.inspect_shared_vm_identity(&sibling_backend_key);
+    let sibling_activation_initial = environment_lifecycle_machine_activation(
+        &sibling_up,
+        sibling_runtime_identity_initial.clone(),
+        sibling_incarnation.generation + 1,
+        clock,
+    );
     let sibling_up = store
         .acknowledge_environment_machine_step(
             &environment_lifecycle_machine_ack(
                 &sibling_up,
-                sibling_up.machine_steps[0].expected_incarnation.clone(),
+                Some(sibling_activation_initial.clone()),
             ),
             clock,
         )
@@ -5885,6 +5959,10 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         .expect("target VM should stop");
     assert!(!runtime.has_sandbox(&target_backend_key));
     assert!(runtime.has_sandbox(&sibling_backend_key));
+    assert_eq!(
+        runtime.inspect_shared_vm_identity(&sibling_backend_key),
+        sibling_runtime_identity_initial
+    );
     let sibling_boot_during_target_stop = environment_lifecycle_guest_exec(
         &runtime,
         &sibling_backend_key,
@@ -5916,7 +5994,11 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
     assert_eq!(stopped_target.machines[0].state, MachineState::Stopped);
     assert_eq!(
         stopped_target.machines[0].incarnation.as_ref(),
-        Some(&target_incarnation)
+        Some(&target_activation_initial.incarnation)
+    );
+    assert_eq!(
+        stopped_target.machines[0].runtime_identity.as_ref(),
+        Some(&target_activation_initial.runtime_identity)
     );
     assert!(target_disk.exists());
     let sibling_after_target_stop =
@@ -5989,7 +6071,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         target_up_after_reopen.machine_steps[0]
             .expected_incarnation
             .as_ref(),
-        Some(&target_incarnation)
+        Some(&target_activation_initial.incarnation)
     );
     boot_invocations += 1;
     runtime
@@ -6004,6 +6086,12 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             },
         )
         .expect("target VM should boot from its existing disk");
+    let target_runtime_identity_after_reopen =
+        runtime.inspect_shared_vm_identity(&target_backend_key);
+    assert_ne!(
+        target_runtime_identity_after_reopen, target_runtime_identity_initial,
+        "a replacement VM boot must expose a new exact runtime identity"
+    );
     let target_boot_after_reopen = environment_lifecycle_guest_exec(
         &runtime,
         &target_backend_key,
@@ -6022,13 +6110,21 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         "cat /proc/sys/kernel/random/boot_id",
     );
     assert_eq!(sibling_boot_after_target_restart, sibling_boot_initial);
+    assert_eq!(
+        runtime.inspect_shared_vm_identity(&sibling_backend_key),
+        sibling_runtime_identity_initial
+    );
+    let target_activation_after_reopen = environment_lifecycle_machine_activation(
+        &target_up_after_reopen,
+        target_runtime_identity_after_reopen.clone(),
+        target_activation_initial.incarnation.generation + 1,
+        clock,
+    );
     let target_up_after_reopen = store
         .acknowledge_environment_machine_step(
             &environment_lifecycle_machine_ack(
                 &target_up_after_reopen,
-                target_up_after_reopen.machine_steps[0]
-                    .expected_incarnation
-                    .clone(),
+                Some(target_activation_after_reopen.clone()),
             ),
             clock,
         )
@@ -6046,6 +6142,20 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         "target_up_after_reopen",
         &target_up_after_reopen,
     ));
+    let restarted_target =
+        environment_lifecycle_environment(&store, &project_id, &target_environment_id);
+    assert_eq!(
+        restarted_target.machines[0].incarnation.as_ref(),
+        Some(&target_activation_after_reopen.incarnation)
+    );
+    assert_eq!(
+        restarted_target.machines[0].runtime_identity.as_ref(),
+        Some(&target_activation_after_reopen.runtime_identity)
+    );
+    assert_eq!(
+        target_activation_after_reopen.incarnation.generation,
+        target_activation_initial.incarnation.generation + 1
+    );
     let sibling_after_target_restart =
         environment_lifecycle_environment(&store, &project_id, &sibling_environment_id);
     let sibling_aggregate_bytes_equal_after_restart =
@@ -6186,6 +6296,10 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
     assert!(sibling_aggregate_bytes_equal_after_delete);
     assert!(sibling_ownership_bytes_equal_after_delete);
     assert!(runtime.has_sandbox(&sibling_backend_key));
+    assert_eq!(
+        runtime.inspect_shared_vm_identity(&sibling_backend_key),
+        sibling_runtime_identity_initial
+    );
     let sibling_boot_after_target_delete = environment_lifecycle_guest_exec(
         &runtime,
         &sibling_backend_key,
@@ -6336,7 +6450,8 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             "host_arch": "aarch64",
             "machine_os": "linux",
             "machine_arch": "aarch64",
-            "profile": "developer",
+            "profile": "hardened",
+            "kernel_profile": "container",
             "backend": "macos_virtualization_linux",
         },
         "ids": {
@@ -6344,14 +6459,14 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
             "target": {
                 "environment_id": target_environment_id,
                 "machine_id": target_machine_id,
-                "incarnation_id": target_incarnation.incarnation_id,
+                "seed_incarnation_id": target_incarnation.incarnation_id,
                 "backend_key": target_backend_key,
                 "disk_resource_id": target_disk_resource,
             },
             "sibling": {
                 "environment_id": sibling_environment_id,
                 "machine_id": sibling_machine_id,
-                "incarnation_id": sibling_incarnation.incarnation_id,
+                "seed_incarnation_id": sibling_incarnation.incarnation_id,
                 "backend_key": sibling_backend_key,
                 "disk_resource_id": sibling_disk_resource,
             },

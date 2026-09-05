@@ -25,7 +25,7 @@ pub use macos_backend::MacosRuntimeBackend;
 pub use runtime::{
     ContainerNamespaceIdentity, ContainerReadyGeneration, InteractiveExecEvent,
     KernelObjectIdentity, Runtime, RuntimeLifecycleAdmissionEvent, RuntimeLifecycleAdmissionKind,
-    RuntimeLifecycleDiagnostics, RuntimeLifecycleObserver,
+    RuntimeLifecycleDiagnostics, RuntimeLifecycleObserver, SharedVmDockerReadiness,
 };
 
 // Re-export shared types for convenience.

@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use vz::Vm;
 use vz::protocol::{ExecEvent, ExecOutput};
-use vz::{NetworkConfig, SharedDirConfig};
+use vz::{DiskConfig, NetworkConfig, SharedDirConfig};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };
@@ -31,8 +31,8 @@ use tokio::sync::{Mutex, OwnedRwLockReadGuard, OwnedRwLockWriteGuard, RwLock};
 use vz::protocol::OciContainerState;
 
 use crate::config::{
-    ExecConfig, ExecutionMode, MountAccess, MountSpec, MountType, OciRuntimeKind, PortMapping,
-    PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, ensure_kernel_for_config,
+    ExecConfig, ExecutionMode, KernelProfile, MountAccess, MountSpec, MountType, OciRuntimeKind,
+    PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig, ensure_kernel_for_config,
 };
 use crate::error::MacosOciError as OciError;
 use vz_image::{ImageInfo, PruneResult};
@@ -269,6 +269,17 @@ pub struct RuntimeLifecycleDiagnostics {
     pub overlay_cleanup_pending: usize,
     /// Rootfs directories currently present on disk.
     pub rootfs_directories: usize,
+}
+
+/// Generation-fenced proof that Docker Engine answered inside one shared VM.
+///
+/// `guest_socket_path` is meaningful only inside this exact Linux VM. It is
+/// not a host Docker endpoint or context and must not be published as one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedVmDockerReadiness {
+    pub runtime_identity: vz_runtime_contract::StackRuntimeIdentity,
+    pub verified_profile: KernelProfile,
+    pub guest_socket_path: String,
 }
 
 /// Integration-test lifecycle admission points.
@@ -512,6 +523,8 @@ impl ContainerLifecycleTransaction {
 #[derive(Clone)]
 struct StackVmRecord {
     identity: vz_runtime_contract::StackRuntimeIdentity,
+    verified_linux_profile: Option<KernelProfile>,
+    docker_provisioned: bool,
     vm: Arc<LinuxVm>,
 }
 

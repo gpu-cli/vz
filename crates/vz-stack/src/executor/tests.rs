@@ -194,6 +194,7 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
             created_at: 1,
         }),
         state: MachineState::Ready,
+        runtime_identity: None,
         legacy_sandbox_id: None,
     };
     let environment = EnvironmentInstance {

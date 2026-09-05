@@ -20,11 +20,12 @@ use vz_runtime_contract::{
     EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState,
     EnvironmentTombstone, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec,
     Lease, LeaseState, LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult,
-    LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineBackend, MachineCapability,
-    MachineError, MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId,
-    MachineInstance, MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineProfile,
-    MachineResources, MachineSpec, MachineState, MachineWorkloadScope, NetworkId, NetworkInstance,
-    NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipCleanupStep,
+    LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence,
+    MachineBackend, MachineCapability, MachineError, MachineErrorCode, MachineId,
+    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineRuntimeIdentity,
+    MachineSpec, MachineState, MachineWorkloadScope, NetworkId, NetworkInstance, NetworkKind,
+    NetworkSpec, OperatingSystem, OwnedResourceKind, OwnershipCleanupStep,
     OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectId,
     ProjectState, RequestMetadata, RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF,
     SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend, SandboxSpec, SandboxState, TargetSpec,
@@ -273,6 +274,11 @@ pub fn capability_set_from_proto(
             entry.capability,
             "capability_set.unsupported.capability",
         )?;
+        if capabilities.contains(&capability) {
+            return Err(TranslationError::DuplicateCapability {
+                name: machine_capability_name(capability).to_string(),
+            });
+        }
         if unsupported
             .insert(capability, entry.reason.clone())
             .is_some()
@@ -446,6 +452,82 @@ pub fn machine_incarnation_from_proto(
     })
 }
 
+/// Convert a target-neutral, backend-issued Machine runtime identity.
+pub fn machine_runtime_identity_to_proto(
+    identity: &MachineRuntimeIdentity,
+) -> runtime_v2::MachineRuntimeIdentity {
+    runtime_v2::MachineRuntimeIdentity {
+        schema_version: identity.schema_version,
+        opaque_id: identity.opaque_id.clone(),
+    }
+}
+
+/// Decode and validate a Machine runtime identity for its exact Machine owner.
+pub fn machine_runtime_identity_from_proto(
+    identity: &runtime_v2::MachineRuntimeIdentity,
+    machine_id: &MachineId,
+) -> Result<MachineRuntimeIdentity, TranslationError> {
+    let decoded = MachineRuntimeIdentity {
+        schema_version: identity.schema_version,
+        opaque_id: identity.opaque_id.clone(),
+    };
+    decoded.validate_for_machine(machine_id)?;
+    Ok(decoded)
+}
+
+/// Convert the complete evidence produced by one successful Machine activation.
+pub fn machine_activation_evidence_to_proto(
+    evidence: &MachineActivationEvidence,
+) -> runtime_v2::MachineActivationEvidence {
+    let (backend, other_backend) = machine_backend_value_to_proto(&evidence.backend);
+    runtime_v2::MachineActivationEvidence {
+        schema_version: evidence.schema_version,
+        backend,
+        other_backend,
+        negotiated_capabilities: Some(capability_set_to_proto(&evidence.negotiated_capabilities)),
+        runtime_identity: Some(machine_runtime_identity_to_proto(
+            &evidence.runtime_identity,
+        )),
+        incarnation: Some(machine_incarnation_to_proto(&evidence.incarnation)),
+    }
+}
+
+/// Decode complete Machine activation evidence and reject malformed explicit evidence.
+pub fn machine_activation_evidence_from_proto(
+    evidence: &runtime_v2::MachineActivationEvidence,
+) -> Result<MachineActivationEvidence, TranslationError> {
+    let incarnation = machine_incarnation_from_proto(required(
+        evidence.incarnation.as_ref(),
+        "machine_activation_evidence.incarnation",
+    )?)?;
+    let machine_id = incarnation.machine_id.clone();
+    let decoded = MachineActivationEvidence {
+        schema_version: evidence.schema_version,
+        backend: machine_backend_from_proto_at(
+            Some(evidence.backend),
+            evidence.other_backend.as_deref(),
+            "machine_activation_evidence.backend",
+        )?
+        .ok_or(TranslationError::MissingRequiredField {
+            field: "machine_activation_evidence.backend",
+        })?,
+        negotiated_capabilities: capability_set_from_proto(required(
+            evidence.negotiated_capabilities.as_ref(),
+            "machine_activation_evidence.negotiated_capabilities",
+        )?)?,
+        runtime_identity: machine_runtime_identity_from_proto(
+            required(
+                evidence.runtime_identity.as_ref(),
+                "machine_activation_evidence.runtime_identity",
+            )?,
+            &machine_id,
+        )?,
+        incarnation,
+    };
+    decoded.validate_shape_for_machine(&machine_id)?;
+    Ok(decoded)
+}
+
 /// Convert one authoritative Machine workload scope to its versioned wire form.
 pub fn machine_workload_scope_to_proto(
     scope: &MachineWorkloadScope,
@@ -508,6 +590,10 @@ pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::Machi
             .map(machine_incarnation_to_proto),
         state: machine_state_to_proto(machine.state) as i32,
         legacy_sandbox_id: machine.legacy_sandbox_id.clone(),
+        runtime_identity: machine
+            .runtime_identity
+            .as_ref()
+            .map(machine_runtime_identity_to_proto),
     }
 }
 
@@ -515,9 +601,10 @@ pub fn machine_instance_to_proto(machine: &MachineInstance) -> runtime_v2::Machi
 pub fn machine_instance_from_proto(
     machine: &runtime_v2::MachineInstance,
 ) -> Result<MachineInstance, TranslationError> {
-    Ok(MachineInstance {
+    let machine_id = MachineId::new(machine.machine_id.clone())?;
+    let decoded = MachineInstance {
         schema_version: machine.schema_version,
-        machine_id: MachineId::new(machine.machine_id.clone())?,
+        machine_id: machine_id.clone(),
         environment_id: EnvironmentId::new(machine.environment_id.clone())?,
         name: machine.name.clone(),
         profile: machine_profile_from_proto(machine.profile, "machine_instance.profile")?,
@@ -545,7 +632,14 @@ pub fn machine_instance_from_proto(
             .transpose()?,
         state: machine_state_from_proto(machine.state)?,
         legacy_sandbox_id: machine.legacy_sandbox_id.clone(),
-    })
+        runtime_identity: machine
+            .runtime_identity
+            .as_ref()
+            .map(|identity| machine_runtime_identity_from_proto(identity, &machine_id))
+            .transpose()?,
+    };
+    decoded.validate()?;
+    Ok(decoded)
 }
 
 /// Convert a persisted network identity to wire form.
@@ -682,6 +776,10 @@ pub fn machine_lifecycle_step_to_proto(
             .resulting_incarnation
             .as_ref()
             .map(machine_incarnation_to_proto),
+        resulting_activation: step
+            .resulting_activation
+            .as_ref()
+            .map(machine_activation_evidence_to_proto),
     }
 }
 
@@ -689,6 +787,21 @@ pub fn machine_lifecycle_step_to_proto(
 pub fn machine_lifecycle_step_from_proto(
     step: &runtime_v2::MachineLifecycleStep,
 ) -> Result<MachineLifecycleStep, TranslationError> {
+    let resulting_incarnation = step
+        .resulting_incarnation
+        .as_ref()
+        .map(machine_incarnation_from_proto)
+        .transpose()?;
+    let resulting_activation = step
+        .resulting_activation
+        .as_ref()
+        .map(machine_activation_evidence_from_proto)
+        .transpose()?;
+    require_matching_activation_incarnation(
+        resulting_incarnation.as_ref(),
+        resulting_activation.as_ref(),
+        "machine_lifecycle_step.resulting_activation",
+    )?;
     Ok(MachineLifecycleStep {
         machine_id: MachineId::new(step.machine_id.clone())?,
         initial_state: machine_state_from_proto_at(
@@ -706,11 +819,8 @@ pub fn machine_lifecycle_step_from_proto(
             .as_ref()
             .map(machine_incarnation_from_proto)
             .transpose()?,
-        resulting_incarnation: step
-            .resulting_incarnation
-            .as_ref()
-            .map(machine_incarnation_from_proto)
-            .transpose()?,
+        resulting_incarnation,
+        resulting_activation,
     })
 }
 
@@ -735,6 +845,10 @@ pub fn machine_lifecycle_step_acknowledgement_to_proto(
             .resulting_incarnation
             .as_ref()
             .map(machine_incarnation_to_proto),
+        resulting_activation: acknowledgement
+            .resulting_activation
+            .as_ref()
+            .map(machine_activation_evidence_to_proto),
     }
 }
 
@@ -742,6 +856,45 @@ pub fn machine_lifecycle_step_acknowledgement_to_proto(
 pub fn machine_lifecycle_step_acknowledgement_from_proto(
     acknowledgement: &runtime_v2::MachineLifecycleStepAcknowledgement,
 ) -> Result<MachineLifecycleStepAcknowledgement, TranslationError> {
+    let target_state = acknowledgement
+        .target_state
+        .map(|state| {
+            machine_state_from_proto_at(
+                state,
+                "machine_lifecycle_step_acknowledgement.target_state",
+            )
+        })
+        .transpose()?;
+    let result = lifecycle_step_result_from_proto(required(
+        acknowledgement.result.as_ref(),
+        "machine_lifecycle_step_acknowledgement.result",
+    )?)?;
+    let resulting_incarnation = acknowledgement
+        .resulting_incarnation
+        .as_ref()
+        .map(machine_incarnation_from_proto)
+        .transpose()?;
+    let resulting_activation = acknowledgement
+        .resulting_activation
+        .as_ref()
+        .map(machine_activation_evidence_from_proto)
+        .transpose()?;
+    require_matching_activation_incarnation(
+        resulting_incarnation.as_ref(),
+        resulting_activation.as_ref(),
+        "machine_lifecycle_step_acknowledgement.resulting_activation",
+    )?;
+    match (target_state, &result, resulting_activation.as_ref()) {
+        (Some(MachineState::Ready), LifecycleStepResult::Succeeded, Some(_)) => {}
+        (_, _, None) => {}
+        _ => {
+            return Err(TranslationError::InvalidValue {
+                field: "machine_lifecycle_step_acknowledgement.resulting_activation",
+                value: "only a successful Up acknowledgement may carry activation evidence"
+                    .to_string(),
+            });
+        }
+    }
     Ok(MachineLifecycleStepAcknowledgement {
         operation_id: LifecycleOperationId::new(acknowledgement.operation_id.clone())?,
         generation: acknowledgement.generation,
@@ -750,30 +903,33 @@ pub fn machine_lifecycle_step_acknowledgement_from_proto(
             acknowledgement.initial_state,
             "machine_lifecycle_step_acknowledgement.initial_state",
         )?,
-        target_state: acknowledgement
-            .target_state
-            .map(|state| {
-                machine_state_from_proto_at(
-                    state,
-                    "machine_lifecycle_step_acknowledgement.target_state",
-                )
-            })
-            .transpose()?,
-        result: lifecycle_step_result_from_proto(required(
-            acknowledgement.result.as_ref(),
-            "machine_lifecycle_step_acknowledgement.result",
-        )?)?,
+        target_state,
+        result,
         expected_incarnation: acknowledgement
             .expected_incarnation
             .as_ref()
             .map(machine_incarnation_from_proto)
             .transpose()?,
-        resulting_incarnation: acknowledgement
-            .resulting_incarnation
-            .as_ref()
-            .map(machine_incarnation_from_proto)
-            .transpose()?,
+        resulting_incarnation,
+        resulting_activation,
     })
+}
+
+fn require_matching_activation_incarnation(
+    resulting_incarnation: Option<&MachineIncarnation>,
+    resulting_activation: Option<&MachineActivationEvidence>,
+    field: &'static str,
+) -> Result<(), TranslationError> {
+    if let Some(activation) = resulting_activation
+        && resulting_incarnation != Some(&activation.incarnation)
+    {
+        return Err(TranslationError::InvalidValue {
+            field,
+            value: "activation incarnation does not exactly match resulting_incarnation"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Convert one exact-owner cleanup step.
@@ -1850,37 +2006,42 @@ fn machine_profile_from_proto(
     }
 }
 
-fn machine_backend_to_proto(value: Option<&MachineBackend>) -> (Option<i32>, Option<String>) {
+fn machine_backend_value_to_proto(value: &MachineBackend) -> (i32, Option<String>) {
     match value {
-        None => (None, None),
-        Some(MachineBackend::MacosVirtualizationLinux) => (
-            Some(runtime_v2::MachineBackend::MacosVirtualizationLinux as i32),
+        MachineBackend::MacosVirtualizationLinux => (
+            runtime_v2::MachineBackend::MacosVirtualizationLinux as i32,
             None,
         ),
-        Some(MachineBackend::MacosNative) => {
-            (Some(runtime_v2::MachineBackend::MacosNative as i32), None)
-        }
-        Some(MachineBackend::LinuxNative) => {
-            (Some(runtime_v2::MachineBackend::LinuxNative as i32), None)
-        }
-        Some(MachineBackend::WindowsLinux) => {
-            (Some(runtime_v2::MachineBackend::WindowsLinux as i32), None)
-        }
-        Some(MachineBackend::WindowsNative) => {
-            (Some(runtime_v2::MachineBackend::WindowsNative as i32), None)
-        }
-        Some(MachineBackend::Other(value)) => (
-            Some(runtime_v2::MachineBackend::Other as i32),
+        MachineBackend::MacosNative => (runtime_v2::MachineBackend::MacosNative as i32, None),
+        MachineBackend::LinuxNative => (runtime_v2::MachineBackend::LinuxNative as i32, None),
+        MachineBackend::WindowsLinux => (runtime_v2::MachineBackend::WindowsLinux as i32, None),
+        MachineBackend::WindowsNative => (runtime_v2::MachineBackend::WindowsNative as i32, None),
+        MachineBackend::Other(value) => (
+            runtime_v2::MachineBackend::Other as i32,
             Some(value.clone()),
         ),
     }
+}
+
+fn machine_backend_to_proto(value: Option<&MachineBackend>) -> (Option<i32>, Option<String>) {
+    value.map_or((None, None), |value| {
+        let (backend, other) = machine_backend_value_to_proto(value);
+        (Some(backend), other)
+    })
 }
 
 fn machine_backend_from_proto(
     raw: Option<i32>,
     other: Option<&str>,
 ) -> Result<Option<MachineBackend>, TranslationError> {
-    let field = "machine_instance.backend";
+    machine_backend_from_proto_at(raw, other, "machine_instance.backend")
+}
+
+fn machine_backend_from_proto_at(
+    raw: Option<i32>,
+    other: Option<&str>,
+    field: &'static str,
+) -> Result<Option<MachineBackend>, TranslationError> {
     let Some(raw) = raw else {
         if let Some(other) = other {
             return Err(inconsistent_other(field, other));
@@ -2909,6 +3070,12 @@ mod tests {
                         generation: 7,
                         created_at: 1_725_000_001,
                     }),
+                    runtime_identity: Some(MachineRuntimeIdentity {
+                        schema_version: V,
+                        opaque_id: format!(
+                            r#"{{"schema_version":1,"stack_id":"vzr1-{suffix}-linux","incarnation_id":"00000000-0000-4000-8000-000000000007"}}"#
+                        ),
+                    }),
                     state: MachineState::Ready,
                     legacy_sandbox_id: Some(format!("legacy-{suffix}")),
                 },
@@ -2934,6 +3101,10 @@ mod tests {
                         machine_id: macos_id.clone(),
                         generation: 3,
                         created_at: 1_725_000_002,
+                    }),
+                    runtime_identity: Some(MachineRuntimeIdentity {
+                        schema_version: V,
+                        opaque_id: format!("macos-native:{suffix}:3"),
                     }),
                     state: MachineState::Ready,
                     legacy_sandbox_id: None,
@@ -3072,6 +3243,16 @@ mod tests {
             .begin(&mut environment, 1_725_001_001)
             .expect("begin Up");
         let step = operation.machine_steps[0].clone();
+        let machine = environment
+            .machines
+            .iter()
+            .find(|machine| machine.machine_id == step.machine_id)
+            .expect("planned Machine")
+            .clone();
+        let resulting_incarnation = step
+            .expected_incarnation
+            .clone()
+            .expect("stopped Machine incarnation");
         let acknowledgement = MachineLifecycleStepAcknowledgement {
             operation_id: operation.operation_id.clone(),
             generation: operation.generation,
@@ -3079,7 +3260,16 @@ mod tests {
             initial_state: step.initial_state,
             target_state: step.target_state,
             expected_incarnation: step.expected_incarnation.clone(),
-            resulting_incarnation: step.expected_incarnation.clone(),
+            resulting_incarnation: Some(resulting_incarnation.clone()),
+            resulting_activation: Some(MachineActivationEvidence {
+                schema_version: V,
+                backend: machine.backend.expect("stopped Machine backend"),
+                negotiated_capabilities: machine.negotiated_capabilities,
+                runtime_identity: machine
+                    .runtime_identity
+                    .expect("stopped Machine runtime identity"),
+                incarnation: resulting_incarnation,
+            }),
             result: LifecycleStepResult::Succeeded,
         };
         operation
@@ -3104,6 +3294,27 @@ mod tests {
         assert!(decoded.completed_at.is_none());
         assert!(decoded.machine_steps[0].expected_incarnation.is_some());
         assert!(decoded.machine_steps[0].resulting_incarnation.is_some());
+        let activation = decoded.machine_steps[0]
+            .resulting_activation
+            .as_ref()
+            .expect("successful Up activation evidence");
+        assert_eq!(activation.backend, MachineBackend::MacosVirtualizationLinux);
+        assert_eq!(
+            Some(&activation.runtime_identity),
+            acknowledgement
+                .resulting_activation
+                .as_ref()
+                .map(|evidence| &evidence.runtime_identity)
+        );
+        assert!(
+            activation
+                .negotiated_capabilities
+                .contains(MachineCapability::DockerEngine)
+        );
+        assert_eq!(
+            Some(&activation.incarnation),
+            decoded.machine_steps[0].resulting_incarnation.as_ref()
+        );
         assert!(decoded.machine_steps[1].resulting_incarnation.is_none());
 
         let wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
@@ -3115,6 +3326,18 @@ mod tests {
             machine_lifecycle_step_acknowledgement_from_proto(&decoded_wire)
                 .expect("Machine acknowledgement translation"),
             acknowledgement
+        );
+
+        let mut historical_operation = operation.clone();
+        historical_operation.machine_steps[0].resulting_activation = None;
+        historical_operation
+            .validate_structure()
+            .expect("historical successful Up without activation evidence remains readable");
+        let wire = environment_lifecycle_operation_to_proto(&historical_operation);
+        assert_eq!(
+            environment_lifecycle_operation_from_proto(&wire)
+                .expect("historical lifecycle translation"),
+            historical_operation
         );
 
         let delete_environment = environment("delete", "/tmp/delete");
@@ -3287,13 +3510,123 @@ mod tests {
             })
         );
 
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.resulting_activation = None;
+        let mut historical_acknowledgement = acknowledgement.clone();
+        historical_acknowledgement.resulting_activation = None;
+        assert_eq!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire)
+                .expect("historical acknowledgement without activation remains readable"),
+            historical_acknowledgement
+        );
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.resulting_activation
+            .as_mut()
+            .expect("activation")
+            .runtime_identity
+            .as_mut()
+            .expect("runtime identity")
+            .opaque_id = " \t".to_string();
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::InvalidTopology(
+                TopologyValidationError::InvalidMachineRuntimeIdentity { .. }
+            ))
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.resulting_activation
+            .as_mut()
+            .expect("activation")
+            .runtime_identity = None;
+        assert_eq!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::MissingRequiredField {
+                field: "machine_activation_evidence.runtime_identity"
+            })
+        );
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.resulting_activation
+            .as_mut()
+            .expect("activation")
+            .schema_version = V + 1;
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::InvalidTopology(
+                TopologyValidationError::UnsupportedSchemaVersion { .. }
+            ))
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        let activation = wire.resulting_activation.as_mut().expect("activation");
+        activation.backend = runtime_v2::MachineBackend::Other as i32;
+        activation.other_backend = None;
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::InvalidValue {
+                field: "machine_activation_evidence.backend",
+                ..
+            })
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        let activation = wire.resulting_activation.as_mut().expect("activation");
+        let capabilities = activation
+            .negotiated_capabilities
+            .as_mut()
+            .expect("negotiated capabilities");
+        let capability = capabilities.capabilities[0];
+        capabilities
+            .unsupported
+            .push(runtime_v2::UnsupportedMachineCapability {
+                capability,
+                reason: "contradictory".to_string(),
+            });
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::DuplicateCapability { .. })
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.resulting_activation
+            .as_mut()
+            .expect("activation")
+            .incarnation
+            .as_mut()
+            .expect("activation incarnation")
+            .generation += 1;
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::InvalidValue {
+                field: "machine_lifecycle_step_acknowledgement.resulting_activation",
+                ..
+            })
+        ));
+
+        let mut wire = machine_lifecycle_step_acknowledgement_to_proto(&acknowledgement);
+        wire.result.as_mut().expect("result").result = Some(
+            runtime_v2::lifecycle_step_result::Result::Failed(runtime_v2::LifecycleStepFailed {
+                reason: "backend failed".to_string(),
+            }),
+        );
+        assert!(matches!(
+            machine_lifecycle_step_acknowledgement_from_proto(&wire),
+            Err(TranslationError::InvalidValue {
+                field: "machine_lifecycle_step_acknowledgement.resulting_activation",
+                ..
+            })
+        ));
+
         let mut wire = environment_lifecycle_operation_to_proto(&operation);
         wire.machine_steps[0].resulting_incarnation = None;
         assert!(matches!(
             environment_lifecycle_operation_from_proto(&wire),
-            Err(TranslationError::InvalidLifecycle(
-                TopologyLifecycleError::InvalidOperation { .. }
-            ))
+            Err(TranslationError::InvalidValue {
+                field: "machine_lifecycle_step.resulting_activation",
+                ..
+            })
         ));
 
         let cleanup = runtime_v2::OwnershipCleanupStepAcknowledgement {
@@ -3486,6 +3819,22 @@ mod tests {
         );
         assert_eq!(decoded.environments[0].bindings[0].name, "source");
         assert!(
+            decoded.environments[0].machines[0]
+                .runtime_identity
+                .as_ref()
+                .expect("Linux runtime identity")
+                .opaque_id
+                .contains("\"stack_id\"")
+        );
+        assert_eq!(
+            decoded.environments[0].machines[1]
+                .runtime_identity
+                .as_ref()
+                .expect("native macOS runtime identity")
+                .opaque_id,
+            "macos-native:alpha:3"
+        );
+        assert!(
             decoded
                 .environments
                 .iter()
@@ -3599,6 +3948,15 @@ mod tests {
                 .iter()
                 .any(|machine| machine.target.os == OperatingSystem::Macos)
         }));
+
+        let mut historical_machine = domain.environments[0].machines[0].clone();
+        historical_machine.runtime_identity = None;
+        let wire = machine_instance_to_proto(&historical_machine);
+        assert_eq!(
+            machine_instance_from_proto(&wire)
+                .expect("historical Machine without runtime identity remains readable"),
+            historical_machine
+        );
     }
 
     #[test]

@@ -2,10 +2,8 @@
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use anyhow::{Context, bail};
-use clap::ValueEnum;
 use vz_runtimed_client::{DaemonClient, DaemonClientConfig};
 
 /// Environment variable used to select the CLI control-plane transport.
@@ -21,43 +19,13 @@ const RUNTIME_STATE_DB_ENV: &str = "VZ_RUNTIME_STATE_DB";
 /// Runtime API base URL used when control plane transport is `api-http`.
 const API_BASE_URL_ENV: &str = "VZ_RUNTIME_API_BASE_URL";
 
-static CONTROL_PLANE_TRANSPORT_OVERRIDE: OnceLock<ControlPlaneTransport> = OnceLock::new();
-
 /// CLI control-plane transport for runtime mutations.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum ControlPlaneTransport {
     /// Direct gRPC calls to `vz-runtimed` over UDS.
-    #[value(name = "daemon-grpc", alias = "daemon")]
     DaemonGrpc,
     /// HTTP calls to a `vz-api` control-plane facade.
-    #[value(name = "api-http", alias = "api")]
     ApiHttp,
-}
-
-impl ControlPlaneTransport {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::DaemonGrpc => "daemon-grpc",
-            Self::ApiHttp => "api-http",
-        }
-    }
-}
-
-/// Set a process-wide transport override from CLI flags.
-pub(crate) fn set_control_plane_transport(transport: ControlPlaneTransport) -> anyhow::Result<()> {
-    if let Some(existing) = CONTROL_PLANE_TRANSPORT_OVERRIDE.get().copied() {
-        if existing != transport {
-            bail!(
-                "control-plane transport already set to `{}`; cannot override with `{}`",
-                existing.as_str(),
-                transport.as_str()
-            );
-        }
-        return Ok(());
-    }
-
-    let _ = CONTROL_PLANE_TRANSPORT_OVERRIDE.set(transport);
-    Ok(())
 }
 
 fn parse_control_plane_transport(raw: Option<OsString>) -> anyhow::Result<ControlPlaneTransport> {
@@ -206,16 +174,9 @@ fn daemon_client_config_with_overrides(
     config
 }
 
-fn configured_control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
-    if let Some(transport) = CONTROL_PLANE_TRANSPORT_OVERRIDE.get().copied() {
-        return Ok(transport);
-    }
-    parse_env_control_plane_transport()
-}
-
 /// Resolve the currently configured control-plane transport.
 pub(crate) fn control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
-    configured_control_plane_transport()
+    parse_env_control_plane_transport()
 }
 
 /// Resolve the base URL for `api-http` transport.
@@ -256,7 +217,7 @@ async fn connect_daemon_grpc_for_state_db(state_db: &Path) -> anyhow::Result<Dae
 pub(crate) async fn connect_existing_daemon_for_state_db(
     state_db: &Path,
 ) -> anyhow::Result<DaemonClient> {
-    match configured_control_plane_transport()? {
+    match parse_env_control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => {
             let socket_override = parse_env_daemon_socket_override();
             let runtime_data_dir_override = parse_env_runtime_data_dir_override();
@@ -286,7 +247,7 @@ pub(crate) async fn connect_existing_daemon_for_state_db(
 pub(crate) async fn connect_control_plane_for_state_db(
     state_db: &Path,
 ) -> anyhow::Result<DaemonClient> {
-    match configured_control_plane_transport()? {
+    match parse_env_control_plane_transport()? {
         ControlPlaneTransport::DaemonGrpc => connect_daemon_grpc_for_state_db(state_db).await,
         ControlPlaneTransport::ApiHttp => bail!(
             "api-http transport cannot use direct daemon gRPC connector; route through runtime API HTTP client helpers"

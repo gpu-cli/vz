@@ -127,6 +127,7 @@ pub(super) fn seed_stack_topology(
                 created_at: 1,
             }),
             state: MachineState::Ready,
+            runtime_identity: None,
             legacy_sandbox_id: None,
         }],
         networks: Vec::new(),

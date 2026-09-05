@@ -232,6 +232,25 @@ message MachineIncarnation {
   uint64 created_at = 5;
 }
 
+// Opaque, backend-issued comparison token for one exact Machine runtime.
+// The value is target-neutral: Linux stack identity details are not part of
+// the public topology contract for native macOS or Windows Machines.
+message MachineRuntimeIdentity {
+  uint32 schema_version = 1;
+  string opaque_id = 2;
+}
+
+// Backend result atomically published by a successful Machine Up step.
+message MachineActivationEvidence {
+  uint32 schema_version = 1;
+  MachineBackend backend = 2;
+  // Carries MachineBackend::Other(String) without weakening the enum contract.
+  optional string other_backend = 3;
+  CapabilitySet negotiated_capabilities = 4;
+  MachineRuntimeIdentity runtime_identity = 5;
+  MachineIncarnation incarnation = 6;
+}
+
 message MachineInstance {
   uint32 schema_version = 1;
   string machine_id = 2;
@@ -248,6 +267,8 @@ message MachineInstance {
   MachineState state = 12;
   optional string legacy_sandbox_id = 13;
   MachineProfile profile = 14;
+  // Absent on historical instances persisted before exact runtime identity.
+  optional MachineRuntimeIdentity runtime_identity = 15;
 }
 
 message NetworkInstance {
@@ -338,6 +359,8 @@ message MachineLifecycleStep {
   optional string failure_reason = 5;
   optional MachineIncarnation expected_incarnation = 6;
   optional MachineIncarnation resulting_incarnation = 7;
+  // Absent on historical terminal operations; required for new successful Up.
+  optional MachineActivationEvidence resulting_activation = 8;
 }
 
 message MachineLifecycleStepAcknowledgement {
@@ -349,6 +372,7 @@ message MachineLifecycleStepAcknowledgement {
   LifecycleStepResult result = 6;
   optional MachineIncarnation expected_incarnation = 7;
   optional MachineIncarnation resulting_incarnation = 8;
+  optional MachineActivationEvidence resulting_activation = 9;
 }
 
 message OwnershipCleanupStep {

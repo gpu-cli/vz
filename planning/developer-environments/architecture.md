@@ -91,6 +91,24 @@ aggregate reports degraded/failed state without identity substitution.
 - Long-running mutations use idempotency keys, stream progress, and terminate
   with a receipt. Unary APIs remain for short bounded reads.
 
+Publishing a successful Machine `up` requires a generation-fenced
+`MachineActivationEvidence` receipt: the actual backend, negotiated capabilities,
+complete backend-issued runtime identity, and Machine incarnation. These fields
+and the Ready state are committed together. Persisted Ready state alone never
+acknowledges a new `up`; the controller must inspect the exact runtime and verify
+readiness again. Reusing an incarnation requires identical activation evidence;
+a replaced runtime requires a new incarnation. One backend runtime token cannot
+be adopted by two Machines, including Machines in different Environments.
+
+Runtime tokens are target-neutral opaque comparison values, not global VM names
+or partial identifiers. For the macOS Linux backend, the token includes the full
+`StackRuntimeIdentity`, not just its incarnation UUID. Historical records without
+activation evidence remain readable, but cannot authorize a newly successful
+`up`. Exact terminal receipt replay is read-only and compares every evidence
+field. Guest-local Docker readiness is only one prerequisite: it does not prove
+the host endpoint, Docker context, Compose/buildx compatibility, or the complete
+Developer Environment release gate.
+
 ## Machine backends and capabilities
 
 The daemon selects a Machine backend from `(host OS, Machine target OS,

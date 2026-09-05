@@ -1629,6 +1629,7 @@ impl StateStore {
             self.insert_workspace_binding(binding)?;
         }
         for machine in &environment.machines {
+            self.require_exclusive_machine_runtime_identity(machine)?;
             self.conn.execute(
                 "INSERT INTO machine_instances
                     (machine_id, environment_id, schema_version, name, state, instance_json,
@@ -2320,7 +2321,10 @@ impl StateStore {
             let planned_operation = operation.clone();
             operation.begin(&mut environment, now)?;
 
-            if kind != EnvironmentLifecycleKind::Delete {
+            // A persisted Ready state is not proof that a backend is still
+            // running. Every new Up requires an explicit activation receipt,
+            // even when preserving the current incarnation.
+            if kind == EnvironmentLifecycleKind::Stop {
                 for step in operation.machine_steps.clone() {
                     if step.target_state == Some(step.initial_state) {
                         operation.apply_machine_step_acknowledgement(
@@ -2332,11 +2336,8 @@ impl StateStore {
                                 initial_state: step.initial_state,
                                 target_state: step.target_state,
                                 expected_incarnation: step.expected_incarnation.clone(),
-                                resulting_incarnation: if kind == EnvironmentLifecycleKind::Up {
-                                    step.expected_incarnation
-                                } else {
-                                    None
-                                },
+                                resulting_incarnation: None,
+                                resulting_activation: None,
                                 result: LifecycleStepResult::Succeeded,
                             },
                             now,
@@ -2431,6 +2432,9 @@ impl StateStore {
                 .iter()
                 .find(|machine| machine.machine_id == acknowledgement.machine_id)
                 .cloned();
+            if let Some(machine) = machine_after.as_ref() {
+                store.require_exclusive_machine_runtime_identity(machine)?;
+            }
             store.update_machine_incarnation_ownership_cas(
                 &environment_before,
                 &environment,
@@ -2980,6 +2984,39 @@ impl StateStore {
         }
     }
 
+    /// A complete backend token is owned by one logical Machine, including
+    /// while that Machine is stopped. Check inside the acknowledgement's
+    /// immediate transaction, before any persisted state is changed.
+    fn require_exclusive_machine_runtime_identity(
+        &self,
+        machine: &MachineInstance,
+    ) -> Result<(), StackError> {
+        let Some(identity) = &machine.runtime_identity else {
+            return Ok(());
+        };
+        let mut statement = self.conn.prepare(
+            "SELECT instance_json FROM machine_instances
+             WHERE machine_id != ?1
+               AND json_extract(instance_json, '$.runtime_identity.opaque_id') = ?2",
+        )?;
+        let candidates = statement.query_map(
+            params![machine.machine_id.as_str(), identity.opaque_id],
+            |row| row.get::<_, String>(0),
+        )?;
+        for candidate in candidates {
+            let candidate: MachineInstance = serde_json::from_str(&candidate?)?;
+            if candidate.backend == machine.backend
+                && candidate.runtime_identity.as_ref() == Some(identity)
+            {
+                return Err(StackError::InvalidSpec(format!(
+                    "backend runtime identity is already owned by Machine `{}`",
+                    candidate.machine_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn machine_ack_is_terminal_replay(
         &self,
         operation: &EnvironmentLifecycleOperation,
@@ -3012,6 +3049,7 @@ impl StateStore {
             || step.target_state != acknowledgement.target_state
             || step.expected_incarnation != acknowledgement.expected_incarnation
             || step.resulting_incarnation != acknowledgement.resulting_incarnation
+            || step.resulting_activation != acknowledgement.resulting_activation
         {
             return Err(TopologyLifecycleError::MachineStepMismatch {
                 machine_id: acknowledgement.machine_id.to_string(),

@@ -54,6 +54,37 @@ YOUKI_ARCHIVE := $(CACHE_DIR)/$(YOUKI_RELEASE_ARCHIVE)
 YOUKI_ARCHIVE_SHA256 ?= b3002d9d39b04f797e783745f92cffec9e0caa464254be98aa0b4dfc184f0233
 YOUKI_BINARY := $(OUT_DIR)/youki
 
+IPTABLES_VERSION ?= 1.8.13
+IPTABLES_RELEASE_ARCHIVE := iptables-$(IPTABLES_VERSION).tar.xz
+IPTABLES_URL ?= https://www.netfilter.org/projects/iptables/files/$(IPTABLES_RELEASE_ARCHIVE)
+IPTABLES_ARCHIVE := $(CACHE_DIR)/$(IPTABLES_RELEASE_ARCHIVE)
+IPTABLES_ARCHIVE_SHA256 ?= 1afcd33da9e8f913ace6a2126788162e207e26f5d5e29c6573c0e581ffc58b99
+IPTABLES_SRC_DIR ?= $(SRC_DIR)
+IPTABLES_SRC := $(IPTABLES_SRC_DIR)/iptables-$(IPTABLES_VERSION)
+IPTABLES_BINARY := $(OUT_DIR)/xtables-legacy-multi
+IPTABLES_HOST ?= aarch64-linux-musl
+ifeq ($(shell uname -s),Darwin)
+IPTABLES_CC ?= aarch64-linux-musl-gcc
+IPTABLES_STRIP ?= aarch64-linux-musl-strip
+IPTABLES_READELF ?= aarch64-linux-musl-readelf
+IPTABLES_CPPFLAGS ?=
+else
+IPTABLES_CC ?= musl-gcc
+IPTABLES_STRIP ?= strip
+IPTABLES_READELF ?= readelf
+# Debian keeps Linux UAPI asm headers in its target multiarch directory, which
+# the musl wrapper intentionally omits from its default libc include search.
+IPTABLES_CPPFLAGS ?= -idirafter /usr/include/$(shell $(IPTABLES_CC) -dumpmachine) -idirafter /usr/include
+endif
+
+ifeq ($(KERNEL_PROFILE),developer)
+INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY)
+IPTABLES_VERSION_JSON := "$(IPTABLES_VERSION)"
+else
+INITRAMFS_PROFILE_INPUTS :=
+IPTABLES_VERSION_JSON := null
+endif
+
 GUEST_AGENT_TARGET ?= aarch64-unknown-linux-musl
 GUEST_AGENT_BUILD_TOOL ?= cargo
 GUEST_AGENT_BINARY := $(CRATES_DIR)/target/$(GUEST_AGENT_TARGET)/release/vz-guest-agent
@@ -65,7 +96,7 @@ AGENT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' $(CRATES_DIR)/vz-gu
 AGENT_PROTOCOL_REVISION := $(shell sed -n 's/^pub const AGENT_PROTOCOL_REVISION: u32 = \([0-9][0-9]*\);/\1/p' $(CRATES_DIR)/vz-agent-proto/src/lib.rs | head -1)
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-.PHONY: help all all-profiles dirs clean distclean kernel kernel-config-summary initramfs guest-agent youki version docker-build docker-build-all
+.PHONY: help all all-profiles dirs clean distclean kernel kernel-config-summary initramfs guest-agent youki iptables version docker-build docker-build-all
 
 help:
 	@echo "Linux artifact build targets:"
@@ -75,6 +106,7 @@ help:
 	@echo "  make kernel-config-summary  Generate .config and print enabled option counts"
 	@echo "  make initramfs      Build only initramfs image"
 	@echo "  make youki          Download pinned youki linux/arm64 runtime binary"
+	@echo "  make iptables        Build pinned static iptables for the developer guest"
 	@echo "  make version        Generate version.json"
 	@echo "  make docker-build   Build selected profile artifacts in Docker"
 	@echo "  make docker-build-all Build developer and container profiles in Docker"
@@ -168,6 +200,64 @@ $(YOUKI_BINARY): $(YOUKI_ARCHIVE) | dirs
 
 youki: $(YOUKI_BINARY)
 
+$(IPTABLES_ARCHIVE): | dirs
+	@echo "Downloading pinned iptables $(IPTABLES_VERSION) source"
+	curl -fL "$(IPTABLES_URL)" -o "$@"
+
+$(IPTABLES_SRC)/.extracted: $(IPTABLES_ARCHIVE) | dirs
+	@echo "Verifying and extracting iptables $(IPTABLES_VERSION) source"
+	@ARCHIVE_SHA="$$(shasum -a 256 "$(IPTABLES_ARCHIVE)" | cut -d' ' -f1)"; \
+	if [[ "$$ARCHIVE_SHA" != "$(IPTABLES_ARCHIVE_SHA256)" ]]; then \
+		echo "iptables archive checksum mismatch: expected $(IPTABLES_ARCHIVE_SHA256), found $$ARCHIVE_SHA" >&2; \
+		exit 1; \
+	fi
+	mkdir -p "$(IPTABLES_SRC_DIR)"
+	rm -rf "$(IPTABLES_SRC)"
+	tar -xf "$(IPTABLES_ARCHIVE)" -C "$(IPTABLES_SRC_DIR)"
+	touch "$@"
+
+$(IPTABLES_BINARY): $(IPTABLES_SRC)/.extracted $(ROOT_DIR)/Makefile | dirs
+	@echo "Building static iptables $(IPTABLES_VERSION) legacy backend (linux/arm64 musl)"
+	@if [[ -f "$(IPTABLES_SRC)/Makefile" ]]; then \
+		$(MAKE) -C "$(IPTABLES_SRC)" distclean; \
+	fi
+	cd "$(IPTABLES_SRC)" && \
+		CC="$(IPTABLES_CC)" CPPFLAGS="$(IPTABLES_CPPFLAGS)" LDFLAGS="-static" ./configure \
+			--host="$(IPTABLES_HOST)" \
+			--prefix=/usr \
+			--disable-nftables \
+			--disable-shared \
+			--enable-static \
+			--disable-devel
+	$(MAKE) -C "$(IPTABLES_SRC)" -j"$(JOBS)" LDFLAGS="-all-static"
+	cp "$(IPTABLES_SRC)/iptables/xtables-legacy-multi" "$@.tmp"
+	"$(IPTABLES_STRIP)" "$@.tmp"
+	@file "$@.tmp" | grep -Eq 'ELF 64-bit LSB.*ARM aarch64.*statically linked' || { \
+		echo "iptables binary must be a static linux/arm64 ELF: $$(file "$@.tmp")" >&2; \
+		exit 1; \
+	}
+	@command -v "$(IPTABLES_READELF)" >/dev/null || { \
+		echo "required ELF verifier not found: $(IPTABLES_READELF)" >&2; \
+		exit 1; \
+	}
+	@ELF_PROGRAM_HEADERS="$$("$(IPTABLES_READELF)" -l "$@.tmp")" || { \
+		echo "failed to read iptables ELF program headers" >&2; \
+		exit 1; \
+	}; \
+	if grep -q 'INTERP' <<<"$$ELF_PROGRAM_HEADERS"; then \
+		echo "iptables binary must not contain a dynamic program interpreter" >&2; \
+		exit 1; \
+	fi
+	mv "$@.tmp" "$@"
+
+ifeq ($(KERNEL_PROFILE),developer)
+iptables: $(IPTABLES_BINARY)
+else
+iptables:
+	@echo "iptables is intentionally available only in the developer guest profile" >&2
+	@exit 1
+endif
+
 guest-agent:
 	@echo "Building vz-guest-agent for $(GUEST_AGENT_TARGET)"
 	@if [[ "$(GUEST_AGENT_BUILD_TOOL)" == "zigbuild" ]]; then \
@@ -179,7 +269,7 @@ guest-agent:
 		cd "$(CRATES_DIR)" && cargo build --release -p vz-guest-agent --target "$(GUEST_AGENT_TARGET)"; \
 	fi
 
-$(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) guest-agent \
+$(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) $(INITRAMFS_PROFILE_INPUTS) guest-agent $(ROOT_DIR)/Makefile \
 	$(INITRAMFS_TEMPLATE_DIR)/init \
 	$(INITRAMFS_TEMPLATE_DIR)/etc/resolv.conf \
 	$(INITRAMFS_TEMPLATE_DIR)/etc/udhcpc.script
@@ -197,6 +287,14 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) guest-agent \
 	done
 	ln -sf /bin/busybox "$(INITRAMFS_ROOT)/sbin/udhcpc"
 
+ifeq ($(KERNEL_PROFILE),developer)
+	cp "$(IPTABLES_BINARY)" "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
+	chmod +x "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
+	for cmd in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \
+		ln -sf /sbin/xtables-legacy-multi "$(INITRAMFS_ROOT)/sbin/$$cmd"; \
+	done
+endif
+
 	cp "$(INITRAMFS_TEMPLATE_DIR)/init" "$(INITRAMFS_ROOT)/init"
 	cp "$(INITRAMFS_TEMPLATE_DIR)/etc/resolv.conf" "$(INITRAMFS_ROOT)/etc/resolv.conf"
 	cp "$(INITRAMFS_TEMPLATE_DIR)/etc/udhcpc.script" "$(INITRAMFS_ROOT)/etc/udhcpc.script"
@@ -209,7 +307,7 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) guest-agent \
 
 initramfs: $(INITRAMFS_IMAGE)
 
-$(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
+$(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(ROOT_DIR)/Makefile
 	@echo "Generating version metadata"
 	@KERNEL_SHA="$$(shasum -a 256 "$(KERNEL_IMAGE)" | cut -d' ' -f1)"; \
 	INITRAMFS_SHA="$$(shasum -a 256 "$(INITRAMFS_IMAGE)" | cut -d' ' -f1)"; \
@@ -219,7 +317,7 @@ $(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY)
 		if [[ -n "$$CAPABILITIES_JSON" ]]; then CAPABILITIES_JSON="$$CAPABILITIES_JSON,\n"; fi; \
 		CAPABILITIES_JSON="$$CAPABILITIES_JSON    \"$$capability\""; \
 	done; \
-	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "profile": "$(KERNEL_PROFILE)",\n  "security_profile": "$(KERNEL_SECURITY_PROFILE)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s",\n  "capabilities": [\n%b\n  ]\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" "$$CAPABILITIES_JSON" > "$(VERSION_JSON)"
+	printf '{\n  "kernel": "$(KERNEL_VERSION)",\n  "profile": "$(KERNEL_PROFILE)",\n  "security_profile": "$(KERNEL_SECURITY_PROFILE)",\n  "busybox": "$(BUSYBOX_VERSION)",\n  "agent": "$(AGENT_VERSION)",\n  "agent_protocol_revision": $(AGENT_PROTOCOL_REVISION),\n  "youki": "$(YOUKI_VERSION)",\n  "iptables": $(IPTABLES_VERSION_JSON),\n  "built": "$(BUILD_TIMESTAMP)",\n  "sha256_vmlinux": "%s",\n  "sha256_initramfs": "%s",\n  "sha256_youki": "%s",\n  "capabilities": [\n%b\n  ]\n}\n' "$$KERNEL_SHA" "$$INITRAMFS_SHA" "$$YOUKI_SHA" "$$CAPABILITIES_JSON" > "$(VERSION_JSON)"
 
 version: $(VERSION_JSON)
 
@@ -233,7 +331,8 @@ docker-build:
 		-v "$(REPO_ROOT):/workspace" \
 		-w /workspace/linux \
 		vz-linux-builder \
-		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= \
+			GUEST_AGENT_BUILD_TOOL=cargo IPTABLES_SRC_DIR=/tmp/vz-iptables-src
 
 docker-build-all:
 	@echo "Building all linux artifact profiles in Docker (JOBS=$(DOCKER_BUILD_JOBS))"
@@ -243,7 +342,8 @@ docker-build-all:
 		-v "$(REPO_ROOT):/workspace" \
 		-w /workspace/linux \
 		vz-linux-builder \
-		make all-profiles JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
+		make all-profiles JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= \
+			GUEST_AGENT_BUILD_TOOL=cargo IPTABLES_SRC_DIR=/tmp/vz-iptables-src
 
 clean:
 	rm -rf "$(OUT_DIR)"

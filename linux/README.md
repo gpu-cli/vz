@@ -14,8 +14,10 @@ The secondary hardened profile is built under `out/container/`. It exists for
 constrained workloads and compatibility while the product converges on
 Developer Environments; it is not a separate peer product.
 
-Full Docker compatibility is roadmap work. When complete, Docker will be an
-implicit, private capability of each Linux Developer Environment, never a
+Full Docker compatibility is roadmap work. The Developer guest now includes a
+pinned, statically linked iptables legacy frontend for Docker bridge/NAT setup;
+the hardened Container guest intentionally does not. When complete, Docker will
+be an implicit, private capability of each Linux Developer Environment, never a
 global daemon or a capability of native macOS/Windows targets. Both Linux
 profiles use the pinned youki runtime; runc fallback is not supported.
 
@@ -47,7 +49,7 @@ make -C linux docker-build-all
 
 | Profile | Output | Baseline | Intended use |
 | --- | --- | --- | --- |
-| `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | **Primary.** Broad Linux Developer Environment kernel, including nested KVM, TUN/TAP, user namespaces, and the capabilities needed by the private Docker roadmap. |
+| `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | **Primary.** Broad Linux Developer Environment kernel, including nested KVM, TUN/TAP, user namespaces, and pinned static iptables userspace for private Docker bridge/NAT. |
 | `container` | `linux/out/container/` | `allnoconfig` + `vz-linux-container.config` | **Secondary hardened option.** Constrained workload kernel with virtio/vsock/virtiofs, overlayfs, netns, seccomp, io_uring, btrfs snapshots, and kernel NFS server support. Docker compatibility is not promised for this profile. |
 
 The secondary hardened profile intentionally does not expose `/proc/config.gz`
@@ -104,12 +106,15 @@ Useful benchmark flags:
 - `vz-linux.config` developer kernel config fragment
 - `vz-linux-container.config` container kernel config fragment
 - `kernel-version.mk` shared kernel version/cache schema
+- pinned netfilter.org iptables source (Developer profile only; archive SHA-256
+  is verified before its static legacy frontend is built)
 - `initramfs/` template files (`init`, `resolv.conf`, `udhcpc.script`)
 - `crates/vz-guest-agent` binary (cross-compiled for Linux)
 
 ## Output compatibility
 
-`version.json` includes guest-agent and pinned `youki` version metadata,
+`version.json` includes guest-agent, pinned `youki`, and profile-qualified
+iptables version metadata,
 artifact SHA256 checksums, the kernel `profile`, a `security_profile`, and
 declared kernel capabilities (`vsock`, `virtiofs`, `hvc0_serial`, `ext4_root`,
 `overlayfs`, `netns`, `seccomp`, `io_uring`, `btrfs_snapshots`,

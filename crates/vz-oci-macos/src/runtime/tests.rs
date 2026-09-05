@@ -12,9 +12,13 @@ use super::exec::{
     pending_control_error,
 };
 use super::stack_vm::{
-    activation_error_with_rollback, classify_stack_runtime_shutdown, clear_recovery_route_last,
-    commit_stack_cleanup_batch, hosts_write_command, publish_recovery_route_first,
-    require_running_pid, require_successful_hosts_write, shutdown_container_cleanup_transition,
+    DOCKER_DISK_BOOTSTRAP_SCRIPT, GuestDiskProbe, PrivateDiskDisposition,
+    activation_error_with_rollback, classify_guest_disk_probe, classify_stack_runtime_shutdown,
+    clear_recovery_route_last, commit_stack_cleanup_batch, complete_private_disk_format,
+    ensure_private_sparse_disk, hosts_write_command, kernel_profile_from_metadata,
+    publish_recovery_route_first, require_docker_provisioned_developer_profile,
+    require_exact_stack_runtime, require_running_pid, require_successful_hosts_write,
+    shutdown_container_cleanup_transition,
 };
 use super::*;
 use vz_linux::KernelVersion;
@@ -40,6 +44,189 @@ fn exact_stack_runtime_shutdown_classification_never_authorizes_a_replacement() 
             current: replacement,
         }
     );
+}
+
+#[test]
+fn exact_docker_readiness_classification_refuses_absence_and_replacement() {
+    let expected = vz_runtime_contract::StackRuntimeIdentity::new("stack-docker").unwrap();
+    let replacement = vz_runtime_contract::StackRuntimeIdentity::new("stack-docker").unwrap();
+
+    assert!(matches!(
+        require_exact_stack_runtime(None, &expected),
+        Err(OciError::SharedRuntimeAbsent { .. })
+    ));
+    assert!(require_exact_stack_runtime(Some(&expected), &expected).is_ok());
+    assert!(matches!(
+        require_exact_stack_runtime(Some(&replacement), &expected),
+        Err(OciError::SharedRuntimeIdentityMismatch {
+            expected_incarnation_id,
+            current_incarnation_id,
+            ..
+        }) if expected_incarnation_id == expected.incarnation_id
+            && current_incarnation_id == replacement.incarnation_id
+    ));
+}
+
+#[test]
+fn docker_profile_is_derived_from_actual_kernel_metadata() {
+    let mut version = KernelVersion {
+        kernel: "fixture".to_string(),
+        profile: Some("developer".to_string()),
+        security_profile: Some("developer-nested-virt".to_string()),
+        busybox: "fixture".to_string(),
+        agent: "fixture".to_string(),
+        agent_protocol_revision: None,
+        youki: "fixture".to_string(),
+        built: None,
+        sha256_vmlinux: None,
+        sha256_initramfs: None,
+        sha256_youki: None,
+        capabilities: None,
+    };
+    assert_eq!(
+        kernel_profile_from_metadata(&version),
+        Some(KernelProfile::Developer)
+    );
+    version.profile = Some("container".to_string());
+    assert_eq!(
+        kernel_profile_from_metadata(&version),
+        Some(KernelProfile::Container)
+    );
+    version.profile = None;
+    assert_eq!(kernel_profile_from_metadata(&version), None);
+}
+
+#[test]
+fn docker_readiness_requires_actual_developer_profile_and_boot_provisioning() {
+    for profile in [None, Some(KernelProfile::Container)] {
+        assert!(matches!(
+            require_docker_provisioned_developer_profile(profile, true, "test"),
+            Err(OciError::UnsupportedOperation { .. })
+        ));
+    }
+    assert!(matches!(
+        require_docker_provisioned_developer_profile(Some(KernelProfile::Developer), false, "test"),
+        Err(OciError::UnsupportedOperation { .. })
+    ));
+    assert_eq!(
+        require_docker_provisioned_developer_profile(Some(KernelProfile::Developer), true, "test")
+            .unwrap(),
+        KernelProfile::Developer
+    );
+}
+
+#[test]
+fn docker_disk_probe_only_formats_an_empty_disk() {
+    assert_eq!(
+        classify_guest_disk_probe(0, "", "", true),
+        Ok(GuestDiskProbe::Unformatted)
+    );
+    assert_eq!(
+        classify_guest_disk_probe(0, "/dev/vda: UUID=\"x\" TYPE=\"ext4\"", "", false),
+        Ok(GuestDiskProbe::ExtFilesystem)
+    );
+    assert!(classify_guest_disk_probe(0, "", "", false).is_err());
+    assert!(classify_guest_disk_probe(0, "/dev/vda: TYPE=\"xfs\"", "", true).is_err());
+    assert!(classify_guest_disk_probe(2, "", "unexpected probe failure", true).is_err());
+}
+
+#[test]
+fn docker_disk_bootstrap_script_is_valid_shell_and_preserves_existing_configs() {
+    let output = Command::new("/bin/sh")
+        .args(["-n", "-c", DOCKER_DISK_BOOTSTRAP_SCRIPT])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "bootstrap shell syntax failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(DOCKER_DISK_BOOTSTRAP_SCRIPT.contains("create_config_once"));
+    assert!(DOCKER_DISK_BOOTSTRAP_SCRIPT.contains("stat -Lc '%h'"));
+    assert!(!DOCKER_DISK_BOOTSTRAP_SCRIPT.contains(": > \"$root/config"));
+}
+
+#[test]
+fn private_docker_disk_is_sparse_private_and_rejects_symlinks() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+
+    let root = tempfile::tempdir().unwrap();
+    let disk = root.path().join("machine").join("data.img");
+    assert_eq!(
+        ensure_private_sparse_disk(&disk, 4096).unwrap(),
+        PrivateDiskDisposition::FormatAuthorized
+    );
+    assert_eq!(
+        ensure_private_sparse_disk(&disk, 4096).unwrap(),
+        PrivateDiskDisposition::FormatAuthorized
+    );
+    let format_intent = disk.with_file_name("data.img.format-intent");
+    assert!(
+        format_intent.is_file(),
+        "format intent must survive a retry"
+    );
+    let linked_intent = disk.with_file_name("linked.format-intent");
+    fs::hard_link(&format_intent, &linked_intent).unwrap();
+    assert!(matches!(
+        ensure_private_sparse_disk(&disk, 4096),
+        Err(OciError::InvalidConfig(_))
+    ));
+    fs::remove_file(linked_intent).unwrap();
+
+    let original = disk.with_file_name("original.img");
+    fs::rename(&disk, &original).unwrap();
+    let replacement = fs::File::create(&disk).unwrap();
+    replacement.set_len(4096).unwrap();
+    assert!(matches!(
+        ensure_private_sparse_disk(&disk, 4096),
+        Err(OciError::InvalidConfig(_))
+    ));
+    fs::remove_file(&disk).unwrap();
+    fs::rename(&original, &disk).unwrap();
+    assert_eq!(
+        ensure_private_sparse_disk(&disk, 4096).unwrap(),
+        PrivateDiskDisposition::FormatAuthorized
+    );
+    complete_private_disk_format(&disk, 4096, PrivateDiskDisposition::FormatAuthorized).unwrap();
+    assert!(!format_intent.exists());
+    assert_eq!(
+        ensure_private_sparse_disk(&disk, 4096).unwrap(),
+        PrivateDiskDisposition::Existing
+    );
+    let hard_linked_disk = disk.with_file_name("hard-linked.img");
+    fs::hard_link(&disk, &hard_linked_disk).unwrap();
+    assert!(matches!(
+        ensure_private_sparse_disk(&disk, 4096),
+        Err(OciError::InvalidConfig(_))
+    ));
+    fs::remove_file(hard_linked_disk).unwrap();
+    let metadata = fs::metadata(&disk).unwrap();
+    assert_eq!(metadata.len(), 4096);
+    assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+    assert_eq!(
+        fs::metadata(disk.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o700
+    );
+
+    let target = root.path().join("foreign.img");
+    fs::write(&target, b"foreign").unwrap();
+    let linked = root.path().join("linked.img");
+    symlink(&target, &linked).unwrap();
+    assert!(matches!(
+        ensure_private_sparse_disk(&linked, 4096),
+        Err(OciError::InvalidConfig(_))
+    ));
+    assert_eq!(fs::read(&target).unwrap(), b"foreign");
+
+    assert!(matches!(
+        ensure_private_sparse_disk(&disk, 8192),
+        Err(OciError::InvalidConfig(_))
+    ));
+    assert_eq!(fs::metadata(&disk).unwrap().len(), 4096);
 }
 
 fn unique_temp_dir(name: &str) -> PathBuf {

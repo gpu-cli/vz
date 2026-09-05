@@ -11,11 +11,12 @@ use vz_runtime_contract::types::{
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
     EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentSpec,
     EnvironmentState, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
-    MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineSpec,
-    MachineState, NetworkId, NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec,
-    OperatingSystem, OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
-    ProjectDefinition, ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    MachineActivationEvidence, MachineBackend, MachineCapability, MachineId, MachineIncarnation,
+    MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement, MachineProfile,
+    MachineResources, MachineRuntimeIdentity, MachineSpec, MachineState, NetworkId,
+    NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec, OperatingSystem,
+    OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
+    ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
     TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
     WorkspaceProjectionMode,
 };
@@ -30,6 +31,24 @@ const V0_3_20_AMBIGUOUS_FIXTURE_SHA256: &str =
     "a591d2e0af4578d94d96fe66423c1d59979d33648d10f8f0a69087d1f5ba2ad7";
 const V0_3_20_MALFORMED_FIXTURE_SHA256: &str =
     "e99a5c6bd2a82c9ef2389ffe12fc00cd637a4f341def67e37e741e7b0b27db38";
+
+// Unit-test backend receipt, deliberately not release/runtime evidence.
+fn test_activation(incarnation: MachineIncarnation) -> MachineActivationEvidence {
+    MachineActivationEvidence {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        backend: MachineBackend::MacosVirtualizationLinux,
+        negotiated_capabilities: CapabilitySet::new([
+            MachineCapability::DockerEngine,
+            MachineCapability::Compose,
+            MachineCapability::Buildx,
+        ]),
+        runtime_identity: MachineRuntimeIdentity {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            opaque_id: format!("unit-test-runtime:{}", incarnation.incarnation_id),
+        },
+        incarnation,
+    }
+}
 
 fn fixture_sha256(fixture: &str) -> String {
     format!("{:x}", Sha256::digest(fixture.as_bytes()))
@@ -298,6 +317,7 @@ fn topology_project_state(
                         created_at: 50,
                     }),
                     state: MachineState::Ready,
+                    runtime_identity: None,
                     legacy_sandbox_id: None,
                 }],
                 networks: vec![NetworkInstance {
@@ -5657,7 +5677,7 @@ fn v3_schema_has_durable_lifecycle_shape_and_constraints() {
 }
 
 #[test]
-fn lifecycle_stop_up_and_stable_target_noops_preserve_identity() {
+fn lifecycle_stop_up_requires_ready_activation_and_preserves_identity() {
     let store = StateStore::in_memory().unwrap();
     let expected = topology_project_state("prj_lifecycle", &["agent"], "/checkout");
     let original = expected.environments[0].clone();
@@ -5673,13 +5693,34 @@ fn lifecycle_stop_up_and_stable_target_noops_preserve_identity() {
             300,
         )
         .unwrap();
-    assert_eq!(ready_up.status, EnvironmentLifecycleStatus::Succeeded);
+    assert_eq!(ready_up.status, EnvironmentLifecycleStatus::Running);
     assert!(
         ready_up
             .machine_steps
             .iter()
-            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+            .all(|step| step.status == LifecycleStepStatus::Pending)
     );
+    for step in ready_up.machine_steps.clone() {
+        store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: ready_up.operation_id.clone(),
+                    generation: ready_up.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation.clone(),
+                    resulting_incarnation: step.expected_incarnation.clone(),
+                    resulting_activation: Some(test_activation(step.expected_incarnation.unwrap())),
+                    result: LifecycleStepResult::Succeeded,
+                },
+                300,
+            )
+            .unwrap();
+    }
+    store
+        .finish_environment_lifecycle(ready_up.operation_id.as_str(), ready_up.generation, 300)
+        .unwrap();
 
     let stop = store
         .begin_environment_lifecycle(
@@ -5704,6 +5745,7 @@ fn lifecycle_stop_up_and_stable_target_noops_preserve_identity() {
                     target_state: step.target_state,
                     expected_incarnation: step.expected_incarnation,
                     resulting_incarnation: None,
+                    resulting_activation: None,
                     result: LifecycleStepResult::Succeeded,
                 },
                 302,
@@ -5754,7 +5796,8 @@ fn lifecycle_stop_up_and_stable_target_noops_preserve_identity() {
                     initial_state: step.initial_state,
                     target_state: step.target_state,
                     expected_incarnation: step.expected_incarnation.clone(),
-                    resulting_incarnation: step.expected_incarnation,
+                    resulting_incarnation: step.expected_incarnation.clone(),
+                    resulting_activation: Some(test_activation(step.expected_incarnation.unwrap())),
                     result: LifecycleStepResult::Succeeded,
                 },
                 306,
@@ -6048,6 +6091,7 @@ fn lifecycle_ack_is_fenced_resumable_and_terminal_replay_is_exact() {
         target_state: step.target_state,
         expected_incarnation: step.expected_incarnation,
         resulting_incarnation: None,
+        resulting_activation: None,
         result: LifecycleStepResult::Succeeded,
     };
     let mut stale = exact.clone();
@@ -6168,6 +6212,7 @@ fn lifecycle_delete_is_exact_durable_replayable_and_releases_name() {
                     target_state: step.target_state,
                     expected_incarnation: step.expected_incarnation,
                     resulting_incarnation: None,
+                    resulting_activation: None,
                     result: LifecycleStepResult::Succeeded,
                 },
                 601,
@@ -6358,6 +6403,7 @@ fn blocked_delete_reopens_retries_and_replays_exact_steps_after_deletion() {
         target_state: step.target_state,
         expected_incarnation: step.expected_incarnation,
         resulting_incarnation: None,
+        resulting_activation: None,
         result: LifecycleStepResult::Failed {
             reason: "transient backend failure".to_string(),
         },
@@ -6501,9 +6547,7 @@ fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() 
     let store = StateStore::in_memory().unwrap();
     let template = topology_project_state("prj_incarnation", &["template"], "/checkout");
     let definition = template.definition;
-    let mut environment = definition.instantiate_environment("fresh", 800).unwrap();
-    environment.machines[0].negotiated_capabilities =
-        environment.machines[0].requested_capabilities.clone();
+    let environment = definition.instantiate_environment("fresh", 800).unwrap();
     let environment_id = environment.environment_id.clone();
     let machine_id = environment.machines[0].machine_id.clone();
     store
@@ -6543,6 +6587,7 @@ fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() 
                 target_state: step.target_state,
                 expected_incarnation: None,
                 resulting_incarnation: Some(first_incarnation.clone()),
+                resulting_activation: Some(test_activation(first_incarnation.clone())),
                 result: LifecycleStepResult::Succeeded,
             },
             802,
@@ -6585,6 +6630,7 @@ fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() 
                 target_state: step.target_state,
                 expected_incarnation: step.expected_incarnation,
                 resulting_incarnation: None,
+                resulting_activation: None,
                 result: LifecycleStepResult::Succeeded,
             },
             805,
@@ -6622,6 +6668,7 @@ fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() 
                 target_state: step.target_state,
                 expected_incarnation: Some(first_incarnation),
                 resulting_incarnation: Some(replacement.clone()),
+                resulting_activation: Some(test_activation(replacement.clone())),
                 result: LifecycleStepResult::Succeeded,
             },
             808,
@@ -6647,7 +6694,484 @@ fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() 
 }
 
 #[test]
-fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
+fn activation_receipt_is_durable_exact_and_exclusive_across_environments() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("activation.db");
+    let store = StateStore::open(&path).unwrap();
+    let mut definition =
+        topology_project_state("prj_activation", &["template"], "/checkout").definition;
+    definition.environment.machines[0].workspace = None;
+    let first = definition.instantiate_environment("first", 100).unwrap();
+    let second = definition.instantiate_environment("second", 100).unwrap();
+    let first_id = first.environment_id.clone();
+    let second_id = second.environment_id.clone();
+    assert!(first.machines[0].backend.is_none());
+    assert!(first.machines[0].runtime_identity.is_none());
+    store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![first, second],
+        })
+        .unwrap();
+    let begin = |store: &StateStore, id: &EnvironmentId, key: &str| {
+        store
+            .begin_environment_lifecycle(
+                id.as_str(),
+                EnvironmentLifecycleKind::Up,
+                key,
+                key,
+                key,
+                101,
+            )
+            .unwrap()
+    };
+    let ack_for = |operation: &EnvironmentLifecycleOperation, id: &str| {
+        let step = &operation.machine_steps[0];
+        let incarnation = MachineIncarnation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            incarnation_id: MachineIncarnationId::new(id).unwrap(),
+            machine_id: step.machine_id.clone(),
+            generation: 1,
+            created_at: 102,
+        };
+        MachineLifecycleStepAcknowledgement {
+            operation_id: operation.operation_id.clone(),
+            generation: operation.generation,
+            machine_id: step.machine_id.clone(),
+            initial_state: step.initial_state,
+            target_state: step.target_state,
+            expected_incarnation: None,
+            resulting_incarnation: Some(incarnation.clone()),
+            resulting_activation: Some(test_activation(incarnation)),
+            result: LifecycleStepResult::Succeeded,
+        }
+    };
+    let first_up = begin(&store, &first_id, "first-up");
+    let exact = ack_for(&first_up, "inc_activation_first");
+    let before = store.load_project_state("prj_activation").unwrap();
+    let writes = store.total_changes_for_test();
+    let mut missing = exact.clone();
+    missing.resulting_activation = None;
+    assert!(
+        store
+            .acknowledge_environment_machine_step(&missing, 102)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), writes);
+    assert_eq!(store.load_project_state("prj_activation").unwrap(), before);
+    store
+        .acknowledge_environment_machine_step(&exact, 102)
+        .unwrap();
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    let persisted = store.load_project_state("prj_activation").unwrap().unwrap();
+    let machine = &persisted
+        .environments
+        .iter()
+        .find(|env| env.environment_id == first_id)
+        .unwrap()
+        .machines[0];
+    let evidence = exact.resulting_activation.as_ref().unwrap();
+    assert_eq!(machine.state, MachineState::Ready);
+    assert_eq!(machine.backend.as_ref(), Some(&evidence.backend));
+    assert_eq!(
+        machine.runtime_identity.as_ref(),
+        Some(&evidence.runtime_identity)
+    );
+    assert_eq!(
+        machine.negotiated_capabilities,
+        evidence.negotiated_capabilities
+    );
+    assert_eq!(machine.incarnation.as_ref(), Some(&evidence.incarnation));
+    store
+        .finish_environment_lifecycle(first_up.operation_id.as_str(), first_up.generation, 103)
+        .unwrap();
+    let writes = store.total_changes_for_test();
+    store
+        .acknowledge_environment_machine_step(&exact, 104)
+        .unwrap();
+    assert_eq!(store.total_changes_for_test(), writes);
+
+    let mut changed_receipts = Vec::new();
+    let mut changed = exact.clone();
+    changed
+        .resulting_activation
+        .as_mut()
+        .unwrap()
+        .runtime_identity
+        .opaque_id
+        .push_str("-replacement");
+    changed_receipts.push(changed);
+    let mut changed = exact.clone();
+    changed.resulting_activation.as_mut().unwrap().backend = MachineBackend::LinuxNative;
+    changed_receipts.push(changed);
+    let mut changed = exact.clone();
+    changed
+        .resulting_activation
+        .as_mut()
+        .unwrap()
+        .negotiated_capabilities = CapabilitySet::default();
+    changed_receipts.push(changed);
+    let mut changed = exact.clone();
+    changed
+        .resulting_activation
+        .as_mut()
+        .unwrap()
+        .schema_version += 1;
+    changed_receipts.push(changed);
+    let mut changed = exact.clone();
+    changed.resulting_activation = None;
+    changed_receipts.push(changed);
+    for changed in changed_receipts {
+        assert!(
+            store
+                .acknowledge_environment_machine_step(&changed, 105)
+                .is_err()
+        );
+        assert_eq!(store.total_changes_for_test(), writes);
+    }
+
+    let second_up = begin(&store, &second_id, "second-up");
+    let mut collision = ack_for(&second_up, "inc_activation_second");
+    collision
+        .resulting_activation
+        .as_mut()
+        .unwrap()
+        .runtime_identity = evidence.runtime_identity.clone();
+    let writes = store.total_changes_for_test();
+    let before = store.load_project_state("prj_activation").unwrap();
+    let error = store
+        .acknowledge_environment_machine_step(&collision, 106)
+        .unwrap_err();
+    assert!(error.to_string().contains("already owned"), "{error}");
+    assert_eq!(store.total_changes_for_test(), writes);
+    assert_eq!(store.load_project_state("prj_activation").unwrap(), before);
+    let valid_second = ack_for(&second_up, "inc_activation_second");
+    store
+        .acknowledge_environment_machine_step(&valid_second, 107)
+        .unwrap();
+}
+
+#[test]
+fn historical_terminal_up_without_activation_is_durable_exact_replay_after_reopen() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("historical-activation.db");
+    let store = StateStore::open(&path).unwrap();
+    let mut definition =
+        topology_project_state("prj_historical_activation", &["template"], "/checkout").definition;
+    definition.environment.machines[0].workspace = None;
+    let environment = definition
+        .instantiate_environment("historical", 200)
+        .unwrap();
+    let environment_id = environment.environment_id.clone();
+    store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        })
+        .unwrap();
+
+    let operation = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-historical-activation",
+            "idem-historical-activation",
+            "sha256:historical-activation",
+            201,
+        )
+        .unwrap();
+    let step = &operation.machine_steps[0];
+    let incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_historical_activation").unwrap(),
+        machine_id: step.machine_id.clone(),
+        generation: 1,
+        created_at: 202,
+    };
+    let acknowledgement = MachineLifecycleStepAcknowledgement {
+        operation_id: operation.operation_id.clone(),
+        generation: operation.generation,
+        machine_id: step.machine_id.clone(),
+        initial_state: step.initial_state,
+        target_state: step.target_state,
+        expected_incarnation: None,
+        resulting_incarnation: Some(incarnation.clone()),
+        resulting_activation: Some(test_activation(incarnation)),
+        result: LifecycleStepResult::Succeeded,
+    };
+    store
+        .acknowledge_environment_machine_step(&acknowledgement, 202)
+        .unwrap();
+    store
+        .finish_environment_lifecycle(operation.operation_id.as_str(), operation.generation, 203)
+        .unwrap();
+
+    // Downgrade only the newly-added optional fields to the exact shape written
+    // by a pre-activation-evidence release, in both normalized and parent JSON.
+    let mut historical_environment = store
+        .load_environment_instance(environment_id.as_str())
+        .unwrap()
+        .unwrap();
+    historical_environment.machines[0].runtime_identity = None;
+    let historical_machine = historical_environment.machines[0].clone();
+    let mut historical_operation = store
+        .load_environment_lifecycle(operation.operation_id.as_str())
+        .unwrap()
+        .unwrap();
+    historical_operation.machine_steps[0].resulting_activation = None;
+    store
+        .conn
+        .execute(
+            "UPDATE environment_instances SET instance_json = ?1 WHERE environment_id = ?2",
+            params![
+                serde_json::to_string(&historical_environment).unwrap(),
+                environment_id.as_str()
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE machine_instances SET instance_json = ?1 WHERE machine_id = ?2",
+            params![
+                serde_json::to_string(&historical_machine).unwrap(),
+                historical_machine.machine_id.as_str()
+            ],
+        )
+        .unwrap();
+    store
+        .conn
+        .execute(
+            "UPDATE environment_lifecycle_operations SET operation_json = ?1 WHERE operation_id = ?2",
+            params![
+                serde_json::to_string(&historical_operation).unwrap(),
+                historical_operation.operation_id.as_str()
+            ],
+        )
+        .unwrap();
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    let reopened_project = store
+        .load_project_state("prj_historical_activation")
+        .unwrap()
+        .unwrap();
+    assert!(
+        reopened_project.environments[0].machines[0]
+            .runtime_identity
+            .is_none()
+    );
+    let reopened_operation = store
+        .load_environment_lifecycle(operation.operation_id.as_str())
+        .unwrap()
+        .unwrap();
+    assert_eq!(reopened_operation, historical_operation);
+    let mut historical_acknowledgement = acknowledgement;
+    historical_acknowledgement.resulting_activation = None;
+    let writes = store.total_changes_for_test();
+    let replayed = store
+        .acknowledge_environment_machine_step(&historical_acknowledgement, 204)
+        .unwrap();
+    assert_eq!(replayed, historical_operation);
+    assert_eq!(store.total_changes_for_test(), writes);
+    assert_eq!(
+        store
+            .load_project_state("prj_historical_activation")
+            .unwrap()
+            .unwrap(),
+        reopened_project
+    );
+}
+
+#[test]
+fn activation_late_journal_failure_rolls_back_machine_parent_and_ownership() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("activation-late-rollback.db");
+    let store = StateStore::open(&path).unwrap();
+    let mut definition =
+        topology_project_state("prj_activation_rollback", &["template"], "/checkout").definition;
+    definition.environment.machines[0].workspace = None;
+    let environment = definition.instantiate_environment("rollback", 300).unwrap();
+    let environment_id = environment.environment_id.clone();
+    store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        })
+        .unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-activation-rollback",
+            "idem-activation-rollback",
+            "sha256:activation-rollback",
+            301,
+        )
+        .unwrap();
+    let step = &operation.machine_steps[0];
+    let incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_activation_rollback").unwrap(),
+        machine_id: step.machine_id.clone(),
+        generation: 1,
+        created_at: 302,
+    };
+    let evidence = test_activation(incarnation.clone());
+    let acknowledgement = MachineLifecycleStepAcknowledgement {
+        operation_id: operation.operation_id.clone(),
+        generation: operation.generation,
+        machine_id: step.machine_id.clone(),
+        initial_state: step.initial_state,
+        target_state: step.target_state,
+        expected_incarnation: None,
+        resulting_incarnation: Some(incarnation.clone()),
+        resulting_activation: Some(evidence.clone()),
+        result: LifecycleStepResult::Succeeded,
+    };
+    let project_before = store
+        .load_project_state("prj_activation_rollback")
+        .unwrap()
+        .unwrap();
+    let operation_before = store
+        .load_environment_lifecycle(operation.operation_id.as_str())
+        .unwrap()
+        .unwrap();
+    let ownership_before: Vec<(String, String, String, Option<String>, String)> = store
+        .conn
+        .prepare(
+            "SELECT resource_kind, resource_id, environment_id, machine_id, record_json
+             FROM topology_ownership ORDER BY resource_kind, resource_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    store
+        .conn
+        .execute_batch(
+            "CREATE TEMP TRIGGER abort_activation_journal_update
+             BEFORE UPDATE ON environment_lifecycle_operations
+             BEGIN SELECT RAISE(ABORT, 'injected activation journal failure'); END;",
+        )
+        .unwrap();
+
+    let error = store
+        .acknowledge_environment_machine_step(&acknowledgement, 302)
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("injected activation journal failure"),
+        "{error}"
+    );
+    assert_eq!(
+        store
+            .load_project_state("prj_activation_rollback")
+            .unwrap()
+            .unwrap(),
+        project_before
+    );
+    assert_eq!(
+        store
+            .load_environment_lifecycle(operation.operation_id.as_str())
+            .unwrap()
+            .unwrap(),
+        operation_before
+    );
+    let ownership_after: Vec<(String, String, String, Option<String>, String)> = store
+        .conn
+        .prepare(
+            "SELECT resource_kind, resource_id, environment_id, machine_id, record_json
+             FROM topology_ownership ORDER BY resource_kind, resource_id",
+        )
+        .unwrap()
+        .query_map([], |row| {
+            Ok((
+                row.get(0)?,
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+            ))
+        })
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(ownership_after, ownership_before);
+    assert!(
+        !ownership_after.iter().any(|(_, resource_id, _, _, _)| {
+            resource_id == incarnation.incarnation_id.as_str()
+        })
+    );
+    store
+        .conn
+        .execute("DROP TRIGGER abort_activation_journal_update", [])
+        .unwrap();
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    assert_eq!(
+        store
+            .load_project_state("prj_activation_rollback")
+            .unwrap()
+            .unwrap(),
+        project_before
+    );
+    assert_eq!(
+        store
+            .load_environment_lifecycle(operation.operation_id.as_str())
+            .unwrap()
+            .unwrap(),
+        operation_before
+    );
+    store
+        .acknowledge_environment_machine_step(&acknowledgement, 303)
+        .unwrap();
+    let project = store
+        .load_project_state("prj_activation_rollback")
+        .unwrap()
+        .unwrap();
+    let machine = &project.environments[0].machines[0];
+    assert_eq!(
+        machine.runtime_identity.as_ref(),
+        Some(&evidence.runtime_identity)
+    );
+    assert_eq!(machine.incarnation.as_ref(), Some(&incarnation));
+    let incarnation_owner: (String, String) = store
+        .conn
+        .query_row(
+            "SELECT environment_id, machine_id FROM topology_ownership
+             WHERE resource_kind = ?1 AND resource_id = ?2",
+            params![
+                serde_json::to_string(&OwnedResourceKind::Incarnation).unwrap(),
+                incarnation.incarnation_id.as_str()
+            ],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(
+        incarnation_owner,
+        (environment_id.to_string(), machine.machine_id.to_string())
+    );
+}
+
+#[test]
+fn lifecycle_partial_up_requires_evidence_even_for_ready_sibling() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("partial-up-degraded.db");
     let store = StateStore::open(&db_path).unwrap();
@@ -6707,7 +7231,7 @@ fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
             .iter()
             .filter(|step| step.status == LifecycleStepStatus::Succeeded)
             .count(),
-        1
+        0
     );
     assert_eq!(
         operation
@@ -6715,7 +7239,7 @@ fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
             .iter()
             .filter(|step| step.status == LifecycleStepStatus::Pending)
             .count(),
-        1
+        2
     );
     let ready_sibling_before: (String, String) = store
         .conn
@@ -6738,7 +7262,7 @@ fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
     let pending = operation
         .machine_steps
         .iter()
-        .find(|step| step.status == LifecycleStepStatus::Pending)
+        .find(|step| step.initial_state == MachineState::Stopped)
         .unwrap();
     let acknowledged = store
         .acknowledge_environment_machine_step(
@@ -6750,6 +7274,7 @@ fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
                 target_state: pending.target_state,
                 expected_incarnation: pending.expected_incarnation.clone(),
                 resulting_incarnation: None,
+                resulting_activation: None,
                 result: LifecycleStepResult::Failed {
                     reason: "guest failed to start".to_string(),
                 },
@@ -6772,6 +7297,29 @@ fn lifecycle_partial_up_auto_acknowledges_only_machine_already_at_target() {
     store
         .conn
         .execute("DROP TRIGGER forbid_ready_sibling_machine_update", [])
+        .unwrap();
+    let ready = operation
+        .machine_steps
+        .iter()
+        .find(|step| step.initial_state == MachineState::Ready)
+        .unwrap();
+    store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: operation.operation_id.clone(),
+                generation: operation.generation,
+                machine_id: ready.machine_id.clone(),
+                initial_state: ready.initial_state,
+                target_state: ready.target_state,
+                expected_incarnation: ready.expected_incarnation.clone(),
+                resulting_incarnation: ready.expected_incarnation.clone(),
+                resulting_activation: Some(test_activation(
+                    ready.expected_incarnation.clone().unwrap(),
+                )),
+                result: LifecycleStepResult::Succeeded,
+            },
+            901,
+        )
         .unwrap();
     let finished = store
         .finish_environment_lifecycle(
@@ -6925,6 +7473,7 @@ fn lifecycle_current_load_and_ack_validate_the_attached_aggregate() {
                     target_state: step.target_state,
                     expected_incarnation: step.expected_incarnation,
                     resulting_incarnation: None,
+                    resulting_activation: None,
                     result: LifecycleStepResult::Succeeded,
                 },
                 921,

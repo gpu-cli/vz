@@ -76,6 +76,25 @@ install_youki_binary() {
   return 0
 }
 
+# The Developer profile carries a static legacy xtables multicall binary in the
+# initramfs. Preserve it when entering an external overlay rootfs. Hardened
+# guests do not contain the binary, so this remains a no-op for that profile.
+install_iptables_binary() {
+  target_root="$1"
+  if [ ! -x /sbin/xtables-legacy-multi ]; then
+    return 0
+  fi
+
+  mkdir -p "$target_root/sbin" || return 1
+  cp /sbin/xtables-legacy-multi "$target_root/sbin/xtables-legacy-multi" || return 1
+  /bin/busybox chmod +x "$target_root/sbin/xtables-legacy-multi" || return 1
+
+  for command in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do
+    /bin/busybox ln -sf /sbin/xtables-legacy-multi "$target_root/sbin/$command" || return 1
+  done
+  return 0
+}
+
 # Ensure loopback works for localhost services and port forwarding.
 /bin/ip link set dev lo up >/dev/console 2>&1 || true
 
@@ -135,6 +154,7 @@ switch_root_into_overlay_rootfs() {
   # Copy busybox into rootfs for network setup commands.
   mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin"
   cp /bin/busybox "$ROOTFS/bin/busybox" || return 1
+  install_iptables_binary "$ROOTFS" || return 1
   # Install applet symlinks using busybox's built-in mechanism.
   # Manual `ln -sf` fails on some overlayfs configurations.
   chroot "$ROOTFS" /bin/busybox --install -s /bin 2>/dev/null || \

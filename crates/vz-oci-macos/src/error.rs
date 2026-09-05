@@ -29,6 +29,26 @@ pub enum MacosOciError {
         reason: String,
     },
 
+    /// No shared-runtime boot exists for the exact Docker-readiness request.
+    #[error("shared runtime is absent for stack: {stack_id}")]
+    SharedRuntimeAbsent {
+        /// Stable stack selector that had no active boot.
+        stack_id: String,
+    },
+
+    /// A reusable stack selector now names a replacement runtime boot.
+    #[error(
+        "shared runtime identity mismatch for stack {stack_id}: expected {expected_incarnation_id}, found {current_incarnation_id}"
+    )]
+    SharedRuntimeIdentityMismatch {
+        /// Stable stack selector shared by the stale and current boots.
+        stack_id: String,
+        /// Incarnation authorized by the caller.
+        expected_incarnation_id: String,
+        /// Incarnation currently registered in the runtime.
+        current_incarnation_id: String,
+    },
+
     /// Container metadata or generation was not found.
     #[error("container not found: {id}")]
     ContainerNotFound { id: String },
@@ -76,6 +96,10 @@ pub enum MacosOciError {
     /// Image store or pull error.
     #[error(transparent)]
     Image(#[from] vz_image::ImageError),
+
+    /// Docker facade binary provisioning or validation failed.
+    #[error(transparent)]
+    DockerArtifacts(#[from] vz_oci::DockerArtifactError),
 
     /// Storage operation failed.
     #[error("storage operation failed: {0}")]

@@ -104,6 +104,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
                     created_at: 1,
                 }),
                 state: MachineState::Ready,
+                runtime_identity: None,
                 legacy_sandbox_id: None,
             }],
             networks: vec![],

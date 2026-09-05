@@ -91,6 +91,7 @@ fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
                     created_at: 1,
                 }),
                 state: MachineState::Ready,
+                runtime_identity: None,
                 legacy_sandbox_id: None,
             }],
             networks: vec![],

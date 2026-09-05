@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
 
 use vz::config::VmConfig;
 use vz::{DiskConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder};
@@ -40,6 +43,12 @@ pub struct LinuxVmConfig {
     /// Used for persistent named volumes — an ext4 filesystem image
     /// that is mounted inside the guest at `/run/vz-oci/volumes`.
     pub disk_image: Option<PathBuf>,
+    /// Ordered block devices attached before the legacy named-volume disk.
+    ///
+    /// Developer Machines use this for their private Docker data disk so it
+    /// remains `/dev/vda`; an optional named-volume disk then follows as
+    /// `/dev/vdb`. Callers must use stable IDs and private writable images.
+    pub disks: Vec<DiskConfig>,
     /// Enable nested virtualization (exposes `/dev/kvm` in the guest).
     ///
     /// When enabled, the guest can run hypervisors like Firecracker or
@@ -128,6 +137,34 @@ impl LinuxVmConfig {
             }
         }
 
+        self.validate_disks()?;
+
+        Ok(())
+    }
+
+    fn validate_disks(&self) -> Result<(), LinuxError> {
+        let mut ids = BTreeSet::new();
+        let mut canonical_paths = BTreeMap::new();
+        let mut file_identities = BTreeMap::new();
+        let disks = self
+            .disks
+            .iter()
+            .map(|disk| (disk.id.as_str(), disk.path.as_path()))
+            .chain(self.disk_image.as_deref().map(|path| ("rootfs", path)));
+
+        for (id, path) in disks {
+            if id.trim().is_empty() {
+                return Err(LinuxError::InvalidConfig(
+                    "disk id must not be empty".to_string(),
+                ));
+            }
+            if !ids.insert(id.to_string()) {
+                return Err(LinuxError::InvalidConfig(format!(
+                    "duplicate disk id `{id}`"
+                )));
+            }
+            validate_disk_file(id, path, &mut canonical_paths, &mut file_identities)?;
+        }
         Ok(())
     }
 
@@ -156,6 +193,7 @@ impl LinuxVmConfig {
 
     /// Convert to a base `vz::VmConfig`.
     pub fn to_vm_config(&self) -> Result<VmConfig, LinuxError> {
+        self.validate()?;
         let shared_dirs = self.ordered_shared_dirs();
 
         let mut builder = VmConfigBuilder::new()
@@ -183,6 +221,10 @@ impl LinuxVmConfig {
             builder = builder.network(network.clone());
         }
 
+        for disk in &self.disks {
+            builder = builder.disk(disk.clone());
+        }
+
         if let Some(disk_image) = &self.disk_image {
             builder = builder.disk(DiskConfig {
                 id: "rootfs".into(),
@@ -197,6 +239,46 @@ impl LinuxVmConfig {
 
         Ok(builder.build()?)
     }
+}
+
+fn validate_disk_file(
+    id: &str,
+    path: &Path,
+    canonical_paths: &mut BTreeMap<PathBuf, String>,
+    file_identities: &mut BTreeMap<(u64, u64), String>,
+) -> Result<(), LinuxError> {
+    let metadata = fs::symlink_metadata(path).map_err(|error| {
+        LinuxError::InvalidConfig(format!(
+            "disk `{id}` image is unavailable at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+        return Err(LinuxError::InvalidConfig(format!(
+            "disk `{id}` image must be a regular non-symlink file: {}",
+            path.display()
+        )));
+    }
+
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        LinuxError::InvalidConfig(format!(
+            "disk `{id}` image cannot be resolved at {}: {error}",
+            path.display()
+        ))
+    })?;
+    if let Some(existing) = canonical_paths.insert(canonical, id.to_string()) {
+        return Err(LinuxError::InvalidConfig(format!(
+            "disk `{id}` and disk `{existing}` reference the same physical image"
+        )));
+    }
+
+    let file_identity = (metadata.dev(), metadata.ino());
+    if let Some(existing) = file_identities.insert(file_identity, id.to_string()) {
+        return Err(LinuxError::InvalidConfig(format!(
+            "disk `{id}` and disk `{existing}` reference the same physical image"
+        )));
+    }
+    Ok(())
 }
 
 impl Default for LinuxVmConfig {
@@ -214,6 +296,7 @@ impl Default for LinuxVmConfig {
             vsock: true,
             network: None,
             disk_image: None,
+            disks: Vec::new(),
             nested_virtualization: true,
         }
     }
@@ -258,6 +341,159 @@ mod tests {
         let cfg = LinuxVmConfig::new(&kernel, &initramfs);
         let vm_cfg = cfg.to_vm_config();
         assert!(vm_cfg.is_ok());
+    }
+
+    #[test]
+    fn explicit_disks_precede_legacy_named_volume_disk() {
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        let docker = tmp.path().join("docker.img");
+        let volumes = tmp.path().join("volumes.img");
+        for path in [&kernel, &initramfs, &docker, &volumes] {
+            fs::write(path, b"fixture").expect("write fixture");
+        }
+
+        let mut cfg = LinuxVmConfig::new(&kernel, &initramfs);
+        cfg.disks.push(DiskConfig {
+            id: "docker".to_string(),
+            path: docker.clone(),
+            read_only: false,
+        });
+        cfg.disk_image = Some(volumes.clone());
+
+        let vm = cfg.to_vm_config().expect("valid VM config");
+        assert_eq!(vm.disks().len(), 2);
+        assert_eq!(vm.disks()[0].id, "docker");
+        assert_eq!(vm.disks()[0].path, docker);
+        assert_eq!(vm.disks()[1].id, "rootfs");
+        assert_eq!(vm.disks()[1].path, volumes);
+    }
+
+    #[test]
+    fn validate_rejects_empty_duplicate_and_legacy_colliding_disk_ids() {
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        let first = tmp.path().join("first.img");
+        let second = tmp.path().join("second.img");
+        let legacy = tmp.path().join("legacy.img");
+        for path in [&kernel, &initramfs, &first, &second, &legacy] {
+            fs::write(path, b"fixture").expect("write fixture");
+        }
+
+        let mut empty = LinuxVmConfig::new(&kernel, &initramfs);
+        empty.disks.push(DiskConfig {
+            id: "  ".to_string(),
+            path: first.clone(),
+            read_only: false,
+        });
+        let error = empty.validate().expect_err("blank disk id must fail");
+        assert!(error.to_string().contains("disk id must not be empty"));
+
+        let mut duplicate = LinuxVmConfig::new(&kernel, &initramfs);
+        duplicate.disks.extend([
+            DiskConfig {
+                id: "docker".to_string(),
+                path: first.clone(),
+                read_only: false,
+            },
+            DiskConfig {
+                id: "docker".to_string(),
+                path: second,
+                read_only: false,
+            },
+        ]);
+        let error = duplicate
+            .validate()
+            .expect_err("duplicate explicit disk id must fail");
+        assert!(error.to_string().contains("duplicate disk id `docker`"));
+
+        let mut legacy_collision = LinuxVmConfig::new(&kernel, &initramfs);
+        legacy_collision.disks.push(DiskConfig {
+            id: "rootfs".to_string(),
+            path: first,
+            read_only: false,
+        });
+        legacy_collision.disk_image = Some(legacy);
+        let error = legacy_collision
+            .to_vm_config()
+            .expect_err("legacy rootfs disk id collision must fail before VM creation");
+        assert!(error.to_string().contains("duplicate disk id `rootfs`"));
+    }
+
+    #[test]
+    fn validate_rejects_lexical_alias_and_same_inode_across_legacy_disk() {
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        let disk = tmp.path().join("docker.img");
+        let alias_parent = tmp.path().join("alias-parent");
+        for path in [&kernel, &initramfs, &disk] {
+            fs::write(path, b"fixture").expect("write fixture");
+        }
+        fs::create_dir(&alias_parent).expect("create alias parent");
+
+        let mut lexical_alias = LinuxVmConfig::new(&kernel, &initramfs);
+        lexical_alias.disks.push(DiskConfig {
+            id: "docker".to_string(),
+            path: disk.clone(),
+            read_only: false,
+        });
+        lexical_alias.disk_image = Some(alias_parent.join("..").join("docker.img"));
+        let error = lexical_alias
+            .validate()
+            .expect_err("lexical alias must not attach one image twice");
+        assert!(error.to_string().contains("same physical image"));
+
+        let hard_link = tmp.path().join("docker-hard-link.img");
+        fs::hard_link(&disk, &hard_link).expect("create hard link");
+        let mut same_inode = LinuxVmConfig::new(&kernel, &initramfs);
+        same_inode.disks.push(DiskConfig {
+            id: "docker".to_string(),
+            path: disk,
+            read_only: false,
+        });
+        same_inode.disk_image = Some(hard_link);
+        let error = same_inode
+            .validate()
+            .expect_err("same inode must not be attached twice");
+        assert!(error.to_string().contains("same physical image"));
+    }
+
+    #[test]
+    fn validate_rejects_symlink_and_nonregular_disk_images() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().expect("tempdir");
+        let kernel = tmp.path().join("vmlinux");
+        let initramfs = tmp.path().join("initramfs.img");
+        let disk = tmp.path().join("docker.img");
+        let disk_symlink = tmp.path().join("docker-link.img");
+        let directory = tmp.path().join("not-a-disk");
+        for path in [&kernel, &initramfs, &disk] {
+            fs::write(path, b"fixture").expect("write fixture");
+        }
+        symlink(&disk, &disk_symlink).expect("create disk symlink");
+        fs::create_dir(&directory).expect("create nonregular disk path");
+
+        let mut symlink_config = LinuxVmConfig::new(&kernel, &initramfs);
+        symlink_config.disks.push(DiskConfig {
+            id: "docker".to_string(),
+            path: disk_symlink,
+            read_only: false,
+        });
+        let error = symlink_config
+            .validate()
+            .expect_err("symlink disk image must fail");
+        assert!(error.to_string().contains("regular non-symlink file"));
+
+        let mut nonregular = LinuxVmConfig::new(&kernel, &initramfs);
+        nonregular.disk_image = Some(directory);
+        let error = nonregular
+            .validate()
+            .expect_err("directory disk image must fail");
+        assert!(error.to_string().contains("regular non-symlink file"));
     }
 
     #[test]

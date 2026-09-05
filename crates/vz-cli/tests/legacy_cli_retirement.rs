@@ -30,6 +30,21 @@ const EXPECTED_STACK_REJECTION: &str = concat!(
     "\"migration\":\"Declare services and Machines in vz.json. The 0.4 public CLI is converging on five lifecycle verbs: vz up, vz exec, vz status, vz stop, and vz delete.\",",
     "\"typed_api_migration\":\"Use the topology-scoped typed API for operations outside the five lifecycle verbs.\"}}\n"
 );
+const EXPECTED_BARE_FLAG_MIGRATION: &str = "The implicit sandbox mode was removed. Declare Developer Environment configuration in vz.json. The 0.4 public CLI is converging on explicit vz up, vz exec, vz status, vz stop, and vz delete lifecycle verbs.";
+const INSTALLED_CLI_ENV: &str = "VZ_TEST_INSTALLED_CLI";
+
+fn cli_binary() -> PathBuf {
+    let Some(path) = std::env::var_os(INSTALLED_CLI_ENV).map(PathBuf::from) else {
+        return PathBuf::from(env!("CARGO_BIN_EXE_vz"));
+    };
+    assert!(path.is_absolute(), "{INSTALLED_CLI_ENV} must be absolute");
+    assert!(
+        path.is_file(),
+        "{INSTALLED_CLI_ENV} must name an existing regular file: {}",
+        path.display()
+    );
+    path
+}
 
 struct IsolatedInvocation {
     root: TempDir,
@@ -58,7 +73,7 @@ impl IsolatedInvocation {
     }
 
     fn run(&self, args: &[&str]) -> std::process::Output {
-        Command::new(env!("CARGO_BIN_EXE_vz"))
+        Command::new(cli_binary())
             .args(args)
             .current_dir(&self.project)
             .env("VZ_RUNTIME_STATE_DB", &self.state_db)
@@ -118,6 +133,32 @@ fn assert_stack_rejected(args: &[&str]) {
     invocation.assert_no_runtime_or_state();
 }
 
+fn assert_bare_flag_rejected(args: &[&str], expected_flag: &str) {
+    let invocation = IsolatedInvocation::new();
+    let output = invocation.run(args);
+    assert_eq!(output.status.code(), Some(LEGACY_COMMAND_REMOVED_EXIT_CODE));
+    assert!(
+        output.stdout.is_empty(),
+        "removed flag must not write stdout"
+    );
+
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let payload: Value = serde_json::from_str(stderr.trim_end()).unwrap();
+    assert_eq!(payload["error"]["code"], LEGACY_COMMAND_REMOVED_CODE);
+    assert_eq!(payload["error"]["command"], expected_flag);
+    assert_eq!(
+        payload["error"]["message"],
+        format!("`vz {expected_flag}` was removed from the 0.4 public CLI")
+    );
+    assert_eq!(payload["error"]["migration"], EXPECTED_BARE_FLAG_MIGRATION);
+    assert_eq!(
+        payload["error"]["typed_api_migration"],
+        "Use the topology-scoped typed API for operations outside the five lifecycle verbs."
+    );
+    assert_eq!(stderr.lines().count(), 1);
+    invocation.assert_no_runtime_or_state();
+}
+
 #[test]
 fn root_help_has_no_stack_command_or_hidden_compatibility_alias() {
     for args in [&["--help"][..], &["help"][..]] {
@@ -130,7 +171,46 @@ fn root_help_has_no_stack_command_or_hidden_compatibility_alias() {
                 .lines()
                 .any(|line| line.trim_start().starts_with("stack"))
         );
+        for flag in [
+            "--continue",
+            "--resume",
+            "--name",
+            "--ephemeral",
+            "--cpus",
+            "--memory",
+            "--base-image",
+            "--main-container",
+            "--control-plane",
+        ] {
+            assert!(!stdout.contains(flag), "root help exposed removed {flag}");
+        }
         invocation.assert_no_runtime_or_state();
+    }
+}
+
+#[test]
+fn every_removed_bare_mode_flag_is_structured_and_nonmutating() {
+    for (args, expected_flag) in [
+        (&["-c"][..], "-c"),
+        (&["-hc"][..], "-c"),
+        (&["-vc"][..], "-c"),
+        (&["-qc"][..], "-c"),
+        (&["--continue"][..], "--continue"),
+        (&["-r", "target"][..], "-r"),
+        (&["-vrtarget"][..], "-r"),
+        (&["-vrcandidate"][..], "-r"),
+        (&["-Vcr"][..], "-c"),
+        (&["--resume=target"][..], "--resume"),
+        (&["--name", "target"][..], "--name"),
+        (&["--ephemeral"][..], "--ephemeral"),
+        (&["--cpus", "4"][..], "--cpus"),
+        (&["--memory=4096"][..], "--memory"),
+        (&["--base-image", "alpine"][..], "--base-image"),
+        (&["--main-container=app"][..], "--main-container"),
+        (&["--control-plane", "daemon-grpc"][..], "--control-plane"),
+        (&["help", "--name", "stack"][..], "--name"),
+    ] {
+        assert_bare_flag_rejected(args, expected_flag);
     }
 }
 

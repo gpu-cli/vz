@@ -110,8 +110,16 @@ reads the nearest checked-in `vz.json` as a typed `ProjectDefinition`, connects
 only to an already-running runtime daemon, and reports a persisted Project,
 Environment, and Machine snapshot. JSON output distinguishes the host and
 daemon backend from each Machine target and reports desired-versus-persisted
-definition drift. It does not claim live Docker health or create a Docker
-context.
+definition drift, requested and negotiated capabilities, and persisted
+unsupported-capability reasons. These are persisted results, not a live health
+probe. Status does not infer Docker availability from a Developer profile or
+create a Docker context.
+
+Bare `vz` now prints static top-level help without discovering or mutating
+runtime state. The implicit create/continue/resume path and its root mutation
+flags are removed, as is the `--control-plane` flag. Removed entries return
+structured migration errors; they are not hidden aliases. Explicit legacy
+command families remain except for the already-retired `stack` family.
 
 The other four 0.4 lifecycle verbs and the final exactly-five-command surface
 are still in development. The currently shipped `vz init` remains a legacy 0.3

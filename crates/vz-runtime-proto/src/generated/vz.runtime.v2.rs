@@ -181,6 +181,33 @@ pub struct MachineIncarnation {
     #[prost(uint64, tag = "5")]
     pub created_at: u64,
 }
+/// Opaque, backend-issued comparison token for one exact Machine runtime.
+/// The value is target-neutral: Linux stack identity details are not part of
+/// the public topology contract for native macOS or Windows Machines.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineRuntimeIdentity {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub opaque_id: ::prost::alloc::string::String,
+}
+/// Backend result atomically published by a successful Machine Up step.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineActivationEvidence {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(enumeration = "MachineBackend", tag = "2")]
+    pub backend: i32,
+    /// Carries MachineBackend::Other(String) without weakening the enum contract.
+    #[prost(string, optional, tag = "3")]
+    pub other_backend: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "4")]
+    pub negotiated_capabilities: ::core::option::Option<CapabilitySet>,
+    #[prost(message, optional, tag = "5")]
+    pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
+    #[prost(message, optional, tag = "6")]
+    pub incarnation: ::core::option::Option<MachineIncarnation>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineInstance {
     #[prost(uint32, tag = "1")]
@@ -212,6 +239,9 @@ pub struct MachineInstance {
     pub legacy_sandbox_id: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(enumeration = "MachineProfile", tag = "14")]
     pub profile: i32,
+    /// Absent on historical instances persisted before exact runtime identity.
+    #[prost(message, optional, tag = "15")]
+    pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkInstance {
@@ -293,6 +323,9 @@ pub struct MachineLifecycleStep {
     pub expected_incarnation: ::core::option::Option<MachineIncarnation>,
     #[prost(message, optional, tag = "7")]
     pub resulting_incarnation: ::core::option::Option<MachineIncarnation>,
+    /// Absent on historical terminal operations; required for new successful Up.
+    #[prost(message, optional, tag = "8")]
+    pub resulting_activation: ::core::option::Option<MachineActivationEvidence>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineLifecycleStepAcknowledgement {
@@ -312,6 +345,8 @@ pub struct MachineLifecycleStepAcknowledgement {
     pub expected_incarnation: ::core::option::Option<MachineIncarnation>,
     #[prost(message, optional, tag = "8")]
     pub resulting_incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(message, optional, tag = "9")]
+    pub resulting_activation: ::core::option::Option<MachineActivationEvidence>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OwnershipCleanupStep {
