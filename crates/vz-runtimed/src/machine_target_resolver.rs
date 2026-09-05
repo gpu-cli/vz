@@ -16,12 +16,15 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vz_linux::{KernelBundleArtifactIdentity, KernelProfile, verify_kernel_bundle_read_only};
 use vz_runtime_contract::{
-    Architecture, HostSpec, MachineBackend, MachineCapability, MachineProfile, MachineSpec,
-    OperatingSystem, ProjectDefinition,
+    Architecture, EnvironmentSpec, HostSpec, MachineBackend, MachineCapability, MachineProfile,
+    MachineSpec, OperatingSystem, ProjectDefinition, TOPOLOGY_SCHEMA_VERSION,
 };
 
 pub const MACHINE_TARGET_CATALOG_SCHEMA_VERSION: u32 = 1;
+pub const RESOLVED_MACHINE_CONFIGURATION_SCHEMA_VERSION: u32 = 1;
 pub const LINUX_APPLIANCE_IMAGE: &str = "vz-linux-appliance";
+const MACHINE_CONFIGURATION_DIGEST_DOMAIN: &[u8] = b"vz.machine-configuration.v1\0";
+const LINUX_BUNDLE_DIGEST_DOMAIN: &[u8] = b"vz.linux.kernel-bundle.v1\0";
 
 /// Explicit installation catalog. No entry is inferred from the local system.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,6 +75,8 @@ pub enum TargetResolutionError {
     AmbiguousTarget { machine: String },
     #[error("artifact verification failed for Machine `{machine}`: {reason}")]
     ArtifactVerification { machine: String, reason: String },
+    #[error("invalid resolved configuration for Machine `{machine}`: {reason}")]
+    InvalidResolvedConfiguration { machine: String, reason: String },
 }
 
 impl MachineTargetCatalog {
@@ -161,7 +166,8 @@ impl MachineTargetCatalog {
     }
 }
 
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedMachineResources {
     pub cpus: u8,
     pub memory_mb: u64,
@@ -170,7 +176,8 @@ pub struct ResolvedMachineResources {
 /// Canonical, path-independent requested and resolved configuration identity.
 /// This contains no negotiated Machine capabilities: artifact metadata is not
 /// Docker/Compose/buildx or native-backend conformance evidence.
-#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ResolvedMachineConfiguration {
     pub schema_version: u32,
     pub host: HostSpec,
@@ -180,6 +187,124 @@ pub struct ResolvedMachineConfiguration {
     pub kernel_profile: KernelProfile,
     pub artifact: KernelBundleArtifactIdentity,
     pub resources: ResolvedMachineResources,
+}
+
+impl ResolvedMachineConfiguration {
+    /// Return the portable identity of this exact persisted configuration.
+    pub fn configuration_digest(&self) -> Result<String, TargetResolutionError> {
+        let canonical = serde_json::to_value(self)
+            .and_then(|value| serde_json::to_vec(&value))
+            .map_err(
+                |error| TargetResolutionError::InvalidResolvedConfiguration {
+                    machine: self.machine.name.clone(),
+                    reason: format!("canonical serialization failed: {error}"),
+                },
+            )?;
+        let mut hasher = Sha256::new();
+        hasher.update(MACHINE_CONFIGURATION_DIGEST_DOMAIN);
+        hasher.update(canonical);
+        Ok(format!("sha256:{:x}", hasher.finalize()))
+    }
+
+    /// Validate a persisted configuration without consulting or reinterpreting a catalog.
+    ///
+    /// The supplied Machine must come from the current validated ProjectDefinition. Its
+    /// original channel remains bound by exact `MachineSpec` equality and this object's
+    /// digest; recovery never performs a new channel lookup.
+    pub fn validate_for_machine(
+        &self,
+        host: HostSpec,
+        machine: &MachineSpec,
+    ) -> Result<(), TargetResolutionError> {
+        let invalid = |reason: &str| TargetResolutionError::InvalidResolvedConfiguration {
+            machine: machine.name.clone(),
+            reason: reason.to_string(),
+        };
+        if self.schema_version != RESOLVED_MACHINE_CONFIGURATION_SCHEMA_VERSION {
+            return Err(invalid("unsupported resolved configuration schema"));
+        }
+        EnvironmentSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            machines: vec![machine.clone()],
+            networks: Vec::new(),
+            endpoints: Vec::new(),
+        }
+        .validate()
+        .map_err(|error| invalid(&format!("invalid MachineSpec: {error}")))?;
+        if self.host != host {
+            return Err(invalid("persisted host does not match the current host"));
+        }
+        if host.os != OperatingSystem::Macos
+            || host.arch != Architecture::Aarch64
+            || machine.target.os != OperatingSystem::Linux
+            || machine.target.arch != Architecture::Aarch64
+            || machine.target.image != LINUX_APPLIANCE_IMAGE
+        {
+            return Err(invalid(
+                "configuration is not the supported Apple-silicon macOS to Linux appliance pair",
+            ));
+        }
+        if self.backend != MachineBackend::MacosVirtualizationLinux {
+            return Err(invalid(
+                "persisted backend does not match the supported target pair",
+            ));
+        }
+        if self.machine != *machine {
+            return Err(invalid(
+                "persisted MachineSpec differs from the current definition",
+            ));
+        }
+        if machine
+            .requested_capabilities
+            .contains(MachineCapability::WindowsConsole)
+            || machine
+                .requested_capabilities
+                .contains(MachineCapability::Gui)
+        {
+            return Err(invalid(
+                "persisted Linux target requests an unsupported GUI or Windows console",
+            ));
+        }
+        let expected_profile = kernel_profile(machine.profile);
+        if self.kernel_profile != expected_profile {
+            return Err(invalid("kernel profile does not match the Machine profile"));
+        }
+        if !label(&self.release_version)
+            || machine
+                .target
+                .version
+                .as_ref()
+                .is_some_and(|version| version != &self.release_version)
+            || machine
+                .target
+                .channel
+                .as_ref()
+                .is_some_and(|channel| !label(channel))
+        {
+            return Err(invalid(
+                "release version/channel is invalid or release differs from the requested version",
+            ));
+        }
+        let expected_resources = normalized_resources(machine).map_err(&invalid)?;
+        if self.resources != expected_resources {
+            return Err(invalid(
+                "resolved resources differ from the normalized Machine request",
+            ));
+        }
+        let expected_artifact_digest = linux_bundle_digest(&self.artifact)
+            .ok_or_else(|| invalid("artifact hashes are not canonical lowercase SHA-256"))?;
+        if self.artifact.digest != expected_artifact_digest {
+            return Err(invalid(
+                "artifact aggregate digest does not match its component hashes",
+            ));
+        }
+        if machine.target.digest.as_deref() != Some(self.artifact.digest.as_str()) {
+            return Err(invalid(
+                "requested target digest does not match the resolved artifact",
+            ));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,20 +419,7 @@ impl MachineTargetResolver {
                 "this Linux appliance has no Windows console or GUI adapter",
             ));
         }
-        let cpus = machine.resources.cpus.unwrap_or(2);
-        let memory = machine
-            .resources
-            .memory_mb
-            .unwrap_or(default_memory(machine.profile));
-        if cpus == 0
-            || memory < 512
-            || memory.checked_mul(1024 * 1024).is_none()
-            || machine.resources.disk_bytes.is_some()
-        {
-            return Err(unsupported(
-                "invalid compute resources or unsupported explicit Machine disk sizing",
-            ));
-        }
+        normalized_resources(machine).map_err(unsupported)?;
         let digest = machine
             .target
             .digest
@@ -352,10 +464,7 @@ impl MachineTargetResolver {
         machine: &MachineSpec,
         entry: &LinuxTargetCatalogEntry,
     ) -> Result<ResolvedLinuxMachineTarget, TargetResolutionError> {
-        let profile = match machine.profile {
-            MachineProfile::Developer => KernelProfile::Developer,
-            MachineProfile::Hardened => KernelProfile::Container,
-        };
+        let profile = kernel_profile(machine.profile);
         let verified = verify_kernel_bundle_read_only(&entry.bundle_dir, profile)
             .await
             .map_err(|error| TargetResolutionError::ArtifactVerification {
@@ -371,34 +480,72 @@ impl MachineTargetResolver {
             });
         }
         let configuration = ResolvedMachineConfiguration {
-            schema_version: 1,
+            schema_version: RESOLVED_MACHINE_CONFIGURATION_SCHEMA_VERSION,
             host: self.host,
             backend: MachineBackend::MacosVirtualizationLinux,
             machine: machine.clone(),
             release_version: entry.version.clone(),
             kernel_profile: profile,
             artifact: verified.artifact_identity,
-            resources: ResolvedMachineResources {
-                cpus: machine.resources.cpus.unwrap_or(2),
-                memory_mb: machine
-                    .resources
-                    .memory_mb
-                    .unwrap_or(default_memory(machine.profile)),
-            },
+            resources: normalized_resources(machine).map_err(|reason| {
+                TargetResolutionError::UnsupportedTarget {
+                    machine: machine.name.clone(),
+                    reason: reason.to_string(),
+                }
+            })?,
         };
-        // Sorted JSON gives non-Rust evidence validators an exact portable encoding.
-        let canonical = serde_json::to_value(&configuration)
-            .and_then(|value| serde_json::to_vec(&value))
-            .map_err(|error| TargetResolutionError::InvalidDefinition(error.to_string()))?;
-        let mut hasher = Sha256::new();
-        hasher.update(b"vz.machine-configuration.v1\0");
-        hasher.update(canonical);
+        configuration.validate_for_machine(self.host, machine)?;
+        let configuration_digest = configuration.configuration_digest()?;
         Ok(ResolvedLinuxMachineTarget {
             bundle_dir: verified.bundle_dir,
             configuration,
-            configuration_digest: format!("sha256:{:x}", hasher.finalize()),
+            configuration_digest,
         })
     }
+}
+
+fn kernel_profile(profile: MachineProfile) -> KernelProfile {
+    match profile {
+        MachineProfile::Developer => KernelProfile::Developer,
+        MachineProfile::Hardened => KernelProfile::Container,
+    }
+}
+
+fn normalized_resources(machine: &MachineSpec) -> Result<ResolvedMachineResources, &'static str> {
+    let cpus = machine.resources.cpus.unwrap_or(2);
+    let memory_mb = machine
+        .resources
+        .memory_mb
+        .unwrap_or(default_memory(machine.profile));
+    if cpus == 0
+        || memory_mb < 512
+        || memory_mb.checked_mul(1024 * 1024).is_none()
+        || machine.resources.disk_bytes.is_some()
+    {
+        return Err("invalid compute resources or unsupported explicit Machine disk sizing");
+    }
+    Ok(ResolvedMachineResources { cpus, memory_mb })
+}
+
+fn linux_bundle_digest(identity: &KernelBundleArtifactIdentity) -> Option<String> {
+    let fields = [
+        ("kernel", identity.kernel_sha256.as_str()),
+        ("initramfs", identity.initramfs_sha256.as_str()),
+        ("youki", identity.youki_sha256.as_str()),
+        ("version", identity.version_sha256.as_str()),
+    ];
+    if fields.iter().any(|(_, hash)| !canonical_sha256(hash)) {
+        return None;
+    }
+    let mut hasher = Sha256::new();
+    hasher.update(LINUX_BUNDLE_DIGEST_DOMAIN);
+    for (field, hash) in fields {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update([0]);
+    }
+    Some(format!("sha256:{:x}", hasher.finalize()))
 }
 
 fn default_memory(profile: MachineProfile) -> u64 {
@@ -415,6 +562,13 @@ fn canonical_digest(value: &str) -> bool {
                 .bytes()
                 .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     })
+}
+
+fn canonical_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
 fn label(value: &str) -> bool {
@@ -525,6 +679,28 @@ mod tests {
             },
         )
         .unwrap()
+    }
+
+    fn corrupt_configuration(
+        name: &'static str,
+        base: &ResolvedMachineConfiguration,
+        machine: &MachineSpec,
+        change: impl FnOnce(&mut ResolvedMachineConfiguration, &mut HostSpec, &mut MachineSpec),
+    ) -> (
+        &'static str,
+        ResolvedMachineConfiguration,
+        HostSpec,
+        MachineSpec,
+    ) {
+        let mut configuration = base.clone();
+        let mut expected_host = host();
+        let mut expected_machine = machine.clone();
+        change(
+            &mut configuration,
+            &mut expected_host,
+            &mut expected_machine,
+        );
+        (name, configuration, expected_host, expected_machine)
     }
 
     #[tokio::test]
@@ -685,6 +861,182 @@ mod tests {
             resolver(vec![first]).resolve_project(&definition).await,
             Err(TargetResolutionError::ArtifactVerification { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn resolved_configuration_persists_and_validates_without_catalog() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let entry = bundle(&root, MachineProfile::Developer).await;
+        let definition = definition(std::slice::from_ref(&entry));
+        let resolved = resolver(vec![entry])
+            .resolve_project(&definition)
+            .await
+            .unwrap();
+        let target = &resolved.machines["machine-0"];
+        let encoded = serde_json::to_vec(target.configuration()).unwrap();
+        let restored: ResolvedMachineConfiguration = serde_json::from_slice(&encoded).unwrap();
+
+        assert_eq!(&restored, target.configuration());
+        assert_eq!(
+            restored.configuration_digest().unwrap(),
+            target.configuration_digest()
+        );
+        restored
+            .validate_for_machine(host(), &definition.environment.machines[0])
+            .unwrap();
+
+        let mut digest_only = restored.clone();
+        digest_only.machine.target.version = None;
+        digest_only.machine.target.channel = None;
+        let digest_only_machine = digest_only.machine.clone();
+        digest_only
+            .validate_for_machine(host(), &digest_only_machine)
+            .unwrap();
+
+        let mut unknown: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        unknown["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ResolvedMachineConfiguration>(unknown).is_err());
+        let mut unknown_resource: serde_json::Value = serde_json::from_slice(&encoded).unwrap();
+        unknown_resource["resources"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<ResolvedMachineConfiguration>(unknown_resource).is_err());
+    }
+
+    #[tokio::test]
+    async fn persisted_configuration_rejects_corruption_without_catalog_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let entry = bundle(&root, MachineProfile::Developer).await;
+        let definition = definition(std::slice::from_ref(&entry));
+        let resolved = resolver(vec![entry])
+            .resolve_project(&definition)
+            .await
+            .unwrap();
+        let base = resolved.machines["machine-0"].configuration();
+        let machine = &definition.environment.machines[0];
+        let cases = vec![
+            corrupt_configuration("configuration schema", base, machine, |config, _, _| {
+                config.schema_version += 1;
+            }),
+            corrupt_configuration("Machine schema", base, machine, |config, _, expected| {
+                config.machine.schema_version += 1;
+                expected.schema_version += 1;
+            }),
+            corrupt_configuration("persisted host", base, machine, |config, _, _| {
+                config.host.os = OperatingSystem::Linux;
+            }),
+            corrupt_configuration("actual host pair", base, machine, |config, host, _| {
+                config.host.os = OperatingSystem::Linux;
+                host.os = OperatingSystem::Linux;
+            }),
+            corrupt_configuration("backend", base, machine, |config, _, _| {
+                config.backend = MachineBackend::MacosNative;
+            }),
+            corrupt_configuration("kernel profile", base, machine, |config, _, _| {
+                config.kernel_profile = KernelProfile::Container;
+            }),
+            corrupt_configuration("Machine profile", base, machine, |config, _, expected| {
+                config.machine.profile = MachineProfile::Hardened;
+                expected.profile = MachineProfile::Hardened;
+            }),
+            corrupt_configuration("normalized resources", base, machine, |config, _, _| {
+                config.resources.cpus += 1;
+            }),
+            corrupt_configuration(
+                "invalid requested resources",
+                base,
+                machine,
+                |config, _, expected| {
+                    config.machine.resources.cpus = Some(0);
+                    config.resources.cpus = 0;
+                    expected.resources.cpus = Some(0);
+                },
+            ),
+            corrupt_configuration("release label", base, machine, |config, _, _| {
+                config.release_version = "invalid release".into();
+            }),
+            corrupt_configuration("release request", base, machine, |config, _, _| {
+                config.release_version = "0.4.1-test".into();
+            }),
+            corrupt_configuration(
+                "Machine request divergence",
+                base,
+                machine,
+                |config, _, _| {
+                    config.machine.name = "different-machine".into();
+                },
+            ),
+            corrupt_configuration("target image", base, machine, |config, _, expected| {
+                config.machine.target.image = "other-appliance".into();
+                expected.target.image = "other-appliance".into();
+            }),
+            corrupt_configuration("target pair", base, machine, |config, _, expected| {
+                config.machine.target.os = OperatingSystem::Windows;
+                expected.target.os = OperatingSystem::Windows;
+            }),
+            corrupt_configuration(
+                "unsupported capability",
+                base,
+                machine,
+                |config, _, expected| {
+                    config
+                        .machine
+                        .requested_capabilities
+                        .capabilities
+                        .insert(MachineCapability::Gui);
+                    expected
+                        .requested_capabilities
+                        .capabilities
+                        .insert(MachineCapability::Gui);
+                },
+            ),
+            corrupt_configuration("target digest", base, machine, |config, _, expected| {
+                let digest = format!("sha256:{}", "f".repeat(64));
+                config.machine.target.digest = Some(digest.clone());
+                expected.target.digest = Some(digest);
+            }),
+            corrupt_configuration(
+                "target channel label",
+                base,
+                machine,
+                |config, _, expected| {
+                    config.machine.target.channel = Some("invalid channel".into());
+                    expected.target.channel = Some("invalid channel".into());
+                },
+            ),
+        ];
+        for field in [
+            "kernel_sha256",
+            "initramfs_sha256",
+            "youki_sha256",
+            "version_sha256",
+        ] {
+            let mut configuration = base.clone();
+            match field {
+                "kernel_sha256" => configuration.artifact.kernel_sha256 = "A".repeat(64),
+                "initramfs_sha256" => configuration.artifact.initramfs_sha256 = "A".repeat(64),
+                "youki_sha256" => configuration.artifact.youki_sha256 = "A".repeat(64),
+                "version_sha256" => configuration.artifact.version_sha256 = "A".repeat(64),
+                _ => unreachable!(),
+            }
+            assert!(
+                configuration.validate_for_machine(host(), machine).is_err(),
+                "corrupted {field} was accepted"
+            );
+        }
+        let mut aggregate = base.clone();
+        aggregate.artifact.digest = format!("sha256:{}", "f".repeat(64));
+        assert!(aggregate.validate_for_machine(host(), machine).is_err());
+
+        for (name, configuration, expected_host, expected_machine) in cases {
+            assert!(
+                matches!(
+                    configuration.validate_for_machine(expected_host, &expected_machine),
+                    Err(TargetResolutionError::InvalidResolvedConfiguration { .. })
+                ),
+                "corrupted {name} was accepted"
+            );
+        }
     }
 
     #[tokio::test]

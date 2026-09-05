@@ -5,8 +5,8 @@ use std::time::Duration;
 pub use vz_image::Auth;
 pub use vz_linux::KernelProfile;
 use vz_linux::{
-    EnsureKernelOptions, KernelPaths, LinuxError, ensure_kernel_profile_with_options,
-    ensure_kernel_with_options,
+    EnsureKernelOptions, KernelBundleArtifactIdentity, KernelPaths, LinuxError,
+    ensure_kernel_profile_with_options, ensure_kernel_with_options, verify_kernel_bundle_read_only,
 };
 
 // Re-export shared types from the runtime contract.
@@ -48,6 +48,19 @@ impl OciRuntimeKind {
     }
 }
 
+/// Explicit content identity and location for a read-only Linux appliance bundle.
+///
+/// The caller must retain a trusted, immutable directory for the runtime's
+/// lifetime. Selection verifies every artifact against `artifact_identity`
+/// without installing, caching, or consulting an external catalog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PinnedLinuxBundle {
+    /// Exact directory containing `vmlinux`, `initramfs.img`, `youki`, and `version.json`.
+    pub directory: PathBuf,
+    /// Exact identity expected for all bundle artifacts and raw version metadata.
+    pub artifact_identity: KernelBundleArtifactIdentity,
+}
+
 /// Top-level runtime configuration.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
@@ -61,6 +74,11 @@ pub struct RuntimeConfig {
     pub linux_bundle_dir: Option<PathBuf>,
     /// Optional kernel profile to select and validate.
     pub linux_profile: Option<KernelProfile>,
+    /// Explicit read-only bundle selected by exact artifact identity.
+    ///
+    /// This mode requires `linux_profile` and is mutually exclusive with the
+    /// legacy install/cache, bundle input, and guest runtime override paths.
+    pub pinned_linux_bundle: Option<PinnedLinuxBundle>,
     /// OCI runtime implementation used for guest lifecycle operations.
     pub guest_oci_runtime: OciRuntimeKind,
     /// Optional host path override for the guest OCI runtime binary (`youki`).
@@ -103,6 +121,7 @@ impl Default for RuntimeConfig {
             linux_install_dir: None,
             linux_bundle_dir: None,
             linux_profile: None,
+            pinned_linux_bundle: None,
             guest_oci_runtime: OciRuntimeKind::default(),
             guest_oci_runtime_path: None,
             guest_state_dir: None,
@@ -121,6 +140,32 @@ impl Default for RuntimeConfig {
 pub(crate) async fn ensure_kernel_for_config(
     config: &RuntimeConfig,
 ) -> Result<KernelPaths, LinuxError> {
+    if let Some(pinned) = &config.pinned_linux_bundle {
+        let profile = config.linux_profile.ok_or_else(|| {
+            LinuxError::InvalidConfig(
+                "pinned Linux bundle mode requires an explicit linux_profile".to_string(),
+            )
+        })?;
+        if config.linux_install_dir.is_some()
+            || config.linux_bundle_dir.is_some()
+            || config.guest_oci_runtime_path.is_some()
+        {
+            return Err(LinuxError::InvalidConfig(
+                "pinned Linux bundle mode cannot be combined with linux_install_dir, linux_bundle_dir, or guest_oci_runtime_path"
+                    .to_string(),
+            ));
+        }
+
+        let verified = verify_kernel_bundle_read_only(&pinned.directory, profile).await?;
+        if verified.artifact_identity != pinned.artifact_identity {
+            return Err(LinuxError::InvalidConfig(
+                "pinned Linux bundle artifact identity does not match the verified bundle"
+                    .to_string(),
+            ));
+        }
+        return Ok(verified.paths);
+    }
+
     let options = EnsureKernelOptions {
         install_dir: config.linux_install_dir.clone(),
         bundle_dir: config.linux_bundle_dir.clone(),
@@ -250,4 +295,243 @@ pub struct ExecConfig {
     pub term_cols: Option<u16>,
     /// Optional exec timeout override.
     pub timeout: Option<Duration>,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    use sha2::{Digest, Sha256};
+    use tempfile::tempdir;
+    use vz_linux::KernelVersion;
+
+    use super::*;
+
+    const KERNEL_FILE: &str = "vmlinux";
+    const INITRAMFS_FILE: &str = "initramfs.img";
+    const YOUKI_FILE: &str = "youki";
+    const VERSION_FILE: &str = "version.json";
+
+    fn sha256(bytes: &[u8]) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(bytes);
+        format!("{:x}", hasher.finalize())
+    }
+
+    async fn write_pinned_bundle(dir: &Path, profile: KernelProfile) -> PinnedLinuxBundle {
+        const KERNEL_BYTES: &[u8] = b"pinned-kernel";
+        const INITRAMFS_BYTES: &[u8] = b"pinned-initramfs";
+        const YOUKI_BYTES: &[u8] = b"pinned-youki";
+
+        tokio::fs::write(dir.join(KERNEL_FILE), KERNEL_BYTES)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join(INITRAMFS_FILE), INITRAMFS_BYTES)
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join(YOUKI_FILE), YOUKI_BYTES)
+            .await
+            .unwrap();
+        let version = KernelVersion {
+            kernel: "6.12.11".to_string(),
+            profile: Some(profile.as_str().to_string()),
+            security_profile: Some(profile.security_profile().to_string()),
+            busybox: "1.37.0".to_string(),
+            agent: env!("CARGO_PKG_VERSION").to_string(),
+            // Keep this fixture explicit so a guest protocol revision change
+            // requires its pinned metadata to be regenerated deliberately.
+            agent_protocol_revision: Some(6),
+            youki: "0.5.7".to_string(),
+            built: None,
+            sha256_vmlinux: Some(sha256(KERNEL_BYTES)),
+            sha256_initramfs: Some(sha256(INITRAMFS_BYTES)),
+            sha256_youki: Some(sha256(YOUKI_BYTES)),
+            capabilities: Some(profile.default_capabilities()),
+        };
+        tokio::fs::write(
+            dir.join(VERSION_FILE),
+            serde_json::to_vec_pretty(&version).unwrap(),
+        )
+        .await
+        .unwrap();
+
+        let verified = verify_kernel_bundle_read_only(dir, profile).await.unwrap();
+        PinnedLinuxBundle {
+            directory: dir.to_path_buf(),
+            artifact_identity: verified.artifact_identity,
+        }
+    }
+
+    fn source_snapshot(dir: &Path) -> BTreeMap<String, Vec<u8>> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    std::fs::read(entry.path()).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_accepts_both_profiles_without_writes() {
+        for profile in [KernelProfile::Developer, KernelProfile::Container] {
+            let bundle = tempdir().unwrap();
+            let output = tempdir().unwrap();
+            let pinned = write_pinned_bundle(bundle.path(), profile).await;
+            let before = source_snapshot(bundle.path());
+            let data_dir = output.path().join("must-not-be-created");
+            let config = RuntimeConfig {
+                data_dir: data_dir.clone(),
+                linux_profile: Some(profile),
+                pinned_linux_bundle: Some(pinned),
+                ..RuntimeConfig::default()
+            };
+
+            let paths = ensure_kernel_for_config(&config).await.unwrap();
+
+            assert_eq!(paths.kernel, bundle.path().join(KERNEL_FILE));
+            assert_eq!(paths.initramfs, bundle.path().join(INITRAMFS_FILE));
+            assert_eq!(paths.youki, bundle.path().join(YOUKI_FILE));
+            assert_eq!(paths.version.profile.as_deref(), Some(profile.as_str()));
+            assert_eq!(source_snapshot(bundle.path()), before);
+            assert!(!data_dir.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_rejects_mismatch_in_every_exact_identity_field() {
+        let bundle = tempdir().unwrap();
+        let expected = write_pinned_bundle(bundle.path(), KernelProfile::Developer).await;
+
+        for field in ["kernel", "initramfs", "youki", "version", "digest"] {
+            let mut pinned = expected.clone();
+            let replacement = "0".repeat(64);
+            match field {
+                "kernel" => pinned.artifact_identity.kernel_sha256 = replacement,
+                "initramfs" => pinned.artifact_identity.initramfs_sha256 = replacement,
+                "youki" => pinned.artifact_identity.youki_sha256 = replacement,
+                "version" => pinned.artifact_identity.version_sha256 = replacement,
+                "digest" => pinned.artifact_identity.digest = format!("sha256:{replacement}"),
+                _ => unreachable!(),
+            }
+            let config = RuntimeConfig {
+                linux_profile: Some(KernelProfile::Developer),
+                pinned_linux_bundle: Some(pinned),
+                ..RuntimeConfig::default()
+            };
+
+            let error = ensure_kernel_for_config(&config).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                LinuxError::InvalidConfig(message)
+                    if message.contains("artifact identity does not match")
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_rejects_artifact_bytes_that_no_longer_match_metadata() {
+        let bundle = tempdir().unwrap();
+        let pinned = write_pinned_bundle(bundle.path(), KernelProfile::Developer).await;
+        tokio::fs::write(bundle.path().join(KERNEL_FILE), b"tampered")
+            .await
+            .unwrap();
+        let names_before = source_snapshot(bundle.path());
+        let config = RuntimeConfig {
+            linux_profile: Some(KernelProfile::Developer),
+            pinned_linux_bundle: Some(pinned),
+            ..RuntimeConfig::default()
+        };
+
+        let error = ensure_kernel_for_config(&config).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinuxError::ArtifactChecksumMismatch { artifact, .. } if artifact == KERNEL_FILE
+        ));
+        assert_eq!(source_snapshot(bundle.path()), names_before);
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_rejects_profile_mismatch() {
+        let bundle = tempdir().unwrap();
+        let pinned = write_pinned_bundle(bundle.path(), KernelProfile::Developer).await;
+        let config = RuntimeConfig {
+            linux_profile: Some(KernelProfile::Container),
+            pinned_linux_bundle: Some(pinned),
+            ..RuntimeConfig::default()
+        };
+
+        let error = ensure_kernel_for_config(&config).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinuxError::KernelProfileMismatch { expected, found }
+                if expected == KernelProfile::Container.as_str()
+                    && found == KernelProfile::Developer.as_str()
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_requires_explicit_profile() {
+        let bundle = tempdir().unwrap();
+        let pinned = write_pinned_bundle(bundle.path(), KernelProfile::Developer).await;
+        let config = RuntimeConfig {
+            pinned_linux_bundle: Some(pinned),
+            ..RuntimeConfig::default()
+        };
+
+        let error = ensure_kernel_for_config(&config).await.unwrap_err();
+
+        assert!(matches!(
+            error,
+            LinuxError::InvalidConfig(message) if message.contains("explicit linux_profile")
+        ));
+    }
+
+    #[tokio::test]
+    async fn pinned_mode_rejects_each_bypass_path_before_verification() {
+        for field in [
+            "linux_install_dir",
+            "linux_bundle_dir",
+            "guest_oci_runtime_path",
+        ] {
+            let missing_bundle = tempdir().unwrap().path().join("missing");
+            let pinned = PinnedLinuxBundle {
+                directory: missing_bundle,
+                artifact_identity: KernelBundleArtifactIdentity {
+                    kernel_sha256: "0".repeat(64),
+                    initramfs_sha256: "0".repeat(64),
+                    youki_sha256: "0".repeat(64),
+                    version_sha256: "0".repeat(64),
+                    digest: format!("sha256:{}", "0".repeat(64)),
+                },
+            };
+            let conflicting_path = PathBuf::from("unused-conflicting-path");
+            let config = RuntimeConfig {
+                linux_install_dir: (field == "linux_install_dir").then(|| conflicting_path.clone()),
+                linux_bundle_dir: (field == "linux_bundle_dir").then(|| conflicting_path.clone()),
+                linux_profile: Some(KernelProfile::Developer),
+                pinned_linux_bundle: Some(pinned),
+                guest_oci_runtime_path: (field == "guest_oci_runtime_path")
+                    .then_some(conflicting_path),
+                ..RuntimeConfig::default()
+            };
+
+            let error = ensure_kernel_for_config(&config).await.unwrap_err();
+
+            assert!(matches!(
+                error,
+                LinuxError::InvalidConfig(message)
+                    if message.contains("cannot be combined")
+            ));
+        }
+    }
 }

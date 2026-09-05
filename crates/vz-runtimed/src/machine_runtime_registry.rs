@@ -70,15 +70,49 @@ struct OwnerManifest {
     configuration_digest: String,
 }
 
-/// Holds both the backend and its lifetime filesystem lock. Registry entries
-/// are strongly retained; dropping a caller's Arc cannot permit a duplicate
-/// backend constructor while this registry remains alive.
-pub struct MachineRuntimeEntry<R> {
-    runtime: R,
+/// A runtime-free lease on one exactly-owned private Machine store.
+///
+/// The retained store and data directory descriptors pin the identities that
+/// were admitted, while the exclusive lock on `directory` fences other daemon
+/// registries for the lifetime of the lease. The registry strongly retains
+/// acquired leases, so dropping a caller's `Arc` cannot release that fence.
+pub struct MachineRuntimeStoreLease {
     manifest: OwnerManifest,
+    registry_root: PathBuf,
     data_path: PathBuf,
     directory: File,
     data_directory: File,
+}
+
+impl MachineRuntimeStoreLease {
+    pub fn data_path(&self) -> &Path {
+        &self.data_path
+    }
+
+    pub fn owner(&self) -> &ResourceOwner {
+        &self.manifest.owner
+    }
+
+    pub fn configuration_digest(&self) -> &str {
+        &self.manifest.configuration_digest
+    }
+
+    pub(crate) fn data_directory(&self) -> &File {
+        &self.data_directory
+    }
+
+    pub(crate) fn validate_current(&self) -> Result<(), MachineRuntimeRegistryError> {
+        validate_current_lease(self)
+    }
+}
+
+/// Holds a backend together with the store lease that fences all of its
+/// persistent state. Registry entries are strongly retained; dropping a
+/// caller's `Arc` cannot permit a duplicate backend constructor while this
+/// registry remains alive.
+pub struct MachineRuntimeEntry<R> {
+    runtime: R,
+    lease: Arc<MachineRuntimeStoreLease>,
 }
 
 impl<R> MachineRuntimeEntry<R> {
@@ -87,11 +121,15 @@ impl<R> MachineRuntimeEntry<R> {
     }
 
     pub fn data_path(&self) -> &Path {
-        &self.data_path
+        self.lease.data_path()
     }
 
     pub fn owner(&self) -> &ResourceOwner {
-        &self.manifest.owner
+        self.lease.owner()
+    }
+
+    pub fn configuration_digest(&self) -> &str {
+        self.lease.configuration_digest()
     }
 }
 
@@ -116,7 +154,12 @@ impl<R> MachineRuntimeEntry<R> {
 /// ancestors despite descriptor-relative validation.
 pub struct MachineRuntimeRegistry<R> {
     root: PathBuf,
-    entries: Mutex<HashMap<String, Arc<MachineRuntimeEntry<R>>>>,
+    state: Mutex<MachineRuntimeRegistryState<R>>,
+}
+
+struct MachineRuntimeRegistryState<R> {
+    leases: HashMap<String, Arc<MachineRuntimeStoreLease>>,
+    entries: HashMap<String, Arc<MachineRuntimeEntry<R>>>,
 }
 
 impl<R> MachineRuntimeRegistry<R> {
@@ -124,7 +167,10 @@ impl<R> MachineRuntimeRegistry<R> {
         let root = absolute_path_without_parent_traversal(&root)?;
         Ok(Self {
             root,
-            entries: Mutex::new(HashMap::new()),
+            state: Mutex::new(MachineRuntimeRegistryState {
+                leases: HashMap::new(),
+                entries: HashMap::new(),
+            }),
         })
     }
 
@@ -149,21 +195,20 @@ impl<R> MachineRuntimeRegistry<R> {
         })
     }
 
-    /// The digest must bind the already-resolved backend, target, profile,
-    /// resources and artifact identities. A changed selection never reuses a
-    /// live or persisted store silently. This API does not resolve TargetSpec.
+    /// Acquires the exact private store without constructing a runtime.
     ///
-    /// `factory` runs only after exact manifest verification and an exclusive
-    /// lifetime lock, since backend constructors may reconcile persistent data.
-    /// Callers must retain the entry while using its backend, including clones.
-    pub fn admit(
+    /// A creating admission requires a digest that binds the already-resolved
+    /// backend, target, profile, resources and artifact identities. Recovery
+    /// may omit the expected digest in `ExistingOnly` mode to discover the
+    /// validated persisted selection; supplying one still requires an exact
+    /// match. This API does not resolve `TargetSpec`.
+    pub fn acquire_store(
         &self,
         owner: &ResourceOwner,
         reservation: &OwnershipRecord,
-        configuration_digest: &str,
+        expected_configuration_digest: Option<&str>,
         mode: MachineRuntimeAdmission,
-        factory: impl FnOnce(&Path) -> Result<R, MachineRuntimeRegistryError>,
-    ) -> Result<Arc<MachineRuntimeEntry<R>>, MachineRuntimeRegistryError> {
+    ) -> Result<Arc<MachineRuntimeStoreLease>, MachineRuntimeRegistryError> {
         let expected = Self::reservation(owner)?;
         if expected != *reservation {
             return Err(MachineRuntimeRegistryError::Conflict(
@@ -171,29 +216,29 @@ impl<R> MachineRuntimeRegistry<R> {
                     .into(),
             ));
         }
-        let digest = configuration_digest.strip_prefix("sha256:").unwrap_or("");
-        if digest.len() != 64
-            || !digest
-                .bytes()
-                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        if mode == MachineRuntimeAdmission::CreateOrOpen && expected_configuration_digest.is_none()
         {
             return Err(MachineRuntimeRegistryError::Invalid(
-                "resolved configuration requires a canonical SHA-256 digest".into(),
+                "creating a Machine runtime store requires a resolved configuration digest".into(),
             ));
         }
-        let manifest = OwnerManifest {
-            schema_version: TOPOLOGY_SCHEMA_VERSION,
-            owner: owner.clone(),
-            reservation: expected,
-            configuration_digest: configuration_digest.into(),
-        };
-        let mut entries = self
-            .entries
+        if let Some(digest) = expected_configuration_digest {
+            validate_configuration_digest(digest)?;
+        }
+        let creating_manifest =
+            expected_configuration_digest.map(|configuration_digest| OwnerManifest {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                owner: owner.clone(),
+                reservation: expected.clone(),
+                configuration_digest: configuration_digest.into(),
+            });
+        let mut state = self
+            .state
             .lock()
             .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
         let root = open_trusted_registry_root(&self.root)?;
         validate_registry_root(&root)?;
-        let key = &manifest.reservation.resource_id;
+        let key = &expected.resource_id;
         let namespace = match child_directory(
             &root,
             "topology-machines",
@@ -211,7 +256,16 @@ impl<R> MachineRuntimeRegistry<R> {
         let directory = match openat(&namespace, key.as_str(), DIRECTORY_FLAGS, Mode::empty()) {
             Ok(fd) => File::from(fd),
             Err(rustix::io::Errno::NOENT) if mode == MachineRuntimeAdmission::CreateOrOpen => {
-                publish_directory(&namespace, key, &manifest)?
+                publish_directory(
+                    &namespace,
+                    key,
+                    creating_manifest.as_ref().ok_or_else(|| {
+                        MachineRuntimeRegistryError::Invalid(
+                            "creating a Machine runtime store requires a resolved configuration digest"
+                                .into(),
+                        )
+                    })?,
+                )?
             }
             Err(rustix::io::Errno::NOENT) => {
                 return Err(MachineRuntimeRegistryError::NotFound(key.clone()));
@@ -220,7 +274,9 @@ impl<R> MachineRuntimeRegistry<R> {
         };
         validate_private_directory(&directory)?;
         let actual = read_manifest(&directory)?;
-        if actual != manifest {
+        validate_persisted_manifest(&actual, owner, &expected)?;
+        if expected_configuration_digest.is_some_and(|digest| digest != actual.configuration_digest)
+        {
             return Err(MachineRuntimeRegistryError::Conflict(
                 "persisted owner or resolved configuration differs".into(),
             ));
@@ -240,16 +296,16 @@ impl<R> MachineRuntimeRegistry<R> {
                 "runtime data ancestry changed during admission".into(),
             ));
         }
-        if let Some(entry) = entries.get(key) {
-            if entry.manifest != manifest
-                || !same_file(&entry.directory, &directory)?
-                || !same_file(&entry.data_directory, &data)?
+        if let Some(lease) = state.leases.get(key) {
+            if lease.manifest != actual
+                || !same_file(&lease.directory, &directory)?
+                || !same_file(&lease.data_directory, &data)?
             {
                 return Err(MachineRuntimeRegistryError::Conflict(
                     "leased runtime directory or data directory was replaced".into(),
                 ));
             }
-            return Ok(Arc::clone(entry));
+            return Ok(Arc::clone(lease));
         }
         fs2::FileExt::try_lock_exclusive(&directory).map_err(|error| {
             if error.kind() == std::io::ErrorKind::WouldBlock {
@@ -258,20 +314,137 @@ impl<R> MachineRuntimeRegistry<R> {
                 error.into()
             }
         })?;
-        let runtime = factory(&data_path)?;
-        let entry = Arc::new(MachineRuntimeEntry {
-            runtime,
-            manifest,
+        let lease = Arc::new(MachineRuntimeStoreLease {
+            manifest: actual,
+            registry_root: self.root.clone(),
             data_path,
             directory,
             data_directory: data,
         });
-        entries.insert(
-            entry.manifest.reservation.resource_id.clone(),
-            Arc::clone(&entry),
+        state.leases.insert(
+            lease.manifest.reservation.resource_id.clone(),
+            Arc::clone(&lease),
         );
+        Ok(lease)
+    }
+
+    /// Attaches one runtime to a lease acquired from this exact registry.
+    ///
+    /// The factory is serialized with all other operations on this registry
+    /// and runs only after the cached lease and current filesystem identities
+    /// have been revalidated. A failed factory leaves the runtime-free lease
+    /// retained and can be retried without reopening or republishing the store.
+    pub fn attach_runtime(
+        &self,
+        lease: Arc<MachineRuntimeStoreLease>,
+        factory: impl FnOnce(&Path) -> Result<R, MachineRuntimeRegistryError>,
+    ) -> Result<Arc<MachineRuntimeEntry<R>>, MachineRuntimeRegistryError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
+        let key = lease.manifest.reservation.resource_id.clone();
+        let Some(cached_lease) = state.leases.get(&key) else {
+            return Err(MachineRuntimeRegistryError::Conflict(
+                "runtime store lease was not acquired by this registry".into(),
+            ));
+        };
+        if !Arc::ptr_eq(cached_lease, &lease) {
+            return Err(MachineRuntimeRegistryError::Conflict(
+                "runtime store lease does not match this registry's exact lease".into(),
+            ));
+        }
+        lease.validate_current()?;
+        if let Some(entry) = state.entries.get(&key) {
+            if !Arc::ptr_eq(&entry.lease, &lease) {
+                return Err(MachineRuntimeRegistryError::Conflict(
+                    "attached runtime does not retain the exact store lease".into(),
+                ));
+            }
+            return Ok(Arc::clone(entry));
+        }
+        let runtime = factory(lease.data_path())?;
+        let entry = Arc::new(MachineRuntimeEntry { runtime, lease });
+        state.entries.insert(key, Arc::clone(&entry));
         Ok(entry)
     }
+
+    /// Compatibility wrapper that acquires the exact store and attaches its
+    /// runtime in one serialized admission.
+    pub fn admit(
+        &self,
+        owner: &ResourceOwner,
+        reservation: &OwnershipRecord,
+        configuration_digest: &str,
+        mode: MachineRuntimeAdmission,
+        factory: impl FnOnce(&Path) -> Result<R, MachineRuntimeRegistryError>,
+    ) -> Result<Arc<MachineRuntimeEntry<R>>, MachineRuntimeRegistryError> {
+        let lease = self.acquire_store(owner, reservation, Some(configuration_digest), mode)?;
+        self.attach_runtime(lease, factory)
+    }
+}
+
+fn validate_current_lease(
+    lease: &MachineRuntimeStoreLease,
+) -> Result<(), MachineRuntimeRegistryError> {
+    let root = open_trusted_registry_root(&lease.registry_root)?;
+    validate_registry_root(&root)?;
+    let namespace = child_directory(&root, "topology-machines", false)?;
+    let key = &lease.manifest.reservation.resource_id;
+    let directory = File::from(openat(
+        &namespace,
+        key.as_str(),
+        DIRECTORY_FLAGS,
+        Mode::empty(),
+    )?);
+    validate_private_directory(&directory)?;
+    if read_manifest(&directory)? != lease.manifest || !same_file(&directory, &lease.directory)? {
+        return Err(MachineRuntimeRegistryError::Conflict(
+            "leased runtime directory or owner manifest was replaced".into(),
+        ));
+    }
+    let data = child_directory(&directory, DATA_NAME, false)?;
+    let current = open_absolute_directory(lease.data_path())?;
+    if !same_file(&data, lease.data_directory())? || !same_file(&current, lease.data_directory())? {
+        return Err(MachineRuntimeRegistryError::Conflict(
+            "leased runtime data directory was replaced".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_configuration_digest(digest: &str) -> Result<(), MachineRuntimeRegistryError> {
+    let value = digest.strip_prefix("sha256:").unwrap_or("");
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(MachineRuntimeRegistryError::Invalid(
+            "resolved configuration requires a canonical SHA-256 digest".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_persisted_manifest(
+    manifest: &OwnerManifest,
+    owner: &ResourceOwner,
+    reservation: &OwnershipRecord,
+) -> Result<(), MachineRuntimeRegistryError> {
+    if manifest.schema_version != TOPOLOGY_SCHEMA_VERSION
+        || manifest.owner != *owner
+        || manifest.reservation != *reservation
+    {
+        return Err(MachineRuntimeRegistryError::Conflict(
+            "persisted runtime store owner or reservation differs".into(),
+        ));
+    }
+    validate_configuration_digest(&manifest.configuration_digest).map_err(|_| {
+        MachineRuntimeRegistryError::Conflict(
+            "persisted runtime store configuration digest is not canonical".into(),
+        )
+    })
 }
 
 fn invalid(error: impl std::fmt::Display) -> MachineRuntimeRegistryError {
@@ -601,6 +774,14 @@ mod tests {
         registry.admit(&owner(), &reservation(), digest, mode, |_| Ok(value))
     }
 
+    fn acquire(
+        registry: &MachineRuntimeRegistry<usize>,
+        digest: Option<&str>,
+        mode: MachineRuntimeAdmission,
+    ) -> Result<Arc<MachineRuntimeStoreLease>, MachineRuntimeRegistryError> {
+        registry.acquire_store(&owner(), &reservation(), digest, mode)
+    }
+
     fn assert_conflict<T>(result: Result<T, MachineRuntimeRegistryError>) {
         assert!(
             matches!(result, Err(MachineRuntimeRegistryError::Conflict(_))),
@@ -617,6 +798,200 @@ mod tests {
             MachineRuntimeRegistry::<usize>::new(PathBuf::from("../runtime")),
             Err(MachineRuntimeRegistryError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn create_without_configuration_digest_has_zero_filesystem_effects() {
+        let temp = TempDir::new().expect("temporary directory");
+        let registry = registry(temp.path());
+
+        let result = acquire(&registry, None, MachineRuntimeAdmission::CreateOrOpen);
+
+        assert!(matches!(
+            result,
+            Err(MachineRuntimeRegistryError::Invalid(_))
+        ));
+        assert!(!temp.path().join("topology-machines").exists());
+        let state = registry.state.lock().expect("registry state");
+        assert!(state.leases.is_empty());
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn concurrent_store_acquisition_is_runtime_free_and_returns_one_lease() {
+        let temp = TempDir::new().expect("temporary directory");
+        let registry = Arc::new(registry(temp.path()));
+        let starts = Arc::new(Barrier::new(8));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let registry = Arc::clone(&registry);
+            let starts = Arc::clone(&starts);
+            threads.push(thread::spawn(move || {
+                starts.wait();
+                acquire(
+                    &registry,
+                    Some(DIGEST_A),
+                    MachineRuntimeAdmission::CreateOrOpen,
+                )
+                .expect("concurrent store acquisition")
+            }));
+        }
+
+        let leases = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("acquisition thread"))
+            .collect::<Vec<_>>();
+        assert!(leases.iter().all(|lease| Arc::ptr_eq(lease, &leases[0])));
+        assert_eq!(leases[0].configuration_digest(), DIGEST_A);
+        let state = registry.state.lock().expect("registry state");
+        assert_eq!(state.leases.len(), 1);
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn concurrent_runtime_attachment_runs_factory_once() {
+        let temp = TempDir::new().expect("temporary directory");
+        let registry = Arc::new(registry(temp.path()));
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("acquire store");
+        let starts = Arc::new(Barrier::new(8));
+        let factory_calls = Arc::new(AtomicUsize::new(0));
+        let mut threads = Vec::new();
+        for _ in 0..8 {
+            let registry = Arc::clone(&registry);
+            let lease = Arc::clone(&lease);
+            let starts = Arc::clone(&starts);
+            let factory_calls = Arc::clone(&factory_calls);
+            threads.push(thread::spawn(move || {
+                starts.wait();
+                registry
+                    .attach_runtime(lease, |_| {
+                        factory_calls.fetch_add(1, Ordering::SeqCst);
+                        Ok(42)
+                    })
+                    .expect("concurrent runtime attachment")
+            }));
+        }
+
+        let entries = threads
+            .into_iter()
+            .map(|thread| thread.join().expect("attachment thread"))
+            .collect::<Vec<_>>();
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 1);
+        assert!(entries.iter().all(|entry| Arc::ptr_eq(entry, &entries[0])));
+        assert_eq!(*entries[0].runtime(), 42);
+    }
+
+    #[test]
+    fn foreign_registry_refuses_store_lease_without_running_factory() {
+        let temp = TempDir::new().expect("temporary directory");
+        let first_registry = registry(temp.path());
+        let lease = acquire(
+            &first_registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("acquire first registry lease");
+        let second_registry = registry(temp.path());
+        let factory_calls = AtomicUsize::new(0);
+
+        let result = second_registry.attach_runtime(lease, |_| {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        });
+
+        assert_conflict(result);
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn existing_only_discovers_persisted_digest_without_runtime_or_writes() {
+        let temp = TempDir::new().expect("temporary directory");
+        let first_registry = registry(temp.path());
+        let first = acquire(
+            &first_registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("create store lease");
+        let manifest_path = store_path(temp.path()).join(MANIFEST_NAME);
+        let manifest_before = fs::read(&manifest_path).expect("read owner manifest");
+        let manifest_metadata_before = fs::metadata(&manifest_path).expect("stat owner manifest");
+        let namespace_before = fs::read_dir(temp.path().join("topology-machines"))
+            .expect("read namespace")
+            .map(|entry| entry.expect("namespace entry").file_name())
+            .collect::<Vec<_>>();
+        drop(first);
+        drop(first_registry);
+
+        let recovered_registry = registry(temp.path());
+        let recovered = acquire(
+            &recovered_registry,
+            None,
+            MachineRuntimeAdmission::ExistingOnly,
+        )
+        .expect("discover exact persisted configuration");
+
+        assert_eq!(recovered.owner(), &owner());
+        assert_eq!(recovered.configuration_digest(), DIGEST_A);
+        recovered.validate_current().expect("lease remains current");
+        assert_eq!(
+            fs::read(&manifest_path).expect("reread owner manifest"),
+            manifest_before
+        );
+        let manifest_metadata_after = fs::metadata(&manifest_path).expect("restat owner manifest");
+        assert_eq!(
+            manifest_metadata_after
+                .modified()
+                .expect("manifest modified time"),
+            manifest_metadata_before
+                .modified()
+                .expect("original manifest modified time")
+        );
+        assert_eq!(
+            manifest_metadata_after.len(),
+            manifest_metadata_before.len()
+        );
+        assert_eq!(
+            fs::read_dir(temp.path().join("topology-machines"))
+                .expect("reread namespace")
+                .map(|entry| entry.expect("namespace entry").file_name())
+                .collect::<Vec<_>>(),
+            namespace_before
+        );
+        let state = recovered_registry.state.lock().expect("registry state");
+        assert_eq!(state.leases.len(), 1);
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn replaced_data_directory_refuses_validation_and_runtime_attachment() {
+        let temp = TempDir::new().expect("temporary directory");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("acquire store");
+        let store = store_path(temp.path());
+        fs::rename(store.join(DATA_NAME), store.join("displaced-data"))
+            .expect("displace data directory");
+        fs::create_dir(store.join(DATA_NAME)).expect("replace data directory");
+        fs::set_permissions(store.join(DATA_NAME), fs::Permissions::from_mode(0o700))
+            .expect("make replacement private");
+        let factory_calls = AtomicUsize::new(0);
+
+        assert_conflict(lease.validate_current());
+        assert_conflict(registry.attach_runtime(lease, |_| {
+            factory_calls.fetch_add(1, Ordering::SeqCst);
+            Ok(1)
+        }));
+        assert_eq!(factory_calls.load(Ordering::SeqCst), 0);
     }
 
     #[test]

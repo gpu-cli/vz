@@ -7,17 +7,18 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use vz_oci_macos::{KernelProfile, MacosRuntimeBackend, Runtime, RuntimeConfig};
+use vz_oci_macos::{
+    KernelProfile, MacosRuntimeBackend, Runtime, RuntimeConfig, SharedVmDockerReadiness,
+};
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
     EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, HostSpec, LifecycleStepResult,
@@ -28,10 +29,13 @@ use vz_runtime_contract::{
     StackResourceHint, StackRuntimeIdentity, StackRuntimeShutdownOutcome,
     StackRuntimeShutdownRequest, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
+use vz_runtimed::machine_artifact_store::{
+    PinnedMachineArtifacts, load_machine_artifacts, pin_machine_artifacts,
+};
 use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
 use vz_runtimed::machine_runtime_registry::{
     MachineRuntimeAdmission, MachineRuntimeEntry, MachineRuntimeRegistry,
-    MachineRuntimeRegistryError,
+    MachineRuntimeRegistryError, MachineRuntimeStoreLease,
 };
 use vz_runtimed::machine_target_resolver::{
     LINUX_APPLIANCE_IMAGE, LinuxTargetCatalogEntry, MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
@@ -62,7 +66,6 @@ struct MachineFixture {
     vm_reservation: OwnershipRecord,
     config_digest: String,
     resolved_configuration: Value,
-    bundle: PathBuf,
     artifact: Value,
     resources: StackResourceHint,
 }
@@ -103,6 +106,47 @@ fn entitled() -> bool {
 
 fn file_sha(path: &Path) -> Result<String> {
     Ok(format!("{:x}", Sha256::digest(fs::read(path)?)))
+}
+
+fn copy_fixture_bundle(source: &Path, destination: &Path) -> Result<()> {
+    fs::DirBuilder::new()
+        .mode(0o700)
+        .create(destination)
+        .with_context(|| format!("create private fixture bundle {}", destination.display()))?;
+    for name in ["vmlinux", "initramfs.img", "youki", "version.json"] {
+        let source_path = source.join(name);
+        let metadata = fs::symlink_metadata(&source_path)?;
+        ensure!(metadata.is_file() && metadata.nlink() == 1);
+        let mut input = File::open(&source_path)?;
+        let target_path = destination.join(name);
+        let mut output = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&target_path)?;
+        io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        ensure!(file_sha(&source_path)? == file_sha(&target_path)?);
+    }
+    File::open(destination)?.sync_all()?;
+    Ok(())
+}
+
+fn create_fixture_sources(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf)> {
+    let original_developer = fs::canonicalize(PathBuf::from(
+        std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?,
+    ))?;
+    let original_hardened = fs::canonicalize(PathBuf::from(
+        std::env::var_os(HARD_BUNDLE_ENV).context(HARD_BUNDLE_ENV)?,
+    ))?;
+    let source_root = root.join("source-bundles");
+    fs::DirBuilder::new().mode(0o700).create(&source_root)?;
+    let developer = source_root.join("developer");
+    let hardened = source_root.join("hardened");
+    copy_fixture_bundle(&original_developer, &developer)?;
+    copy_fixture_bundle(&original_hardened, &hardened)?;
+    File::open(&source_root)?.sync_all()?;
+    Ok((source_root, developer, hardened))
 }
 
 fn serial_log_evidence(path: &Path) -> Result<Value> {
@@ -244,6 +288,7 @@ fn target_catalog(
 
 async fn invalid_sibling_preflight(
     root: &Path,
+    source_root: &Path,
     resolver: &MachineTargetResolver,
     definition: &ProjectDefinition,
 ) -> Result<bool> {
@@ -272,7 +317,10 @@ async fn invalid_sibling_preflight(
         ));
         ensure!(!root.join("topology.db").exists());
         ensure!(!root.join("registry").exists());
-        ensure!(fs::read_dir(root)?.next().transpose()?.is_none());
+        let entries = fs::read_dir(root)?
+            .map(|entry| Ok(entry?.path()))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(entries.len() == 1 && entries[0] == source_root);
     }
     Ok(true)
 }
@@ -329,7 +377,6 @@ fn fixtures(
             vm_reservation,
             config_digest: target.configuration_digest().to_string(),
             resolved_configuration: serde_json::to_value(target.configuration())?,
-            bundle,
             artifact,
             resources: StackResourceHint {
                 cpus: Some(2),
@@ -341,36 +388,107 @@ fn fixtures(
     .collect()
 }
 
-fn admit(
+fn attach_runtime(
     registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
-    fixture: &MachineFixture,
-    mode: MachineRuntimeAdmission,
+    pin: &PinnedMachineArtifacts,
 ) -> Result<Arc<MachineRuntimeEntry<MacosRuntimeBackend>>> {
-    let profile = fixture.profile;
-    let bundle = fixture.bundle.clone();
-    Ok(registry.admit(
-        &fixture.owner,
-        &fixture.store_reservation,
-        &fixture.config_digest,
-        mode,
-        move |data| {
+    let profile = pin.configuration().kernel_profile;
+    let memory_mb = pin.configuration().resources.memory_mb;
+    let bundle = pin.runtime_bundle();
+    Ok(
+        registry.attach_runtime(Arc::clone(pin.store()), move |data| {
             Ok(MacosRuntimeBackend::new(Runtime::new(RuntimeConfig {
                 data_dir: data.into(),
-                linux_install_dir: Some(data.join("linux-install")),
-                linux_bundle_dir: Some(bundle),
+                linux_install_dir: None,
+                linux_bundle_dir: None,
                 linux_profile: Some(profile),
+                pinned_linux_bundle: Some(bundle),
                 require_exact_agent_version: true,
                 agent_ready_timeout: Duration::from_secs(35),
                 exec_timeout: Duration::from_secs(30),
-                default_memory_mb: if profile == KernelProfile::Developer {
-                    4096
-                } else {
-                    1024
-                },
+                default_memory_mb: memory_mb,
                 ..RuntimeConfig::default()
             })))
-        },
-    )?)
+        })?,
+    )
+}
+
+fn acquire_stores(
+    registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
+    fixtures: &[MachineFixture],
+    mode: MachineRuntimeAdmission,
+    require_digest: bool,
+) -> Result<Vec<Arc<MachineRuntimeStoreLease>>> {
+    fixtures
+        .iter()
+        .map(|fixture| {
+            Ok(registry.acquire_store(
+                &fixture.owner,
+                &fixture.store_reservation,
+                require_digest.then_some(fixture.config_digest.as_str()),
+                mode,
+            )?)
+        })
+        .collect()
+}
+
+async fn pin_all(
+    stores: &[Arc<MachineRuntimeStoreLease>],
+    fixtures: &[MachineFixture],
+    resolved: &ResolvedProjectTargets,
+    cleanup_directories: &mut Vec<PathBuf>,
+) -> Result<Vec<PinnedMachineArtifacts>> {
+    let mut pins = Vec::new();
+    for (store, fixture) in stores.iter().zip(fixtures) {
+        let target = resolved
+            .machines
+            .get(fixture.name)
+            .with_context(|| format!("resolved Machine target {}", fixture.name))?;
+        let pin = pin_machine_artifacts(Arc::clone(store), target).await?;
+        let bundle = pin.bundle_dir();
+        let directory = bundle.parent().context("pin parent")?.to_path_buf();
+        cleanup_directories.push(bundle);
+        cleanup_directories.push(directory);
+        pins.push(pin);
+    }
+    Ok(pins)
+}
+
+async fn load_all(
+    stores: &[Arc<MachineRuntimeStoreLease>],
+    fixtures: &[MachineFixture],
+    state: &ProjectState,
+) -> Result<Vec<PinnedMachineArtifacts>> {
+    let mut pins = Vec::new();
+    for (store, fixture) in stores.iter().zip(fixtures) {
+        let machine = state
+            .definition
+            .environment
+            .machines
+            .iter()
+            .find(|machine| machine.name == fixture.name)
+            .with_context(|| format!("persisted MachineSpec {}", fixture.name))?;
+        pins.push(load_machine_artifacts(Arc::clone(store), host(), machine).await?);
+    }
+    Ok(pins)
+}
+
+fn host() -> HostSpec {
+    HostSpec {
+        os: OperatingSystem::Macos,
+        arch: Architecture::Aarch64,
+    }
+}
+
+fn pin_snapshot(
+    stores: &[Arc<MachineRuntimeStoreLease>],
+    fixtures: &[MachineFixture],
+) -> Result<Value> {
+    let mut snapshots = BTreeMap::new();
+    for (store, fixture) in stores.iter().zip(fixtures) {
+        snapshots.insert(fixture.name, installed(store.data_path())?);
+    }
+    Ok(serde_json::to_value(snapshots)?)
 }
 
 fn all_reservations(fixtures: &[MachineFixture]) -> Vec<&OwnershipRecord> {
@@ -633,6 +751,65 @@ async fn guest(activation: &MachineRuntimeActivation, script: &str) -> Result<St
     Ok(output.stdout)
 }
 
+async fn docker_failure_diagnostics(activation: &MachineRuntimeActivation, label: &str) -> String {
+    let script = r#"
+set +e
+echo '--- mounts ---'
+/bin/busybox grep -E ' (/var/lib/docker|/mnt/vz-docker-bin|/mnt/linux-bin) ' /proc/mounts
+echo '--- youki metadata ---'
+/bin/busybox stat -c 'path=%n mode=%a uid=%u gid=%g size=%s inode=%i links=%h device=%d' /mnt/linux-bin/youki /usr/local/bin/youki
+/bin/busybox sha256sum /mnt/linux-bin/youki
+/mnt/linux-bin/youki --version
+/usr/local/bin/youki --version
+echo '--- daemon processes ---'
+/bin/busybox ps
+for log in /var/lib/docker/log/containerd.log /var/lib/docker/log/dockerd.log; do
+  echo "--- $log (last 65536 bytes) ---"
+  if test -f "$log"; then
+    /bin/busybox tail -c 65536 "$log"
+  else
+    echo '<missing>'
+  fi
+done
+echo '--- end Docker diagnostics ---'
+exit 0
+"#;
+    match activation
+        .exec(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            Duration::from_secs(10),
+        )
+        .await
+    {
+        Ok(output) => format!(
+            "Machine {label} diagnostic exit={}\nstdout:\n{}\nstderr:\n{}",
+            output.exit_code, output.stdout, output.stderr
+        ),
+        Err(error) => format!("Machine {label} diagnostic capture failed: {error}"),
+    }
+}
+
+#[expect(
+    clippy::print_stderr,
+    reason = "fail-only guest diagnostics must survive in the physical harness log"
+)]
+async fn ensure_docker_ready_with_diagnostics(
+    activation: &MachineRuntimeActivation,
+    label: &str,
+) -> Result<SharedVmDockerReadiness> {
+    match activation.ensure_docker_ready().await {
+        Ok(readiness) => Ok(readiness),
+        Err(error) => {
+            let diagnostics = docker_failure_diagnostics(activation, label).await;
+            eprintln!("{diagnostics}");
+            Err(anyhow!(
+                "Machine {label} Docker readiness failed: {error}; diagnostics were written to the harness log"
+            ))
+        }
+    }
+}
+
 fn docker_probe_evidence(output: &str, operation: &str, marker: &str) -> Result<Value> {
     let value: Value = serde_json::from_str(output.trim()).context("Docker API probe JSON")?;
     ensure!(value["operation"] == operation);
@@ -681,39 +858,96 @@ async fn cleanup(targets: &[CleanupTarget]) -> Result<()> {
     Ok(())
 }
 
-fn leased_without_factory(
+fn cleanup_pin_permissions(root: &Path, directories: &[PathBuf]) -> Result<()> {
+    for directory in directories {
+        ensure!(directory.starts_with(root));
+        ensure!(matches!(
+            directory.file_name().and_then(|name| name.to_str()),
+            Some("linux-target" | "bundle")
+        ));
+        let metadata = fs::symlink_metadata(directory)?;
+        ensure!(metadata.is_dir() && !metadata.file_type().is_symlink());
+        fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+fn locked_store_acquisition_refused(
     registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
     fixture: &MachineFixture,
-) -> Result<()> {
-    let called = AtomicBool::new(false);
-    let result = registry.admit(
+) -> Result<bool> {
+    let result = registry.acquire_store(
         &fixture.owner,
         &fixture.store_reservation,
-        &fixture.config_digest,
+        None,
         MachineRuntimeAdmission::ExistingOnly,
-        |_| {
-            called.store(true, Ordering::SeqCst);
-            Err(MachineRuntimeRegistryError::Invalid("must not run".into()))
-        },
     );
     ensure!(matches!(
         result,
         Err(MachineRuntimeRegistryError::Leased(_))
     ));
-    ensure!(!called.load(Ordering::SeqCst));
-    Ok(())
+    Ok(true)
 }
 
-fn installed(entry: &MachineRuntimeEntry<MacosRuntimeBackend>) -> Result<Value> {
-    let dir = fs::canonicalize(entry.data_path().join("linux-install"))?;
-    let version: Value = serde_json::from_slice(&fs::read(dir.join("version.json"))?)?;
+fn immutable_identity(path: &Path) -> Result<Value> {
+    let metadata = fs::symlink_metadata(path)?;
     Ok(json!({
+        "device": metadata.dev(),
+        "inode": metadata.ino(),
+        "mode": metadata.mode() & 0o7777,
+        "uid": metadata.uid(),
+        "links": metadata.nlink(),
+        "size": metadata.size(),
+        "mtime_seconds": metadata.mtime(),
+        "mtime_nanoseconds": metadata.mtime_nsec(),
+        "ctime_seconds": metadata.ctime(),
+        "ctime_nanoseconds": metadata.ctime_nsec(),
+    }))
+}
+
+fn installed(data_path: &Path) -> Result<Value> {
+    let pin_dir = fs::canonicalize(data_path.join("linux-target"))?;
+    let dir = fs::canonicalize(pin_dir.join("bundle"))?;
+    let configuration_path = fs::canonicalize(pin_dir.join("configuration.json"))?;
+    let configuration_bytes = fs::read(&configuration_path)?;
+    let configuration: Value = serde_json::from_slice(&configuration_bytes)?;
+    let profile = configuration["kernel_profile"]
+        .as_str()
+        .context("pinned kernel profile")?;
+    let artifacts = [
+        ("vmlinux", 0o400),
+        ("initramfs.img", 0o400),
+        ("youki", 0o500),
+        ("version.json", 0o400),
+    ];
+    let mut artifact_identities = BTreeMap::new();
+    for (name, expected_mode) in artifacts {
+        let path = dir.join(name);
+        let metadata = fs::symlink_metadata(&path)?;
+        ensure!(
+            metadata.is_file()
+                && metadata.nlink() == 1
+                && metadata.mode() & 0o7777 == expected_mode
+        );
+        artifact_identities.insert(name, immutable_identity(&path)?);
+    }
+    ensure!(fs::symlink_metadata(&pin_dir)?.mode() & 0o7777 == 0o700);
+    ensure!(fs::symlink_metadata(&dir)?.mode() & 0o7777 == 0o500);
+    ensure!(fs::symlink_metadata(&configuration_path)?.mode() & 0o7777 == 0o400);
+    Ok(json!({
+        "pin_dir": pin_dir,
         "dir": dir,
-        "profile": version["profile"],
+        "profile": profile,
         "kernel_sha256": file_sha(&dir.join("vmlinux"))?,
         "initramfs_sha256": file_sha(&dir.join("initramfs.img"))?,
         "youki_sha256": file_sha(&dir.join("youki"))?,
         "version_sha256": file_sha(&dir.join("version.json"))?,
+        "configuration_path": configuration_path,
+        "configuration_sha256": format!("{:x}", Sha256::digest(&configuration_bytes)),
+        "pin_directory_identity": immutable_identity(&pin_dir)?,
+        "bundle_directory_identity": immutable_identity(&dir)?,
+        "configuration_identity": immutable_identity(&configuration_path)?,
+        "artifact_identities": artifact_identities,
     }))
 }
 
@@ -782,12 +1016,12 @@ fn storage_evidence(
         for child in [
             entry.runtime().inner().rootfs_store_dir(),
             entry.runtime().inner().setup_commits_host_dir(),
-            entry.data_path().join("linux-install"),
+            entry.data_path().join("linux-target"),
         ] {
             ensure!(fs::canonicalize(child)?.starts_with(&root));
         }
         roots.push(root);
-        installs.insert(fixture.name, installed(entry)?);
+        installs.insert(fixture.name, installed(entry.data_path())?);
     }
     let disk_a = docker_disk(&entries[0], fixtures[0].stack_id());
     let disk_b = docker_disk(&entries[1], fixtures[1].stack_id());
@@ -829,13 +1063,12 @@ fn machine_evidence(
     })
 }
 
-async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Result<Value> {
-    let developer_bundle = fs::canonicalize(PathBuf::from(
-        std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?,
-    ))?;
-    let hardened_bundle = fs::canonicalize(PathBuf::from(
-        std::env::var_os(HARD_BUNDLE_ENV).context(HARD_BUNDLE_ENV)?,
-    ))?;
+async fn run_inner(
+    root: &Path,
+    cleanup_targets: &mut Vec<CleanupTarget>,
+    pin_cleanup_directories: &mut Vec<PathBuf>,
+) -> Result<Value> {
+    let (source_root, developer_bundle, hardened_bundle) = create_fixture_sources(root)?;
     let developer_verified =
         vz_linux::verify_kernel_bundle_read_only(&developer_bundle, KernelProfile::Developer)
             .await?;
@@ -849,10 +1082,7 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         &hardened_verified.artifact_identity.digest,
     )?;
     let resolver = MachineTargetResolver::new(
-        HostSpec {
-            os: OperatingSystem::Macos,
-            arch: Architecture::Aarch64,
-        },
+        host(),
         target_catalog(
             developer_bundle,
             developer_verified.artifact_identity.digest,
@@ -861,7 +1091,7 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         ),
     )?;
     let invalid_sibling_rejected_without_state =
-        invalid_sibling_preflight(root, &resolver, &definition).await?;
+        invalid_sibling_preflight(root, &source_root, &resolver, &definition).await?;
     let resolved = resolver.resolve_project(&definition).await?;
     ensure!(resolved.machines.len() == definition.environment.machines.len());
     ensure!(resolved.definition_digest == definition.digest()?);
@@ -886,25 +1116,31 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
     let registry_root = root.join("registry");
     fs::DirBuilder::new().mode(0o700).create(&registry_root)?;
     let registry = MachineRuntimeRegistry::new(registry_root.clone())?;
-    let mut entries = Vec::new();
-    for fixture in &fixtures {
-        let entry = admit(&registry, fixture, MachineRuntimeAdmission::CreateOrOpen)?;
-        cleanup_targets.push(CleanupTarget {
-            runtime: entry.runtime().inner().clone(),
-            stack_id: fixture.stack_id().into(),
-        });
-        let replay = admit(&registry, fixture, MachineRuntimeAdmission::CreateOrOpen)?;
-        ensure!(Arc::ptr_eq(&entry, &replay));
-        entries.push(entry);
-    }
-    let docker_probe = fs::canonicalize(PathBuf::from(
-        std::env::var_os(DOCKER_PROBE_ENV).context(DOCKER_PROBE_ENV)?,
-    ))?;
-    let docker_probe_sha256 = file_sha(&docker_probe)?;
-    let probe_a_path = install_docker_probe(&entries[0], &docker_probe)?;
-    let probe_b_path = install_docker_probe(&entries[1], &docker_probe)?;
-    ensure!(file_sha(&probe_a_path)? == docker_probe_sha256);
-    ensure!(file_sha(&probe_b_path)? == docker_probe_sha256);
+    let stores = acquire_stores(
+        &registry,
+        &fixtures,
+        MachineRuntimeAdmission::CreateOrOpen,
+        true,
+    )?;
+    let pins = pin_all(&stores, &fixtures, &resolved, pin_cleanup_directories).await?;
+    let pin_snapshot_before_replay = pin_snapshot(&stores, &fixtures)?;
+    let mut replay_cleanup_directories = Vec::new();
+    let replay_pins = pin_all(
+        &stores,
+        &fixtures,
+        &resolved,
+        &mut replay_cleanup_directories,
+    )
+    .await?;
+    ensure!(replay_cleanup_directories.as_slice() == pin_cleanup_directories.as_slice());
+    let pin_snapshot_after_replay = pin_snapshot(&stores, &fixtures)?;
+    ensure!(pin_snapshot_before_replay == pin_snapshot_after_replay);
+    drop(replay_pins);
+    fs::remove_dir_all(&source_root)?;
+    ensure!(!source_root.exists());
+    File::open(root)?.sync_all()?;
+    drop(resolved);
+    drop(resolver);
     let first_up = store.begin_environment_lifecycle(
         environment_id.as_str(),
         EnvironmentLifecycleKind::Up,
@@ -922,7 +1158,27 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         require_machine_fence(&store, &stale_first_up, &fixtures[0]).is_err(),
         "stale lifecycle generation authorized a Machine boot"
     );
-
+    let mut entries = Vec::new();
+    for (fixture, pin) in fixtures.iter().zip(&pins) {
+        let entry = attach_runtime(&registry, pin)?;
+        cleanup_targets.push(CleanupTarget {
+            runtime: entry.runtime().inner().clone(),
+            stack_id: fixture.stack_id().into(),
+        });
+        let replay = attach_runtime(&registry, pin)?;
+        ensure!(Arc::ptr_eq(&entry, &replay));
+        entries.push(entry);
+    }
+    drop(pins);
+    drop(stores);
+    let docker_probe = fs::canonicalize(PathBuf::from(
+        std::env::var_os(DOCKER_PROBE_ENV).context(DOCKER_PROBE_ENV)?,
+    ))?;
+    let docker_probe_sha256 = file_sha(&docker_probe)?;
+    let probe_a_path = install_docker_probe(&entries[0], &docker_probe)?;
+    let probe_b_path = install_docker_probe(&entries[1], &docker_probe)?;
+    ensure!(file_sha(&probe_a_path)? == docker_probe_sha256);
+    ensure!(file_sha(&probe_b_path)? == docker_probe_sha256);
     // Both Developer Machines boot concurrently and remain live together.
     let (dev_a, dev_b) = tokio::join!(
         boot(&entries[0], &fixtures[0]),
@@ -936,7 +1192,10 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         dev_b.runtime_identity().clone(),
         hard.runtime_identity().clone(),
     ];
-    let (ready_a, ready_b) = tokio::join!(dev_a.ensure_docker_ready(), dev_b.ensure_docker_ready());
+    let (ready_a, ready_b) = tokio::join!(
+        ensure_docker_ready_with_diagnostics(&dev_a, "developer-a first boot"),
+        ensure_docker_ready_with_diagnostics(&dev_b, "developer-b first boot")
+    );
     ensure!(ready_a?.runtime_identity == first[0]);
     ensure!(ready_b?.runtime_identity == first[1]);
     ensure!(matches!(
@@ -1025,8 +1284,10 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
     drop(entries);
     drop(registry);
     let reopened_registry = MachineRuntimeRegistry::new(registry_root)?;
+    let mut locked_reopen_store_acquisition_refused = true;
     for fixture in &fixtures {
-        leased_without_factory(&reopened_registry, fixture)?;
+        locked_reopen_store_acquisition_refused &=
+            locked_store_acquisition_refused(&reopened_registry, fixture)?;
     }
     ensure!(guest(&retained_a, "printf retained-a").await? == "retained-a");
     ensure!(guest(&retained_b, "printf retained-b").await? == "retained-b");
@@ -1060,8 +1321,24 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
     drop(store);
 
     let reopened_store = StateStore::open(&store_path)?;
+    let reopened_state = reopened_store
+        .load_project_state(project_id.as_str())?
+        .context("reopened Project state")?;
     let reopened_stopped_owned_read_only =
         require_owned_read_only(&reopened_store, project_id.as_str(), &fixtures)?;
+    ensure!(!source_root.exists());
+    let reopened_stores = acquire_stores(
+        &reopened_registry,
+        &fixtures,
+        MachineRuntimeAdmission::ExistingOnly,
+        false,
+    )?;
+    // This recovery deliberately has no target catalog or source bundle. The
+    // fixture still retains its expected owners/resources for assertions; the
+    // runtime configuration itself is loaded only from persisted state + pins.
+    let reopened_pins = load_all(&reopened_stores, &fixtures, &reopened_state).await?;
+    let recovered_pin_snapshot = pin_snapshot(&reopened_stores, &fixtures)?;
+    ensure!(recovered_pin_snapshot == pin_snapshot_before_replay);
     let second_up = reopened_store.begin_environment_lifecycle(
         environment_id.as_str(),
         EnvironmentLifecycleKind::Up,
@@ -1074,18 +1351,16 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         require_machine_fence(&reopened_store, &second_up, fixture)?;
     }
     let mut reopened_entries = Vec::new();
-    for fixture in &fixtures {
-        let entry = admit(
-            &reopened_registry,
-            fixture,
-            MachineRuntimeAdmission::ExistingOnly,
-        )?;
+    for (fixture, pin) in fixtures.iter().zip(&reopened_pins) {
+        let entry = attach_runtime(&reopened_registry, pin)?;
         cleanup_targets.push(CleanupTarget {
             runtime: entry.runtime().inner().clone(),
             stack_id: fixture.stack_id().into(),
         });
         reopened_entries.push(entry);
     }
+    drop(reopened_pins);
+    drop(reopened_stores);
     let (second_a, second_b) = tokio::join!(
         boot(&reopened_entries[0], &fixtures[0]),
         boot(&reopened_entries[1], &fixtures[1])
@@ -1100,8 +1375,8 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
     ];
     ensure!(second.iter().zip(&first).all(|(new, old)| new != old));
     let (ready_a, ready_b) = tokio::join!(
-        second_a.ensure_docker_ready(),
-        second_b.ensure_docker_ready()
+        ensure_docker_ready_with_diagnostics(&second_a, "developer-a reopened boot"),
+        ensure_docker_ready_with_diagnostics(&second_b, "developer-b reopened boot")
     );
     ready_a?;
     ready_b?;
@@ -1179,6 +1454,12 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
             "all_machines_resolved_before_state": all_machines_resolved_before_state,
             "invalid_sibling_rejected_without_state": invalid_sibling_rejected_without_state,
         },
+        "artifact_pinning": {
+            "all_pins_before_runtime_construction": true,
+            "source_bundles_removed_before_boot": true,
+            "recovery_without_catalog_or_source": true,
+            "pin_replay_read_only": true,
+        },
         "topology": {
             "project_id": project_id, "environment_id": environment_id,
             "creating_owned_read_only": creating_owned_read_only,
@@ -1198,6 +1479,11 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
         },
         "storage": {
             "first": first_storage, "reopened": reopened_storage,
+            "pin_snapshots": {
+                "before_replay": pin_snapshot_before_replay,
+                "after_replay": pin_snapshot_after_replay,
+                "recovered": recovered_pin_snapshot,
+            },
             "same_named_docker_volumes_hold_distinct_values": true,
             "sibling_rootfs_and_setup_sentinels_invisible": true,
             "developer_docker_state_survived_reopen": true,
@@ -1218,7 +1504,7 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
             "stale_generation_refused_before_boot": true,
             "resource_drift_refused_without_replacement": true,
             "activation_retained_store_lock_after_registry_drop": true,
-            "locked_reopen_factory_invocations": 0,
+            "locked_reopen_store_acquisition_refused": locked_reopen_store_acquisition_refused,
             "activation_exec_after_registry_drop": true,
             "cold_reopen_new_identities": true,
             "old_identities_refused_as_replacements": true,
@@ -1250,14 +1536,26 @@ async fn physical() -> Result<Value> {
     // macOS exposes /var through a symlink; the registry correctly refuses it.
     let root = fs::canonicalize(temporary.path())?;
     let mut cleanup_targets = Vec::new();
-    let result = run_inner(&root, &mut cleanup_targets).await;
-    let cleanup_result = cleanup(&cleanup_targets).await;
-    match (result, cleanup_result) {
-        (Ok(value), Ok(())) => Ok(value),
-        (Err(error), Ok(())) => Err(error),
-        (Ok(_), Err(cleanup)) => Err(cleanup),
-        (Err(error), Err(cleanup)) => Err(anyhow!(
-            "scenario failed: {error:#}; cleanup failed: {cleanup:#}"
+    let mut pin_cleanup_directories = Vec::new();
+    let result = run_inner(&root, &mut cleanup_targets, &mut pin_cleanup_directories).await;
+    let mut cleanup_failures = Vec::new();
+    if let Err(error) = cleanup(&cleanup_targets).await {
+        cleanup_failures.push(format!("VM cleanup failed: {error:#}"));
+    }
+    drop(cleanup_targets);
+    if let Err(error) = cleanup_pin_permissions(&root, &pin_cleanup_directories) {
+        cleanup_failures.push(format!("pin permission cleanup failed: {error:#}"));
+    }
+    if let Err(error) = temporary.close() {
+        cleanup_failures.push(format!("fixture TempDir close failed: {error}"));
+    }
+    match (result, cleanup_failures.is_empty()) {
+        (Ok(value), true) => Ok(value),
+        (Err(error), true) => Err(error),
+        (Ok(_), false) => Err(anyhow!(cleanup_failures.join("; "))),
+        (Err(error), false) => Err(anyhow!(
+            "scenario failed: {error:#}; {}",
+            cleanup_failures.join("; ")
         )),
     }
 }

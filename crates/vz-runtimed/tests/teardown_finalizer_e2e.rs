@@ -25,6 +25,10 @@ use vz_runtime_proto::runtime_v2;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
 use vz_stack::{StackEvent, StackSpec, StateStore, TeardownFinalizerStatus};
 
+#[path = "support/committed_json.rs"]
+mod committed_json;
+use committed_json::{read_committed_json, write_committed_json, write_json};
+
 const HELPER_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_HELPER";
 const ROOT_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_ROOT";
 const BOOT_STACK_ENV: &str = "VZ_RUNTIMED_TEARDOWN_E2E_BOOT_STACK";
@@ -396,17 +400,6 @@ async fn successful_apply_with(
     }
 }
 
-async fn wait_for_file(path: &Path, timeout: Duration) {
-    let deadline = tokio::time::Instant::now() + timeout;
-    while tokio::time::Instant::now() < deadline {
-        if path.is_file() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    panic!("file was not created in time: {}", path.display());
-}
-
 async fn wait_for_json_file(path: &Path, timeout: Duration) -> serde_json::Value {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -434,17 +427,6 @@ async fn wait_for_socket(path: &Path) {
     panic!("socket was not created in time: {}", path.display());
 }
 
-fn write_json(path: &Path, value: &serde_json::Value) {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).expect("create JSON parent");
-    }
-    std::fs::write(
-        path,
-        serde_json::to_vec_pretty(value).expect("serialize JSON evidence"),
-    )
-    .expect("write JSON evidence");
-}
-
 async fn run_helper() {
     let root = PathBuf::from(std::env::var(ROOT_ENV).expect("helper root"));
     let stack_id = std::env::var(STACK_ENV).unwrap_or_else(|_| STACK_ID.to_string());
@@ -461,7 +443,7 @@ async fn run_helper() {
             .await
             .expect("boot real shared Linux VM");
         let identity_path = PathBuf::from(std::env::var(IDENTITY_ENV).expect("identity path"));
-        write_json(
+        write_committed_json(
             &identity_path,
             &serde_json::to_value(identity).expect("serialize runtime identity"),
         );
@@ -483,7 +465,7 @@ async fn run_helper() {
             .e2e_inspect_stack_runtime(&stack_id)
             .await
             .expect("inspect replacement after stale refusal");
-        write_json(
+        write_committed_json(
             Path::new(&path),
             &serde_json::to_value(&identity).expect("serialize survivor identity"),
         );
@@ -1499,11 +1481,8 @@ async fn teardown_finalizer_sigkill_restart_replacement_refusal() {
         Some(&exact_stop_marker),
     );
     wait_for_socket(&cfg.socket_path).await;
-    wait_for_file(&original_identity_path, Duration::from_secs(90)).await;
-    let original: StackRuntimeIdentity = serde_json::from_slice(
-        &std::fs::read(&original_identity_path).expect("read original identity"),
-    )
-    .expect("decode original identity");
+    let original: StackRuntimeIdentity =
+        read_committed_json(&original_identity_path, Duration::from_secs(90)).await;
 
     let mut first_client = connect_stack_client(&cfg.socket_path).await;
     let first_scope = scope.clone();
@@ -1547,11 +1526,8 @@ async fn teardown_finalizer_sigkill_restart_replacement_refusal() {
         None,
     );
     wait_for_socket(&cfg.socket_path).await;
-    wait_for_file(&replacement_identity_path, Duration::from_secs(90)).await;
-    let replacement_identity: StackRuntimeIdentity = serde_json::from_slice(
-        &std::fs::read(&replacement_identity_path).expect("read replacement identity"),
-    )
-    .expect("decode replacement identity");
+    let replacement_identity: StackRuntimeIdentity =
+        read_committed_json(&replacement_identity_path, Duration::from_secs(90)).await;
     assert_ne!(replacement_identity, original);
 
     let mut replacement_client = connect_stack_client(&cfg.socket_path).await;
@@ -1571,12 +1547,9 @@ async fn teardown_finalizer_sigkill_restart_replacement_refusal() {
 
     drop(replacement_client);
     std::fs::write(&replacement_stop, b"stop").expect("request graceful helper stop");
-    wait_for_file(&survivor_path, Duration::from_secs(30)).await;
+    let survivor: Option<StackRuntimeIdentity> =
+        read_committed_json(&survivor_path, Duration::from_secs(30)).await;
     replacement.wait_success(Duration::from_secs(30)).await;
-    let survivor: Option<StackRuntimeIdentity> = serde_json::from_slice(
-        &std::fs::read(&survivor_path).expect("read replacement survivor evidence"),
-    )
-    .expect("decode replacement survivor evidence");
     assert_eq!(survivor.as_ref(), Some(&replacement_identity));
 
     // With the replacement intentionally removed, another production-daemon

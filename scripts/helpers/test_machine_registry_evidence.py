@@ -19,6 +19,11 @@ from machine_registry_evidence import (
 
 
 def fixture():
+    def immutable(inode, mode, size, links=1):
+        return {"device": 1, "inode": inode, "mode": mode, "uid": 501, "links": links,
+                "size": size, "mtime_seconds": 1_780_000_000, "mtime_nanoseconds": inode,
+                "ctime_seconds": 1_780_000_000, "ctime_nanoseconds": inode + 1}
+
     build = {"profile": "release", "test_binary_sha256": "1" * 64,
              "developer_initramfs_sha256": "2" * 64, "container_initramfs_sha256": "3" * 64,
              "docker_probe_sha256": "4" * 64, "docker_probe_source_sha256": "5" * 64,
@@ -67,9 +72,12 @@ def fixture():
             "artifact": artifact_identity,
             "resources": resources,
         }
+        configuration_bytes = json.dumps(resolved, sort_keys=True, separators=(",", ":"),
+                                         ensure_ascii=False).encode()
         machine = {"owner": owner, "verified_profile": profile, "resolved_configuration": resolved,
                    "configuration_digest": configuration_digest(resolved),
-                   "artifact": dict(artifact, bundle="/private/tmp/bundles/" + profile)}
+                   "artifact": dict(artifact, bundle="/private/tmp/fixture/source-bundles/" +
+                                    ("developer" if index < 2 else "hardened"))}
         for field, kind, logical in [("store_reservation", "machine_runtime_store", "runtime"), ("vm_reservation", "runtime_vm", "vm")]:
             machine[field] = {"schema_version": 1, "resource_kind": {"other": kind},
                               "resource_id": resource_name(owner, kind, logical),
@@ -81,7 +89,22 @@ def fixture():
         root = "/private/tmp/fixture/registry/topology-machines/" + machine["store_reservation"]["resource_id"] + "/data"
         storage["data_roots"].append(root)
         storage["data_root_identities"].append({"device": 1, "inode": 100 + index, "mode": 0o700, "uid": 501, "links": 5, "size": 1280})
-        storage["installed_artifacts"][name.replace("_", "-")] = dict(artifact, dir=root + "/linux-install")
+        pin_dir = root + "/linux-target"
+        bundle_dir = pin_dir + "/bundle"
+        storage["installed_artifacts"][name.replace("_", "-")] = dict(
+            artifact,
+            pin_dir=pin_dir,
+            dir=bundle_dir,
+            configuration_path=pin_dir + "/configuration.json",
+            configuration_sha256=hashlib.sha256(configuration_bytes).hexdigest(),
+            pin_directory_identity=immutable(300 + index * 10, 0o700, 128, links=3),
+            bundle_directory_identity=immutable(301 + index * 10, 0o500, 256, links=2),
+            configuration_identity=immutable(302 + index * 10, 0o400, len(configuration_bytes)),
+            artifact_identities={file: immutable(303 + index * 10 + offset,
+                                                 0o500 if file == "youki" else 0o400,
+                                                 1024 + offset)
+                                 for offset, file in enumerate(["vmlinux", "initramfs.img", "youki", "version.json"])},
+        )
         if index < 2:
             disk_key = hashlib.sha256(machine["vm_reservation"]["resource_id"].encode()).hexdigest()
             storage["developer_docker_disks"].append(root + "/docker-machines/" + disk_key + "/data.img")
@@ -96,7 +119,7 @@ def fixture():
     lease = dict.fromkeys(["same_registry_admission_reused_arc", "same_boot_request_replayed_identity", "stale_generation_refused_before_boot",
                           "resource_drift_refused_without_replacement", "activation_retained_store_lock_after_registry_drop",
                           "activation_exec_after_registry_drop", "cold_reopen_new_identities", "old_identities_refused_as_replacements"], True)
-    lease["locked_reopen_factory_invocations"] = 0
+    lease["locked_reopen_store_acquisition_refused"] = True
     serial = {"regular_nonempty": True}
     for phase, suffix in [("first_boot", ".first-boot.log"), ("second_boot", ".log")]:
         serial[phase] = [{"path": "/private/tmp/evidence/machine-registry-vm-serial/" + machine["vm_reservation"]["resource_id"] + suffix,
@@ -104,9 +127,17 @@ def fixture():
     return {"schema_version": 1, "scope": "registry_and_boot_lease_infrastructure_only", "build": build,
             "target_resolution": {"all_machines_resolved_before_state": True,
                                   "invalid_sibling_rejected_without_state": True},
+            "artifact_pinning": {"all_pins_before_runtime_construction": True,
+                                 "source_bundles_removed_before_boot": True,
+                                 "recovery_without_catalog_or_source": True,
+                                 "pin_replay_read_only": True},
             "serial_logs": serial,
             "topology": topology, "machines": machines,
-            "storage": {"first": storage, "reopened": copy.deepcopy(storage), "docker_api_probe_outputs": outputs,
+            "storage": {"first": storage, "reopened": copy.deepcopy(storage),
+                        "pin_snapshots": {"before_replay": copy.deepcopy(storage["installed_artifacts"]),
+                                          "after_replay": copy.deepcopy(storage["installed_artifacts"]),
+                                          "recovered": copy.deepcopy(storage["installed_artifacts"])},
+                        "docker_api_probe_outputs": outputs,
                         "docker_api_probe_sha256": build["docker_probe_sha256"], "same_named_docker_volumes_hold_distinct_values": True,
                         "sibling_rootfs_and_setup_sentinels_invisible": True, "developer_docker_state_survived_reopen": True,
                         "orphan_rootfs_cleanup_observed_on_reopen": True},
@@ -159,14 +190,18 @@ class EvidenceTests(unittest.TestCase):
             (["schema_version"], True),
             (["claims", "production_up"], True),
             (["lease", "same_boot_request_replayed_identity"], 1),
-            (["lease", "locked_reopen_factory_invocations"], False),
-            (["lease", "locked_reopen_factory_invocations"], 1),
+            (["lease", "locked_reopen_store_acquisition_refused"], False),
+            (["lease", "locked_reopen_store_acquisition_refused"], 0),
             (["topology", "creating_owned_read_only"], "true"),
             (["topology", "docker_capabilities_synthesized"], True),
             (["topology", "developer_ready_without_docker_conformance_rejected"], False),
             (["topology", "hardened_activation_published"], False),
             (["target_resolution", "all_machines_resolved_before_state"], False),
             (["target_resolution", "invalid_sibling_rejected_without_state"], 1),
+            (["artifact_pinning", "all_pins_before_runtime_construction"], False),
+            (["artifact_pinning", "source_bundles_removed_before_boot"], 1),
+            (["artifact_pinning", "recovery_without_catalog_or_source"], False),
+            (["artifact_pinning", "pin_replay_read_only"], False),
             (["serial_logs", "regular_nonempty"], False),
             (["serial_logs", "first_boot", 0, "path"], "/private/tmp/foreign.log"),
             (["serial_logs", "second_boot", 0, "sha256"], "not-a-sha"),
@@ -174,9 +209,17 @@ class EvidenceTests(unittest.TestCase):
             (["machines", "developer_a", "configuration_digest"], "sha256:" + "a" * 64),
             (["machines", "developer_a", "owner", "environment_id"], "env_foreign"),
             (["machines", "developer_b", "vm_reservation", "resource_id"], "foreign"),
+            (["machines", "developer_a", "artifact", "bundle"], "/private/tmp/bundles/developer"),
             (["machines", "developer_a", "resolved_configuration", "resources", "memory_mb"], 1024),
             (["machines", "developer_a", "resolved_configuration", "artifact", "digest"], "sha256:" + "a" * 64),
             (["machines", "developer_a", "resolved_configuration", "machine", "target", "image"], "ubuntu"),
+            (["storage", "first", "installed_artifacts", "developer-a", "dir"], "/private/tmp/foreign"),
+            (["storage", "first", "installed_artifacts", "developer-a", "configuration_sha256"], "a" * 64),
+            (["storage", "first", "installed_artifacts", "developer-a", "configuration_identity", "mode"], 0o600),
+            (["storage", "first", "installed_artifacts", "developer-a", "pin_directory_identity", "mode"], 0o500),
+            (["storage", "first", "installed_artifacts", "developer-a", "bundle_directory_identity", "mode"], 0o700),
+            (["storage", "first", "installed_artifacts", "developer-b", "artifact_identities", "vmlinux", "inode"], 303),
+            (["storage", "pin_snapshots", "after_replay", "developer-a", "configuration_identity", "ctime_nanoseconds"], 999),
             (["storage", "first", "data_roots", 0], "/private/tmp/foreign/data"),
             (["storage", "first", "data_root_identities", 0, "mode"], 0o777),
             (["storage", "first", "developer_docker_disk_identities", 1, "inode"], 200),
@@ -199,6 +242,18 @@ class EvidenceTests(unittest.TestCase):
     def test_duplicate_json_key_is_rejected(self):
         with self.assertRaises(InvalidEvidence):
             json.loads('{"schema_version":1,"schema_version":1}', object_pairs_hook=unique_object)
+
+    def test_pinned_artifact_permissions_are_exact(self):
+        for artifact, replacement in [("youki", 0o400), ("youki", 0o700), ("vmlinux", 0o500)]:
+            value = fixture()
+            expected = copy.deepcopy(value["build"])
+            installed_sets = [value["storage"][phase]["installed_artifacts"]
+                              for phase in ["first", "reopened"]]
+            installed_sets.extend(value["storage"]["pin_snapshots"].values())
+            for installed in installed_sets:
+                installed["developer-a"]["artifact_identities"][artifact]["mode"] = replacement
+            with self.subTest(artifact=artifact, replacement=replacement), self.assertRaises(InvalidEvidence):
+                validate(value, expected)
 
     def test_raw_serial_files_require_matching_bytes_and_regular_nonempty_files(self):
         with tempfile.TemporaryDirectory() as temporary:

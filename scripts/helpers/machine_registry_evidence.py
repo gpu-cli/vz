@@ -75,8 +75,22 @@ def validate_file_identity(value, mode, single_link=False):
         require(value["links"] == 1 and value["size"] == 64 * 1024**3, "Docker disk not single-link 64 GiB")
 
 
+def validate_immutable_identity(value, mode, directory=False):
+    keys(value, ["device", "inode", "mode", "uid", "links", "size", "mtime_seconds",
+                 "mtime_nanoseconds", "ctime_seconds", "ctime_nanoseconds"])
+    require(all(type(number) is int and number >= 0 for number in value.values()), "invalid immutable metadata")
+    require(value["inode"] > 0 and value["mode"] == mode and value["links"] > 0,
+            "unsafe immutable path identity/mode")
+    require(0 <= value["mtime_nanoseconds"] < 1_000_000_000
+            and 0 <= value["ctime_nanoseconds"] < 1_000_000_000, "invalid immutable timestamp")
+    if directory:
+        require(value["links"] >= 1, "invalid immutable directory")
+    else:
+        require(value["links"] == 1 and value["size"] > 0, "immutable pin file is empty or linked")
+
+
 def validate(value, expected):
-    keys(value, ["schema_version", "scope", "build", "target_resolution", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
+    keys(value, ["schema_version", "scope", "build", "target_resolution", "artifact_pinning", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
     require(type(value["schema_version"]) is int and value["schema_version"] == 1, "schema version")
     require(value["scope"] == "registry_and_boot_lease_infrastructure_only", "scope overclaim")
     require(expected["profile"] == "release", "physical registry gate requires release")
@@ -91,6 +105,10 @@ def validate(value, expected):
     target_resolution = value["target_resolution"]
     keys(target_resolution, ["all_machines_resolved_before_state", "invalid_sibling_rejected_without_state"])
     require(all(flag is True for flag in target_resolution.values()), "target resolution did not fail closed before state")
+    artifact_pinning = value["artifact_pinning"]
+    keys(artifact_pinning, ["all_pins_before_runtime_construction", "source_bundles_removed_before_boot",
+                            "recovery_without_catalog_or_source", "pin_replay_read_only"])
+    require(all(flag is True for flag in artifact_pinning.values()), "artifact pin admission/recovery proof failed")
 
     topology = value["topology"]
     read_flags = ["creating_owned_read_only", "failed_up_owned_read_only", "stopped_owned_read_only",
@@ -106,7 +124,7 @@ def validate(value, expected):
 
     names = ["developer_a", "developer_b", "hardened"]
     keys(value["machines"], names)
-    machine_ids, resources, incarnations = [], [], []
+    machine_ids, resources, incarnations, source_bundles = [], [], [], []
     for index, name in enumerate(names):
         machine = value["machines"][name]
         keys(machine, ["owner", "store_reservation", "vm_reservation", "configuration_digest", "resolved_configuration",
@@ -128,7 +146,7 @@ def validate(value, expected):
         artifact = machine["artifact"]
         artifact_fields = ["profile", "kernel_sha256", "initramfs_sha256", "youki_sha256", "version_sha256"]
         keys(artifact, ["bundle"] + artifact_fields)
-        path(artifact["bundle"])
+        source_bundles.append(path(artifact["bundle"]))
         require(machine["verified_profile"] == profile and artifact["profile"] == profile, "profile mismatch")
         for field in artifact_fields[1:]:
             sha(artifact[field])
@@ -183,11 +201,16 @@ def validate(value, expected):
             require(incarnation.version == 4 and str(incarnation) == identity["incarnation_id"], "invalid boot incarnation")
             incarnations.append(str(incarnation))
     require(len(set(machine_ids)) == 3 and len(set(resources)) == 6 and len(set(incarnations)) == 6, "duplicate owner/resource/boot")
+    require(source_bundles[0] == source_bundles[1]
+            and source_bundles[0].name == "developer" and source_bundles[2].name == "hardened"
+            and source_bundles[0].parent == source_bundles[2].parent
+            and source_bundles[0].parent.name == "source-bundles",
+            "resolver did not use the exact disposable fixture sources")
 
     storage = value["storage"]
     storage_flags = ["same_named_docker_volumes_hold_distinct_values", "sibling_rootfs_and_setup_sentinels_invisible",
                      "developer_docker_state_survived_reopen", "orphan_rootfs_cleanup_observed_on_reopen"]
-    keys(storage, ["first", "reopened", "docker_api_probe_sha256", "docker_api_probe_outputs"] + storage_flags)
+    keys(storage, ["first", "reopened", "pin_snapshots", "docker_api_probe_sha256", "docker_api_probe_outputs"] + storage_flags)
     require(all(storage[field] is True for field in storage_flags), "storage isolation/persistence failure")
     require(storage["docker_api_probe_sha256"] == build["docker_probe_sha256"], "wrong executed probe")
     for phase in ["first", "reopened"]:
@@ -202,8 +225,10 @@ def validate(value, expected):
         require(type(section["data_root_identities"]) is list and len(section["data_root_identities"]) == 3, "missing directory identities")
         require(type(section["developer_docker_disks"]) is list and len(section["developer_docker_disks"]) == 2, "missing Docker disks")
         require(type(section["developer_docker_disk_identities"]) is list and len(section["developer_docker_disk_identities"]) == 2, "missing disk identities")
-        keys(section["installed_artifacts"], [name.replace("_", "-") for name in names])
+        machine_names = [name.replace("_", "-") for name in names]
+        keys(section["installed_artifacts"], machine_names)
         namespaces, root_inodes, disk_inodes, uids = [], [], [], []
+        pin_inodes, artifact_inodes = [], []
         for index, name in enumerate(names):
             machine = value["machines"][name]
             root = path(section["data_roots"][index])
@@ -215,9 +240,39 @@ def validate(value, expected):
             root_inodes.append((metadata["device"], metadata["inode"]))
             uids.append(metadata["uid"])
             installed = section["installed_artifacts"][name.replace("_", "-")]
-            keys(installed, ["dir", "profile", "kernel_sha256", "initramfs_sha256", "youki_sha256", "version_sha256"])
-            require(path(installed["dir"]) == root / "linux-install", "artifact install escaped private store")
-            require(all(installed[field] == machine["artifact"][field] for field in installed if field != "dir"), "installed artifact differs from source")
+            keys(installed, ["pin_dir", "dir", "profile", "kernel_sha256", "initramfs_sha256",
+                             "youki_sha256", "version_sha256", "configuration_path",
+                             "configuration_sha256", "pin_directory_identity", "bundle_directory_identity",
+                             "configuration_identity", "artifact_identities"])
+            pin_dir = path(installed["pin_dir"])
+            bundle_dir = path(installed["dir"])
+            configuration_path = path(installed["configuration_path"])
+            require(pin_dir == root / "linux-target" and bundle_dir == pin_dir / "bundle"
+                    and configuration_path == pin_dir / "configuration.json", "artifact pin escaped private store")
+            for field in ["profile", "kernel_sha256", "initramfs_sha256", "youki_sha256", "version_sha256"]:
+                require(installed[field] == machine["artifact"][field], "installed artifact differs from source identity")
+            sha(installed["configuration_sha256"])
+            encoded_configuration = json.dumps(machine["resolved_configuration"], sort_keys=True,
+                                               separators=(",", ":"), ensure_ascii=False).encode()
+            require(installed["configuration_sha256"] == hashlib.sha256(encoded_configuration).hexdigest(),
+                    "raw pinned configuration hash mismatch")
+            validate_immutable_identity(installed["pin_directory_identity"], 0o700, directory=True)
+            validate_immutable_identity(installed["bundle_directory_identity"], 0o500, directory=True)
+            validate_immutable_identity(installed["configuration_identity"], 0o400)
+            require(installed["configuration_identity"]["size"] == len(encoded_configuration),
+                    "pinned configuration size mismatch")
+            keys(installed["artifact_identities"], ["vmlinux", "initramfs.img", "youki", "version.json"])
+            for artifact_name, identity in installed["artifact_identities"].items():
+                validate_immutable_identity(identity, 0o500 if artifact_name == "youki" else 0o400)
+                require(identity["uid"] == metadata["uid"], "pinned artifact owner differs")
+                artifact_inodes.append((identity["device"], identity["inode"]))
+            require(installed["pin_directory_identity"]["uid"] == metadata["uid"]
+                    and installed["bundle_directory_identity"]["uid"] == metadata["uid"]
+                    and installed["configuration_identity"]["uid"] == metadata["uid"],
+                    "pin owner differs from Machine store")
+            pin_inodes.extend([(installed["pin_directory_identity"]["device"], installed["pin_directory_identity"]["inode"]),
+                               (installed["bundle_directory_identity"]["device"], installed["bundle_directory_identity"]["inode"]),
+                               (installed["configuration_identity"]["device"], installed["configuration_identity"]["inode"])])
             if index < 2:
                 disk_key = hashlib.sha256(machine["vm_reservation"]["resource_id"].encode()).hexdigest()
                 require(path(section["developer_docker_disks"][index]) == root / "docker-machines" / disk_key / "data.img", "Docker disk escaped Machine store")
@@ -225,13 +280,22 @@ def validate(value, expected):
                 validate_file_identity(disk_metadata, 0o600, single_link=True)
                 require(disk_metadata["uid"] == metadata["uid"], "Docker disk owner differs")
                 disk_inodes.append((disk_metadata["device"], disk_metadata["inode"]))
-        require(len(set(namespaces)) == 1 and len(set(root_inodes)) == 3 and len(set(disk_inodes)) == 2 and len(set(uids)) == 1,
-                "shared storage inode or inconsistent namespace/owner")
+        require(len(set(namespaces)) == 1 and len(set(root_inodes)) == 3 and len(set(disk_inodes)) == 2
+                and len(set(uids)) == 1 and len(set(pin_inodes)) == 9 and len(set(artifact_inodes)) == 12,
+                "shared storage/pin inode or inconsistent namespace/owner")
     for field in ["data_roots", "developer_docker_disks", "installed_artifacts"]:
         require(storage["first"][field] == storage["reopened"][field], "persistent paths/artifacts changed on reopen")
     for field in ["data_root_identities", "developer_docker_disk_identities"]:
         for before, after in zip(storage["first"][field], storage["reopened"][field]):
             require(all(before[key] == after[key] for key in ["device", "inode", "mode", "uid"]), "persistent resource was replaced")
+    snapshots = storage["pin_snapshots"]
+    keys(snapshots, ["before_replay", "after_replay", "recovered"])
+    expected_pins = storage["first"]["installed_artifacts"]
+    for snapshot in snapshots.values():
+        keys(snapshot, [name.replace("_", "-") for name in names])
+        require(snapshot == expected_pins, "pin replay/recovery changed immutable files or metadata")
+    require(storage["reopened"]["installed_artifacts"] == expected_pins,
+            "reopened runtime did not use the original immutable pins")
 
     outputs = storage["docker_api_probe_outputs"]
     keys(outputs, [name + suffix for name in names[:2] for suffix in ["_create", "_first_verify", "_reopened_verify"]])
@@ -259,11 +323,10 @@ def validate(value, expected):
 
     lease_flags = ["same_registry_admission_reused_arc", "same_boot_request_replayed_identity", "stale_generation_refused_before_boot",
                    "resource_drift_refused_without_replacement", "activation_retained_store_lock_after_registry_drop",
-                   "activation_exec_after_registry_drop", "cold_reopen_new_identities", "old_identities_refused_as_replacements"]
-    keys(value["lease"], lease_flags + ["locked_reopen_factory_invocations"])
+                   "activation_exec_after_registry_drop", "cold_reopen_new_identities", "old_identities_refused_as_replacements",
+                   "locked_reopen_store_acquisition_refused"]
+    keys(value["lease"], lease_flags)
     require(all(value["lease"][field] is True for field in lease_flags), "missing/failed lease proof")
-    require(type(value["lease"]["locked_reopen_factory_invocations"]) is int and value["lease"]["locked_reopen_factory_invocations"] == 0,
-            "backend constructor ran while leased")
     require(value["claims"] == {"production_up": False, "native_macos_machine": False, "host_docker_socket_or_context": False}
             and all(item is False for item in value["claims"].values()), "unsupported release claim")
 

@@ -150,10 +150,57 @@ bytes to the resolved identity. Rechecking mutable paths is not a substitute.
 Kernel metadata is not negotiated Docker/Compose/buildx capability evidence,
 and artifact resolution is not authorization for workspace or network effects.
 
+## Private artifact pins (DEV)
+
+The registry now separates `acquire_store` from `attach_runtime`.
+`MachineRuntimeStoreLease` retains the exact owner manifest, trusted ancestry,
+directory identities and exclusive store lock without constructing a Runtime.
+The registry retains pending leases, and runtime attachment revalidates the
+lease and serializes the factory so an exact store has at most one Runtime.
+An `ExistingOnly` acquisition can read its persisted configuration digest rather
+than needing a catalog to reconstruct it.
+
+`pin_machine_artifacts` copies the four resolved Linux appliance artifacts into
+a private pending directory and checks every copied hash. It persists canonical
+resolved configuration, syncs files and directories, independently verifies the
+completed bundle, and publishes `data/linux-target` with no-replace rename and
+parent sync. The outer pin directory is private `0700` (Darwin requires a
+writable directory for rename), its bundle directory and executable youki are
+`0500`, and other files are `0400`, with exact owner, single-link regular-file
+and inventory checks. Docker and its embedded BuildKit execute youki directly
+from a read-only VirtioFS share, so its owner execute bit must survive pinning;
+neither execute removal nor added write permission is accepted on recovery. Pins
+are immutable through the API; hostile same-UID host processes remain outside
+the isolation guarantee. Another successful publisher is
+accepted only after its complete pin verifies against the same store identity.
+Heavy copying runs separately from asynchronous verification to avoid starving
+the filesystem worker pool under concurrent admissions.
+
+`load_machine_artifacts` is the recovery path: missing or incomplete pins are
+errors, not requests to install, repair or rediscover artifacts. It validates the
+canonical configuration against the current exact Machine request, host,
+backend, resource normalization and owner digest, then verifies pinned bytes.
+It performs no channel lookup. Unknown pending directories left by a crash are
+not candidates and are not automatically deleted or adopted.
+
+The explicit `RuntimeConfig.pinned_linux_bundle` mode verifies this expected
+bundle read-only and rejects legacy install/bundle paths and a separate youki
+override. It never invokes the ambient kernel installer. This pins the Linux
+appliance bundle; it does not yet bind the separate Developer Docker tool bundle
+and BuildKit provisioning to a complete production admission plan. Nor does it
+certify host Docker clients or publish negotiated capabilities.
+
+Callers must pin every sibling before attaching any Runtime, and keep the exact
+store lease alive through boot. Owner-validated deletion must account for the
+read-only pin directories; changing their permissions is a deletion effect and
+must occur only under the controller's lifecycle/resource fence, after the VM is
+stopped. The infrastructure alone does not authorize deletion or establish the
+full crash-resumable admission state machine.
+
 ## Still required before production Up
 
-Wire the explicit resolver into a production Environment controller with the
-immutable artifact boundary above. The legacy shared-VM path remains separate;
+Wire the explicit resolver and pin store into a production Environment
+controller with the immutable artifact boundary above. The legacy shared-VM path remains separate;
 its ambient artifact selection must never be used as a topology fallback.
 The pinning/recovery implementation is tracked by `vz-mzs.2.5.8.2`: acquire
 runtime-free owner store leases, pin every sibling, then attach runtimes.
@@ -177,6 +224,19 @@ Their focused local-Mac evidence is infrastructure evidence only. Completion
 still requires the complete installed-artifact aggregate gate in
 [`GOAL-0.4.0.md`](GOAL-0.4.0.md), including exact cleanup of owned resources and
 all crash/recovery scenarios.
+
+The next product vertical is a server-streaming topology Up RPC with a thin
+`vz up` client, not a legacy `run` alias. Its daemon-owned supervisor must hold
+the selected Environment lock across admission and lifecycle, retain Machine
+activations, and reconstruct response-loss results from the durable journal.
+Fresh preflight resolves all siblings before reservation; existing recovery
+loads exact persisted specifications and pins without a catalog. The controller
+must fence both store and VM records before every effect, and may only use
+CreateOrOpen in a proven never-started admission phase. Workspace binding for an
+existing Stopped Environment, mutable definition reconciliation, topology policy
+authorization, startup replay, and Developer endpoint/context capability proof
+remain missing integration work. A Hardened-only successful Up or guest Docker
+ping must not be presented as the requested Developer lifecycle.
 
 ## Verification evidence
 
@@ -227,3 +287,78 @@ all six raw logs. Unit verification passed for Linux 76, daemon 195 with one
 existing ignored test, and the expanded resolver suite 9; Python evidence tests
 6, strict affected-target Clippy and workspace formatting passed. These scoped
 results do not satisfy the missing five-verb or aggregate 0.4 release gates.
+
+The source-independent pinning lane passed at
+`.artifacts/sandbox-vm-e2e/20260905T050448Z/summary.txt`. All three Machine stores
+and pins are acquired before any Runtime construction. The fixture removes only
+its private source bundles and drops the resolver before first boot; recovery
+opens ExistingOnly stores and validates persisted specifications and pins.
+Before/after replay/recovery inode, mode, mtime, ctime and byte identities match.
+The independent validator also checked exact file modes, both Developer Docker
+volume owners and contents, and all six retained serial logs. This is
+catalog/source-independent backend recovery, not a new daemon-process or full
+production-controller recovery test. Guest mount-table text is not used as proof
+of host-side write denial; host pin identities and read-only replay are what this
+lane proves.
+
+Earlier attempts at `20260905T045455Z` and diagnostic run `20260905T045959Z`
+failed Docker readiness. The diagnostic log proves pinned youki mode `0400`
+caused `fork/exec /mnt/linux-bin/youki: permission denied`, then embedded BuildKit
+initialization failed. The correction preserves owner execute permission with
+exact `0500` mode, without adding write access or choosing another runtime.
+The diagnostics remain in the test and are bounded and failure-only; readiness
+failures still fail the lane. These development attempts are not a zero-retry
+aggregate release run.
+
+The final release-built artifact-store crash companion passed at
+`.artifacts/machine-artifact-pins/run-3Pig4o/crash-reopen.log`: ten actual SIGKILL
+checkpoints spanning pending creation, each artifact/configuration sync,
+directory sync, publication and parent sync. The parent requires signal 9 and
+the exact checkpoint prefix, rejects panic/unwind and timeout, and validates
+read-only refusal or exact published recovery without Runtime construction.
+The injector parks after successful signal delivery rather than unwinding while
+Darwin schedules termination. This is a filesystem-component test with synthetic
+bundle contents, not a VM or installed-daemon crash gate. The copied release
+driver, build output and raw log are bound by `evidence.sha256` in that directory.
+Its companion library log records OCI 235 passed with four opt-in tests ignored,
+and daemon 214 passed with two opt-in tests ignored; the crash companion was
+explicitly run separately. A sandboxed library attempt in `run-8RlWpP` could not
+create daemon test sockets; the successful run had local socket permission.
+Focused pin tests passed 8/8, pinned OCI configuration 6/6, resolver 11/11,
+registry 25/25 and Python evidence tests 7/7. Strict affected production/fixture
+Clippy and workspace formatting passed. None of these scoped results closes the
+production Developer Up or aggregate release requirements.
+
+The first full regression attempt for this pinning change, `20260905T050642Z`,
+passed runtime 19 and both runtime/StateStore crash companions but exposed a
+teardown-test handoff race: its helper created `replacement-identity.json`
+before writing the JSON, while its reader waited only for path existence.
+`vz-mzs.2.5.9` tracks the fix: complete synced, no-replace JSON publication plus
+a separately published checksum-bound ready marker. Once ready is observed,
+checksum or JSON errors are terminal; readers do not retry malformed committed
+data. This changes the test's process handoff, not production teardown semantics.
+The failed attempt's owned helper processes were confirmed exited.
+
+The subsequent focused teardown scenario at `20260905T051848Z` passed its real
+VM/process assertions but was correctly rejected by the harness's exact test
+count: the new helper unit test had been colocated in the physical target. The
+shared handoff implementation now lives in `tests/support/committed_json.rs`,
+with its deterministic publication/no-overwrite/malformed-commit regression in
+the separate `teardown_handoff` target. Each target lists exactly one test;
+the separate helper passed with zero ignored or filtered tests. The physical
+suite-count gate was not weakened.
+
+The final fresh full release backend regression passed at
+`.artifacts/sandbox-vm-e2e/20260905T052420Z/summary.txt`: runtime 19, runtime
+crash/reopen, StateStore crash atomicity, daemon teardown/recovery, Machine
+registry, stack 24 and BuildKit 3. Every required evidence validator reported
+success. The physical teardown and three-Machine targets each ran exactly one
+test with zero failed, ignored or filtered tests; the separate deterministic
+handoff regression remains in
+`.artifacts/machine-artifact-pins/run-3Pig4o/teardown-handoff-unit.log`.
+After the run, a process inventory found no remaining teardown, registry,
+runtime, stack or BuildKit test processes, or `vz-runtimed` daemon. The crash
+companion's six checksummed artifacts were reverified, and workspace formatting
+and diff checks passed. These are scoped backend and test-protocol results;
+they do not certify the installed five-command lifecycle, host Docker clients,
+native macOS Machines or the aggregate 0.4 release gate.

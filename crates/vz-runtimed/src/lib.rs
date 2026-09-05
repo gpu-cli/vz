@@ -5,6 +5,8 @@ pub mod btrfs_portability;
 mod execution_sessions;
 mod grpc;
 #[cfg(target_os = "macos")]
+pub mod machine_artifact_store;
+#[cfg(target_os = "macos")]
 pub mod machine_runtime_activation;
 #[cfg(unix)]
 pub mod machine_runtime_registry;
