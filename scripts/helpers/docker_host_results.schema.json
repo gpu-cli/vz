@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "DEV host Docker fixture observations, not aggregate release results",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "kind", "suite", "run_id", "scope", "release_sha256", "fixture_sha256", "compatibility_certified", "release_scenarios_passed", "test_case_retries", "outcome", "failure", "cleanup_errors", "observations", "command_count", "owned_projects", "remaining"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "kind": {"const": "docker_host_fixture_subset"},
+    "suite": {"enum": ["build", "compose", "all"]},
+    "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,39}$"},
+    "scope": {
+      "type": "object", "additionalProperties": false,
+      "required": ["project_id", "environment_id", "machine_id", "machine_incarnation", "runtime_identity", "docker_context", "docker_endpoint", "engine_id"],
+      "properties": {
+        "project_id": {"$ref": "#/$defs/identity"},
+        "environment_id": {"$ref": "#/$defs/identity"},
+        "machine_id": {"$ref": "#/$defs/identity"},
+        "machine_incarnation": {"$ref": "#/$defs/identity"},
+        "runtime_identity": {"$ref": "#/$defs/identity"},
+        "docker_context": {"$ref": "#/$defs/identity"},
+        "docker_endpoint": {"type": "string", "pattern": "^unix:///"},
+        "engine_id": {"$ref": "#/$defs/identity"}
+      }
+    },
+    "release_sha256": {"$ref": "#/$defs/digest"},
+    "fixture_sha256": {"$ref": "#/$defs/digest"},
+    "compatibility_certified": {"const": false},
+    "release_scenarios_passed": {"const": []},
+    "test_case_retries": {"const": 0},
+    "outcome": {"enum": ["failed", "fixture_assertions_passed"]},
+    "failure": {"type": ["string", "null"]},
+    "cleanup_errors": {"type": "array", "items": {"type": "string", "minLength": 1}},
+    "command_count": {"type": "integer", "minimum": 0},
+    "observations": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["recipe", "related_scenario_ids", "first_command", "last_command", "outcome", "assertions"],
+        "properties": {
+          "recipe": {"enum": ["build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount", "compose-create", "compose-up-order", "compose-exec", "compose-network-paths", "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure"]},
+          "related_scenario_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
+                                   "items": {"type": "string", "pattern": "^docker\\.[a-z_]+\\.[a-z_]+$"}},
+          "first_command": {"type": "integer", "minimum": 1},
+          "last_command": {"type": "integer", "minimum": 0},
+          "outcome": {"enum": ["failed", "fixture_assertions_passed"]},
+          "assertions": {"type": "array", "items": {"type": "string", "minLength": 1}}
+        },
+        "allOf": [{"if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}}},
+                   "then": {"properties": {"assertions": {"minItems": 1}}}}]
+      }
+    },
+    "owned_projects": {
+      "type": "object", "additionalProperties": {
+        "type": "object", "additionalProperties": false,
+        "required": ["container", "network", "volume"],
+        "properties": {
+          "container": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+          "network": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
+          "volume": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "remaining": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+  },
+  "allOf": [{
+    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}}},
+    "then": {"properties": {"failure": {"const": null}, "cleanup_errors": {"maxItems": 0},
+                             "observations": {"minItems": 1, "items": {"properties": {"outcome": {"const": "fixture_assertions_passed"}}}}}}
+  }, {
+    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "build"}}},
+    "then": {"properties": {"observations": {"minItems": 5, "maxItems": 5}}}
+  }, {
+    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "compose"}}},
+    "then": {"properties": {"observations": {"minItems": 8, "maxItems": 8}}}
+  }, {
+    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "all"}}},
+    "then": {"properties": {"observations": {"minItems": 13, "maxItems": 13}}}
+  }],
+  "$defs": {
+    "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "identity": {"type": "string", "minLength": 1, "maxLength": 256}
+  }
+}
