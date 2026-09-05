@@ -1,0 +1,7 @@
+ARG FIXTURE_BASE
+FROM ${FIXTURE_BASE} AS build
+ARG FIXTURE_BASE
+ARG FIXTURE_SSH_HOST
+ARG FIXTURE_SSH_PORT
+COPY tools.py ssh-response.txt /fixture/
+RUN --mount=type=secret,id=known_hosts,required=true python3 /fixture/tools.py ssh

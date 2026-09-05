@@ -53,6 +53,18 @@ pub(crate) struct DockerSupervisor {
 }
 
 impl DockerSupervisor {
+    /// Forwarding never starts Docker or selects a caller-provided destination.
+    pub(crate) async fn connect_forward(&self) -> anyhow::Result<UnixStream> {
+        let worker = self.worker.lock().await;
+        if !worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
+            bail!("Docker forwarding requires an active, explicitly provisioned supervisor");
+        }
+        validate_runtime_invariants()?;
+        UnixStream::connect(DOCKER_SOCKET_PATH)
+            .await
+            .context("connect to provisioned private Docker Engine")
+    }
+
     pub(crate) fn new() -> Self {
         Self {
             worker: Mutex::new(None),
@@ -524,6 +536,13 @@ mod tests {
     #[tokio::test]
     async fn supervisor_is_lazy_until_explicit_ensure_call() {
         let supervisor = DockerSupervisor::new();
+        assert!(!supervisor.worker_started().await);
+        let error = supervisor.connect_forward().await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("active, explicitly provisioned supervisor")
+        );
         assert!(!supervisor.worker_started().await);
     }
 

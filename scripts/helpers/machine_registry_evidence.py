@@ -12,6 +12,18 @@ import stat
 import sys
 import uuid
 
+from docker_time_namespace_evidence import (
+    InvalidEvidence as InvalidTimeNamespaceEvidence,
+    validate as validate_time_namespace,
+)
+from docker_device_policy_evidence import (
+    InvalidEvidence as InvalidDevicePolicyEvidence,
+    validate as validate_device_policy,
+)
+from docker_seccomp_policy_evidence import (
+    InvalidEvidence as InvalidSeccompPolicyEvidence,
+    validate as validate_seccomp_policy,
+)
 
 class InvalidEvidence(ValueError):
     pass
@@ -90,9 +102,9 @@ def validate_immutable_identity(value, mode, directory=False):
 
 
 def validate(value, expected):
-    keys(value, ["schema_version", "scope", "build", "target_resolution", "artifact_pinning", "controller", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
+    keys(value, ["schema_version", "scope", "build", "target_resolution", "artifact_pinning", "controller", "topology", "machines", "storage", "lease", "claims", "serial_logs", "host_endpoint", "live_sessions"])
     require(type(value["schema_version"]) is int and value["schema_version"] == 1, "schema version")
-    require(value["scope"] == "registry_and_boot_lease_infrastructure_only", "scope overclaim")
+    require(value["scope"] == "registry_boot_lease_and_host_endpoint_infrastructure_only", "scope overclaim")
     require(expected["profile"] == "release", "physical registry gate requires release")
     build = value["build"]
     keys(build, expected.keys())
@@ -331,8 +343,228 @@ def validate(value, expected):
                    "locked_reopen_store_acquisition_refused"]
     keys(value["lease"], lease_flags)
     require(all(value["lease"][field] is True for field in lease_flags), "missing/failed lease proof")
-    require(value["claims"] == {"production_up": False, "native_macos_machine": False, "host_docker_socket_or_context": False}
+    validate_host_endpoint(value["host_endpoint"], value["machines"])
+    validate_live_sessions(value["live_sessions"], value["machines"])
+    require(value["claims"] == {"production_up": False, "native_macos_machine": False, "managed_docker_context_or_full_compatibility": False}
             and all(item is False for item in value["claims"].values()), "unsupported release claim")
+
+
+def validate_live_sessions(value, machines):
+    keys(value, ["scope", "receipts", "commands", "sockets_removed", "restart_recovery", "public_stop"])
+    require(value["scope"] == "registered_original_runtime_stop_only", "live-session scope overclaim")
+    require(value["sockets_removed"] is True and value["restart_recovery"] is False
+            and value["public_stop"] is False, "live-session cleanup or unsupported claim")
+    require(type(value["receipts"]) is list and len(value["receipts"]) == 3, "missing live-session receipts")
+    operations = set()
+    for name, receipt in zip(["developer_a", "developer_b", "hardened"], value["receipts"]):
+        keys(receipt, ["owner", "operation_id", "generation", "runtime_identity", "endpoint", "outcome"])
+        require(receipt["owner"] == machines[name]["owner"]
+                and receipt["runtime_identity"] == machines[name]["first_identity"], "wrong live-session identity")
+        require(receipt["outcome"] == "stopped", "live-session physical stop was not proven")
+        require(type(receipt["operation_id"]) is str and receipt["operation_id"]
+                and type(receipt["generation"]) is int and receipt["generation"] == 2,
+                "wrong live-session Stop operation generation")
+        operations.add(receipt["operation_id"])
+        if name == "hardened":
+            require(receipt["endpoint"] is None, "Hardened session acquired an endpoint")
+        else:
+            validate_endpoint_shutdown(receipt["endpoint"])
+    require(len(operations) == 1, "session receipts belong to different Stop operations")
+    commands = value["commands"]
+    keys(commands, ["before_a", "before_b", "stopped_a", "surviving_b"])
+    engines, endpoints = {}, {}
+    for name, command in commands.items():
+        keys(command, ["args", "endpoint", "config", "exit_code", "stdout", "stderr",
+                       "input_bytes", "input_sha256", "elapsed_ms"])
+        require(command["args"] == ["info", "--format", "{{json .}}"], "session probe command changed")
+        require(type(command["endpoint"]) is str and command["endpoint"].startswith("unix:///private/tmp/vz-ls-"),
+                "session probe escaped its private endpoint")
+        socket = path(command["endpoint"][7:])
+        require(path(command["config"]) == socket.parent / "client", "session probe used ambient Docker config")
+        target = "b" if name.endswith("_b") else "a"
+        require(target not in endpoints or endpoints[target] == socket, "session probe cross-routed")
+        endpoints[target] = socket
+        require(type(command["exit_code"]) is int and
+                (command["exit_code"] != 0 if name == "stopped_a" else command["exit_code"] == 0),
+                "session stop/survivor command failed")
+        require(type(command["elapsed_ms"]) is int and 0 <= command["elapsed_ms"] < 60_000,
+                "session probe exceeded deadline")
+        require(type(command["input_bytes"]) is int and command["input_bytes"] == 0
+                and command["input_sha256"] == hashlib.sha256(b"").hexdigest(), "session probe input changed")
+        require(type(command["stdout"]) is str and type(command["stderr"]) is str, "missing session raw output")
+        if name != "stopped_a":
+            info = json.loads(command["stdout"])
+            require(type(info.get("ID")) is str and info["ID"] and info.get("DefaultRuntime") == "youki",
+                    "session probe wrong Engine/runtime")
+            engines[name] = info["ID"]
+    require(endpoints["a"] != endpoints["b"] and endpoints["a"].parent == endpoints["b"].parent,
+            "session endpoints alias or escape one root")
+    require(engines["before_a"] != engines["before_b"] == engines["surviving_b"], "sibling Engine replaced or aliased")
+
+
+def validate_endpoint_shutdown(receipt):
+    keys(receipt, ["accepted_connections", "completed_connections", "cancelled_connections",
+                   "failed_connections", "active_connections", "socket_removed"])
+    for field in ["accepted_connections", "completed_connections", "cancelled_connections",
+                  "failed_connections", "active_connections"]:
+        require(type(receipt[field]) is int and receipt[field] >= 0, "invalid relay accounting")
+    require(receipt["accepted_connections"] > 0
+            and receipt["accepted_connections"] == sum(receipt[field] for field in ["completed_connections", "cancelled_connections", "failed_connections"])
+            and receipt["active_connections"] == 0 and receipt["socket_removed"] is True,
+            "endpoint client/socket leaked or receipt inconsistent")
+
+
+def validate_host_endpoint(value, machines):
+    keys(value, ["scope", "client", "client_sha256", "busybox_sha256", "owners",
+                 "runtime_identities", "commands", "socket_modes", "sockets_removed",
+                 "unrelated_file_preserved", "managed_contexts", "compose_buildx", "hardened_refusal", "preexisting_path_refusal", "shutdown", "time_namespaces", "device_policies", "seccomp_policies"])
+    require(value["scope"] == "focused_host_endpoint_transport_only", "host endpoint scope overclaim")
+    require(value["client"] == "/usr/local/bin/docker", "host client substituted")
+    sha(value["client_sha256"])
+    sha(value["busybox_sha256"])
+    require(value["owners"] == [machines[name]["owner"] for name in ["developer_a", "developer_b"]],
+            "host endpoint wrong Machine owner")
+    require(value["runtime_identities"] == [machines[name]["first_identity"] for name in ["developer_a", "developer_b"]],
+            "host endpoint wrong boot identity")
+    require(value["socket_modes"] == [0o600, 0o600]
+            and all(type(mode) is int for mode in value["socket_modes"]), "host socket permissions")
+    for field in ["sockets_removed", "unrelated_file_preserved"]:
+        require(value[field] is True, "host endpoint cleanup/ownership failure")
+    require(value["managed_contexts"] is False and value["compose_buildx"] is False,
+            "unproven context/Compose/buildx claim")
+    for field in ["hardened_refusal", "preexisting_path_refusal"]:
+        require(type(value[field]) is str and value[field].strip(), "missing endpoint refusal")
+    require(type(value["shutdown"]) is list and len(value["shutdown"]) == 2, "missing endpoint shutdown receipt")
+    for receipt in value["shutdown"]:
+        validate_endpoint_shutdown(receipt)
+    commands = value["commands"]
+    keys(commands, ["client_version", "info_a", "info_b", "import_a", "import_b",
+                    "volume_a", "volume_b", "write_a", "write_b", "read_a", "read_b",
+                    "memory_a", "memory_b", "stdin_eof", "events_a", "event_volume_a", "stopped_a", "surviving_b"])
+    endpoints, configs = {}, set()
+    no_input = hashlib.sha256(b"").hexdigest()
+    for name, command in commands.items():
+        keys(command, ["args", "endpoint", "config", "exit_code", "stdout", "stderr",
+                       "input_bytes", "input_sha256", "elapsed_ms"])
+        require(type(command["args"]) is list and command["args"]
+                and all(type(arg) is str for arg in command["args"]), "invalid host command")
+        require(type(command["endpoint"]) is str and command["endpoint"].startswith("unix:///private/tmp/vz-de-"),
+                "host command endpoint escaped private fixture")
+        socket = path(command["endpoint"][7:])
+        require(socket.suffix == ".sock", "invalid host socket path")
+        config = path(command["config"])
+        require(config == socket.parent / "client", "host client configuration not isolated")
+        configs.add(config)
+        target = "b" if name.endswith("_b") else "a"
+        if target in endpoints:
+            require(endpoints[target] == socket, "host command cross-routed")
+        endpoints[target] = socket
+        require(type(command["exit_code"]) is int, "missing host command exit")
+        require(command["exit_code"] != 0 if name == "stopped_a" else command["exit_code"] == 0,
+                "host command unexpected exit status")
+        require(all(type(command[field]) is str for field in ["stdout", "stderr"]), "missing raw host output")
+        require(type(command["elapsed_ms"]) is int and 0 <= command["elapsed_ms"] < 60_000,
+                "host command exceeded deadline")
+        require(type(command["input_bytes"]) is int and command["input_bytes"] >= 0, "invalid host input length")
+        sha(command["input_sha256"])
+        if name not in ["import_a", "import_b", "stdin_eof"]:
+            require(command["input_bytes"] == 0 and command["input_sha256"] == no_input,
+                    "unexpected host command stdin")
+    require(len(set(endpoints.values())) == 2 and len(configs) == 1, "host endpoints alias")
+    require(type(value["time_namespaces"]) is list and len(value["time_namespaces"]) == 2,
+            "missing per-Machine Docker time/exec proof")
+    time_containers = []
+    for index, name in enumerate(["a", "b"]):
+        try:
+            time_containers.append(validate_time_namespace(
+                value["time_namespaces"][index], machines["developer_" + name],
+                "unix://" + str(endpoints[name]), str(next(iter(configs)))))
+        except InvalidTimeNamespaceEvidence as error:
+            raise InvalidEvidence(str(error)) from error
+    require(len(set(time_containers)) == 2, "Docker time proof reused a sibling container")
+    require(type(value["device_policies"]) is list and len(value["device_policies"]) == 2,
+            "missing per-Machine differential Docker device policy proof")
+    device_containers = []
+    for index, name in enumerate(["a", "b"]):
+        try:
+            device_containers.extend(validate_device_policy(
+                value["device_policies"][index], machines["developer_" + name],
+                "unix://" + str(endpoints[name]), str(next(iter(configs)))))
+        except InvalidDevicePolicyEvidence as error:
+            raise InvalidEvidence(str(error)) from error
+    require(len(set(time_containers + device_containers)) == 6,
+            "Docker device proof reused a sibling, paired or time-proof container")
+    require(type(value["seccomp_policies"]) is list and len(value["seccomp_policies"]) == 2,
+            "missing per-Machine default/custom init/exec seccomp proof")
+    seccomp_containers = []
+    for index, name in enumerate(["a", "b"]):
+        try:
+            seccomp_containers.extend(validate_seccomp_policy(
+                value["seccomp_policies"][index], machines["developer_" + name],
+                "unix://" + str(endpoints[name]), str(next(iter(configs)))))
+        except InvalidSeccompPolicyEvidence as error:
+            raise InvalidEvidence(str(error)) from error
+    require(len(set(time_containers + device_containers + seccomp_containers)) == 14,
+            "Docker seccomp proof reused a sibling or other policy container")
+    require(commands["client_version"]["args"] == ["--version"]
+            and commands["client_version"]["stdout"].startswith("Docker version "), "missing host version")
+    engines = {}
+    for name in ["info_a", "info_b", "surviving_b"]:
+        require(commands[name]["args"] == ["info", "--format", "{{json .}}"], "not an Engine info command")
+        info = json.loads(commands[name]["stdout"], object_pairs_hook=unique_object)
+        require(type(info.get("ID")) is str and info["ID"].strip(), "missing Engine ID")
+        require(info.get("DefaultRuntime") == "youki", "host Engine selected alternate OCI runtime")
+        require(info.get("MemoryLimit") is True, "Developer Engine lacks memory limit support")
+        features = json.loads(info["Runtimes"]["youki"]["status"]["org.opencontainers.runtime-spec.features"],
+                              object_pairs_hook=unique_object)
+        require(features["linux"]["cgroup"]["v2"] is True, "youki lacks compiled cgroup v2 support")
+        engines[name] = info["ID"]
+    require(engines["info_a"] != engines["info_b"] and engines["surviving_b"] == engines["info_b"],
+            "Engine identity alias/replacement")
+    require(commands["stopped_a"]["args"] == ["info"] and commands["stopped_a"]["stderr"].strip(),
+            "missing stopped endpoint refusal")
+    image = "vz-endpoint-fixture:local"
+    run = ["run", "--rm", "--network", "none", "-v", "vz-endpoint-shared:/data", image, "/bin/busybox"]
+    for name, marker in [("a", "developer-a"), ("b", "developer-b")]:
+        imported = commands["import_" + name]
+        require(imported["args"] == ["image", "import", "-", image], "fixture image not imported by host")
+        require(re.fullmatch(r"sha256:[0-9a-f]{64}\s*", imported["stdout"]), "invalid imported image ID")
+        require(imported["input_bytes"] > 0, "missing fixture rootfs bytes")
+        volume = commands["volume_" + name]
+        require(volume["args"] == ["volume", "create", "--label", "dev.vz.endpoint.owner=" + marker, "vz-endpoint-shared"]
+                and volume["stdout"].strip() == "vz-endpoint-shared", "host volume owner mismatch")
+        write = commands["write_" + name]
+        require(write["args"] == run + ["sh", "-c", f"printf {marker} > /data/marker; /bin/busybox cat /data/marker"]
+                and write["stdout"] == marker, "host volume write mismatch")
+        read = commands["read_" + name]
+        require(read["args"] == run + ["cat", "/data/marker"] and read["stdout"] == marker,
+                "host volume isolation read mismatch")
+        limited = commands["memory_" + name]
+        require(limited["args"] == ["run", "--rm", "--network", "none", "--memory", "64m",
+                                    image, "/bin/busybox", "cat", "/sys/fs/cgroup/memory.max"]
+                and limited["stdout"].strip() == "67108864", "container memory limit not applied")
+    require(all(commands["import_a"][field] == commands["import_b"][field]
+                for field in ["input_bytes", "input_sha256"]), "fixture tar bytes differ between Machines")
+    streamed = commands["stdin_eof"]
+    require(streamed["args"] == ["run", "-i", "--rm", "--network", "none", image, "/bin/busybox", "sh", "-c",
+                                  "/bin/busybox cat; /bin/busybox sleep 1; printf done"], "stdin EOF scenario substituted")
+    payload = b"vz-endpoint-half-close\n" * 12_000
+    require(streamed["input_bytes"] == len(payload)
+            and streamed["input_sha256"] == hashlib.sha256(payload).hexdigest()
+            and streamed["stdout"].encode() == payload + b"done", "host stream lost bytes/half-close/trailing output")
+    events = commands["events_a"]
+    args = events["args"]
+    require(len(args) == 11 and args[:2] == ["events", "--since"] and args[3] == "--until"
+            and args[5:] == ["--filter", "type=volume", "--filter", "event=create", "--format", "{{json .}}"]
+            and args[2].isdigit() and args[4].isdigit() and int(args[4]) - int(args[2]) == 3,
+            "host events window or command substituted")
+    created = commands["event_volume_a"]
+    require(created["args"] == ["volume", "create", "--label", "dev.vz.endpoint.owner=developer-a", "vz-endpoint-event"]
+            and created["stdout"].strip() == "vz-endpoint-event", "missing host event stimulus")
+    records = [json.loads(line, object_pairs_hook=unique_object) for line in events["stdout"].splitlines()]
+    require(any(record.get("Type") == "volume" and record.get("Action") == "create"
+                and record.get("Actor", {}).get("ID") == "vz-endpoint-event" for record in records),
+            "host event stream missed exact volume create")
 
 
 def unique_object(pairs):

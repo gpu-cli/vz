@@ -22,13 +22,18 @@ mod execution;
 mod files;
 mod image;
 mod linux_vm;
+mod machine_exec;
 mod sandbox;
 mod stack;
 mod stream_completion;
 mod topology;
+pub use machine_exec::{MachineExecEvent, MachineExecOutput, MachineExecStream};
 mod transport;
 
-pub use topology::ProjectStateSnapshot;
+pub use topology::{
+    EnvironmentStopEvent, EnvironmentStopStream, ProjectStateSnapshot,
+    environment_stop_error_detail,
+};
 
 #[cfg(test)]
 mod tests;

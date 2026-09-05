@@ -110,6 +110,7 @@ pub struct HostSpec {
 
 /// Immutable target artifact and platform requested for one Machine.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct TargetSpec {
     pub os: OperatingSystem,
     pub arch: Architecture,
@@ -155,6 +156,7 @@ pub enum MachineProfile {
 
 /// Deterministically ordered set of Machine capabilities.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct CapabilitySet {
     #[serde(default)]
     pub capabilities: BTreeSet<MachineCapability>,
@@ -186,6 +188,7 @@ impl CapabilitySet {
 
 /// Desired compute resources for one Machine.
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MachineResources {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cpus: Option<u8>,
@@ -205,6 +208,7 @@ pub enum WorkspaceProjectionMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct WorkspaceProjection {
     pub binding: String,
     pub target_path: String,
@@ -213,6 +217,7 @@ pub struct WorkspaceProjection {
 
 /// Desired Machine within the reusable Environment topology.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct MachineSpec {
     pub schema_version: u32,
     pub name: String,
@@ -236,6 +241,7 @@ pub enum NetworkKind {
 
 /// Desired Environment-local network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkSpec {
     pub schema_version: u32,
     pub name: String,
@@ -255,6 +261,7 @@ pub enum EndpointProtocol {
 
 /// Desired endpoint reference using topology-local Machine/network names.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EndpointSpec {
     pub schema_version: u32,
     pub name: String,
@@ -268,6 +275,7 @@ pub struct EndpointSpec {
 
 /// Reusable desired topology instantiated by each EnvironmentInstance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct EnvironmentSpec {
     pub schema_version: u32,
     pub machines: Vec<MachineSpec>,
@@ -279,6 +287,7 @@ pub struct EnvironmentSpec {
 
 /// Versioned, portable project definition.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
 pub struct ProjectDefinition {
     pub schema_version: u32,
     pub project_id: ProjectId,

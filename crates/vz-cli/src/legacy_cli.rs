@@ -14,17 +14,35 @@ pub const LEGACY_COMMAND_REMOVED_EXIT_CODE: i32 = 2;
 /// Stable machine-readable error code for a removed legacy command.
 pub const LEGACY_COMMAND_REMOVED_CODE: &str = "legacy_command_removed";
 
-const STACK_MIGRATION: &str = "Declare services and Machines in vz.json. The 0.4 public CLI is converging on five lifecycle verbs: vz up, vz exec, vz status, vz stop, and vz delete.";
+const ROOT_MIGRATION: &str = "Declare Developer Environment topology in vz.json. Use vz status to inspect it, vz exec for Machine execution, and vz stop to preserve it. The complete 0.4 lifecycle adds vz up and vz delete; consult installed help for implemented DEV capabilities.";
 const BARE_FLAG_MIGRATION: &str = "The implicit sandbox mode was removed. Declare Developer Environment configuration in vz.json. The 0.4 public CLI is converging on explicit vz up, vz exec, vz status, vz stop, and vz delete lifecycle verbs.";
 const TYPED_API_MIGRATION: &str =
     "Use the topology-scoped typed API for operations outside the five lifecycle verbs.";
 
+/// Frozen pre-0.4 root command inventory, including the hidden debug family.
+/// None of these names has a clap parser or a dispatch path.
+pub const REMOVED_ROOT_COMMANDS: &[&str] = &[
+    "create",
+    "ls",
+    "rm",
+    "inspect",
+    "attach",
+    "close-shell",
+    "init",
+    "run",
+    "logs",
+    "stack",
+    "image",
+    "diff",
+    "checkpoint",
+    "vm",
+    "self-sign",
+    "debug",
+];
+
 /// A removed root command recognized before the active clap command tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum RemovedRootCommand {
-    /// The pre-0.4 Compose/stack command family.
-    Stack,
-}
+pub struct RemovedRootCommand(&'static str);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RemovedCliEntry {
@@ -51,22 +69,19 @@ impl RemovedCliEntry {
 impl RemovedRootCommand {
     /// Removed root spelling.
     pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Stack => "stack",
-        }
+        self.0
     }
 
     const fn migration(self) -> &'static str {
-        match self {
-            Self::Stack => STACK_MIGRATION,
-        }
+        ROOT_MIGRATION
     }
 
     fn from_root(root: &OsStr) -> Option<Self> {
-        match root.to_str() {
-            Some("stack") => Some(Self::Stack),
-            _ => None,
-        }
+        let root = root.to_str()?;
+        REMOVED_ROOT_COMMANDS
+            .iter()
+            .find(|candidate| **candidate == root)
+            .map(|candidate| Self(candidate))
     }
 }
 
@@ -145,7 +160,7 @@ where
         if !options_ended && text == "--" {
             // Clap still accepts a subcommand after a root-level `--`. Keep
             // looking for that one root token, but never scan past an active
-            // root (for example, `vz run -- stack`).
+            // root (for example, `vz exec -- stack`).
             options_ended = true;
             continue;
         }
@@ -260,11 +275,9 @@ mod tests {
     #[test]
     fn explicit_command_arguments_and_tokens_after_double_dash_are_not_reinterpreted() {
         for args in [
-            vec!["vz", "run", "--", "stack"],
             vec!["vz", "exec", "--", "stack"],
-            vec!["vz", "run", "--", "--name"],
             vec!["vz", "exec", "--", "--resume"],
-            vec!["vz", "help", "image", "stack"],
+            vec!["vz", "help", "status", "stack"],
             vec!["vz", "--", "--name", "stack"],
         ] {
             assert!(rejection_for_args(args).is_none());
@@ -308,17 +321,61 @@ mod tests {
     }
 
     #[test]
+    fn every_removed_root_rejects_every_nested_argument_and_help_route() {
+        for root in REMOVED_ROOT_COMMANDS {
+            for prefix in [
+                vec!["vz"],
+                vec!["vz", "--json"],
+                vec!["vz", "-vvq"],
+                vec!["vz", "--"],
+                vec!["vz", "help"],
+                vec!["vz", "--help"],
+                vec!["vz", "--version"],
+                vec!["vz", "help", "--"],
+                vec!["vz", "help", "-v"],
+            ] {
+                for suffix in [
+                    vec![],
+                    vec!["--help"],
+                    vec!["--", "arbitrary"],
+                    vec!["unknown", "--arbitrary", "value"],
+                ] {
+                    let args = prefix
+                        .iter()
+                        .copied()
+                        .chain(std::iter::once(*root))
+                        .chain(suffix.iter().copied());
+                    let rejection = rejection_for_args(args).expect("legacy root must reject");
+                    assert_eq!(rejection.error.command, *root);
+                    assert_eq!(rejection.error.code, LEGACY_COMMAND_REMOVED_CODE);
+                    assert_eq!(rejection.error.migration, ROOT_MIGRATION);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn active_exec_arguments_remain_opaque_even_if_legacy_spellings() {
+        for root in REMOVED_ROOT_COMMANDS {
+            assert!(rejection_for_args(["vz", "exec", "--", root, "--resume"]).is_none());
+            assert!(rejection_for_args(["vz", "status", "--environment", root]).is_none());
+            assert!(rejection_for_args(["vz", "stop", "--environment", root]).is_none());
+        }
+    }
+
+    #[test]
     fn renders_deterministic_structured_migration_error() {
         let rejection = rejection_for_args(["vz", "stack", "up"]).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&rejection.to_json()).unwrap();
+        assert_eq!(value["error"]["code"], LEGACY_COMMAND_REMOVED_CODE);
+        assert_eq!(value["error"]["command"], "stack");
         assert_eq!(
-            rejection.to_json(),
-            concat!(
-                "{\"error\":{\"code\":\"legacy_command_removed\",",
-                "\"command\":\"stack\",",
-                "\"message\":\"`vz stack` was removed from the 0.4 public CLI\",",
-                "\"migration\":\"Declare services and Machines in vz.json. The 0.4 public CLI is converging on five lifecycle verbs: vz up, vz exec, vz status, vz stop, and vz delete.\",",
-                "\"typed_api_migration\":\"Use the topology-scoped typed API for operations outside the five lifecycle verbs.\"}}"
-            )
+            value["error"]["message"],
+            "`vz stack` was removed from the 0.4 public CLI"
         );
+        assert_eq!(value["error"]["migration"], ROOT_MIGRATION);
+        assert_eq!(value["error"]["typed_api_migration"], TYPED_API_MIGRATION);
+        assert_eq!(rejection.to_json(), rejection.to_json());
+        assert_eq!(rejection.to_json().lines().count(), 1);
     }
 }

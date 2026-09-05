@@ -39,6 +39,7 @@ use vz_image::{ImageInfo, PruneResult};
 
 mod bundle;
 mod exec;
+mod machine_exec;
 mod networking;
 mod oci_lifecycle;
 mod resolve;

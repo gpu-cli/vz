@@ -798,6 +798,31 @@ impl Runtime {
 }
 
 impl SharedVmLifecycleLease {
+    /// Open the fixed private Docker socket in this exact leased boot. No
+    /// target path, TCP address, or replacement VM is selected by the caller.
+    /// Retain this lease until the returned stream is closed.
+    pub async fn open_docker_stream(&self) -> Result<vz_linux::GrpcDockerStream, OciError> {
+        let record = self
+            .stack_vms
+            .lock()
+            .await
+            .get(&self.runtime_identity.stack_id)
+            .cloned();
+        require_exact_stack_runtime(
+            record.as_ref().map(|record| &record.identity),
+            &self.runtime_identity,
+        )?;
+        let record = record.ok_or_else(|| OciError::SharedRuntimeAbsent {
+            stack_id: self.runtime_identity.stack_id.clone(),
+        })?;
+        require_docker_provisioned_developer_profile(
+            record.verified_linux_profile,
+            record.docker_provisioned,
+            "shared_vm_lease_open_docker_stream",
+        )?;
+        Ok(record.vm.open_docker_stream().await?)
+    }
+
     /// Full identity of the exact shared-VM boot protected by this lease.
     pub fn runtime_identity(&self) -> &vz_runtime_contract::StackRuntimeIdentity {
         &self.runtime_identity

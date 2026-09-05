@@ -16,6 +16,7 @@ path = "src/main.rs"
 vz-stack = { workspace = true }
 vz-runtime-contract = { workspace = true }
 vz-runtime-proto = { workspace = true }
+vz-runtime-translate = { workspace = true }
 vz-image = { workspace = true }
 vz-runtimed-client = { workspace = true }
 tokio = { workspace = true }

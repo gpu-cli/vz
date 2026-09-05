@@ -428,10 +428,9 @@ fn create_named_netns(name: &str) -> io::Result<()> {
             } else {
                 -1
             };
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("create_named_netns({name}) failed: child exited with code {exit_code}"),
-            ));
+            return Err(io::Error::other(format!(
+                "create_named_netns({name}) failed: child exited with code {exit_code}"
+            )));
         }
     }
 
@@ -590,10 +589,11 @@ fn ip_run(args: &[&str]) -> io::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!("{IP_BIN} {} failed: {}", args.join(" "), stderr.trim()),
-        ));
+        return Err(io::Error::other(format!(
+            "{IP_BIN} {} failed: {}",
+            args.join(" "),
+            stderr.trim()
+        )));
     }
     Ok(())
 }
@@ -635,15 +635,12 @@ fn nsenter_ip(ns_path: &str, args: &[&str]) -> io::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            format!(
-                "{IP_BIN} {} in netns {} failed: {}",
-                args.join(" "),
-                ns_path,
-                stderr.trim()
-            ),
-        ));
+        return Err(io::Error::other(format!(
+            "{IP_BIN} {} in netns {} failed: {}",
+            args.join(" "),
+            ns_path,
+            stderr.trim()
+        )));
     }
     Ok(())
 }

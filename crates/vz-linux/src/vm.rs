@@ -725,6 +725,49 @@ impl LinuxVm {
         })?
     }
 
+    /// Allocate a guest-incarnation-bound ticket for ordinary Machine execution.
+    pub async fn prepare_machine_exec_request(&self) -> Result<String, LinuxError> {
+        self.prepare_container_exec_request().await
+    }
+
+    /// Start supervised execution in this exact Machine, with no OCI target.
+    /// `pty` is `(rows, cols)` or `None` for pipes. Retain this VM and request
+    /// ticket until ready/terminal proof or exact-ticket reconciliation; dropped
+    /// futures and ambiguous errors do not release lifecycle ownership.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec_machine_stream_ready_classified_for_request(
+        &self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        pty: Option<(u32, u32)>,
+    ) -> Result<(GrpcExecStream, u64), ContainerExecStartError> {
+        let mut client = GrpcAgentClient::connect_default(Arc::clone(&self.vm))
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        client
+            .ping()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        let info = client
+            .system_info()
+            .await
+            .map_err(ContainerExecStartError::Definite)?;
+        validate_guest_system_info(&info).map_err(ContainerExecStartError::Definite)?;
+        client
+            .exec_machine_stream_ready_for_request(
+                dispatch_gate,
+                request_id,
+                command,
+                args,
+                options,
+                pty,
+            )
+            .await
+    }
+
     /// Start a pipe exec using a request identity retained by the caller.
     /// Ambiguous errors and dropped futures require reconciliation of this
     /// exact ID before releasing VM or lifecycle authority.
@@ -1050,6 +1093,16 @@ impl LinuxVm {
                 timeout.as_secs_f64()
             ))
         })?
+    }
+
+    /// Open an opaque connection to this VM's provisioned private Docker Engine.
+    pub async fn open_docker_stream(&self) -> Result<crate::GrpcDockerStream, LinuxError> {
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        client.docker_forward().await
     }
 
     /// Open a dedicated port-forward stream to a guest-local target port.

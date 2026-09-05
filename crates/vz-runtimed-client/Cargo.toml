@@ -8,9 +8,11 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+prost = { workspace = true }
 hyper-util = { workspace = true, features = ["tokio"] }
 thiserror = { workspace = true }
 tokio = { workspace = true, features = ["net", "time"] }
+tokio-stream = { workspace = true }
 tonic = { workspace = true }
 tower = { workspace = true }
 tracing = { workspace = true }

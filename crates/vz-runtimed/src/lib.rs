@@ -4,10 +4,20 @@ mod btrfs_health;
 pub mod btrfs_portability;
 #[cfg(target_os = "macos")]
 pub mod environment_runtime_controller;
+#[cfg(target_os = "macos")]
+pub mod environment_stop;
 mod execution_sessions;
 mod grpc;
 #[cfg(target_os = "macos")]
 pub mod machine_artifact_store;
+#[cfg(target_os = "macos")]
+pub mod machine_docker_endpoint;
+#[cfg(target_os = "macos")]
+pub mod machine_exec;
+#[cfg(target_os = "macos")]
+mod machine_execution_activity;
+#[cfg(target_os = "macos")]
+pub mod machine_live_sessions;
 #[cfg(target_os = "macos")]
 pub mod machine_runtime_activation;
 #[cfg(unix)]
@@ -87,6 +97,14 @@ pub(crate) struct SandboxStartupResolution {
 struct AllowAllPolicyHook;
 
 impl RuntimePolicyHook for AllowAllPolicyHook {
+    fn evaluate_topology(
+        &self,
+        _scope: &vz_runtime_contract::TopologyAuthorization,
+        _metadata: &RequestMetadata,
+    ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(PolicyDecision::Allow)
+    }
+
     fn evaluate(
         &self,
         _operation: RuntimeOperation,
@@ -152,6 +170,8 @@ pub struct RuntimeDaemon {
     machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend>,
     #[cfg(target_os = "macos")]
     environment_runtime_controller: environment_runtime_controller::EnvironmentRuntimeController,
+    #[cfg(target_os = "macos")]
+    machine_live_sessions: machine_live_sessions::MachineLiveSessions,
     state_store: Mutex<StateStore>,
     teardown_finalizer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     execution_sessions: ExecutionSessionRegistry,
@@ -224,7 +244,7 @@ impl RuntimeDaemon {
         )
     }
 
-    #[cfg(any(test, feature = "test-backend"))]
+    #[cfg(test)]
     pub(crate) fn start_with_policy_hook(
         config: RuntimedConfig,
         policy_hook: Arc<dyn RuntimePolicyHook>,
@@ -443,6 +463,8 @@ impl RuntimeDaemon {
             machine_runtime_registry,
             #[cfg(target_os = "macos")]
             environment_runtime_controller: Default::default(),
+            #[cfg(target_os = "macos")]
+            machine_live_sessions: Default::default(),
             state_store: Mutex::new(state_store),
             teardown_finalizer_locks: Mutex::new(HashMap::new()),
             execution_sessions: ExecutionSessionRegistry::default(),
@@ -599,6 +621,13 @@ impl RuntimeDaemon {
         self.environment_runtime_controller
             .acquire(project_id, environment_id)
             .await
+    }
+
+    /// Authoritative live-session ownership for topology controllers. Unknown
+    /// sessions after restart remain uncertain until explicit reconciliation.
+    #[cfg(target_os = "macos")]
+    pub fn machine_live_sessions(&self) -> &machine_live_sessions::MachineLiveSessions {
+        &self.machine_live_sessions
     }
 
     /// Prepare private runtime stores/pins under a retained Environment fence.

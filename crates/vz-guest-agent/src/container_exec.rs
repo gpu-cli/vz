@@ -19,6 +19,11 @@ use std::sync::atomic::{AtomicI32, Ordering};
 use anyhow::Context;
 use anyhow::bail;
 
+// Ordinary Machine commands share only supervision primitives, never OCI
+// resolution, target identities, cgroup attachment, or namespace entry.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod machine;
+
 pub(crate) const TRAMPOLINE_MARKER: &str = "__vz_container_exec_v4";
 const SELF_EXE: &str = "/proc/self/exe";
 #[cfg(any(target_os = "linux", test))]
@@ -1647,12 +1652,24 @@ fn prepare_exec_payload(
     invocation: &TrampolineInvocation,
     identity: ResolvedIdentity,
 ) -> anyhow::Result<ExecPayload> {
-    let mut argv = Vec::with_capacity(invocation.args.len() + 1);
-    argv.push(
-        CString::new(invocation.command.as_bytes())
-            .context("container exec argv[0] contains NUL")?,
-    );
-    for argument in &invocation.args {
+    prepare_command_payload(
+        &invocation.command,
+        &invocation.args,
+        invocation.retain_shell_environment,
+        identity,
+    )
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn prepare_command_payload(
+    command: &str,
+    args: &[String],
+    retain_shell_environment: bool,
+    identity: ResolvedIdentity,
+) -> anyhow::Result<ExecPayload> {
+    let mut argv = Vec::with_capacity(args.len() + 1);
+    argv.push(CString::new(command.as_bytes()).context("container exec argv[0] contains NUL")?);
+    for argument in args {
         argv.push(
             CString::new(argument.as_bytes()).context("container exec argument contains NUL")?,
         );
@@ -1673,7 +1690,7 @@ fn prepare_exec_payload(
         // portable-pty injects SHELL while constructing its child Command.
         // Strip that adapter-only value unless it was part of the normalized
         // request environment, keeping unary, pipe, and PTY exec identical.
-        .filter(|(key, _)| invocation.retain_shell_environment || key != b"SHELL")
+        .filter(|(key, _)| retain_shell_environment || key != b"SHELL")
         .collect::<Vec<_>>();
     raw_environment.sort_by(|left, right| left.0.cmp(&right.0));
     let mut environment = Vec::with_capacity(raw_environment.len());
@@ -1694,7 +1711,7 @@ fn prepare_exec_payload(
         .chain(std::iter::once(std::ptr::null()))
         .collect();
     let command_candidates = prepare_command_candidates(
-        invocation.command.as_bytes(),
+        command.as_bytes(),
         search_path.as_deref().unwrap_or(b"/bin:/usr/bin"),
     )?;
 
@@ -1880,6 +1897,17 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
 
     child_apply_identity(fds.setup_error, payload);
 
+    finish_child_exec(fds.setup_error, Some(fds.target_pidfd), payload)
+}
+
+/// Common post-identity exec path. Ordinary Machine execution has no target
+/// init pidfd to recheck because it never enters an OCI target.
+#[cfg(target_os = "linux")]
+fn finish_child_exec(
+    setup_error: libc::c_int,
+    target_pidfd: Option<libc::c_int>,
+    payload: &ExecPayload,
+) -> ! {
     // Do not leak the agent's signal policy into the requested program.
     // SAFETY: the signal set is initialized before use and affects only this
     // post-fork child.
@@ -1889,45 +1917,33 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
             .chain(std::iter::once(libc::SIGRTMIN()))
         {
             if libc::signal(signal, libc::SIG_DFL) == libc::SIG_ERR {
-                child_setup_fail(
-                    fds.setup_error,
-                    ChildSetupStage::SignalState,
-                    current_errno(),
-                );
+                child_setup_fail(setup_error, ChildSetupStage::SignalState, current_errno());
             }
         }
         if libc::signal(libc::SIGPIPE, libc::SIG_DFL) == libc::SIG_ERR {
-            child_setup_fail(
-                fds.setup_error,
-                ChildSetupStage::SignalState,
-                current_errno(),
-            );
+            child_setup_fail(setup_error, ChildSetupStage::SignalState, current_errno());
         }
         let mut empty: libc::sigset_t = std::mem::zeroed();
         if libc::sigemptyset(&raw mut empty) != 0
             || libc::sigprocmask(libc::SIG_SETMASK, &raw const empty, std::ptr::null_mut()) != 0
         {
-            child_setup_fail(
-                fds.setup_error,
-                ChildSetupStage::SignalState,
-                current_errno(),
-            );
+            child_setup_fail(setup_error, ChildSetupStage::SignalState, current_errno());
         }
     }
 
     // Recheck the pinned container init immediately before descriptor closure
     // and exec. A dead init invalidates the namespace/root target even though
     // the pinned descriptors themselves remain usable.
-    if !pidfd_is_alive_raw(fds.target_pidfd) {
-        child_setup_fail(fds.setup_error, ChildSetupStage::TargetRace, libc::ESRCH);
+    if target_pidfd.is_some_and(|fd| !pidfd_is_alive_raw(fd)) {
+        child_setup_fail(setup_error, ChildSetupStage::TargetRace, libc::ESRCH);
     }
 
     // Preserve only the CLOEXEC setup-error pipe until execve. A successful
     // exec closes it and tells the supervisor setup completed; all preparation
     // descriptors are closed immediately.
-    if !close_fds_except(fds.setup_error) {
+    if !close_fds_except(setup_error) {
         child_setup_fail(
-            fds.setup_error,
+            setup_error,
             ChildSetupStage::CloseDescriptors,
             current_errno(),
         );
@@ -1948,11 +1964,11 @@ fn child_exec(fds: ChildLaunchFds, expected_cgroup: &[u8], payload: &mut ExecPay
         if errno == libc::EACCES {
             saw_access_denied = true;
         } else if errno != libc::ENOENT && errno != libc::ENOTDIR {
-            child_execve_fail(fds.setup_error, errno);
+            child_execve_fail(setup_error, errno);
         }
     }
     child_execve_fail(
-        fds.setup_error,
+        setup_error,
         if saw_access_denied {
             libc::EACCES
         } else {
@@ -2318,6 +2334,11 @@ fn terminate_and_reap_descendants(group: libc::pid_t) -> anyhow::Result<()> {
     }
 
     SUPERVISED_PROCESS_GROUP.store(0, Ordering::Release);
+    reap_adopted_descendants()
+}
+
+#[cfg(target_os = "linux")]
+fn reap_adopted_descendants() -> anyhow::Result<()> {
     let deadline = std::time::Instant::now() + DESCENDANT_REAP_TIMEOUT;
     loop {
         kill_adopted_descendants()?;

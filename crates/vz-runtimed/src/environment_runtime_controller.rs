@@ -86,6 +86,7 @@ pub struct EnvironmentRuntimeController {
 }
 
 impl EnvironmentRuntimeController {
+    #[cfg(any(test, not(feature = "test-backend")))]
     pub(crate) fn require_own_lease(
         &self,
         lease: &EnvironmentControllerLease,
@@ -168,6 +169,23 @@ fn reservations(
 }
 
 impl EnvironmentControllerLease {
+    pub(crate) fn require_owner(&self, owner: &ResourceOwner) -> Result<(), StackError> {
+        if self.project_id != owner.project_id || self.environment_id != owner.environment_id {
+            return Err(conflict(
+                "Environment controller lease belongs to another owner",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn retained_guard(&self) -> Arc<OwnedMutexGuard<()>> {
+        Arc::clone(&self.guard)
+    }
+
+    pub(crate) fn controller_identity(&self) -> &Arc<()> {
+        &self.controller_identity
+    }
+
     /// Prepare all Machines under this lease. This never boots or publishes Ready.
     /// Fresh admission may complete partially prepared stores only while the
     /// durable never-started fence holds. Every later phase is read-only recovery.

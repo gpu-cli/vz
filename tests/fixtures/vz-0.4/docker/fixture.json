@@ -1,0 +1,308 @@
+{
+  "schema_version": 1,
+  "state": "fixture_subset_unverified",
+  "target_release": "0.4.0",
+  "runtime_scenarios_executed": 0,
+  "compatibility_certified": false,
+  "expected_payload_sha256": {
+    "build_alpha": "ba5a14beace02a3116e5f2ad0d31edb7003834c0e612131fdb6ee3924db75378",
+    "build_beta": "fec388215a5466f2fa08f79755643b5b8aa0bf5d19781660d579cd7ee2b2d973",
+    "secret_output": "060807e34d53e1912c0c44782359ab9ae72329ef03bcc1ae7300924aec762740",
+    "ssh_output": "af0ce282674779f36fa9a86e8aa6732d8703d01c9e957d39106863af84c99291"
+  },
+  "secret_input_sha256": "534f64a0b04ee7779e6179cb41b866456ed19cd2408cacf61ce9f814bbb83d8a",
+  "scope": "Deterministic BuildKit and Compose workloads only; no host lane or complete 63-scenario fixture bundle.",
+  "inputs": {
+    "FIXTURE_BASE": {
+      "required": true,
+      "pin": "repository@sha256:<64 lowercase hex>",
+      "provides": [
+        "linux/arm64",
+        "/bin/sh",
+        "python3",
+        "writable /out parent"
+      ],
+      "resolved_digest": null
+    },
+    "FIXTURE_SSH_BASE": {
+      "required": true,
+      "pin": "repository@sha256:<64 lowercase hex>",
+      "provides": [
+        "linux/arm64",
+        "python3",
+        "/bin/sh",
+        "/bin/cat",
+        "OpenSSH client/server",
+        "unlocked root account for public-key login",
+        "/run/sshd directory"
+      ],
+      "resolved_digest": null
+    },
+    "FIXTURE_IMAGE": {
+      "required": true,
+      "pin": "sha256:<64 lowercase hex> local image ID or repository@sha256:<64 lowercase hex>",
+      "source": "Build compose/Dockerfile with FIXTURE_BASE and capture immutable result ID."
+    },
+    "FIXTURE_OWNER": {
+      "required": true,
+      "pattern": "[a-z0-9][a-z0-9-]{0,63}",
+      "source": "Host harness retains exact project/environment/machine/run mapping."
+    },
+    "FIXTURE_RUN": {
+      "required": true,
+      "pattern": "[a-z0-9][a-z0-9-]{0,63}",
+      "source": "One unique candidate run token; same for all layer-cache comparison builds."
+    }
+  },
+  "expected": {
+    "build_alpha": "vz04-build-v1\nvariant=alpha\n",
+    "build_beta": "vz04-build-v1\nvariant=beta\n",
+    "secret_output": "vz04-secret-mount-ok-v1\n",
+    "ssh_output": "vz04-ssh-authenticated-v1\n",
+    "cache_output_template": "vz04-cache-v1\nowner={owner}\nstate={cold|warm}\nstep={step}\n",
+    "persistence_template": "vz04|db|{owner}|persisted\n",
+    "health_template": "vz04|{service}|{owner}|ready\n",
+    "exec_stdout_template": "vz04|api|{owner}|exec-stdout\n",
+    "exec_stderr_template": "vz04|api|{owner}|exec-stderr\n",
+    "exec_exit_code": 37,
+    "failure_stdout_template": "vz04|failure|{owner}|exit-37\n",
+    "failure_exit_code": 37,
+    "logs": {
+      "db": [
+        "vz04|db|{owner}|listening\n"
+      ],
+      "api": [
+        "vz04|api|{owner}|dependency-healthy\n",
+        "vz04|api|{owner}|listening\n"
+      ],
+      "worker": [
+        "vz04|worker|{owner}|dependency-healthy\n",
+        "vz04|worker|{owner}|listening\n"
+      ],
+      "isolated": [
+        "vz04|isolated|{owner}|listening\n"
+      ]
+    },
+    "dependency_edges": [
+      [
+        "db",
+        "api"
+      ],
+      [
+        "api",
+        "worker"
+      ]
+    ],
+    "networks": {
+      "db": [
+        "backend"
+      ],
+      "api": [
+        "frontend",
+        "backend"
+      ],
+      "worker": [
+        "frontend"
+      ],
+      "isolated": [
+        "isolated"
+      ]
+    },
+    "volume": {
+      "service": "db",
+      "key": "state",
+      "destination": "/data",
+      "sentinel": "/data/sentinel.txt"
+    },
+    "replicas": 3,
+    "scaled_down_replicas": 1,
+    "allowed_paths": [
+      [
+        "worker",
+        "api",
+        8080,
+        "/value"
+      ],
+      [
+        "api",
+        "db",
+        8080,
+        "/value"
+      ]
+    ],
+    "denied_paths": [
+      [
+        "worker",
+        "db",
+        8080
+      ],
+      [
+        "isolated",
+        "api",
+        8080
+      ],
+      [
+        "isolated",
+        "db",
+        8080
+      ]
+    ],
+    "final_stage_files": {
+      "multi_stage": [
+        "payload.txt"
+      ],
+      "secret": [
+        "secret.txt"
+      ],
+      "ssh": [
+        "ssh.txt"
+      ],
+      "cache_mount": [
+        "cache.txt"
+      ]
+    }
+  },
+  "canaries": {
+    "secret_input": "inputs/secret.txt",
+    "secret_scan_scope": [
+      "build stdout/stderr",
+      "exported image layers",
+      "exported BuildKit cache blobs after decompression",
+      "public evidence"
+    ],
+    "intermediate_input": "build/intermediate-canary.txt",
+    "intermediate_scan_scope": [
+      "final stage image filesystem",
+      "local final-stage export"
+    ],
+    "private_ssh_key_source": "Generate a fresh isolated fixture key and agent outside source/build contexts; retain public key fingerprint only."
+  },
+  "recipes": {
+    "multi_stage": {
+      "dockerfile": "build/Dockerfile",
+      "context": "build",
+      "target": "output",
+      "arguments": {
+        "FIXTURE_VARIANT": "alpha",
+        "FIXTURE_RUN": "<same unique candidate run token>"
+      },
+      "required_assertions": [
+        "exact payload bytes",
+        "final image contains only payload.txt",
+        "intermediate canary absent from final stage"
+      ]
+    },
+    "build_arguments": {
+      "variants": [
+        "alpha",
+        "beta"
+      ],
+      "required_assertions": [
+        "exact variant payload bytes",
+        "changed payload layer digest"
+      ]
+    },
+    "layer_cache": {
+      "dockerfile": "build/Dockerfile",
+      "cache_to": "type=local,dest=<owned fresh directory>,mode=max",
+      "cache_from": "type=local,src=<same owned export>",
+      "required_assertions": [
+        "first payload vertex executes",
+        "identical second build payload vertex cached",
+        "fresh isolated same-Machine builder without import misses",
+        "fresh isolated same-Machine builder with explicit import hits",
+        "sibling Machine and Environment without import miss",
+        "all payload bytes identical"
+      ],
+      "notes": "Cache-hit claims require raw BuildKit vertex receipts, not elapsed time or output digest alone."
+    },
+    "cache_mount": {
+      "dockerfile": "build/Dockerfile.cache",
+      "id": "vz04-cache-probe",
+      "sequence": [
+        {
+          "machine": "A",
+          "state": "cold",
+          "step": "first"
+        },
+        {
+          "machine": "A",
+          "state": "warm",
+          "step": "second"
+        },
+        {
+          "machine": "B",
+          "state": "cold",
+          "step": "first"
+        },
+        {
+          "machine": "sibling-environment",
+          "state": "cold",
+          "step": "first"
+        }
+      ],
+      "notes": "Use distinct owner tokens and forced-distinct step arguments. A fresh builder is required per candidate. Layer-cache export does not export cache-mount contents."
+    },
+    "secrets": {
+      "dockerfile": "build/Dockerfile.secret",
+      "mount_id": "fixture",
+      "negative": "Omit --secret; required mount must fail. Use a fresh builder or --no-cache so a cached vertex cannot hide a missing secret."
+    },
+    "ssh": {
+      "positive_dockerfile": "build/Dockerfile.ssh",
+      "negative_dockerfile": "build/Dockerfile.ssh-negative",
+      "mount_id": "fixture",
+      "known_hosts_secret": "known_hosts",
+      "server_context": "ssh",
+      "server_port": 2222,
+      "required_assertions": [
+        "agent-only public-key authentication returns exact response",
+        "same server and known_hosts without --ssh fails",
+        "required mount missing fails before command",
+        "private key absent from image/cache/logs/evidence",
+        "host-key mismatch fails"
+      ],
+      "notes": "Pin the SSH client/server base, provision owned server public authorization and private host key, use strict known_hosts from that host key. No host ssh-agent or user keys."
+    },
+    "compose": {
+      "file": "compose/compose.json",
+      "health_negative_overlay": "compose/blocked-health.json",
+      "project_name": "<unique run-owned name>",
+      "readiness_deadline_seconds": 30,
+      "denial_attempt_deadline_seconds": 3,
+      "failure_command_suffix": [
+        "--profile",
+        "failure",
+        "up",
+        "--abort-on-container-exit",
+        "--exit-code-from",
+        "failure"
+      ],
+      "required_assertions": [
+        "created services not running before up",
+        "health event precedes dependent start event",
+        "blocked database prevents API and worker startup",
+        "direct worker-to-db and isolated paths denied by name AND actual inspected IP",
+        "API /value equals persisted database bytes",
+        "three distinct worker container IDs and matching /identity hostnames",
+        "scale down to one preserves surviving exact identity and removes the others",
+        "exec output streams and exit37 match",
+        "failure exit37 and partial resource inventory retained",
+        "stop/up does not rewrite persistence sentinel",
+        "down removes only exact project-owned resources"
+      ]
+    }
+  },
+  "remaining": [
+    "All host Docker/Compose/buildx invocation and evidence collection/validation",
+    "Runtime verification for every fixture here",
+    "Immutable base/client/server artifacts and actual image/OCI/cache export digests",
+    "Authenticated registry and complete image lifecycle fixtures",
+    "Container stdin/attach/TTY/signals/events and exact exit matrix",
+    "Mount ownership/read-only/tmpfs and host projection fixtures",
+    "Published-port and exhaustive network/owner isolation fixtures",
+    "OOM/resource-pressure/concurrent-client fixtures and health schedules",
+    "Staged recovery, lifecycle injection and exact cleanup decoys",
+    "Full fixture inventory freeze and complete 63-scenario contract"
+  ]
+}

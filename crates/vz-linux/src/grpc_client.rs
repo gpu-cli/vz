@@ -151,6 +151,7 @@ fn build_exec_request(
         term_rows: terminal.rows,
         term_cols: terminal.cols,
         container_target: container_target.map(|container_id| ContainerExecTarget { container_id }),
+        supervised_machine: false,
     }
 }
 
@@ -360,6 +361,38 @@ fn validate_exec_event_metadata(
 }
 
 impl GrpcAgentClient {
+    /// Connect only to this guest's already-provisioned private Engine socket.
+    pub async fn docker_forward(&mut self) -> Result<crate::GrpcDockerStream, LinuxError> {
+        use vz_agent_proto::{DockerForwardFrame, DockerForwardOpen, docker_forward_frame::Frame};
+        let (sender, receiver) = mpsc::channel(8);
+        sender
+            .send(DockerForwardFrame {
+                frame: Some(Frame::Open(DockerForwardOpen {
+                    metadata: Some(self.next_transport_metadata(None)),
+                })),
+            })
+            .await
+            .map_err(|_| LinuxError::Protocol("Docker open channel closed".to_string()))?;
+        let handshake = async {
+            let mut inbound = self
+                .agent
+                .docker_forward(tokio_stream::wrappers::ReceiverStream::new(receiver))
+                .await?
+                .into_inner();
+            match inbound.message().await? {
+                Some(DockerForwardFrame {
+                    frame: Some(Frame::Connected(_)),
+                }) => Ok(crate::GrpcDockerStream::new(inbound, sender)),
+                _ => Err(LinuxError::Protocol(
+                    "Docker relay did not acknowledge connection".to_string(),
+                )),
+            }
+        };
+        tokio::time::timeout(CONNECT_TIMEOUT, handshake)
+            .await
+            .map_err(|_| LinuxError::Protocol("Docker relay connection timed out".to_string()))?
+    }
+
     /// Runtime capability declaration for this gRPC guest path.
     pub fn advertised_runtime_capabilities() -> RuntimeCapabilities {
         vz_runtime_contract::canonical_backend_capabilities(
@@ -443,6 +476,52 @@ impl GrpcAgentClient {
         .into_inner();
         validate_allocated_exec_request_id(&response.exec_request_id)?;
         Ok(response.exec_request_id)
+    }
+
+    /// Allocate a single-use ticket for supervised execution in this Machine.
+    pub async fn prepare_machine_exec_request(&mut self) -> Result<String, LinuxError> {
+        self.prepare_container_exec_request().await
+    }
+
+    /// Start ticketed execution in the Machine, without any OCI target.
+    /// `pty` contains `(rows, cols)`; `None` selects separate output pipes.
+    /// Ambiguous errors require reconciliation of this exact request ticket.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn exec_machine_stream_ready_for_request(
+        &mut self,
+        dispatch_gate: ContainerExecDispatchGate,
+        request_id: String,
+        command: String,
+        args: Vec<String>,
+        options: ExecOptions,
+        pty: Option<(u32, u32)>,
+    ) -> Result<(GrpcExecStream, u64), ContainerExecStartError> {
+        validate_allocated_exec_request_id(&request_id)
+            .map_err(ContainerExecStartError::Definite)?;
+        let metadata = ProtoTransportMetadata {
+            request_id: request_id.clone(),
+            idempotency_key: format!("exec_machine:{request_id}"),
+        };
+        let terminal = pty.map_or_else(ExecTerminal::default, |(rows, cols)| ExecTerminal {
+            allocate_pty: true,
+            rows,
+            cols,
+        });
+        let mut request = build_exec_request(command, args, options, None, metadata, terminal);
+        request.supervised_machine = true;
+        if !dispatch_gate.authorize_dispatch() {
+            return Err(ContainerExecStartError::Definite(LinuxError::Protocol(
+                "Machine exec was cancelled or timed out before dispatch".to_string(),
+            )));
+        }
+        let response = self
+            .agent
+            .exec(request)
+            .await
+            .map_err(classify_exec_rpc_status)?;
+        GrpcExecStream::new(response.into_inner(), Some(request_id))
+            .wait_machine_ready()
+            .await
     }
 
     /// Fence or cancel/reap an ambiguously-started exec by its prepared request ID.
@@ -1159,6 +1238,9 @@ fn decode_exec_stream_event(
         Some(exec_event::Event::ContainerReady(_)) => Err(LinuxError::Protocol(
             "exec stream repeated container readiness".to_string(),
         )),
+        Some(exec_event::Event::MachineReady(_)) => Err(LinuxError::Protocol(
+            "exec stream repeated Machine readiness".to_string(),
+        )),
         None => Ok(None),
     }
 }
@@ -1169,6 +1251,19 @@ impl ExecStreamReadError {
             Self::Protocol(error) | Self::Transport(error) => error,
         }
     }
+}
+
+fn require_machine_ready(event: &vz_agent_proto::ExecEvent) -> Result<(), LinuxError> {
+    if event.exec_id == 0
+        || event.sequence != 1
+        || event.request_id.is_empty()
+        || !matches!(event.event, Some(exec_event::Event::MachineReady(_)))
+    {
+        return Err(LinuxError::Protocol(
+            "Machine exec omitted typed readiness or its control identity".to_string(),
+        ));
+    }
+    Ok(())
 }
 
 fn require_container_ready(
@@ -1238,6 +1333,36 @@ fn definite_initial_exec_rejection(
 }
 
 impl GrpcExecStream {
+    async fn wait_machine_ready(mut self) -> Result<(Self, u64), ContainerExecStartError> {
+        let first = self
+            .inner
+            .message()
+            .await
+            .map_err(|error| ContainerExecStartError::Ambiguous(error.into()))?
+            .ok_or_else(|| {
+                ContainerExecStartError::Ambiguous(LinuxError::Protocol(
+                    "Machine exec stream ended before readiness".to_string(),
+                ))
+            })?;
+        validate_exec_event_metadata(
+            &mut self.last_sequence,
+            &mut self.expected_request_id,
+            first.sequence,
+            first.request_id.as_str(),
+        )
+        .map_err(ContainerExecStartError::Ambiguous)?;
+        if let Some(rejection) = definite_initial_exec_rejection(
+            &first,
+            self.expected_request_id.as_deref().unwrap_or_default(),
+        ) {
+            return Err(rejection);
+        }
+        require_machine_ready(&first).map_err(ContainerExecStartError::Ambiguous)?;
+        let exec_id = first.exec_id;
+        self.expected_exec_id = Some(exec_id);
+        Ok((self, exec_id))
+    }
+
     async fn next_checked_inner(
         &mut self,
     ) -> Result<Option<vz::protocol::ExecEvent>, ExecStreamReadError> {
@@ -1586,6 +1711,86 @@ fn buildctl_guest_command(args: Vec<String>) -> (String, Vec<String>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn machine_ready_requires_its_own_first_frame_and_control_identity() {
+        let ready = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::MachineReady(
+                vz_agent_proto::MachineExecReady {},
+            )),
+            exec_id: 42,
+            sequence: 1,
+            request_id: "ticket".to_string(),
+        };
+        assert!(require_machine_ready(&ready).is_ok());
+        for invalid in [
+            vz_agent_proto::ExecEvent {
+                exec_id: 0,
+                ..ready.clone()
+            },
+            vz_agent_proto::ExecEvent {
+                sequence: 2,
+                ..ready.clone()
+            },
+            vz_agent_proto::ExecEvent {
+                request_id: String::new(),
+                ..ready.clone()
+            },
+            vz_agent_proto::ExecEvent {
+                event: Some(exec_event::Event::Stdout(vec![])),
+                ..ready.clone()
+            },
+            vz_agent_proto::ExecEvent {
+                event: Some(exec_event::Event::ContainerReady(
+                    vz_agent_proto::ContainerExecReady {
+                        generation: Some(ready_generation("not-a-Machine")),
+                    },
+                )),
+                ..ready.clone()
+            },
+        ] {
+            assert!(require_machine_ready(&invalid).is_err());
+        }
+        assert!(require_container_ready(&ready, "not-a-container").is_err());
+    }
+
+    #[test]
+    fn machine_checked_stream_pins_identity_and_rejects_repeated_ready() {
+        let event = |exec_id, request_id: &str, event| vz_agent_proto::ExecEvent {
+            exec_id,
+            request_id: request_id.to_string(),
+            sequence: 2,
+            event: Some(event),
+        };
+        for invalid in [
+            event(43, "ticket", exec_event::Event::Stdout(vec![0, 255])),
+            event(42, "other", exec_event::Event::ExitCode(0)),
+            event(
+                42,
+                "ticket",
+                exec_event::Event::MachineReady(vz_agent_proto::MachineExecReady {}),
+            ),
+        ] {
+            assert!(
+                decode_exec_stream_event(
+                    &mut 1,
+                    &mut Some("ticket".to_string()),
+                    Some(42),
+                    invalid
+                )
+                .is_err()
+            );
+        }
+        let decoded = decode_exec_stream_event(
+            &mut 1,
+            &mut Some("ticket".to_string()),
+            Some(42),
+            event(42, "ticket", exec_event::Event::Stdout(vec![0, 255])),
+        );
+        assert!(
+            matches!(decoded, Ok(Some(vz::protocol::ExecEvent::Stdout(bytes))) if bytes == [0,255])
+        );
+    }
 
     #[tokio::test]
     async fn cancellation_during_preflight_closes_dispatch_gate_before_send() {

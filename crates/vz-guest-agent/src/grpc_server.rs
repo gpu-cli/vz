@@ -143,6 +143,43 @@ impl ContainerReadyListener {
         };
         enforce_ready_deadline(deadline, operation).await
     }
+
+    async fn wait_machine(&self, expected: &SpawnedProcessIdentity) -> Result<(), Status> {
+        use tokio::io::AsyncReadExt as _;
+        enforce_ready_deadline(
+            tokio::time::Instant::now() + CONTAINER_READY_TIMEOUT,
+            async {
+                let (stream, _) =
+                    self.listener.accept().await.map_err(|error| {
+                        Status::internal(format!("Machine ready accept: {error}"))
+                    })?;
+                let credentials = stream.peer_cred().map_err(|error| {
+                    Status::internal(format!("Machine ready credentials: {error}"))
+                })?;
+                if credentials.pid() != Some(expected.pid() as i32) || credentials.uid() != 0 {
+                    return Err(Status::permission_denied(
+                        "Machine readiness sender is not the pinned supervisor",
+                    ));
+                }
+                expected.ensure_same_generation().map_err(|error| {
+                    Status::failed_precondition(format!("Machine supervisor changed: {error}"))
+                })?;
+                let mut bytes = Vec::new();
+                stream
+                    .take(4097)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(|error| Status::internal(format!("Machine ready read: {error}")))?;
+                crate::container_exec::machine::decode_ready(
+                    &bytes,
+                    &self.challenge,
+                    expected.start_time(),
+                )
+                .map_err(|error| Status::failed_precondition(error.to_string()))
+            },
+        )
+        .await
+    }
 }
 
 #[cfg(any(target_os = "linux", test))]
@@ -269,7 +306,10 @@ impl<C: PendingPipeProcess> PendingPipeChild<C> {
     fn with_request_permit(child: C, request_permit: Option<ExecRequestPermit>) -> Self {
         Self {
             child: Some(child),
-            request_permit: RetainedExecRequestPermit(request_permit),
+            request_permit: RetainedExecRequestPermit {
+                permit: request_permit,
+                preserve_supervisor: false,
+            },
         }
     }
 
@@ -333,15 +373,18 @@ enum PendingChildCleanupOutcome {
 }
 
 #[derive(Default)]
-struct RetainedExecRequestPermit(Option<ExecRequestPermit>);
+struct RetainedExecRequestPermit {
+    permit: Option<ExecRequestPermit>,
+    preserve_supervisor: bool,
+}
 
 impl RetainedExecRequestPermit {
     fn take_for_publish(&mut self) -> Option<ExecRequestPermit> {
-        self.0.take()
+        self.permit.take()
     }
 
     fn fence_after_reap(mut self) {
-        drop(self.0.take());
+        drop(self.permit.take());
     }
 }
 
@@ -351,7 +394,7 @@ impl Drop for RetainedExecRequestPermit {
         // only safe state: fencing would incorrectly assert that no child can
         // still exist. The permit is released explicitly only after reap proof
         // or transferred for publication.
-        if let Some(permit) = self.0.take() {
+        if let Some(permit) = self.permit.take() {
             std::mem::forget(permit);
         }
     }
@@ -386,7 +429,10 @@ fn drive_pending_pipe_cleanup<C: PendingPipeProcess>(
     let force_deadline = std::time::Instant::now();
     loop {
         request_pending_child_force_cancel(pid);
-        if std::time::Instant::now() >= force_deadline {
+        // Machine supervisors themselves are the descendant-reap authority.
+        // Never SIGKILL that authority just because the bounded caller timed
+        // out: keep signalling its owned group and retain uncertainty instead.
+        if !request_permit.preserve_supervisor && std::time::Instant::now() >= force_deadline {
             if let Err(error) = child.start_kill() {
                 warn!(?pid, %error, "grpc: pending pipe child kill failed; retaining and retrying");
             }
@@ -466,7 +512,6 @@ fn request_pending_child_force_cancel(pid: Option<u32>) {
         // cannot be recycled between lookup and delivery.
         // SAFETY: kill receives the exact positive PID returned by Child::id.
         let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGRTMIN()) };
-        return;
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -559,7 +604,7 @@ fn drive_pending_pty_cleanup(
     let force_deadline = std::time::Instant::now();
     loop {
         request_pending_child_force_cancel(pid);
-        if std::time::Instant::now() >= force_deadline {
+        if !request_permit.preserve_supervisor && std::time::Instant::now() >= force_deadline {
             if let Err(error) = child.kill() {
                 warn!(?pid, %error, "grpc: pending PTY child kill failed; retaining and retrying");
             }
@@ -639,7 +684,10 @@ impl PendingPtyChild {
     ) -> Self {
         Self {
             child: Some(child),
-            request_permit: RetainedExecRequestPermit(request_permit),
+            request_permit: RetainedExecRequestPermit {
+                permit: request_permit,
+                preserve_supervisor: false,
+            },
         }
     }
 
@@ -1491,6 +1539,51 @@ fn prepare_agent_exec(
     req: &ExecRequest,
     ready_handshake: Option<(&str, &str)>,
 ) -> Result<PreparedAgentExec, Status> {
+    if req.supervised_machine {
+        if req.container_target.is_some() {
+            return Err(Status::invalid_argument(
+                "Machine and container execution targets are mutually exclusive",
+            ));
+        }
+        #[cfg(any(target_os = "linux", test))]
+        {
+            if req.env.iter().any(|(key, value)| {
+                key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
+            }) {
+                return Err(Status::invalid_argument(
+                    "Machine exec environment contains an invalid key or NUL byte",
+                ));
+            }
+            let handshake = ready_handshake.ok_or_else(|| {
+                Status::invalid_argument("Machine execution requires authenticated readiness")
+            })?;
+            let command = crate::container_exec::machine::prepare(
+                &req.command,
+                &req.args,
+                &req.working_dir,
+                &req.user,
+                handshake,
+            )
+            .map_err(|error| Status::invalid_argument(error.to_string()))?;
+            return Ok(PreparedAgentExec {
+                command: command.program,
+                args: command.args,
+                spawn_working_dir: Some("/".to_string()),
+                spawn_user: None,
+                spawn_environment: req
+                    .env
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect(),
+                clear_environment: false,
+                container_targeted: false,
+            });
+        }
+        #[cfg(not(any(target_os = "linux", test)))]
+        return Err(Status::unimplemented(
+            "supervised Machine execution requires a Linux guest",
+        ));
+    }
     if let Some(target) = &req.container_target {
         let spec = normalized_container_exec(
             &target.container_id,
@@ -1595,7 +1688,7 @@ impl AgentServiceImpl {
             None
         };
         #[cfg(target_os = "linux")]
-        let ready_listener = if req.container_target.is_some() {
+        let ready_listener = if req.container_target.is_some() || req.supervised_machine {
             match ContainerReadyListener::bind() {
                 Ok(listener) => Some(listener),
                 Err(error) => {
@@ -1630,7 +1723,7 @@ impl AgentServiceImpl {
             None,
         ) {
             Ok(launch) => launch,
-            Err(error) if req.container_target.is_some() => {
+            Err(error) if req.container_target.is_some() || req.supervised_machine => {
                 return Ok(definite_exec_rejection(
                     &request_id,
                     format!("container pipe exec rejected before spawn: {error}"),
@@ -1676,6 +1769,7 @@ impl AgentServiceImpl {
             }
         };
         let mut pending_child = PendingPipeChild::with_request_permit(child, request_permit.take());
+        pending_child.request_permit.preserve_supervisor = req.supervised_machine;
 
         info!(request_id = %request_id, command = %launch.command, arg_count = launch.args.len(), container_targeted = launch.container_targeted, "grpc: process spawned");
 
@@ -1697,7 +1791,33 @@ impl AgentServiceImpl {
         };
 
         #[cfg(target_os = "linux")]
-        let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
+        let (ready_generation, process_identity) = if req.supervised_machine {
+            let Some(listener) = ready_listener else {
+                return reject_pending_pipe(
+                    pending_child,
+                    &request_id,
+                    Status::internal("Machine execution lost its readiness listener"),
+                )
+                .await;
+            };
+            let identity = match SpawnedProcessIdentity::capture(spawned_pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return reject_pending_pipe(
+                        pending_child,
+                        &request_id,
+                        Status::failed_precondition(format!(
+                            "Machine supervisor identity unavailable: {error}"
+                        )),
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = listener.wait_machine(&identity).await {
+                return reject_pending_pipe(pending_child, &request_id, error).await;
+            }
+            (None, identity.into_process_identity())
+        } else if let Some(listener) = ready_listener {
             let Some(target) = req.container_target.as_ref() else {
                 let rejection = Status::internal("ready listener lost container target");
                 return reject_pending_pipe(pending_child, &request_id, rejection).await;
@@ -1745,7 +1865,7 @@ impl AgentServiceImpl {
 
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<ExecEvent, Status>>(64);
         #[cfg(target_os = "linux")]
-        let initial_sequence = u64::from(ready_generation.is_some());
+        let initial_sequence = u64::from(ready_generation.is_some() || req.supervised_machine);
         #[cfg(not(target_os = "linux"))]
         let initial_sequence = 0;
 
@@ -1765,7 +1885,7 @@ impl AgentServiceImpl {
                 child,
                 stdin,
                 process_identity,
-                launch.container_targeted,
+                launch.container_targeted || req.supervised_machine,
             );
             if let Some(permit) = retained_permit.take_for_publish() {
                 permit.publish(exec_id);
@@ -1778,6 +1898,15 @@ impl AgentServiceImpl {
                     event: Some(exec_event::Event::ContainerReady(ContainerExecReady {
                         generation: Some(generation),
                     })),
+                    sequence: 1,
+                    request_id: request_id.clone(),
+                    exec_id,
+                }))
+                .await;
+        } else if req.supervised_machine {
+            let _ = tx
+                .send(Ok(ExecEvent {
+                    event: Some(exec_event::Event::MachineReady(MachineExecReady {})),
                     sequence: 1,
                     request_id: request_id.clone(),
                     exec_id,
@@ -1942,7 +2071,7 @@ impl AgentServiceImpl {
             None
         };
         #[cfg(target_os = "linux")]
-        let ready_listener = if req.container_target.is_some() {
+        let ready_listener = if req.container_target.is_some() || req.supervised_machine {
             match ContainerReadyListener::bind() {
                 Ok(listener) => Some(listener),
                 Err(error) => {
@@ -1977,7 +2106,7 @@ impl AgentServiceImpl {
             None,
         ) {
             Ok(launch) => launch,
-            Err(error) if req.container_target.is_some() => {
+            Err(error) if req.container_target.is_some() || req.supervised_machine => {
                 return Ok(definite_exec_rejection(
                     &request_id,
                     format!("container PTY exec rejected before spawn: {error}"),
@@ -1998,7 +2127,7 @@ impl AgentServiceImpl {
 
         #[cfg(target_os = "linux")]
         if let Err(error) = ensure_devpts_ready() {
-            if req.container_target.is_some() {
+            if req.container_target.is_some() || req.supervised_machine {
                 return Ok(definite_exec_rejection(
                     &request_id,
                     format!("container PTY exec devpts rejected before spawn: {error}"),
@@ -2021,7 +2150,7 @@ impl AgentServiceImpl {
             pixel_height: 0,
         }) {
             Ok(pair) => pair,
-            Err(error) if req.container_target.is_some() => {
+            Err(error) if req.container_target.is_some() || req.supervised_machine => {
                 return Ok(definite_exec_rejection(
                     &request_id,
                     format!("container PTY exec openpty rejected before spawn: {error}"),
@@ -2078,6 +2207,7 @@ impl AgentServiceImpl {
             }
         };
         let mut pending_child = PendingPtyChild::new(child, request_permit.take());
+        pending_child.request_permit.preserve_supervisor = req.supervised_machine;
         info!(request_id = %request_id, "grpc: PTY process spawned");
 
         // Drop slave — only the child uses it.
@@ -2110,7 +2240,33 @@ impl AgentServiceImpl {
         );
 
         #[cfg(target_os = "linux")]
-        let (ready_generation, process_identity) = if let Some(listener) = ready_listener {
+        let (ready_generation, process_identity) = if req.supervised_machine {
+            let Some(listener) = ready_listener else {
+                return reject_pending_pty(
+                    pending_child,
+                    &request_id,
+                    Status::internal("Machine execution lost its readiness listener"),
+                )
+                .await;
+            };
+            let identity = match SpawnedProcessIdentity::capture(spawned_pid) {
+                Ok(identity) => identity,
+                Err(error) => {
+                    return reject_pending_pty(
+                        pending_child,
+                        &request_id,
+                        Status::failed_precondition(format!(
+                            "Machine supervisor identity unavailable: {error}"
+                        )),
+                    )
+                    .await;
+                }
+            };
+            if let Err(error) = listener.wait_machine(&identity).await {
+                return reject_pending_pty(pending_child, &request_id, error).await;
+            }
+            (None, identity.into_process_identity())
+        } else if let Some(listener) = ready_listener {
             let Some(target) = req.container_target.as_ref() else {
                 return reject_pending_pty(
                     pending_child,
@@ -2159,7 +2315,13 @@ impl AgentServiceImpl {
         // frame for backwards compatibility.
         #[cfg(target_os = "linux")]
         let first_event = ready_generation.map_or_else(
-            || exec_event::Event::Stdout(Vec::new()),
+            || {
+                if req.supervised_machine {
+                    exec_event::Event::MachineReady(MachineExecReady {})
+                } else {
+                    exec_event::Event::Stdout(Vec::new())
+                }
+            },
             |generation| {
                 exec_event::Event::ContainerReady(ContainerExecReady {
                     generation: Some(generation),
@@ -2220,7 +2382,12 @@ impl AgentServiceImpl {
             };
             // portable-pty Child isn't tokio-compatible, so we wrap it in the
             // process table as a waitable entry below instead.
-            let _ = table.insert_pty(exec_id, child, process_identity, launch.container_targeted);
+            let _ = table.insert_pty(
+                exec_id,
+                child,
+                process_identity,
+                launch.container_targeted || req.supervised_machine,
+            );
             if let Some(permit) = retained_permit.take_for_publish() {
                 permit.publish(exec_id);
             }
@@ -2472,7 +2639,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             "grpc: exec request routing"
         );
 
-        let request_permit = if req.container_target.is_some() {
+        let request_permit = if req.container_target.is_some() || req.supervised_machine {
             validate_container_exec_request_id(&request_id)?;
             let registry = self.state.process_table.lock().await.request_registry();
             match registry.claim(&request_id) {
@@ -2493,6 +2660,20 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         } else {
             None
         };
+
+        if req.supervised_machine && req.container_target.is_some() {
+            return Ok(definite_exec_rejection(
+                &request_id,
+                "Machine and container execution targets are mutually exclusive".to_string(),
+            ));
+        }
+        #[cfg(not(target_os = "linux"))]
+        if req.supervised_machine {
+            return Ok(definite_exec_rejection(
+                &request_id,
+                "supervised Machine execution requires a Linux guest".to_string(),
+            ));
+        }
 
         if req.allocate_pty {
             self.exec_pty(req, request_id, request_permit).await
@@ -2791,6 +2972,39 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         }
     }
 
+    type DockerForwardStream = crate::docker_forward::DockerForwardStream;
+
+    async fn docker_forward(
+        &self,
+        request: Request<tonic::Streaming<DockerForwardFrame>>,
+    ) -> Result<Response<Self::DockerForwardStream>, Status> {
+        let mut inbound = request.into_inner();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(5), inbound.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("Docker open timed out"))??;
+        match first.and_then(|frame| frame.frame) {
+            Some(docker_forward_frame::Frame::Open(open))
+                if open
+                    .metadata
+                    .as_ref()
+                    .is_some_and(|metadata| !metadata.request_id.is_empty()) => {}
+            _ => {
+                return Err(Status::invalid_argument(
+                    "first Docker frame must be Open with request metadata",
+                ));
+            }
+        }
+        let target = self
+            .state
+            .docker_supervisor
+            .connect_forward()
+            .await
+            .map_err(|error| {
+                Status::failed_precondition(format!("Docker forwarding unavailable: {error}"))
+            })?;
+        Ok(Response::new(crate::docker_forward::start(inbound, target)))
+    }
+
     type PortForwardStream = ReceiverStream<Result<PortForwardFrame, Status>>;
 
     async fn port_forward(
@@ -2994,7 +3208,7 @@ impl oci_service_server::OciService for OciServiceImpl {
         );
 
         // Patch the OCI config to work in the minimal guest VM kernel.
-        let config_path = format!("{}/config.json", &req.bundle_path);
+        let config_path = format!("{}/config.json", req.bundle_path);
         match patch_oci_config(&config_path).await {
             Ok(()) => info!(container_id = %req.container_id, "oci: config patched for guest VM"),
             Err(e) => {
@@ -3802,7 +4016,10 @@ mod tests {
         let mut permit = registry.claim(&request_id).unwrap();
         permit.authorize_start().unwrap();
         let (mut child, state) = pending_pipe_test_child(0, false);
-        child.request_permit = RetainedExecRequestPermit(Some(permit));
+        child.request_permit = RetainedExecRequestPermit {
+            permit: Some(permit),
+            preserve_supervisor: false,
+        };
         let error = reject_pending_pipe_with_timeout(
             child,
             &request_id,
@@ -4038,7 +4255,10 @@ mod tests {
         state
             .allow_reap
             .store(false, std::sync::atomic::Ordering::Release);
-        child.request_permit = RetainedExecRequestPermit(Some(permit));
+        child.request_permit = RetainedExecRequestPermit {
+            permit: Some(permit),
+            preserve_supervisor: false,
+        };
         let error = reject_pending_pty_with_timeout(
             child,
             &request_id,
@@ -4155,6 +4375,7 @@ mod tests {
             container_target: container_id.map(|container_id| ContainerExecTarget {
                 container_id: container_id.to_string(),
             }),
+            supervised_machine: false,
         }
     }
 
@@ -4173,6 +4394,127 @@ mod tests {
                 .map(OsString::from)
                 .collect::<Vec<_>>()
         ));
+    }
+
+    #[test]
+    fn explicit_machine_mode_selects_supervision_without_container_identity() {
+        for pty in [false, true] {
+            let mut req = exec_request(None, pty);
+            req.supervised_machine = true;
+            let challenge = "a".repeat(64);
+            let launch =
+                prepare_agent_exec(&req, Some(("/run/vz-agent-exec/test.sock", &challenge)))
+                    .unwrap();
+            assert!(!launch.container_targeted);
+            assert!(launch.spawn_user.is_none());
+            let args = launch.args.iter().map(OsString::from).collect::<Vec<_>>();
+            assert!(crate::container_exec::machine::is_request(&args));
+            assert!(!crate::container_exec::is_trampoline_request(&args));
+            assert!(prepare_agent_exec(&req, None).is_err());
+            req.container_target = Some(ContainerExecTarget {
+                container_id: "web".into(),
+            });
+            assert!(
+                prepare_agent_exec(&req, Some(("/run/vz-agent-exec/test.sock", &challenge)))
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_request_claims_and_fences_the_same_exact_guest_ticket_journal() {
+        use vz_agent_proto::agent_service_server::AgentService as _;
+        let process_table = Arc::new(Mutex::new(ProcessTable::new()));
+        let service = AgentServiceImpl::new(SharedState {
+            process_table: Arc::clone(&process_table),
+            docker_supervisor: Arc::new(crate::docker::DockerSupervisor::new()),
+        });
+        let registry = process_table.lock().await.request_registry();
+        for pty in [false, true] {
+            let ticket = registry.allocate_request_id().unwrap();
+            let permit = registry.claim(&ticket).unwrap();
+            let request = || {
+                Request::new(ExecRequest {
+                    supervised_machine: true,
+                    allocate_pty: pty,
+                    metadata: Some(TransportMetadata {
+                        request_id: ticket.clone(),
+                        idempotency_key: String::new(),
+                    }),
+                    ..ExecRequest::default()
+                })
+            };
+            assert_eq!(
+                service.exec(request()).await.unwrap_err().code(),
+                tonic::Code::AlreadyExists
+            );
+            drop(permit);
+            let mut rx = service
+                .exec(request())
+                .await
+                .unwrap()
+                .into_inner()
+                .into_inner();
+            let event = rx.recv().await.unwrap().unwrap();
+            assert_eq!(event.request_id, ticket);
+            assert_eq!(event.exec_id, 0);
+            assert!(matches!(event.event, Some(exec_event::Event::Error(_))));
+            assert_eq!(
+                registry.reconcile(&ticket),
+                ExecRequestReconcile::FencedNeverStarted
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn machine_pending_pipe_keeps_supervisor_and_ticket_after_timeout() {
+        let registry = ProcessTable::new().request_registry();
+        let ticket = registry.allocate_request_id().unwrap();
+        let mut permit = registry.claim(&ticket).unwrap();
+        permit.authorize_start().unwrap();
+        let (mut child, state) = pending_pipe_test_child(0, false);
+        child.request_permit = RetainedExecRequestPermit {
+            permit: Some(permit),
+            preserve_supervisor: true,
+        };
+        let result = child
+            .terminate_and_reap_with_timeout(
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+        assert_eq!(result, PendingChildCleanupOutcome::Retained);
+        assert_eq!(registry.reconcile(&ticket), ExecRequestReconcile::Starting);
+        assert_eq!(state.kills.load(Ordering::Acquire), 0);
+        state.allow_reap.store(true, Ordering::Release);
+        await_pending_pipe_test_reap(&state).await;
+        assert_eq!(state.kills.load(Ordering::Acquire), 0);
+    }
+
+    #[tokio::test]
+    async fn machine_pending_pty_keeps_supervisor_and_ticket_after_timeout() {
+        let registry = ProcessTable::new().request_registry();
+        let ticket = registry.allocate_request_id().unwrap();
+        let mut permit = registry.claim(&ticket).unwrap();
+        permit.authorize_start().unwrap();
+        let (mut child, state) = pending_pty_test_child(0, 1, 0);
+        state.allow_reap.store(false, Ordering::Release);
+        child.request_permit = RetainedExecRequestPermit {
+            permit: Some(permit),
+            preserve_supervisor: true,
+        };
+        let result = child
+            .terminate_and_reap_with_timeout(
+                std::time::Duration::from_millis(10),
+                std::time::Duration::from_millis(1),
+            )
+            .await;
+        assert_eq!(result, PendingChildCleanupOutcome::Retained);
+        assert_eq!(registry.reconcile(&ticket), ExecRequestReconcile::Starting);
+        assert_eq!(state.kills.load(Ordering::Acquire), 0);
+        state.allow_reap.store(true, Ordering::Release);
+        await_pending_pty_test_reap(&state).await;
+        assert_eq!(state.kills.load(Ordering::Acquire), 0);
     }
 
     #[test]

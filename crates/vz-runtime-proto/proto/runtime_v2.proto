@@ -1,7 +1,7 @@
 // Runtime V2 gRPC service definitions for the vz control plane.
 //
 // Runtime V2 service groups include:
-//   - TopologyService:   read-only Developer Environment topology lookup
+//   - TopologyService:   Developer Environment lookup and streamed Stop
 //   - SandboxService:    sandbox lifecycle (create, get, list, terminate)
 //   - LeaseService:      lease management (open, heartbeat, close)
 //   - ContainerService:  container lifecycle (create, get, list, remove)
@@ -452,10 +452,121 @@ message ProjectState {
   repeated EnvironmentInstance environments = 3;
 }
 
-// Read-only Developer Environment topology queries. Lifecycle mutations are
-// intentionally excluded until the daemon owns their backend execution path.
+// Developer Environment queries and daemon-owned topology lifecycle.
 service TopologyService {
   rpc GetProjectState(GetProjectStateRequest) returns (GetProjectStateResponse);
+  // Disconnect cancels observation, not the admitted Stop. Replay with the
+  // same request/idempotency IDs resumes the durable operation or its receipt.
+  rpc StopEnvironment(StopEnvironmentRequest) returns (stream StopEnvironmentEvent);
+  // First frame opens one exact Machine execution. Subsequent frames control
+  // only that execution; disconnect requests cancellation and terminal reap.
+  rpc ExecMachine(stream MachineExecFrame) returns (stream MachineExecEvent);
+}
+
+message MachineExecutionTerminal {
+  uint32 rows = 1;
+  uint32 columns = 2;
+}
+
+message MachineExecutionSpec {
+  repeated string argv = 1;
+  map<string, string> environment = 2;
+  optional string working_directory = 3;
+  optional string user = 4;
+  optional MachineExecutionTerminal terminal = 5;
+  uint64 timeout_millis = 6;
+}
+
+message MachineExecOpen {
+  string project_id = 1;
+  optional string environment = 2;
+  optional string process_environment_id = 3;
+  optional string workspace_key = 4;
+  optional string machine = 5;
+  optional string process_machine_id = 6;
+  MachineExecutionSpec spec = 7;
+}
+
+message MachineExecFrame {
+  RequestMetadata metadata = 1;
+  uint64 sequence = 2;
+  // Empty only on the first Open frame; exact accepted ID on every control.
+  string execution_id = 3;
+  oneof payload {
+    MachineExecOpen open = 4;
+    bytes stdin = 5;
+    bool stdin_eof = 6;
+    int32 signal = 7;
+    MachineExecutionTerminal resize = 8;
+    bool cancel = 9;
+  }
+}
+
+message MachineExecutionScope {
+  uint32 schema_version = 1;
+  string execution_id = 2;
+  string request_id = 3;
+  string idempotency_key = 4;
+  string request_hash = 5;
+  string project_id = 6;
+  string environment_id = 7;
+  string machine_id = 8;
+  uint64 environment_generation = 9;
+  MachineIncarnation incarnation = 10;
+  MachineRuntimeIdentity runtime_identity = 11;
+  string definition_digest = 12;
+}
+
+enum MachineExecutionState {
+  MACHINE_EXECUTION_STATE_UNSPECIFIED = 0;
+  MACHINE_EXECUTION_STATE_ADMITTED = 1;
+  MACHINE_EXECUTION_STATE_COMPLETED = 2;
+  MACHINE_EXECUTION_STATE_UNCERTAIN = 3;
+  MACHINE_EXECUTION_STATE_QUIESCED = 4;
+}
+
+message MachineExecutionReceipt {
+  MachineExecutionScope scope = 1;
+  MachineExecutionState state = 2;
+  optional int32 exit_code = 3;
+  optional string failure = 4;
+  bool output_replay_available = 5;
+  uint64 created_at = 6;
+  uint64 updated_at = 7;
+}
+
+message MachineExecEvent {
+  uint32 schema_version = 1;
+  MachineExecutionScope scope = 2;
+  uint64 sequence = 3;
+  // Only a stored terminal receipt may be replayed; output is not retained.
+  bool replayed = 4;
+  oneof payload {
+    bool ready = 5;
+    bytes stdout = 6;
+    bytes stderr = 7;
+    MachineExecutionReceipt receipt = 8;
+  }
+}
+
+message StopEnvironmentRequest {
+  RequestMetadata metadata = 1;
+  string project_id = 2;
+  optional string environment = 3;
+  optional string process_environment_id = 4;
+  optional string workspace_key = 5;
+  // Bounded physical Stop deadline per Machine, 1..300000 milliseconds.
+  uint64 machine_timeout_millis = 6;
+}
+
+message StopEnvironmentEvent {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  uint64 sequence = 3;
+  EnvironmentLifecycleOperation operation = 4;
+  bool terminal = 5;
+  // Present for a failed terminal operation, never a successful receipt.
+  optional ErrorDetail error = 6;
 }
 
 message GetProjectStateRequest {

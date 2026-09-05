@@ -24,7 +24,9 @@ $(error unsupported KERNEL_PROFILE '$(KERNEL_PROFILE)'; expected developer or co
 endif
 
 OUT_DIR ?= $(DEFAULT_OUT_DIR)
+ALL_OUT_DIR ?= $(ROOT_DIR)/out
 SRC_DIR ?= $(ROOT_DIR)/src
+BUILD_DIR ?= $(SRC_DIR)/build
 CACHE_DIR ?= $(ROOT_DIR)/.cache
 TRUST_EXISTING_KERNEL_IMAGE ?= 0
 
@@ -38,21 +40,26 @@ JOBS ?= $(shell getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/de
 include $(ROOT_DIR)/kernel-version.mk
 KERNEL_URL ?= https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-$(KERNEL_VERSION).tar.xz
 KERNEL_ARCHIVE := $(CACHE_DIR)/linux-$(KERNEL_VERSION).tar.xz
-KERNEL_SRC := $(SRC_DIR)/linux-$(KERNEL_VERSION)
+KERNEL_SRC := $(SRC_DIR)/linux-$(KERNEL_VERSION)-$(KERNEL_ARCHIVE_SHA256)
+KERNEL_BUILD_DIR := $(BUILD_DIR)/$(KERNEL_PROFILE)/linux-$(KERNEL_VERSION)
 KERNEL_IMAGE := $(OUT_DIR)/vmlinux
 
 BUSYBOX_VERSION ?= 1.37.0
 BUSYBOX_URL ?= https://busybox.net/downloads/busybox-$(BUSYBOX_VERSION).tar.bz2
 BUSYBOX_ARCHIVE := $(CACHE_DIR)/busybox-$(BUSYBOX_VERSION).tar.bz2
-BUSYBOX_SRC := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)
+# https://busybox.net/downloads/busybox-1.37.0.tar.bz2.sha256
+BUSYBOX_ARCHIVE_SHA256 ?= 3311dff32e746499f4df0d5df04d7eb396382d7e108bb9250e7b519b837043a4
+BUSYBOX_SRC := $(SRC_DIR)/busybox-$(BUSYBOX_VERSION)-$(BUSYBOX_ARCHIVE_SHA256)
+BUSYBOX_BUILD_DIR := $(BUILD_DIR)/$(KERNEL_PROFILE)/busybox-$(BUSYBOX_VERSION)
 BUSYBOX_BINARY := $(OUT_DIR)/busybox
+SOURCE_BUILD_HELPER := $(ROOT_DIR)/source-build.py
+SOURCE_BUILD_RECIPES := --recipe "$(ROOT_DIR)/Makefile" --recipe "$(ROOT_DIR)/Dockerfile" \
+	--recipe "$(ROOT_DIR)/kernel-version.mk" --recipe "$(SOURCE_BUILD_HELPER)" \
+	--recipe "$(ROOT_DIR)/docker-build.sh"
 
-YOUKI_VERSION ?= 0.5.7
-YOUKI_RELEASE_ARCHIVE := youki-$(YOUKI_VERSION)-aarch64-musl.tar.gz
-YOUKI_URL ?= https://github.com/youki-dev/youki/releases/download/v$(YOUKI_VERSION)/$(YOUKI_RELEASE_ARCHIVE)
-YOUKI_ARCHIVE := $(CACHE_DIR)/$(YOUKI_RELEASE_ARCHIVE)
-YOUKI_ARCHIVE_SHA256 ?= b3002d9d39b04f797e783745f92cffec9e0caa464254be98aa0b4dfc184f0233
+YOUKI_VERSION := $(shell sed -n 's/^YOUKI_VERSION=//p' $(ROOT_DIR)/youki/inputs.env)
 YOUKI_BINARY := $(OUT_DIR)/youki
+YOUKI_RECIPE := $(ROOT_DIR)/youki/build.sh
 
 IPTABLES_VERSION ?= 1.8.13
 IPTABLES_RELEASE_ARCHIVE := iptables-$(IPTABLES_VERSION).tar.xz
@@ -105,7 +112,7 @@ help:
 	@echo "  make kernel         Build only Linux kernel image"
 	@echo "  make kernel-config-summary  Generate .config and print enabled option counts"
 	@echo "  make initramfs      Build only initramfs image"
-	@echo "  make youki          Download pinned youki linux/arm64 runtime binary"
+	@echo "  make youki          Build/verify pinned static youki with v2, devices, seccomp"
 	@echo "  make iptables        Build pinned static iptables for the developer guest"
 	@echo "  make version        Generate version.json"
 	@echo "  make docker-build   Build selected profile artifacts in Docker"
@@ -120,8 +127,8 @@ help:
 all: $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(VERSION_JSON)
 
 all-profiles:
-	$(MAKE) KERNEL_PROFILE=developer all
-	$(MAKE) KERNEL_PROFILE=container all
+	$(MAKE) KERNEL_PROFILE=developer OUT_DIR="$(ALL_OUT_DIR)" all
+	$(MAKE) KERNEL_PROFILE=container OUT_DIR="$(ALL_OUT_DIR)/container" all
 
 dirs:
 	mkdir -p "$(OUT_DIR)" "$(SRC_DIR)" "$(CACHE_DIR)"
@@ -130,73 +137,68 @@ $(KERNEL_ARCHIVE): | dirs
 	@echo "Downloading Linux kernel $(KERNEL_VERSION)"
 	curl -fL "$(KERNEL_URL)" -o "$@"
 
-$(KERNEL_SRC)/.extracted: $(KERNEL_ARCHIVE) | dirs
-	rm -rf "$(KERNEL_SRC)"
-	tar -xf "$(KERNEL_ARCHIVE)" -C "$(SRC_DIR)"
-	touch "$@"
+.PHONY: kernel-source-verify busybox-source-verify kernel-cache-verify source-check
+source-check: kernel-source-verify busybox-source-verify
+
+kernel-source-verify: $(KERNEL_ARCHIVE) | dirs
+	python3 "$(SOURCE_BUILD_HELPER)" prepare --archive "$(KERNEL_ARCHIVE)" \
+		--sha256 "$(KERNEL_ARCHIVE_SHA256)" --root-name "linux-$(KERNEL_VERSION)" \
+		--destination "$(KERNEL_SRC)" --build-dir "$(KERNEL_BUILD_DIR)"
 
 ifeq ($(TRUST_EXISTING_KERNEL_IMAGE),1)
-$(KERNEL_IMAGE):
-	@test -s "$(KERNEL_IMAGE)" || { echo "missing cached kernel image for $(KERNEL_PROFILE): $(KERNEL_IMAGE)" >&2; exit 1; }
+kernel-cache-verify:
+	python3 "$(SOURCE_BUILD_HELPER)" verify --kind kernel --artifact "$(KERNEL_IMAGE)" \
+		--profile "$(KERNEL_PROFILE)" --sha256 "$(KERNEL_ARCHIVE_SHA256)" \
+		--arch "$(ARCH)" --cross-compile="$(CROSS_COMPILE)" --base-config "$(KERNEL_BASE_CONFIG)" \
+		--config "$(KERNEL_CONFIG_FRAGMENT)" $(SOURCE_BUILD_RECIPES)
+$(KERNEL_IMAGE): kernel-cache-verify
 else
-$(KERNEL_IMAGE): $(KERNEL_SRC)/.extracted $(KERNEL_CONFIG_FRAGMENT)
+$(KERNEL_IMAGE): kernel-source-verify $(KERNEL_CONFIG_FRAGMENT)
 	@echo "Building Linux kernel image ($(KERNEL_PROFILE) profile)"
-	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) $(KERNEL_BASE_CONFIG)
-	cd "$(KERNEL_SRC)" && scripts/kconfig/merge_config.sh -m .config "$(KERNEL_CONFIG_FRAGMENT)"
-	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
-	cd "$(KERNEL_SRC)" && make -j"$(JOBS)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) Image
-	cp "$(KERNEL_SRC)/arch/arm64/boot/Image" "$(KERNEL_IMAGE)"
+	python3 "$(SOURCE_BUILD_HELPER)" build --kind kernel --artifact "$(KERNEL_IMAGE)" \
+		--profile "$(KERNEL_PROFILE)" --archive "$(KERNEL_ARCHIVE)" --sha256 "$(KERNEL_ARCHIVE_SHA256)" \
+		--source "$(KERNEL_SRC)" --build-dir "$(KERNEL_BUILD_DIR)" --arch "$(ARCH)" \
+		--cross-compile="$(CROSS_COMPILE)" --jobs "$(JOBS)" --base-config "$(KERNEL_BASE_CONFIG)" \
+		--config "$(KERNEL_CONFIG_FRAGMENT)" $(SOURCE_BUILD_RECIPES)
 endif
 
 kernel: $(KERNEL_IMAGE)
 
-kernel-config-summary: $(KERNEL_SRC)/.extracted $(KERNEL_CONFIG_FRAGMENT)
+kernel-config-summary: kernel-source-verify $(KERNEL_CONFIG_FRAGMENT)
 	@echo "Generating Linux kernel config summary ($(KERNEL_PROFILE) profile)"
-	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) $(KERNEL_BASE_CONFIG)
-	cd "$(KERNEL_SRC)" && scripts/kconfig/merge_config.sh -m .config "$(KERNEL_CONFIG_FRAGMENT)"
-	cd "$(KERNEL_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
+	$(MAKE) -C "$(KERNEL_SRC)" O="$(KERNEL_BUILD_DIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) $(KERNEL_BASE_CONFIG)
+	cd "$(KERNEL_BUILD_DIR)" && "$(KERNEL_SRC)/scripts/kconfig/merge_config.sh" -m -O "$(KERNEL_BUILD_DIR)" .config "$(KERNEL_CONFIG_FRAGMENT)"
+	$(MAKE) -C "$(KERNEL_SRC)" O="$(KERNEL_BUILD_DIR)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) olddefconfig
 	@awk '\
 		/^CONFIG_/ && /=y$$/ { y++ } \
 		/^CONFIG_/ && /=m$$/ { m++ } \
 		/^# CONFIG_/ && / is not set$$/ { n++ } \
 		END { printf "profile=$(KERNEL_PROFILE) enabled_y=%d enabled_m=%d disabled=%d\n", y+0, m+0, n+0 } \
-	' "$(KERNEL_SRC)/.config"
+	' "$(KERNEL_BUILD_DIR)/.config"
 
 $(BUSYBOX_ARCHIVE): | dirs
 	@echo "Downloading BusyBox $(BUSYBOX_VERSION)"
 	curl -fL "$(BUSYBOX_URL)" -o "$@"
 
-$(BUSYBOX_SRC)/.extracted: $(BUSYBOX_ARCHIVE) | dirs
-	rm -rf "$(BUSYBOX_SRC)"
-	tar -xf "$(BUSYBOX_ARCHIVE)" -C "$(SRC_DIR)"
-	touch "$@"
+busybox-source-verify: $(BUSYBOX_ARCHIVE) | dirs
+	python3 "$(SOURCE_BUILD_HELPER)" prepare --archive "$(BUSYBOX_ARCHIVE)" \
+		--sha256 "$(BUSYBOX_ARCHIVE_SHA256)" --root-name "busybox-$(BUSYBOX_VERSION)" \
+		--destination "$(BUSYBOX_SRC)" --build-dir "$(BUSYBOX_BUILD_DIR)"
 
-$(BUSYBOX_BINARY): $(BUSYBOX_SRC)/.extracted
+$(BUSYBOX_BINARY): busybox-source-verify
 	@echo "Building BusyBox (static)"
-	cd "$(BUSYBOX_SRC)" && make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) defconfig
-	cd "$(BUSYBOX_SRC)" && sed -i.bak \
-		-e 's/^# CONFIG_STATIC is not set/CONFIG_STATIC=y/' \
-		-e 's/^CONFIG_SHA1_HWACCEL=y/# CONFIG_SHA1_HWACCEL is not set/' \
-		-e 's/^CONFIG_SHA256_HWACCEL=y/# CONFIG_SHA256_HWACCEL is not set/' \
-		.config && rm -f .config.bak
-	cd "$(BUSYBOX_SRC)" && (set +o pipefail; yes "" | make ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) oldconfig)
-	cd "$(BUSYBOX_SRC)" && make -j"$(JOBS)" ARCH=$(ARCH) CROSS_COMPILE=$(CROSS_COMPILE) busybox
-	cp "$(BUSYBOX_SRC)/busybox" "$(BUSYBOX_BINARY)"
+	python3 "$(SOURCE_BUILD_HELPER)" build --kind busybox --artifact "$(BUSYBOX_BINARY)" \
+		--profile "$(KERNEL_PROFILE)" --archive "$(BUSYBOX_ARCHIVE)" --sha256 "$(BUSYBOX_ARCHIVE_SHA256)" \
+		--source "$(BUSYBOX_SRC)" --build-dir "$(BUSYBOX_BUILD_DIR)" --arch "$(ARCH)" \
+		--cross-compile="$(CROSS_COMPILE)" --jobs "$(JOBS)" $(SOURCE_BUILD_RECIPES)
 
-$(YOUKI_ARCHIVE): | dirs
-	@echo "Downloading pinned youki $(YOUKI_VERSION) (linux/arm64 musl)"
-	curl -fL "$(YOUKI_URL)" -o "$@"
+# Always revalidate a cached candidate and existing output, including executable
+# mode. Timestamp-only reuse can retain a featureless or non-executable runtime.
+.PHONY: youki-verify
+youki-verify:
 
-$(YOUKI_BINARY): $(YOUKI_ARCHIVE) | dirs
-	@echo "Verifying and extracting youki runtime"
-	@ARCHIVE_SHA="$$(shasum -a 256 "$(YOUKI_ARCHIVE)" | cut -d' ' -f1)"; \
-	if [[ "$$ARCHIVE_SHA" != "$(YOUKI_ARCHIVE_SHA256)" ]]; then \
-		echo "youki archive checksum mismatch: expected $(YOUKI_ARCHIVE_SHA256), found $$ARCHIVE_SHA" >&2; \
-		exit 1; \
-	fi
-	rm -f "$(YOUKI_BINARY)"
-	tar -xzf "$(YOUKI_ARCHIVE)" -C "$(OUT_DIR)" youki
-	chmod +x "$(YOUKI_BINARY)"
+$(YOUKI_BINARY): youki-verify | dirs
+	bash "$(YOUKI_RECIPE)" --install "$(YOUKI_BINARY)"
 
 youki: $(YOUKI_BINARY)
 
@@ -204,6 +206,13 @@ $(IPTABLES_ARCHIVE): | dirs
 	@echo "Downloading pinned iptables $(IPTABLES_VERSION) source"
 	curl -fL "$(IPTABLES_URL)" -o "$@"
 
+ifeq ($(shell uname -s),Darwin)
+# Upstream contains xt_TCPMSS.h/xt_tcpmss.h and case-distinct extension sources.
+# A default macOS filesystem aliases those names and silently corrupts extraction.
+$(IPTABLES_BINARY): $(IPTABLES_ARCHIVE) $(ROOT_DIR)/Makefile $(ROOT_DIR)/iptables-build-darwin.sh | dirs
+	bash "$(ROOT_DIR)/iptables-build-darwin.sh" "$(REPO_ROOT)" "$(OUT_DIR)" \
+		"$(IPTABLES_ARCHIVE)" "$(IPTABLES_VERSION)" "$(IPTABLES_ARCHIVE_SHA256)" "$(DOCKER_BUILD_JOBS)"
+else
 $(IPTABLES_SRC)/.extracted: $(IPTABLES_ARCHIVE) | dirs
 	@echo "Verifying and extracting iptables $(IPTABLES_VERSION) source"
 	@ARCHIVE_SHA="$$(shasum -a 256 "$(IPTABLES_ARCHIVE)" | cut -d' ' -f1)"; \
@@ -249,6 +258,7 @@ $(IPTABLES_BINARY): $(IPTABLES_SRC)/.extracted $(ROOT_DIR)/Makefile | dirs
 		exit 1; \
 	fi
 	mv "$@.tmp" "$@"
+endif
 
 ifeq ($(KERNEL_PROFILE),developer)
 iptables: $(IPTABLES_BINARY)
@@ -322,28 +332,21 @@ $(VERSION_JSON): $(KERNEL_IMAGE) $(INITRAMFS_IMAGE) $(YOUKI_BINARY) $(ROOT_DIR)/
 version: $(VERSION_JSON)
 
 DOCKER_BUILD_JOBS ?= 4
+LINUX_DOCKER_TARGET ?= all
+ifeq ($(LINUX_DOCKER_TARGET),all)
+DOCKER_YOUKI_PREREQUISITE := youki
+else
+DOCKER_YOUKI_PREREQUISITE :=
+endif
 
-docker-build:
+docker-build: $(KERNEL_ARCHIVE) $(BUSYBOX_ARCHIVE) $(DOCKER_YOUKI_PREREQUISITE)
 	@echo "Building linux artifacts in Docker ($(KERNEL_PROFILE) profile, JOBS=$(DOCKER_BUILD_JOBS))"
-	docker build -t vz-linux-builder "$(ROOT_DIR)"
-	docker run --rm \
-		--ulimit nofile=1048576:1048576 \
-		-v "$(REPO_ROOT):/workspace" \
-		-w /workspace/linux \
-		vz-linux-builder \
-		make all KERNEL_PROFILE="$(KERNEL_PROFILE)" JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= \
-			GUEST_AGENT_BUILD_TOOL=cargo IPTABLES_SRC_DIR=/tmp/vz-iptables-src
+	bash "$(ROOT_DIR)/docker-build.sh" "$(REPO_ROOT)" "$(OUT_DIR)" "$(CACHE_DIR)" "$(KERNEL_PROFILE)" "$(DOCKER_BUILD_JOBS)"
 
 docker-build-all:
 	@echo "Building all linux artifact profiles in Docker (JOBS=$(DOCKER_BUILD_JOBS))"
-	docker build -t vz-linux-builder "$(ROOT_DIR)"
-	docker run --rm \
-		--ulimit nofile=1048576:1048576 \
-		-v "$(REPO_ROOT):/workspace" \
-		-w /workspace/linux \
-		vz-linux-builder \
-		make all-profiles JOBS="$(DOCKER_BUILD_JOBS)" CROSS_COMPILE= \
-			GUEST_AGENT_BUILD_TOOL=cargo IPTABLES_SRC_DIR=/tmp/vz-iptables-src
+	$(MAKE) KERNEL_PROFILE=developer OUT_DIR="$(ALL_OUT_DIR)" docker-build
+	$(MAKE) KERNEL_PROFILE=container OUT_DIR="$(ALL_OUT_DIR)/container" docker-build
 
 clean:
 	rm -rf "$(OUT_DIR)"

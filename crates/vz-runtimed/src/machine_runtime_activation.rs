@@ -43,6 +43,13 @@ pub struct MachineRuntimeActivation {
 }
 
 impl MachineRuntimeActivation {
+    pub(crate) fn execution_lease(&self) -> &SharedVmLifecycleLease {
+        &self.lease
+    }
+    pub(crate) fn entry(&self) -> &Arc<MachineRuntimeEntry<MacosRuntimeBackend>> {
+        &self.entry
+    }
+
     pub fn owner(&self) -> &ResourceOwner {
         self.entry.owner()
     }
@@ -59,6 +66,12 @@ impl MachineRuntimeActivation {
     /// created or inferred by this operation.
     pub async fn ensure_docker_ready(&self) -> Result<SharedVmDockerReadiness, OciError> {
         self.lease.ensure_docker_ready().await
+    }
+
+    /// Exact-boot Docker transport. An endpoint supervisor must retain this
+    /// activation for every live stream, then drain clients before stopping VM.
+    pub async fn open_docker_stream(&self) -> Result<vz_linux::GrpcDockerStream, OciError> {
+        self.lease.open_docker_stream().await
     }
 
     /// Execute in the exact leased guest without recursively acquiring a

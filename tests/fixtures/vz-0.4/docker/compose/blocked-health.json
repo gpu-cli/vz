@@ -1,0 +1,9 @@
+{
+  "services": {
+    "db": {
+      "environment": {
+        "FIXTURE_BLOCK_HEALTH": "1"
+      }
+    }
+  }
+}

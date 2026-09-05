@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 6;
+pub const AGENT_PROTOCOL_REVISION: u32 = 8;
 
 #[cfg(test)]
 mod tests {
@@ -87,10 +87,35 @@ mod tests {
             container_target: Some(ContainerExecTarget {
                 container_id: "svc-web".to_string(),
             }),
+            supervised_machine: false,
         };
         let encoded = msg.encode_to_vec();
         let decoded = ExecRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn supervised_machine_execution_has_distinct_wire_readiness() {
+        let request = ExecRequest {
+            command: "/bin/sh".to_string(),
+            supervised_machine: true,
+            ..ExecRequest::default()
+        };
+        let decoded = ExecRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+        assert!(decoded.supervised_machine);
+        assert!(decoded.container_target.is_none());
+        let event = ExecEvent {
+            event: Some(exec_event::Event::MachineReady(MachineExecReady {})),
+            exec_id: 9,
+            request_id: "ticket".to_string(),
+            sequence: 1,
+        };
+        let decoded = ExecEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+        assert_eq!(event, decoded);
+        assert!(matches!(
+            decoded.event,
+            Some(exec_event::Event::MachineReady(_))
+        ));
     }
 
     #[test]
@@ -271,6 +296,27 @@ mod tests {
         let encoded = msg.encode_to_vec();
         let decoded = DockerEnsureEvent::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    #[test]
+    fn docker_forward_frames_round_trip_without_destination_selectors() {
+        use docker_forward_frame::Frame;
+        for frame in [
+            Frame::Open(DockerForwardOpen {
+                metadata: Some(TransportMetadata {
+                    request_id: "docker-forward-1".to_string(),
+                    idempotency_key: String::new(),
+                }),
+            }),
+            Frame::Connected(DockerForwardConnected {}),
+            Frame::Data(vec![0, 255, 1, 128]),
+            Frame::Eof(DockerForwardEof {}),
+            Frame::WriteClosed(DockerForwardWriteClosed {}),
+        ] {
+            let message = DockerForwardFrame { frame: Some(frame) };
+            let decoded = DockerForwardFrame::decode(message.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(message, decoded);
+        }
     }
 
     // ── Port Forward ────────────────────────────────────────────

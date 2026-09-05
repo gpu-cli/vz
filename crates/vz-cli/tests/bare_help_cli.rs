@@ -7,6 +7,8 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const INSTALLED_CLI_ENV: &str = "VZ_TEST_INSTALLED_CLI";
+// Transitional DEV snapshot; deliberately not the five-verb release snapshot.
+const DEV_HELP_SNAPSHOT: &str = include_str!("fixtures/dev-help.txt");
 
 fn cli_binary() -> PathBuf {
     let Some(path) = std::env::var_os(INSTALLED_CLI_ENV).map(PathBuf::from) else {
@@ -106,6 +108,7 @@ fn bare_invocation_is_exact_static_help_without_state_or_daemon_access() {
     );
     assert!(bare.stderr.is_empty(), "bare vz must not write stderr");
     assert!(!bare.stdout.is_empty(), "bare vz must print top-level help");
+    assert_eq!(bare.stdout, DEV_HELP_SNAPSHOT.as_bytes());
     invocation.assert_unchanged();
 
     let explicit_help = invocation.run(&["--help"]);

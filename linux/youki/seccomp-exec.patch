@@ -1,0 +1,398 @@
+Locally authored vz seccomp exec correction for pinned youki 0.7.0.
+Not an upstream-reviewed backport. Preserve exact original profiles, select
+installation phase by NNP value, and separate read-only notify metadata from
+mutable init lifecycle state. Ordinary filters require no notification state.
+
+--- a/crates/libcontainer/src/container/builder_impl.rs
++++ b/crates/libcontainer/src/container/builder_impl.rs
+@@ -44,6 +44,8 @@
+     pub notify_path: PathBuf,
+     /// Container state
+     pub container: Option<Container>,
++    // Read-only original state for tenant seccomp notifications; never saved.
++    pub tenant_seccomp_state: Option<crate::container::State>,
+     /// File descriptos preserved/passed to the container init process.
+     pub preserve_fds: i32,
+     /// If the container is to be run in detached mode
+@@ -180,6 +182,7 @@
+             notify_listener,
+             preserve_fds: self.preserve_fds,
+             container: self.container.to_owned(),
++            tenant_seccomp_state: self.tenant_seccomp_state.clone(),
+             user_ns_config: self.user_ns_config.to_owned(),
+             cgroup_config,
+             detached: self.detached,
+--- a/crates/libcontainer/src/container/init_builder.rs
++++ b/crates/libcontainer/src/container/init_builder.rs
+@@ -123,6 +123,7 @@
+             user_ns_config,
+             notify_path,
+             container: Some(container.clone()),
++            tenant_seccomp_state: None,
+             preserve_fds: self.base.preserve_fds,
+             detached: self.detached,
+             executor: self.base.executor,
+--- a/crates/libcontainer/src/container/tenant_builder.rs
++++ b/crates/libcontainer/src/container/tenant_builder.rs
+@@ -277,6 +277,9 @@
+             user_ns_config,
+             notify_path: notify_path.clone(),
+             container: None,
++            // Do not populate container: builder_impl would persist exec's
++            // PID as init's PID. Notification metadata is immutable only.
++            tenant_seccomp_state: Some(container.state.clone()),
+             preserve_fds: self.base.preserve_fds,
+             detached: self.detached,
+             executor: self.base.executor,
+@@ -470,6 +473,12 @@
+             linux_builder = linux_builder.time_offsets(time_offsets.clone());
+         }
+ 
++        // setns does not inherit the init process's seccomp filters. Reapply
++        // the exact original policy to exec, including custom rules/flags.
++        if let Some(seccomp) = spec_linux.seccomp() {
++            linux_builder = linux_builder.seccomp(seccomp.clone());
++        }
++
+         let linux = linux_builder.build()?;
+         spec.set_process(Some(process)).set_linux(Some(linux));
+ 
+@@ -655,6 +664,74 @@
+             .collect();
+ 
+         TenantContainerBuilder::new(base).with_env(env_map)
++    }
++
++    fn assert_vz_tenant_seccomp_profile(profile: Option<oci_spec::runtime::LinuxSeccomp>) {
++        for from_process_file in [false, true] {
++            for no_new_privileges in [None, Some(false), Some(true)] {
++                let temporary = tempfile::tempdir().unwrap();
++                let mut spec = Spec::default();
++                let mut linux = spec.linux().clone().unwrap();
++                linux.set_seccomp(profile.clone());
++                spec.set_linux(Some(linux));
++                let mut process = spec.process().clone().unwrap();
++                process.set_no_new_privileges(no_new_privileges);
++                spec.set_process(Some(process));
++                let mut container = Container::default();
++                container.set_pid(nix::unistd::getpid().as_raw());
++                let mut builder =
++                    builder_with_env(&[]).with_container_args(vec!["/bin/true".into()]);
++                if from_process_file {
++                    let path = temporary.path().join("process.json");
++                    fs::write(
++                        &path,
++                        serde_json::to_vec(spec.process().as_ref().unwrap()).unwrap(),
++                    )
++                    .unwrap();
++                    builder = builder.with_process(Some(path));
++                }
++                builder
++                    .adapt_spec_for_tenant(&mut spec, &container)
++                    .unwrap();
++                assert_eq!(spec.linux().as_ref().unwrap().seccomp(), &profile);
++                assert_eq!(
++                    spec.process().as_ref().unwrap().no_new_privileges(),
++                    if from_process_file {
++                        no_new_privileges
++                    } else {
++                        no_new_privileges.or(Some(true))
++                    }
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn test_vz_exec_seccomp_preserves_default_profile() {
++        let fixture = Spec::load(
++            Path::new(env!("CARGO_MANIFEST_DIR")).join("src/seccomp/fixture/config.json"),
++        )
++        .unwrap();
++        let profile = fixture.linux().as_ref().unwrap().seccomp().clone();
++        assert!(profile.is_some());
++        assert_vz_tenant_seccomp_profile(profile);
++    }
++
++    #[test]
++    fn test_vz_exec_seccomp_preserves_custom_profile() {
++        let profile = serde_json::from_value(serde_json::json!({
++            "defaultAction": "SCMP_ACT_ALLOW",
++            "flags": ["SECCOMP_FILTER_FLAG_LOG"],
++            "architectures": ["SCMP_ARCH_AARCH64"],
++            "syscalls": [{"names": ["uname"], "action": "SCMP_ACT_ERRNO", "errnoRet": 99}]
++        }))
++        .unwrap();
++        assert_vz_tenant_seccomp_profile(Some(profile));
++    }
++
++    #[test]
++    fn test_vz_exec_seccomp_preserves_absent_profile() {
++        assert_vz_tenant_seccomp_profile(None);
+     }
+ 
+     // --- capabilities tests ---
+--- a/crates/libcontainer/src/process/args.rs
++++ b/crates/libcontainer/src/process/args.rs
+@@ -34,6 +34,7 @@
+     pub preserve_fds: i32,
+     /// Container state
+     pub container: Option<Container>,
++    pub(crate) tenant_seccomp_state: Option<crate::container::State>,
+     /// Options for new namespace creation
+     pub user_ns_config: Option<UserNamespaceConfig>,
+     /// Cgroup Manager Config
+--- a/crates/libcontainer/src/process/container_main_process.rs
++++ b/crates/libcontainer/src/process/container_main_process.rs
+@@ -49,6 +49,119 @@
+ 
+ type Result<T> = std::result::Result<T, ProcessError>;
+ 
++#[cfg(feature = "libseccomp")]
++fn seccomp_notification_state(
++    seccomp: Option<&oci_spec::runtime::LinuxSeccomp>,
++    original: Option<&crate::container::State>,
++    kind: ContainerType,
++    payload_pid: Pid,
++) -> Result<Option<oci_spec::runtime::ContainerProcessState>> {
++    let Some(seccomp) = seccomp.filter(|profile| crate::seccomp::is_notify(profile)) else {
++        // Ordinary filters need no listener and no lifecycle Container. In
++        // particular, tenant exec deliberately owns no mutable init state.
++        return Ok(None);
++    };
++    let original = original.ok_or(ProcessError::ContainerStateRequired)?;
++    let status = match kind {
++        ContainerType::InitContainer => oci_spec::runtime::ContainerState::Creating,
++        ContainerType::TenantContainer { .. } => oci_spec::runtime::ContainerState::Running,
++    };
++    let state = oci_spec::runtime::StateBuilder::default()
++        .version(OCI_VERSION)
++        .id(original.id.clone())
++        .status(status)
++        .pid(payload_pid.as_raw())
++        .bundle(original.bundle.clone())
++        .annotations(original.annotations.clone().unwrap_or_default())
++        .build()
++        .map_err(|error| ProcessError::OciStateBuild(error.to_string()))?;
++    Ok(Some(
++        oci_spec::runtime::ContainerProcessStateBuilder::default()
++            .version(OCI_VERSION)
++            .fds(vec![SECCOMP_FD_NAME.to_string()])
++            .pid(payload_pid.as_raw())
++            .metadata(seccomp.listener_metadata().clone().unwrap_or_default())
++            .state(state)
++            .build()
++            .map_err(|error| ProcessError::OciStateBuild(error.to_string()))?,
++    ))
++}
++
++#[cfg(all(test, feature = "libseccomp"))]
++mod vz_seccomp_notification_tests {
++    use super::*;
++
++    #[test]
++    fn test_vz_seccomp_non_notify_needs_no_container_state() {
++        let default_spec = oci_spec::runtime::Spec::load(
++            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/seccomp/fixture/config.json"),
++        )
++        .unwrap();
++        let default_profile = default_spec.linux().as_ref().unwrap().seccomp().clone();
++        let custom = serde_json::from_str(
++            r#"{"defaultAction":"SCMP_ACT_ALLOW","syscalls":[{"names":["readlinkat"],"action":"SCMP_ACT_ERRNO","errnoRet":13}]}"#,
++        ).unwrap();
++        for profile in [None, default_profile, Some(custom)] {
++            for kind in [
++                ContainerType::InitContainer,
++                ContainerType::TenantContainer { exec_notify_fd: -1 },
++            ] {
++                assert!(
++                    seccomp_notification_state(profile.as_ref(), None, kind, Pid::from_raw(42))
++                        .unwrap()
++                        .is_none()
++                );
++            }
++        }
++    }
++
++    #[test]
++    fn test_vz_seccomp_notify_uses_immutable_original_and_payload_pid() {
++        let profile = serde_json::from_str(
++            r#"{"defaultAction":"SCMP_ACT_ALLOW","listenerPath":"/listener","listenerMetadata":"exact-metadata","syscalls":[{"names":["uname"],"action":"SCMP_ACT_NOTIFY"}]}"#,
++        ).unwrap();
++        let mut original = crate::container::Container::default().state;
++        original.id = "exact-original-container".into();
++        original.bundle = PathBuf::from("/declared/bundle");
++        original.pid = Some(777);
++        original.annotations = Some(std::collections::HashMap::from([(
++            "proof".into(),
++            "original".into(),
++        )]));
++        let before = serde_json::to_value(&original).unwrap();
++        for (kind, status) in [
++            (ContainerType::InitContainer, "creating"),
++            (
++                ContainerType::TenantContainer { exec_notify_fd: -1 },
++                "running",
++            ),
++        ] {
++            assert!(matches!(
++                seccomp_notification_state(Some(&profile), None, kind, Pid::from_raw(42)),
++                Err(ProcessError::ContainerStateRequired)
++            ));
++            let value = seccomp_notification_state(
++                Some(&profile),
++                Some(&original),
++                kind,
++                Pid::from_raw(42),
++            )
++            .unwrap()
++            .unwrap();
++            let value = serde_json::to_value(value).unwrap();
++            assert_eq!(value["pid"], 42);
++            assert_eq!(value["state"]["pid"], 42);
++            assert_eq!(value["state"]["status"], status);
++            assert_eq!(value["state"]["id"], "exact-original-container");
++            assert_eq!(value["state"]["bundle"], "/declared/bundle");
++            assert_eq!(value["state"]["annotations"]["proof"], "original");
++            assert_eq!(value["metadata"], "exact-metadata");
++            assert_eq!(value["fds"], serde_json::json!([SECCOMP_FD_NAME]));
++            assert_eq!(serde_json::to_value(&original).unwrap(), before);
++        }
++    }
++}
++
+ pub fn container_main_process(container_args: &ContainerArgs) -> Result<Pid> {
+     // We use a set of channels to communicate between parent and child process.
+     // Each channel is uni-directional. Because we will pass these channel to
+@@ -213,42 +326,25 @@
+ 
+         #[cfg(feature = "libseccomp")]
+         if let Some(seccomp) = linux.seccomp() {
+-            let container = container_args
+-                .container
+-                .as_ref()
+-                .ok_or(ProcessError::ContainerStateRequired)?;
+-
+-            // Determine OCI status based on container type (matching runc behavior)
+-            let oci_status = match container_args.container_type {
+-                ContainerType::InitContainer => oci_spec::runtime::ContainerState::Creating,
+-                ContainerType::TenantContainer { .. } => oci_spec::runtime::ContainerState::Running,
+-            };
+-
+-            // Build OCI-compliant ContainerProcessState using builder pattern
+-            let oci_state = oci_spec::runtime::StateBuilder::default()
+-                .version(OCI_VERSION)
+-                .id(container.state.id.clone())
+-                .status(oci_status)
+-                .pid(init_pid.as_raw())
+-                .bundle(container.state.bundle.clone())
+-                .annotations(container.state.annotations.clone().unwrap_or_default())
+-                .build()
+-                .map_err(|e| ProcessError::OciStateBuild(e.to_string()))?;
+-
+-            let state = oci_spec::runtime::ContainerProcessStateBuilder::default()
+-                .version(OCI_VERSION)
+-                .fds(vec![SECCOMP_FD_NAME.to_string()])
+-                .pid(init_pid.as_raw())
+-                .metadata(seccomp.listener_metadata().clone().unwrap_or_default())
+-                .state(oci_state)
+-                .build()
+-                .map_err(|e| ProcessError::OciStateBuild(e.to_string()))?;
+-            crate::process::seccomp_listener::sync_seccomp(
+-                seccomp,
+-                &state,
+-                &mut init_sender,
+-                &mut init_main_receiver,
+-            )?;
++            let original = container_args.tenant_seccomp_state.as_ref().or_else(|| {
++                container_args
++                    .container
++                    .as_ref()
++                    .map(|container| &container.state)
++            });
++            if let Some(state) = seccomp_notification_state(
++                Some(seccomp),
++                original,
++                container_args.container_type,
++                init_pid,
++            )? {
++                crate::process::seccomp_listener::sync_seccomp(
++                    seccomp,
++                    &state,
++                    &mut init_sender,
++                    &mut init_main_receiver,
++                )?;
++            }
+         }
+     }
+ 
+--- a/crates/libcontainer/src/process/init/process.rs
++++ b/crates/libcontainer/src/process/init/process.rs
+@@ -37,6 +37,12 @@
+ use crate::user_ns::UserNamespaceConfig;
+ use crate::{apparmor, capabilities, hooks, tty, utils};
+ 
++// Only an enabled no_new_privileges bit permits installing a filter after
++// dropping CAP_SYS_ADMIN. Explicit false has the same semantics as omission.
++fn seccomp_after_capability_drop(no_new_privileges: Option<bool>) -> bool {
++    no_new_privileges.unwrap_or(false)
++}
++
+ // Some variables are unused in the case where libseccomp feature is not enabled.
+ #[allow(unused_variables)]
+ pub fn container_init_process(
+@@ -353,7 +359,7 @@
+     // as close to exec as possible.
+     #[cfg(feature = "libseccomp")]
+     if let Some(seccomp) = ctx.linux.seccomp() {
+-        if ctx.process.no_new_privileges().is_none() {
++        if !seccomp_after_capability_drop(ctx.process.no_new_privileges()) {
+             let notify_fd = seccomp::initialize_seccomp(seccomp).map_err(|err| {
+                 tracing::error!(?err, "failed to initialize seccomp");
+                 err
+@@ -365,7 +371,7 @@
+         }
+     }
+     #[cfg(not(feature = "libseccomp"))]
+-    if ctx.process.no_new_privileges().is_none() {
++    if !seccomp_after_capability_drop(ctx.process.no_new_privileges()) {
+         tracing::warn!("seccomp not available, unable to enforce no_new_privileges!")
+     }
+ 
+@@ -400,7 +406,7 @@
+     // notify socket will still need network related syscalls.
+     #[cfg(feature = "libseccomp")]
+     if let Some(seccomp) = ctx.linux.seccomp() {
+-        if ctx.process.no_new_privileges().is_some() {
++        if seccomp_after_capability_drop(ctx.process.no_new_privileges()) {
+             let notify_fd = seccomp::initialize_seccomp(seccomp).map_err(|err| {
+                 tracing::error!(?err, "failed to initialize seccomp");
+                 err
+@@ -412,7 +418,7 @@
+         }
+     }
+     #[cfg(not(feature = "libseccomp"))]
+-    if ctx.process.no_new_privileges().is_some() {
++    if seccomp_after_capability_drop(ctx.process.no_new_privileges()) {
+         tracing::warn!("seccomp not available, unable to set seccomp privileges!")
+     }
+ 
+@@ -1074,6 +1080,18 @@
+     use super::*;
+     use crate::syscall::syscall::create_syscall;
+     use crate::syscall::test::{ArgName, IoPriorityArgs, MountArgs, TestHelperSyscall};
++
++    #[test]
++    fn test_vz_seccomp_phase_respects_nnp_value() {
++        for (wire, late) in [(None, false), (Some(false), false), (Some(true), true)] {
++            let mut process = oci_spec::runtime::Process::default();
++            process.set_no_new_privileges(wire);
++            assert_eq!(
++                seccomp_after_capability_drop(process.no_new_privileges()),
++                late
++            );
++        }
++    }
+ 
+     #[test]
+     fn test_readonly_path() -> Result<()> {

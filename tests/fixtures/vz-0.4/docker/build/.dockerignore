@@ -1,0 +1,6 @@
+*
+!Dockerfile*
+!tools.py
+!input.txt
+!intermediate-canary.txt
+!ssh-response.txt

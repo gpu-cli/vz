@@ -98,6 +98,26 @@ pub enum PolicyDecision {
     Deny { reason: String },
 }
 
+/// Aggregate operations have their own authority; sandbox policy is not a
+/// substitute for permission to act on a complete Environment topology.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TopologyOperation {
+    Up,
+    Stop,
+    Exec,
+}
+
+/// Exact daemon-resolved ownership supplied to topology policy hooks.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TopologyAuthorization {
+    pub operation: TopologyOperation,
+    pub project_id: crate::ProjectId,
+    pub environment_id: crate::EnvironmentId,
+    pub machine_ids: Vec<crate::MachineId>,
+    pub definition_digest: String,
+}
+
 /// Generic policy extension hook for runtime operations.
 pub trait RuntimePolicyHook: Send + Sync {
     fn evaluate(
@@ -105,6 +125,17 @@ pub trait RuntimePolicyHook: Send + Sync {
         operation: RuntimeOperation,
         metadata: &RequestMetadata,
     ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Existing policy extensions must explicitly opt in to aggregate authority.
+    fn evaluate_topology(
+        &self,
+        _scope: &TopologyAuthorization,
+        _metadata: &RequestMetadata,
+    ) -> Result<PolicyDecision, Box<dyn std::error::Error + Send + Sync>> {
+        Ok(PolicyDecision::Deny {
+            reason: "policy does not authorize Developer Environment operations".into(),
+        })
+    }
 }
 
 /// Enforce a policy hook decision with stable error taxonomy mapping.

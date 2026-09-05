@@ -12,12 +12,8 @@ const CONTROL_PLANE_TRANSPORT_ENV: &str = "VZ_CONTROL_PLANE_TRANSPORT";
 const DAEMON_SOCKET_PATH_ENV: &str = "VZ_RUNTIME_DAEMON_SOCKET";
 /// Optional runtime data directory override (socket/log/metrics parent).
 const RUNTIME_DATA_DIR_ENV: &str = "VZ_RUNTIME_DATA_DIR";
-/// Optional daemon autostart policy override (`true/false`, `1/0`, etc.).
-const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
 /// Optional runtime state DB path override.
 const RUNTIME_STATE_DB_ENV: &str = "VZ_RUNTIME_STATE_DB";
-/// Runtime API base URL used when control plane transport is `api-http`.
-const API_BASE_URL_ENV: &str = "VZ_RUNTIME_API_BASE_URL";
 
 /// CLI control-plane transport for runtime mutations.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -50,57 +46,6 @@ fn parse_control_plane_transport(raw: Option<OsString>) -> anyhow::Result<Contro
 
 fn parse_env_control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
     parse_control_plane_transport(std::env::var_os(CONTROL_PLANE_TRANSPORT_ENV))
-}
-
-fn parse_api_base_url(raw: Option<OsString>) -> anyhow::Result<String> {
-    let Some(raw) = raw else {
-        return Ok("http://127.0.0.1:8181".to_string());
-    };
-
-    let value = raw.to_string_lossy().trim().to_string();
-    if value.is_empty() {
-        return Ok("http://127.0.0.1:8181".to_string());
-    }
-
-    let parsed = reqwest::Url::parse(&value)
-        .with_context(|| format!("invalid `{API_BASE_URL_ENV}` URL: {value}"))?;
-    if !matches!(parsed.scheme(), "http" | "https") {
-        bail!(
-            "invalid `{}` URL scheme `{}`; expected http or https",
-            API_BASE_URL_ENV,
-            parsed.scheme()
-        );
-    }
-
-    Ok(value)
-}
-
-fn parse_env_api_base_url() -> anyhow::Result<String> {
-    parse_api_base_url(std::env::var_os(API_BASE_URL_ENV))
-}
-
-fn parse_daemon_autostart(raw: Option<OsString>) -> anyhow::Result<bool> {
-    let Some(raw) = raw else {
-        return Ok(true);
-    };
-
-    let value = raw.to_string_lossy().trim().to_ascii_lowercase();
-    if value.is_empty() {
-        return Ok(true);
-    }
-
-    match value.as_str() {
-        "1" | "true" | "yes" | "on" => Ok(true),
-        "0" | "false" | "no" | "off" => Ok(false),
-        other => bail!(
-            "unsupported `{}` value `{other}`; expected one of: 1,true,yes,on,0,false,no,off",
-            DAEMON_AUTOSTART_ENV
-        ),
-    }
-}
-
-fn parse_env_daemon_autostart() -> anyhow::Result<bool> {
-    parse_daemon_autostart(std::env::var_os(DAEMON_AUTOSTART_ENV))
 }
 
 fn parse_daemon_socket_override(raw: Option<OsString>) -> Option<PathBuf> {
@@ -174,41 +119,6 @@ fn daemon_client_config_with_overrides(
     config
 }
 
-/// Resolve the currently configured control-plane transport.
-pub(crate) fn control_plane_transport() -> anyhow::Result<ControlPlaneTransport> {
-    parse_env_control_plane_transport()
-}
-
-/// Resolve the base URL for `api-http` transport.
-pub(crate) fn runtime_api_base_url() -> anyhow::Result<String> {
-    parse_env_api_base_url()
-}
-
-/// Build daemon client config scoped to a specific runtime state DB path.
-pub(crate) fn daemon_client_config(state_db: &Path) -> anyhow::Result<DaemonClientConfig> {
-    let auto_spawn = parse_env_daemon_autostart()?;
-    let socket_override = parse_env_daemon_socket_override();
-    let runtime_data_dir_override = parse_env_runtime_data_dir_override();
-    Ok(daemon_client_config_with_overrides(
-        state_db,
-        socket_override,
-        runtime_data_dir_override,
-        auto_spawn,
-    ))
-}
-
-async fn connect_daemon_grpc_for_state_db(state_db: &Path) -> anyhow::Result<DaemonClient> {
-    let config = daemon_client_config(state_db)?;
-    DaemonClient::connect_with_config(config)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to connect to vz-runtimed for state db {}",
-                state_db.display()
-            )
-        })
-}
-
 /// Connect to an already-running daemon without creating runtime state.
 ///
 /// Read-only Developer Environment commands use this path so observing status
@@ -237,18 +147,6 @@ pub(crate) async fn connect_existing_daemon_for_state_db(
                     )
                 })
         }
-        ControlPlaneTransport::ApiHttp => bail!(
-            "api-http transport cannot use direct daemon gRPC connector; route through runtime API HTTP client helpers"
-        ),
-    }
-}
-
-/// Connect to the configured runtime control-plane transport.
-pub(crate) async fn connect_control_plane_for_state_db(
-    state_db: &Path,
-) -> anyhow::Result<DaemonClient> {
-    match parse_env_control_plane_transport()? {
-        ControlPlaneTransport::DaemonGrpc => connect_daemon_grpc_for_state_db(state_db).await,
         ControlPlaneTransport::ApiHttp => bail!(
             "api-http transport cannot use direct daemon gRPC connector; route through runtime API HTTP client helpers"
         ),
@@ -293,33 +191,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_daemon_autostart_accepts_bool_and_numeric_values() {
-        assert_eq!(parse_daemon_autostart(None).ok(), Some(true));
-        assert_eq!(
-            parse_daemon_autostart(Some(OsString::from("true"))).ok(),
-            Some(true)
-        );
-        assert_eq!(
-            parse_daemon_autostart(Some(OsString::from("1"))).ok(),
-            Some(true)
-        );
-        assert_eq!(
-            parse_daemon_autostart(Some(OsString::from("false"))).ok(),
-            Some(false)
-        );
-        assert_eq!(
-            parse_daemon_autostart(Some(OsString::from("0"))).ok(),
-            Some(false)
-        );
-    }
-
-    #[test]
-    fn parse_daemon_autostart_rejects_invalid_values() {
-        let result = parse_daemon_autostart(Some(OsString::from("sometimes")));
-        assert!(result.is_err());
-    }
-
-    #[test]
     fn parse_daemon_socket_override_ignores_empty() {
         let override_path = parse_daemon_socket_override(Some(OsString::from("")));
         assert!(override_path.is_none());
@@ -335,19 +206,6 @@ mod tests {
     fn parse_state_db_override_ignores_empty() {
         let override_path = parse_state_db_override(Some(OsString::from("")));
         assert!(override_path.is_none());
-    }
-
-    #[test]
-    fn parse_api_base_url_defaults_and_validates() {
-        assert_eq!(
-            parse_api_base_url(None).ok(),
-            Some("http://127.0.0.1:8181".to_string())
-        );
-        assert_eq!(
-            parse_api_base_url(Some(OsString::from("http://localhost:9999"))).ok(),
-            Some("http://localhost:9999".to_string())
-        );
-        assert!(parse_api_base_url(Some(OsString::from("ftp://localhost:9999"))).is_err());
     }
 
     #[test]

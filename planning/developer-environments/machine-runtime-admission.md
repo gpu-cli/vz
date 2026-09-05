@@ -267,6 +267,42 @@ still requires the complete installed-artifact aggregate gate in
 [`GOAL-0.4.0.md`](GOAL-0.4.0.md), including exact cleanup of owned resources and
 all crash/recovery scenarios.
 
+### Live-session ownership for Stop (DEV)
+
+`RuntimeDaemon` now owns a `MachineLiveSessions` registry. A controller registers
+the exact live activation, original Runtime/store entry and optional
+pointer-identical Docker endpoint before releasing caller ownership. Duplicate
+live/uncertain registrations are rejected; rejected endpoint handles remain
+with the caller. An equal Machine name or freshly constructed Runtime cannot
+substitute for the registered boot.
+
+Stop validates the current durable Machine step and both VM/store reservations,
+drains and joins the endpoint, releases the activation reader, then calls exact
+shutdown on the retained original Runtime. Its owned task preserves the
+Environment fence and result if the observer disappears. A failed or timed-out
+stop retains the original Runtime anchor and fence as uncertain state. A missing
+registration after daemon restart is an error, not proof of `AlreadyAbsent`.
+Durable restart reconciliation and an explicit uncertainty-recovery operation
+remain required; this registry alone does not make Stop crash-resumable.
+
+The focused physical fixture now routes its first Stop through this owner and
+checks that the stopped Machine's Docker socket refuses while the sibling Engine
+keeps its identity. This is an infrastructure gate, not the public `vz stop`
+acceptance test. The public spelling now invokes a streamed topology RPC with
+exact-owner authorization, daemon-owned supervision, durable acknowledgements,
+and immutable replay validation. Admission rechecks policy after waiting for
+the controller fence. Read-only terminal replay remains available while a
+failed physical operation retains its uncertainty fence; a cached exact positive
+physical receipt can repair a failed durable acknowledgement without stopping a
+replacement runtime. Unknown restart ownership still fails closed.
+
+The installed control-plane slice passed with staged, ad-hoc-signed release CLI
+and external production daemon at
+`.artifacts/topology-stop-installed-L0YbgC/`. Its three Stop checks use seeded
+stopped/failed topology; they do not prove live Machine effects. Startup replay,
+explicit uncertainty recovery, native/additional topology resource handlers,
+and the complete public physical lifecycle remain integration work.
+
 The next product vertical is a server-streaming topology Up RPC with a thin
 `vz up` client, not a legacy `run` alias. Its daemon-owned supervisor must hold
 the selected Environment lock across admission and lifecycle, retain Machine

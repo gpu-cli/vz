@@ -1,0 +1,1410 @@
+{
+  "schema_version": 1,
+  "target_release": "0.4.0",
+  "status": "DEV_TRANSITIONAL_NOT_RELEASE_ACCEPTANCE",
+  "normative_source": "planning/developer-environments/legacy-cli-removal.md",
+  "required_release_roots": [
+    "up",
+    "exec",
+    "status",
+    "stop",
+    "delete"
+  ],
+  "implemented_dev_roots": [
+    "stop",
+    "exec",
+    "status"
+  ],
+  "removed_roots": [
+    "create",
+    "ls",
+    "rm",
+    "inspect",
+    "attach",
+    "close-shell",
+    "init",
+    "run",
+    "logs",
+    "stack",
+    "image",
+    "diff",
+    "checkpoint",
+    "vm",
+    "self-sign",
+    "debug"
+  ],
+  "removed_root_flags": [
+    "-c",
+    "--continue",
+    "-r",
+    "--resume",
+    "--name",
+    "--ephemeral",
+    "--cpus",
+    "--memory",
+    "--base-image",
+    "--main-container",
+    "--control-plane"
+  ],
+  "rejection": {
+    "exit_code": 2,
+    "code": "legacy_command_removed",
+    "stream": "stderr",
+    "format": "single_line_json",
+    "stdout": "empty",
+    "state_effects": "none"
+  },
+  "retained_replaced_semantics": [
+    "status",
+    "stop"
+  ],
+  "bare_invocation": {
+    "exit_code": 0,
+    "stdout": "exact_static_help_snapshot",
+    "stderr": "empty",
+    "state_discovery": false,
+    "state_mutation": false
+  },
+  "pinned_release_baseline": {
+    "version": "0.3.20",
+    "state": "pending",
+    "artifact_url": null,
+    "artifact_sha256": null,
+    "reason": "The immutable released v0.3.20 binary has not been acquired and verified. Development-binary traversal is not release acceptance."
+  },
+  "dev_baseline": {
+    "artifact": ".artifacts/topology-cli-installed-r93vAW/vz",
+    "artifact_sha256": "5ab312e325887413a5f53d217ca0d82dcc8d73261322597067a75d8b24a23202",
+    "signature_check": "codesign --verify --strict",
+    "provenance": "signed_development_build_not_immutable_released_v0.3.20",
+    "traversal": "Recursive --help through Commands sections; explicitly included hidden debug root and vm linux e2e.",
+    "help_paths": [
+      {
+        "path": [
+          "create"
+        ],
+        "help_sha256": "5239222451bb76c098355b72c583895e5744378b7d803e54b484b2d6993bf1cb"
+      },
+      {
+        "path": [
+          "ls"
+        ],
+        "help_sha256": "e56e5bfb92fcc289aefd264fe13ceb6c50c9647ce2c2a212ff9ae3d82bdc76f6"
+      },
+      {
+        "path": [
+          "rm"
+        ],
+        "help_sha256": "4e5ec4faf39ec62008fc97c07a9899f99aabfeefd67ba5121c0beebff835baec"
+      },
+      {
+        "path": [
+          "inspect"
+        ],
+        "help_sha256": "eb4376e859607ff6a282bb2892765b5cf7844cc47bb718d47e5af454b6d37a9a"
+      },
+      {
+        "path": [
+          "attach"
+        ],
+        "help_sha256": "22578587bb8750ef645ef7d64c7f29b87027b5c0b2964e30b509efc31ac60cdd"
+      },
+      {
+        "path": [
+          "close-shell"
+        ],
+        "help_sha256": "a3c84c42d508a74d3d26d2307c8fa8ab57346e50ce203e4be97d4ffc3747f439"
+      },
+      {
+        "path": [
+          "init"
+        ],
+        "help_sha256": "bc3842be82477b7c031790430037da0e88082042c0a325e0c1b3bcabcbb6f5c7"
+      },
+      {
+        "path": [
+          "run"
+        ],
+        "help_sha256": "e36329313781754a27c45961cb59a85ccd4190a53eff2cdc7f08a8c225021a41"
+      },
+      {
+        "path": [
+          "logs"
+        ],
+        "help_sha256": "271ee166e7682964ac7c4c83565d0812c9769772113e68520404e97b90710643"
+      },
+      {
+        "path": [
+          "image"
+        ],
+        "help_sha256": "91989b09ae0c5da55baff7cc47d204122a48d4cde4d80bfdb7bdbbdfd7e5459d"
+      },
+      {
+        "path": [
+          "diff"
+        ],
+        "help_sha256": "7f5df6d124434a0cfe29439aa6cecf89c448f37aa84751ae9489053bc7cfef1e"
+      },
+      {
+        "path": [
+          "checkpoint"
+        ],
+        "help_sha256": "d31d1d23386570cff7fb65d41f9614551172851636f8a6a7b535336c6a7c4ff8"
+      },
+      {
+        "path": [
+          "vm"
+        ],
+        "help_sha256": "1d416431c9caeb4710bb7604585a219e102ff8aad566d8ecae8a0068b28e664d"
+      },
+      {
+        "path": [
+          "self-sign"
+        ],
+        "help_sha256": "f40e57ee134a7467fcf0ee66031adff691f7c63de68107f2be69e0f590856695"
+      },
+      {
+        "path": [
+          "debug"
+        ],
+        "help_sha256": "19d6ab67b743e45712ff7929a44ae6316cb964f51f0dcc231e184ca161469817"
+      },
+      {
+        "path": [
+          "image",
+          "pull"
+        ],
+        "help_sha256": "c938ee59812a9e0d3aa8f36bdf2f6ec0ba63295b9852001e20a2ae516dc81c97"
+      },
+      {
+        "path": [
+          "image",
+          "build"
+        ],
+        "help_sha256": "46c0695e3962386ee9ac63b2725be0e0bf0b936db85c2a6e407e3054515fd85d"
+      },
+      {
+        "path": [
+          "image",
+          "ls"
+        ],
+        "help_sha256": "769a917756f514818adda69247519130b0a806ff7808d611abfd14a177e60f7a"
+      },
+      {
+        "path": [
+          "image",
+          "prune"
+        ],
+        "help_sha256": "b773fe7a4f4eb587d6521bb0998bdc20e0b7606f878b6ea5c4e769a2f3cc15a1"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "list"
+        ],
+        "help_sha256": "84f75995e740c19e24d46d4fdb5f9bd109cc16982e4737ee813432df83bc1262"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "inspect"
+        ],
+        "help_sha256": "a5ca73f729ce45e3dbda390bb82fe11b50119c652d0269695920afd51d3b15c1"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "create"
+        ],
+        "help_sha256": "2180c2af4634246dd6eadbb8fbcf184e4b125b7fa8cdec8b5a425dd3879b90df"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "restore"
+        ],
+        "help_sha256": "dfa2a004feba577c2c3e4afd3a645087498c62a5925c7e59e807d91e03583e94"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "fork"
+        ],
+        "help_sha256": "c066fbbb282cf56ef3d6589180c63bbc7ccae3cae1a74c570f2ea9c1838ae6b8"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "export"
+        ],
+        "help_sha256": "f6a9dc4a6bbf0d9a731e49f2f0c634ac267b7f13832c043848e06f86ebf8fdda"
+      },
+      {
+        "path": [
+          "checkpoint",
+          "import"
+        ],
+        "help_sha256": "652da2d4a6544aa1ab5774ad656f4711f90c145f5aa66b64841590635f73c682"
+      },
+      {
+        "path": [
+          "vm",
+          "mac"
+        ],
+        "help_sha256": "369192ea35ac0dbf31bbd219cdfe8b4aa178c74cc6f84e42d3ddfda1fda40104"
+      },
+      {
+        "path": [
+          "vm",
+          "linux"
+        ],
+        "help_sha256": "9219d19ab5b0afc4b6f4fd0aa4e9aa150145259a948148acaf08a5e88ad0284d"
+      },
+      {
+        "path": [
+          "debug",
+          "container"
+        ],
+        "help_sha256": "88b766c98f09b36bf8ae735fe1f46c0f184a779d5a40354841f04ade90b5afff"
+      },
+      {
+        "path": [
+          "debug",
+          "docker"
+        ],
+        "help_sha256": "4c00c8dda2b9cc4cdf2328fa9194ee3da05ba7fb9721270fb19596507eb5ff76"
+      },
+      {
+        "path": [
+          "debug",
+          "vm"
+        ],
+        "help_sha256": "4722771a4a452b7846ef4397de26b184459657c0872d358980299cfb9a5e634b"
+      },
+      {
+        "path": [
+          "debug",
+          "lease"
+        ],
+        "help_sha256": "9e49dcdb8c8c5be637a42c5a6fe0a4cde074ff03fadf005ebecd45e445df2a06"
+      },
+      {
+        "path": [
+          "debug",
+          "execution"
+        ],
+        "help_sha256": "caeafeb8f70b632cbca0d476190416311958a77232e93e35d53b6010b95bee36"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint"
+        ],
+        "help_sha256": "4a5caeb38bf5cd82d60e7608163a0c62901376547b3be936c83a0964c9183b8d"
+      },
+      {
+        "path": [
+          "debug",
+          "build"
+        ],
+        "help_sha256": "6d47d4f0c62abb2937d3055b80ebc75b7176da5a73bc0fb23e5002102097802d"
+      },
+      {
+        "path": [
+          "debug",
+          "file"
+        ],
+        "help_sha256": "781c53af47179b28499038cf676c0da46c12c299d3f8e489ed1d31912fa95f7b"
+      },
+      {
+        "path": [
+          "image",
+          "build",
+          "cache"
+        ],
+        "help_sha256": "8636572d70f19ba9a239275389fc3803aed590fe441731cd0693edf044c4d9a6"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "init"
+        ],
+        "help_sha256": "b5c4ceac85191af307644e3d71c923b49227bb37094b9459492df62287f7cc44"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "run"
+        ],
+        "help_sha256": "cc36f4eba4002a0b2f28e47bf158bce0c3ed565b943bf35c3e9b44a6c96a0f00"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "exec"
+        ],
+        "help_sha256": "e765c3b75ef3202bbbf84d7e82d21c40d4762dc053ee386ba7c23084064978ac"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "save"
+        ],
+        "help_sha256": "271120f0e3e9c4ec88051286c703ad3468c851344bdec4c4b7840d9af8c9d6a2"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "restore"
+        ],
+        "help_sha256": "fba5f09a2c877f72ae490c748876d0b4f62cbfafe695f2c8c4bfbac428795daf"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "list"
+        ],
+        "help_sha256": "347e82eb087f221bf03f8c074df410d406b701fbcc595b9221c1f18ef2389f17"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "stop"
+        ],
+        "help_sha256": "3fb951e056abda569ec833db7f72da6703951ac8816c4bfa943b2634620b9d88"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "rm"
+        ],
+        "help_sha256": "dd8f14218cf94b187be3644ca8789e47cedaee3268c9413f5292164428541737"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "cache"
+        ],
+        "help_sha256": "c3de24763865a68f5e75f7ece0b1b3705f31c66faa8ab870b2397ae61de00e45"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "provision"
+        ],
+        "help_sha256": "b289e6ede5b1c4448669711dd2e4f45f97d91c475927ecc561610311424c18bf"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "cleanup"
+        ],
+        "help_sha256": "d0282ed5de1fc320c1cd5ef6e66e67ca62ddc7e73af4832ea3d99569778dcc1a"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "self-sign"
+        ],
+        "help_sha256": "630f67659441637c80a1e146e8608c3a5f5cc87b3f2e36f896dce90ec98bebd1"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "validate"
+        ],
+        "help_sha256": "fbe8d4fde3fb532519180227d78df53396860a6bca18d67b20fd32cfa414a123"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "base"
+        ],
+        "help_sha256": "cc9d034ed626d124790ffa7db303467cb90dd2874b5af062f75a1f874865eeba"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch"
+        ],
+        "help_sha256": "f7b0d0af13ab33e54de2769750bfe6fbe3c0eb7f972baca4d70788f7b79926a2"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "init"
+        ],
+        "help_sha256": "23d5f92905cc3de79b5c66edce11d15c473d0bc9c23dffe3d61357fc5a4873f1"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "run"
+        ],
+        "help_sha256": "e1ed8fc0cd52a6878e6464df247c8f96ebd29576fc7210b1bfd14cbccf860926"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "list"
+        ],
+        "help_sha256": "e77bd891ed38ae14c962072731be8e390cb8aa69ddc6ab77652841c7d5e47a35"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "inspect"
+        ],
+        "help_sha256": "b4e8d6a9e9c7425cbc75fd60bca7da2a628b2f12bfc3ab6864ae389fa40fd5ed"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "attach"
+        ],
+        "help_sha256": "7f93a8db0395e3958c0924370a56055483ec11bdb446bdb66a025e0b69c32420"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "exec"
+        ],
+        "help_sha256": "42b3c8d2b026601695bdf276f6ab0dee956be9fd7671851b658e91b8c25901e1"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "save"
+        ],
+        "help_sha256": "cf581d6a813ff83c1e2fae281d39eaeea327c4d9c266953ff86f56e0fdc036be"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "restore"
+        ],
+        "help_sha256": "56043cb95f1f6fa6d33e387d5a064548d487e1913b8d2bc4a5cee05141a7a761"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "base"
+        ],
+        "help_sha256": "473f968c18623e2a5ad8abfae82d482b94f0ab646f179f5ccd04f835bd992d9f"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "validate"
+        ],
+        "help_sha256": "e03b1ff6f8300284b1c699d56e852d9d84beea92442398040d8e3c88dd8873e5"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "patch"
+        ],
+        "help_sha256": "801213793e7d36c03ccaf0a97330654ad74d68f53ae9e8878564152d94f581dc"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "stop"
+        ],
+        "help_sha256": "752f2dc87f07bde90c0d4c75775d7593e373ae0dd6a77e6c1d378a6f993c097c"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "rm"
+        ],
+        "help_sha256": "8192c8850e3385a92aa7763d0b3af289e623fdc4bbbb9e05bc631901b47ea8c8"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "test"
+        ],
+        "help_sha256": "f26b515a6758f309d3acadfc495940a8a2d51e4a709247531ae9cb2f481d423a"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "run"
+        ],
+        "help_sha256": "9160dbd04d53331609b75036c9b9d214af5a21e41e0042388f87b993532b4bfc"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "create"
+        ],
+        "help_sha256": "b243000f93c592f1d266066987a776bc737c33b3eaa61b36f2f723b5857287b4"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "exec"
+        ],
+        "help_sha256": "ca4c1ce34242e744f371cf294f39107a22bff476591ebb5140143504291e4a9e"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "ps"
+        ],
+        "help_sha256": "227041875b3f48e95ade6d73456c471c795310ab87ccf09f5d8dab79a3a1a925"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "stop"
+        ],
+        "help_sha256": "1628b431ed434cc0d41ebfff01d7ed848819856f7f388003bbe4bde0a7a1f5ec"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "rm"
+        ],
+        "help_sha256": "02cfbe8846e6e15103741d9b10888862df877642a114494c0fdfe78862de5b32"
+      },
+      {
+        "path": [
+          "debug",
+          "container",
+          "logs"
+        ],
+        "help_sha256": "5246522bd2976db669d0612d11101f6a94dd6b354f7fe8d027493dfe8b594868"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "run"
+        ],
+        "help_sha256": "052a3d5de382089a31d1508b29610a93800a916d6fcfbadfca909b1e1388e1c2"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "exec"
+        ],
+        "help_sha256": "68accefa53221ca52ef28df3f9df84517c321579ce7dc5f1437e592428fe4866"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "ps"
+        ],
+        "help_sha256": "701a14c60caebd6cdc0a24423e42f24107c2968675da754b5ea6b36173b327dc"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "logs"
+        ],
+        "help_sha256": "c9b6ef42bce6ee14ace3088861bca8c9fd6ef33f0c65ffd9123a3d7157f7638a"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "pull"
+        ],
+        "help_sha256": "e0e466a905766f2c1835f978b843defd32fd70623ec1a6ee35d4cf6947e8dc9f"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "build"
+        ],
+        "help_sha256": "98f30280a2bf3c532642c4cba128a5dc64c3e908251cd659337f216803c16855"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "stop"
+        ],
+        "help_sha256": "4528b9d5d84764472678ed9d1719c6d2d80329a8db63d30f6c8e139a8c3aa081"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "rm"
+        ],
+        "help_sha256": "321ed17a73c31ef58c5551140d0bc71a6171ff7704c2156f4ebe63e001c0b11e"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "init"
+        ],
+        "help_sha256": "0b8fe16f4a79b9afaeef01d6d222a0e511279b63ddcee0d8995eca8565910208"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "run"
+        ],
+        "help_sha256": "ff29dacb00c7a0186818dbcccf176e7677c8cb0051e303f36b6709d507f9eb58"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "exec"
+        ],
+        "help_sha256": "83d23e64813f2565ba7b840e10606651f9dec93a30b9be8bcb2a1aa74aba5a43"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "save"
+        ],
+        "help_sha256": "ee39bdefc9c9fd53ef35a77c7181987cd27a8f5f18ea58fbfd35fef6558c00d2"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "restore"
+        ],
+        "help_sha256": "180b47f4bc6ca25f1067a07b03b2792fc965faf9a74282b3ec42f25403834fe9"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "list"
+        ],
+        "help_sha256": "27c02bfd8b2da4ba8937859fc718c215add1e18695021cb36f93bdd893c6f984"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "stop"
+        ],
+        "help_sha256": "7199e30111f5ebdcf21752e1d608300bc6d5810a8da049d07c8dc971251dcd50"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "rm"
+        ],
+        "help_sha256": "73de5713567f99b88d4b092553da5ecf9bc37de869ab433caffdf43435b90137"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "cache"
+        ],
+        "help_sha256": "bc4cddc86bdeaf5969239fa3cded068d02df6ed51ea9675efd1f21fad7461978"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "provision"
+        ],
+        "help_sha256": "625cc13bd55e9ad34a7d4bf28dd56c72141336e10eaeb0ff0232a78722b43d3e"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "cleanup"
+        ],
+        "help_sha256": "07d83c40d84dd3aab348874b432681dc3e479043ce02b57c26886b9dc3f88442"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "self-sign"
+        ],
+        "help_sha256": "12aa3aff4b51a8ebf96e3f94a7937d831ca9e0acdaaa4984c0ad1e0297cf2d1d"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "validate"
+        ],
+        "help_sha256": "f4794e419cce497466d771595c1e1227240f33f7500b5657655326835233e6f1"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "base"
+        ],
+        "help_sha256": "ff863485ef5cf5fe582bc9596b06ce47da6b026f4cb79050c6dc3c98b5c02a79"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch"
+        ],
+        "help_sha256": "1b0252d54c5032cfa91e6c3cf1b629613955fdea2f9738fb30e99bd7e4def8aa"
+      },
+      {
+        "path": [
+          "debug",
+          "lease",
+          "list"
+        ],
+        "help_sha256": "1148dccd1059c716757473230f435d7b86a5c6443c974573965f8d2b27801304"
+      },
+      {
+        "path": [
+          "debug",
+          "lease",
+          "inspect"
+        ],
+        "help_sha256": "65c9652e5bf63cca84e2b6392a8745725cf1175503c19a6c40e539c5ff33dd8e"
+      },
+      {
+        "path": [
+          "debug",
+          "lease",
+          "close"
+        ],
+        "help_sha256": "94ba439a90a5af5689b94ccf873905b52988422d3be120f5f29047239e65aab6"
+      },
+      {
+        "path": [
+          "debug",
+          "execution",
+          "list"
+        ],
+        "help_sha256": "96878a5a617e18b9b58b4e379438af360132ab457c7d27dc5f686b57a6ba5d72"
+      },
+      {
+        "path": [
+          "debug",
+          "execution",
+          "inspect"
+        ],
+        "help_sha256": "f0571e78d512c886a24fc4bd110fdb00a00d67e931a443f472af2db188697f5b"
+      },
+      {
+        "path": [
+          "debug",
+          "execution",
+          "cancel"
+        ],
+        "help_sha256": "3ec77fe976fc9915a293529f773f717ccfb65d179fb4af60079f82d143fc4f42"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "list"
+        ],
+        "help_sha256": "cadc3a44c0263e60a70f5ebb30e71bcebd7258878f4eb70e0f277914c160b936"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "inspect"
+        ],
+        "help_sha256": "b183054dcf62607753753c7465a7c0a34c52ea5f28302a09af6c2d26fb6f041f"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "create"
+        ],
+        "help_sha256": "14b6cd0b22bc69f45b867ac246bdd6f586da3245b502e1fb028a47b5e6b825cd"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "restore"
+        ],
+        "help_sha256": "081236ca7f8e5fa97b044b70e7ce1c317a5e43fe8c49a0f8e3b91df8152fbcaf"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "fork"
+        ],
+        "help_sha256": "f44a7c79d8386192597489cb0c4e9772838665297c146f7e94e91a42a5b26eb6"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "export"
+        ],
+        "help_sha256": "0190280837cf96d89f75939ba5231e8a140a840791de08170ba705b48650995b"
+      },
+      {
+        "path": [
+          "debug",
+          "checkpoint",
+          "import"
+        ],
+        "help_sha256": "ea20ccd7fb9bc031bbaf2009dccfcc2ecf5f5abc6b7477d54e6149309c065c35"
+      },
+      {
+        "path": [
+          "debug",
+          "build",
+          "list"
+        ],
+        "help_sha256": "15d8ac7a3b5b935dd86f7f2092a0e706e3b88dd733cd554e161f459a612f58b0"
+      },
+      {
+        "path": [
+          "debug",
+          "build",
+          "inspect"
+        ],
+        "help_sha256": "1042659b3b0e1fd8b8a059e197cf97ec0a4d8d93652dfeafc94f0a552f6b8d09"
+      },
+      {
+        "path": [
+          "debug",
+          "build",
+          "cancel"
+        ],
+        "help_sha256": "cd8f6d27344f60870358b8393e97becfbc074851cf8a113ca0148eb9bba8c9d8"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "list"
+        ],
+        "help_sha256": "9757d66ffd26b6b6caef747f7ea50708ae5ad2d98c3274d2442b6aba2ca14913"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "read"
+        ],
+        "help_sha256": "3fc6278c81aed945e0cd02e4b9691de58d2c3d089788f01857c447afae6e40f6"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "write"
+        ],
+        "help_sha256": "727e779cf4bb862402a50c5481273dac8ec5a5e6e231f617e5b0031185c6928f"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "mkdir"
+        ],
+        "help_sha256": "f40419737cb085a6fd8e5945789ed2c4aebf944dca73d15a5df0a382d16ed9d1"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "rm"
+        ],
+        "help_sha256": "2a4482e9617b7615eef4431820ffd3f9ee2563dc7a0f15fa2f35c62ed48364ad"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "mv"
+        ],
+        "help_sha256": "eb83151ef19d8773eb9931f7258824828cfdb87d8759b211a1e6bafc98470b2b"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "cp"
+        ],
+        "help_sha256": "0108a22238ba4fa224f2057916b2b0302301acb3186cd1dd74634f7815e30576"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "chmod"
+        ],
+        "help_sha256": "9c97c803cdfba3e918d1d7010a5c1469f8e4d2dd267f40eee91956d4b4691241"
+      },
+      {
+        "path": [
+          "debug",
+          "file",
+          "chown"
+        ],
+        "help_sha256": "043afbda329ec63b50fc13626e63e51cef088665d749524fb1ddf33dc1969634"
+      },
+      {
+        "path": [
+          "image",
+          "build",
+          "cache",
+          "du"
+        ],
+        "help_sha256": "046367913de7dd548424473888714ccfb7102847d07da667c1d84835c86f6c07"
+      },
+      {
+        "path": [
+          "image",
+          "build",
+          "cache",
+          "prune"
+        ],
+        "help_sha256": "2c9ea0a9d3854f1ae7c2d0ca03c6551bb6175e9c18ee2b2aed9d0c7b5c5f6d56"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "cache",
+          "list"
+        ],
+        "help_sha256": "8044a9b042036fd4782bd0d898bf9845300d659501ac6c01e00ba58d0670b830"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "cache",
+          "clean"
+        ],
+        "help_sha256": "f87e616c6b287ac63b15bce6915aec207388d8498ff8118504912f481b87f458"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "validate",
+          "run"
+        ],
+        "help_sha256": "8ddebbb9bd127881e65afa6e9a009a1151c9500db227e81b64b76fe8bf8e3822"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "validate",
+          "manifest"
+        ],
+        "help_sha256": "538b2e8312fca28fffe1ded1cf3412a73dc4f96bcb09dfe06b80238d37d4efdc"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "validate",
+          "list"
+        ],
+        "help_sha256": "744a7c8cbb2679901eed8b4f5936d8a0c11bf832acad151536d83dade06c52b2"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "validate",
+          "sweep-build"
+        ],
+        "help_sha256": "00a3a88fe7425b1bfe1b42ee94b96f6582315c637ed35813d91fb29b1dfc28a3"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "base",
+          "list"
+        ],
+        "help_sha256": "285e828ebf6d7a0955f848df4be6e9e4f25db5b6d3c972f26c1f682f67eaf053"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "base",
+          "verify"
+        ],
+        "help_sha256": "67d7e8d0038b283ceb2ed7a0ad4c84d59ab18db09d808baceb5e7ddaacb288bf"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch",
+          "create"
+        ],
+        "help_sha256": "7c260982ec275ddbe42e576328918f78f5e58d660ec3b7e11e021ab811f68a3f"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch",
+          "verify"
+        ],
+        "help_sha256": "93939f0f6acbccdedb926aa88ac3f80d060d49b6b32916466f3471ced8c24d74"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch",
+          "apply"
+        ],
+        "help_sha256": "b6afc47ff2203475395a181f0a391b48db694c90c346b20a0da7dfa6b65b7344"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch",
+          "create-delta"
+        ],
+        "help_sha256": "e086bda97be3045b0a0e828546d06951c7fdde8f662aa2bfb62b81e3ecb8a0c4"
+      },
+      {
+        "path": [
+          "vm",
+          "mac",
+          "patch",
+          "apply-delta"
+        ],
+        "help_sha256": "b303d4b90d05ec68e40937431fbcc3466ca454978cfa18962b7e5b735ef06247"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "base",
+          "list"
+        ],
+        "help_sha256": "0e22c591f657a914ad6af62553069880594bc541cbc8ca1c21e091c2e05e7f26"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "base",
+          "inspect"
+        ],
+        "help_sha256": "85d2c04d7a6515cdd74948ee4b7c3dcde0fc2bebfdf90b8227df82688093c857"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "base",
+          "upsert"
+        ],
+        "help_sha256": "1fbf3c827827435bb86b1955b84b143ce349c5d28ac0ed7fc4c30bd561dd116f"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "base",
+          "delete"
+        ],
+        "help_sha256": "4dc1edd7465fdb5ef9498672249864ca54bcf9b39eeb8269a186bb2631e5da40"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "patch",
+          "apply"
+        ],
+        "help_sha256": "e0efb09fddb78a202e4a0dddaffbab25d3c7a6c75964dea00571aa17e3b86e86"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "patch",
+          "rollback"
+        ],
+        "help_sha256": "ddd27968f04a66fedec1a94f31f395c9c0c28249f797106fbcbccbbdcd6605df"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "test",
+          "e2e"
+        ],
+        "help_sha256": "499d611f3165be42ab90940212b6c8cd8d435b9df4641c18920bfc19d984590f"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "build",
+          "cache"
+        ],
+        "help_sha256": "a1e071b4e5f887bab130b8c6c6917c50fafa56e6df28a6e867dfe5b7871b9099"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "cache",
+          "list"
+        ],
+        "help_sha256": "9df055a77296720585e5b637ee0ed709c19f5d857564e3b3003bd8bd5743acfa"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "cache",
+          "clean"
+        ],
+        "help_sha256": "0180cf456e2b3d8b38be2f212e30811c5e250204682e8ad230defb99d71a9845"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "validate",
+          "run"
+        ],
+        "help_sha256": "3b61f4fe56599705cf48cd148c48ae037118aaf4dd78524a366fc0794bd3391f"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "validate",
+          "manifest"
+        ],
+        "help_sha256": "0551df54cdb49ff6da7f47162a20074122285bcb64a63a7fad061491e0d058ff"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "validate",
+          "list"
+        ],
+        "help_sha256": "59c7e4bdfb7c32e698223ec36f735c64d3269dfcbf141c9aa695df805de26cfc"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "validate",
+          "sweep-build"
+        ],
+        "help_sha256": "6fd100b3df7ba35b73f3b1fcc807267b68ac2c18f32c3c95a094cb695d5f3eb2"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "base",
+          "list"
+        ],
+        "help_sha256": "41bc4cc58b827e5e4ee3d4df0f3c49e40cc70a7862c8f53525bccccd08b55593"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "base",
+          "verify"
+        ],
+        "help_sha256": "55997134ca527fd7a3ff3287255bd1bd81c99d54945da4944a04e60065e434e6"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch",
+          "create"
+        ],
+        "help_sha256": "b45570dccaf9661696640f4dbd40c8605c31e160fce959a0b93f3a4adc183bd4"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch",
+          "verify"
+        ],
+        "help_sha256": "ebc8b7b56a007f9683921c8c4fd5046d07246f264c4b2ace7291e5f07ab18f4e"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch",
+          "apply"
+        ],
+        "help_sha256": "f9e9b46945e816a30cc1ee5943b322f5a467610be3bfa2c7882c629013b8715f"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch",
+          "create-delta"
+        ],
+        "help_sha256": "59bb109d66a19313eb8132b7f1c1a26f3a3027f695cb7249ab719156001fa6d1"
+      },
+      {
+        "path": [
+          "debug",
+          "vm",
+          "patch",
+          "apply-delta"
+        ],
+        "help_sha256": "5f5fde795b162e52729dda631fa42bf64b08df66a0fc2ecff881e77bb220f0a1"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "build",
+          "cache",
+          "du"
+        ],
+        "help_sha256": "458bc92684e29721c003bb12e20d4946fe9ae5cd97e9aae8aa3713c037c4ab4b"
+      },
+      {
+        "path": [
+          "debug",
+          "docker",
+          "build",
+          "cache",
+          "prune"
+        ],
+        "help_sha256": "9242a11bf9b69bec3538f36363666a2d5e8197d660c72d3f72e84082b46ee210"
+      },
+      {
+        "path": [
+          "vm",
+          "linux",
+          "e2e"
+        ],
+        "help_sha256": "7fd3b91b620f12b28592030bcdb30dbf4a01a19f09a38cce7794eabc24c51a2b"
+      }
+    ]
+  },
+  "normative_only_paths": [
+    [
+      "stack"
+    ],
+    [
+      "stack",
+      "up"
+    ],
+    [
+      "stack",
+      "down"
+    ],
+    [
+      "stack",
+      "ps"
+    ],
+    [
+      "stack",
+      "ls"
+    ],
+    [
+      "stack",
+      "config"
+    ],
+    [
+      "stack",
+      "events"
+    ],
+    [
+      "stack",
+      "logs"
+    ],
+    [
+      "stack",
+      "exec"
+    ],
+    [
+      "stack",
+      "run"
+    ],
+    [
+      "stack",
+      "stop"
+    ],
+    [
+      "stack",
+      "start"
+    ],
+    [
+      "stack",
+      "restart"
+    ],
+    [
+      "stack",
+      "dashboard"
+    ]
+  ]
+}

@@ -128,3 +128,73 @@ the exact project, Environment, Machine, incarnation, and topology digest.
   the user's default context.
 - Real local-Mac black-box tests cover all five verbs against multi-instance,
   multi-Machine, and mixed Linux/macOS topologies.
+
+## Implementation evidence (DEV, not release acceptance)
+
+The authoring schema and example now exist at the paths above. The production
+definition loader rejects unknown fields at every desired-object boundary;
+schema and semantic validation remain distinct. The example deliberately does
+not invent a published appliance digest. Installed authoring-resource packaging
+and real `up` bootstrap are still required.
+
+`stop` now dispatches to a selected-Environment streamed RPC, not the old direct
+VM command. The daemon authorizes exact topology ownership, retains the Stop
+task independently of client observation, and preserves request/idempotency
+identity for replay. Its current effect adapter is limited to registered
+Linux/ARM64 sessions; unknown state after restart and unsupported native or
+additional topology resources fail closed.
+
+The staged, ad-hoc-signed release CLI and external `macos-vz` daemon passed
+14 local-Mac black-box checks at
+`.artifacts/topology-stop-installed-L0YbgC/`: Stop 3, status 4, bare help 2,
+and existing legacy-removal regressions 5. `evidence.sha256` binds executables,
+test drivers, and raw logs. Stop tests use seeded stopped/failed topology and
+prove control-plane selection, replay, sibling preservation, and unknown-state
+refusal; they do **not** prove physical Machine shutdown. This does not replace
+the daily installed binary or certify all five verbs.
+
+`exec` now has a real bidirectional CLI/client/daemon path for an already Ready,
+exactly owned Linux Machine. Durable admission prevents duplicate dispatch after
+restart; stream events and controls bind request, Environment, Machine, and
+incarnation. A retained supervisor handles stdin EOF, output, signals, PTY resize,
+deadlines, and cancellation. Stop closes execution admission and requires
+positive reaping before releasing the original Machine. Uncertain work retains
+ownership; a no-live-work result without an exit status is labelled `Quiesced`,
+not falsely reported as never started. This is a DEV implementation slice, not
+physical CLI acceptance or permission to promote Developer readiness from Engine
+startup alone.
+
+The subsequent staged, ad-hoc-signed CLI/daemon run at
+`.artifacts/topology-cli-installed-r93vAW/` passed 16 checks: the preceding 14
+plus two Exec checks over a real local socket. Exec coverage proves exact
+terminal-receipt replay (including a nonzero command exit) and unknown-runtime
+refusal, not live command execution. Its checksums bind the copied executables,
+test drivers, and raw logs. The daily installation remains unchanged.
+
+`up` and `delete` remain absent. Exec's automatic dependency reconciliation,
+declared-default Machine support, and native adapter remain required, as do
+full live status/contexts and the complete installed mixed-target lifecycle gate.
+
+All 16 retired roots, including hidden `debug`, have now been removed from the
+actual parser and dispatch. Legacy command modules are no longer compiled into
+the CLI. `config/cli-removal-v0.4.json` records a signed DEV baseline inventory
+and the still-missing immutable v0.3.20 release traversal. Tests cover every
+inventoried nested path, static help, structured rejection, and zero contacts
+to real HTTP/Unix listeners. The old API-mode CLI-success tests were replaced
+with retirement assertions; this does not certify their typed-API replacements.
+Remaining API coverage and stale harness consumers are explicitly inventoried
+in `crates/vz-cli/tests/fixtures/retired-api-cli-coverage.md`.
+
+The Up prerequisite now reserves exact prospective ownership and a non-expiring
+idempotency receipt in one transaction, after authorization. Seven tests cover
+denied-creation rollback, retry/reopen identity, sibling preservation, and
+durable workspace-binding truth. This is not an executable `vz up`; its retained
+boot/reconciliation supervisor and public transport remain to be implemented.
+
+The post-retirement signed CLI/daemon run at
+`.artifacts/topology-cli-installed-9JFtJP/` passed 19 checks: Exec 2, Stop 3,
+status 4, bare help 2, retirement 6, and no-contact rejection over both transport
+modes 2. Its checksum manifest binds executables, test drivers, and raw logs.
+These are installed-artifact control-plane and retirement checks, including
+seeded topology and terminal receipts, not live execution or the complete
+five-verb lifecycle. The daily installation remains unchanged.

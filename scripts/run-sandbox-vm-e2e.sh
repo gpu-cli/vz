@@ -62,7 +62,9 @@ Options:
 Environment:
   VZ_SKIP_KERNEL_CHECK=1      Skip ~/.vz/linux preflight check
   VZ_E2E_GUEST_AGENT_BUILD_TOOL=<tool>
-                              Linux guest-agent build tool (default: zigbuild)
+                              Linux guest-agent build tool (cargo inside the verified Linux builder)
+  LINUX_DOCKER_CONTEXT=<name>  Explicit local Unix-socket Docker build context
+  YOUKI_DOCKER_CONTEXT=<name>  Explicit context for uncached pinned youki builds
   VZ_BUILDKIT_ARTIFACT_ARCHIVE=<absolute-path>
   VZ_BUILDKIT_ARTIFACT_SHA256=<64-hex-digest>
                               Optional paired operator override for BuildKit.
@@ -698,14 +700,23 @@ fi
 # The VM executes the Linux guest agent embedded in each profile's initramfs,
 # not the macOS host binary built below. Rebuild both bundles on every run so
 # source changes cannot be silently tested against a stale guest executable.
-GUEST_AGENT_BUILD_TOOL="${VZ_E2E_GUEST_AGENT_BUILD_TOOL:-zigbuild}"
+GUEST_AGENT_BUILD_TOOL="${VZ_E2E_GUEST_AGENT_BUILD_TOOL:-cargo}"
+if [[ "$GUEST_AGENT_BUILD_TOOL" != "cargo" ]]; then
+    err "guest bundles now build on case-sensitive Linux storage; VZ_E2E_GUEST_AGENT_BUILD_TOOL must be cargo"
+fi
+if [[ -z "${LINUX_DOCKER_CONTEXT:-}" ]]; then
+    err "set LINUX_DOCKER_CONTEXT to an explicit local Unix-socket Docker build context"
+fi
 for kernel_profile in developer container; do
     echo "==> rebuilding Linux $kernel_profile guest bundle"
+    # The wrapper verifies source/config/compiler provenance before reusing a
+    # kernel and rebuilds guest userland from this checkout. A direct Mac make
+    # would extract case-distinct BusyBox/kernel inputs on host storage and
+    # cannot verify the native Linux compiler identity of cached artifacts.
     make -C "$REPO_ROOT/linux" \
         KERNEL_PROFILE="$kernel_profile" \
-        TRUST_EXISTING_KERNEL_IMAGE=1 \
-        GUEST_AGENT_BUILD_TOOL="$GUEST_AGENT_BUILD_TOOL" \
-        initramfs version 2>&1 | tee "$RUN_DIR/linux-$kernel_profile-build.log"
+        LINUX_DOCKER_TARGET=all \
+        docker-build 2>&1 | tee "$RUN_DIR/linux-$kernel_profile-build.log"
 done
 
 DEVELOPER_INITRAMFS_SHA256="$(shasum -a 256 "$REPO_ROOT/linux/out/initramfs.img" | cut -d' ' -f1)"

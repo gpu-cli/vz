@@ -56,6 +56,10 @@ service AgentService {
   // waits for containerd plus dockerd readiness.
   rpc EnsureDocker(DockerEnsureRequest) returns (stream DockerEnsureEvent);
 
+  // Opaque, half-close preserving connection to the provisioned private Engine.
+  // No caller-selected destination; Open/Connected precede Data and directional Eof.
+  rpc DockerForward(stream DockerForwardFrame) returns (stream DockerForwardFrame);
+
   // Bidirectional TCP relay through the guest.
   // Client sends PortForwardOpen as the first frame, then raw data
   // flows in both directions.
@@ -155,6 +159,9 @@ message ExecRequest {
   // resolves and pins the container target; callers must send the original
   // command rather than constructing namespace-enter arguments themselves.
   ContainerExecTarget container_target = 10;
+  // Explicit ticketed, descendant-supervised execution in this Machine itself.
+  // Mutually exclusive with container_target; never implies an OCI container.
+  bool supervised_machine = 11;
 }
 
 message ContainerExecTarget {
@@ -173,6 +180,8 @@ message ExecEvent {
     // guest emits this only after the exact target has been pinned and the
     // requested process has successfully crossed execve(2).
     ContainerExecReady container_ready = 8;
+    // First event for supervised_machine, after successful command execve.
+    MachineExecReady machine_ready = 9;
   }
   // Monotonic sequence index within one exec stream.
   uint64 sequence = 5;
@@ -209,6 +218,9 @@ message ContainerGeneration {
 message ContainerExecReady {
   ContainerGeneration generation = 1;
 }
+
+// Correlation and control identity live on the enclosing ExecEvent.
+message MachineExecReady {}
 
 message StdinWriteRequest {
   uint64 exec_id = 1;
@@ -297,6 +309,21 @@ message DockerEnsureEvent {
 }
 
 // ─── Port Forward ───────────────────────────────────────────────
+
+message DockerForwardFrame {
+  oneof frame {
+    DockerForwardOpen open = 1;
+    DockerForwardConnected connected = 2;
+    bytes data = 3; // Nonempty, at most 65536 bytes.
+    DockerForwardEof eof = 4; // Shuts down only this direction.
+    DockerForwardWriteClosed write_closed = 5; // Guest consumed request EOF and shut down Engine write half.
+  }
+}
+
+message DockerForwardOpen { TransportMetadata metadata = 1; }
+message DockerForwardConnected {}
+message DockerForwardEof {}
+message DockerForwardWriteClosed {}
 
 message PortForwardFrame {
   oneof frame {

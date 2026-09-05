@@ -1,0 +1,10 @@
+ARG FIXTURE_BASE
+FROM ${FIXTURE_BASE} AS build
+ARG FIXTURE_BASE
+ARG FIXTURE_SSH_HOST
+ARG FIXTURE_SSH_PORT
+COPY tools.py ssh-response.txt /fixture/
+RUN --mount=type=ssh,id=fixture,required=true --mount=type=secret,id=known_hosts,required=true python3 /fixture/tools.py ssh
+RUN test ! -e /run/secrets/known_hosts && test ! -e /run/buildkit/ssh_agent.0
+FROM scratch AS output
+COPY --from=build /out/ssh.txt /ssh.txt

@@ -5,6 +5,7 @@
 
 mod benchmark;
 mod config;
+mod docker_stream;
 mod error;
 pub mod grpc_client;
 mod kernel;
@@ -15,6 +16,7 @@ pub use benchmark::{
     run_boot_benchmark_with_progress,
 };
 pub use config::LinuxVmConfig;
+pub use docker_stream::GrpcDockerStream;
 pub use error::LinuxError;
 pub use grpc_client::{
     ContainerExecDispatchGate, ContainerExecStartError, ExecOptions, GrpcExecStream,
@@ -29,6 +31,8 @@ pub use kernel::{
     ensure_kernel_with_options, verify_kernel_bundle_read_only,
 };
 pub use vm::LinuxVm;
+/// Checked ordinary Machine execution output; readiness is consumed separately.
+pub use vz::protocol::ExecEvent as MachineExecOutputEvent;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};
 pub use vz_agent_proto::{
     ContainerGeneration, ContainerNamespaceIdentity, KernelObjectIdentity, ReconcileExecResponse,

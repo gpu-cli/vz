@@ -7,6 +7,9 @@ from pathlib import Path
 import tempfile
 import unittest
 
+from test_docker_time_namespace_evidence import fixture as time_namespace_fixture
+from test_docker_device_policy_evidence import fixture as device_policy_fixture
+from test_docker_seccomp_policy_evidence import fixture as seccomp_policy_fixture
 from machine_registry_evidence import (
     InvalidEvidence,
     bundle_digest,
@@ -14,8 +17,80 @@ from machine_registry_evidence import (
     resource_name,
     unique_object,
     validate,
+    validate_host_endpoint,
+    validate_live_sessions,
     verify_serial_files,
 )
+
+
+def live_session_fixture(machines):
+    host = host_fixture(machines)
+    commands = {}
+    for name, original in [("before_a", "info_a"), ("before_b", "info_b"),
+                           ("stopped_a", "stopped_a"), ("surviving_b", "surviving_b")]:
+        command = copy.deepcopy(host["commands"][original])
+        command["args"] = ["info", "--format", "{{json .}}"]
+        for field in ["endpoint", "config"]:
+            command[field] = command[field].replace("vz-de-fixture", "vz-ls-fixture")
+        commands[name] = command
+    return {"scope": "registered_original_runtime_stop_only", "commands": commands,
+            "sockets_removed": True, "restart_recovery": False, "public_stop": False,
+            "receipts": [{"owner": machine["owner"], "operation_id": "lop_stop_fixture",
+                          "generation": 2, "runtime_identity": machine["first_identity"],
+                          "endpoint": copy.deepcopy(host["shutdown"][0]) if name != "hardened" else None,
+                          "outcome": "stopped"} for name, machine in machines.items()]}
+
+
+def host_fixture(machines):
+    commands = {}
+    def command(name, args, stdout, payload=b"", code=0):
+        target = "b" if name.endswith("_b") else "a"
+        commands[name] = {"args": args, "endpoint": "unix:///private/tmp/vz-de-fixture/" + target + ".sock",
+                          "config": "/private/tmp/vz-de-fixture/client", "exit_code": code,
+                          "stdout": stdout, "stderr": "connection refused" if code else "",
+                          "input_bytes": len(payload), "input_sha256": hashlib.sha256(payload).hexdigest(),
+                          "elapsed_ms": 1}
+    command("client_version", ["--version"], "Docker version 29.4.0, build fixture\n")
+    for name in ["info_a", "info_b", "surviving_b"]:
+        command(name, ["info", "--format", "{{json .}}"],
+                json.dumps({"ID": "engine-a" if name.endswith("_a") else "engine-b", "DefaultRuntime": "youki", "MemoryLimit": True,
+                            "Runtimes": {"youki": {"status": {"org.opencontainers.runtime-spec.features":
+                                                              json.dumps({"linux": {"cgroup": {"v2": True}}})}}}}))
+    command("stopped_a", ["info"], "", code=1)
+    image = "vz-endpoint-fixture:local"
+    run = ["run", "--rm", "--network", "none", "-v", "vz-endpoint-shared:/data", image, "/bin/busybox"]
+    for name, marker in [("a", "developer-a"), ("b", "developer-b")]:
+        command("import_" + name, ["image", "import", "-", image], "sha256:" + "a" * 64 + "\n", payload=b"fixture-tar")
+        command("volume_" + name, ["volume", "create", "--label", "dev.vz.endpoint.owner=" + marker, "vz-endpoint-shared"],
+                "vz-endpoint-shared\n")
+        command("write_" + name, run + ["sh", "-c", f"printf {marker} > /data/marker; /bin/busybox cat /data/marker"], marker)
+        command("read_" + name, run + ["cat", "/data/marker"], marker)
+        command("memory_" + name, ["run", "--rm", "--network", "none", "--memory", "64m",
+                                   image, "/bin/busybox", "cat", "/sys/fs/cgroup/memory.max"], "67108864\n")
+    payload = b"vz-endpoint-half-close\n" * 12_000
+    command("stdin_eof", ["run", "-i", "--rm", "--network", "none", image, "/bin/busybox", "sh", "-c",
+                          "/bin/busybox cat; /bin/busybox sleep 1; printf done"], payload.decode() + "done", payload)
+    command("events_a", ["events", "--since", "100", "--until", "103", "--filter", "type=volume", "--filter", "event=create", "--format", "{{json .}}"],
+            json.dumps({"Type": "volume", "Action": "create", "Actor": {"ID": "vz-endpoint-event"}}))
+    command("event_volume_a", ["volume", "create", "--label", "dev.vz.endpoint.owner=developer-a", "vz-endpoint-event"], "vz-endpoint-event\n")
+    return {"scope": "focused_host_endpoint_transport_only", "client": "/usr/local/bin/docker",
+            "client_sha256": "a" * 64, "busybox_sha256": "b" * 64,
+            "owners": [machines[name]["owner"] for name in ["developer_a", "developer_b"]],
+            "runtime_identities": [machines[name]["first_identity"] for name in ["developer_a", "developer_b"]],
+            "commands": commands, "socket_modes": [0o600, 0o600], "sockets_removed": True,
+            "time_namespaces": [time_namespace_fixture(
+                machines["developer_" + name], commands["info_" + name]["endpoint"],
+                commands["info_" + name]["config"]) for name in ["a", "b"]],
+            "device_policies": [device_policy_fixture(
+                machines["developer_" + name], commands["info_" + name]["endpoint"],
+                commands["info_" + name]["config"]) for name in ["a", "b"]],
+            "seccomp_policies": [seccomp_policy_fixture(
+                machines["developer_" + name], commands["info_" + name]["endpoint"],
+                commands["info_" + name]["config"]) for name in ["a", "b"]],
+            "unrelated_file_preserved": True, "managed_contexts": False, "compose_buildx": False,
+            "hardened_refusal": "Developer Linux Machine required", "preexisting_path_refusal": "path already exists",
+            "shutdown": [{"accepted_connections": 5, "completed_connections": 3, "cancelled_connections": 1,
+                          "failed_connections": 1, "active_connections": 0, "socket_removed": True} for _ in range(2)]}
 
 
 def fixture():
@@ -124,7 +199,9 @@ def fixture():
     for phase, suffix in [("first_boot", ".first-boot.log"), ("second_boot", ".log")]:
         serial[phase] = [{"path": "/private/tmp/evidence/machine-registry-vm-serial/" + machine["vm_reservation"]["resource_id"] + suffix,
                           "sha256": "9" * 64} for machine in machines.values()]
-    return {"schema_version": 1, "scope": "registry_and_boot_lease_infrastructure_only", "build": build,
+    return {"schema_version": 1, "scope": "registry_boot_lease_and_host_endpoint_infrastructure_only", "build": build,
+            "host_endpoint": host_fixture(machines),
+            "live_sessions": live_session_fixture(machines),
             "target_resolution": {"all_machines_resolved_before_state": True,
                                   "invalid_sibling_rejected_without_state": True},
             "artifact_pinning": {"all_pins_before_runtime_construction": True,
@@ -146,10 +223,92 @@ def fixture():
                         "docker_api_probe_sha256": build["docker_probe_sha256"], "same_named_docker_volumes_hold_distinct_values": True,
                         "sibling_rootfs_and_setup_sentinels_invisible": True, "developer_docker_state_survived_reopen": True,
                         "orphan_rootfs_cleanup_observed_on_reopen": True},
-            "lease": lease, "claims": {"production_up": False, "native_macos_machine": False, "host_docker_socket_or_context": False}}
+            "lease": lease, "claims": {"production_up": False, "native_macos_machine": False, "managed_docker_context_or_full_compatibility": False}}
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_host_transport_rejects_cross_routing_and_missing_proof(self):
+        baseline = fixture()
+        for mutate in [
+            lambda host: host["commands"]["read_b"].update(endpoint=host["commands"]["read_a"]["endpoint"]),
+            lambda host: host["commands"]["info_b"].update(stdout=host["commands"]["info_a"]["stdout"]),
+            lambda host: host["commands"]["stopped_a"].update(exit_code=0),
+            lambda host: host["commands"]["surviving_b"].update(stdout=host["commands"]["info_a"]["stdout"]),
+            lambda host: host["commands"]["stdin_eof"].update(stdout=host["commands"]["stdin_eof"]["stdout"][:-4]),
+            lambda host: host["commands"]["stdin_eof"].update(input_bytes=1),
+            lambda host: host["commands"]["memory_a"].update(stdout="max\n"),
+            lambda host: host["commands"]["info_a"].update(stdout=json.dumps({"ID": "engine-a", "DefaultRuntime": "youki", "MemoryLimit": False})),
+            lambda host: host["commands"]["info_a"].update(stdout=json.dumps({"ID": "engine-a", "DefaultRuntime": "youki", "MemoryLimit": True,
+                "Runtimes": {"youki": {"status": {"org.opencontainers.runtime-spec.features": '{"linux":{"cgroup":{"v2":false}}}'}}}})),
+            lambda host: host["commands"]["import_b"].update(input_sha256="f" * 64),
+            lambda host: host["commands"]["read_b"].update(stdout="developer-a"),
+            lambda host: host["commands"]["events_a"].update(stdout=""),
+            lambda host: host["commands"]["info_a"].update(config="/Users/user/.docker"),
+            lambda host: host.update(socket_modes=[0o666, 0o600]),
+            lambda host: host.update(managed_contexts=True),
+            lambda host: host.update(compose_buildx=True),
+            lambda host: host.update(unrelated_file_preserved=False),
+            lambda host: host.update(hardened_refusal=""),
+            lambda host: host["shutdown"][0].update(active_connections=1),
+            lambda host: host["shutdown"][1].update(accepted_connections=50),
+            lambda host: host.update(time_namespaces=[]),
+            lambda host: host["time_namespaces"][0].update(time_offsets_tested=True),
+            lambda host: host["time_namespaces"][1].update(owner=host["time_namespaces"][0]["owner"]),
+            lambda host: host.update(device_policies=[]),
+            lambda host: host.update(seccomp_policies=[]),
+            lambda host: host["seccomp_policies"][0]["matrix"]["custom_exec"]["commands"]["exec"].update(exit_code=0, stdout="/bin/busybox\n"),
+            lambda host: host["device_policies"][0].update(numeric_errno_measured=True),
+            lambda host: host["device_policies"][1].update(owner=host["device_policies"][0]["owner"]),
+        ]:
+            host = copy.deepcopy(baseline["host_endpoint"])
+            mutate(host)
+            with self.assertRaises(InvalidEvidence):
+                validate_host_endpoint(host, baseline["machines"])
+
+    def test_device_proof_cannot_reuse_sibling_or_time_container_with_consistent_raw_ids(self):
+        baseline = fixture()
+        for replacement in [baseline["host_endpoint"]["device_policies"][0]["matrix"]["default_policy"]["container_id"],
+                            baseline["host_endpoint"]["time_namespaces"][1]["container_id"]]:
+            host = copy.deepcopy(baseline["host_endpoint"])
+            case = host["device_policies"][1]["matrix"]["default_policy"]
+            original = case["container_id"]
+            host["device_policies"][1]["matrix"]["default_policy"] = json.loads(json.dumps(case).replace(original, replacement))
+            with self.assertRaises(InvalidEvidence):
+                validate_host_endpoint(host, baseline["machines"])
+
+    def test_seccomp_proof_rejects_reused_sibling_or_other_policy_container(self):
+        baseline = fixture()
+        for replacement in [baseline["host_endpoint"]["device_policies"][0]["matrix"]["default_policy"]["container_id"],
+                            baseline["host_endpoint"]["time_namespaces"][0]["container_id"],
+                            baseline["host_endpoint"]["seccomp_policies"][0]["matrix"]["custom_exec"]["container_id"]]:
+            host = copy.deepcopy(baseline["host_endpoint"])
+            case = host["seccomp_policies"][1]["matrix"]["custom_exec"]
+            original = case["container_id"]
+            host["seccomp_policies"][1]["matrix"]["custom_exec"] = json.loads(json.dumps(case).replace(original, replacement))
+            with self.assertRaises(InvalidEvidence):
+                validate_host_endpoint(host, baseline["machines"])
+
+    def test_live_session_stop_rejects_unknown_absence_cross_routing_and_leaks(self):
+        baseline = fixture()
+        for mutate in [
+            lambda value: value["receipts"][0].update(outcome="already_absent"),
+            lambda value: value["receipts"][0].update(owner=value["receipts"][1]["owner"]),
+            lambda value: value["receipts"][0].update(runtime_identity=value["receipts"][1]["runtime_identity"]),
+            lambda value: value["receipts"][0].update(generation=3),
+            lambda value: value["receipts"][0].update(operation_id="lop_other"),
+            lambda value: value["receipts"][0]["endpoint"].update(active_connections=1),
+            lambda value: value["receipts"][2].update(endpoint=value["receipts"][0]["endpoint"]),
+            lambda value: value["commands"]["stopped_a"].update(exit_code=0),
+            lambda value: value["commands"]["surviving_b"].update(stdout=value["commands"]["before_a"]["stdout"]),
+            lambda value: value["commands"]["surviving_b"].update(endpoint=value["commands"]["before_a"]["endpoint"]),
+            lambda value: value.update(restart_recovery=True),
+            lambda value: value.update(public_stop=True),
+        ]:
+            value = copy.deepcopy(baseline["live_sessions"])
+            mutate(value)
+            with self.assertRaises(InvalidEvidence):
+                validate_live_sessions(value, baseline["machines"])
+
     def test_domain_separated_identity_vectors(self):
         artifact = {"kernel_sha256": "6" * 64, "initramfs_sha256": "2" * 64,
                     "youki_sha256": "7" * 64, "version_sha256": "8" * 64}

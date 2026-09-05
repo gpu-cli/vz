@@ -22,10 +22,8 @@ pub struct ErrorDetail {
     pub request_id: ::prost::alloc::string::String,
     /// Stable machine-readable context retained across gRPC failures.
     #[prost(map = "string, string", tag = "4")]
-    pub details: ::std::collections::HashMap<
-        ::prost::alloc::string::String,
-        ::prost::alloc::string::String,
-    >,
+    pub details:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct HostSpec {
@@ -480,6 +478,180 @@ pub struct ProjectState {
     pub definition: ::core::option::Option<ProjectDefinition>,
     #[prost(message, repeated, tag = "3")]
     pub environments: ::prost::alloc::vec::Vec<EnvironmentInstance>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MachineExecutionTerminal {
+    #[prost(uint32, tag = "1")]
+    pub rows: u32,
+    #[prost(uint32, tag = "2")]
+    pub columns: u32,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecutionSpec {
+    #[prost(string, repeated, tag = "1")]
+    pub argv: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(map = "string, string", tag = "2")]
+    pub environment:
+        ::std::collections::HashMap<::prost::alloc::string::String, ::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub working_directory: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub user: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "5")]
+    pub terminal: ::core::option::Option<MachineExecutionTerminal>,
+    #[prost(uint64, tag = "6")]
+    pub timeout_millis: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecOpen {
+    #[prost(string, tag = "1")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "2")]
+    pub environment: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "3")]
+    pub process_environment_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub machine: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "6")]
+    pub process_machine_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, optional, tag = "7")]
+    pub spec: ::core::option::Option<MachineExecutionSpec>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecFrame {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(uint64, tag = "2")]
+    pub sequence: u64,
+    /// Empty only on the first Open frame; exact accepted ID on every control.
+    #[prost(string, tag = "3")]
+    pub execution_id: ::prost::alloc::string::String,
+    #[prost(oneof = "machine_exec_frame::Payload", tags = "4, 5, 6, 7, 8, 9")]
+    pub payload: ::core::option::Option<machine_exec_frame::Payload>,
+}
+/// Nested message and enum types in `MachineExecFrame`.
+pub mod machine_exec_frame {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(message, tag = "4")]
+        Open(super::MachineExecOpen),
+        #[prost(bytes, tag = "5")]
+        Stdin(::prost::alloc::vec::Vec<u8>),
+        #[prost(bool, tag = "6")]
+        StdinEof(bool),
+        #[prost(int32, tag = "7")]
+        Signal(i32),
+        #[prost(message, tag = "8")]
+        Resize(super::MachineExecutionTerminal),
+        #[prost(bool, tag = "9")]
+        Cancel(bool),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecutionScope {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub execution_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub idempotency_key: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub request_hash: ::prost::alloc::string::String,
+    #[prost(string, tag = "6")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "7")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "8")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "9")]
+    pub environment_generation: u64,
+    #[prost(message, optional, tag = "10")]
+    pub incarnation: ::core::option::Option<MachineIncarnation>,
+    #[prost(message, optional, tag = "11")]
+    pub runtime_identity: ::core::option::Option<MachineRuntimeIdentity>,
+    #[prost(string, tag = "12")]
+    pub definition_digest: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecutionReceipt {
+    #[prost(message, optional, tag = "1")]
+    pub scope: ::core::option::Option<MachineExecutionScope>,
+    #[prost(enumeration = "MachineExecutionState", tag = "2")]
+    pub state: i32,
+    #[prost(int32, optional, tag = "3")]
+    pub exit_code: ::core::option::Option<i32>,
+    #[prost(string, optional, tag = "4")]
+    pub failure: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(bool, tag = "5")]
+    pub output_replay_available: bool,
+    #[prost(uint64, tag = "6")]
+    pub created_at: u64,
+    #[prost(uint64, tag = "7")]
+    pub updated_at: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineExecEvent {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(message, optional, tag = "2")]
+    pub scope: ::core::option::Option<MachineExecutionScope>,
+    #[prost(uint64, tag = "3")]
+    pub sequence: u64,
+    /// Only a stored terminal receipt may be replayed; output is not retained.
+    #[prost(bool, tag = "4")]
+    pub replayed: bool,
+    #[prost(oneof = "machine_exec_event::Payload", tags = "5, 6, 7, 8")]
+    pub payload: ::core::option::Option<machine_exec_event::Payload>,
+}
+/// Nested message and enum types in `MachineExecEvent`.
+pub mod machine_exec_event {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Payload {
+        #[prost(bool, tag = "5")]
+        Ready(bool),
+        #[prost(bytes, tag = "6")]
+        Stdout(::prost::alloc::vec::Vec<u8>),
+        #[prost(bytes, tag = "7")]
+        Stderr(::prost::alloc::vec::Vec<u8>),
+        #[prost(message, tag = "8")]
+        Receipt(super::MachineExecutionReceipt),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopEnvironmentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub environment: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub process_environment_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
+    /// Bounded physical Stop deadline per Machine, 1..300000 milliseconds.
+    #[prost(uint64, tag = "6")]
+    pub machine_timeout_millis: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct StopEnvironmentEvent {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "4")]
+    pub operation: ::core::option::Option<EnvironmentLifecycleOperation>,
+    #[prost(bool, tag = "5")]
+    pub terminal: bool,
+    /// Present for a failed terminal operation, never a successful receipt.
+    #[prost(message, optional, tag = "6")]
+    pub error: ::core::option::Option<ErrorDetail>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetProjectStateRequest {
@@ -3192,6 +3364,41 @@ impl LifecycleStepStatus {
 }
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
+pub enum MachineExecutionState {
+    Unspecified = 0,
+    Admitted = 1,
+    Completed = 2,
+    Uncertain = 3,
+    Quiesced = 4,
+}
+impl MachineExecutionState {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_EXECUTION_STATE_UNSPECIFIED",
+            Self::Admitted => "MACHINE_EXECUTION_STATE_ADMITTED",
+            Self::Completed => "MACHINE_EXECUTION_STATE_COMPLETED",
+            Self::Uncertain => "MACHINE_EXECUTION_STATE_UNCERTAIN",
+            Self::Quiesced => "MACHINE_EXECUTION_STATE_QUIESCED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_EXECUTION_STATE_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_EXECUTION_STATE_ADMITTED" => Some(Self::Admitted),
+            "MACHINE_EXECUTION_STATE_COMPLETED" => Some(Self::Completed),
+            "MACHINE_EXECUTION_STATE_UNCERTAIN" => Some(Self::Uncertain),
+            "MACHINE_EXECUTION_STATE_QUIESCED" => Some(Self::Quiesced),
+            _ => None,
+        }
+    }
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
 pub enum SpaceCacheTrustOutcome {
     Unspecified = 0,
     LocalHit = 1,
@@ -3252,8 +3459,7 @@ pub mod topology_service_client {
     )]
     use tonic::codegen::http::Uri;
     use tonic::codegen::*;
-    /// Read-only Developer Environment topology queries. Lifecycle mutations are
-    /// intentionally excluded until the daemon owns their backend execution path.
+    /// Developer Environment queries and daemon-owned topology lifecycle.
     #[derive(Debug, Clone)]
     pub struct TopologyServiceClient<T> {
         inner: tonic::client::Grpc<T>,
@@ -3351,6 +3557,51 @@ pub mod topology_service_client {
                 "GetProjectState",
             ));
             self.inner.unary(req, path, codec).await
+        }
+        /// Disconnect cancels observation, not the admitted Stop. Replay with the
+        /// same request/idempotency IDs resumes the durable operation or its receipt.
+        pub async fn stop_environment(
+            &mut self,
+            request: impl tonic::IntoRequest<super::StopEnvironmentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::StopEnvironmentEvent>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.TopologyService/StopEnvironment",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "vz.runtime.v2.TopologyService",
+                "StopEnvironment",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
+        /// First frame opens one exact Machine execution. Subsequent frames control
+        /// only that execution; disconnect requests cancellation and terminal reap.
+        pub async fn exec_machine(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<Message = super::MachineExecFrame>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::MachineExecEvent>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path =
+                http::uri::PathAndQuery::from_static("/vz.runtime.v2.TopologyService/ExecMachine");
+            let mut req = request.into_streaming_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "vz.runtime.v2.TopologyService",
+                "ExecMachine",
+            ));
+            self.inner.streaming(req, path, codec).await
         }
     }
 }
@@ -5889,9 +6140,30 @@ pub mod topology_service_server {
             &self,
             request: tonic::Request<super::GetProjectStateRequest>,
         ) -> std::result::Result<tonic::Response<super::GetProjectStateResponse>, tonic::Status>;
+        /// Server streaming response type for the StopEnvironment method.
+        type StopEnvironmentStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::StopEnvironmentEvent, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Disconnect cancels observation, not the admitted Stop. Replay with the
+        /// same request/idempotency IDs resumes the durable operation or its receipt.
+        async fn stop_environment(
+            &self,
+            request: tonic::Request<super::StopEnvironmentRequest>,
+        ) -> std::result::Result<tonic::Response<Self::StopEnvironmentStream>, tonic::Status>;
+        /// Server streaming response type for the ExecMachine method.
+        type ExecMachineStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::MachineExecEvent, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// First frame opens one exact Machine execution. Subsequent frames control
+        /// only that execution; disconnect requests cancellation and terminal reap.
+        async fn exec_machine(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::MachineExecFrame>>,
+        ) -> std::result::Result<tonic::Response<Self::ExecMachineStream>, tonic::Status>;
     }
-    /// Read-only Developer Environment topology queries. Lifecycle mutations are
-    /// intentionally excluded until the daemon owns their backend execution path.
+    /// Developer Environment queries and daemon-owned topology lifecycle.
     #[derive(Debug)]
     pub struct TopologyServiceServer<T> {
         inner: Arc<T>,
@@ -6003,6 +6275,94 @@ pub mod topology_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.unary(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.TopologyService/StopEnvironment" => {
+                    #[allow(non_camel_case_types)]
+                    struct StopEnvironmentSvc<T: TopologyService>(pub Arc<T>);
+                    impl<T: TopologyService>
+                        tonic::server::ServerStreamingService<super::StopEnvironmentRequest>
+                        for StopEnvironmentSvc<T>
+                    {
+                        type Response = super::StopEnvironmentEvent;
+                        type ResponseStream = T::StopEnvironmentStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::StopEnvironmentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TopologyService>::stop_environment(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = StopEnvironmentSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.TopologyService/ExecMachine" => {
+                    #[allow(non_camel_case_types)]
+                    struct ExecMachineSvc<T: TopologyService>(pub Arc<T>);
+                    impl<T: TopologyService>
+                        tonic::server::StreamingService<super::MachineExecFrame>
+                        for ExecMachineSvc<T>
+                    {
+                        type Response = super::MachineExecEvent;
+                        type ResponseStream = T::ExecMachineStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<tonic::Streaming<super::MachineExecFrame>>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TopologyService>::exec_machine(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ExecMachineSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

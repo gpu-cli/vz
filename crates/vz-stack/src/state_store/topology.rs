@@ -1892,37 +1892,62 @@ impl StateStore {
         context: &EnvironmentSelectionContext,
         now: u64,
     ) -> Result<EnvironmentUpReservation, StackError> {
+        self.with_immediate_transaction(|store| {
+            store.resolve_or_reserve_environment_for_up_in_transaction(
+                definition,
+                context,
+                now,
+                &|_| Ok(()),
+            )
+        })
+    }
+
+    /// Internal transaction body shared by trusted reservation and authorized,
+    /// durable request admission. Authorization sees exact prospective IDs
+    /// before any Project or Environment insertion.
+    pub(super) fn resolve_or_reserve_environment_for_up_in_transaction(
+        &self,
+        definition: &ProjectDefinition,
+        context: &EnvironmentSelectionContext,
+        now: u64,
+        authorize: &impl Fn(&EnvironmentInstance) -> Result<(), StackError>,
+    ) -> Result<EnvironmentUpReservation, StackError> {
         definition
             .validate()
             .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
-        self.with_immediate_transaction(|store| {
-            let (mut project, project_exists) = match store
-                .load_project_state(definition.project_id.as_str())?
-            {
-                Some(project) => {
-                    if project.definition != *definition {
-                        return Err(StackError::InvalidSpec(format!(
-                            "project definition drift for `{}`; persisted digest={}, requested digest={}",
-                            definition.project_id,
-                            project.definition.digest().map_err(|error| StackError::InvalidSpec(error.to_string()))?,
-                            definition.digest().map_err(|error| StackError::InvalidSpec(error.to_string()))?,
-                        )));
-                    }
-                    (project, true)
+        let store = self;
+        let (mut project, project_exists) = match store
+            .load_project_state(definition.project_id.as_str())?
+        {
+            Some(project) => {
+                if project.definition != *definition {
+                    return Err(StackError::InvalidSpec(format!(
+                        "project definition drift for `{}`; persisted digest={}, requested digest={}",
+                        definition.project_id,
+                        project
+                            .definition
+                            .digest()
+                            .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                        definition
+                            .digest()
+                            .map_err(|error| StackError::InvalidSpec(error.to_string()))?,
+                    )));
                 }
-                None => (
-                    ProjectState {
-                        schema_version: TOPOLOGY_SCHEMA_VERSION,
-                        definition: definition.clone(),
-                        environments: Vec::new(),
-                    },
-                    false,
-                ),
-            };
+                (project, true)
+            }
+            None => (
+                ProjectState {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    definition: definition.clone(),
+                    environments: Vec::new(),
+                },
+                false,
+            ),
+        };
 
-            match project.resolve_environment_for_up(context)? {
-                EnvironmentUpDecision::Existing { selection } => {
-                    let environment = project
+        match project.resolve_environment_for_up(context)? {
+            EnvironmentUpDecision::Existing { selection } => {
+                let environment = project
                         .environments
                         .iter()
                         .find(|environment| environment.environment_id == selection.environment_id)
@@ -1933,40 +1958,41 @@ impl StateStore {
                                 selection.environment_id
                             ))
                         })?;
-                    Ok(EnvironmentUpReservation::Existing {
-                        selection,
-                        environment,
-                    })
-                }
-                EnvironmentUpDecision::Create { name } => {
-                    let environment = definition
-                        .instantiate_environment(name, now)
-                        .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
-                    project.environments.push(environment.clone());
-                    project
-                        .validate()
-                        .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
-                    if !project_exists {
-                        store.conn.execute(
-                            "INSERT INTO project_definitions
+                authorize(&environment)?;
+                Ok(EnvironmentUpReservation::Existing {
+                    selection,
+                    environment,
+                })
+            }
+            EnvironmentUpDecision::Create { name } => {
+                let environment = definition
+                    .instantiate_environment(name, now)
+                    .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+                authorize(&environment)?;
+                project.environments.push(environment.clone());
+                project
+                    .validate()
+                    .map_err(|error| StackError::InvalidSpec(error.to_string()))?;
+                if !project_exists {
+                    store.conn.execute(
+                        "INSERT INTO project_definitions
                                 (project_id, schema_version, name, definition_json, created_at,
                                  updated_at)
                              VALUES (?1, ?2, ?3, ?4, ?5, ?5)",
-                            params![
-                                definition.project_id.as_str(),
-                                definition.schema_version,
-                                definition.name,
-                                serde_json::to_string(definition)?,
-                                sqlite_u64(now, "Environment created_at")?,
-                            ],
-                        )?;
-                    }
-                    store.insert_environment(&environment)?;
-                    store.refresh_project_timestamps(definition.project_id.as_str())?;
-                    Ok(EnvironmentUpReservation::Created { environment })
+                        params![
+                            definition.project_id.as_str(),
+                            definition.schema_version,
+                            definition.name,
+                            serde_json::to_string(definition)?,
+                            sqlite_u64(now, "Environment created_at")?,
+                        ],
+                    )?;
                 }
+                store.insert_environment(&environment)?;
+                store.refresh_project_timestamps(definition.project_id.as_str())?;
+                Ok(EnvironmentUpReservation::Created { environment })
             }
-        })
+        }
     }
 
     /// Reserve a declared workspace slot while an Environment is still Creating.

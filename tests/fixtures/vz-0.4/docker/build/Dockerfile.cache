@@ -1,0 +1,10 @@
+ARG FIXTURE_BASE
+FROM ${FIXTURE_BASE} AS build
+ARG FIXTURE_BASE
+ARG FIXTURE_OWNER
+ARG FIXTURE_CACHE_EXPECT
+ARG FIXTURE_CACHE_STEP
+COPY tools.py /fixture/tools.py
+RUN --network=none --mount=type=cache,id=vz04-cache-probe,target=/cache,sharing=locked python3 /fixture/tools.py cache
+FROM scratch AS output
+COPY --from=build /out/cache.txt /cache.txt

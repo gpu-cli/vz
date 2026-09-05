@@ -27,6 +27,8 @@ use crate::events::{EventRecord, StackEvent};
 use crate::network::PublishedPort;
 use crate::reconcile::Action;
 
+mod environment_up;
+mod machine_execution;
 mod stack_journal;
 pub use stack_journal::{
     StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,

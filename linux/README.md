@@ -17,27 +17,67 @@ Developer Environments; it is not a separate peer product.
 Full Docker compatibility is roadmap work. The Developer guest now includes a
 pinned, statically linked iptables legacy frontend for Docker bridge/NAT setup;
 the hardened Container guest intentionally does not. When complete, Docker will
-be an implicit, private capability of each Linux Developer Environment, never a
+be an implicit, private capability of each Developer-profile Linux Machine, never a
 global daemon or a capability of native macOS/Windows targets. Both Linux
 profiles use the pinned youki runtime; runc fallback is not supported.
 
 ## Quick start
 
-```bash
-make -C linux all
-```
-
-Build the secondary hardened profile:
+On macOS, build sources and compiler workspaces must reside on a case-sensitive
+Linux filesystem. Select your local Docker build context explicitly:
 
 ```bash
-make -C linux KERNEL_PROFILE=container all
+export YOUKI_DOCKER_CONTEXT=orbstack
+export IPTABLES_DOCKER_CONTEXT=orbstack
+export LINUX_DOCKER_CONTEXT=orbstack
+make -C linux docker-build-all
 ```
 
-If your host toolchain does not have ARM64 + musl cross support:
+Use your local context name (`default` on many Linux build hosts); this does not
+change Docker's global current context. Docker is used as build infrastructure,
+not as a substitute for vz-managed Machine verification. A validated cached
+youki artifact can be installed without a Docker daemon. The pinned source
+recipe, static dependencies and verification contract are documented in
+[`youki/README.md`](youki/README.md).
+
+Fresh iptables builds on macOS also use the explicitly selected local Linux
+builder, with source extracted into its private case-sensitive filesystem.
+Upstream case-distinct headers cannot be safely extracted into a default Mac
+checkout. Prepare `vz-linux-builder` from `linux/Dockerfile` if it is absent;
+the helper resolves and records the exact local image ID and builds offline.
+
+Build only the primary Developer profile:
 
 ```bash
 make -C linux docker-build
 ```
+
+Direct `make all`/`make kernel` require case-sensitive source and build storage
+and a suitable Linux cross/native toolchain. They intentionally reject the
+usual case-insensitive Mac checkout. The Docker wrapper uses verified,
+profile-specific Linux storage without deleting or reusing the old host source
+tree. See [`SOURCE-BUILDS.md`](SOURCE-BUILDS.md) for pinned source inventories,
+case-preservation checks, staged builds, and cache provenance.
+
+On macOS, standalone `make iptables` and Developer initramfs builds also route
+iptables compilation through a local Linux builder. Upstream contains
+case-distinct source/header names (for example `xt_TCPMSS.h` and `xt_tcpmss.h`),
+which cannot safely be extracted on the usual case-insensitive Mac filesystem.
+Prepare and explicitly select the builder before those targets:
+
+```bash
+docker --context orbstack build -t vz-linux-builder linux
+IPTABLES_DOCKER_CONTEXT=orbstack make -C linux iptables
+```
+
+Choose your actual local Unix-socket Docker context; there is no implicit default
+daemon fallback. `IPTABLES_DOCKER_BUILDER` may select another prepared Linux/arm64
+builder image. The helper resolves its immutable image ID before execution,
+verifies the pinned source archive, and builds with networking disabled in the
+container's private, case-sensitive `/tmp`. The checkout and archive are mounted
+read-only; only the selected output directory is writable. This is build
+infrastructure, not host-Docker runtime conformance evidence. Hardened builds do
+not acquire iptables.
 
 Build both distributable profiles:
 
@@ -59,7 +99,9 @@ SCSI/ATA, NFS client support, 9p, SquashFS, or FAT/VFAT.
 Release CI caches each profile kernel image separately from the initramfs and
 metadata. Normal `vz` releases rebuild the guest agent/initramfs and regenerate
 `version.json`, but only recompile a profile kernel image when that profile's
-kernel config, `kernel-version.mk`, or Docker build environment changes.
+kernel config, `kernel-version.mk`, source/build recipes, or Docker build
+environment changes. Cached images require matching, validated `.build.json`
+provenance; an image's presence or timestamp alone is not sufficient.
 
 ## Profile selection API
 
@@ -76,10 +118,11 @@ additional validation:
 - `vz_linux::ensure_kernel_profile(KernelProfile::Container)`
 - `vz_linux::ensure_kernel_bundle(KernelBundleOptions { profile: Some(...), required_capabilities: ..., ..Default::default() })`
 
-OCI runtime callers can set `RuntimeConfig::linux_profile`. CLI users can pass
-`--kernel-profile developer|container` on OCI commands and `vz vm linux init`.
-New Developer Environment flows should select `developer` implicitly; the flag
-is primarily an infrastructure and compatibility control.
+OCI runtime callers can set `RuntimeConfig::linux_profile`. The transitional
+0.3 CLI still exposes backend profile flags and `vz vm`; these are not the 0.4
+public interface and must be removed, not retained as hidden aliases. The 0.4
+ProjectDefinition carries each Machine's explicit Developer/Hardened profile,
+and the five lifecycle commands operate on that topology.
 
 ## Benchmark boot latency
 
@@ -106,6 +149,8 @@ Useful benchmark flags:
 - `vz-linux.config` developer kernel config fragment
 - `vz-linux-container.config` container kernel config fragment
 - `kernel-version.mk` shared kernel version/cache schema
+- `youki/` checksum-pinned source, Rust/native build inputs and static binary
+  verification, with explicit cgroup-v2, device-filter and seccomp features
 - pinned netfilter.org iptables source (Developer profile only; archive SHA-256
   is verified before its static legacy frontend is built)
 - `initramfs/` template files (`init`, `resolv.conf`, `udhcpc.script`)

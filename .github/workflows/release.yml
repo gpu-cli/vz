@@ -195,42 +195,45 @@ jobs:
         id: linux-developer-kernel-cache
         uses: actions/cache@v4
         with:
-          path: linux/out/vmlinux
-          key: linux-kernel-developer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Dockerfile', 'linux/vz-linux.config') }}
+          path: |
+            linux/out/vmlinux
+            linux/out/vmlinux.build.json
+          key: linux-kernel-developer-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Makefile', 'linux/Dockerfile', 'linux/source-build.py', 'linux/docker-build.sh', 'linux/vz-linux.config') }}
 
       - name: Cache container Linux kernel image
         id: linux-container-kernel-cache
         uses: actions/cache@v4
         with:
-          path: linux/out/container/vmlinux
-          key: linux-kernel-container-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Dockerfile', 'linux/vz-linux-container.config') }}
+          path: |
+            linux/out/container/vmlinux
+            linux/out/container/vmlinux.build.json
+          key: linux-kernel-container-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('linux/kernel-version.mk', 'linux/Makefile', 'linux/Dockerfile', 'linux/source-build.py', 'linux/docker-build.sh', 'linux/vz-linux-container.config') }}
 
-      - name: Build missing Linux kernel images via Docker
+      - name: Verify cached provenance or rebuild Linux kernel images via Docker
         run: |
           cd linux
           docker build -t vz-linux-builder .
+          builder_id="$(docker image inspect vz-linux-builder --format '{{.Id}}')"
           for profile in developer container; do
-            out_dir="out"
-            if [ "$profile" = "container" ]; then
-              out_dir="out/container"
-            fi
-
-            if [ -s "$out_dir/vmlinux" ]; then
-              echo "Using cached $profile kernel image"
-              continue
-            fi
-
+            # make validates artifact/source/config/recipe/builder provenance;
+            # the presence of a cached image alone never bypasses verification.
             docker run --rm \
+              -e "VZ_LINUX_BUILDER_ID=$builder_id" \
               -v "$(cd .. && pwd):/workspace" \
               -w /workspace/linux \
               vz-linux-builder \
               make kernel KERNEL_PROFILE="$profile" CROSS_COMPILE= GUEST_AGENT_BUILD_TOOL=cargo
           done
 
+      - name: Build pinned youki on the local Docker host
+        run: YOUKI_DOCKER_CONTEXT=default make -C linux youki
+
       - name: Build Linux userland bundles via Docker
         run: |
           cd linux
+          builder_id="$(docker image inspect vz-linux-builder --format '{{.Id}}')"
           docker run --rm \
+            -e "VZ_LINUX_BUILDER_ID=$builder_id" \
             -v "$(cd .. && pwd):/workspace" \
             -w /workspace/linux \
             vz-linux-builder \
@@ -287,6 +290,18 @@ jobs:
             ((.capabilities // []) | index("nfsd")) and
             ((.capabilities // []) | index("container_sandbox"))
           ' linux/out/container/version.json >/dev/null
+
+      - name: Retain kernel and BusyBox source build provenance
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-source-build-provenance
+          path: |
+            linux/out/vmlinux.build.json
+            linux/out/busybox.build.json
+            linux/out/container/vmlinux.build.json
+            linux/out/container/busybox.build.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Package Linux artifacts
         env:

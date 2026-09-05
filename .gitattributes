@@ -1,0 +1,4 @@
+# Unified-diff blank context lines require their leading space. Preserve exact
+# pinned patch bytes; ordinary source whitespace checks remain enabled.
+linux/youki/seccomp-exec.patch whitespace=-blank-at-eol
+linux/youki/tenant-root.patch whitespace=-blank-at-eol

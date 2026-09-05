@@ -1,0 +1,157 @@
+{
+  "services": {
+    "db": {
+      "image": "${FIXTURE_IMAGE:?immutable fixture image required}",
+      "pull_policy": "never",
+      "command": [
+        "db"
+      ],
+      "environment": {
+        "FIXTURE_OWNER": "${FIXTURE_OWNER:?exact owner token required}"
+      },
+      "networks": [
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python3",
+          "/fixture/service.py",
+          "health",
+          "db"
+        ],
+        "interval": "1s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "0s"
+      },
+      "volumes": [
+        "state:/data"
+      ]
+    },
+    "api": {
+      "image": "${FIXTURE_IMAGE:?immutable fixture image required}",
+      "pull_policy": "never",
+      "command": [
+        "api"
+      ],
+      "environment": {
+        "FIXTURE_OWNER": "${FIXTURE_OWNER:?exact owner token required}"
+      },
+      "networks": [
+        "frontend",
+        "backend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python3",
+          "/fixture/service.py",
+          "health",
+          "api"
+        ],
+        "interval": "1s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "0s"
+      },
+      "depends_on": {
+        "db": {
+          "condition": "service_healthy"
+        }
+      }
+    },
+    "worker": {
+      "image": "${FIXTURE_IMAGE:?immutable fixture image required}",
+      "pull_policy": "never",
+      "command": [
+        "worker"
+      ],
+      "environment": {
+        "FIXTURE_OWNER": "${FIXTURE_OWNER:?exact owner token required}"
+      },
+      "networks": [
+        "frontend"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python3",
+          "/fixture/service.py",
+          "health",
+          "worker"
+        ],
+        "interval": "1s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "0s"
+      },
+      "depends_on": {
+        "api": {
+          "condition": "service_healthy"
+        }
+      }
+    },
+    "isolated": {
+      "image": "${FIXTURE_IMAGE:?immutable fixture image required}",
+      "pull_policy": "never",
+      "command": [
+        "isolated"
+      ],
+      "environment": {
+        "FIXTURE_OWNER": "${FIXTURE_OWNER:?exact owner token required}"
+      },
+      "networks": [
+        "isolated"
+      ],
+      "healthcheck": {
+        "test": [
+          "CMD",
+          "python3",
+          "/fixture/service.py",
+          "health",
+          "isolated"
+        ],
+        "interval": "1s",
+        "timeout": "3s",
+        "retries": 5,
+        "start_period": "0s"
+      }
+    },
+    "failure": {
+      "image": "${FIXTURE_IMAGE:?immutable fixture image required}",
+      "pull_policy": "never",
+      "profiles": [
+        "failure"
+      ],
+      "command": [
+        "failure"
+      ],
+      "environment": {
+        "FIXTURE_OWNER": "${FIXTURE_OWNER:?exact owner token required}"
+      },
+      "networks": [
+        "frontend"
+      ],
+      "depends_on": {
+        "api": {
+          "condition": "service_healthy"
+        }
+      }
+    }
+  },
+  "networks": {
+    "frontend": {
+      "internal": true
+    },
+    "backend": {
+      "internal": true
+    },
+    "isolated": {
+      "internal": true
+    }
+  },
+  "volumes": {
+    "state": {}
+  }
+}

@@ -1,0 +1,2029 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vz.dev/schemas/docker-compatibility-v0.4.schema.json",
+  "title": "vz 0.4 Docker candidate compatibility requirements",
+  "description": "Inputs only, never a PASS receipt. Canonical scenarios prevent silent expected-result weakening or coverage removal. The strict helper additionally rejects unresolved pins and verifies source, fixture and harness digests.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "target_release",
+    "contract_state",
+    "normative_source",
+    "support_claim",
+    "candidate_versions",
+    "host_client_observation",
+    "execution_policy",
+    "fixture_bundle",
+    "harness",
+    "intentional_exclusions",
+    "scenarios",
+    "minimum_requirements_sha256"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../schemas/docker-compatibility-v0.4.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "target_release": {
+      "const": "0.4.0"
+    },
+    "contract_state": {
+      "enum": [
+        "draft_unverified",
+        "inputs_frozen"
+      ]
+    },
+    "normative_source": {
+      "const": "planning/developer-environments/GOAL-0.4.0.md#strict-e2e-release-gate"
+    },
+    "support_claim": {
+      "const": "candidate_versions_only_not_certified"
+    },
+    "candidate_versions": {
+      "const": {
+        "docker_engine": {
+          "minimum": "29.7.2",
+          "maximum": "29.7.2",
+          "build": "6a43e3d",
+          "source_commit": "6a43e3d5afddf4111da0f864bbc7cae5d7e95001",
+          "archive_sha256": "43d143448adf2c2787704e7d7704fd6d62d367a54c5edaef0a3f75509cb0938d"
+        },
+        "engine_api": {
+          "minimum": "1.40",
+          "maximum": "1.55",
+          "minimum_override_allowed": false,
+          "source_state": "verified_primary_source",
+          "source_url": "https://raw.githubusercontent.com/moby/moby/6a43e3d5afddf4111da0f864bbc7cae5d7e95001/daemon/config/config.go",
+          "source_sha256": "35a92efe74f32169c0900a68b5558fcd23313d596248972d304d5755121cfcca",
+          "upstream_configurable_floor": "1.24"
+        },
+        "docker_cli": {
+          "minimum": "29.4.0",
+          "maximum": "29.4.0",
+          "build": "9d7ad9f"
+        },
+        "compose": {
+          "minimum": "5.1.2",
+          "maximum": "5.1.2"
+        },
+        "buildx": {
+          "minimum": "0.33.0",
+          "maximum": "0.33.0",
+          "commit": "f7897eba028583e0071642db3c011e860444f8cf"
+        }
+      }
+    },
+    "host_client_observation": {
+      "const": {
+        "commands": [
+          [
+            "/usr/local/bin/docker",
+            "--version"
+          ],
+          [
+            "/usr/local/bin/docker",
+            "compose",
+            "version"
+          ],
+          [
+            "/usr/local/bin/docker",
+            "buildx",
+            "version"
+          ]
+        ],
+        "stdout": "Docker version 29.4.0, build 9d7ad9f\nDocker Compose version v5.1.2\ngithub.com/docker/buildx v0.33.0 f7897eba028583e0071642db3c011e860444f8cf\n",
+        "sha256": "e78a864147a205d71c20fe9acc7d8c89df66ca18584bee93bd33fecff24e8dee",
+        "scope": "version_commands_only_no_daemon_or_compatibility_test"
+      }
+    },
+    "execution_policy": {
+      "const": {
+        "host_os": "macos",
+        "host_architecture": "arm64",
+        "machine_os": "linux",
+        "machine_profile": "developer",
+        "unmodified_installed_host_clients_required": true,
+        "exact_machine_context_required": true,
+        "global_docker_context_must_remain_unchanged": true,
+        "guest_substitute_clients_allowed": false,
+        "internal_rust_shortcuts_allowed": false,
+        "mocks_as_release_evidence_allowed": false,
+        "docker_desktop_daemon_allowed": false,
+        "host_system_daemon_allowed": false,
+        "fallback_daemon_allowed": false,
+        "runtime": "youki",
+        "runtime_overrides_allowed": false,
+        "runc_crun_allowed": false,
+        "test_case_retries": 0,
+        "scope_fields": [
+          "project_id",
+          "environment_id",
+          "machine_id",
+          "machine_incarnation",
+          "runtime_identity",
+          "docker_context",
+          "docker_endpoint"
+        ],
+        "isolation_inventory": [
+          "containers",
+          "images",
+          "volumes",
+          "networks",
+          "events",
+          "buildkit_caches",
+          "lifecycle_effects"
+        ],
+        "phases": [
+          "clean-provision",
+          "persisted-recovery",
+          "final-cleanup"
+        ],
+        "cleanup": "exact_run_owned_resources_only_with_surviving_environment_health_and_sentinel_checks",
+        "raw_evidence_required": true,
+        "secret_canaries_must_be_absent": true
+      }
+    },
+    "fixture_bundle": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "path",
+        "sha256",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "pending",
+            "pinned"
+          ]
+        },
+        "path": {
+          "const": "tests/fixtures/vz-0.4/docker"
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "pending"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "state",
+        "entry_point",
+        "sha256",
+        "reason"
+      ],
+      "properties": {
+        "state": {
+          "enum": [
+            "pending",
+            "pinned"
+          ]
+        },
+        "sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "reason": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2048
+        },
+        "entry_point": {
+          "const": "scripts/run-linux-docker-e2e.sh"
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "state": {
+                "const": "pending"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "sha256": {
+                "type": "null"
+              }
+            }
+          },
+          "else": {
+            "properties": {
+              "sha256": {
+                "type": "string",
+                "pattern": "^[0-9a-f]{64}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "intentional_exclusions": {
+      "const": []
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 63,
+      "maxItems": 63,
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          {
+            "id": "docker.engine.version",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "server_version": "29.7.2",
+              "client_version": "29.4.0",
+              "target_os": "linux",
+              "target_architecture": "arm64"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "version"
+              ]
+            ]
+          },
+          {
+            "id": "docker.engine.info",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "default_runtime": "youki",
+              "engine_identity": "selected_machine",
+              "daemon_unique_per_machine": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "info"
+              ]
+            ]
+          },
+          {
+            "id": "docker.engine.context",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "endpoint_owner": "selected_environment_and_machine",
+              "global_default_unchanged": true,
+              "stale_or_foreign_context": "reject"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "context",
+                "inspect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.engine.api_negotiation",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "server_default_min_api": "1.40",
+              "server_max_api": "1.55",
+              "automatic_negotiation": "highest_mutually_supported",
+              "api_1_39": "reject",
+              "api_1_56": "reject",
+              "min_api_override_absent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "version"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.registry_login",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "valid_credentials": "success",
+              "invalid_credentials": "reject",
+              "secret_canary_in_logs": false,
+              "credentials_owner": "selected_machine_client_config"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "login"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.pull",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "resolved_digest": "fixture.image_digest",
+              "content_digest_verified": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "pull"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.push",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "registry_digest": "fixture.image_digest",
+              "unauthorized_registry_push": "reject"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "push"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.tag",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "new_tag_digest": "fixture.image_digest",
+              "source_tag_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "tag"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.inspect",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "id_and_platform": "fixture.image_identity",
+              "labels": "fixture.image_labels"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "image",
+                "inspect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.save_load",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "round_trip_digest": "fixture.image_digest",
+              "archive_payload_verified": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "image",
+                "save"
+              ],
+              [
+                "image",
+                "load"
+              ]
+            ]
+          },
+          {
+            "id": "docker.image.remove",
+            "required": true,
+            "client": "docker",
+            "phase": "final-cleanup",
+            "expected": {
+              "selected_reference_absent": true,
+              "unrelated_image_digests_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "image",
+                "rm"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.create",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "state": "created",
+              "running": false,
+              "configuration": "fixture.container_configuration"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "create"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.start",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "state": "running",
+              "container_id_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "start"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.stop",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "state": "exited",
+              "no_live_processes": true,
+              "identity_preserved": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "stop"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.restart",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "state": "running",
+              "container_id_unchanged": true,
+              "process_generation_changed": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "restart"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.kill",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "state": "exited",
+              "container_exit_code": 137,
+              "no_live_processes": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "kill",
+                "--signal",
+                "KILL"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.wait",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "stdout": "37\n",
+              "container_exit_code": 37
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "wait"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.remove",
+            "required": true,
+            "client": "docker",
+            "phase": "final-cleanup",
+            "expected": {
+              "selected_container_absent": true,
+              "selected_processes_absent": true,
+              "unrelated_container_ids_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "container",
+                "rm"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.health_checks",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "transitions": [
+                "starting",
+                "healthy",
+                "unhealthy"
+              ],
+              "health_probe_exit_codes": [
+                0,
+                1
+              ],
+              "bounded_poll_samples_retained": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "inspect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.logs",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "stdout": "fixture.stdout_bytes",
+              "stderr": "fixture.stderr_bytes",
+              "follow_order_preserved": true,
+              "no_cross_machine_output": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "logs"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.events",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "ordered_events": [
+                "create",
+                "start",
+                "die",
+                "destroy"
+              ],
+              "event_ids": "exact_owned_container_ids",
+              "foreign_events_absent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "events"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.attach",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "binary_stdin_round_trip": true,
+              "stdout_stderr_demultiplexed": true,
+              "half_close_preserves_output": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "attach"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.exec",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "stdout": "fixture.exec_stdout",
+              "working_directory": "fixture.working_directory",
+              "effective_user": "fixture.user",
+              "same_container_root_and_namespaces": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "exec"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.stdin",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "binary_input_digest": "fixture.stdin_sha256",
+              "eof_delivered_once": true,
+              "trailing_output_after_eof_preserved": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--interactive"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.tty",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "isatty": true,
+              "initial_size": [
+                24,
+                80
+              ],
+              "resized_size": [
+                40,
+                120
+              ],
+              "terminal_restored": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "exec",
+                "--interactive",
+                "--tty"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.signals",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "observed_signal": "SIGTERM",
+              "signal_delivered_to_owned_process": true,
+              "unrelated_processes_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "kill",
+                "--signal",
+                "TERM"
+              ]
+            ]
+          },
+          {
+            "id": "docker.container.exact_exit_results",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "normal_exit_codes": [
+                0,
+                37
+              ],
+              "signal_exit_codes": [
+                130,
+                137,
+                143
+              ],
+              "missing_command_exit_code": 127,
+              "non_executable_exit_code": 126
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.bind_mounts",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "host_to_container_bytes": "fixture.bind_input",
+              "container_to_host_bytes": "fixture.bind_output",
+              "only_declared_workspace_visible": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--mount",
+                "type=bind"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.named_volumes",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "same_machine_reuse_persists": true,
+              "volume_identity": "owned_named_volume",
+              "other_machine_cannot_read": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "volume",
+                "create"
+              ],
+              [
+                "run",
+                "--mount",
+                "type=volume"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.tmpfs",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "filesystem_type": "tmpfs",
+              "data_absent_after_recreate": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--tmpfs"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.read_only_mounts",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "root_write": "reject",
+              "readonly_mount_write": "reject",
+              "declared_writable_mount_write": "success"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--read-only",
+                "--mount",
+                "type=bind,readonly"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.ownership",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "uid_gid": "fixture.uid_gid",
+              "created_file_ownership": "fixture.uid_gid",
+              "forbidden_write": "reject"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--user"
+              ]
+            ]
+          },
+          {
+            "id": "docker.storage.persistence",
+            "required": true,
+            "client": "docker",
+            "phase": "persisted-recovery",
+            "expected": {
+              "after_stop_up_sha256": "fixture.persistence_sha256",
+              "stable_environment_and_machine_ids": true,
+              "unrelated_state_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "volume",
+                "inspect"
+              ],
+              [
+                "container",
+                "inspect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.network.user_defined_networks",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_members_communicate": true,
+              "disconnected_member_denied": true,
+              "network_owned_by_machine": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "network",
+                "create"
+              ],
+              [
+                "network",
+                "connect"
+              ],
+              [
+                "network",
+                "disconnect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.network.dns",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_alias_resolution": "fixture.dns_answers",
+              "foreign_environment_alias": "denied",
+              "stale_alias_after_remove": "absent"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run"
+              ]
+            ]
+          },
+          {
+            "id": "docker.network.published_ports",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "listener_address": "127.0.0.1",
+              "assigned_ports_unique": true,
+              "selected_service_response": "fixture.service_response",
+              "wildcard_or_lan_listener": false
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--publish",
+                "127.0.0.1::8080"
+              ]
+            ]
+          },
+          {
+            "id": "docker.network.cleanup",
+            "required": true,
+            "client": "docker",
+            "phase": "final-cleanup",
+            "expected": {
+              "owned_routes_dns_listeners_mounts_absent": true,
+              "unrelated_inventory_sha256_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "network",
+                "rm"
+              ],
+              [
+                "volume",
+                "rm"
+              ],
+              [
+                "container",
+                "rm"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.multi_stage",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "final_image_content": "fixture.final_stage_sha256",
+              "intermediate_only_secret_absent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.parallel",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "parallel_builds": 4,
+              "all_outputs_match_fixture": true,
+              "unrelated_one_second_health_failures": 0
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.build_arguments",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_argument_output": "fixture.build_arg_output",
+              "different_argument_changes_expected_layer": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build",
+                "--build-arg"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.secrets",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "secret_available_only_during_mount": true,
+              "secret_in_image_cache_logs_evidence": false
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build",
+                "--secret"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.cache_reuse",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "second_build_cache_hit_for_unchanged_steps": true,
+              "output_digest_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.cache_export",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "export_import_cache_hit": true,
+              "output_digest_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build",
+                "--cache-to"
+              ],
+              [
+                "buildx",
+                "build",
+                "--cache-from"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.cache_isolation",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "cache_visible_to_same_machine": true,
+              "sibling_machine_cache_hit_without_import": false,
+              "sibling_environment_cache_hit_without_import": false
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.ssh_mounts",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_ssh_mount_authenticates": true,
+              "undeclared_ssh_access": "reject",
+              "private_key_in_image_cache_logs_evidence": false
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build",
+                "--ssh"
+              ]
+            ]
+          },
+          {
+            "id": "docker.build.output_export",
+            "required": true,
+            "client": "buildx",
+            "phase": "clean-provision",
+            "expected": {
+              "local_export_sha256": "fixture.export_sha256",
+              "oci_export_digest": "fixture.image_digest",
+              "export_outside_owned_destination": false
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "buildx",
+                "build",
+                "--output"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.create",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "services_state": "created",
+              "configuration": "fixture.compose_configuration",
+              "no_running_service_before_up": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "create"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.up",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "all_required_services_healthy": true,
+              "owned_project_labels_exact": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up",
+                "--detach"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.down",
+            "required": true,
+            "client": "compose",
+            "phase": "final-cleanup",
+            "expected": {
+              "owned_containers_networks_requested_volumes_absent": true,
+              "external_and_unrelated_resources_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "down",
+                "--volumes",
+                "--remove-orphans"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.dependency_ordering",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "observed_start_order": "fixture.dependency_order",
+              "undeclared_dependency_edges_absent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.health_ordering",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "dependent_starts_after_dependency_healthy": true,
+              "unhealthy_dependency_blocks_dependent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.networks",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_network_membership": "fixture.compose_networks",
+              "undeclared_service_path": "reject"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.volumes",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "declared_volume_mounts": "fixture.compose_volumes",
+              "restart_data_sha256": "fixture.persistence_sha256"
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.logs",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "per_service_bytes_and_order": "fixture.compose_logs",
+              "foreign_project_output_absent": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "logs",
+                "--follow"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.exec",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "selected_service": "fixture.compose_service",
+              "stdout": "fixture.exec_stdout",
+              "exit_code": 37
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "exec",
+                "--no-TTY"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.scaling",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "replicas": 3,
+              "all_replica_identities_unique": true,
+              "scaled_down_replicas_removed": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up",
+                "--scale"
+              ]
+            ]
+          },
+          {
+            "id": "docker.compose.failure_propagation",
+            "required": true,
+            "client": "compose",
+            "phase": "clean-provision",
+            "expected": {
+              "exit_code": 37,
+              "failed_dependency_not_reported_healthy": true,
+              "partial_owned_resources_accounted_for": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "compose",
+                "up",
+                "--abort-on-container-exit",
+                "--exit-code-from"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.resource_limits",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "effective_cgroup_limits": "fixture.resource_limits",
+              "limits_enforced": true,
+              "sibling_limits_unchanged": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--memory",
+                "--cpus",
+                "--pids-limit"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.oom",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "memory_limit_bytes": 1073741824,
+              "oom_killed": true,
+              "container_exit_code": 137,
+              "sibling_health_probe_seconds": 60,
+              "sibling_health_probe_interval_seconds": 1,
+              "sibling_health_failures": 0
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "run",
+                "--memory"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.daemon_restart_recovery",
+            "required": true,
+            "client": "docker",
+            "phase": "persisted-recovery",
+            "expected": {
+              "exact_owned_daemon_restarted": true,
+              "healthy_within_seconds": 60,
+              "stable_machine_and_endpoint_identity": true,
+              "persistent_sentinel_sha256": "fixture.persistence_sha256",
+              "no_fallback_daemon": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "info"
+              ],
+              [
+                "ps"
+              ],
+              [
+                "volume",
+                "inspect"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.concurrent_clients",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "parallel_execs": 8,
+              "parallel_pulls": 4,
+              "parallel_builds": 4,
+              "ready_containers": 20,
+              "ready_window_seconds": 60,
+              "all_results_exact_owner_correlated": true
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "exec"
+              ],
+              [
+                "pull"
+              ],
+              [
+                "buildx",
+                "build"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.same_environment_isolation",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "developer_linux_machines": 2,
+              "environment_count": 1,
+              "cross_visible_containers_images_volumes_networks_events_caches": 0,
+              "cross_machine_lifecycle_effects": 0
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "ps"
+              ],
+              [
+                "image",
+                "ls"
+              ],
+              [
+                "volume",
+                "ls"
+              ],
+              [
+                "network",
+                "ls"
+              ],
+              [
+                "events"
+              ]
+            ]
+          },
+          {
+            "id": "docker.operation.sibling_environment_isolation",
+            "required": true,
+            "client": "docker",
+            "phase": "clean-provision",
+            "expected": {
+              "environments": 3,
+              "repeated_machine_service_names_ports_dns_cidrs": true,
+              "cross_visible_containers_images_volumes_networks_events_caches": 0,
+              "cross_environment_lifecycle_effects": 0
+            },
+            "scope": "exact_environment_machine",
+            "evidence": [
+              "raw_host_command",
+              "stdout_stderr_exit_timing",
+              "immutable_owner_runtime_endpoint",
+              "before_after_owned_inventory",
+              "youki_runtime_invocation",
+              "fixture_and_release_digests"
+            ],
+            "command_paths": [
+              [
+                "ps"
+              ],
+              [
+                "image",
+                "ls"
+              ],
+              [
+                "volume",
+                "ls"
+              ],
+              [
+                "network",
+                "ls"
+              ],
+              [
+                "events"
+              ]
+            ]
+          }
+        ]
+      }
+    },
+    "minimum_requirements_sha256": {
+      "const": "e518e9a961e37479706ffe742184307e9977981067622b94a530b3b866f8666b"
+    }
+  }
+}

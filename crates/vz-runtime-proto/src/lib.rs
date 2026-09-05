@@ -30,6 +30,7 @@ mod tests {
     enum RpcMode {
         Unary,
         ServerStreaming,
+        BidirectionalStreaming,
     }
 
     fn parse_runtime_v2_rpc_modes(proto: &str) -> BTreeMap<String, RpcMode> {
@@ -44,7 +45,16 @@ mod tests {
             else {
                 continue;
             };
-            let mode = if line.contains("returns (stream ") {
+            let mode = if line.contains("(stream ")
+                && line.contains("returns (stream ")
+                && line
+                    .split("returns")
+                    .next()
+                    .unwrap_or_default()
+                    .contains("(stream ")
+            {
+                RpcMode::BidirectionalStreaming
+            } else if line.contains("returns (stream ") {
                 RpcMode::ServerStreaming
             } else {
                 RpcMode::Unary
@@ -197,6 +207,8 @@ mod tests {
             ("ChownPath", RpcMode::Unary),
             ("GetCapabilities", RpcMode::Unary),
             ("GetProjectState", RpcMode::Unary),
+            ("StopEnvironment", RpcMode::ServerStreaming),
+            ("ExecMachine", RpcMode::BidirectionalStreaming),
             ("ValidateLinuxVm", RpcMode::ServerStreaming),
             ("ListLinuxVmBases", RpcMode::Unary),
             ("GetLinuxVmBase", RpcMode::Unary),
@@ -234,6 +246,7 @@ mod tests {
         let _ = StackRunContainerRequest::default();
         let _ = GetCapabilitiesRequest::default();
         let _ = GetProjectStateRequest::default();
+        let _ = StopEnvironmentRequest::default();
 
         // Verify response types.
         let _ = SandboxResponse::default();
@@ -254,6 +267,7 @@ mod tests {
         let _ = StackRunContainerResponse::default();
         let _ = GetCapabilitiesResponse::default();
         let _ = GetProjectStateResponse::default();
+        let _ = StopEnvironmentEvent::default();
 
         // Verify payload types used in responses.
         let _ = SandboxPayload::default();
@@ -574,6 +588,7 @@ mod tests {
 
         let create_execution = CreateExecutionRequest::default();
         assert!(create_execution.metadata.is_none());
+        assert!(MachineExecFrame::default().metadata.is_none());
 
         let write_exec_stdin = WriteExecStdinRequest::default();
         assert!(write_exec_stdin.metadata.is_none());
@@ -968,6 +983,28 @@ mod tests {
             (
                 "GetProjectStateResponse",
                 &[("request_id", 1), ("project", 2)],
+            ),
+            (
+                "StopEnvironmentRequest",
+                &[
+                    ("metadata", 1),
+                    ("project_id", 2),
+                    ("environment", 3),
+                    ("process_environment_id", 4),
+                    ("workspace_key", 5),
+                    ("machine_timeout_millis", 6),
+                ],
+            ),
+            (
+                "StopEnvironmentEvent",
+                &[
+                    ("schema_version", 1),
+                    ("request_id", 2),
+                    ("sequence", 3),
+                    ("operation", 4),
+                    ("terminal", 5),
+                    ("error", 6),
+                ],
             ),
             ("TopologyCandidate", &[("id", 1), ("name", 2)]),
             ("TopologyNotFoundDetail", &[("kind", 1), ("selector", 2)]),
@@ -1572,6 +1609,267 @@ mod tests {
             decoded.result.and_then(|result| result.result),
             Some(StepResult::Succeeded(_))
         ));
+    }
+
+    #[test]
+    fn runtime_v2_stop_generated_wire_tags_are_stable() {
+        use crate::runtime_v2::*;
+        // Independent wire bytes catch stale generated tags even when the
+        // .proto inventory and same-generated-type round trips both pass.
+        let request = StopEnvironmentRequest {
+            metadata: Some(RequestMetadata::default()),
+            project_id: "p".into(),
+            environment: Some(String::new()),
+            process_environment_id: Some(String::new()),
+            workspace_key: Some(String::new()),
+            machine_timeout_millis: 1,
+        };
+        assert_eq!(
+            request.encode_to_vec(),
+            [0x0a, 0, 0x12, 1, b'p', 0x1a, 0, 0x22, 0, 0x2a, 0, 0x30, 1]
+        );
+        let event = StopEnvironmentEvent {
+            schema_version: 1,
+            request_id: "r".into(),
+            sequence: 1,
+            operation: Some(EnvironmentLifecycleOperation::default()),
+            terminal: true,
+            error: Some(ErrorDetail::default()),
+        };
+        assert_eq!(
+            event.encode_to_vec(),
+            [0x08, 1, 0x12, 1, b'r', 0x18, 1, 0x22, 0, 0x28, 1, 0x32, 0]
+        );
+    }
+
+    #[test]
+    fn runtime_v2_machine_exec_wire_tags_and_stream_modes_are_stable() {
+        use crate::runtime_v2::*;
+        let proto = include_str!("../proto/runtime_v2.proto");
+        assert_proto_fields(
+            proto,
+            "MachineExecFrame",
+            &[
+                ("metadata", 1),
+                ("sequence", 2),
+                ("execution_id", 3),
+                ("open", 4),
+                ("stdin", 5),
+                ("stdin_eof", 6),
+                ("signal", 7),
+                ("resize", 8),
+                ("cancel", 9),
+            ],
+        );
+        assert_proto_fields(
+            proto,
+            "MachineExecutionScope",
+            &[
+                ("schema_version", 1),
+                ("execution_id", 2),
+                ("request_id", 3),
+                ("idempotency_key", 4),
+                ("request_hash", 5),
+                ("project_id", 6),
+                ("environment_id", 7),
+                ("machine_id", 8),
+                ("environment_generation", 9),
+                ("incarnation", 10),
+                ("runtime_identity", 11),
+                ("definition_digest", 12),
+            ],
+        );
+        assert_proto_fields(
+            proto,
+            "MachineExecEvent",
+            &[
+                ("schema_version", 1),
+                ("scope", 2),
+                ("sequence", 3),
+                ("replayed", 4),
+                ("ready", 5),
+                ("stdout", 6),
+                ("stderr", 7),
+                ("receipt", 8),
+            ],
+        );
+        let frame = MachineExecFrame {
+            metadata: Some(RequestMetadata::default()),
+            sequence: 1,
+            execution_id: "x".into(),
+            payload: Some(machine_exec_frame::Payload::Stdin(vec![0, 255])),
+        };
+        assert_eq!(
+            frame.encode_to_vec(),
+            [0x0a, 0, 0x10, 1, 0x1a, 1, b'x', 0x2a, 2, 0, 255]
+        );
+        let event = MachineExecEvent {
+            schema_version: 1,
+            scope: Some(MachineExecutionScope::default()),
+            sequence: 1,
+            replayed: false,
+            payload: Some(machine_exec_event::Payload::Receipt(
+                MachineExecutionReceipt::default(),
+            )),
+        };
+        assert_eq!(event.encode_to_vec(), [0x08, 1, 0x12, 0, 0x18, 1, 0x42, 0]);
+        assert_eq!(
+            parse_runtime_v2_rpc_modes(include_str!("../proto/runtime_v2.proto"))
+                .get("ExecMachine"),
+            Some(&RpcMode::BidirectionalStreaming)
+        );
+    }
+
+    #[test]
+    fn runtime_v2_machine_exec_preserves_selector_presence_and_binary_controls() {
+        use crate::runtime_v2::*;
+        for selector in [None, Some(String::new()), Some("selected".into())] {
+            let frame = MachineExecFrame {
+                metadata: Some(RequestMetadata {
+                    request_id: "req".into(),
+                    idempotency_key: "idem".into(),
+                    trace_id: "trace".into(),
+                }),
+                sequence: 0,
+                execution_id: String::new(),
+                payload: Some(machine_exec_frame::Payload::Open(MachineExecOpen {
+                    project_id: "project".into(),
+                    environment: selector.clone(),
+                    process_environment_id: selector.clone(),
+                    workspace_key: selector.clone(),
+                    machine: selector.clone(),
+                    process_machine_id: selector,
+                    spec: Some(MachineExecutionSpec {
+                        argv: vec!["/bin/sh".into()],
+                        timeout_millis: 1,
+                        ..Default::default()
+                    }),
+                })),
+            };
+            assert_eq!(
+                MachineExecFrame::decode(frame.encode_to_vec().as_slice()).unwrap(),
+                frame
+            );
+        }
+        for payload in [
+            machine_exec_frame::Payload::Stdin(vec![0, 255]),
+            machine_exec_frame::Payload::StdinEof(true),
+            machine_exec_frame::Payload::Signal(15),
+            machine_exec_frame::Payload::Resize(MachineExecutionTerminal {
+                rows: 24,
+                columns: 80,
+            }),
+            machine_exec_frame::Payload::Cancel(true),
+        ] {
+            let frame = MachineExecFrame {
+                payload: Some(payload),
+                ..Default::default()
+            };
+            assert_eq!(
+                MachineExecFrame::decode(frame.encode_to_vec().as_slice()).unwrap(),
+                frame
+            );
+        }
+    }
+
+    #[test]
+    fn runtime_v2_stop_request_preserves_selection_presence_and_metadata() {
+        use crate::runtime_v2::*;
+        for selector in [None, Some(String::new()), Some("env_selected".into())] {
+            let request = StopEnvironmentRequest {
+                metadata: Some(RequestMetadata {
+                    request_id: "req-stop".into(),
+                    idempotency_key: "idem-stop".into(),
+                    trace_id: "trace-stop".into(),
+                }),
+                project_id: "prj_selected".into(),
+                environment: selector.clone(),
+                process_environment_id: selector.clone(),
+                workspace_key: selector,
+                machine_timeout_millis: 300_000,
+            };
+            let decoded =
+                StopEnvironmentRequest::decode(request.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, request);
+        }
+    }
+
+    #[test]
+    fn runtime_v2_stop_progress_and_terminal_receipts_round_trip() {
+        use crate::runtime_v2::*;
+        for (status, step_status, terminal, failure) in [
+            (
+                EnvironmentLifecycleStatus::Running,
+                LifecycleStepStatus::Pending,
+                false,
+                None,
+            ),
+            (
+                EnvironmentLifecycleStatus::Succeeded,
+                LifecycleStepStatus::Succeeded,
+                true,
+                None,
+            ),
+            (
+                EnvironmentLifecycleStatus::Failed,
+                LifecycleStepStatus::Failed,
+                true,
+                Some("exact teardown uncertain"),
+            ),
+        ] {
+            let event = StopEnvironmentEvent {
+                schema_version: 1,
+                request_id: "req-stop".into(),
+                sequence: u64::from(terminal),
+                terminal,
+                operation: Some(EnvironmentLifecycleOperation {
+                    schema_version: 1,
+                    operation_id: "lop_stop".into(),
+                    project_id: "prj_selected".into(),
+                    environment_id: "env_selected".into(),
+                    kind: EnvironmentLifecycleKind::Stop as i32,
+                    generation: 8,
+                    request_id: "req-stop".into(),
+                    idempotency_key: "idem-stop".into(),
+                    request_hash: "sha256:request".into(),
+                    definition_digest: "sha256:definition".into(),
+                    initial_state: EnvironmentState::Ready as i32,
+                    requested_target: EnvironmentState::Stopped as i32,
+                    status: status as i32,
+                    machine_steps: vec![MachineLifecycleStep {
+                        machine_id: "mch_selected".into(),
+                        initial_state: MachineState::Ready as i32,
+                        target_state: Some(MachineState::Stopped as i32),
+                        expected_incarnation: Some(MachineIncarnation {
+                            schema_version: 1,
+                            incarnation_id: "inc_original".into(),
+                            machine_id: "mch_selected".into(),
+                            generation: 7,
+                            created_at: 100,
+                        }),
+                        resulting_incarnation: None,
+                        resulting_activation: None,
+                        status: step_status as i32,
+                        failure_reason: failure.map(str::to_string),
+                    }],
+                    cleanup_steps: vec![],
+                    created_at: 101,
+                    updated_at: 102,
+                    completed_at: terminal.then_some(102),
+                }),
+                error: failure.map(|message| ErrorDetail {
+                    code: "backend_unavailable".into(),
+                    message: message.into(),
+                    request_id: "req-stop".into(),
+                    details: std::collections::HashMap::from([(
+                        "environment_id".into(),
+                        "env_selected".into(),
+                    )]),
+                }),
+            };
+            let decoded = StopEnvironmentEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, event);
+        }
     }
 
     #[test]

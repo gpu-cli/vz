@@ -116,6 +116,10 @@ pub struct MachineRuntimeEntry<R> {
 }
 
 impl<R> MachineRuntimeEntry<R> {
+    pub(crate) fn validate_current(&self) -> Result<(), MachineRuntimeRegistryError> {
+        self.lease.validate_current()
+    }
+
     pub fn runtime(&self) -> &R {
         &self.runtime
     }
@@ -489,7 +493,7 @@ fn open_absolute_directory(path: &Path) -> Result<File, MachineRuntimeRegistryEr
     Ok(directory)
 }
 
-fn open_trusted_registry_root(path: &Path) -> Result<File, MachineRuntimeRegistryError> {
+pub(crate) fn open_trusted_registry_root(path: &Path) -> Result<File, MachineRuntimeRegistryError> {
     if !path.is_absolute() {
         return Err(MachineRuntimeRegistryError::Invalid(
             "runtime path must be absolute".into(),

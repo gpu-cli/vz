@@ -1,8 +1,22 @@
 //! Physical proof for private per-Machine runtime admission and leased VM boots.
-//! This proves infrastructure, not production `vz up` or a host Docker endpoint.
+//! This proves infrastructure and focused host Docker transport, not production
+//! `vz up`, managed contexts, or complete Docker compatibility.
 
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
+
+#[path = "support/docker_device_policy.rs"]
+mod docker_device_policy;
+#[path = "support/docker_exec_root.rs"]
+mod docker_exec_root;
+#[path = "support/docker_exec_root_values.rs"]
+mod docker_exec_root_values;
+#[path = "support/docker_namespace_values.rs"]
+mod docker_namespace_values;
+#[path = "support/docker_seccomp_policy.rs"]
+mod docker_seccomp_policy;
+#[path = "support/docker_time_namespace.rs"]
+mod docker_time_namespace;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
@@ -29,6 +43,8 @@ use vz_runtime_contract::{
 };
 use vz_runtimed::environment_runtime_controller::EnvironmentRuntimeController;
 use vz_runtimed::machine_artifact_store::{PinnedMachineArtifacts, pin_machine_artifacts};
+use vz_runtimed::machine_docker_endpoint::MachineDockerEndpoint;
+use vz_runtimed::machine_live_sessions::MachineLiveSessions;
 use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
 use vz_runtimed::machine_runtime_registry::{
     MachineRuntimeAdmission, MachineRuntimeEntry, MachineRuntimeRegistry,
@@ -734,6 +750,492 @@ async fn guest(activation: &MachineRuntimeActivation, script: &str) -> Result<St
     Ok(output.stdout)
 }
 
+/// Every Docker invocation carries an explicit endpoint and an isolated client
+/// configuration. No inherited context, TLS option, or daemon can select a peer.
+#[allow(clippy::print_stderr)] // Preserve raw failed-command evidence in the harness log.
+async fn host_docker(socket: &Path, config: &Path, args: &[&str], input: Vec<u8>) -> Result<Value> {
+    use std::process::Stdio;
+    use tokio::io::AsyncWriteExt;
+    let mut command = tokio::process::Command::new("/usr/local/bin/docker");
+    command.args(["--host", &format!("unix://{}", socket.display())]);
+    command.args(args).env("DOCKER_CONFIG", config);
+    for name in [
+        "DOCKER_HOST",
+        "DOCKER_CONTEXT",
+        "DOCKER_TLS",
+        "DOCKER_TLS_VERIFY",
+        "DOCKER_CERT_PATH",
+        "DOCKER_API_VERSION",
+    ] {
+        command.env_remove(name);
+    }
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    let mut child = command
+        .spawn()
+        .context("spawn unmodified host Docker CLI")?;
+    let mut stdin = child.stdin.take().context("Docker stdin")?;
+    let input_sha256 = format!("{:x}", Sha256::digest(&input));
+    let input_bytes = input.len();
+    let started = std::time::Instant::now();
+    let (write, output) = tokio::time::timeout(Duration::from_secs(60), async move {
+        tokio::join!(
+            async move {
+                stdin.write_all(&input).await?;
+                stdin.shutdown().await
+            },
+            child.wait_with_output()
+        )
+    })
+    .await
+    .context("host Docker command exceeded 60 seconds")?;
+    let output = output?;
+    if output.status.success() {
+        write?;
+    }
+    let value = json!({"args": args, "endpoint": format!("unix://{}", socket.display()),
+        "config": config, "exit_code": output.status.code().context("Docker killed by signal")?,
+        "stdout": String::from_utf8(output.stdout)?, "stderr": String::from_utf8(output.stderr)?,
+        "input_bytes": input_bytes, "input_sha256": input_sha256,
+        "elapsed_ms": started.elapsed().as_millis()});
+    eprintln!("host Docker command: {}", serde_json::to_string(&value)?);
+    Ok(value)
+}
+
+fn docker_stdout(value: &Value) -> Result<&str> {
+    ensure!(value["exit_code"] == 0, "host Docker failed: {value}");
+    value["stdout"].as_str().context("host Docker stdout")
+}
+
+async fn host_endpoint_proof(
+    a: Arc<MachineRuntimeActivation>,
+    b: Arc<MachineRuntimeActivation>,
+    hardened: Arc<MachineRuntimeActivation>,
+) -> Result<Value> {
+    // Short private paths avoid Darwin's sockaddr_un length limit.
+    let temporary = tempfile::Builder::new()
+        .prefix("vz-de-")
+        .tempdir_in("/private/tmp")?;
+    let root = temporary.path();
+    fs::set_permissions(root, fs::Permissions::from_mode(0o700))?;
+    let config = root.join("client");
+    fs::DirBuilder::new().mode(0o700).create(&config)?;
+    let decoy = root.join("unrelated.sock");
+    fs::write(&decoy, b"unrelated-host-file")?;
+    let hardened_path = MachineDockerEndpoint::socket_path_for(root, hardened.owner())?;
+    let hardened_refusal =
+        match MachineDockerEndpoint::start(Arc::clone(&hardened), &hardened_path).await {
+            Err(error) => error.to_string(),
+            Ok(endpoint) => {
+                endpoint.shutdown().await?;
+                return Err(anyhow!("Hardened Machine acquired a Docker endpoint"));
+            }
+        };
+    ensure!(!hardened_path.exists());
+    let target_a = MachineDockerEndpoint::socket_path_for(root, a.owner())?;
+    let target_b = MachineDockerEndpoint::socket_path_for(root, b.owner())?;
+    fs::write(&target_a, b"do-not-adopt-this-endpoint")?;
+    let collision_before = fs::symlink_metadata(&target_a)?;
+    let preexisting_path_refusal =
+        match MachineDockerEndpoint::start(Arc::clone(&a), &target_a).await {
+            Err(error) => error.to_string(),
+            Ok(endpoint) => {
+                endpoint.shutdown().await?;
+                return Err(anyhow!("endpoint adopted a preexisting host file"));
+            }
+        };
+    ensure!(
+        fs::read(&target_a)? == b"do-not-adopt-this-endpoint"
+            && fs::symlink_metadata(&target_a)?.ino() == collision_before.ino()
+    );
+    // Only remove the fixture file whose identity and bytes were just verified.
+    fs::remove_file(&target_a)?;
+    let endpoint_a = MachineDockerEndpoint::start(Arc::clone(&a), &target_a).await?;
+    let endpoint_b = match MachineDockerEndpoint::start(Arc::clone(&b), &target_b).await {
+        Ok(endpoint) => endpoint,
+        Err(error) => {
+            endpoint_a.shutdown().await?;
+            return Err(error.into());
+        }
+    };
+    let path_a = endpoint_a.socket_path().to_path_buf();
+    let path_b = endpoint_b.socket_path().to_path_buf();
+    let result = async {
+        let socket_modes = [
+            fs::symlink_metadata(&path_a)?.mode() & 0o7777,
+            fs::symlink_metadata(&path_b)?.mode() & 0o7777,
+        ];
+        ensure!(socket_modes == [0o600, 0o600]);
+        let mut commands = BTreeMap::new();
+        let version = host_docker(&path_a, &config, &["--version"], vec![]).await?;
+        ensure!(docker_stdout(&version)?.starts_with("Docker version "));
+        commands.insert("client_version", version);
+        let info_args = ["info", "--format", "{{json .}}"];
+        let (info_a, info_b) = tokio::join!(
+            host_docker(&path_a, &config, &info_args, vec![]),
+            host_docker(&path_b, &config, &info_args, vec![])
+        );
+        let (info_a, info_b) = (info_a?, info_b?);
+        let engine_a: Value = serde_json::from_str(docker_stdout(&info_a)?)?;
+        let engine_b: Value = serde_json::from_str(docker_stdout(&info_b)?)?;
+        ensure!(
+            engine_a["ID"].as_str().is_some_and(|id| !id.is_empty())
+                && engine_a["ID"] != engine_b["ID"]
+        );
+        ensure!(engine_a["DefaultRuntime"] == "youki" && engine_b["DefaultRuntime"] == "youki");
+        ensure!(engine_a["MemoryLimit"] == true && engine_b["MemoryLimit"] == true);
+        for engine in [&engine_a, &engine_b] {
+            let features: Value = serde_json::from_str(
+                engine["Runtimes"]["youki"]["status"]["org.opencontainers.runtime-spec.features"]
+                    .as_str()
+                    .context("youki runtime feature report")?,
+            )?;
+            ensure!(features["linux"]["cgroup"]["v2"] == true);
+        }
+        commands.insert("info_a", info_a);
+        commands.insert("info_b", info_b);
+
+        // Import an offline test image through the host CLI, using the exact
+        // busybox bytes executing in this guest rather than pulling an unpinned tag.
+        let busybox = PathBuf::from(std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?)
+            .join("busybox");
+        let busybox = fs::canonicalize(busybox)?;
+        let busybox_sha256 = file_sha(&busybox)?;
+        for activation in [&a, &b] {
+            ensure!(
+                guest(activation, "/bin/busybox sha256sum /bin/busybox")
+                    .await?
+                    .split_whitespace()
+                    .next()
+                    == Some(busybox_sha256.as_str())
+            );
+        }
+        let image_root = root.join("image");
+        fs::create_dir(&image_root)?;
+        fs::create_dir(image_root.join("bin"))?;
+        fs::copy(&busybox, image_root.join("bin/busybox"))?;
+        fs::set_permissions(
+            image_root.join("bin/busybox"),
+            fs::Permissions::from_mode(0o755),
+        )?;
+        let tar = Command::new("/usr/bin/tar")
+            .args(["-cf", "-"])
+            .arg("-C")
+            .arg(&image_root)
+            .arg("bin")
+            .output()?;
+        ensure!(tar.status.success(), "fixture rootfs tar failed");
+        for (label, socket) in [("a", &path_a), ("b", &path_b)] {
+            let imported = host_docker(
+                socket,
+                &config,
+                &["image", "import", "-", "vz-endpoint-fixture:local"],
+                tar.stdout.clone(),
+            )
+            .await?;
+            ensure!(docker_stdout(&imported)?.trim().starts_with("sha256:"));
+            commands.insert(if label == "a" { "import_a" } else { "import_b" }, imported);
+            let marker = if label == "a" {
+                "developer-a"
+            } else {
+                "developer-b"
+            };
+            let created = host_docker(
+                socket,
+                &config,
+                &[
+                    "volume",
+                    "create",
+                    "--label",
+                    &format!("dev.vz.endpoint.owner={marker}"),
+                    "vz-endpoint-shared",
+                ],
+                vec![],
+            )
+            .await?;
+            ensure!(docker_stdout(&created)?.trim() == "vz-endpoint-shared");
+            commands.insert(if label == "a" { "volume_a" } else { "volume_b" }, created);
+            let script = format!("printf {marker} > /data/marker; /bin/busybox cat /data/marker");
+            let write_args = [
+                "run",
+                "--rm",
+                "--network",
+                "none",
+                "-v",
+                "vz-endpoint-shared:/data",
+                "vz-endpoint-fixture:local",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                &script,
+            ];
+            let write = host_docker(socket, &config, &write_args, vec![]);
+            // Diagnostic-only observation of the fixture's runtime logs. It
+            // neither substitutes a guest client nor changes OCI execution.
+            // The shim removes its bundle after a failed create, so a later
+            // daemon-log dump alone cannot retain the actual runtime error.
+            let written = if std::env::var_os("VZ_TEST_DOCKER_TRACE_CREATE").is_some() {
+                let activation = if label == "a" { &a } else { &b };
+                let (written, trace) = tokio::join!(write, trace_docker_create(activation));
+                let written = written?;
+                ensure!(
+                    written["exit_code"] == 0,
+                    "host Docker failed: {written}\n{trace}"
+                );
+                written
+            } else {
+                write.await?
+            };
+            ensure!(docker_stdout(&written)? == marker);
+            commands.insert(if label == "a" { "write_a" } else { "write_b" }, written);
+        }
+        let (time_a, time_b) = tokio::join!(
+            docker_time_namespace::prove(&a, &path_a, &config),
+            docker_time_namespace::prove(&b, &path_b, &config),
+        );
+        let time_namespaces = [time_a?, time_b?];
+        let (devices_a, devices_b) = tokio::join!(
+            docker_device_policy::prove(&a, &path_a, &config),
+            docker_device_policy::prove(&b, &path_b, &config),
+        );
+        let device_policies = [devices_a?, devices_b?];
+        let (seccomp_a, seccomp_b) = tokio::join!(
+            docker_seccomp_policy::prove(&a, &path_a, &config),
+            docker_seccomp_policy::prove(&b, &path_b, &config),
+        );
+        let seccomp_policies = [seccomp_a?, seccomp_b?];
+        let read_args = [
+            "run",
+            "--rm",
+            "--network",
+            "none",
+            "-v",
+            "vz-endpoint-shared:/data",
+            "vz-endpoint-fixture:local",
+            "/bin/busybox",
+            "cat",
+            "/data/marker",
+        ];
+        let (read_a, read_b) = tokio::join!(
+            host_docker(&path_a, &config, &read_args, vec![]),
+            host_docker(&path_b, &config, &read_args, vec![])
+        );
+        let (read_a, read_b) = (read_a?, read_b?);
+        ensure!(
+            docker_stdout(&read_a)? == "developer-a" && docker_stdout(&read_b)? == "developer-b"
+        );
+        commands.insert("read_a", read_a);
+        commands.insert("read_b", read_b);
+        for (label, socket) in [("memory_a", &path_a), ("memory_b", &path_b)] {
+            let limited = host_docker(
+                socket,
+                &config,
+                &[
+                    "run",
+                    "--rm",
+                    "--network",
+                    "none",
+                    "--memory",
+                    "64m",
+                    "vz-endpoint-fixture:local",
+                    "/bin/busybox",
+                    "cat",
+                    "/sys/fs/cgroup/memory.max",
+                ],
+                vec![],
+            )
+            .await?;
+            ensure!(docker_stdout(&limited)?.trim() == "67108864");
+            commands.insert(label, limited);
+        }
+        let input = b"vz-endpoint-half-close\n".repeat(12_000);
+        let streamed = host_docker(
+            &path_a,
+            &config,
+            &[
+                "run",
+                "-i",
+                "--rm",
+                "--network",
+                "none",
+                "vz-endpoint-fixture:local",
+                "/bin/busybox",
+                "sh",
+                "-c",
+                "/bin/busybox cat; /bin/busybox sleep 1; printf done",
+            ],
+            input.clone(),
+        )
+        .await?;
+        let mut expected = input;
+        expected.extend_from_slice(b"done");
+        ensure!(docker_stdout(&streamed)?.as_bytes() == expected);
+        commands.insert("stdin_eof", streamed);
+        let since = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_secs();
+        let since = since.to_string();
+        let until = (since.parse::<u64>()? + 3).to_string();
+        let events_args = [
+            "events",
+            "--since",
+            &since,
+            "--until",
+            &until,
+            "--filter",
+            "type=volume",
+            "--filter",
+            "event=create",
+            "--format",
+            "{{json .}}",
+        ];
+        let create_args = [
+            "volume",
+            "create",
+            "--label",
+            "dev.vz.endpoint.owner=developer-a",
+            "vz-endpoint-event",
+        ];
+        let (events, created) = tokio::join!(
+            host_docker(&path_a, &config, &events_args, vec![]),
+            host_docker(&path_a, &config, &create_args, vec![])
+        );
+        let (events, created) = (events?, created?);
+        ensure!(docker_stdout(&created)?.trim() == "vz-endpoint-event");
+        let events_json: Vec<Value> = docker_stdout(&events)?
+            .lines()
+            .map(serde_json::from_str)
+            .collect::<std::result::Result<_, _>>()?;
+        ensure!(events_json.iter().any(|event| event["Type"] == "volume"
+            && event["Action"] == "create"
+            && event["Actor"]["ID"] == "vz-endpoint-event"));
+        commands.insert("events_a", events);
+        commands.insert("event_volume_a", created);
+        Ok::<_, anyhow::Error>((
+            commands,
+            busybox_sha256,
+            socket_modes,
+            time_namespaces,
+            device_policies,
+            seccomp_policies,
+        ))
+    }
+    .await;
+    let result = match result {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            let (diagnostics_a, diagnostics_b) = tokio::join!(
+                docker_failure_diagnostics(&a, "developer-a host endpoint"),
+                docker_failure_diagnostics(&b, "developer-b host endpoint")
+            );
+            Err(anyhow!("{error:#}\n{diagnostics_a}\n{diagnostics_b}"))
+        }
+    };
+    // Always stop both adapters before returning an assertion failure. The VM
+    // cleanup path must never wait on an endpoint's retained activation lease.
+    let stop_a = endpoint_a.shutdown().await;
+    let after_a = if result.is_ok() && stop_a.is_ok() {
+        Some(tokio::join!(
+            host_docker(&path_a, &config, &["info"], vec![]),
+            host_docker(
+                &path_b,
+                &config,
+                &["info", "--format", "{{json .}}"],
+                vec![]
+            )
+        ))
+    } else {
+        None
+    };
+    let stop_b = endpoint_b.shutdown().await;
+    let shutdown_a = stop_a?;
+    let shutdown_b = stop_b?;
+    ensure!(shutdown_a.active_connections == 0 && shutdown_b.active_connections == 0);
+    ensure!(shutdown_a.socket_removed && shutdown_b.socket_removed);
+    let (
+        mut commands,
+        busybox_sha256,
+        socket_modes,
+        time_namespaces,
+        device_policies,
+        seccomp_policies,
+    ) = result?;
+    let (refused, survivor) = after_a.context("missing endpoint shutdown probe")?;
+    let (refused, survivor) = (refused?, survivor?);
+    ensure!(refused["exit_code"].as_i64().is_some_and(|code| code != 0));
+    let survivor_info: Value = serde_json::from_str(docker_stdout(&survivor)?)?;
+    let previous_info: Value = serde_json::from_str(docker_stdout(&commands["info_b"])?)?;
+    ensure!(survivor_info["ID"] == previous_info["ID"]);
+    commands.insert("stopped_a", refused);
+    commands.insert("surviving_b", survivor);
+    ensure!(!path_a.exists() && !path_b.exists());
+    ensure!(fs::read(&decoy)? == b"unrelated-host-file");
+    let value = json!({"scope": "focused_host_endpoint_transport_only", "client": "/usr/local/bin/docker",
+        "client_sha256": file_sha(Path::new("/usr/local/bin/docker"))?, "busybox_sha256": busybox_sha256,
+        "owners": [a.owner(), b.owner()], "runtime_identities": [a.runtime_identity(), b.runtime_identity()],
+        "commands": commands, "socket_modes": socket_modes,
+        "time_namespaces": time_namespaces,
+        "device_policies": device_policies,
+        "seccomp_policies": seccomp_policies,
+        "shutdown": [shutdown_a, shutdown_b],
+        "sockets_removed": true, "unrelated_file_preserved": true, "managed_contexts": false,
+        "compose_buildx": false, "hardened_refusal": hardened_refusal,
+        "preexisting_path_refusal": preexisting_path_refusal});
+    temporary.close()?;
+    Ok(value)
+}
+
+async fn trace_docker_create(activation: &MachineRuntimeActivation) -> String {
+    let script = r#"
+set +e
+sample=0
+emitted=0
+previous=''
+config_seen=''
+while test "$sample" -lt 600 && test "$emitted" -lt 16; do
+  for config in /run/vz-docker/containerd/io.containerd.runtime.v2.task/moby/*/config.json; do
+    if test -s "$config" && test "$config" != "$config_seen"; then
+      echo "--- OCI create config: $config sample=$sample ---"
+      /bin/busybox head -c 32768 "$config"
+      echo
+      config_seen="$config"
+    fi
+  done
+  for log in /run/vz-docker/containerd/io.containerd.runtime.v2.task/moby/*/log.json; do
+    if test -s "$log"; then
+      current=$(/bin/busybox sha256sum "$log" 2>/dev/null)
+      if test "$current" != "$previous"; then
+        echo "--- OCI create log: $log sample=$sample ---"
+        /bin/busybox tail -c 8192 "$log"
+        previous="$current"
+        emitted=$((emitted + 1))
+      fi
+    fi
+  done
+  sample=$((sample + 1))
+  /bin/busybox sleep 0.01
+done
+echo "--- OCI create observer finished: samples=$sample emitted=$emitted ---"
+"#;
+    match activation
+        .exec(
+            "/bin/sh".into(),
+            vec!["-c".into(), script.into()],
+            Duration::from_secs(12),
+        )
+        .await
+    {
+        Ok(output) => format!(
+            "OCI create observer exit={}\nstdout:\n{}\nstderr:\n{}",
+            output.exit_code, output.stdout, output.stderr
+        ),
+        Err(error) => format!("OCI create observer failed: {error}"),
+    }
+}
+
 async fn docker_failure_diagnostics(activation: &MachineRuntimeActivation, label: &str) -> String {
     let script = r#"
 set +e
@@ -1199,9 +1701,9 @@ async fn run_inner(
         boot(&entries[0], &fixtures[0]),
         boot(&entries[1], &fixtures[1])
     );
-    let dev_a = dev_a?;
-    let dev_b = dev_b?;
-    let hard = boot(&entries[2], &fixtures[2]).await?;
+    let dev_a = Arc::new(dev_a?);
+    let dev_b = Arc::new(dev_b?);
+    let hard = Arc::new(boot(&entries[2], &fixtures[2]).await?);
     let first = vec![
         dev_a.runtime_identity().clone(),
         dev_b.runtime_identity().clone(),
@@ -1253,6 +1755,8 @@ async fn run_inner(
     let first_verify_probe_b = docker_probe_evidence(&probe_b?, "verify", "developer-b")?;
     ensure!(probe_h? == "hardened-isolated");
     let first_storage = storage_evidence(&entries, &fixtures)?;
+    let host_endpoint =
+        host_endpoint_proof(Arc::clone(&dev_a), Arc::clone(&dev_b), Arc::clone(&hard)).await?;
 
     drop(dev_a);
     drop(dev_b);
@@ -1293,9 +1797,9 @@ async fn run_inner(
         boot(&entries[0], &fixtures[0]),
         boot(&entries[1], &fixtures[1])
     );
-    let retained_a = retained_a?;
-    let retained_b = retained_b?;
-    let retained_h = boot(&entries[2], &fixtures[2]).await?;
+    let retained_a = Arc::new(retained_a?);
+    let retained_b = Arc::new(retained_b?);
+    let retained_h = Arc::new(boot(&entries[2], &fixtures[2]).await?);
     let first_up_proof = finish_failed_up(&store, first_up, &fixtures, &first, 1, 120)?;
     let first_failed_up_owned_read_only =
         require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
@@ -1311,11 +1815,41 @@ async fn run_inner(
     ensure!(guest(&retained_a, "printf retained-a").await? == "retained-a");
     ensure!(guest(&retained_b, "printf retained-b").await? == "retained-b");
     ensure!(guest(&retained_h, "printf retained-h").await? == "retained-h");
+    let first_stop_lease = controller.acquire(&project_id, &environment_id).await?;
+    let sessions = MachineLiveSessions::default();
+    let session_root = tempfile::Builder::new()
+        .prefix("vz-ls-")
+        .tempdir_in("/private/tmp")?;
+    fs::set_permissions(session_root.path(), fs::Permissions::from_mode(0o700))?;
+    let session_config = session_root.path().join("client");
+    fs::DirBuilder::new().mode(0o700).create(&session_config)?;
+    let session_a_path =
+        MachineDockerEndpoint::socket_path_for(session_root.path(), retained_a.owner())?;
+    let session_b_path =
+        MachineDockerEndpoint::socket_path_for(session_root.path(), retained_b.owner())?;
+    for (activation, path) in [
+        (&retained_a, Some(&session_a_path)),
+        (&retained_b, Some(&session_b_path)),
+        (&retained_h, None),
+    ] {
+        let mut endpoint = match path {
+            Some(path) => Some(MachineDockerEndpoint::start(Arc::clone(activation), path).await?),
+            None => None,
+        };
+        sessions.register(&first_stop_lease, Arc::clone(activation), &mut endpoint)?;
+        ensure!(endpoint.is_none());
+    }
     drop(retained_a);
     drop(retained_b);
     drop(retained_h);
-
-    let first_stop_lease = controller.acquire(&project_id, &environment_id).await?;
+    let session_info_args = ["info", "--format", "{{json .}}"];
+    let (session_info_a, session_info_b) = tokio::join!(
+        host_docker(&session_a_path, &session_config, &session_info_args, vec![]),
+        host_docker(&session_b_path, &session_config, &session_info_args, vec![]),
+    );
+    let (session_info_a, session_info_b) = (session_info_a?, session_info_b?);
+    docker_stdout(&session_info_a)?;
+    let session_b_identity: Value = serde_json::from_str(docker_stdout(&session_info_b)?)?;
     let first_stop = store.begin_environment_lifecycle(
         environment_id.as_str(),
         EnvironmentLifecycleKind::Stop,
@@ -1324,12 +1858,49 @@ async fn run_inner(
         "sha256:registry-stop-1",
         130,
     )?;
-    for (target, identity) in cleanup_targets.iter().take(3).zip(&first) {
-        ensure!(
-            shutdown(&target.runtime, identity, first_stop.operation_id.as_str()).await?
-                == StackRuntimeShutdownOutcome::Stopped
-        );
+    let mut session_stop_receipts = Vec::new();
+    let mut session_stop_commands =
+        BTreeMap::from([("before_a", session_info_a), ("before_b", session_info_b)]);
+    for (index, fixture) in fixtures.iter().enumerate() {
+        let receipt = sessions
+            .stop(
+                &first_stop_lease,
+                &store,
+                &first_stop,
+                fixture
+                    .owner
+                    .machine_id
+                    .as_ref()
+                    .context("session Machine ID")?,
+                TIMEOUT,
+            )
+            .await?;
+        ensure!(receipt.owner == fixture.owner && receipt.runtime_identity == first[index]);
+        ensure!(receipt.outcome == StackRuntimeShutdownOutcome::Stopped);
+        session_stop_receipts.push(receipt);
+        if index == 0 {
+            let (refused, survivor) = tokio::join!(
+                host_docker(&session_a_path, &session_config, &session_info_args, vec![]),
+                host_docker(&session_b_path, &session_config, &session_info_args, vec![]),
+            );
+            let (refused, survivor) = (refused?, survivor?);
+            ensure!(refused["exit_code"].as_i64().is_some_and(|code| code != 0));
+            let surviving_info: Value = serde_json::from_str(docker_stdout(&survivor)?)?;
+            ensure!(surviving_info["ID"] == session_b_identity["ID"]);
+            session_stop_commands.insert("stopped_a", refused);
+            session_stop_commands.insert("surviving_b", survivor);
+        }
     }
+    ensure!(!session_a_path.exists() && !session_b_path.exists());
+    let live_sessions = json!({
+        "scope": "registered_original_runtime_stop_only",
+        "receipts": session_stop_receipts,
+        "commands": session_stop_commands,
+        "sockets_removed": true,
+        "restart_recovery": false,
+        "public_stop": false,
+    });
+    session_root.close()?;
     finish_stop(&store, first_stop, 131)?;
     drop(first_stop_lease);
     let stopped_owned_read_only = require_owned_read_only(&store, project_id.as_str(), &fixtures)?;
@@ -1490,7 +2061,9 @@ async fn run_inner(
 
     Ok(json!({
         "schema_version": 1,
-        "scope": "registry_and_boot_lease_infrastructure_only",
+        "host_endpoint": host_endpoint,
+        "live_sessions": live_sessions,
+        "scope": "registry_boot_lease_and_host_endpoint_infrastructure_only",
         "build": {
             "profile": std::env::var(BUILD_PROFILE_ENV).unwrap_or_else(|_| "unknown".into()),
             "test_binary_sha256": std::env::var(TEST_SHA_ENV).unwrap_or_else(|_| "unknown".into()),
@@ -1571,7 +2144,7 @@ async fn run_inner(
             "second_boot": second_boot_serial_logs,
             "regular_nonempty": true,
         },
-        "claims": { "production_up": false, "native_macos_machine": false, "host_docker_socket_or_context": false },
+        "claims": { "production_up": false, "native_macos_machine": false, "managed_docker_context_or_full_compatibility": false },
     }))
 }
 

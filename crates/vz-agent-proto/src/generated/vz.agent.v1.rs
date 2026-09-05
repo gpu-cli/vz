@@ -94,6 +94,10 @@ pub struct ExecRequest {
     /// command rather than constructing namespace-enter arguments themselves.
     #[prost(message, optional, tag = "10")]
     pub container_target: ::core::option::Option<ContainerExecTarget>,
+    /// Explicit ticketed, descendant-supervised execution in this Machine itself.
+    /// Mutually exclusive with container_target; never implies an OCI container.
+    #[prost(bool, tag = "11")]
+    pub supervised_machine: bool,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ContainerExecTarget {
@@ -113,7 +117,7 @@ pub struct ExecEvent {
     /// Exec identifier for correlation (sent in first event for PTY sessions).
     #[prost(uint64, tag = "7")]
     pub exec_id: u64,
-    #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4, 8")]
+    #[prost(oneof = "exec_event::Event", tags = "1, 2, 3, 4, 8, 9")]
     pub event: ::core::option::Option<exec_event::Event>,
 }
 /// Nested message and enum types in `ExecEvent`.
@@ -133,6 +137,9 @@ pub mod exec_event {
         /// requested process has successfully crossed execve(2).
         #[prost(message, tag = "8")]
         ContainerReady(super::ContainerExecReady),
+        /// First event for supervised_machine, after successful command execve.
+        #[prost(message, tag = "9")]
+        MachineReady(super::MachineExecReady),
     }
 }
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
@@ -178,6 +185,9 @@ pub struct ContainerExecReady {
     #[prost(message, optional, tag = "1")]
     pub generation: ::core::option::Option<ContainerGeneration>,
 }
+/// Correlation and control identity live on the enclosing ExecEvent.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct MachineExecReady {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StdinWriteRequest {
     #[prost(uint64, tag = "1")]
@@ -371,6 +381,41 @@ pub mod docker_ensure_event {
         }
     }
 }
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerForwardFrame {
+    #[prost(oneof = "docker_forward_frame::Frame", tags = "1, 2, 3, 4, 5")]
+    pub frame: ::core::option::Option<docker_forward_frame::Frame>,
+}
+/// Nested message and enum types in `DockerForwardFrame`.
+pub mod docker_forward_frame {
+    #[derive(Clone, PartialEq, ::prost::Oneof)]
+    pub enum Frame {
+        #[prost(message, tag = "1")]
+        Open(super::DockerForwardOpen),
+        #[prost(message, tag = "2")]
+        Connected(super::DockerForwardConnected),
+        /// Nonempty, at most 65536 bytes.
+        #[prost(bytes, tag = "3")]
+        Data(::prost::alloc::vec::Vec<u8>),
+        /// Shuts down only this direction.
+        #[prost(message, tag = "4")]
+        Eof(super::DockerForwardEof),
+        /// Guest consumed request EOF and shut down Engine write half.
+        #[prost(message, tag = "5")]
+        WriteClosed(super::DockerForwardWriteClosed),
+    }
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerForwardOpen {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DockerForwardConnected {}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DockerForwardEof {}
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct DockerForwardWriteClosed {}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct PortForwardFrame {
     #[prost(oneof = "port_forward_frame::Frame", tags = "1, 2")]
@@ -917,6 +962,34 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "EnsureDocker"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Opaque, half-close preserving connection to the provisioned private Engine.
+        /// No caller-selected destination; Open/Connected precede Data and directional Eof.
+        pub async fn docker_forward(
+            &mut self,
+            request: impl tonic::IntoStreamingRequest<
+                Message = super::DockerForwardFrame,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DockerForwardFrame>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/DockerForward",
+            );
+            let mut req = request.into_streaming_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "DockerForward"));
+            self.inner.streaming(req, path, codec).await
+        }
         /// Bidirectional TCP relay through the guest.
         /// Client sends PortForwardOpen as the first frame, then raw data
         /// flows in both directions.
@@ -1447,6 +1520,21 @@ pub mod agent_service_server {
             request: tonic::Request<super::DockerEnsureRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::EnsureDockerStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the DockerForward method.
+        type DockerForwardStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DockerForwardFrame, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Opaque, half-close preserving connection to the provisioned private Engine.
+        /// No caller-selected destination; Open/Connected precede Data and directional Eof.
+        async fn docker_forward(
+            &self,
+            request: tonic::Request<tonic::Streaming<super::DockerForwardFrame>>,
+        ) -> std::result::Result<
+            tonic::Response<Self::DockerForwardStream>,
             tonic::Status,
         >;
         /// Server streaming response type for the PortForward method.
@@ -2079,6 +2167,54 @@ pub mod agent_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/DockerForward" => {
+                    #[allow(non_camel_case_types)]
+                    struct DockerForwardSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::StreamingService<super::DockerForwardFrame>
+                    for DockerForwardSvc<T> {
+                        type Response = super::DockerForwardFrame;
+                        type ResponseStream = T::DockerForwardStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<
+                                tonic::Streaming<super::DockerForwardFrame>,
+                            >,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::docker_forward(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DockerForwardSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.streaming(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

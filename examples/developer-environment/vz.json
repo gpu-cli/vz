@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "project_id": "prj_example_replace_once_with_unique_project_id",
+  "name": "developer-environment",
+  "environment": {
+    "schema_version": 1,
+    "machines": [
+      {
+        "schema_version": 1,
+        "name": "dev",
+        "profile": "developer",
+        "target": {
+          "os": "linux",
+          "arch": "aarch64",
+          "image": "vz-linux-appliance"
+        },
+        "resources": {"cpus": 2, "memory_mb": 4096}
+      }
+    ]
+  }
+}

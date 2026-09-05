@@ -64,18 +64,6 @@ pub struct DevRunArgs {
     pub fresh: bool,
 }
 
-/// Stop the Linux VM for the current project.
-#[derive(Args, Debug)]
-pub struct DevStopArgs {
-    /// Path to vz.json (default: search cwd and parents).
-    #[arg(long)]
-    pub config: Option<PathBuf>,
-
-    /// Stop all running `vz run` sandboxes (not just current project).
-    #[arg(long)]
-    pub all: bool,
-}
-
 // ── vz.json schema ─────────────────────────────────────────────────
 
 const VZ_CONFIG_FILE: &str = "vz.json";
@@ -555,44 +543,6 @@ pub async fn cmd_run(args: DevRunArgs) -> anyhow::Result<()> {
 
     if exit_code != 0 {
         std::process::exit(exit_code);
-    }
-
-    Ok(())
-}
-
-pub async fn cmd_stop(args: DevStopArgs) -> anyhow::Result<()> {
-    let state_db = default_state_db_path();
-    let mut client = connect_control_plane_for_state_db(&state_db).await?;
-
-    if args.all {
-        // Stop all vz-run sandboxes.
-        let response = client
-            .list_sandboxes(runtime_v2::ListSandboxesRequest { metadata: None })
-            .await
-            .context("failed to list sandboxes")?;
-
-        let run_sandboxes: Vec<_> = response
-            .sandboxes
-            .iter()
-            .filter(|s| s.sandbox_id.starts_with("vz-run-"))
-            .filter(|s| s.state == "ready" || s.state == "active")
-            .collect();
-
-        if run_sandboxes.is_empty() {
-            eprintln!("No running `vz run` VMs found.");
-            return Ok(());
-        }
-
-        for sandbox in &run_sandboxes {
-            let _ = terminate_sandbox(&mut client, &sandbox.sandbox_id).await;
-            eprintln!("Stopped {}", sandbox.sandbox_id);
-        }
-        eprintln!("Stopped {} VM(s).", run_sandboxes.len());
-    } else {
-        let (_config, project_dir) = load_config(args.config.as_deref())?;
-        let sandbox_id = sandbox_id_for_project(&project_dir);
-        terminate_sandbox(&mut client, &sandbox_id).await?;
-        eprintln!("Stopped VM for {}", project_dir.display());
     }
 
     Ok(())

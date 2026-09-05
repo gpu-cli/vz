@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/gpu-cli/vz/raw/main/schemas/vz-project-definition-v1.schema.json",
+  "title": "vz ProjectDefinition v1",
+  "description": "Reusable desired topology, not a running Environment. Structural validation must be followed by ProjectDefinition::validate and target-qualified artifact/capability admission. Schema acceptance is not a support or release-readiness claim.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "project_id", "name", "environment"],
+  "properties": {
+    "schema_version": {"const": 1},
+    "project_id": {"$ref": "#/$defs/id"},
+    "name": {"$ref": "#/$defs/name"},
+    "environment": {"$ref": "#/$defs/environment"}
+  },
+  "$defs": {
+    "id": {"type": "string", "minLength": 1, "maxLength": 128, "not": {"pattern": "[^A-Za-z0-9_.:-]"}},
+    "name": {
+      "type": "string", "minLength": 1, "maxLength": 128, "pattern": "\\S",
+      "description": "The runtime additionally enforces a maximum of 128 UTF-8 bytes. Names must be unique within their resource kind."
+    },
+    "optionalString": {"type": ["string", "null"]},
+    "capability": {"enum": ["posix_exec", "posix_pty", "signals", "files", "ports", "docker_engine", "compose", "buildx", "snapshot", "suspend", "checkpoint", "gui", "windows_console"]},
+    "requestedCapabilities": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "capabilities": {"type": "array", "items": {"$ref": "#/$defs/capability"}},
+        "unsupported": {"type": "object", "maxProperties": 0}
+      }
+    },
+    "target": {
+      "type": "object", "additionalProperties": false,
+      "required": ["os", "arch", "image"],
+      "properties": {
+        "os": {"enum": ["linux", "macos", "windows"]},
+        "arch": {"enum": ["aarch64", "x86_64"]},
+        "image": {"type": "string", "minLength": 1, "pattern": "\\S"},
+        "version": {"$ref": "#/$defs/optionalString"},
+        "channel": {"$ref": "#/$defs/optionalString"},
+        "digest": {"$ref": "#/$defs/optionalString"}
+      },
+      "description": "Host and target are separate. This describes a requested target; the backend must resolve and verify exact pinned artifacts and reject unsupported host/target pairs without substitution."
+    },
+    "resources": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "cpus": {"type": ["integer", "null"], "minimum": 0, "maximum": 255},
+        "memory_mb": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615},
+        "disk_bytes": {"type": ["integer", "null"], "minimum": 0, "maximum": 18446744073709551615}
+      },
+      "description": "Wire-format bounds only. Runtime admission applies backend resource limits before creating a Machine."
+    },
+    "workspace": {
+      "type": "object", "additionalProperties": false,
+      "required": ["binding", "target_path", "mode"],
+      "properties": {
+        "binding": {"type": "string"},
+        "target_path": {"type": "string"},
+        "mode": {"enum": ["read_write", "read_only", "snapshot"]}
+      },
+      "description": "Binding names refer to opaque worktree associations, not path-derived Environment identity. Runtime admission validates projection paths and writer policy."
+    },
+    "machine": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "profile", "target"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "profile": {"enum": ["developer", "hardened"]},
+        "target": {"$ref": "#/$defs/target"},
+        "resources": {"$ref": "#/$defs/resources"},
+        "requested_capabilities": {"$ref": "#/$defs/requestedCapabilities"},
+        "workspace": {"anyOf": [{"$ref": "#/$defs/workspace"}, {"type": "null"}]}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
+          "then": {"properties": {"target": {"properties": {"os": {"const": "linux"}}}}}
+        },
+        {
+          "if": {"anyOf": [
+            {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
+            {"properties": {"target": {"properties": {"os": {"enum": ["macos", "windows"]}}, "required": ["os"]}}, "required": ["target"]}
+          ]},
+          "then": {"properties": {"requested_capabilities": {"properties": {"capabilities": {"not": {"contains": {"enum": ["docker_engine", "compose", "buildx"]}}}}}}}
+        }
+      ],
+      "description": "Developer Linux implicitly owns Docker; no Docker flag, global socket or Linux sidecar exists for other profiles/targets."
+    },
+    "network": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "kind"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "kind": {"enum": ["private", "simulated_public"]},
+        "cidr": {"$ref": "#/$defs/optionalString"}
+      }
+    },
+    "endpoint": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "machine", "network", "protocol", "port"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "machine": {"$ref": "#/$defs/name"},
+        "network": {"$ref": "#/$defs/name"},
+        "protocol": {"enum": ["tcp", "udp", "http", "https"]},
+        "port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "hostname": {"$ref": "#/$defs/optionalString"}
+      }
+    },
+    "environment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "machines"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "machines": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/machine"}},
+        "networks": {"type": "array", "items": {"$ref": "#/$defs/network"}},
+        "endpoints": {"type": "array", "items": {"$ref": "#/$defs/endpoint"}}
+      },
+      "description": "Semantic validation checks unique names and exact endpoint Machine/network references. More than one named Environment may instantiate this same topology, including within one worktree."
+    }
+  }
+}

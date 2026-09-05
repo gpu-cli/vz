@@ -343,7 +343,7 @@ mod tests {
             agent: env!("CARGO_PKG_VERSION").to_string(),
             // Keep this fixture explicit so a guest protocol revision change
             // requires its pinned metadata to be regenerated deliberately.
-            agent_protocol_revision: Some(6),
+            agent_protocol_revision: Some(7),
             youki: "0.5.7".to_string(),
             built: None,
             sha256_vmlinux: Some(sha256(KERNEL_BYTES)),

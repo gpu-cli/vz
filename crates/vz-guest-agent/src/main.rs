@@ -9,6 +9,7 @@
 
 mod container_exec;
 mod docker;
+mod docker_forward;
 mod grpc_server;
 mod listener;
 #[cfg(target_os = "linux")]
@@ -81,6 +82,9 @@ fn main() -> anyhow::Result<()> {
     #[cfg(target_os = "linux")]
     {
         let trampoline_args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if container_exec::machine::is_request(&trampoline_args) {
+            return container_exec::machine::run(trampoline_args);
+        }
         if container_exec::is_trampoline_request(&trampoline_args) {
             return container_exec::run_trampoline(trampoline_args);
         }

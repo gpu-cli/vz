@@ -1,22 +1,11 @@
-//! vz -- container runtime and macOS VM sandbox CLI.
+//! Developer Environment lifecycle CLI.
 //!
-//! Manages OCI containers and macOS virtual machines for sandboxed
-//! coding agent execution. On macOS, uses Apple's Virtualization.framework
-//! via the `vz` crate. On Linux, uses native OCI runtimes directly.
+//! Topology-owned execution, status, and lifecycle operations use the typed
+//! daemon API. Retired infrastructure commands have no parser or dispatch path.
 
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
 mod commands;
-#[cfg(target_os = "macos")]
-mod control;
-#[cfg(target_os = "macos")]
-#[allow(unsafe_code)]
-mod gui;
-#[cfg(target_os = "macos")]
-mod ipsw;
-#[cfg(target_os = "macos")]
-use vz_macos_provision as provision;
-mod registry;
 
 use clap::{CommandFactory, Parser};
 use tracing::error;
@@ -25,10 +14,12 @@ use vz_cli::legacy_cli::{LEGACY_COMMAND_REMOVED_EXIT_CODE, rejection_for_args};
 const CLI_WORKFLOW_EXAMPLES: &str = "\
 Examples:
   vz                  Show this help without touching runtime state
-  vz ls               List sandboxes
-  vz <COMMAND>        Run an explicit subcommand";
+  vz status --json    Inspect the selected Environment topology
+  vz exec -- uname -s  Execute in the selected Ready Machine
 
-/// vz — instant sandboxed Linux environments.
+Implementation status: DEV. The complete 0.4 five-verb lifecycle is not yet shipped.";
+
+/// vz — reproducible, parallel Developer Environments.
 ///
 /// Run `vz` without arguments to print top-level help without accessing runtime
 /// state. Legacy bare-mode mutation and configuration flags are rejected.
@@ -36,7 +27,7 @@ Examples:
 #[command(
     name = "vz",
     version,
-    about = "vz — instant sandboxed Linux environments",
+    about = "vz — reproducible, parallel Developer Environments",
     after_help = CLI_WORKFLOW_EXAMPLES,
     long_about = None
 )]
@@ -60,67 +51,17 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Create a new sandbox without attaching an interactive shell.
-    Create(commands::sandbox::SandboxCreateArgs),
+    /// Stop the selected Developer Environment, preserving identities and state.
+    Stop(commands::dev_stop::DevStopArgs),
 
-    // ── Sandbox management (top-level) ──
-    /// List sandboxes.
-    Ls(commands::sandbox::SandboxListArgs),
-
-    /// Remove a sandbox.
-    Rm(commands::sandbox::SandboxTerminateArgs),
-
-    /// Show detailed sandbox information (JSON).
-    Inspect(commands::sandbox::SandboxInspectArgs),
-
-    /// Attach to a running sandbox.
-    Attach(commands::sandbox::SandboxAttachArgs),
-
-    /// Close an active shell session for a sandbox.
-    CloseShell(commands::sandbox::SandboxCloseShellArgs),
-
-    // ── Dev environment ──
-    /// Generate a vz.json configuration for the current project.
-    Init(commands::dev_init::DevInitArgs),
-
-    /// Run a command in the project's Linux VM (reads vz.json).
-    #[cfg(target_os = "macos")]
-    Run(commands::dev::DevRunArgs),
-
-    /// Stop the Linux VM for the current project.
-    #[cfg(target_os = "macos")]
-    Stop(commands::dev::DevStopArgs),
+    /// Execute in one selected Ready Machine (Linux-on-macOS DEV adapter).
+    ///
+    /// Automatic startup/reconciliation and native-target execution are not yet
+    /// available. Unknown runtime ownership fails closed; no legacy Run fallback.
+    Exec(commands::dev_exec::DevExecArgs),
 
     /// Show the project's persisted Developer Environment topology.
     Status(commands::dev_status::DevStatusArgs),
-
-    /// Show daemon logs for debugging.
-    Logs(commands::dev_logs::DevLogsArgs),
-
-    // ── Image management ──
-    /// OCI image management (pull, build, list, prune).
-    Image(commands::image::ImageArgs),
-
-    // ── Diff contract ──
-    /// Compare two checkpoints with the versioned diff contract.
-    Diff(commands::diff::DiffArgs),
-
-    /// Checkpoint lifecycle management (list, inspect, create, restore, fork).
-    Checkpoint(commands::checkpoint::CheckpointArgs),
-
-    /// VM command namespaces (`mac`, `linux`).
-    Vm(commands::vm::VmArgs),
-
-    // ── Setup ──
-    /// Ad-hoc sign the vz binary with required entitlements.
-    ///
-    /// Required after `cargo install vz-cli` to enable Virtualization.framework.
-    SelfSign(commands::self_sign::SelfSignArgs),
-
-    // ── Debug/advanced (hidden) ──
-    /// Advanced debugging and low-level operations.
-    #[command(hide = true)]
-    Debug(Box<commands::debug::DebugArgs>),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -158,67 +99,37 @@ fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    // GUI mode: `vz vm mac run` (and legacy `vz debug vm run`) without
-    // --headless needs AppKit on the main thread.
-    #[cfg(target_os = "macos")]
-    if let Some(Commands::Vm(ref vm_args)) = cli.command
-        && let commands::vm::VmCommand::Mac(ref mac_args) = vm_args.action
-        && let commands::vm::MacVmCommand::Run(ref args) = mac_args.action
-        && !args.headless
-    {
-        let Some(Commands::Vm(vm_args)) = cli.command else {
-            unreachable!()
-        };
-        let commands::vm::VmCommand::Mac(mac_args) = vm_args.action else {
-            unreachable!()
-        };
-        let commands::vm::MacVmCommand::Run(args) = mac_args.action else {
-            unreachable!()
-        };
-        return gui::run_with_gui(args);
-    }
-
-    #[cfg(target_os = "macos")]
-    if let Some(Commands::Debug(ref debug_args)) = cli.command {
-        if let commands::debug::DebugCommand::Vm(ref vm_args) = debug_args.action {
-            if let commands::vm::MacVmCommand::Run(ref args) = vm_args.action {
-                if !args.headless {
-                    let Some(Commands::Debug(debug_args)) = cli.command else {
-                        unreachable!()
-                    };
-                    let commands::debug::DebugCommand::Vm(mac_args) = debug_args.action else {
-                        unreachable!()
-                    };
-                    let commands::vm::MacVmCommand::Run(args) = mac_args.action else {
-                        unreachable!()
-                    };
-                    return gui::run_with_gui(args);
-                }
-            }
-        }
-    }
-
-    // Headless path: normal tokio runtime.
+    // Only explicit topology commands reach runtime setup.
     let runtime = tokio::runtime::Runtime::new()?;
     runtime.block_on(async {
         let result = match cli.command {
             // Bare and read-only-global-only invocations returned before setup.
             None => unreachable!("command absence handled before runtime setup"),
 
-            // Sandbox management
-            Some(Commands::Create(args)) => commands::sandbox::cmd_create(args).await,
-            Some(Commands::Ls(args)) => commands::sandbox::cmd_list(args).await,
-            Some(Commands::Rm(args)) => commands::sandbox::cmd_terminate(args).await,
-            Some(Commands::Inspect(args)) => commands::sandbox::cmd_inspect(args).await,
-            Some(Commands::Attach(args)) => commands::sandbox::cmd_attach(args).await,
-            Some(Commands::CloseShell(args)) => commands::sandbox::cmd_close_shell(args).await,
-
-            // Dev environment
-            Some(Commands::Init(args)) => commands::dev_init::cmd_dev_init(args).await,
-            #[cfg(target_os = "macos")]
-            Some(Commands::Run(args)) => commands::dev::cmd_run(args).await,
-            #[cfg(target_os = "macos")]
-            Some(Commands::Stop(args)) => commands::dev::cmd_stop(args).await,
+            Some(Commands::Stop(args)) => {
+                match commands::dev_stop::cmd_dev_stop(args, json).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if !error.already_emitted() {
+                            eprintln!("{}", error.to_json());
+                        }
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
+            Some(Commands::Exec(args)) => {
+                // cmd_dev_exec restores terminal state and flushes output before
+                // returning. Exit directly: a pending Tokio stdin blocking read
+                // must not make a completed guest process hang runtime teardown.
+                let code = match commands::dev_exec::cmd_dev_exec(args, json).await {
+                    Ok(code) => code,
+                    Err(error) => {
+                        eprintln!("{}", error.to_json());
+                        error.exit_code()
+                    }
+                };
+                std::process::exit(code);
+            }
             Some(Commands::Status(args)) => {
                 match commands::dev_status::cmd_dev_status(args, json).await {
                     Ok(()) => Ok(()),
@@ -228,25 +139,6 @@ fn main() -> anyhow::Result<()> {
                     }
                 }
             }
-            Some(Commands::Logs(args)) => commands::dev_logs::cmd_dev_logs(args).await,
-
-            // Image management
-            Some(Commands::Image(args)) => commands::image::run(args).await,
-
-            // Diff contract
-            Some(Commands::Diff(args)) => commands::diff::run(args).await,
-
-            // Checkpoint lifecycle
-            Some(Commands::Checkpoint(args)) => commands::checkpoint::run(args).await,
-
-            // VM command namespaces
-            Some(Commands::Vm(args)) => commands::vm::run(args).await,
-
-            // Setup
-            Some(Commands::SelfSign(args)) => commands::self_sign::run(args).await,
-
-            // Debug/advanced
-            Some(Commands::Debug(args)) => commands::debug::run(*args).await,
         };
 
         if let Err(ref e) = result {
@@ -317,214 +209,65 @@ mod tests {
     }
 
     #[test]
-    fn parse_close_shell_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "close-shell", "sandbox-a"]).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Some(Commands::CloseShell(commands::sandbox::SandboxCloseShellArgs {
-                sandbox_id,
-                ..
-            })) if sandbox_id == "sandbox-a"
-        ));
-    }
-
-    #[test]
-    fn parse_verbose_flag() {
-        let cli = Cli::try_parse_from(["vz", "-v", "ls"]).expect("parse");
-        assert_eq!(cli.verbose, 1);
-    }
-
-    #[test]
-    fn parse_quiet_flag() {
-        let cli = Cli::try_parse_from(["vz", "--quiet", "ls"]).expect("parse");
+    fn parse_read_only_global_controls() {
+        let cli = Cli::try_parse_from(["vz", "-vv", "--quiet", "--json", "status"]).expect("parse");
+        assert_eq!(cli.verbose, 2);
         assert!(cli.quiet);
-    }
-
-    #[test]
-    fn parse_json_flag() {
-        let cli = Cli::try_parse_from(["vz", "--json", "ls"]).expect("parse");
         assert!(cli.json);
     }
 
     #[test]
-    fn parse_ls_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "ls"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Ls(_))));
+    fn dev_parser_inventory_contains_only_implemented_lifecycle_commands() {
+        let mut command = Cli::command();
+        command.build();
+        let names = command
+            .get_subcommands()
+            .map(|child| child.get_name())
+            .collect::<Vec<_>>();
+        // Transitional DEV assertion, not the five-verb release acceptance gate.
+        assert_eq!(names, ["stop", "exec", "status", "help"]);
+        for child in command.get_subcommands() {
+            assert!(!child.is_hide_set());
+            assert_eq!(child.get_all_aliases().count(), 0);
+        }
     }
 
     #[test]
-    fn parse_rm_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "rm", "sbx-123"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Rm(_))));
+    fn removed_roots_have_no_parser_even_without_preflight_rejection() {
+        for root in vz_cli::legacy_cli::REMOVED_ROOT_COMMANDS {
+            for suffix in [&[][..], &["--help"][..], &["arbitrary", "--unknown"][..]] {
+                let args = std::iter::once("vz")
+                    .chain(std::iter::once(*root))
+                    .chain(suffix.iter().copied());
+                let error = Cli::try_parse_from(args).expect_err("removed parser must not exist");
+                assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+            }
+            let error =
+                Cli::try_parse_from(["vz", "help", root]).expect_err("no hidden help parser");
+            assert_eq!(error.kind(), clap::error::ErrorKind::InvalidSubcommand);
+        }
     }
 
     #[test]
-    fn parse_inspect_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "inspect", "sbx-123"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Inspect(_))));
-    }
-
-    #[test]
-    fn parse_attach_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "attach", "sbx-123"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Attach(_))));
-    }
-
-    #[test]
-    fn parse_diff_subcommand() {
-        let cli = Cli::try_parse_from(["vz", "diff", "cp-001", "cp-002", "--mode", "system"])
-            .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Diff(_))));
-    }
-
-    #[test]
-    fn parse_image_pull() {
-        let cli = Cli::try_parse_from(["vz", "image", "pull", "alpine:latest"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Image(_))));
-    }
-
-    #[test]
-    fn parse_image_ls() {
-        let cli = Cli::try_parse_from(["vz", "image", "ls"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Image(_))));
-    }
-
-    #[test]
-    fn parse_image_prune() {
-        let cli = Cli::try_parse_from(["vz", "image", "prune"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Image(_))));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_image_build() {
-        let cli = Cli::try_parse_from(["vz", "image", "build"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Image(_))));
-    }
-
-    #[test]
-    fn parse_debug_docker() {
-        let cli = Cli::try_parse_from(["vz", "debug", "docker", "ps"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Debug(_))));
-    }
-
-    #[test]
-    fn parse_debug_container_run() {
-        let cli = Cli::try_parse_from([
-            "vz",
-            "debug",
-            "container",
-            "run",
-            "alpine:latest",
-            "--",
-            "echo",
-            "hello",
-        ])
-        .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Debug(_))));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_debug_vm_init() {
-        let cli = Cli::try_parse_from(["vz", "debug", "vm", "init", "--disk-size", "64G"])
-            .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Debug(_))));
-    }
-
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn parse_vm_mac_init() {
-        let cli =
-            Cli::try_parse_from(["vz", "vm", "mac", "init", "--disk-size", "64G"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_e2e() {
-        let cli = Cli::try_parse_from([
-            "vz",
-            "vm",
-            "linux",
-            "test",
-            "e2e",
-            "--vm-name",
-            "linux-e2e",
-            "--guest-repo",
-            "/workspaces/vz",
-        ])
-        .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_run() {
-        let cli = Cli::try_parse_from([
-            "vz", "vm", "linux", "run", "--name", "space-a", "--cpus", "4", "--memory", "4096",
-        ])
-        .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_init() {
-        let cli = Cli::try_parse_from([
-            "vz",
-            "vm",
-            "linux",
-            "init",
-            "--name",
-            "linux-test",
-            "--disk-size-gb",
-            "80",
-            "--force",
-        ])
-        .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_list() {
-        let cli = Cli::try_parse_from(["vz", "vm", "linux", "list"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_inspect() {
-        let cli = Cli::try_parse_from(["vz", "vm", "linux", "inspect", "vz-1234"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_attach() {
-        let cli = Cli::try_parse_from(["vz", "vm", "linux", "attach", "vz-1234"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_exec() {
-        let cli = Cli::try_parse_from([
-            "vz", "vm", "linux", "exec", "vz-1234", "--", "echo", "hello",
-        ])
-        .expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_stop() {
-        let cli = Cli::try_parse_from(["vz", "vm", "linux", "stop", "vz-1234"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_vm_linux_rm() {
-        let cli = Cli::try_parse_from(["vz", "vm", "linux", "rm", "vz-1234"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Vm(_))));
-    }
-
-    #[test]
-    fn parse_debug_lease() {
-        let cli = Cli::try_parse_from(["vz", "debug", "lease", "list"]).expect("parse");
-        assert!(matches!(cli.command, Some(Commands::Debug(_))));
+    fn all_hidden_help_contains_no_retired_command_or_alias() {
+        let mut command = Cli::command();
+        command.build();
+        // Explicitly unhide every parser node. A hidden compatibility family
+        // must not evade a public-help snapshot.
+        let names = command
+            .get_subcommands()
+            .map(|child| child.get_name().to_owned())
+            .collect::<Vec<_>>();
+        for name in names {
+            command = command.mut_subcommand(name, |child| child.hide(false));
+        }
+        let text = command.render_long_help().to_string();
+        for root in vz_cli::legacy_cli::REMOVED_ROOT_COMMANDS {
+            assert!(
+                !text
+                    .lines()
+                    .any(|line| line.trim_start().starts_with(&format!("{root} ")))
+            );
+        }
     }
 }

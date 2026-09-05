@@ -34,6 +34,9 @@ use vz_runtime_contract::{
 };
 use vz_runtime_proto::runtime_v2;
 
+mod machine_execution;
+pub use machine_execution::*;
+
 /// Conversion failures between Runtime V2 wire messages and domain entities.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum TranslationError {
