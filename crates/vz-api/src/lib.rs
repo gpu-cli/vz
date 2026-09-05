@@ -1,4 +1,4 @@
-//! OpenAPI/SSE/WebSocket transport adapter for Runtime V2.
+//! HTTP and OpenAPI transport adapter for Runtime V2.
 
 #![forbid(unsafe_code)]
 #![recursion_limit = "256"]
@@ -12,7 +12,6 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use async_stream::stream;
-use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::middleware;
@@ -39,8 +38,6 @@ use vz_runtime_contract::{
 #[cfg(test)]
 use vz_stack::StateStore;
 
-const DEFAULT_EVENT_PAGE_SIZE: usize = 100;
-const MAX_EVENT_PAGE_SIZE: usize = 1000;
 const DEFAULT_EVENT_POLL_INTERVAL: Duration = Duration::from_millis(250);
 
 static NEXT_REQUEST_ID: AtomicU64 = AtomicU64::new(1);
@@ -70,10 +67,8 @@ pub struct ApiConfig {
     pub daemon_auto_spawn: bool,
     /// Runtime capabilities advertised by this API surface.
     pub capabilities: RuntimeCapabilities,
-    /// Poll interval for SSE/WebSocket event adapters.
+    /// Poll interval for SSE adapters.
     pub event_poll_interval: Duration,
-    /// Default event page size for `/v1/events`.
-    pub default_event_page_size: usize,
 }
 
 impl Default for ApiConfig {
@@ -85,7 +80,6 @@ impl Default for ApiConfig {
             daemon_auto_spawn: true,
             capabilities: RuntimeCapabilities::default(),
             event_poll_interval: DEFAULT_EVENT_POLL_INTERVAL,
-            default_event_page_size: DEFAULT_EVENT_PAGE_SIZE,
         }
     }
 }
@@ -98,7 +92,6 @@ struct ApiState {
     daemon_auto_spawn: bool,
     capabilities: RuntimeCapabilities,
     event_poll_interval: Duration,
-    default_event_page_size: usize,
     observability: Arc<ApiObservability>,
 }
 
@@ -111,7 +104,6 @@ impl From<ApiConfig> for ApiState {
             daemon_auto_spawn: config.daemon_auto_spawn,
             capabilities: config.capabilities,
             event_poll_interval: config.event_poll_interval,
-            default_event_page_size: config.default_event_page_size.clamp(1, MAX_EVENT_PAGE_SIZE),
             observability: Arc::new(ApiObservability::default()),
         }
     }
@@ -209,34 +201,6 @@ pub fn router(config: ApiConfig) -> Router {
         .route("/openapi.json", get(openapi_json))
         .route("/metrics", get(metrics_prometheus))
         .route("/v1/capabilities", get(capabilities))
-        .route("/v1/stacks/apply", post(apply_stack))
-        .route("/v1/stacks/teardown", post(teardown_stack))
-        .route("/v1/stacks/{stack_name}/status", get(get_stack_status))
-        .route("/v1/stacks/{stack_name}/events", get(list_stack_events))
-        .route("/v1/stacks/{stack_name}/logs", get(get_stack_logs))
-        .route(
-            "/v1/stacks/{stack_name}/services/{service_name}/stop",
-            post(stop_stack_service),
-        )
-        .route(
-            "/v1/stacks/{stack_name}/services/{service_name}/start",
-            post(start_stack_service),
-        )
-        .route(
-            "/v1/stacks/{stack_name}/services/{service_name}/restart",
-            post(restart_stack_service),
-        )
-        .route(
-            "/v1/stacks/run-container/create",
-            post(create_stack_run_container),
-        )
-        .route(
-            "/v1/stacks/run-container/remove",
-            post(remove_stack_run_container),
-        )
-        .route("/v1/events/{stack_name}", get(list_events))
-        .route("/v1/events/{stack_name}/stream", get(stream_events_sse))
-        .route("/v1/events/{stack_name}/ws", get(stream_events_ws))
         .route("/v1/sandboxes", get(list_sandboxes).post(create_sandbox))
         .route("/v1/spaces/cache/prepare", post(prepare_space_cache))
         .route("/v1/spaces/cache/export", post(export_space_cache))

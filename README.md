@@ -159,23 +159,13 @@ full compatibility merely because the OCI workflows below are available.
 }
 ```
 
-### 2. Run a current vz-managed Compose stack
+### 2. Stack CLI retirement on the 0.4 development line
 
-```bash
-# Start services
-vz stack up -f compose.yaml -n demo
-
-# Inspect and stream logs
-vz stack ps demo
-vz stack logs demo --service web --follow
-
-# Tear down
-vz stack down demo --volumes
-```
-
-Stack networking defaults to service identity inside the stack network.
-Host-facing port publishing is explicit opt-in via Compose host bindings
-(`HOST:CONTAINER`); container-only ports remain internal.
+The former `vz stack ...` command family is no longer executable. Calls fail
+before daemon or state access with the structured `legacy_command_removed`
+response and migration guidance. Multi-service topology belongs in `vz.json`;
+lower-level topology operations remain available through typed APIs while the
+five-verb 0.4 CLI is implemented.
 
 #### Reaching macOS host services from inside a container
 
@@ -293,7 +283,8 @@ groups below are removed from the 0.4 public surface in favor of `up`, `exec`,
 
 ### vz-managed stacks
 
-`stack up`, `stack down`, `stack ps`, `stack ls`, `stack config`, `stack events`, `stack logs`, `stack exec`, `stack run`, `stack stop`, `stack start`, `stack restart`, `stack dashboard`
+The former `stack` command family is retired on the 0.4 development line; it
+returns `legacy_command_removed` and is not retained as a hidden alias.
 
 ### VMs (macOS)
 
@@ -301,7 +292,7 @@ groups below are removed from the 0.4 public surface in favor of `up`, `exec`,
 
 ## Runtime Daemon Connectivity
 
-Runtime-mutating CLI surfaces (`sandbox`, `stack`, `image`, `file`, `lease`, `execution`, `checkpoint`, `build`) use `vz-runtimed` over gRPC/UDS.
+Runtime-mutating CLI surfaces (`sandbox`, `image`, `file`, `lease`, `execution`, `checkpoint`, `build`) use `vz-runtimed` over gRPC/UDS.
 
 - Default socket path is derived from the state DB directory:
   - `<state-db-parent>/.vz-runtime/runtimed.sock`
@@ -330,9 +321,6 @@ vz-cli
   +-- container commands --> vz-oci --> vz-runtime-contract
   |                              |-> macOS backend (vz-oci-macos, VM-backed)
   |                              '-- Linux backend (vz-linux-native)
-  |
-  +-- stack commands -----> vz-stack (Compose orchestration)
-  |
   '-- vm commands (macOS) -> vz (Virtualization.framework wrapper) + vz-guest-agent
 ```
 

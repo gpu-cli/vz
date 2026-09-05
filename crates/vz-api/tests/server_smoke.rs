@@ -72,7 +72,6 @@ async fn runtime_api_server_smoke_serves_capabilities() -> Result<()> {
             ..RuntimeCapabilities::default()
         },
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 10,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -135,7 +134,6 @@ async fn sandbox_crud_over_http() -> Result<()> {
         daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities::default(),
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 10,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
@@ -266,7 +264,6 @@ async fn file_service_round_trip_over_http() -> Result<()> {
         daemon_auto_spawn: true,
         capabilities: RuntimeCapabilities::default(),
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 10,
     });
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")

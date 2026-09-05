@@ -45,6 +45,10 @@ The matrix is consumed by transport/manager parity tests in:
 | `CreateNetworkDomain` | *(not claimed)* | *(n/a)* | no | yes | no |
 | `PublishPort` | *(not claimed)* | *(n/a)* | no | no | no |
 | `ConnectContainer` | *(not claimed)* | *(n/a)* | no | no | no |
-| `ListEvents` | `/v1/events/{stack_name}` | `events` | no | no | no |
+| `ListEvents` | *(not claimed)* | *(n/a)* | no | no | no |
 | `GetReceipt` | `/v1/receipts` | `receipts` | no | no | no |
 | `GetCapabilities` | `/v1/capabilities` | `capabilities` | no | no | no |
+
+`ListEvents` remains a Runtime operation for scoped gRPC consumers. The former
+free-form HTTP stack-name routes are intentionally retired because they could
+not carry the required Project/Environment/Machine authority.

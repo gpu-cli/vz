@@ -12,7 +12,6 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tower::ServiceExt;
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed::{RuntimeDaemon, RuntimedConfig, serve_runtime_uds_with_shutdown};
-use vz_stack::StackEvent;
 
 struct TestDaemonHandle {
     #[allow(dead_code)]
@@ -218,7 +217,6 @@ fn base_test_config(state_store_path: PathBuf) -> ApiConfig {
             ..RuntimeCapabilities::default()
         },
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 2,
     }
 }
 
@@ -235,7 +233,6 @@ fn test_config_daemon_only(state_store_path: PathBuf) -> ApiConfig {
 
 fn sample_openapi_path(path: &str) -> String {
     match path {
-        "/v1/events/{stack_name}" => "/v1/events/runtime-conformance-stack".to_string(),
         "/v1/sandboxes/{sandbox_id}" => "/v1/sandboxes/sbx-nonexistent".to_string(),
         "/v1/sandboxes/{sandbox_id}/shell/open" => {
             "/v1/sandboxes/sbx-nonexistent/shell/open".to_string()
@@ -292,9 +289,8 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/export"));
     assert!(paths.contains_key("/v1/checkpoints/{checkpoint_id}/children"));
-    assert!(paths.contains_key("/v1/events/{stack_name}"));
-    assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
-    assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
+    assert!(!paths.keys().any(|path| path.starts_with("/v1/stacks")));
+    assert!(!paths.keys().any(|path| path.starts_with("/v1/events")));
     assert!(paths.contains_key("/v1/receipts/{receipt_id}"));
     assert!(paths.contains_key("/v1/capabilities"));
     assert!(paths.contains_key("/v1/files/read"));
@@ -306,6 +302,65 @@ fn openapi_document_contains_required_paths() {
     assert!(paths.contains_key("/v1/files/copy"));
     assert!(paths.contains_key("/v1/files/chmod"));
     assert!(paths.contains_key("/v1/files/chown"));
+}
+
+#[tokio::test]
+async fn retired_unscoped_stack_and_event_routes_have_no_side_effects() {
+    let temp_dir = tempdir().unwrap();
+    let state_store_path = temp_dir.path().join("state.db");
+    let state_sentinel = b"retired routes must not touch runtime state";
+    std::fs::write(&state_store_path, state_sentinel).unwrap();
+
+    let daemon_runtime_data_dir = temp_dir.path().join("daemon-runtime");
+    let daemon_socket_path = daemon_runtime_data_dir.join("runtimed.sock");
+    let app = router(ApiConfig {
+        state_store_path: state_store_path.clone(),
+        daemon_socket_path: Some(daemon_socket_path.clone()),
+        daemon_runtime_data_dir: Some(daemon_runtime_data_dir.clone()),
+        daemon_auto_spawn: true,
+        capabilities: RuntimeCapabilities::default(),
+        event_poll_interval: Duration::from_millis(10),
+    });
+
+    let retired_routes = [
+        ("POST", "/v1/stacks/apply"),
+        ("POST", "/v1/stacks/teardown"),
+        ("GET", "/v1/stacks/demo/status"),
+        ("GET", "/v1/stacks/demo/events"),
+        ("GET", "/v1/stacks/demo/logs"),
+        ("POST", "/v1/stacks/demo/services/web/stop"),
+        ("POST", "/v1/stacks/demo/services/web/start"),
+        ("POST", "/v1/stacks/demo/services/web/restart"),
+        ("POST", "/v1/stacks/run-container/create"),
+        ("POST", "/v1/stacks/run-container/remove"),
+        ("GET", "/v1/events/demo"),
+        ("GET", "/v1/events/demo/stream"),
+        ("GET", "/v1/events/demo/ws"),
+    ];
+
+    for (method, path) in retired_routes {
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(path)
+                    .header("content-type", "application/json")
+                    .body(Body::from("{}"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "retired route {method} {path} must not dispatch"
+        );
+    }
+
+    assert_eq!(std::fs::read(&state_store_path).unwrap(), state_sentinel);
+    assert!(!daemon_socket_path.exists());
+    assert!(!daemon_runtime_data_dir.exists());
 }
 
 #[test]
@@ -340,12 +395,10 @@ fn transport_modules_do_not_directly_import_state_store() {
         "src/daemon_bridge/mod.rs",
         "src/daemon_bridge/common.rs",
         "src/daemon_bridge/sandbox.rs",
-        "src/daemon_bridge/stack.rs",
         "src/daemon_bridge/lease.rs",
         "src/daemon_bridge/build.rs",
         "src/daemon_bridge/execution.rs",
         "src/daemon_bridge/checkpoint.rs",
-        "src/daemon_bridge/events.rs",
         "src/daemon_bridge/images.rs",
         "src/daemon_bridge/container.rs",
         "src/daemon_bridge/filesystem.rs",
@@ -632,64 +685,6 @@ async fn image_pull_requires_daemon_when_legacy_fallback_disabled() {
 }
 
 #[tokio::test]
-async fn events_endpoint_respects_cursor_and_limit() {
-    let temp_dir = tempdir().unwrap();
-    let state_path = temp_dir.path().join("state.db");
-    let store = StateStore::open(&state_path).unwrap();
-    for index in 0..3 {
-        store
-            .emit_event(
-                "my-stack",
-                &StackEvent::ServiceCreating {
-                    stack_name: "my-stack".to_string(),
-                    service_name: format!("svc-{index}"),
-                },
-            )
-            .unwrap();
-    }
-
-    let app = router(test_config(state_path.clone()));
-    let first_response = app
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/v1/events/my-stack?after=0&limit=2")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(first_response.status(), StatusCode::OK);
-
-    let first_payload: serde_json::Value = serde_json::from_slice(
-        &to_bytes(first_response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(first_payload["events"].as_array().unwrap().len(), 2);
-    let next_cursor = first_payload["next_cursor"].as_i64().unwrap();
-
-    let second_response = app
-        .oneshot(
-            Request::builder()
-                .uri(format!("/v1/events/my-stack?after={next_cursor}&limit=2"))
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(second_response.status(), StatusCode::OK);
-    let second_payload: serde_json::Value = serde_json::from_slice(
-        &to_bytes(second_response.into_body(), usize::MAX)
-            .await
-            .unwrap(),
-    )
-    .unwrap();
-    assert_eq!(second_payload["events"].as_array().unwrap().len(), 1);
-}
-
-#[tokio::test]
 async fn transport_parity_error_codes_match_runtime_contract() {
     let temp_dir = tempdir().unwrap();
     let state_path = temp_dir.path().join("state.db");
@@ -722,47 +717,6 @@ async fn transport_parity_error_codes_match_runtime_contract() {
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
 }
 
-#[tokio::test]
-async fn transport_parity_event_cursor_matches_state_store_slice() {
-    let temp_dir = tempdir().unwrap();
-    let state_path = temp_dir.path().join("state.db");
-    let store = StateStore::open(&state_path).unwrap();
-    for index in 0..4 {
-        store
-            .emit_event(
-                "my-stack",
-                &StackEvent::ServiceCreating {
-                    stack_name: "my-stack".to_string(),
-                    service_name: format!("svc-{index}"),
-                },
-            )
-            .unwrap();
-    }
-    let expected = store.load_events_since_limited("my-stack", 0, 3).unwrap();
-    let expected_ids: Vec<i64> = expected.iter().map(|record| record.id).collect();
-
-    let app = router(test_config(state_path));
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/events/my-stack?after=0&limit=3")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    assert_eq!(response.status(), StatusCode::OK);
-    let payload: serde_json::Value =
-        serde_json::from_slice(&to_bytes(response.into_body(), usize::MAX).await.unwrap()).unwrap();
-    let ids: Vec<i64> = payload["events"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|event| event["id"].as_i64().unwrap())
-        .collect();
-    assert_eq!(ids, expected_ids);
-}
-
 #[test]
 fn transport_parity_openapi_and_grpc_surface_require_metadata_and_ordering() {
     let exec_request = vz_agent_proto::ExecRequest::default();
@@ -777,8 +731,7 @@ fn transport_parity_openapi_and_grpc_surface_require_metadata_and_ordering() {
     let document = openapi_document_json();
     let paths = document["paths"].as_object().unwrap();
     assert!(paths.contains_key("/v1/executions"));
-    assert!(paths.contains_key("/v1/events/{stack_name}/stream"));
-    assert!(paths.contains_key("/v1/events/{stack_name}/ws"));
+    assert!(!paths.keys().any(|path| path.starts_with("/v1/events")));
 }
 
 #[tokio::test]
@@ -847,7 +800,6 @@ async fn transport_parity_openapi_surface_errors_match_runtime_operation_labels(
             && matches!(
                 surface.path,
                 "/v1/capabilities"
-                    | "/v1/events/{stack_name}"
                     | "/v1/sandboxes"
                     | "/v1/leases"
                     | "/v1/executions"
@@ -1410,7 +1362,6 @@ fn test_config_with_resize(state_store_path: PathBuf) -> ApiConfig {
             ..RuntimeCapabilities::default()
         },
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 2,
     }
 }
 
@@ -1638,7 +1589,6 @@ fn test_config_with_capabilities(
         daemon_auto_spawn: true,
         capabilities,
         event_poll_interval: Duration::from_millis(10),
-        default_event_page_size: 2,
     }
 }
 
@@ -2161,9 +2111,6 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
         "ListBuilds",
         "CancelBuild",
         "StreamBuildEvents",
-        // EventService
-        "ListEvents",
-        "StreamEvents",
         // FileService
         "ReadFile",
         "WriteFile",
@@ -2178,10 +2125,9 @@ fn transport_parity_openapi_operations_match_grpc_rpcs() {
         "GetCapabilities",
     ];
 
-    // Streaming RPCs use SSE/WS, not REST — they have separate
-    // OpenAPI operations (streamEventsSse, streamEventsWs) rather
-    // than a direct camelCase mapping.
-    let streaming_rpcs = ["StreamExecOutput", "StreamBuildEvents", "StreamEvents"];
+    // Runtime EventService is intentionally gRPC-only: its typed scope cannot
+    // be represented by the retired free-form stack-name HTTP routes.
+    let streaming_rpcs = ["StreamExecOutput", "StreamBuildEvents"];
 
     for rpc in &grpc_rpcs {
         if streaming_rpcs.contains(rpc) {
@@ -4097,56 +4043,6 @@ async fn throughput_list_sandboxes_large_result_set() {
     assert!(
         elapsed.as_secs() < 2,
         "list_sandboxes with 50 entries took {elapsed:?} (>2s budget)"
-    );
-}
-
-/// Events endpoint with a large event history should paginate
-/// without performance degradation.
-#[tokio::test]
-async fn throughput_events_large_history() {
-    let temp_dir = tempdir().unwrap();
-    let state_path = temp_dir.path().join("state.db");
-    let store = StateStore::open(&state_path).unwrap();
-
-    // Pre-populate 1,000 events.
-    for i in 0..1_000 {
-        store
-            .emit_event(
-                "perf-stack",
-                &StackEvent::ServiceCreating {
-                    stack_name: "perf-stack".to_string(),
-                    service_name: format!("svc-{i}"),
-                },
-            )
-            .unwrap();
-    }
-    drop(store);
-
-    let app = router(test_config(state_path));
-
-    // Query page from midpoint.
-    let start = std::time::Instant::now();
-    let response = app
-        .oneshot(
-            Request::builder()
-                .uri("/v1/events/perf-stack?after=500&limit=100")
-                .body(Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
-    let elapsed = start.elapsed();
-
-    assert_eq!(response.status(), StatusCode::OK);
-    let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
-    let payload: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let events = payload["events"].as_array().unwrap();
-    assert_eq!(events.len(), 100);
-
-    // Paginated query against 1,000 events should complete in under 1 second.
-    assert!(
-        elapsed.as_secs() < 1,
-        "events pagination (100 of 1000) took {elapsed:?} (>1s budget)"
     );
 }
 

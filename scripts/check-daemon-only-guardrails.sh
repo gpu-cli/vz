@@ -38,7 +38,6 @@ runtime_cli_control_plane_files=(
   "crates/vz-cli/src/commands/file.rs"
   "crates/vz-cli/src/commands/lease.rs"
   "crates/vz-cli/src/commands/sandbox.rs"
-  "crates/vz-cli/src/commands/stack/commands.rs"
 )
 
 runtime_cli_files=(

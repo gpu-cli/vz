@@ -190,9 +190,6 @@ fn metric_placeholder_for_segment(previous: &str, segment: &str) -> Option<&'sta
         "images" => Some("{image_ref}"),
         "builds" => Some("{build_id}"),
         "receipts" => Some("{receipt_id}"),
-        "events" => Some("{stack_name}"),
-        "stacks" => Some("{stack_name}"),
-        "services" => Some("{service_name}"),
         _ if looks_dynamic(segment) => Some("{id}"),
         _ => None,
     }
@@ -205,21 +202,9 @@ fn is_stable_metrics_segment(segment: &str) -> bool {
             | "metrics"
             | "v1"
             | "capabilities"
-            | "stacks"
-            | "apply"
-            | "teardown"
-            | "status"
-            | "events"
-            | "logs"
-            | "services"
-            | "stop"
-            | "start"
-            | "restart"
-            | "run-container"
             | "create"
             | "remove"
             | "stream"
-            | "ws"
             | "sandboxes"
             | "shell"
             | "open"
@@ -296,14 +281,6 @@ mod tests {
         assert_eq!(
             normalize_http_path_for_metrics("/v1/sandboxes/sbx-123/shell/open"),
             "/v1/sandboxes/{sandbox_id}/shell/open"
-        );
-        assert_eq!(
-            normalize_http_path_for_metrics("/v1/stacks/my-stack/services/web/restart"),
-            "/v1/stacks/{stack_name}/services/{service_name}/restart"
-        );
-        assert_eq!(
-            normalize_http_path_for_metrics("/v1/events/runtime-stack/stream"),
-            "/v1/events/{stack_name}/stream"
         );
     }
 

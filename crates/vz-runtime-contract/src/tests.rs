@@ -2924,6 +2924,17 @@ fn primitive_conformance_matrix_is_complete_and_stable() {
 
     assert!(covered_by_matrix > 0);
     assert!(required_paths.len() >= 3);
+
+    let Some(list_events) = PRIMITIVE_CONFORMANCE_MATRIX
+        .iter()
+        .find(|entry| entry.operation == RuntimeOperation::ListEvents)
+    else {
+        panic!("missing ListEvents conformance row");
+    };
+    assert!(
+        list_events.openapi.is_none(),
+        "ListEvents must not claim the retired unscoped HTTP surface"
+    );
 }
 
 #[test]

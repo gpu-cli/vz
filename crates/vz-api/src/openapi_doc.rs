@@ -5,7 +5,7 @@ use super::{
     CheckpointResponse, ChmodPathRequest, ChownPathRequest, CloseSandboxShellRequest,
     CloseSandboxShellResponse, ContainerListResponse, ContainerResponse, CopyPathRequest,
     CreateCheckpointRequest, CreateContainerRequest, CreateExecutionRequest, CreateSandboxRequest,
-    DiffCheckpointsResponse, ErrorResponse, EventsResponse, ExecutionListResponse,
+    DiffCheckpointsResponse, ErrorResponse, ExecutionListResponse,
     ExecutionOutputStreamEventPayload, ExecutionResponse, ExportCheckpointRequest,
     ExportCheckpointResponse, ExportSpaceCacheRequest, ExportSpaceCacheResponse,
     FileMutationResponse, ForkCheckpointRequest, ImageListResponse, ImageResponse,
@@ -19,7 +19,7 @@ use super::{
 };
 use utoipa::OpenApi;
 
-const API_DESCRIPTION: &str = "Container runtime API with sandbox lifecycle, lease management, execution dispatch, checkpoint/restore, and real-time event streaming via SSE and WebSocket.";
+const API_DESCRIPTION: &str = "Container runtime API with sandbox lifecycle, lease management, execution dispatch, checkpoint/restore, and execution output streaming via SSE.";
 const IDEMPOTENCY_KEY_DESCRIPTION: &str = "Client-supplied idempotency key. Repeated requests with the same key and body return the cached response. Same key with a different body returns 409 Conflict.";
 const REQUEST_ID_DESCRIPTION: &str =
     "Client-supplied request identifier echoed back in every response. Auto-generated when absent.";
@@ -41,59 +41,6 @@ fn get_openapi_document() {}
     responses((status = 200, description = "Capabilities list", body = CapabilitiesResponse))
 )]
 fn get_capabilities() {}
-
-#[utoipa::path(
-    get,
-    path = "/v1/events/{stack_name}",
-    operation_id = "listEvents",
-    summary = "Paginated event log for a stack",
-    params(
-        ("stack_name" = String, Path, description = "Stack identifier for event filtering"),
-        ("after" = Option<i64>, Query, description = "Return events with id strictly greater than this cursor"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of events to return (1..1000)"),
-        ("scope" = Option<String>, Query, description = "Optional event scope filter"),
-    ),
-    responses(
-        (status = 200, description = "Paginated event list", body = EventsResponse),
-        (status = 500, description = "Internal error", body = ErrorResponse),
-    )
-)]
-fn list_events() {}
-
-#[utoipa::path(
-    get,
-    path = "/v1/events/{stack_name}/stream",
-    operation_id = "streamEventsSse",
-    summary = "Server-Sent Events stream of stack events",
-    params(
-        ("stack_name" = String, Path, description = "Stack identifier for event filtering"),
-        ("after" = Option<i64>, Query, description = "Return events with id strictly greater than this cursor"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of events to return (1..1000)"),
-        ("scope" = Option<String>, Query, description = "Optional event scope filter"),
-    ),
-    responses((
-        status = 200,
-        description = "SSE event stream",
-        content_type = "text/event-stream",
-        body = String
-    ))
-)]
-fn stream_events_sse() {}
-
-#[utoipa::path(
-    get,
-    path = "/v1/events/{stack_name}/ws",
-    operation_id = "streamEventsWs",
-    summary = "WebSocket stream of stack events",
-    params(
-        ("stack_name" = String, Path, description = "Stack identifier for event filtering"),
-        ("after" = Option<i64>, Query, description = "Return events with id strictly greater than this cursor"),
-        ("limit" = Option<usize>, Query, description = "Maximum number of events to return (1..1000)"),
-        ("scope" = Option<String>, Query, description = "Optional event scope filter"),
-    ),
-    responses((status = 101, description = "WebSocket upgrade"))
-)]
-fn stream_events_ws() {}
 
 #[utoipa::path(
     post,
@@ -976,9 +923,6 @@ fn chown_path() {}
     paths(
         get_openapi_document,
         get_capabilities,
-        list_events,
-        stream_events_sse,
-        stream_events_ws,
         create_sandbox,
         prepare_space_cache,
         export_space_cache,

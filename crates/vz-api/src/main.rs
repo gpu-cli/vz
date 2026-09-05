@@ -31,17 +31,13 @@ const DAEMON_AUTOSTART_ENV: &str = "VZ_RUNTIME_DAEMON_AUTOSTART";
 const DAEMON_RUNTIME_DATA_DIR_ENV: &str = "VZ_RUNTIME_DAEMON_RUNTIME_DIR";
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "vz-api",
-    version,
-    about = "Runtime V2 OpenAPI/SSE adapter server"
-)]
+#[command(name = "vz-api", version, about = "Runtime V2 HTTP adapter server")]
 struct Cli {
     /// Socket address to bind the HTTP server.
     #[arg(long, default_value = "127.0.0.1:8181")]
     bind: SocketAddr,
 
-    /// SQLite state-store path used by event endpoints.
+    /// SQLite state-store path used by the runtime daemon.
     #[arg(long, default_value = "stack-state.db")]
     state_store_path: PathBuf,
 
@@ -57,13 +53,9 @@ struct Cli {
     #[arg(long)]
     daemon_auto_spawn: Option<bool>,
 
-    /// Poll interval for SSE/WebSocket event adapters in milliseconds.
+    /// Poll interval for SSE adapters in milliseconds.
     #[arg(long, default_value_t = 250)]
     event_poll_ms: u64,
-
-    /// Default page size for `/v1/events/{stack_name}` reads.
-    #[arg(long, default_value_t = 100)]
-    default_event_page_size: usize,
 
     /// Start from stack baseline capabilities before applying explicit flags.
     #[arg(long)]
@@ -97,7 +89,6 @@ async fn main() -> Result<()> {
         daemon_auto_spawn,
         capabilities,
         event_poll_interval: Duration::from_millis(cli.event_poll_ms.max(1)),
-        default_event_page_size: cli.default_event_page_size,
     };
 
     let app = router(config);

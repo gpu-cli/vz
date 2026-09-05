@@ -137,7 +137,8 @@ authenticated import relay.
 
 4. **No persistent stack state** -- if the vz process exits, in-memory stack state
    (bridge names, netns tracking) is lost. Containers remain running but port forwarding
-   rules and bridge interfaces may become orphaned. Run `vz stack down` before exiting.
+   rules and bridge interfaces may become orphaned. Teardown through the topology-scoped
+   typed API before exiting; the legacy `vz stack down` CLI is retired.
 
 5. **Developer Environment parity is incomplete on Linux hosts** -- `vz init`, `vz run`, `vz exec`, `vz save`,
    `vz restore`, `vz list`, `vz stop`, `vz cache`, `vz provision`, `vz cleanup`,

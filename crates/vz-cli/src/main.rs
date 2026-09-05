@@ -20,6 +20,7 @@ mod registry;
 
 use clap::Parser;
 use tracing::error;
+use vz_cli::legacy_cli::{LEGACY_COMMAND_REMOVED_EXIT_CODE, rejection_for_args};
 
 const CLI_WORKFLOW_EXAMPLES: &str = "\
 Examples:
@@ -139,10 +140,6 @@ enum Commands {
     /// Show daemon logs for debugging.
     Logs(commands::dev_logs::DevLogsArgs),
 
-    // ── Stack orchestration ──
-    /// Multi-service stack orchestration from Compose files.
-    Stack(commands::stack::StackArgs),
-
     // ── Image management ──
     /// OCI image management (pull, build, list, prune).
     Image(commands::image::ImageArgs),
@@ -170,25 +167,20 @@ enum Commands {
 }
 
 fn main() -> anyhow::Result<()> {
-    let cli = Cli::parse();
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(rejection) = rejection_for_args(args.iter().cloned()) {
+        eprintln!("{}", rejection.to_json());
+        std::process::exit(LEGACY_COMMAND_REMOVED_EXIT_CODE);
+    }
+    let cli = Cli::parse_from(args);
     if let Some(transport) = cli.control_plane {
         commands::runtime_daemon::set_control_plane_transport(transport)?;
     }
 
-    // Suppress info-level tracing noise for stack up/down.
-    let is_stack_progress = matches!(
-        cli.command,
-        Some(Commands::Stack(ref args)) if matches!(
-            args.action,
-            commands::stack::StackCommand::Up(_)
-            | commands::stack::StackCommand::Down(_)
-        )
-    );
-
     // Default sandbox mode should suppress info logs too.
     let is_sandbox_mode = cli.command.is_none();
 
-    let filter = if cli.quiet || ((is_stack_progress || is_sandbox_mode) && cli.verbose == 0) {
+    let filter = if cli.quiet || (is_sandbox_mode && cli.verbose == 0) {
         "error"
     } else {
         match cli.verbose {
@@ -281,9 +273,6 @@ fn main() -> anyhow::Result<()> {
             Some(Commands::Stop(args)) => commands::dev::cmd_stop(args).await,
             Some(Commands::Status(args)) => commands::dev_status::cmd_dev_status(args).await,
             Some(Commands::Logs(args)) => commands::dev_logs::cmd_dev_logs(args).await,
-
-            // Stack orchestration
-            Some(Commands::Stack(args)) => commands::stack::run(args).await,
 
             // Image management
             Some(Commands::Image(args)) => commands::image::run(args).await,
@@ -499,46 +488,6 @@ mod tests {
     fn parse_image_build() {
         let cli = Cli::try_parse_from(["vz", "image", "build"]).expect("parse");
         assert!(matches!(cli.command, Some(Commands::Image(_))));
-    }
-
-    #[test]
-    fn parse_stack_up() {
-        let cli = Cli::try_parse_from(["vz", "stack", "up", "--file", "docker-compose.yaml"])
-            .expect("parse");
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Stack(ref args))
-                if matches!(args.action, commands::stack::StackCommand::Up(_))
-        ));
-    }
-
-    #[test]
-    fn parse_stack_down() {
-        let cli = Cli::try_parse_from(["vz", "stack", "down", "myapp"]).expect("parse");
-        assert!(matches!(
-            cli.command,
-            Some(Commands::Stack(ref args))
-                if matches!(args.action, commands::stack::StackCommand::Down(_))
-        ));
-    }
-
-    #[test]
-    fn parse_stack_exec() {
-        let cli = Cli::try_parse_from([
-            "vz", "stack", "exec", "myapp", "db", "--", "psql", "-U", "app",
-        ])
-        .expect("parse");
-        if let Some(Commands::Stack(ref args)) = cli.command {
-            if let commands::stack::StackCommand::Exec(ref exec) = args.action {
-                assert_eq!(exec.name, "myapp");
-                assert_eq!(exec.service, "db");
-                assert_eq!(exec.command, vec!["psql", "-U", "app"]);
-            } else {
-                panic!("expected Exec");
-            }
-        } else {
-            panic!("expected Stack");
-        }
     }
 
     #[test]

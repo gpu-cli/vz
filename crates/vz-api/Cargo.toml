@@ -1,7 +1,7 @@
 [package]
 name = "vz-api"
 version = "0.1.0"
-description = "OpenAPI + SSE/WebSocket transport adapter for Runtime V2"
+description = "HTTP + OpenAPI transport adapter for Runtime V2"
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
@@ -10,7 +10,7 @@ repository.workspace = true
 [dependencies]
 anyhow = { workspace = true }
 async-stream = "0.3"
-axum = { version = "0.8", features = ["ws"] }
+axum = "0.8"
 base64 = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

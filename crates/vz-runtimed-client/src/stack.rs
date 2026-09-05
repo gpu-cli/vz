@@ -9,6 +9,41 @@ use crate::stream_completion::{
 use crate::transport::status_to_client_error;
 use crate::{DaemonClient, Result};
 
+fn validate_stack_scope(
+    socket_path: &std::path::Path,
+    operation: &'static str,
+    stack_name: &str,
+    scope: Option<&runtime_v2::MachineWorkloadScope>,
+) -> Result<()> {
+    let scope = scope.ok_or_else(|| {
+        status_to_client_error(
+            socket_path,
+            Status::invalid_argument(format!(
+                "{operation} requires an exact MachineWorkloadScope"
+            )),
+        )
+    })?;
+    let decoded =
+        vz_runtime_translate::machine_workload_scope_from_proto(scope).map_err(|error| {
+            status_to_client_error(
+                socket_path,
+                Status::invalid_argument(format!(
+                    "{operation} has an invalid MachineWorkloadScope: {error}"
+                )),
+            )
+        })?;
+    if decoded.stack_id != stack_name {
+        return Err(status_to_client_error(
+            socket_path,
+            Status::invalid_argument(format!(
+                "{operation} stack_name `{stack_name}` does not match MachineWorkloadScope stack_id `{}`",
+                decoded.stack_id
+            )),
+        ));
+    }
+    Ok(())
+}
+
 impl DaemonClient {
     /// Call Runtime V2 `ApplyStack`.
     pub async fn apply_stack(
@@ -57,6 +92,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::ApplyStackRequest,
     ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::ApplyStackEvent>>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "ApplyStack",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .apply_stack(Request::new(request))
@@ -112,6 +153,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::TeardownStackRequest,
     ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::TeardownStackEvent>>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "TeardownStack",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .teardown_stack(Request::new(request))
@@ -133,6 +180,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::GetStackStatusRequest,
     ) -> Result<tonic::Response<runtime_v2::GetStackStatusResponse>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "GetStackStatus",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .get_stack_status(Request::new(request))
@@ -154,6 +207,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::ListStackEventsRequest,
     ) -> Result<tonic::Response<runtime_v2::ListStackEventsResponse>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "ListStackEvents",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .list_stack_events(Request::new(request))
@@ -175,6 +234,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::GetStackLogsRequest,
     ) -> Result<tonic::Response<runtime_v2::GetStackLogsResponse>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "GetStackLogs",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .get_stack_logs(Request::new(request))
@@ -234,6 +299,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::StackServiceActionEvent>>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "StopStackService",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .stop_stack_service(Request::new(request))
@@ -293,6 +364,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::StackServiceActionEvent>>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "StartStackService",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .start_stack_service(Request::new(request))
@@ -352,6 +429,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::StackServiceActionRequest,
     ) -> Result<tonic::Response<tonic::Streaming<runtime_v2::StackServiceActionEvent>>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "RestartStackService",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .restart_stack_service(Request::new(request))
@@ -375,6 +458,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::StackRunContainerRequest,
     ) -> Result<tonic::Response<runtime_v2::StackRunContainerResponse>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "CreateStackRunContainer",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .create_stack_run_container(Request::new(request))
@@ -398,6 +487,12 @@ impl DaemonClient {
         &mut self,
         mut request: runtime_v2::StackRunContainerRequest,
     ) -> Result<tonic::Response<runtime_v2::StackRunContainerResponse>> {
+        validate_stack_scope(
+            &self.config.socket_path,
+            "RemoveStackRunContainer",
+            &request.stack_name,
+            request.scope.as_ref(),
+        )?;
         Self::ensure_metadata(&mut request.metadata);
         self.stack_client
             .remove_stack_run_container(Request::new(request))

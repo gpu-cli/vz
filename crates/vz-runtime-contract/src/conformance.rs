@@ -372,10 +372,7 @@ pub const PRIMITIVE_CONFORMANCE_MATRIX: &[PrimitiveConformanceEntry] = &[
     },
     PrimitiveConformanceEntry {
         operation: RuntimeOperation::ListEvents,
-        openapi: Some(OpenApiPrimitiveSurface {
-            path: "/v1/events/{stack_name}",
-            surface: "events",
-        }),
+        openapi: None,
         manager: false,
         grpc_metadata: false,
         cli: false,

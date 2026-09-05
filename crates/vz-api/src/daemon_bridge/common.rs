@@ -51,19 +51,6 @@ pub(crate) fn lease_payload_from_runtime_proto(payload: runtime_v2::LeasePayload
     }
 }
 
-pub(crate) fn stack_service_status_from_runtime_proto(
-    payload: runtime_v2::StackServiceStatus,
-) -> StackServiceStatusPayload {
-    StackServiceStatusPayload {
-        service_name: payload.service_name,
-        replica_index: payload.replica_index,
-        phase: payload.phase,
-        ready: payload.ready,
-        container_id: payload.container_id,
-        last_error: payload.last_error,
-    }
-}
-
 pub(crate) fn build_payload_from_runtime_proto(payload: runtime_v2::BuildPayload) -> BuildPayload {
     BuildPayload {
         build_id: payload.build_id,
@@ -166,19 +153,6 @@ pub(crate) fn container_payload_from_runtime_proto(
         } else {
             Some(payload.ended_at)
         },
-    }
-}
-
-pub(crate) fn api_event_record_from_runtime_proto(
-    event: runtime_v2::RuntimeEvent,
-) -> ApiEventRecord {
-    let event_value = serde_json::from_str::<serde_json::Value>(&event.event_json)
-        .unwrap_or_else(|_| serialization_error_value());
-    ApiEventRecord {
-        id: event.id,
-        stack_name: event.stack_name,
-        created_at: event.created_at,
-        event: event_value,
     }
 }
 
@@ -332,24 +306,6 @@ pub(crate) fn daemon_request_metadata(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn stack_service_status_bridge_and_json_preserve_replica_index() {
-        let projected = stack_service_status_from_runtime_proto(runtime_v2::StackServiceStatus {
-            service_name: "web".to_string(),
-            replica_index: 2,
-            phase: "running".to_string(),
-            ready: true,
-            container_id: "ctr-web-2".to_string(),
-            last_error: String::new(),
-        });
-
-        assert_eq!(projected.service_name, "web");
-        assert_eq!(projected.replica_index, 2);
-        let json = serde_json::to_value(projected).unwrap();
-        assert_eq!(json["service_name"], "web");
-        assert_eq!(json["replica_index"], 2);
-    }
 
     #[test]
     fn daemon_request_metadata_preserves_request_id_and_idempotency_key() {

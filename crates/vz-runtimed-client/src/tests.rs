@@ -219,6 +219,30 @@ fn assert_grpc_status_in(error: DaemonClientError, expected: &[Code]) {
     }
 }
 
+async fn assert_local_scope_preflight<T>(
+    operation: &str,
+    future: impl std::future::Future<Output = Result<T>>,
+) {
+    let result = tokio::time::timeout(Duration::from_millis(250), future)
+        .await
+        .unwrap_or_else(|_| panic!("{operation} scope validation reached the unavailable network"));
+    let error = match result {
+        Ok(_) => panic!("{operation} accepted a request without exact Machine scope"),
+        Err(error) => error,
+    };
+    match error {
+        DaemonClientError::Grpc(status) => {
+            assert_eq!(status.code(), Code::InvalidArgument, "{operation}");
+            assert!(
+                status.message().contains(operation)
+                    && status.message().contains("MachineWorkloadScope"),
+                "unexpected {operation} scope error: {status}"
+            );
+        }
+        other => panic!("{operation} reached transport before scope validation: {other:?}"),
+    }
+}
+
 #[test]
 fn structured_unavailable_status_preserves_application_error_details() {
     let socket = Path::new("/tmp/vz-structured-status.sock");
@@ -907,6 +931,145 @@ async fn checkpoint_export_and_import_missing_paths_return_not_found() {
     assert_grpc_status_in(import_error, &[Code::NotFound]);
 
     daemon.stop().await;
+}
+
+#[tokio::test]
+async fn stack_service_scope_validation_fails_locally_before_every_rpc_send() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let daemon = start_daemon(runtimed_config(&tmp)).await;
+    let mut client = DaemonClient::connect_with_config(client_config(&tmp, false))
+        .await
+        .expect("client connect");
+
+    // Leave the established client pointed at a dead transport. Every call
+    // below must still return InvalidArgument immediately; Unavailable or a
+    // timeout proves that its lowest-level send skipped local scope preflight.
+    let RunningDaemon { task, .. } = daemon;
+    task.abort();
+    assert!(
+        task.await
+            .expect_err("aborted daemon task must not complete")
+            .is_cancelled(),
+        "daemon task must be cancelled before scope preflight probes"
+    );
+
+    let stack_name = "stack-client-scope-preflight";
+    assert_local_scope_preflight(
+        "ApplyStack",
+        client.apply_stack_stream_with_metadata(runtime_v2::ApplyStackRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "TeardownStack",
+        client.teardown_stack_stream_with_metadata(runtime_v2::TeardownStackRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "GetStackStatus",
+        client.get_stack_status_with_metadata(runtime_v2::GetStackStatusRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "ListStackEvents",
+        client.list_stack_events_with_metadata(runtime_v2::ListStackEventsRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "GetStackLogs",
+        client.get_stack_logs_with_metadata(runtime_v2::GetStackLogsRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "StopStackService",
+        client.stop_stack_service_stream_with_metadata(runtime_v2::StackServiceActionRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "StartStackService",
+        client.start_stack_service_stream_with_metadata(runtime_v2::StackServiceActionRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "RestartStackService",
+        client.restart_stack_service_stream_with_metadata(runtime_v2::StackServiceActionRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "CreateStackRunContainer",
+        client.create_stack_run_container_with_metadata(runtime_v2::StackRunContainerRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+    assert_local_scope_preflight(
+        "RemoveStackRunContainer",
+        client.remove_stack_run_container_with_metadata(runtime_v2::StackRunContainerRequest {
+            stack_name: stack_name.to_string(),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    let malformed_scope = runtime_v2::MachineWorkloadScope {
+        schema_version: 0,
+        project_id: "prj-client-scope".to_string(),
+        environment_id: "env-client-scope".to_string(),
+        machine_id: "mch-client-scope".to_string(),
+        machine_incarnation_id: "inc-client-scope".to_string(),
+        stack_id: stack_name.to_string(),
+    };
+    assert_local_scope_preflight(
+        "GetStackStatus",
+        client.get_stack_status_with_metadata(runtime_v2::GetStackStatusRequest {
+            stack_name: stack_name.to_string(),
+            scope: Some(malformed_scope),
+            ..Default::default()
+        }),
+    )
+    .await;
+
+    let mismatched_scope = runtime_v2::MachineWorkloadScope {
+        schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,
+        project_id: "prj-client-scope".to_string(),
+        environment_id: "env-client-scope".to_string(),
+        machine_id: "mch-client-scope".to_string(),
+        machine_incarnation_id: "inc-client-scope".to_string(),
+        stack_id: "stack-other-machine-workload".to_string(),
+    };
+    assert_local_scope_preflight(
+        "GetStackStatus",
+        client.get_stack_status_with_metadata(runtime_v2::GetStackStatusRequest {
+            stack_name: stack_name.to_string(),
+            scope: Some(mismatched_scope),
+            ..Default::default()
+        }),
+    )
+    .await;
 }
 
 #[tokio::test]
