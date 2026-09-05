@@ -102,9 +102,18 @@ impl<R> MachineRuntimeEntry<R> {
 ///
 /// The runtime backend still accepts a path rather than a directory descriptor.
 /// The registry verifies that path immediately before construction and on every
-/// cached admission, and retains both directory descriptors. Processes running
-/// as the same effective user remain inside the filesystem trust boundary: they
-/// can rename writable ancestors despite descriptor-relative validation.
+/// cached admission, and retains both directory descriptors. Admission also
+/// requires every configured-root path component to be owned by root or the
+/// effective user and rejects writable non-sticky ancestors. A trusted sticky
+/// ancestor is accepted only when its next component is also root- or
+/// effective-user-owned.
+///
+/// These checks inspect POSIX owner and mode bits. Callers must additionally
+/// ensure that the configured ancestry has no ACL or equivalent grant allowing
+/// an untrusted process to rename a component; mode-bit validation cannot prove
+/// the absence of such grants. Processes running as the same effective user
+/// remain inside the filesystem trust boundary and can rename writable
+/// ancestors despite descriptor-relative validation.
 pub struct MachineRuntimeRegistry<R> {
     root: PathBuf,
     entries: Mutex<HashMap<String, Arc<MachineRuntimeEntry<R>>>>,
@@ -182,7 +191,7 @@ impl<R> MachineRuntimeRegistry<R> {
             .entries
             .lock()
             .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
-        let root = open_absolute_directory(&self.root)?;
+        let root = open_trusted_registry_root(&self.root)?;
         validate_registry_root(&root)?;
         let key = &manifest.reservation.resource_id;
         let namespace = match child_directory(
@@ -305,6 +314,67 @@ fn open_absolute_directory(path: &Path) -> Result<File, MachineRuntimeRegistryEr
         }
     }
     Ok(directory)
+}
+
+fn open_trusted_registry_root(path: &Path) -> Result<File, MachineRuntimeRegistryError> {
+    if !path.is_absolute() {
+        return Err(MachineRuntimeRegistryError::Invalid(
+            "runtime path must be absolute".into(),
+        ));
+    }
+    let expected_uid = rustix::process::geteuid().as_raw();
+    let mut directory = File::from(rustix::fs::open("/", DIRECTORY_FLAGS, Mode::empty())?);
+    validate_trusted_ancestry_component(&directory, expected_uid)?;
+    for component in path.components() {
+        match component {
+            Component::RootDir => {}
+            Component::Normal(name) => {
+                let child = File::from(openat(&directory, name, DIRECTORY_FLAGS, Mode::empty())?);
+                validate_trusted_ancestry_edge(&directory, &child, expected_uid)?;
+                directory = child;
+            }
+            _ => {
+                return Err(MachineRuntimeRegistryError::Invalid(
+                    "runtime path must not contain parent traversal".into(),
+                ));
+            }
+        }
+    }
+    Ok(directory)
+}
+
+fn validate_trusted_ancestry_component(
+    directory: &File,
+    expected_uid: u32,
+) -> Result<(), MachineRuntimeRegistryError> {
+    let metadata = fstat(directory)?;
+    if !FileType::from_raw_mode(metadata.st_mode).is_dir()
+        || (metadata.st_uid != 0 && metadata.st_uid != expected_uid)
+    {
+        return Err(MachineRuntimeRegistryError::Conflict(
+            "runtime root ancestry must contain only root- or effective-user-owned directories"
+                .into(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trusted_ancestry_edge(
+    parent: &File,
+    child: &File,
+    expected_uid: u32,
+) -> Result<(), MachineRuntimeRegistryError> {
+    validate_trusted_ancestry_component(parent, expected_uid)?;
+    validate_trusted_ancestry_component(child, expected_uid)?;
+    let parent_metadata = fstat(parent)?;
+    let parent_mode = Mode::from_raw_mode(parent_metadata.st_mode);
+    if parent_mode.intersects(Mode::WGRP | Mode::WOTH) && !parent_mode.contains(Mode::SVTX) {
+        return Err(MachineRuntimeRegistryError::Conflict(
+            "runtime root ancestry must not contain a non-sticky group/world-writable directory"
+                .into(),
+        ));
+    }
+    Ok(())
 }
 
 fn child_directory(
@@ -948,6 +1018,72 @@ mod tests {
         assert_conflict(result);
         assert_eq!(constructor_calls.load(Ordering::SeqCst), 0);
         assert!(!root.join("topology-machines").exists());
+    }
+
+    #[test]
+    fn writable_non_sticky_ancestor_is_rejected_without_effects() {
+        let temp = TempDir::new().expect("temporary directory");
+        let canonical_temp = fs::canonicalize(temp.path()).expect("canonical temporary directory");
+        let writable_ancestor = canonical_temp.join("untrusted-writable-ancestor");
+        fs::create_dir(&writable_ancestor).expect("create writable ancestor");
+        fs::set_permissions(&writable_ancestor, fs::Permissions::from_mode(0o777))
+            .expect("make ancestor group/world writable without sticky bit");
+        let root = writable_ancestor.join("runtime-root");
+        fs::create_dir(&root).expect("create strict runtime root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make runtime root private");
+
+        let registry = MachineRuntimeRegistry::<usize>::new(root.clone())
+            .expect("constructor remains filesystem-read-free");
+        let constructor_calls = AtomicUsize::new(0);
+        let result = registry.admit(
+            &owner(),
+            &reservation(),
+            DIGEST_A,
+            MachineRuntimeAdmission::CreateOrOpen,
+            |_| {
+                constructor_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(1)
+            },
+        );
+
+        assert_conflict(result);
+        assert_eq!(constructor_calls.load(Ordering::SeqCst), 0);
+        assert!(!root.join("topology-machines").exists());
+    }
+
+    #[test]
+    fn canonical_temporary_root_below_trusted_sticky_ancestor_is_accepted() {
+        let temp = TempDir::new().expect("temporary directory");
+        let canonical_temp = fs::canonicalize(temp.path()).expect("canonical temporary directory");
+        let sticky_ancestor = canonical_temp.join("trusted-sticky-ancestor");
+        fs::create_dir(&sticky_ancestor).expect("create sticky ancestor");
+        fs::set_permissions(&sticky_ancestor, fs::Permissions::from_mode(0o1777))
+            .expect("make trusted ancestor sticky and writable");
+        let root = sticky_ancestor.join("runtime-root");
+        fs::create_dir(&root).expect("create runtime root");
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700))
+            .expect("make runtime root private");
+
+        let registry = MachineRuntimeRegistry::<usize>::new(root.clone())
+            .expect("constructor remains filesystem-read-free");
+        let constructor_calls = AtomicUsize::new(0);
+        let entry = registry
+            .admit(
+                &owner(),
+                &reservation(),
+                DIGEST_A,
+                MachineRuntimeAdmission::CreateOrOpen,
+                |_| {
+                    constructor_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(1)
+                },
+            )
+            .expect("trusted sticky ancestry must admit the exact runtime root");
+
+        assert_eq!(constructor_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*entry.runtime(), 1);
+        assert!(store_path(&root).is_dir());
     }
 
     #[test]

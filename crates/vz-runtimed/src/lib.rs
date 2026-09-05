@@ -8,6 +8,8 @@ mod grpc;
 pub mod machine_runtime_activation;
 #[cfg(unix)]
 pub mod machine_runtime_registry;
+#[cfg(target_os = "macos")]
+pub mod machine_target_resolver;
 mod placement_scheduler;
 #[cfg(any(test, feature = "test-backend"))]
 mod test_backend;
@@ -140,6 +142,8 @@ pub struct DaemonHealth {
 pub struct RuntimeDaemon {
     config: RuntimedConfig,
     manager: WorkspaceRuntimeManager<PlatformBackend>,
+    #[cfg(target_os = "macos")]
+    machine_target_resolver: machine_target_resolver::MachineTargetResolver,
     #[cfg(unix)]
     machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend>,
     state_store: Mutex<StateStore>,
@@ -167,6 +171,24 @@ impl RuntimeDaemon {
         )
     }
 
+    /// Start with one explicit Machine artifact catalog.
+    ///
+    /// The catalog is validated before daemon filesystem initialization. An
+    /// empty catalog is valid and never triggers ambient artifact discovery.
+    #[cfg(target_os = "macos")]
+    pub fn start_with_machine_target_catalog(
+        config: RuntimedConfig,
+        machine_target_catalog: machine_target_resolver::MachineTargetCatalog,
+    ) -> Result<Self, RuntimedError> {
+        Self::start_with_policy_hook_catalog_and_retention(
+            config,
+            Arc::new(AllowAllPolicyHook),
+            None,
+            machine_target_catalog,
+            vz_stack::CheckpointRetentionPolicy::default(),
+        )
+    }
+
     /// Start the daemon with an explicit checkpoint retention policy.
     pub fn start_with_checkpoint_retention_policy(
         config: RuntimedConfig,
@@ -176,6 +198,22 @@ impl RuntimeDaemon {
             config,
             Arc::new(AllowAllPolicyHook),
             None,
+            checkpoint_retention_policy,
+        )
+    }
+
+    /// Start with an explicit Machine artifact catalog and checkpoint policy.
+    #[cfg(target_os = "macos")]
+    pub fn start_with_machine_target_catalog_and_checkpoint_retention_policy(
+        config: RuntimedConfig,
+        machine_target_catalog: machine_target_resolver::MachineTargetCatalog,
+        checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
+    ) -> Result<Self, RuntimedError> {
+        Self::start_with_policy_hook_catalog_and_retention(
+            config,
+            Arc::new(AllowAllPolicyHook),
+            None,
+            machine_target_catalog,
             checkpoint_retention_policy,
         )
     }
@@ -200,6 +238,30 @@ impl RuntimeDaemon {
         policy_hash: Option<String>,
         checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
     ) -> Result<Self, RuntimedError> {
+        Self::start_with_policy_hook_catalog_and_retention(
+            config,
+            policy_hook,
+            policy_hash,
+            #[cfg(target_os = "macos")]
+            machine_target_resolver::MachineTargetCatalog::default(),
+            checkpoint_retention_policy,
+        )
+    }
+
+    fn start_with_policy_hook_catalog_and_retention(
+        config: RuntimedConfig,
+        policy_hook: Arc<dyn RuntimePolicyHook>,
+        policy_hash: Option<String>,
+        #[cfg(target_os = "macos")]
+        machine_target_catalog: machine_target_resolver::MachineTargetCatalog,
+        checkpoint_retention_policy: vz_stack::CheckpointRetentionPolicy,
+    ) -> Result<Self, RuntimedError> {
+        #[cfg(target_os = "macos")]
+        let machine_target_resolver = machine_target_resolver::MachineTargetResolver::new(
+            current_macos_host_spec()?,
+            machine_target_catalog,
+        )
+        .map_err(|source| RuntimedError::InitializeMachineTargetResolver { source })?;
         ensure_parent_dir(&config.state_store_path).map_err(|source| {
             RuntimedError::CreateStateStoreDir {
                 path: config.state_store_path.clone(),
@@ -369,6 +431,8 @@ impl RuntimeDaemon {
         Ok(Self {
             config,
             manager,
+            #[cfg(target_os = "macos")]
+            machine_target_resolver,
             #[cfg(unix)]
             machine_runtime_registry,
             state_store: Mutex::new(state_store),
@@ -502,6 +566,15 @@ impl RuntimeDaemon {
         &self,
     ) -> &machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend> {
         &self.machine_runtime_registry
+    }
+
+    /// Borrow the explicit, read-only Machine target resolver.
+    ///
+    /// This is selection infrastructure for a future topology controller; it
+    /// does not reserve resources or authorize lifecycle effects.
+    #[cfg(target_os = "macos")]
+    pub fn machine_target_resolver(&self) -> &machine_target_resolver::MachineTargetResolver {
+        &self.machine_target_resolver
     }
 
     pub(crate) fn enforce_policy_preflight(
@@ -762,6 +835,23 @@ fn load_legacy_checkpoint_migration_mode_enabled() -> Result<bool, RuntimedError
             value: value.to_string_lossy().to_string(),
         }),
     }
+}
+
+#[cfg(target_os = "macos")]
+fn current_macos_host_spec() -> Result<vz_runtime_contract::HostSpec, RuntimedError> {
+    let arch = match std::env::consts::ARCH {
+        "aarch64" => vz_runtime_contract::Architecture::Aarch64,
+        "x86_64" => vz_runtime_contract::Architecture::X86_64,
+        architecture => {
+            return Err(RuntimedError::UnsupportedMachineTargetHostArchitecture {
+                architecture: architecture.to_string(),
+            });
+        }
+    };
+    Ok(vz_runtime_contract::HostSpec {
+        os: vz_runtime_contract::OperatingSystem::Macos,
+        arch,
+    })
 }
 
 #[cfg(any(test, feature = "test-backend"))]
@@ -1178,6 +1268,15 @@ impl Drop for StartupLock {
 /// Daemon startup failures.
 #[derive(Debug, Error)]
 pub enum RuntimedError {
+    #[cfg(target_os = "macos")]
+    #[error("failed to initialize Machine target resolver: {source}")]
+    InitializeMachineTargetResolver {
+        #[source]
+        source: machine_target_resolver::TargetResolutionError,
+    },
+    #[cfg(target_os = "macos")]
+    #[error("unsupported macOS host architecture for Machine targets: {architecture}")]
+    UnsupportedMachineTargetHostArchitecture { architecture: String },
     #[cfg(unix)]
     #[error("failed to initialize private Machine runtime registry at {path}: {source}")]
     InitializeMachineRuntimeRegistry {
@@ -1311,6 +1410,12 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    #[cfg(target_os = "macos")]
+    use vz_runtime_contract::{
+        Architecture, CapabilitySet, EnvironmentSpec, MachineCapability, MachineResources,
+        MachineSpec, OperatingSystem, ProjectDefinition, ProjectId, TOPOLOGY_SCHEMA_VERSION,
+        TargetSpec,
+    };
     use vz_runtime_contract::{
         Build, BuildSpec, BuildState, Container, ContainerSpec, ContainerState, Execution,
         ExecutionSpec, ExecutionState, MachineProfile, Sandbox, SandboxBackend, SandboxSpec,
@@ -1389,6 +1494,105 @@ mod tests {
             runtime_data_dir: root.join("runtime"),
             socket_path: root.join("runtime").join("runtimed.sock"),
         }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn machine_target_definition(digest: &str) -> ProjectDefinition {
+        ProjectDefinition {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            project_id: ProjectId::new("prj_startup_catalog").expect("valid Project ID"),
+            name: "startup-catalog".to_string(),
+            environment: EnvironmentSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                machines: vec![MachineSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "linux".to_string(),
+                    profile: MachineProfile::Developer,
+                    target: TargetSpec {
+                        os: OperatingSystem::Linux,
+                        arch: Architecture::Aarch64,
+                        image: machine_target_resolver::LINUX_APPLIANCE_IMAGE.to_string(),
+                        version: Some("test-release".to_string()),
+                        channel: None,
+                        digest: Some(digest.to_string()),
+                    },
+                    resources: MachineResources::default(),
+                    requested_capabilities: CapabilitySet::new([MachineCapability::PosixExec]),
+                    workspace: None,
+                }],
+                networks: Vec::new(),
+                endpoints: Vec::new(),
+            },
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn invalid_machine_target_catalog_fails_before_startup_filesystem_effects() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let root = temp.path().join("not-created");
+        let config = startup_validation_config(&root);
+        let catalog = machine_target_resolver::MachineTargetCatalog {
+            schema_version: 0,
+            linux: Vec::new(),
+        };
+
+        let result = RuntimeDaemon::start_with_machine_target_catalog(config, catalog);
+        assert!(matches!(
+            result,
+            Err(RuntimedError::InitializeMachineTargetResolver { .. })
+        ));
+        assert!(!root.exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn default_machine_target_catalog_does_not_discover_ambient_artifacts() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let daemon = RuntimeDaemon::start(startup_validation_config(temp.path()))
+            .expect("daemon with explicit empty catalog");
+        let definition = machine_target_definition(&format!("sha256:{}", "a".repeat(64)));
+
+        let result = daemon
+            .machine_target_resolver()
+            .resolve_project(&definition)
+            .await;
+        assert!(matches!(
+            result,
+            Err(machine_target_resolver::TargetResolutionError::TargetNotFound { .. })
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn explicit_machine_target_catalog_is_retained_by_daemon() {
+        let temp = tempfile::tempdir().expect("temporary directory");
+        let digest = format!("sha256:{}", "b".repeat(64));
+        let catalog = machine_target_resolver::MachineTargetCatalog {
+            schema_version: machine_target_resolver::MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
+            linux: vec![machine_target_resolver::LinuxTargetCatalogEntry {
+                image: machine_target_resolver::LINUX_APPLIANCE_IMAGE.to_string(),
+                version: "test-release".to_string(),
+                profile: MachineProfile::Developer,
+                bundle_dir: temp.path().join("intentionally-missing-bundle"),
+                digest: digest.clone(),
+                channels: Default::default(),
+            }],
+        };
+        let daemon = RuntimeDaemon::start_with_machine_target_catalog(
+            startup_validation_config(temp.path()),
+            catalog,
+        )
+        .expect("daemon with explicit valid catalog");
+
+        let result = daemon
+            .machine_target_resolver()
+            .resolve_project(&machine_target_definition(&digest))
+            .await;
+        assert!(matches!(
+            result,
+            Err(machine_target_resolver::TargetResolutionError::ArtifactVerification { .. })
+        ));
     }
 
     fn assert_recovery_side_effects_absent(

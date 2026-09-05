@@ -49,15 +49,15 @@ record is interchangeable with the logical `Machine` ownership edge.
    not effect authorization: the controller must independently fence its
    lifecycle operation and generation.
 
-The backend still consumes filesystem paths. Its configured ancestry must be
-trusted and non-replaceable by other host users. The current registry checks
-each component for symlinks, but only validates ownership/mode on the configured
-root and private descendants; it does not yet enforce trusted ancestor ownership
-and rename permissions. A foreign-user-owned or non-sticky group/world-writable
-ancestor therefore remains an unsafe configuration even when the final root is
-private. Production admission must reject it before this infrastructure is wired
-to Up (tracked by `vz-mzs.2.5.8.1`). The local-Mac fixture uses canonical, trusted
-temporary-directory ancestry.
+The backend still consumes filesystem paths. The registry now checks every
+ancestor without following symlinks: ancestors must be root- or daemon-owned and
+not group/world writable, except for trusted sticky directories with trusted
+children. Unsafe ancestry fails before namespace creation or backend construction.
+The final root retains its stricter ownership and permission checks. This is a
+POSIX ownership/mode boundary, not an ACL auditor: operators must ensure ACLs or
+equivalent grants do not permit another user to replace the hierarchy. The
+local-Mac fixture uses canonical, trusted temporary-directory ancestry. Tracking
+and aggregate verification remain under `vz-mzs.2.5.8.1`.
 
 Even with trusted ancestry, path-based backend I/O is not safe against a hostile
 process with the daemon's own host UID. Such a process must not concurrently
@@ -111,15 +111,57 @@ activation evidence retains the normal capability and incarnation checks.
 The physical lane preserves separate, checksummed serial logs for both boot
 generations rather than overwriting the first boot's diagnostics.
 
+## Explicit target resolution (DEV)
+
+`MachineTargetResolver::resolve_project` consumes every Machine's host/target,
+profile, image, version, channel, digest and requested resources before returning
+an artifact plan. All sibling selections must succeed before artifact reads;
+all artifact verification must succeed before a caller may reserve state. This
+read-only API has no StateStore, installer, cache discovery or boot callback.
+
+The macOS daemon accepts an explicit absolute `--machine-target-catalog` JSON
+file, validated before tracing, runtime directories, database or socket creation.
+Omission means an empty catalog, not discovery from environment variables or a
+workspace. Schema version 1 contains a `linux` list whose entries declare
+`image`, `version`, `profile`, `bundle_dir`, `digest`, and optional `channels`.
+The only currently implemented image is `vz-linux-appliance`, on Apple-silicon
+macOS with Linux/aarch64 targets. It is not Ubuntu or another requested distro.
+Native macOS returns a typed unimplemented-backend error; future host/target
+pairs are unsupported rather than mapped to this Linux adapter.
+
+Every target requires a canonical pinned SHA-256 bundle digest. A supplied
+version or channel must match an explicit catalog entry; omitted selectors are
+accepted only when the remaining exact selection is unambiguous. Developer and
+Hardened select the actual `developer` and `container` bundles respectively.
+The read-only verifier requires exact profile, security profile, agent version,
+protocol revision, required kernel capabilities and all artifact checksums. Its
+aggregate identity binds kernel, initramfs, youki and raw version metadata with
+the `vz.linux.kernel-bundle.v1` domain. The path-independent Machine configuration
+digest additionally binds the full requested Machine specification, actual host,
+backend, release, profile, artifacts and normalized resources with the
+`vz.machine-configuration.v1` domain. Explicit Machine disk sizing is rejected
+until the backend can honor it; it is not silently ignored.
+
+Catalog paths and their ancestry are trusted operator inputs. Read-only
+verification does not pin the source bytes against subsequent replacement.
+Before production activation, the controller must materialize and retain the
+verified bytes in immutable private storage, then bind the actual installed
+bytes to the resolved identity. Rechecking mutable paths is not a substitute.
+Kernel metadata is not negotiated Docker/Compose/buildx capability evidence,
+and artifact resolution is not authorization for workspace or network effects.
+
 ## Still required before production Up
 
-The shared-VM boot path does not resolve `TargetSpec.image`, `version`, `channel`
-or `digest`. A kernel bundle is not automatically the requested Machine image:
-booting the bundled initramfs must not be reported as booting an Ubuntu target,
-for example. Production integration needs a resolved Machine artifact/rootfs
-mapping that consumes every declared target field, verifies the selected bytes,
-and rejects unsupported selections before effects. No ambient bundle or profile
-fallback may fill this gap.
+Wire the explicit resolver into a production Environment controller with the
+immutable artifact boundary above. The legacy shared-VM path remains separate;
+its ambient artifact selection must never be used as a topology fallback.
+The pinning/recovery implementation is tracked by `vz-mzs.2.5.8.2`: acquire
+runtime-free owner store leases, pin every sibling, then attach runtimes.
+`Runtime::new` itself performs reconciliation and cleanup, so it is not a pure
+constructor that can safely precede this preflight. Recovery after lifecycle
+begin must validate persisted pins without requiring the original catalog.
+The per-Environment controller lock must cover admission as well as lifecycle
+execution; a generation check without that serialization is insufficient.
 
 The supervisor also needs a proven durable admission phase for a crash between
 the ownership reservation and first directory publication. This may use a phase
@@ -154,5 +196,34 @@ backend regression passed at
 crash/reopen, StateStore crash atomicity, daemon teardown/recovery, the three-Machine
 registry lane, stack and BuildKit. The registry evidence and all six serial logs
 were validated again in that run. This certifies the scoped backend regression,
-not the missing production target resolver, host Docker clients, native macOS
-adapter, five-verb CLI or aggregate 0.4 release gate.
+not production resolver/controller integration, host Docker clients, native
+macOS adapter, five-verb CLI or aggregate 0.4 release gate.
+
+The resolver-backed signed release lane passed at
+`.artifacts/sandbox-vm-e2e/20260905T041000Z/summary.txt`. It resolves all three
+Machines before opening StateStore, refuses four invalid sibling selectors
+without state creation, and binds the actual resolver's configuration and
+artifact digests to the installed private artifacts and two boot generations.
+The independent validator recomputes both domain-separated digests and validates
+all six raw serial logs. This run also exercises the trusted-ancestry admission
+checks with real local Machines. A preceding compiler-cache wrapper failure
+occurred before test execution; the successful run disabled that wrapper.
+
+The installed-daemon catalog rejection check passed at
+`.artifacts/machine-target-catalog/20260905T041411Z/installed-invalid-catalog.log`,
+against the exact signed release daemon staged by that physical run. Invalid
+schema, relative path, final symlink and writable-by-others catalog cases all
+returned failure without creating database, runtime, socket, log, PID or lock
+paths, and preserved catalog bytes and inode metadata. The raw rejection
+diagnostics and executable digest are retained. This is startup rejection
+evidence, not a production lifecycle command or aggregate release certification.
+
+The subsequent full release backend regression passed at
+`.artifacts/sandbox-vm-e2e/20260905T041159Z/summary.txt`: runtime 19, runtime
+crash/reopen, StateStore crash atomicity, daemon teardown/recovery, registry,
+stack 24 and BuildKit 3. The independent registry audit additionally matched
+current source bundle bytes to first/reopened installed artifacts and verified
+all six raw logs. Unit verification passed for Linux 76, daemon 195 with one
+existing ignored test, and the expanded resolver suite 9; Python evidence tests
+6, strict affected-target Clippy and workspace formatting passed. These scoped
+results do not satisfy the missing five-verb or aggregate 0.4 release gates.

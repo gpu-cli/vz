@@ -30,9 +30,22 @@ def sha(value):
     require(type(value) is str and re.fullmatch(r"[0-9a-f]{64}", value), "invalid SHA-256")
 
 
-def digest(value):
+def configuration_digest(value):
     encoded = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
-    return "sha256:" + hashlib.sha256(encoded).hexdigest()
+    value = hashlib.sha256(b"vz.machine-configuration.v1\0" + encoded).hexdigest()
+    return "sha256:" + value
+
+
+def bundle_digest(value):
+    hasher = hashlib.sha256(b"vz.linux.kernel-bundle.v1\0")
+    for name, key in [("kernel", "kernel_sha256"), ("initramfs", "initramfs_sha256"),
+                      ("youki", "youki_sha256"), ("version", "version_sha256")]:
+        sha(value[key])
+        hasher.update(name.encode())
+        hasher.update(b"\0")
+        hasher.update(value[key].encode())
+        hasher.update(b"\0")
+    return "sha256:" + hasher.hexdigest()
 
 
 def path(value):
@@ -63,7 +76,7 @@ def validate_file_identity(value, mode, single_link=False):
 
 
 def validate(value, expected):
-    keys(value, ["schema_version", "scope", "build", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
+    keys(value, ["schema_version", "scope", "build", "target_resolution", "topology", "machines", "storage", "lease", "claims", "serial_logs"])
     require(type(value["schema_version"]) is int and value["schema_version"] == 1, "schema version")
     require(value["scope"] == "registry_and_boot_lease_infrastructure_only", "scope overclaim")
     require(expected["profile"] == "release", "physical registry gate requires release")
@@ -74,6 +87,10 @@ def validate(value, expected):
         if key.endswith("sha256"):
             sha(number)
     require(build["docker_probe_go_version"].startswith("go version go"), "missing Go provenance")
+
+    target_resolution = value["target_resolution"]
+    keys(target_resolution, ["all_machines_resolved_before_state", "invalid_sibling_rejected_without_state"])
+    require(all(flag is True for flag in target_resolution.values()), "target resolution did not fail closed before state")
 
     topology = value["topology"]
     read_flags = ["creating_owned_read_only", "failed_up_owned_read_only", "stopped_owned_read_only",
@@ -118,18 +135,45 @@ def validate(value, expected):
         expected_initramfs = build["developer_initramfs_sha256" if index < 2 else "container_initramfs_sha256"]
         require(artifact["initramfs_sha256"] == expected_initramfs, "wrong boot artifact")
         resolved = machine["resolved_configuration"]
-        keys(resolved, ["backend", "target", "profile", "resources", "artifact", "network", "oci_runtime"])
-        artifact_identity = {field: artifact[field] for field in artifact_fields}
-        require(resolved["backend"] == "macos-vz" and resolved["profile"] == profile and resolved["oci_runtime"] == "youki",
-                "wrong resolved backend/profile/runtime")
-        require(resolved["network"] is True and resolved["artifact"] == artifact_identity, "resolved artifact mismatch")
-        require(resolved["resources"] == {"cpus": 2, "memory_mb": 4096 if index < 2 else 1024}, "unproven boot resource selection")
-        target = resolved["target"]
+        keys(resolved, ["schema_version", "host", "backend", "machine", "release_version",
+                        "kernel_profile", "artifact", "resources"])
+        require(type(resolved["schema_version"]) is int and resolved["schema_version"] == 1,
+                "resolved configuration schema")
+        require(resolved["host"] == {"os": "macos", "arch": "aarch64"}
+                and resolved["backend"] == "macos_virtualization_linux",
+                "wrong resolved host/backend")
+        expected_name = name.replace("_", "-")
+        requested = resolved["machine"]
+        keys(requested, ["schema_version", "name", "profile", "target", "resources", "requested_capabilities"])
+        requested_profile = "developer" if index < 2 else "hardened"
+        require(type(requested["schema_version"]) is int and requested["schema_version"] == 1,
+                "Machine request schema")
+        require(requested["name"] == expected_name and requested["profile"] == requested_profile,
+                "wrong resolved Machine name/profile")
+        require(requested["requested_capabilities"] == {"capabilities": ["posix_exec"]},
+                "unproven requested capabilities")
+        expected_resources = {"cpus": 2, "memory_mb": 4096 if index < 2 else 1024}
+        require(requested["resources"] == expected_resources and resolved["resources"] == expected_resources,
+                "unproven boot resource selection")
+        require(resolved["release_version"] == "0.4.0-registry-e2e"
+                and resolved["kernel_profile"] == profile,
+                "wrong resolved release/kernel profile")
+        resolved_artifact = resolved["artifact"]
+        keys(resolved_artifact, artifact_fields[1:] + ["digest"])
+        artifact_identity = {field: artifact[field] for field in artifact_fields[1:]}
+        require(all(resolved_artifact[field] == artifact_identity[field] for field in artifact_identity),
+                "resolved artifact bytes mismatch")
+        expected_bundle_digest = bundle_digest(artifact_identity)
+        require(resolved_artifact["digest"] == expected_bundle_digest,
+                "resolved aggregate artifact digest mismatch")
+        target = requested["target"]
         keys(target, ["os", "arch", "image", "version", "channel", "digest"])
-        require(target == {"os": "linux", "arch": "aarch64", "image": "local-vz-" + name.replace("_", "-"),
-                           "version": "0.4.0-registry-e2e", "channel": "local-physical-e2e", "digest": digest(artifact_identity)},
+        require(target == {"os": "linux", "arch": "aarch64", "image": "vz-linux-appliance",
+                           "version": "0.4.0-registry-e2e", "channel": "local-physical-e2e",
+                           "digest": expected_bundle_digest},
                 "target fixture does not match selected artifact")
-        require(machine["configuration_digest"] == digest(resolved), "configuration digest mismatch")
+        require(machine["configuration_digest"] == configuration_digest(resolved),
+                "configuration digest mismatch")
         for phase in ["first_identity", "reopened_identity"]:
             identity = machine[phase]
             keys(identity, ["schema_version", "stack_id", "incarnation_id"])

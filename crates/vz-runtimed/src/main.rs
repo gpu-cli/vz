@@ -30,6 +30,11 @@ struct Cli {
     #[arg(long, default_value = ".vz-runtime/runtimed.sock")]
     socket_path: PathBuf,
 
+    /// Absolute path to the explicit Machine target artifact catalog.
+    #[cfg(target_os = "macos")]
+    #[arg(long, value_name = "ABSOLUTE_FILE")]
+    machine_target_catalog: Option<PathBuf>,
+
     /// Maximum retained untagged checkpoints in daemon GC loop.
     #[arg(long, default_value_t = 128)]
     checkpoint_retention_max_untagged_count: usize,
@@ -43,24 +48,41 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    #[cfg(target_os = "macos")]
+    let machine_target_catalog = match cli.machine_target_catalog.as_deref() {
+        Some(path) => vz_runtimed::machine_target_resolver::MachineTargetCatalog::from_file(path)
+            .with_context(|| {
+            format!(
+                "failed to load explicit Machine target catalog {}",
+                path.display()
+            )
+        })?,
+        None => vz_runtimed::machine_target_resolver::MachineTargetCatalog::default(),
+    };
+
     // Write logs to a file next to the socket for `vz logs` support.
     let log_file_path = cli.socket_path.with_extension("log");
     init_tracing(Some(&log_file_path));
 
-    let daemon = Arc::new(
-        RuntimeDaemon::start_with_checkpoint_retention_policy(
-            RuntimedConfig {
-                state_store_path: cli.state_store_path,
-                runtime_data_dir: cli.runtime_data_dir,
-                socket_path: cli.socket_path,
-            },
-            CheckpointRetentionPolicy {
-                max_untagged_count: cli.checkpoint_retention_max_untagged_count,
-                max_age_secs: cli.checkpoint_retention_max_age_secs,
-            },
-        )
-        .context("failed to start runtime daemon")?,
+    let config = RuntimedConfig {
+        state_store_path: cli.state_store_path,
+        runtime_data_dir: cli.runtime_data_dir,
+        socket_path: cli.socket_path,
+    };
+    let checkpoint_retention_policy = CheckpointRetentionPolicy {
+        max_untagged_count: cli.checkpoint_retention_max_untagged_count,
+        max_age_secs: cli.checkpoint_retention_max_age_secs,
+    };
+    #[cfg(target_os = "macos")]
+    let daemon = RuntimeDaemon::start_with_machine_target_catalog_and_checkpoint_retention_policy(
+        config,
+        machine_target_catalog,
+        checkpoint_retention_policy,
     );
+    #[cfg(not(target_os = "macos"))]
+    let daemon =
+        RuntimeDaemon::start_with_checkpoint_retention_policy(config, checkpoint_retention_policy);
+    let daemon = Arc::new(daemon.context("failed to start runtime daemon")?);
 
     let health = daemon.health();
     info!(

@@ -12,6 +12,9 @@ const KERNEL_FILE: &str = "vmlinux";
 const INITRAMFS_FILE: &str = "initramfs.img";
 const YOUKI_FILE: &str = "youki";
 const VERSION_FILE: &str = "version.json";
+const MAX_VERSION_METADATA_BYTES: u64 = 64 * 1024;
+const MAX_VERSION_VALUE_BYTES: usize = 256;
+const VERIFIED_BUNDLE_DIGEST_DOMAIN: &[u8] = b"vz.linux.kernel-bundle.v1\0";
 
 /// Installed kernel artifact paths and metadata.
 #[derive(Debug, Clone)]
@@ -231,6 +234,38 @@ pub struct KernelBundle {
     pub capabilities: BTreeSet<KernelCapability>,
 }
 
+/// Content identity for a read-only verified Linux appliance bundle.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KernelBundleArtifactIdentity {
+    /// SHA256 of the Linux kernel image.
+    pub kernel_sha256: String,
+    /// SHA256 of the initramfs image.
+    pub initramfs_sha256: String,
+    /// SHA256 of the pinned `youki` executable.
+    pub youki_sha256: String,
+    /// SHA256 of the exact, unparsed `version.json` bytes.
+    pub version_sha256: String,
+    /// Versioned, domain-separated aggregate digest of all four hashes.
+    ///
+    /// This is SHA256 over `vz.linux.kernel-bundle.v1\0`, followed in order by
+    /// `kernel`, `initramfs`, `youki`, and `version`; each field is framed as
+    /// its ASCII name, NUL, its 64-byte lowercase hexadecimal hash, then NUL.
+    pub digest: String,
+}
+
+/// Explicit, verified Linux appliance bundle selected without installation or discovery.
+#[derive(Debug, Clone)]
+pub struct VerifiedKernelBundle {
+    /// Caller-supplied bundle directory. It is deliberately not canonicalized.
+    pub bundle_dir: PathBuf,
+    /// Exact artifact paths and parsed metadata from the supplied directory.
+    pub paths: KernelPaths,
+    /// Explicit capability declarations validated for the selected profile.
+    pub capabilities: BTreeSet<KernelCapability>,
+    /// Artifact-level and aggregate content identity.
+    pub artifact_identity: KernelBundleArtifactIdentity,
+}
+
 /// Options for resolving kernel artifacts.
 #[derive(Debug, Clone)]
 pub struct EnsureKernelOptions {
@@ -373,6 +408,86 @@ pub async fn ensure_kernel_bundle(
     })
 }
 
+/// Verify one explicitly selected Linux appliance bundle without writing to disk.
+///
+/// This function performs no environment lookup, workspace fallback, cache install,
+/// or filesystem mutation. The supplied directory must be from a trusted read-only
+/// catalog: metadata checks and symlink rejection do not make a same-UID, mutable
+/// directory immune to races after this function returns.
+pub async fn verify_kernel_bundle_read_only(
+    bundle_dir: &Path,
+    profile: KernelProfile,
+) -> Result<VerifiedKernelBundle, LinuxError> {
+    require_directory_without_symlink(bundle_dir).await?;
+
+    let kernel = bundle_dir.join(KERNEL_FILE);
+    let initramfs = bundle_dir.join(INITRAMFS_FILE);
+    let youki = bundle_dir.join(YOUKI_FILE);
+    let version_path = bundle_dir.join(VERSION_FILE);
+    for (artifact, path) in [
+        (KERNEL_FILE, kernel.as_path()),
+        (INITRAMFS_FILE, initramfs.as_path()),
+        (YOUKI_FILE, youki.as_path()),
+        (VERSION_FILE, version_path.as_path()),
+    ] {
+        require_regular_file_without_symlink(bundle_dir, artifact, path).await?;
+    }
+
+    let raw_version = read_bounded_version_metadata(&version_path).await?;
+    let version: KernelVersion = serde_json::from_slice(&raw_version)?;
+    validate_verified_version_metadata(&version, profile)?;
+    let capabilities = version.capabilities.clone().ok_or_else(|| {
+        LinuxError::InvalidConfig(format!(
+            "{VERSION_FILE} must explicitly declare capabilities for profile `{}`",
+            profile.as_str()
+        ))
+    })?;
+    validate_required_capabilities(&capabilities, &profile.default_capabilities())?;
+
+    let expected_kernel =
+        require_canonical_checksum(KERNEL_FILE, version.sha256_vmlinux.as_deref())?;
+    let expected_initramfs =
+        require_canonical_checksum(INITRAMFS_FILE, version.sha256_initramfs.as_deref())?;
+    let expected_youki = require_canonical_checksum(YOUKI_FILE, version.sha256_youki.as_deref())?;
+
+    let kernel_sha256 = sha256_file(&kernel).await?;
+    require_matching_checksum(KERNEL_FILE, &kernel, expected_kernel, &kernel_sha256)?;
+    let initramfs_sha256 = sha256_file(&initramfs).await?;
+    require_matching_checksum(
+        INITRAMFS_FILE,
+        &initramfs,
+        expected_initramfs,
+        &initramfs_sha256,
+    )?;
+    let youki_sha256 = sha256_file(&youki).await?;
+    require_matching_checksum(YOUKI_FILE, &youki, expected_youki, &youki_sha256)?;
+    let version_sha256 = sha256_bytes(&raw_version);
+    let digest = verified_bundle_digest(
+        &kernel_sha256,
+        &initramfs_sha256,
+        &youki_sha256,
+        &version_sha256,
+    );
+
+    Ok(VerifiedKernelBundle {
+        bundle_dir: bundle_dir.to_path_buf(),
+        paths: KernelPaths {
+            kernel,
+            initramfs,
+            youki,
+            version,
+        },
+        capabilities,
+        artifact_identity: KernelBundleArtifactIdentity {
+            kernel_sha256,
+            initramfs_sha256,
+            youki_sha256,
+            version_sha256,
+            digest,
+        },
+    })
+}
+
 /// Ensure Linux kernel artifacts are installed and compatible.
 ///
 /// Resolution order:
@@ -473,6 +588,171 @@ async fn ensure_kernel_with_resolved_options(
     }
 
     Err(LinuxError::MissingKernelArtifacts { dir: install_dir })
+}
+
+async fn require_directory_without_symlink(dir: &Path) -> Result<(), LinuxError> {
+    let metadata = match tokio::fs::symlink_metadata(dir).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LinuxError::MissingKernelArtifacts {
+                dir: dir.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(LinuxError::InvalidConfig(format!(
+            "explicit kernel bundle directory must be a non-symlink directory: {}",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn require_regular_file_without_symlink(
+    bundle_dir: &Path,
+    artifact: &str,
+    path: &Path,
+) -> Result<(), LinuxError> {
+    let metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Err(LinuxError::MissingKernelArtifacts {
+                dir: bundle_dir.to_path_buf(),
+            });
+        }
+        Err(error) => return Err(error.into()),
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_file() {
+        return Err(LinuxError::InvalidConfig(format!(
+            "kernel bundle artifact `{artifact}` must be a non-symlink regular file: {}",
+            path.display()
+        )));
+    }
+    Ok(())
+}
+
+async fn read_bounded_version_metadata(path: &Path) -> Result<Vec<u8>, LinuxError> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if metadata.len() == 0 || metadata.len() > MAX_VERSION_METADATA_BYTES {
+        return Err(LinuxError::InvalidConfig(format!(
+            "{VERSION_FILE} must contain 1..={MAX_VERSION_METADATA_BYTES} bytes"
+        )));
+    }
+    let file = tokio::fs::File::open(path).await?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(MAX_VERSION_METADATA_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .await?;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_VERSION_METADATA_BYTES {
+        return Err(LinuxError::InvalidConfig(format!(
+            "{VERSION_FILE} must contain 1..={MAX_VERSION_METADATA_BYTES} bytes"
+        )));
+    }
+    Ok(bytes)
+}
+
+fn validate_verified_version_metadata(
+    version: &KernelVersion,
+    profile: KernelProfile,
+) -> Result<(), LinuxError> {
+    validate_kernel_metadata(
+        version,
+        env!("CARGO_PKG_VERSION"),
+        vz_agent_proto::AGENT_PROTOCOL_REVISION,
+        true,
+        Some(profile),
+    )?;
+    let security_profile = version.security_profile.as_deref().unwrap_or("<missing>");
+    if security_profile != profile.security_profile() {
+        return Err(LinuxError::InvalidConfig(format!(
+            "kernel artifact security profile mismatch: expected {}, found {security_profile}",
+            profile.security_profile()
+        )));
+    }
+    for (field, value) in [
+        ("kernel", version.kernel.as_str()),
+        ("busybox", version.busybox.as_str()),
+        ("agent", version.agent.as_str()),
+        ("youki", version.youki.as_str()),
+    ] {
+        if value.trim().is_empty()
+            || value.len() > MAX_VERSION_VALUE_BYTES
+            || value.chars().any(char::is_control)
+        {
+            return Err(LinuxError::InvalidConfig(format!(
+                "kernel artifact metadata `{field}` must be nonblank, control-free, and at most {MAX_VERSION_VALUE_BYTES} bytes"
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn require_canonical_checksum<'a>(
+    artifact: &str,
+    checksum: Option<&'a str>,
+) -> Result<&'a str, LinuxError> {
+    let checksum = checksum.ok_or_else(|| {
+        LinuxError::InvalidConfig(format!(
+            "{VERSION_FILE} must declare sha256 for `{artifact}`"
+        ))
+    })?;
+    if checksum.len() != 64
+        || !checksum
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(LinuxError::InvalidConfig(format!(
+            "{VERSION_FILE} sha256 for `{artifact}` must be exactly 64 lowercase hexadecimal characters"
+        )));
+    }
+    Ok(checksum)
+}
+
+fn require_matching_checksum(
+    artifact: &str,
+    path: &Path,
+    expected: &str,
+    found: &str,
+) -> Result<(), LinuxError> {
+    if found == expected {
+        Ok(())
+    } else {
+        Err(LinuxError::ArtifactChecksumMismatch {
+            artifact: artifact.to_string(),
+            path: path.display().to_string(),
+            expected: expected.to_string(),
+            found: found.to_string(),
+        })
+    }
+}
+
+fn sha256_bytes(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
+/// Hash framing is exactly the domain bytes followed by four repetitions of
+/// `field-name`, NUL, the fixed 64-byte lowercase hash, NUL, in the order below.
+fn verified_bundle_digest(
+    kernel_sha256: &str,
+    initramfs_sha256: &str,
+    youki_sha256: &str,
+    version_sha256: &str,
+) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(VERIFIED_BUNDLE_DIGEST_DOMAIN);
+    for (field, hash) in [
+        ("kernel", kernel_sha256),
+        ("initramfs", initramfs_sha256),
+        ("youki", youki_sha256),
+        ("version", version_sha256),
+    ] {
+        hasher.update(field.as_bytes());
+        hasher.update([0]);
+        hasher.update(hash.as_bytes());
+        hasher.update([0]);
+    }
+    format!("sha256:{:x}", hasher.finalize())
 }
 
 /// Capabilities expected from the current `vz-linux` Apple VZ kernel flavor.
@@ -843,6 +1123,269 @@ mod tests {
         )
         .await
         .expect("write version");
+    }
+
+    async fn write_verified_bundle(dir: &Path, profile: KernelProfile) {
+        write_artifacts_with_checksums(dir, env!("CARGO_PKG_VERSION").to_string(), true).await;
+        write_artifact_profile(dir, profile).await;
+    }
+
+    async fn version_value(dir: &Path) -> serde_json::Value {
+        serde_json::from_slice(&tokio::fs::read(dir.join(VERSION_FILE)).await.unwrap()).unwrap()
+    }
+
+    async fn write_version_value(dir: &Path, value: &serde_json::Value) {
+        tokio::fs::write(
+            dir.join(VERSION_FILE),
+            serde_json::to_vec_pretty(value).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn directory_names(dir: &Path) -> BTreeSet<String> {
+        std::fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_accepts_both_profiles_and_is_path_independent() {
+        for profile in [KernelProfile::Developer, KernelProfile::Container] {
+            let first = tempdir().unwrap();
+            let second = tempdir().unwrap();
+            write_verified_bundle(first.path(), profile).await;
+            write_verified_bundle(second.path(), profile).await;
+            let expected_names = BTreeSet::from([
+                KERNEL_FILE.to_string(),
+                INITRAMFS_FILE.to_string(),
+                YOUKI_FILE.to_string(),
+                VERSION_FILE.to_string(),
+            ]);
+
+            let first_verified = verify_kernel_bundle_read_only(first.path(), profile)
+                .await
+                .unwrap();
+            let second_verified = verify_kernel_bundle_read_only(second.path(), profile)
+                .await
+                .unwrap();
+
+            assert_eq!(first_verified.bundle_dir, first.path());
+            assert_eq!(first_verified.paths.kernel, first.path().join(KERNEL_FILE));
+            assert_eq!(
+                first_verified.paths.version.profile.as_deref(),
+                Some(profile.as_str())
+            );
+            assert_eq!(first_verified.capabilities, profile.default_capabilities());
+            assert_eq!(
+                first_verified.artifact_identity,
+                second_verified.artifact_identity
+            );
+            assert!(
+                first_verified
+                    .artifact_identity
+                    .digest
+                    .starts_with("sha256:")
+            );
+            assert_eq!(first_verified.artifact_identity.digest.len(), 71);
+            assert_eq!(
+                serde_json::from_str::<KernelBundleArtifactIdentity>(
+                    &serde_json::to_string(&first_verified.artifact_identity).unwrap()
+                )
+                .unwrap(),
+                first_verified.artifact_identity
+            );
+            assert_eq!(directory_names(first.path()), expected_names);
+            assert_eq!(directory_names(second.path()), expected_names);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_requires_every_explicit_metadata_declaration() {
+        for field in [
+            "profile",
+            "security_profile",
+            "capabilities",
+            "sha256_vmlinux",
+            "sha256_initramfs",
+            "sha256_youki",
+            "agent",
+            "agent_protocol_revision",
+            "kernel",
+            "youki",
+        ] {
+            let bundle = tempdir().unwrap();
+            write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+            let mut version = version_value(bundle.path()).await;
+            version.as_object_mut().unwrap().remove(field);
+            write_version_value(bundle.path(), &version).await;
+
+            assert!(
+                verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer)
+                    .await
+                    .is_err(),
+                "missing `{field}` must fail closed"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_rejects_metadata_mismatch_and_missing_capabilities() {
+        let cases = [
+            ("agent", serde_json::json!("other-host-version")),
+            (
+                "agent_protocol_revision",
+                serde_json::json!(vz_agent_proto::AGENT_PROTOCOL_REVISION + 1),
+            ),
+            ("profile", serde_json::json!("container")),
+            ("security_profile", serde_json::json!("container-hardened")),
+            ("kernel", serde_json::json!("")),
+            ("youki", serde_json::json!("\n")),
+        ];
+        for (field, replacement) in cases {
+            let bundle = tempdir().unwrap();
+            write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+            let mut version = version_value(bundle.path()).await;
+            version[field] = replacement;
+            write_version_value(bundle.path(), &version).await;
+            assert!(
+                verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer)
+                    .await
+                    .is_err(),
+                "mismatched `{field}` must fail closed"
+            );
+        }
+
+        let bundle = tempdir().unwrap();
+        write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+        let mut version = version_value(bundle.path()).await;
+        version["capabilities"] = serde_json::json!(["vsock"]);
+        write_version_value(bundle.path(), &version).await;
+        assert!(matches!(
+            verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer).await,
+            Err(LinuxError::MissingKernelCapabilities { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_requires_canonical_checksums_and_detects_tampering() {
+        let bundle = tempdir().unwrap();
+        write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+        let mut version = version_value(bundle.path()).await;
+        version["sha256_vmlinux"] = serde_json::json!(
+            version["sha256_vmlinux"]
+                .as_str()
+                .unwrap()
+                .to_ascii_uppercase()
+        );
+        write_version_value(bundle.path(), &version).await;
+        assert!(matches!(
+            verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer).await,
+            Err(LinuxError::InvalidConfig(_))
+        ));
+
+        write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+        tokio::fs::write(bundle.path().join(INITRAMFS_FILE), b"tampered")
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer).await,
+            Err(LinuxError::ArtifactChecksumMismatch { ref artifact, .. })
+                if artifact == INITRAMFS_FILE
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_binds_unknown_raw_version_metadata() {
+        let bundle = tempdir().unwrap();
+        write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+        let before = verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer)
+            .await
+            .unwrap()
+            .artifact_identity;
+
+        let mut version = version_value(bundle.path()).await;
+        version["iptables"] = serde_json::json!("1.8.13");
+        write_version_value(bundle.path(), &version).await;
+        let after = verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer)
+            .await
+            .unwrap()
+            .artifact_identity;
+
+        assert_eq!(before.kernel_sha256, after.kernel_sha256);
+        assert_eq!(before.initramfs_sha256, after.initramfs_sha256);
+        assert_eq!(before.youki_sha256, after.youki_sha256);
+        assert_ne!(before.version_sha256, after.version_sha256);
+        assert_ne!(before.digest, after.digest);
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_rejects_missing_symlinked_and_nonregular_inputs() {
+        let missing = tempdir().unwrap();
+        write_verified_bundle(missing.path(), KernelProfile::Developer).await;
+        tokio::fs::remove_file(missing.path().join(YOUKI_FILE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(missing.path(), KernelProfile::Developer).await,
+            Err(LinuxError::MissingKernelArtifacts { .. })
+        ));
+
+        let symlinked_artifact = tempdir().unwrap();
+        write_verified_bundle(symlinked_artifact.path(), KernelProfile::Developer).await;
+        tokio::fs::remove_file(symlinked_artifact.path().join(YOUKI_FILE))
+            .await
+            .unwrap();
+        std::os::unix::fs::symlink(
+            symlinked_artifact.path().join(KERNEL_FILE),
+            symlinked_artifact.path().join(YOUKI_FILE),
+        )
+        .unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(symlinked_artifact.path(), KernelProfile::Developer)
+                .await,
+            Err(LinuxError::InvalidConfig(_))
+        ));
+
+        let nonregular = tempdir().unwrap();
+        write_verified_bundle(nonregular.path(), KernelProfile::Developer).await;
+        tokio::fs::remove_file(nonregular.path().join(INITRAMFS_FILE))
+            .await
+            .unwrap();
+        tokio::fs::create_dir(nonregular.path().join(INITRAMFS_FILE))
+            .await
+            .unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(nonregular.path(), KernelProfile::Developer).await,
+            Err(LinuxError::InvalidConfig(_))
+        ));
+
+        let parent = tempdir().unwrap();
+        let real = parent.path().join("real");
+        write_verified_bundle(&real, KernelProfile::Developer).await;
+        let linked = parent.path().join("linked");
+        std::os::unix::fs::symlink(&real, &linked).unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(&linked, KernelProfile::Developer).await,
+            Err(LinuxError::InvalidConfig(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_only_verifier_bounds_raw_version_metadata() {
+        let bundle = tempdir().unwrap();
+        write_verified_bundle(bundle.path(), KernelProfile::Developer).await;
+        tokio::fs::write(
+            bundle.path().join(VERSION_FILE),
+            vec![b' '; MAX_VERSION_METADATA_BYTES as usize + 1],
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            verify_kernel_bundle_read_only(bundle.path(), KernelProfile::Developer).await,
+            Err(LinuxError::InvalidConfig(_))
+        ));
     }
 
     #[tokio::test]

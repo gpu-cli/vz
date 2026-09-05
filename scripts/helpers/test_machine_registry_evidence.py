@@ -7,7 +7,15 @@ from pathlib import Path
 import tempfile
 import unittest
 
-from machine_registry_evidence import InvalidEvidence, digest, resource_name, unique_object, validate, verify_serial_files
+from machine_registry_evidence import (
+    InvalidEvidence,
+    bundle_digest,
+    configuration_digest,
+    resource_name,
+    unique_object,
+    validate,
+    verify_serial_files,
+)
 
 
 def fixture():
@@ -32,13 +40,36 @@ def fixture():
         artifact = {"profile": profile, "kernel_sha256": "6" * 64,
                     "initramfs_sha256": build["developer_initramfs_sha256" if index < 2 else "container_initramfs_sha256"],
                     "youki_sha256": "7" * 64, "version_sha256": "8" * 64}
-        resolved = {"backend": "macos-vz", "profile": profile, "artifact": artifact,
-                    "resources": {"cpus": 2, "memory_mb": 4096 if index < 2 else 1024},
-                    "network": True, "oci_runtime": "youki",
-                    "target": {"os": "linux", "arch": "aarch64", "image": "local-vz-" + name.replace("_", "-"),
-                               "version": "0.4.0-registry-e2e", "channel": "local-physical-e2e", "digest": digest(artifact)}}
+        artifact_identity = {key: value for key, value in artifact.items() if key != "profile"}
+        artifact_identity["digest"] = bundle_digest(artifact_identity)
+        resources = {"cpus": 2, "memory_mb": 4096 if index < 2 else 1024}
+        resolved = {
+            "schema_version": 1,
+            "host": {"os": "macos", "arch": "aarch64"},
+            "backend": "macos_virtualization_linux",
+            "machine": {
+                "schema_version": 1,
+                "name": name.replace("_", "-"),
+                "profile": "developer" if index < 2 else "hardened",
+                "target": {
+                    "os": "linux",
+                    "arch": "aarch64",
+                    "image": "vz-linux-appliance",
+                    "version": "0.4.0-registry-e2e",
+                    "channel": "local-physical-e2e",
+                    "digest": artifact_identity["digest"],
+                },
+                "resources": resources,
+                "requested_capabilities": {"capabilities": ["posix_exec"]},
+            },
+            "release_version": "0.4.0-registry-e2e",
+            "kernel_profile": profile,
+            "artifact": artifact_identity,
+            "resources": resources,
+        }
         machine = {"owner": owner, "verified_profile": profile, "resolved_configuration": resolved,
-                   "configuration_digest": digest(resolved), "artifact": dict(artifact, bundle="/private/tmp/bundles/" + profile)}
+                   "configuration_digest": configuration_digest(resolved),
+                   "artifact": dict(artifact, bundle="/private/tmp/bundles/" + profile)}
         for field, kind, logical in [("store_reservation", "machine_runtime_store", "runtime"), ("vm_reservation", "runtime_vm", "vm")]:
             machine[field] = {"schema_version": 1, "resource_kind": {"other": kind},
                               "resource_id": resource_name(owner, kind, logical),
@@ -71,6 +102,8 @@ def fixture():
         serial[phase] = [{"path": "/private/tmp/evidence/machine-registry-vm-serial/" + machine["vm_reservation"]["resource_id"] + suffix,
                           "sha256": "9" * 64} for machine in machines.values()]
     return {"schema_version": 1, "scope": "registry_and_boot_lease_infrastructure_only", "build": build,
+            "target_resolution": {"all_machines_resolved_before_state": True,
+                                  "invalid_sibling_rejected_without_state": True},
             "serial_logs": serial,
             "topology": topology, "machines": machines,
             "storage": {"first": storage, "reopened": copy.deepcopy(storage), "docker_api_probe_outputs": outputs,
@@ -81,6 +114,14 @@ def fixture():
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_domain_separated_identity_vectors(self):
+        artifact = {"kernel_sha256": "6" * 64, "initramfs_sha256": "2" * 64,
+                    "youki_sha256": "7" * 64, "version_sha256": "8" * 64}
+        self.assertEqual(bundle_digest(artifact),
+                         "sha256:c4cec0f78f143e6d0ad95ebc436ab2f55d0f0c643eebac18cfbda677db9926bd")
+        self.assertEqual(configuration_digest({"a": 1, "z": "x"}),
+                         "sha256:7ac986f44f58a11f84ce2a2f8c46e3d288ea5556e9fff125331d85d78831717b")
+
     def test_complete_fixture_passes(self):
         value = fixture()
         validate(value, copy.deepcopy(value["build"]))
@@ -124,6 +165,8 @@ class EvidenceTests(unittest.TestCase):
             (["topology", "docker_capabilities_synthesized"], True),
             (["topology", "developer_ready_without_docker_conformance_rejected"], False),
             (["topology", "hardened_activation_published"], False),
+            (["target_resolution", "all_machines_resolved_before_state"], False),
+            (["target_resolution", "invalid_sibling_rejected_without_state"], 1),
             (["serial_logs", "regular_nonempty"], False),
             (["serial_logs", "first_boot", 0, "path"], "/private/tmp/foreign.log"),
             (["serial_logs", "second_boot", 0, "sha256"], "not-a-sha"),
@@ -132,6 +175,8 @@ class EvidenceTests(unittest.TestCase):
             (["machines", "developer_a", "owner", "environment_id"], "env_foreign"),
             (["machines", "developer_b", "vm_reservation", "resource_id"], "foreign"),
             (["machines", "developer_a", "resolved_configuration", "resources", "memory_mb"], 1024),
+            (["machines", "developer_a", "resolved_configuration", "artifact", "digest"], "sha256:" + "a" * 64),
+            (["machines", "developer_a", "resolved_configuration", "machine", "target", "image"], "ubuntu"),
             (["storage", "first", "data_roots", 0], "/private/tmp/foreign/data"),
             (["storage", "first", "data_root_identities", 0, "mode"], 0o777),
             (["storage", "first", "developer_docker_disk_identities", 1, "inode"], 200),

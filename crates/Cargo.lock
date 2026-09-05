@@ -3957,6 +3957,8 @@ dependencies = [
  "tower 0.5.3",
  "tracing",
  "tracing-subscriber",
+ "vz-agent-proto",
+ "vz-linux",
  "vz-linux-native",
  "vz-oci-macos",
  "vz-runtime-contract",

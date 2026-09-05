@@ -4,7 +4,7 @@
 #![cfg(all(target_os = "macos", target_arch = "aarch64"))]
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use vz_oci_macos::{KernelProfile, MacosRuntimeBackend, Runtime, RuntimeConfig};
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
-    EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, LifecycleStepResult,
+    EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, HostSpec, LifecycleStepResult,
     MachineActivationEvidence, MachineBackend, MachineCapability, MachineIncarnation,
     MachineIncarnationId, MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources,
     MachineRuntimeIdentity, MachineSpec, MachineState, OperatingSystem, OwnershipRecord,
@@ -32,6 +32,10 @@ use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
 use vz_runtimed::machine_runtime_registry::{
     MachineRuntimeAdmission, MachineRuntimeEntry, MachineRuntimeRegistry,
     MachineRuntimeRegistryError,
+};
+use vz_runtimed::machine_target_resolver::{
+    LINUX_APPLIANCE_IMAGE, LinuxTargetCatalogEntry, MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
+    MachineTargetCatalog, MachineTargetResolver, ResolvedProjectTargets, TargetResolutionError,
 };
 use vz_stack::StateStore;
 
@@ -141,43 +145,27 @@ fn second_boot_serial_logs(directory: &Path, fixtures: &[MachineFixture]) -> Res
         .collect()
 }
 
-fn value_sha(value: &Value) -> Result<String> {
-    Ok(format!(
-        "sha256:{:x}",
-        Sha256::digest(serde_json::to_vec(value)?)
-    ))
-}
-
-fn artifact_identity(artifact: &Value) -> Value {
+fn artifact(
+    bundle: &Path,
+    profile: KernelProfile,
+    identity: &vz_linux::KernelBundleArtifactIdentity,
+) -> Value {
     json!({
-        "profile": artifact["profile"],
-        "kernel_sha256": artifact["kernel_sha256"],
-        "initramfs_sha256": artifact["initramfs_sha256"],
-        "youki_sha256": artifact["youki_sha256"],
-        "version_sha256": artifact["version_sha256"],
-    })
-}
-
-fn artifact(bundle: &Path, profile: KernelProfile) -> Result<Value> {
-    let bundle = fs::canonicalize(bundle)?;
-    let version: Value = serde_json::from_slice(&fs::read(bundle.join("version.json"))?)?;
-    ensure!(version["profile"] == profile.as_str());
-    Ok(json!({
         "bundle": bundle,
         "profile": profile.as_str(),
-        "kernel_sha256": file_sha(&bundle.join("vmlinux"))?,
-        "initramfs_sha256": file_sha(&bundle.join("initramfs.img"))?,
-        "youki_sha256": file_sha(&bundle.join("youki"))?,
-        "version_sha256": file_sha(&bundle.join("version.json"))?,
-    }))
+        "kernel_sha256": identity.kernel_sha256,
+        "initramfs_sha256": identity.initramfs_sha256,
+        "youki_sha256": identity.youki_sha256,
+        "version_sha256": identity.version_sha256,
+    })
 }
 
 fn definition(
     project_id: vz_runtime_contract::ProjectId,
-    dev: &Value,
-    hard: &Value,
+    developer_digest: &str,
+    hardened_digest: &str,
 ) -> Result<ProjectDefinition> {
-    let spec = |name: &str, profile: MachineProfile, memory_mb: u64, artifact: &Value| {
+    let spec = |name: &str, profile: MachineProfile, memory_mb: u64, digest: &str| {
         Ok::<_, anyhow::Error>(MachineSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             name: name.into(),
@@ -185,10 +173,10 @@ fn definition(
             target: TargetSpec {
                 os: OperatingSystem::Linux,
                 arch: Architecture::Aarch64,
-                image: format!("local-vz-{name}"),
+                image: LINUX_APPLIANCE_IMAGE.to_string(),
                 version: Some("0.4.0-registry-e2e".into()),
                 channel: Some("local-physical-e2e".into()),
-                digest: Some(value_sha(&artifact_identity(artifact))?),
+                digest: Some(digest.to_string()),
             },
             resources: MachineResources {
                 cpus: Some(2),
@@ -207,9 +195,19 @@ fn definition(
         environment: EnvironmentSpec {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             machines: vec![
-                spec("developer-a", MachineProfile::Developer, 4096, dev)?,
-                spec("developer-b", MachineProfile::Developer, 4096, dev)?,
-                spec("hardened", MachineProfile::Hardened, 1024, hard)?,
+                spec(
+                    "developer-a",
+                    MachineProfile::Developer,
+                    4096,
+                    developer_digest,
+                )?,
+                spec(
+                    "developer-b",
+                    MachineProfile::Developer,
+                    4096,
+                    developer_digest,
+                )?,
+                spec("hardened", MachineProfile::Hardened, 1024, hardened_digest)?,
             ],
             networks: vec![],
             endpoints: vec![],
@@ -217,15 +215,80 @@ fn definition(
     })
 }
 
-fn fixtures(state: &ProjectState, dev: Value, hard: Value) -> Result<Vec<MachineFixture>> {
+fn target_catalog(
+    developer_bundle: PathBuf,
+    developer_digest: String,
+    hardened_bundle: PathBuf,
+    hardened_digest: String,
+) -> MachineTargetCatalog {
+    let entry = |profile, bundle_dir, digest| LinuxTargetCatalogEntry {
+        image: LINUX_APPLIANCE_IMAGE.to_string(),
+        version: "0.4.0-registry-e2e".to_string(),
+        profile,
+        bundle_dir,
+        digest,
+        channels: BTreeSet::from(["local-physical-e2e".to_string()]),
+    };
+    MachineTargetCatalog {
+        schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
+        linux: vec![
+            entry(
+                MachineProfile::Developer,
+                developer_bundle,
+                developer_digest,
+            ),
+            entry(MachineProfile::Hardened, hardened_bundle, hardened_digest),
+        ],
+    }
+}
+
+async fn invalid_sibling_preflight(
+    root: &Path,
+    resolver: &MachineTargetResolver,
+    definition: &ProjectDefinition,
+) -> Result<bool> {
+    let mut invalid_definitions = Vec::new();
+
+    let mut unknown_image = definition.clone();
+    unknown_image.environment.machines[1].target.image = "unknown-linux-appliance".to_string();
+    invalid_definitions.push(unknown_image);
+
+    let mut unknown_version = definition.clone();
+    unknown_version.environment.machines[1].target.version = Some("unknown-release".to_string());
+    invalid_definitions.push(unknown_version);
+
+    let mut unknown_channel = definition.clone();
+    unknown_channel.environment.machines[1].target.channel = Some("unknown-channel".to_string());
+    invalid_definitions.push(unknown_channel);
+
+    let mut wrong_digest = definition.clone();
+    wrong_digest.environment.machines[1].target.digest = Some(format!("sha256:{}", "0".repeat(64)));
+    invalid_definitions.push(wrong_digest);
+
+    for invalid in invalid_definitions {
+        ensure!(matches!(
+            resolver.resolve_project(&invalid).await,
+            Err(TargetResolutionError::TargetNotFound { machine }) if machine == "developer-b"
+        ));
+        ensure!(!root.join("topology.db").exists());
+        ensure!(!root.join("registry").exists());
+        ensure!(fs::read_dir(root)?.next().transpose()?.is_none());
+    }
+    Ok(true)
+}
+
+fn fixtures(
+    state: &ProjectState,
+    resolved: &ResolvedProjectTargets,
+) -> Result<Vec<MachineFixture>> {
     let environment = state.environments.first().context("fixture Environment")?;
     [
-        ("developer-a", KernelProfile::Developer, 4096, dev.clone()),
-        ("developer-b", KernelProfile::Developer, 4096, dev),
-        ("hardened", KernelProfile::Container, 1024, hard),
+        ("developer-a", KernelProfile::Developer, 4096),
+        ("developer-b", KernelProfile::Developer, 4096),
+        ("hardened", KernelProfile::Container, 1024),
     ]
     .into_iter()
-    .map(|(name, profile, memory_mb, artifact)| {
+    .map(|(name, profile, memory_mb)| {
         let machine = environment
             .machines
             .iter()
@@ -238,29 +301,34 @@ fn fixtures(state: &ProjectState, dev: Value, hard: Value) -> Result<Vec<Machine
         };
         let store_reservation = MachineRuntimeRegistry::<MacosRuntimeBackend>::reservation(&owner)?;
         let vm_reservation = MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(&owner)?;
-        let resolved = json!({
-            "backend": "macos-vz",
-            "target": machine.target,
-            "profile": profile.as_str(),
-            "resources": machine.resources,
-            "artifact": artifact_identity(&artifact),
-            "network": true,
-            "oci_runtime": "youki",
-        });
-        let bundle = PathBuf::from(
-            artifact["bundle"]
-                .as_str()
-                .context("artifact bundle path")?,
-        );
-        let config_digest = value_sha(&resolved)?;
+        let target = resolved
+            .machines
+            .get(name)
+            .with_context(|| format!("resolved Machine target {name}"))?;
+        ensure!(target.profile() == profile);
+        let configuration = target.configuration();
+        ensure!(configuration.machine.name == machine.name);
+        ensure!(configuration.machine.profile == machine.profile);
+        ensure!(configuration.machine.target == machine.target);
+        ensure!(configuration.machine.resources == machine.resources);
+        ensure!(configuration.machine.requested_capabilities == machine.requested_capabilities);
+        ensure!(configuration.machine.workspace.is_none());
+        ensure!(configuration.host.os == OperatingSystem::Macos);
+        ensure!(configuration.host.arch == Architecture::Aarch64);
+        ensure!(configuration.backend == MachineBackend::MacosVirtualizationLinux);
+        ensure!(configuration.release_version == "0.4.0-registry-e2e");
+        ensure!(target.configuration().resources.cpus == 2);
+        ensure!(target.configuration().resources.memory_mb == memory_mb);
+        let bundle = target.bundle_dir().to_path_buf();
+        let artifact = artifact(&bundle, profile, &target.configuration().artifact);
         Ok(MachineFixture {
             name,
             profile,
             owner,
             store_reservation,
             vm_reservation,
-            config_digest,
-            resolved_configuration: resolved,
+            config_digest: target.configuration_digest().to_string(),
+            resolved_configuration: serde_json::to_value(target.configuration())?,
             bundle,
             artifact,
             resources: StackResourceHint {
@@ -762,16 +830,42 @@ fn machine_evidence(
 }
 
 async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Result<Value> {
-    let dev_artifact = artifact(
-        &PathBuf::from(std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?),
-        KernelProfile::Developer,
-    )?;
-    let hard_artifact = artifact(
-        &PathBuf::from(std::env::var_os(HARD_BUNDLE_ENV).context(HARD_BUNDLE_ENV)?),
-        KernelProfile::Container,
-    )?;
+    let developer_bundle = fs::canonicalize(PathBuf::from(
+        std::env::var_os(DEV_BUNDLE_ENV).context(DEV_BUNDLE_ENV)?,
+    ))?;
+    let hardened_bundle = fs::canonicalize(PathBuf::from(
+        std::env::var_os(HARD_BUNDLE_ENV).context(HARD_BUNDLE_ENV)?,
+    ))?;
+    let developer_verified =
+        vz_linux::verify_kernel_bundle_read_only(&developer_bundle, KernelProfile::Developer)
+            .await?;
+    let hardened_verified =
+        vz_linux::verify_kernel_bundle_read_only(&hardened_bundle, KernelProfile::Container)
+            .await?;
     let project_id = vz_runtime_contract::ProjectId::new("prj_machine_registry_e2e")?;
-    let definition = definition(project_id.clone(), &dev_artifact, &hard_artifact)?;
+    let definition = definition(
+        project_id.clone(),
+        &developer_verified.artifact_identity.digest,
+        &hardened_verified.artifact_identity.digest,
+    )?;
+    let resolver = MachineTargetResolver::new(
+        HostSpec {
+            os: OperatingSystem::Macos,
+            arch: Architecture::Aarch64,
+        },
+        target_catalog(
+            developer_bundle,
+            developer_verified.artifact_identity.digest,
+            hardened_bundle,
+            hardened_verified.artifact_identity.digest,
+        ),
+    )?;
+    let invalid_sibling_rejected_without_state =
+        invalid_sibling_preflight(root, &resolver, &definition).await?;
+    let resolved = resolver.resolve_project(&definition).await?;
+    ensure!(resolved.machines.len() == definition.environment.machines.len());
+    ensure!(resolved.definition_digest == definition.digest()?);
+    let all_machines_resolved_before_state = true;
     let environment = definition.instantiate_environment("registry-e2e", 100)?;
     let environment_id = environment.environment_id.clone();
     let store_path = root.join("topology.db");
@@ -784,7 +878,7 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
     let state = store
         .load_project_state(project_id.as_str())?
         .context("Project state")?;
-    let fixtures = fixtures(&state, dev_artifact, hard_artifact)?;
+    let fixtures = fixtures(&state, &resolved)?;
     for (offset, record) in all_reservations(&fixtures).into_iter().enumerate() {
         store.reserve_owned_resource(record, 101 + offset as u64)?;
     }
@@ -1080,6 +1174,10 @@ async fn run_inner(root: &Path, cleanup_targets: &mut Vec<CleanupTarget>) -> Res
             "docker_probe_source_sha256": std::env::var(DOCKER_PROBE_SOURCE_SHA_ENV).unwrap_or_else(|_| "unknown".into()),
             "docker_probe_go_version": std::env::var(DOCKER_PROBE_GO_VERSION_ENV).unwrap_or_else(|_| "unknown".into()),
             "docker_probe_sha256": docker_probe_sha256.clone(),
+        },
+        "target_resolution": {
+            "all_machines_resolved_before_state": all_machines_resolved_before_state,
+            "invalid_sibling_rejected_without_state": invalid_sibling_rejected_without_state,
         },
         "topology": {
             "project_id": project_id, "environment_id": environment_id,

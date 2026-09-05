@@ -21,11 +21,12 @@ pub use grpc_client::{
     GrpcPortForwardStream, OciExecOptions,
 };
 pub use kernel::{
-    EnsureKernelOptions, KernelBundle, KernelBundleOptions, KernelCapability, KernelFlavor,
-    KernelPaths, KernelProfile, KernelVersion, default_linux_dir, default_linux_profile_dir,
+    EnsureKernelOptions, KernelBundle, KernelBundleArtifactIdentity, KernelBundleOptions,
+    KernelCapability, KernelFlavor, KernelPaths, KernelProfile, KernelVersion,
+    VerifiedKernelBundle, default_linux_dir, default_linux_profile_dir,
     default_vz_linux_kernel_capabilities, default_vz_linux_kernel_profile_capabilities,
     ensure_kernel, ensure_kernel_bundle, ensure_kernel_profile, ensure_kernel_profile_with_options,
-    ensure_kernel_with_options,
+    ensure_kernel_with_options, verify_kernel_bundle_read_only,
 };
 pub use vm::LinuxVm;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};
