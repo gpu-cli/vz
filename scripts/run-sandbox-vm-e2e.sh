@@ -35,7 +35,7 @@ Options:
   --profile <debug|release>   Cargo profile for builds (default: debug)
                               complete runtime-containing lanes require release
   --suite <name>              Suite to run (repeatable, comma-separated allowed)
-                              names: runtime, runtimed, stack, buildkit, sandbox, all
+                              names: runtime, runtimed, machine-registry, stack, buildkit, sandbox, all
                               default: sandbox (runtime + stack)
   --scenario <name>           Run named use-case scenario(s) (repeatable/comma-separated)
                               names:
@@ -45,6 +45,7 @@ Options:
                                 runtime-port-forwarding, runtime-shared-vm-net,
                                 runtime-generation-crash-reopen, stack-real-services,
                                 runtimed-teardown-finalizer-crash-reopen,
+                                runtimed-machine-runtime-registry,
                                 stack-control-socket, stack-port-forwarding,
                                 stack-container-ownership,
                                 stack-snapshot-restore,
@@ -117,6 +118,9 @@ expand_suite_token() {
             runtimed)
                 append_unique "runtimed"
                 ;;
+            machine-registry)
+                append_unique "machine-registry"
+                ;;
             stack)
                 append_unique "stack"
                 ;;
@@ -131,11 +135,12 @@ expand_suite_token() {
                 FULL_CLOSURE_GATE_SELECTED=true
                 append_unique "runtime"
                 append_unique "runtimed"
+                append_unique "machine-registry"
                 append_unique "stack"
                 append_unique "buildkit"
                 ;;
             *)
-                err "unknown suite '$part' (expected runtime|runtimed|stack|buildkit|sandbox|all)"
+                err "unknown suite '$part' (expected runtime|runtimed|machine-registry|stack|buildkit|sandbox|all)"
                 ;;
         esac
     done
@@ -152,7 +157,7 @@ expand_scenario_token() {
         case "$part" in
             "")
                 ;;
-            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen|runtimed-teardown-finalizer-crash-reopen|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
+            runtime-smoke|runtime-lifecycle|runtime-container-id-ownership|runtime-exec-semantics|runtime-exec-supervision|runtime-exec-defaults|runtime-port-forwarding|runtime-shared-vm-net|runtime-generation-crash-reopen|runtimed-teardown-finalizer-crash-reopen|runtimed-machine-runtime-registry|stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|stack-user-journey-checkpoint|environment-lifecycle-journal-linux-vm|buildkit-roundtrip)
                 append_unique_scenario "$part"
                 ;;
             sandbox-usecases)
@@ -180,6 +185,7 @@ expand_scenario_token() {
                 append_unique_scenario "runtime-shared-vm-net"
                 append_unique_scenario "runtime-generation-crash-reopen"
                 append_unique_scenario "runtimed-teardown-finalizer-crash-reopen"
+                append_unique_scenario "runtimed-machine-runtime-registry"
                 append_unique_scenario "stack-real-services"
                 append_unique_scenario "stack-control-socket"
                 append_unique_scenario "stack-port-forwarding"
@@ -202,6 +208,9 @@ scenario_suite() {
             ;;
         runtimed-teardown-finalizer-crash-reopen)
             echo "runtimed"
+            ;;
+        runtimed-machine-runtime-registry)
+            echo "machine-registry"
             ;;
         stack-real-services|stack-control-socket|stack-port-forwarding|stack-container-ownership|stack-snapshot-restore|environment-lifecycle-journal-linux-vm)
             echo "stack"
@@ -249,6 +258,9 @@ scenario_test_filter() {
             ;;
         runtimed-teardown-finalizer-crash-reopen)
             echo "teardown_finalizer_sigkill_restart_replacement_refusal"
+            ;;
+        runtimed-machine-runtime-registry)
+            echo "three_machine_registry_boot_lease_reopen_isolation"
             ;;
         stack-real-services)
             echo "real_services_postgres_and_redis"
@@ -380,6 +392,16 @@ if [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" \
     || " ${RESOLVED_SCENARIOS[*]:-} " == *" runtimed-teardown-finalizer-crash-reopen "* ]]; then
     RUNTIMED_TEARDOWN_LANE_SELECTED=true
 fi
+
+MACHINE_REGISTRY_LANE_SELECTED=false
+if [[ "$FULL_CLOSURE_GATE_SELECTED" == "true" \
+    || " ${RESOLVED_SUITES[*]} " == *" machine-registry "* \
+    || " ${RESOLVED_SCENARIOS[*]:-} " == *" runtimed-machine-runtime-registry "* ]]; then
+    MACHINE_REGISTRY_LANE_SELECTED=true
+fi
+if [[ "$MACHINE_REGISTRY_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
+    err "per-Machine runtime registry physical evidence requires --profile release"
+fi
 if [[ "$RUNTIMED_TEARDOWN_LANE_SELECTED" == "true" && "$PROFILE" != "release" ]]; then
     err "runtimed teardown finalizer crash/reopen evidence requires --profile release"
 fi
@@ -508,6 +530,29 @@ STACK_CRASH_REOPEN_EVIDENCE="$RUN_DIR/runtime-generation-state-store-v7.json"
 STACK_CRASH_REOPEN_SHA256="$RUN_DIR/runtime-generation-state-store-v7.json.sha256"
 RUNTIMED_TEARDOWN_EVIDENCE="$RUN_DIR/runtimed-teardown-finalizer-crash-reopen.json"
 RUNTIMED_TEARDOWN_SHA256="$RUN_DIR/runtimed-teardown-finalizer-crash-reopen.json.sha256"
+MACHINE_REGISTRY_EVIDENCE="$RUN_DIR/machine-runtime-registry.json"
+MACHINE_REGISTRY_SHA256="$RUN_DIR/machine-runtime-registry.json.sha256"
+MACHINE_REGISTRY_DOCKER_PROBE="none"
+MACHINE_REGISTRY_DOCKER_PROBE_SHA256="none"
+MACHINE_REGISTRY_DOCKER_PROBE_SOURCE_SHA256="none"
+MACHINE_REGISTRY_DOCKER_PROBE_GO_VERSION="none"
+if [[ "$MACHINE_REGISTRY_LANE_SELECTED" == "true" ]]; then
+    command -v go >/dev/null 2>&1 || err "Go is required to build the test-only Machine registry Docker API probe"
+    probe_source="$REPO_ROOT/scripts/helpers/machine-registry-docker-probe.go"
+    [[ -f "$probe_source" && ! -L "$probe_source" ]] \
+        || err "missing regular Machine registry Docker probe source: $probe_source"
+    MACHINE_REGISTRY_DOCKER_PROBE="$RUN_DIR/machine-registry-docker-probe-linux-arm64"
+    MACHINE_REGISTRY_DOCKER_PROBE_SOURCE_SHA256="$(shasum -a 256 "$probe_source" | cut -d' ' -f1)"
+    MACHINE_REGISTRY_DOCKER_PROBE_GO_VERSION="$(go version)"
+    env CGO_ENABLED=0 GOOS=linux GOARCH=arm64 \
+        go build -trimpath -o "$MACHINE_REGISTRY_DOCKER_PROBE" "$probe_source"
+    chmod 0555 "$MACHINE_REGISTRY_DOCKER_PROBE"
+    file "$MACHINE_REGISTRY_DOCKER_PROBE" > "$RUN_DIR/machine-registry-docker-probe.file.txt"
+    grep -Eq 'ELF 64-bit LSB executable, ARM aarch64.*statically linked' \
+        "$RUN_DIR/machine-registry-docker-probe.file.txt" \
+        || err "Machine registry Docker probe is not a static Linux/arm64 ELF"
+    MACHINE_REGISTRY_DOCKER_PROBE_SHA256="$(shasum -a 256 "$MACHINE_REGISTRY_DOCKER_PROBE" | cut -d' ' -f1)"
+fi
 
 BUILDKIT_ARCHIVE_BASENAME="vz-buildkit-v0.19.0-linux-arm64.tar"
 BUILDKIT_SHA256_BASENAME="$BUILDKIT_ARCHIVE_BASENAME.sha256"
@@ -770,6 +815,9 @@ suite_package() {
         runtimed)
             echo "vz-runtimed"
             ;;
+        machine-registry)
+            echo "vz-runtimed"
+            ;;
         stack)
             echo "vz-stack"
             ;;
@@ -789,6 +837,9 @@ suite_test_name() {
             ;;
         runtimed)
             echo "teardown_finalizer_e2e"
+            ;;
+        machine-registry)
+            echo "machine_runtime_registry_e2e"
             ;;
         stack)
             echo "stack_e2e"
@@ -3044,6 +3095,21 @@ write_and_validate_runtimed_teardown_checksum() {
     (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
 }
 
+validate_machine_registry_evidence() {
+    python3 "$SCRIPT_DIR/helpers/machine_registry_evidence.py" "$@"
+}
+
+write_and_validate_machine_registry_checksum() {
+    local evidence_file="$1"
+    local checksum_file="$2"
+    local name
+    name="$(basename "$evidence_file")"
+    local digest
+    digest="$(shasum -a 256 "$evidence_file" | cut -d' ' -f1)"
+    printf '%s  %s\n' "$digest" "$name" > "$checksum_file"
+    (cd "$(dirname "$evidence_file")" && shasum -a 256 -c "$(basename "$checksum_file")") >/dev/null
+}
+
 run_and_log() {
     local suite="$1"
     local label="$2"
@@ -3057,6 +3123,7 @@ run_and_log() {
     local crash_reopen_test_binary_sha256=""
     local stack_crash_reopen_test_binary_sha256=""
     local runtimed_teardown_test_binary_sha256=""
+    local machine_registry_test_binary_sha256=""
     local emits_vm_full_unsupported_evidence=false
 
     # BuildKit tests are sensitive to stale shared cache state under ~/.vz/buildkit.
@@ -3071,10 +3138,24 @@ run_and_log() {
         cmd_env+=("VZ_BUILDKIT_ARTIFACT_SHA256=$BUILDKIT_EXPECTED_SHA256")
     fi
 
-    if [[ "$suite" == "stack" || "$suite" == "runtime" || "$suite" == "runtimed" ]]; then
+    if [[ "$suite" == "stack" || "$suite" == "runtime" || "$suite" == "runtimed" \
+        || "$suite" == "machine-registry" ]]; then
         local stack_serial_dir="$RUN_DIR/${label}-vm-serial"
         mkdir -p "$stack_serial_dir"
         cmd_env+=("VZ_STACK_SERIAL_LOG_DIR=$stack_serial_dir")
+    fi
+
+    if [[ "$suite" == "machine-registry" ]]; then
+        machine_registry_test_binary_sha256="$(shasum -a 256 "$binary" | cut -d' ' -f1)"
+        rm -f "$MACHINE_REGISTRY_EVIDENCE" "$MACHINE_REGISTRY_SHA256"
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_EVIDENCE=$MACHINE_REGISTRY_EVIDENCE")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_BUILD_PROFILE=$PROFILE")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_TEST_BINARY_SHA256=$machine_registry_test_binary_sha256")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_DEVELOPER_INITRAMFS_SHA256=$DEVELOPER_INITRAMFS_SHA256")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_CONTAINER_INITRAMFS_SHA256=$CONTAINER_INITRAMFS_SHA256")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_DOCKER_PROBE=$MACHINE_REGISTRY_DOCKER_PROBE")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_DOCKER_PROBE_SOURCE_SHA256=$MACHINE_REGISTRY_DOCKER_PROBE_SOURCE_SHA256")
+        cmd_env+=("VZ_MACHINE_RUNTIME_REGISTRY_DOCKER_PROBE_GO_VERSION=$MACHINE_REGISTRY_DOCKER_PROBE_GO_VERSION")
     fi
 
     if [[ "$suite" == "runtimed" ]]; then
@@ -3302,6 +3383,15 @@ run_and_log() {
         return 114
     fi
 
+    if [[ $status -eq 0 && "$PROFILE" == "release" \
+        && "$suite" == "machine-registry" && "$label" == "machine-registry" ]] \
+        && ! grep -Fqx \
+            "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished" \
+            <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
+        echo "complete Machine registry suite did not report exactly 1/1 physical test" >&2
+        return 117
+    fi
+
     if [[ $status -eq 0 && "$label" != "$suite" ]] \
         && ! grep -Eq \
             '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished$' \
@@ -3450,6 +3540,28 @@ run_and_log() {
         RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED=true
     fi
 
+    if [[ $status -eq 0 ]] && [[ "$suite" == "machine-registry" ]]; then
+        if [[ ! -f "$MACHINE_REGISTRY_EVIDENCE" ]] \
+            || ! validate_machine_registry_evidence \
+                "$MACHINE_REGISTRY_EVIDENCE" \
+                "$PROFILE" \
+                "$machine_registry_test_binary_sha256" \
+                "$DEVELOPER_INITRAMFS_SHA256" \
+                "$CONTAINER_INITRAMFS_SHA256" \
+                "$MACHINE_REGISTRY_DOCKER_PROBE_SHA256" \
+                "$MACHINE_REGISTRY_DOCKER_PROBE_SOURCE_SHA256" \
+                "$MACHINE_REGISTRY_DOCKER_PROBE_GO_VERSION"; then
+            echo "per-Machine runtime registry evidence is missing or malformed" >&2
+            return 118
+        fi
+        if ! write_and_validate_machine_registry_checksum \
+            "$MACHINE_REGISTRY_EVIDENCE" "$MACHINE_REGISTRY_SHA256"; then
+            echo "per-Machine runtime registry evidence checksum failed" >&2
+            return 119
+        fi
+        MACHINE_REGISTRY_EVIDENCE_VALIDATED=true
+    fi
+
     if [[ $status -eq 0 && "$label" == "runtime-generation-state-store-v7" ]]; then
         local runtime_crash_reopen_sha256_value
         runtime_crash_reopen_sha256_value="$(shasum -a 256 "$RUNTIME_CRASH_REOPEN_EVIDENCE" | cut -d' ' -f1)"
@@ -3506,6 +3618,12 @@ echo "==> output directory: $RUN_DIR"
     echo "stack_crash_reopen_checksum=$STACK_CRASH_REOPEN_SHA256"
     echo "runtimed_teardown_evidence=$RUNTIMED_TEARDOWN_EVIDENCE"
     echo "runtimed_teardown_checksum=$RUNTIMED_TEARDOWN_SHA256"
+    echo "machine_runtime_registry_evidence=$MACHINE_REGISTRY_EVIDENCE"
+    echo "machine_runtime_registry_checksum=$MACHINE_REGISTRY_SHA256"
+    echo "machine_registry_docker_probe=$MACHINE_REGISTRY_DOCKER_PROBE"
+    echo "machine_registry_docker_probe_sha256=$MACHINE_REGISTRY_DOCKER_PROBE_SHA256"
+    echo "machine_registry_docker_probe_source_sha256=$MACHINE_REGISTRY_DOCKER_PROBE_SOURCE_SHA256"
+    echo "machine_registry_docker_probe_go_version=$MACHINE_REGISTRY_DOCKER_PROBE_GO_VERSION"
 } > "$RUN_DIR/run-info.txt"
 
 echo "==> building host binaries required for local VM flows"
@@ -3568,6 +3686,8 @@ STACK_CRASH_REOPEN_EVIDENCE_VALIDATED=false
 STACK_CRASH_REOPEN_EVIDENCE_REQUIRED="$CRASH_REOPEN_LANE_SELECTED"
 RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED=false
 RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED="$RUNTIMED_TEARDOWN_LANE_SELECTED"
+MACHINE_REGISTRY_EVIDENCE_VALIDATED=false
+MACHINE_REGISTRY_EVIDENCE_REQUIRED="$MACHINE_REGISTRY_LANE_SELECTED"
 
 run_stack_crash_reopen_companion() {
     local binary="$1"
@@ -3807,6 +3927,12 @@ if [[ "$RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED" == "true" \
     FAILED+=("runtimed-teardown-finalizer-evidence:115")
 fi
 
+if [[ "$MACHINE_REGISTRY_EVIDENCE_REQUIRED" == "true" \
+    && "$MACHINE_REGISTRY_EVIDENCE_VALIDATED" != "true" ]]; then
+    echo "==> required per-Machine runtime registry evidence was not validated" >&2
+    FAILED+=("machine-runtime-registry-evidence:118")
+fi
+
 if [[ "$BUILDKIT_RELEASE_GATE_QUALIFIED" == "pending" ]]; then
     if [[ "$BUILDKIT_EVIDENCE_VALIDATED" == "true" && ${#FAILED[@]} -eq 0 ]]; then
         BUILDKIT_RELEASE_GATE_QUALIFIED="true"
@@ -3920,6 +4046,15 @@ action_summary="$RUN_DIR/summary.txt"
     fi
     echo "runtimed_teardown_required=$RUNTIMED_TEARDOWN_EVIDENCE_REQUIRED"
     echo "runtimed_teardown_validated=$RUNTIMED_TEARDOWN_EVIDENCE_VALIDATED"
+    if [[ "$MACHINE_REGISTRY_EVIDENCE_VALIDATED" == "true" ]]; then
+        echo "machine_runtime_registry=$MACHINE_REGISTRY_EVIDENCE"
+        echo "machine_runtime_registry_sha256=$MACHINE_REGISTRY_SHA256"
+    else
+        echo "machine_runtime_registry=none"
+        echo "machine_runtime_registry_sha256=none"
+    fi
+    echo "machine_runtime_registry_required=$MACHINE_REGISTRY_EVIDENCE_REQUIRED"
+    echo "machine_runtime_registry_validated=$MACHINE_REGISTRY_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
 if [[ ${#FAILED[@]} -gt 0 ]]; then

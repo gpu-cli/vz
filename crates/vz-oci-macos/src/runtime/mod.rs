@@ -525,7 +525,21 @@ struct StackVmRecord {
     identity: vz_runtime_contract::StackRuntimeIdentity,
     verified_linux_profile: Option<KernelProfile>,
     docker_provisioned: bool,
+    boot_ports: Vec<PortMapping>,
+    boot_resources: vz_runtime_contract::StackResourceHint,
     vm: Arc<LinuxVm>,
+}
+
+/// Atomic ownership of one exact shared-VM boot.
+///
+/// The lease is intentionally non-cloneable. While it is alive, replacement
+/// and shutdown of the same shared VM wait behind its lifecycle fence.
+#[must_use = "dropping the lease releases exact shared-VM lifecycle ownership"]
+pub struct SharedVmLifecycleLease {
+    runtime_identity: vz_runtime_contract::StackRuntimeIdentity,
+    verified_profile: KernelProfile,
+    stack_vms: Arc<Mutex<HashMap<String, StackVmRecord>>>,
+    _stack_lifecycle_guard: OwnedRwLockReadGuard<()>,
 }
 
 /// Unified runtime entrypoint.

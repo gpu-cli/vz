@@ -99,6 +99,48 @@ pub(super) fn kernel_profile_from_metadata(
     }
 }
 
+pub(super) fn require_explicit_verified_profile(
+    configured: Option<KernelProfile>,
+    verified: Option<KernelProfile>,
+    operation: &str,
+) -> Result<KernelProfile, OciError> {
+    let Some(configured) = configured else {
+        return Err(OciError::UnsupportedOperation {
+            operation: operation.to_string(),
+            reason: "managed shared-VM acquisition requires an explicit Linux profile".to_string(),
+        });
+    };
+    if verified != Some(configured) {
+        return Err(OciError::UnsupportedOperation {
+            operation: operation.to_string(),
+            reason: format!(
+                "configured Linux profile `{}` was not proven by the selected boot artifact",
+                configured.as_str()
+            ),
+        });
+    }
+    Ok(configured)
+}
+
+pub(super) fn require_matching_shared_vm_boot_request(
+    stack_id: &str,
+    actual_ports: &[PortMapping],
+    actual_resources: &vz_runtime_contract::StackResourceHint,
+    requested_ports: &[PortMapping],
+    requested_resources: &vz_runtime_contract::StackResourceHint,
+) -> Result<(), OciError> {
+    let resources_match = actual_resources.cpus == requested_resources.cpus
+        && actual_resources.memory_mb == requested_resources.memory_mb
+        && actual_resources.volume_mounts == requested_resources.volume_mounts
+        && actual_resources.disk_image_path == requested_resources.disk_image_path;
+    if actual_ports == requested_ports && resources_match {
+        return Ok(());
+    }
+    Err(OciError::InvalidConfig(format!(
+        "shared VM boot request drift for stack '{stack_id}': the active boot has different ports or resources"
+    )))
+}
+
 pub(super) fn require_docker_provisioned_developer_profile(
     verified_profile: Option<KernelProfile>,
     docker_provisioned: bool,
@@ -755,6 +797,76 @@ impl Runtime {
     }
 }
 
+impl SharedVmLifecycleLease {
+    /// Full identity of the exact shared-VM boot protected by this lease.
+    pub fn runtime_identity(&self) -> &vz_runtime_contract::StackRuntimeIdentity {
+        &self.runtime_identity
+    }
+
+    /// Linux profile proven from the selected boot artifact metadata.
+    pub const fn verified_profile(&self) -> KernelProfile {
+        self.verified_profile
+    }
+
+    /// Start and health-check the private Docker Engine without releasing this
+    /// lease's generation fence.
+    ///
+    /// Success is an Engine and mount readiness proof only. It does not
+    /// negotiate or publish Developer Machine capabilities.
+    pub async fn ensure_docker_ready(&self) -> Result<SharedVmDockerReadiness, OciError> {
+        let record = self
+            .stack_vms
+            .lock()
+            .await
+            .get(&self.runtime_identity.stack_id)
+            .cloned();
+        require_exact_stack_runtime(
+            record.as_ref().map(|record| &record.identity),
+            &self.runtime_identity,
+        )?;
+        let Some(record) = record else {
+            return Err(OciError::SharedRuntimeAbsent {
+                stack_id: self.runtime_identity.stack_id.clone(),
+            });
+        };
+        Runtime::docker_readiness_for_record(&record, "shared_vm_lease_ensure_docker_ready").await
+    }
+
+    /// Execute directly in the exact shared VM protected by this lease.
+    ///
+    /// This deliberately does not reacquire the lifecycle reader. Tokio's
+    /// writer-preferring lock could otherwise deadlock a lease holder behind a
+    /// queued shutdown writer while the writer waits for this lease to drop.
+    pub async fn exec(
+        &self,
+        command: String,
+        args: Vec<String>,
+        timeout: Duration,
+    ) -> Result<ExecOutput, OciError> {
+        let record = self
+            .stack_vms
+            .lock()
+            .await
+            .get(&self.runtime_identity.stack_id)
+            .cloned();
+        require_exact_stack_runtime(
+            record.as_ref().map(|record| &record.identity),
+            &self.runtime_identity,
+        )?;
+        let Some(record) = record else {
+            return Err(OciError::SharedRuntimeAbsent {
+                stack_id: self.runtime_identity.stack_id.clone(),
+            });
+        };
+        let result = record.vm.exec_collect(command, args, timeout).await?;
+        Ok(ExecOutput {
+            exit_code: result.exit_code,
+            stdout: result.stdout,
+            stderr: result.stderr,
+        })
+    }
+}
+
 fn diagnostic_file_component(value: &str) -> String {
     value
         .chars()
@@ -936,7 +1048,10 @@ require_mount /dev/vda /var/lib/docker ext4
         Ok(())
     }
 
-    async fn verify_guest_docker_prerequisites(vm: &LinuxVm) -> Result<(), OciError> {
+    async fn verify_guest_docker_prerequisites(
+        vm: &LinuxVm,
+        operation: &str,
+    ) -> Result<(), OciError> {
         const SCRIPT: &str = r#"
 set -eu
 fail() { echo "$1" >&2; exit 1; }
@@ -961,7 +1076,7 @@ esac
             .await?;
         if output.exit_code != 0 {
             return Err(OciError::UnsupportedOperation {
-                operation: "ensure_shared_vm_docker_ready_exact".to_string(),
+                operation: operation.to_string(),
                 reason: format!(
                     "verified Developer Linux boot lacks the pinned iptables prerequisite: {}{}",
                     output.stdout, output.stderr
@@ -969,6 +1084,30 @@ esac
             });
         }
         Ok(())
+    }
+
+    async fn docker_readiness_for_record(
+        record: &super::StackVmRecord,
+        operation: &str,
+    ) -> Result<SharedVmDockerReadiness, OciError> {
+        let verified_profile = require_docker_provisioned_developer_profile(
+            record.verified_linux_profile,
+            record.docker_provisioned,
+            operation,
+        )?;
+        Self::verify_guest_docker_prerequisites(&record.vm, operation).await?;
+        let guest_socket_path = record.vm.ensure_docker_ready().await?;
+        if guest_socket_path != DOCKER_GUEST_SOCKET {
+            return Err(OciError::InvalidConfig(format!(
+                "Docker readiness returned unexpected guest socket path {guest_socket_path:?}"
+            )));
+        }
+        Self::verify_guest_docker_mounts(&record.vm).await?;
+        Ok(SharedVmDockerReadiness {
+            runtime_identity: record.identity.clone(),
+            verified_profile,
+            guest_socket_path,
+        })
     }
 
     /// Boot a shared VM for a multi-service stack.
@@ -996,6 +1135,17 @@ esac
             .await
             .write_owned()
             .await;
+        self.boot_shared_vm_locked(stack_id, ports, resources, None)
+            .await
+    }
+
+    async fn boot_shared_vm_locked(
+        &self,
+        stack_id: &str,
+        ports: Vec<PortMapping>,
+        resources: vz_runtime_contract::StackResourceHint,
+        required_profile: Option<KernelProfile>,
+    ) -> Result<(), OciError> {
         let _activation_guard = self.acquire_stack_activation_guard(stack_id).await;
 
         // Snapshot lock-protected counters into locals so the lock guards
@@ -1046,6 +1196,16 @@ esac
             );
         }
 
+        let kernel = ensure_kernel_for_config(&self.config).await?;
+        let verified_linux_profile = kernel_profile_from_metadata(&kernel.version);
+        if let Some(required_profile) = required_profile {
+            require_explicit_verified_profile(
+                Some(required_profile),
+                verified_linux_profile,
+                "boot_or_inspect_shared_vm",
+            )?;
+        }
+
         let rootfs_store = self.rootfs_store_dir();
         fs::create_dir_all(&rootfs_store)?;
 
@@ -1057,8 +1217,6 @@ esac
         let setup_commits = self.setup_commits_host_dir();
         fs::create_dir_all(&setup_commits)?;
 
-        let kernel = ensure_kernel_for_config(&self.config).await?;
-        let verified_linux_profile = kernel_profile_from_metadata(&kernel.version);
         let docker_provisioning = if self.config.linux_profile == Some(KernelProfile::Developer) {
             if verified_linux_profile != Some(KernelProfile::Developer) {
                 return Err(OciError::UnsupportedOperation {
@@ -1310,6 +1468,8 @@ esac
                 identity: runtime_identity,
                 verified_linux_profile,
                 docker_provisioned: docker_provisioning.is_some(),
+                boot_ports: ports,
+                boot_resources: resources,
                 vm,
             },
         );
@@ -2387,6 +2547,77 @@ esac
             .map(|record| record.identity.clone()))
     }
 
+    /// Atomically boot or reuse one managed shared VM and retain exact
+    /// lifecycle ownership in the returned lease.
+    ///
+    /// This managed entrypoint requires an explicit Linux profile. An active
+    /// boot is reusable only when its verified artifact profile and complete
+    /// boot request match exactly. The write fence used for boot/inspection is
+    /// downgraded directly into the returned read lease, leaving no replacement
+    /// window between observation and subsequent readiness work.
+    pub async fn boot_or_inspect_shared_vm(
+        &self,
+        stack_id: &str,
+        ports: Vec<PortMapping>,
+        resources: vz_runtime_contract::StackResourceHint,
+    ) -> Result<SharedVmLifecycleLease, OciError> {
+        vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
+            .map_err(OciError::InvalidConfig)?;
+        let required_profile = require_explicit_verified_profile(
+            self.config.linux_profile,
+            self.config.linux_profile,
+            "boot_or_inspect_shared_vm",
+        )?;
+        let stack_lifecycle_guard = self
+            .stack_lifecycle_lock(stack_id)
+            .await
+            .write_owned()
+            .await;
+
+        let current = { self.stack_vms.lock().await.get(stack_id).cloned() };
+        let record = match current {
+            Some(record) => {
+                require_explicit_verified_profile(
+                    Some(required_profile),
+                    record.verified_linux_profile,
+                    "boot_or_inspect_shared_vm",
+                )?;
+                require_matching_shared_vm_boot_request(
+                    stack_id,
+                    &record.boot_ports,
+                    &record.boot_resources,
+                    &ports,
+                    &resources,
+                )?;
+                record
+            }
+            None => {
+                self.boot_shared_vm_locked(stack_id, ports, resources, Some(required_profile))
+                    .await?;
+                self.stack_vms
+                    .lock()
+                    .await
+                    .get(stack_id)
+                    .cloned()
+                    .ok_or_else(|| OciError::SharedRuntimeAbsent {
+                        stack_id: stack_id.to_string(),
+                    })?
+            }
+        };
+        let verified_profile = require_explicit_verified_profile(
+            Some(required_profile),
+            record.verified_linux_profile,
+            "boot_or_inspect_shared_vm",
+        )?;
+        let stack_lifecycle_guard = stack_lifecycle_guard.downgrade();
+        Ok(SharedVmLifecycleLease {
+            runtime_identity: record.identity,
+            verified_profile,
+            stack_vms: Arc::clone(&self.stack_vms),
+            _stack_lifecycle_guard: stack_lifecycle_guard,
+        })
+    }
+
     /// Start and health-check the private Docker Engine in one exact shared VM.
     ///
     /// The returned socket path is guest-local. This method does not create a
@@ -2407,25 +2638,7 @@ esac
                 stack_id: stack_id.to_string(),
             });
         };
-        let verified_profile = require_docker_provisioned_developer_profile(
-            current.verified_linux_profile,
-            current.docker_provisioned,
-            "ensure_shared_vm_docker_ready_exact",
-        )?;
-
-        Self::verify_guest_docker_prerequisites(&current.vm).await?;
-        let guest_socket_path = current.vm.ensure_docker_ready().await?;
-        if guest_socket_path != DOCKER_GUEST_SOCKET {
-            return Err(OciError::InvalidConfig(format!(
-                "Docker readiness returned unexpected guest socket path {guest_socket_path:?}"
-            )));
-        }
-        Self::verify_guest_docker_mounts(&current.vm).await?;
-        Ok(SharedVmDockerReadiness {
-            runtime_identity: current.identity,
-            verified_profile,
-            guest_socket_path,
-        })
+        Self::docker_readiness_for_record(&current, "ensure_shared_vm_docker_ready_exact").await
     }
 
     /// Atomically compare and stop exactly one shared-runtime boot.

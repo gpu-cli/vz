@@ -3266,6 +3266,15 @@ fn validate_machine_backend(
 }
 
 impl MachineInstance {
+    fn is_stopped_before_activation(&self) -> bool {
+        self.state == MachineState::Stopped
+            && self.backend.is_none()
+            && self.incarnation.is_none()
+            && self.runtime_identity.is_none()
+            && self.negotiated_capabilities.capabilities.is_empty()
+            && self.negotiated_capabilities.unsupported.is_empty()
+    }
+
     pub fn validate(&self) -> Result<(), TopologyValidationError> {
         validate_schema(self.schema_version)?;
         self.machine_id.validate()?;
@@ -3284,10 +3293,12 @@ impl MachineInstance {
             }
         }
         // Creation can fail before capability negotiation completes. Persist that
-        // failure record so reconciliation can diagnose or resume it; operational
-        // Ready/Stopped Machines still require a complete negotiation result.
-        let negotiation_complete =
-            matches!(self.state, MachineState::Ready | MachineState::Stopped);
+        // failure record so reconciliation can diagnose or resume it. A successful
+        // Stop after such a failure is also persistable, but only while every field
+        // established by activation remains absent. Ready and previously or
+        // partially activated Stopped Machines still require complete negotiation.
+        let negotiation_complete = self.state == MachineState::Ready
+            || (self.state == MachineState::Stopped && !self.is_stopped_before_activation());
         validate_machine_profile(
             self.machine_id.as_str(),
             self.profile,
@@ -3424,7 +3435,9 @@ fn validate_exact_topology_ownership(
                     ));
                 }
             }
-            None if matches!(machine.state, MachineState::Ready | MachineState::Stopped)
+            None if (machine.state == MachineState::Ready
+                || (machine.state == MachineState::Stopped
+                    && !machine.is_stopped_before_activation()))
                 && !has_exact_legacy_proof =>
             {
                 return Err(TopologyValidationError::InvalidMachineIncarnation {
@@ -4899,7 +4912,7 @@ mod tests {
     }
 
     #[test]
-    fn partial_creation_failure_persists_but_post_creation_states_remain_strict() {
+    fn failed_creation_can_stop_only_while_activation_evidence_is_entirely_absent() {
         let definition = project_definition();
         let creating = definition.instantiate_environment("agent", 42).unwrap();
 
@@ -4921,9 +4934,33 @@ mod tests {
         for machine in &mut stopped.machines {
             machine.state = MachineState::Stopped;
         }
+        stopped
+            .validate()
+            .expect("a stopped Machine that never activated must remain persistable");
+
+        let mut partial_backend = stopped.clone();
+        partial_backend.machines[0].backend = Some(fixture_backend(&partial_backend.machines[0]));
         assert!(matches!(
-            stopped.validate(),
+            partial_backend.validate(),
             Err(TopologyValidationError::MissingCapability { .. })
+        ));
+
+        let mut partial_negotiation = stopped.clone();
+        partial_negotiation.machines[0].negotiated_capabilities =
+            CapabilitySet::new([MachineCapability::DockerEngine]);
+        assert!(matches!(
+            partial_negotiation.validate(),
+            Err(TopologyValidationError::MissingCapability { .. })
+        ));
+
+        let mut negotiated_without_incarnation = stopped.clone();
+        negotiated_without_incarnation.machines[0].negotiated_capabilities =
+            negotiated_without_incarnation.machines[0]
+                .requested_capabilities
+                .clone();
+        assert!(matches!(
+            negotiated_without_incarnation.validate(),
+            Err(TopologyValidationError::InvalidMachineIncarnation { .. })
         ));
 
         for machine in &mut stopped.machines {
@@ -4947,6 +4984,115 @@ mod tests {
                 Err(TopologyValidationError::DefinitionTopologyMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn failed_up_can_stop_without_activation_and_then_retry_up() {
+        let mut environment = project_definition()
+            .instantiate_environment("failed-up-stop", 450)
+            .unwrap();
+        let mut failed_up = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-failed-up",
+            "idem-failed-up",
+            "sha256:failed-up",
+            451,
+        )
+        .unwrap();
+        failed_up.begin(&mut environment, 452).unwrap();
+        for step in failed_up.machine_steps.clone() {
+            let acknowledgement = machine_acknowledgement(
+                &failed_up,
+                &environment,
+                &step,
+                LifecycleStepResult::Failed {
+                    reason: "backend refused activation".to_string(),
+                },
+                None,
+            );
+            failed_up
+                .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 453)
+                .unwrap();
+        }
+        assert_eq!(
+            failed_up
+                .finish_live_transition(&mut environment, 454)
+                .unwrap(),
+            EnvironmentState::Failed
+        );
+
+        let mut stop = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Stop,
+            "req-stop-never-activated",
+            "idem-stop-never-activated",
+            "sha256:stop-never-activated",
+            455,
+        )
+        .unwrap();
+        stop.begin(&mut environment, 456).unwrap();
+        for step in stop.machine_steps.clone() {
+            let acknowledgement = machine_acknowledgement(
+                &stop,
+                &environment,
+                &step,
+                LifecycleStepResult::Succeeded,
+                None,
+            );
+            stop.apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 457)
+                .unwrap();
+        }
+        assert_eq!(
+            stop.finish_live_transition(&mut environment, 458).unwrap(),
+            EnvironmentState::Stopped
+        );
+        assert!(environment.machines.iter().all(|machine| {
+            machine.state == MachineState::Stopped
+                && machine.backend.is_none()
+                && machine.incarnation.is_none()
+                && machine.runtime_identity.is_none()
+                && machine.negotiated_capabilities == CapabilitySet::default()
+        }));
+
+        let mut retry_up = EnvironmentLifecycleOperation::plan(
+            &environment,
+            LifecycleOperationId::generate(),
+            EnvironmentLifecycleKind::Up,
+            "req-retry-up",
+            "idem-retry-up",
+            "sha256:retry-up",
+            459,
+        )
+        .unwrap();
+        retry_up.begin(&mut environment, 460).unwrap();
+        for (index, step) in retry_up.machine_steps.clone().into_iter().enumerate() {
+            let incarnation = MachineIncarnation {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                incarnation_id: MachineIncarnationId::new(format!("inc_retry_up_{index}")).unwrap(),
+                machine_id: step.machine_id.clone(),
+                generation: 1,
+                created_at: 461,
+            };
+            let acknowledgement = machine_acknowledgement(
+                &retry_up,
+                &environment,
+                &step,
+                LifecycleStepResult::Succeeded,
+                Some(incarnation),
+            );
+            retry_up
+                .apply_machine_step_acknowledgement(&mut environment, &acknowledgement, 461)
+                .unwrap();
+        }
+        assert_eq!(
+            retry_up
+                .finish_live_transition(&mut environment, 462)
+                .unwrap(),
+            EnvironmentState::Ready
+        );
     }
 
     #[test]

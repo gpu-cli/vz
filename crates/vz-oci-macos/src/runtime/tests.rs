@@ -17,7 +17,8 @@ use super::stack_vm::{
     clear_recovery_route_last, commit_stack_cleanup_batch, complete_private_disk_format,
     ensure_private_sparse_disk, hosts_write_command, kernel_profile_from_metadata,
     publish_recovery_route_first, require_docker_provisioned_developer_profile,
-    require_exact_stack_runtime, require_running_pid, require_successful_hosts_write,
+    require_exact_stack_runtime, require_explicit_verified_profile,
+    require_matching_shared_vm_boot_request, require_running_pid, require_successful_hosts_write,
     shutdown_container_cleanup_transition,
 };
 use super::*;
@@ -94,6 +95,203 @@ fn docker_profile_is_derived_from_actual_kernel_metadata() {
     );
     version.profile = None;
     assert_eq!(kernel_profile_from_metadata(&version), None);
+}
+
+#[test]
+fn managed_shared_vm_requires_the_exact_explicit_verified_profile() {
+    assert_eq!(
+        require_explicit_verified_profile(
+            Some(KernelProfile::Developer),
+            Some(KernelProfile::Developer),
+            "test",
+        )
+        .unwrap(),
+        KernelProfile::Developer
+    );
+    for (configured, verified) in [
+        (None, Some(KernelProfile::Developer)),
+        (Some(KernelProfile::Developer), None),
+        (
+            Some(KernelProfile::Developer),
+            Some(KernelProfile::Container),
+        ),
+    ] {
+        assert!(matches!(
+            require_explicit_verified_profile(configured, verified, "test"),
+            Err(OciError::UnsupportedOperation { .. })
+        ));
+    }
+}
+
+#[tokio::test]
+async fn managed_shared_vm_missing_profile_fails_before_runtime_filesystem_effects() {
+    fn snapshot_tree(root: &Path) -> Vec<(PathBuf, bool, Vec<u8>)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, bool, Vec<u8>)>) {
+            for entry in fs::read_dir(path).unwrap() {
+                let entry = entry.unwrap();
+                let path = entry.path();
+                let metadata = fs::symlink_metadata(&path).unwrap();
+                let is_dir = metadata.file_type().is_dir();
+                entries.push((
+                    path.strip_prefix(root).unwrap().to_path_buf(),
+                    is_dir,
+                    if metadata.file_type().is_file() {
+                        fs::read(&path).unwrap()
+                    } else {
+                        Vec::new()
+                    },
+                ));
+                if is_dir {
+                    visit(root, &path, entries);
+                }
+            }
+        }
+
+        let mut entries = Vec::new();
+        if root.is_dir() {
+            visit(root, root, &mut entries);
+        }
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    let root = unique_temp_dir("managed-shared-vm-missing-profile");
+    let data_dir = root.join("must-not-be-created");
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: data_dir.clone(),
+        linux_profile: None,
+        ..RuntimeConfig::default()
+    });
+    let before = snapshot_tree(&data_dir);
+    let result = runtime
+        .boot_or_inspect_shared_vm(
+            "machine-no-profile",
+            Vec::new(),
+            vz_runtime_contract::StackResourceHint::default(),
+        )
+        .await;
+    let error = match result {
+        Err(error) => error,
+        Ok(_) => panic!("managed acquisition accepted a missing explicit profile"),
+    };
+    assert!(matches!(error, OciError::UnsupportedOperation { .. }));
+    assert_eq!(snapshot_tree(&data_dir), before);
+    drop(runtime);
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
+    let ports = vec![PortMapping {
+        host: 8042,
+        container: 42,
+        protocol: PortProtocol::Tcp,
+        target_host: Some("172.30.0.2".to_string()),
+    }];
+    let resources = vz_runtime_contract::StackResourceHint {
+        cpus: Some(4),
+        memory_mb: Some(8192),
+        volume_mounts: vec![vz_runtime_contract::StackVolumeMount {
+            tag: "vz-mount-0".to_string(),
+            host_path: std::path::PathBuf::from("/tmp/vz-machine-workspace"),
+            guest_path: Some("/workspace".to_string()),
+            read_only: false,
+        }],
+        disk_image_path: Some(std::path::PathBuf::from("/tmp/vz-machine-volume.img")),
+    };
+    assert!(
+        require_matching_shared_vm_boot_request(
+            "machine-a",
+            &ports,
+            &resources,
+            &ports,
+            &resources,
+        )
+        .is_ok()
+    );
+
+    let mut drifted_ports = ports.clone();
+    drifted_ports[0].host += 1;
+    let mut drifted_cpus = resources.clone();
+    drifted_cpus.cpus = Some(5);
+    let mut drifted_memory = resources.clone();
+    drifted_memory.memory_mb = Some(4096);
+    let mut drifted_mounts = resources.clone();
+    drifted_mounts.volume_mounts[0].read_only = true;
+    let mut drifted_disk = resources.clone();
+    drifted_disk.disk_image_path = None;
+    for (requested_ports, requested_resources) in [
+        (drifted_ports, resources.clone()),
+        (ports.clone(), drifted_cpus),
+        (ports.clone(), drifted_memory),
+        (ports.clone(), drifted_mounts),
+        (ports.clone(), drifted_disk),
+    ] {
+        let error = require_matching_shared_vm_boot_request(
+            "machine-a",
+            &ports,
+            &resources,
+            &requested_ports,
+            &requested_resources,
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("boot request drift"));
+        assert_eq!(ports[0].host, 8042, "drift check mutated active ports");
+        assert_eq!(resources.cpus, Some(4), "drift check mutated active CPU");
+        assert_eq!(
+            resources.memory_mb,
+            Some(8192),
+            "drift check mutated active memory"
+        );
+        assert!(!resources.volume_mounts[0].read_only);
+        assert!(resources.disk_image_path.is_some());
+    }
+}
+
+#[tokio::test]
+async fn shared_vm_lifecycle_lease_blocks_exact_shutdown_until_drop() {
+    let runtime = Runtime::new(RuntimeConfig {
+        data_dir: unique_temp_dir("shared-vm-lifecycle-lease"),
+        linux_profile: Some(KernelProfile::Developer),
+        ..RuntimeConfig::default()
+    });
+    let identity = vz_runtime_contract::StackRuntimeIdentity::new("machine-lease").unwrap();
+    let lease = SharedVmLifecycleLease {
+        runtime_identity: identity.clone(),
+        verified_profile: KernelProfile::Developer,
+        stack_vms: Arc::clone(&runtime.stack_vms),
+        _stack_lifecycle_guard: runtime
+            .stack_lifecycle_lock(&identity.stack_id)
+            .await
+            .read_owned()
+            .await,
+    };
+    assert_eq!(lease.runtime_identity(), &identity);
+    assert_eq!(lease.verified_profile(), KernelProfile::Developer);
+
+    let shutdown_runtime = runtime.clone();
+    let request = vz_runtime_contract::StackRuntimeShutdownRequest {
+        schema_version: vz_runtime_contract::STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+        operation_id: "op-lease-shutdown".to_string(),
+        expected: identity,
+    };
+    let mut shutdown =
+        tokio::spawn(async move { shutdown_runtime.shutdown_shared_vm_exact(&request).await });
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut shutdown)
+            .await
+            .is_err(),
+        "exact shutdown crossed the live shared-VM lease"
+    );
+    drop(lease);
+    assert_eq!(
+        tokio::time::timeout(Duration::from_secs(1), shutdown)
+            .await
+            .expect("shutdown stayed blocked after lease drop")
+            .unwrap()
+            .unwrap(),
+        vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent
+    );
 }
 
 #[test]

@@ -6543,6 +6543,156 @@ fn delete_supersedes_non_delete_and_resource_reservation_obeys_fence() {
 }
 
 #[test]
+fn failed_first_up_can_stop_without_activation_reopen_and_retry() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("failed-first-up-stop.db");
+    let template = topology_project_state("prj_failed_first_up", &["template"], "/checkout");
+    let mut definition = template.definition;
+    definition.environment.machines[0].workspace = None;
+    let environment = definition.instantiate_environment("fresh", 780).unwrap();
+    let environment_id = environment.environment_id.clone();
+    let machine_id = environment.machines[0].machine_id.clone();
+
+    let store = StateStore::open(&path).unwrap();
+    store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![environment],
+        })
+        .unwrap();
+
+    let failed_up = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-failed-first-up",
+            "idem-failed-first-up",
+            "sha256:failed-first-up",
+            781,
+        )
+        .unwrap();
+    let step = failed_up.machine_steps[0].clone();
+    let failed_up = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: failed_up.operation_id.clone(),
+                generation: failed_up.generation,
+                machine_id: machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: None,
+                resulting_incarnation: None,
+                resulting_activation: None,
+                result: LifecycleStepResult::Failed {
+                    reason: "backend refused activation".to_string(),
+                },
+            },
+            782,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(failed_up.operation_id.as_str(), failed_up.generation, 783)
+        .unwrap();
+
+    let stop = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Stop,
+            "req-stop-never-activated",
+            "idem-stop-never-activated",
+            "sha256:stop-never-activated",
+            784,
+        )
+        .unwrap();
+    let step = stop.machine_steps[0].clone();
+    let stop = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: stop.operation_id.clone(),
+                generation: stop.generation,
+                machine_id: machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: None,
+                resulting_incarnation: None,
+                resulting_activation: None,
+                result: LifecycleStepResult::Succeeded,
+            },
+            785,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(stop.operation_id.as_str(), stop.generation, 786)
+        .unwrap();
+    drop(store);
+
+    let store = StateStore::open(&path).unwrap();
+    let stopped = store
+        .load_project_state("prj_failed_first_up")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(stopped.state, EnvironmentState::Stopped);
+    assert_eq!(stopped.machines[0].state, MachineState::Stopped);
+    assert_eq!(stopped.machines[0].backend, None);
+    assert_eq!(stopped.machines[0].incarnation, None);
+    assert_eq!(stopped.machines[0].runtime_identity, None);
+    assert_eq!(
+        stopped.machines[0].negotiated_capabilities,
+        CapabilitySet::default()
+    );
+
+    let retry_up = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-retry-first-up",
+            "idem-retry-first-up",
+            "sha256:retry-first-up",
+            787,
+        )
+        .unwrap();
+    let step = retry_up.machine_steps[0].clone();
+    let incarnation = MachineIncarnation {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        incarnation_id: MachineIncarnationId::new("inc_retry_first_up").unwrap(),
+        machine_id,
+        generation: 1,
+        created_at: 788,
+    };
+    let retry_up = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: retry_up.operation_id.clone(),
+                generation: retry_up.generation,
+                machine_id: incarnation.machine_id.clone(),
+                initial_state: step.initial_state,
+                target_state: step.target_state,
+                expected_incarnation: None,
+                resulting_incarnation: Some(incarnation.clone()),
+                resulting_activation: Some(test_activation(incarnation)),
+                result: LifecycleStepResult::Succeeded,
+            },
+            788,
+        )
+        .unwrap();
+    store
+        .finish_environment_lifecycle(retry_up.operation_id.as_str(), retry_up.generation, 789)
+        .unwrap();
+    let ready = store
+        .load_project_state("prj_failed_first_up")
+        .unwrap()
+        .unwrap()
+        .environments
+        .remove(0);
+    assert_eq!(ready.state, EnvironmentState::Ready);
+    assert_eq!(ready.machines[0].state, MachineState::Ready);
+    assert!(ready.machines[0].runtime_identity.is_some());
+}
+
+#[test]
 fn successful_up_persists_first_and_replacement_incarnation_ownership_exactly() {
     let store = StateStore::in_memory().unwrap();
     let template = topology_project_state("prj_incarnation", &["template"], "/checkout");
@@ -13772,6 +13922,388 @@ fn owned_resource_reservation_is_idempotent_and_foreign_collision_rolls_back() {
         store.load_project_state("prj_resources").unwrap(),
         Some(after_idempotent)
     );
+}
+
+#[test]
+fn exact_owned_resource_requirement_is_read_only_for_live_states_and_reopen() {
+    let ready_store = StateStore::in_memory().unwrap();
+    let ready = topology_project_state("prj_require_ready", &["ready"], "/checkout");
+    let ready_ownership = ready.environments[0]
+        .ownership
+        .iter()
+        .find(|record| record.resource_kind == OwnedResourceKind::Machine)
+        .unwrap()
+        .clone();
+    ready_store.save_project_state(&ready).unwrap();
+    let ready_changes = ready_store.total_changes_for_test();
+    assert_eq!(
+        ready_store
+            .require_owned_resource(&ready_ownership)
+            .unwrap(),
+        ready_ownership
+    );
+    assert_eq!(ready_store.total_changes_for_test(), ready_changes);
+
+    let creating_store = StateStore::in_memory().unwrap();
+    let template = topology_project_state("prj_require_creating", &["template"], "/checkout");
+    let definition = template.definition;
+    let creating_environment = definition.instantiate_environment("creating", 100).unwrap();
+    let creating_ownership = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-creating-private-disk".to_string(),
+        environment_id: creating_environment.environment_id.clone(),
+        machine_id: Some(creating_environment.machines[0].machine_id.clone()),
+    };
+    creating_store
+        .save_project_state(&ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![creating_environment],
+        })
+        .unwrap();
+    creating_store
+        .reserve_owned_resource(&creating_ownership, 101)
+        .unwrap();
+    let creating_changes = creating_store.total_changes_for_test();
+    assert_eq!(
+        creating_store
+            .require_owned_resource(&creating_ownership)
+            .unwrap(),
+        creating_ownership
+    );
+    assert_eq!(creating_store.total_changes_for_test(), creating_changes);
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("require-owned-resource.db");
+    let stopped_ownership = {
+        let store = StateStore::open(&path).unwrap();
+        let mut stopped = topology_project_state("prj_require_stopped", &["stopped"], "/checkout");
+        stopped.environments[0].state = EnvironmentState::Stopped;
+        stopped.environments[0].machines[0].state = MachineState::Stopped;
+        let ownership = stopped.environments[0]
+            .ownership
+            .iter()
+            .find(|record| record.resource_kind == OwnedResourceKind::Machine)
+            .unwrap()
+            .clone();
+        store.save_project_state(&stopped).unwrap();
+        let changes = store.total_changes_for_test();
+        assert_eq!(store.require_owned_resource(&ownership).unwrap(), ownership);
+        assert_eq!(store.total_changes_for_test(), changes);
+        ownership
+    };
+
+    let reopened = StateStore::open(&path).unwrap();
+    let reopened_changes = reopened.total_changes_for_test();
+    assert_eq!(
+        reopened.require_owned_resource(&stopped_ownership).unwrap(),
+        stopped_ownership
+    );
+    assert_eq!(reopened.total_changes_for_test(), reopened_changes);
+}
+
+#[test]
+fn exact_owned_resource_requirement_validates_active_up_and_rejects_nonowners_without_writes() {
+    let store = StateStore::in_memory().unwrap();
+    let project =
+        topology_project_state("prj_require_active_up", &["owner", "foreign"], "/checkout");
+    let owner = &project.environments[0];
+    let ownership = OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Disk,
+        resource_id: "vzr1-active-up-private-disk".to_string(),
+        environment_id: owner.environment_id.clone(),
+        machine_id: Some(owner.machines[0].machine_id.clone()),
+    };
+    let foreign_environment = project.environments[1].environment_id.clone();
+    let foreign_machine = project.environments[1].machines[0].machine_id.clone();
+    store.save_project_state(&project).unwrap();
+    store.reserve_owned_resource(&ownership, 299).unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            owner.environment_id.as_str(),
+            EnvironmentLifecycleKind::Up,
+            "req-require-active-up",
+            "idem-require-active-up",
+            "sha256:require-active-up",
+            300,
+        )
+        .unwrap();
+    assert_eq!(operation.status, EnvironmentLifecycleStatus::Running);
+
+    let changes = store.total_changes_for_test();
+    assert_eq!(store.require_owned_resource(&ownership).unwrap(), ownership);
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let foreign = OwnershipRecord {
+        environment_id: foreign_environment,
+        machine_id: Some(foreign_machine),
+        ..ownership.clone()
+    };
+    let error = store.require_owned_resource(&foreign).unwrap_err();
+    assert!(matches!(error, StackError::OwnedResourceCollision(_)));
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let stale = OwnershipRecord {
+        schema_version: 0,
+        ..ownership.clone()
+    };
+    let error = store.require_owned_resource(&stale).unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::StateConflict,
+            ..
+        }
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let missing = OwnershipRecord {
+        resource_id: "vzr1-missing-owned-resource".to_string(),
+        ..ownership
+    };
+    let error = store.require_owned_resource(&missing).unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::Machine {
+            code: MachineErrorCode::NotFound,
+            ..
+        }
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+}
+
+#[test]
+fn current_machine_lifecycle_fence_is_exact_read_only_and_survives_reopen() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("current-machine-lifecycle-fence.db");
+    let (operation, step, ownership, foreign_collision, missing) = {
+        let store = StateStore::open(&path).unwrap();
+        let project = topology_project_state(
+            "prj_machine_lifecycle_fence",
+            &["owner", "foreign"],
+            "/checkout",
+        );
+        let owner = &project.environments[0];
+        let machine_ownership = owner
+            .ownership
+            .iter()
+            .find(|record| record.resource_kind == OwnedResourceKind::Machine)
+            .unwrap()
+            .clone();
+        let disk_ownership = OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Disk,
+            resource_id: "vzr1-machine-lifecycle-fence-disk".to_string(),
+            environment_id: owner.environment_id.clone(),
+            machine_id: Some(owner.machines[0].machine_id.clone()),
+        };
+        let foreign_existing = project.environments[1]
+            .ownership
+            .iter()
+            .find(|record| record.resource_kind == OwnedResourceKind::Machine)
+            .unwrap()
+            .clone();
+        let foreign_collision = OwnershipRecord {
+            environment_id: owner.environment_id.clone(),
+            machine_id: Some(owner.machines[0].machine_id.clone()),
+            ..foreign_existing
+        };
+        let missing = OwnershipRecord {
+            resource_kind: OwnedResourceKind::Socket,
+            resource_id: "vzr1-missing-machine-lifecycle-socket".to_string(),
+            ..disk_ownership.clone()
+        };
+        store.save_project_state(&project).unwrap();
+        store.reserve_owned_resource(&disk_ownership, 299).unwrap();
+        let operation = store
+            .begin_environment_lifecycle(
+                owner.environment_id.as_str(),
+                EnvironmentLifecycleKind::Up,
+                "req-machine-lifecycle-fence",
+                "idem-machine-lifecycle-fence",
+                "sha256:machine-lifecycle-fence",
+                300,
+            )
+            .unwrap();
+        let step = operation.machine_steps[0].clone();
+        (
+            operation,
+            step,
+            vec![machine_ownership, disk_ownership],
+            foreign_collision,
+            missing,
+        )
+    };
+
+    let store = StateStore::open(&path).unwrap();
+    let changes = store.total_changes_for_test();
+    let (environment, current) = store
+        .require_current_machine_lifecycle_fence(&operation, &step, &ownership)
+        .unwrap();
+    assert_eq!(current, operation);
+    assert_eq!(environment.environment_id, operation.environment_id);
+    assert_eq!(
+        environment.active_operation_id,
+        Some(operation.operation_id.clone())
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let mut stale_generation = operation.clone();
+    stale_generation.generation += 1;
+    let error = store
+        .require_current_machine_lifecycle_fence(&stale_generation, &step, &ownership)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::TopologyLifecycle(error)
+            if matches!(*error, vz_runtime_contract::types::TopologyLifecycleError::GenerationMismatch { .. })
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let mut wrong_kind = operation.clone();
+    wrong_kind.kind = EnvironmentLifecycleKind::Stop;
+    wrong_kind.requested_target = EnvironmentState::Stopped;
+    wrong_kind.machine_steps[0].target_state = Some(MachineState::Stopped);
+    let wrong_kind_step = wrong_kind.machine_steps[0].clone();
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&wrong_kind, &wrong_kind_step, &ownership)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let mut wrong_definition = operation.clone();
+    wrong_definition.definition_digest = "sha256:foreign-definition".to_string();
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&wrong_definition, &step, &ownership)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&operation, &step, &[])
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let duplicate = [ownership[0].clone(), ownership[0].clone()];
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&operation, &step, &duplicate)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let with_foreign_second = [ownership[0].clone(), foreign_collision];
+    assert!(matches!(
+        store
+            .require_current_machine_lifecycle_fence(&operation, &step, &with_foreign_second)
+            .unwrap_err(),
+        StackError::OwnedResourceCollision(_)
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let with_missing_second = [ownership[0].clone(), missing];
+    assert!(matches!(
+        store
+            .require_current_machine_lifecycle_fence(&operation, &step, &with_missing_second)
+            .unwrap_err(),
+        StackError::Machine {
+            code: MachineErrorCode::NotFound,
+            ..
+        }
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+}
+
+#[test]
+fn current_machine_lifecycle_fence_rejects_advanced_terminal_and_detached_state_read_only() {
+    let store = StateStore::in_memory().unwrap();
+    let project = topology_project_state("prj_machine_fence_advanced", &["owner"], "/checkout");
+    let ownership = project.environments[0]
+        .ownership
+        .iter()
+        .filter(|record| record.machine_id.is_some())
+        .cloned()
+        .collect::<Vec<_>>();
+    store.save_project_state(&project).unwrap();
+    let operation = store
+        .begin_environment_lifecycle(
+            "env_owner",
+            EnvironmentLifecycleKind::Up,
+            "req-machine-fence-advanced",
+            "idem-machine-fence-advanced",
+            "sha256:machine-fence-advanced",
+            300,
+        )
+        .unwrap();
+    let pending_step = operation.machine_steps[0].clone();
+    let incarnation = pending_step.expected_incarnation.clone().unwrap();
+    let acknowledged = store
+        .acknowledge_environment_machine_step(
+            &MachineLifecycleStepAcknowledgement {
+                operation_id: operation.operation_id.clone(),
+                generation: operation.generation,
+                machine_id: pending_step.machine_id.clone(),
+                initial_state: pending_step.initial_state,
+                target_state: pending_step.target_state,
+                expected_incarnation: pending_step.expected_incarnation.clone(),
+                resulting_incarnation: Some(incarnation.clone()),
+                resulting_activation: Some(test_activation(incarnation)),
+                result: LifecycleStepResult::Succeeded,
+            },
+            301,
+        )
+        .unwrap();
+    let changes = store.total_changes_for_test();
+
+    let error = store
+        .require_current_machine_lifecycle_fence(&operation, &pending_step, &ownership)
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        StackError::TopologyLifecycle(error)
+            if matches!(*error, vz_runtime_contract::types::TopologyLifecycleError::MachineStepMismatch { .. })
+    ));
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let acknowledged_step = acknowledged.machine_steps[0].clone();
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&acknowledged, &acknowledged_step, &ownership)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), changes);
+
+    let terminal = store
+        .finish_environment_lifecycle(
+            acknowledged.operation_id.as_str(),
+            acknowledged.generation,
+            302,
+        )
+        .unwrap();
+    let terminal_changes = store.total_changes_for_test();
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(
+                &terminal,
+                &terminal.machine_steps[0],
+                &ownership,
+            )
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), terminal_changes);
+
+    assert!(
+        store
+            .require_current_machine_lifecycle_fence(&operation, &pending_step, &ownership)
+            .is_err()
+    );
+    assert_eq!(store.total_changes_for_test(), terminal_changes);
 }
 
 #[test]

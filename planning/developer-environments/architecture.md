@@ -142,6 +142,11 @@ BuildKit state, image/volume stores, networks, credentials, endpoint, and Docker
 context. Even Machines in the same Environment cannot share a daemon implicitly.
 Shared registries/caches must be declared topology resources.
 
+Private runtime-store admission, recovery ownership checks and atomic Linux
+boot leases are specified in
+[`machine-runtime-admission.md`](machine-runtime-admission.md). These are
+infrastructure boundaries, not evidence that production topology Up is complete.
+
 The Engine Endpoint Adapter authorizes and routes each request by
 `(environment_id, machine_id)`, preserves Docker streaming/hijacking semantics,
 and performs only narrowly authorized host-path translation. `vz status`

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
@@ -7,7 +7,7 @@ use vz_runtime_contract::types::{
     EnvironmentLifecycleStatus, EnvironmentSelection, EnvironmentSelectionContext,
     EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision, LegacyMigrationError,
     LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus, MachineInstance,
-    MachineLifecycleStepAcknowledgement, NetworkInstance, OwnedResourceKind,
+    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, NetworkInstance, OwnedResourceKind,
     OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition, ProjectState,
     TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError, WorkspaceBinding,
     migrate_legacy_developer_sandbox,
@@ -2252,6 +2252,347 @@ impl StateStore {
             store.update_environment_parent_cas(&before, &environment)?;
             Ok(requested.clone())
         })
+    }
+
+    /// Require one exact persisted ownership edge without reserving or mutating it.
+    ///
+    /// The ownership row, its Environment aggregate, and any attached lifecycle
+    /// journal are validated from one deferred SQLite snapshot. This is only a
+    /// read-side identity assertion: it grants no authority to perform effects.
+    /// Callers must independently fence lifecycle operation and generation before
+    /// mutating a physical resource.
+    pub fn require_owned_resource(
+        &self,
+        expected: &OwnershipRecord,
+    ) -> Result<OwnershipRecord, StackError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        let existing = self.require_exact_owned_resource_row(expected)?;
+        self.require_owned_resource_parent(expected)?;
+
+        transaction.commit()?;
+        Ok(existing)
+    }
+
+    /// Require an exact current Machine lifecycle fence and all supplied resources.
+    ///
+    /// The Environment aggregate, active operation journal, exact Machine step,
+    /// and every ownership row are checked in one deferred SQLite read snapshot.
+    /// `expected_ownership` must be nonempty, duplicate-free, and entirely scoped
+    /// to the Machine in `expected_step`.
+    ///
+    /// This is an instantaneous read assertion, not authority for a later effect.
+    /// The caller must hold its per-Environment controller serialization across
+    /// this check and the corresponding physical operation.
+    pub fn require_current_machine_lifecycle_fence(
+        &self,
+        expected_operation: &EnvironmentLifecycleOperation,
+        expected_step: &MachineLifecycleStep,
+        expected_ownership: &[OwnershipRecord],
+    ) -> Result<(EnvironmentInstance, EnvironmentLifecycleOperation), StackError> {
+        let transaction = self.conn.unchecked_transaction()?;
+        if expected_operation.status != EnvironmentLifecycleStatus::Running {
+            return Err(TopologyLifecycleError::InvalidOperation {
+                reason: format!(
+                    "expected lifecycle operation `{}` must be Running, found {:?}",
+                    expected_operation.operation_id, expected_operation.status
+                ),
+            }
+            .into());
+        }
+        expected_operation.validate_structure()?;
+        let expected_operation_step = expected_operation
+            .machine_steps
+            .iter()
+            .find(|step| step.machine_id == expected_step.machine_id)
+            .ok_or_else(|| TopologyLifecycleError::MachineStepNotFound {
+                operation_id: expected_operation.operation_id.to_string(),
+                machine_id: expected_step.machine_id.to_string(),
+            })?;
+        if expected_operation_step != expected_step
+            || !matches!(
+                expected_step.status,
+                LifecycleStepStatus::Pending | LifecycleStepStatus::Running
+            )
+        {
+            return Err(TopologyLifecycleError::MachineStepMismatch {
+                machine_id: expected_step.machine_id.to_string(),
+            }
+            .into());
+        }
+        if expected_ownership.is_empty() {
+            return Err(TopologyLifecycleError::InvalidOperation {
+                reason: format!(
+                    "Machine `{}` lifecycle fence requires at least one owned resource",
+                    expected_step.machine_id
+                ),
+            }
+            .into());
+        }
+        let mut ownership_keys = BTreeSet::new();
+        for ownership in expected_ownership {
+            if ownership.environment_id != expected_operation.environment_id
+                || ownership.machine_id.as_ref() != Some(&expected_step.machine_id)
+            {
+                return Err(TopologyLifecycleError::InvalidOperation {
+                    reason: format!(
+                        "owned resource `{:?}:{}` is not scoped to Machine `{}` in Environment `{}`",
+                        ownership.resource_kind,
+                        ownership.resource_id,
+                        expected_step.machine_id,
+                        expected_operation.environment_id
+                    ),
+                }
+                .into());
+            }
+            if !ownership_keys.insert((
+                ownership.resource_kind.clone(),
+                ownership.resource_id.as_str(),
+            )) {
+                return Err(TopologyLifecycleError::InvalidOperation {
+                    reason: format!(
+                        "duplicate owned resource `{:?}:{}` in Machine `{}` lifecycle fence",
+                        ownership.resource_kind, ownership.resource_id, expected_step.machine_id
+                    ),
+                }
+                .into());
+            }
+        }
+
+        let environment = self
+            .load_environment_instance(expected_operation.environment_id.as_str())?
+            .ok_or_else(|| environment_not_found(expected_operation.environment_id.as_str()))?;
+        let active_operation_id = environment.active_operation_id.as_ref().ok_or_else(|| {
+            TopologyLifecycleError::OperationMismatch {
+                environment_id: environment.environment_id.to_string(),
+                expected: "active operation".to_string(),
+                found: expected_operation.operation_id.to_string(),
+            }
+        })?;
+        if active_operation_id != &expected_operation.operation_id {
+            return Err(TopologyLifecycleError::OperationMismatch {
+                environment_id: environment.environment_id.to_string(),
+                expected: active_operation_id.to_string(),
+                found: expected_operation.operation_id.to_string(),
+            }
+            .into());
+        }
+        let current_operation = self
+            .load_environment_lifecycle(active_operation_id.as_str())?
+            .ok_or_else(|| operation_not_found(active_operation_id.as_str()))?;
+        current_operation.validate_against_environment(&environment)?;
+        if current_operation.status != EnvironmentLifecycleStatus::Running {
+            return Err(TopologyLifecycleError::InvalidOperation {
+                reason: format!(
+                    "current lifecycle operation `{}` must be Running, found {:?}",
+                    current_operation.operation_id, current_operation.status
+                ),
+            }
+            .into());
+        }
+        if current_operation.generation != expected_operation.generation {
+            return Err(TopologyLifecycleError::GenerationMismatch {
+                operation_id: current_operation.operation_id.to_string(),
+                expected: current_operation.generation,
+                found: expected_operation.generation,
+            }
+            .into());
+        }
+        if current_operation.kind != expected_operation.kind
+            || current_operation.project_id != expected_operation.project_id
+            || current_operation.environment_id != expected_operation.environment_id
+            || current_operation.definition_digest != expected_operation.definition_digest
+        {
+            return Err(TopologyLifecycleError::InvalidOperation {
+                reason: format!(
+                    "expected lifecycle operation `{}` does not match the current Project/Environment/kind/definition fence",
+                    expected_operation.operation_id
+                ),
+            }
+            .into());
+        }
+        let current_step = current_operation
+            .machine_steps
+            .iter()
+            .find(|step| step.machine_id == expected_step.machine_id)
+            .ok_or_else(|| TopologyLifecycleError::MachineStepNotFound {
+                operation_id: current_operation.operation_id.to_string(),
+                machine_id: expected_step.machine_id.to_string(),
+            })?;
+        if current_step != expected_step
+            || !matches!(
+                current_step.status,
+                LifecycleStepStatus::Pending | LifecycleStepStatus::Running
+            )
+        {
+            return Err(TopologyLifecycleError::MachineStepMismatch {
+                machine_id: expected_step.machine_id.to_string(),
+            }
+            .into());
+        }
+        for ownership in expected_ownership {
+            self.require_exact_owned_resource_row(ownership)?;
+            if !environment
+                .ownership
+                .iter()
+                .any(|record| record == ownership)
+            {
+                return Err(StackError::Machine {
+                    code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                    message: format!(
+                        "owned resource `{:?}:{}` is absent from Environment `{}`",
+                        ownership.resource_kind, ownership.resource_id, ownership.environment_id
+                    ),
+                });
+            }
+        }
+
+        transaction.commit()?;
+        Ok((environment, current_operation))
+    }
+
+    fn require_exact_owned_resource_row(
+        &self,
+        expected: &OwnershipRecord,
+    ) -> Result<OwnershipRecord, StackError> {
+        let encoded_kind = serde_json::to_string(&expected.resource_kind)?;
+        let row: Option<(String, String, String, Option<String>, i64, String)> = self
+            .conn
+            .query_row(
+                "SELECT resource_kind, resource_id, environment_id, machine_id,
+                        schema_version, record_json
+                 FROM topology_ownership
+                 WHERE resource_kind = ?1 AND resource_id = ?2",
+                params![encoded_kind, expected.resource_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            resource_kind,
+            resource_id,
+            sql_environment_id,
+            sql_machine_id,
+            schema_version,
+            json,
+        )) = row
+        else {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::NotFound,
+                message: format!(
+                    "owned resource `{:?}:{}` not found",
+                    expected.resource_kind, expected.resource_id
+                ),
+            });
+        };
+
+        let table = "topology_ownership";
+        let key = format!("{resource_kind}:{resource_id}");
+        let existing: OwnershipRecord = parse_persisted_json(table, &key, "record_json", &json)?;
+        require_projection(
+            resource_kind == serde_json::to_string(&existing.resource_kind)?,
+            table,
+            &key,
+            "resource_kind",
+        )?;
+        require_projection(
+            resource_id == existing.resource_id,
+            table,
+            &key,
+            "resource_id",
+        )?;
+        require_projection(
+            sql_environment_id == existing.environment_id.as_str(),
+            table,
+            &key,
+            "environment_id",
+        )?;
+        require_projection(
+            sql_machine_id.as_deref() == existing.machine_id.as_ref().map(|id| id.as_str()),
+            table,
+            &key,
+            "machine_id",
+        )?;
+        require_projection(
+            schema_version == i64::from(existing.schema_version),
+            table,
+            &key,
+            "schema_version",
+        )?;
+
+        if existing != *expected {
+            if existing.environment_id != expected.environment_id
+                || existing.machine_id != expected.machine_id
+            {
+                return Err(StackError::OwnedResourceCollision(Box::new(
+                    OwnedResourceCollisionError {
+                        resource_kind: encoded_kind,
+                        resource_id: expected.resource_id.clone(),
+                        existing_environment_id: existing.environment_id.to_string(),
+                        existing_machine_id: existing.machine_id.map(|id| id.to_string()),
+                    },
+                )));
+            }
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "owned resource `{:?}:{}` does not match its exact persisted record",
+                    expected.resource_kind, expected.resource_id
+                ),
+            });
+        }
+
+        Ok(existing)
+    }
+
+    fn require_owned_resource_parent(
+        &self,
+        expected: &OwnershipRecord,
+    ) -> Result<EnvironmentInstance, StackError> {
+        let environment = self
+            .load_environment_instance(expected.environment_id.as_str())?
+            .ok_or_else(|| environment_not_found(expected.environment_id.as_str()))?;
+        if !environment
+            .ownership
+            .iter()
+            .any(|record| record == expected)
+        {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "owned resource `{:?}:{}` is absent from Environment `{}`",
+                    expected.resource_kind, expected.resource_id, expected.environment_id
+                ),
+            });
+        }
+        if let Some(machine_id) = &expected.machine_id
+            && !environment
+                .machines
+                .iter()
+                .any(|machine| &machine.machine_id == machine_id)
+        {
+            return Err(StackError::Machine {
+                code: vz_runtime_contract::MachineErrorCode::StateConflict,
+                message: format!(
+                    "owned resource `{:?}:{}` references Machine `{machine_id}` outside Environment `{}`",
+                    expected.resource_kind, expected.resource_id, expected.environment_id
+                ),
+            });
+        }
+        if let Some(operation_id) = environment.active_operation_id.as_ref() {
+            let operation = self
+                .load_environment_lifecycle(operation_id.as_str())?
+                .ok_or_else(|| operation_not_found(operation_id.as_str()))?;
+            operation.validate_against_environment(&environment)?;
+        }
+        Ok(environment)
     }
 
     /// Persist and begin one generation-fenced Environment lifecycle operation.

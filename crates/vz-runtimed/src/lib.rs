@@ -4,6 +4,10 @@ mod btrfs_health;
 pub mod btrfs_portability;
 mod execution_sessions;
 mod grpc;
+#[cfg(target_os = "macos")]
+pub mod machine_runtime_activation;
+#[cfg(unix)]
+pub mod machine_runtime_registry;
 mod placement_scheduler;
 #[cfg(any(test, feature = "test-backend"))]
 mod test_backend;
@@ -136,6 +140,8 @@ pub struct DaemonHealth {
 pub struct RuntimeDaemon {
     config: RuntimedConfig,
     manager: WorkspaceRuntimeManager<PlatformBackend>,
+    #[cfg(unix)]
+    machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend>,
     state_store: Mutex<StateStore>,
     teardown_finalizer_locks: Mutex<HashMap<String, Weak<tokio::sync::Mutex<()>>>>,
     execution_sessions: ExecutionSessionRegistry,
@@ -315,6 +321,13 @@ impl RuntimeDaemon {
             )?;
 
         let manager = build_runtime_manager(&config.runtime_data_dir);
+        #[cfg(unix)]
+        let machine_runtime_registry =
+            machine_runtime_registry::MachineRuntimeRegistry::new(config.runtime_data_dir.clone())
+                .map_err(|source| RuntimedError::InitializeMachineRuntimeRegistry {
+                    path: config.runtime_data_dir.clone(),
+                    source,
+                })?;
         let placement_scheduler = PlacementScheduler::default();
         placement_scheduler
             .refresh(&state_store, current_unix_secs())
@@ -356,6 +369,8 @@ impl RuntimeDaemon {
         Ok(Self {
             config,
             manager,
+            #[cfg(unix)]
+            machine_runtime_registry,
             state_store: Mutex::new(state_store),
             teardown_finalizer_locks: Mutex::new(HashMap::new()),
             execution_sessions: ExecutionSessionRegistry::default(),
@@ -474,6 +489,19 @@ impl RuntimeDaemon {
     /// instead of mutating state-store entities directly.
     pub fn manager(&self) -> &WorkspaceRuntimeManager<PlatformBackend> {
         &self.manager
+    }
+
+    /// Private per-Machine store admission, separate from the legacy manager.
+    ///
+    /// This is infrastructure for the topology controller, not a lifecycle API.
+    /// Before admission the controller must validate the target/artifact
+    /// selection and exact persisted ownership reservation. Before backend
+    /// effects it must also fence the current lifecycle operation/generation.
+    #[cfg(unix)]
+    pub fn machine_runtime_registry(
+        &self,
+    ) -> &machine_runtime_registry::MachineRuntimeRegistry<PlatformBackend> {
+        &self.machine_runtime_registry
     }
 
     pub(crate) fn enforce_policy_preflight(
@@ -1150,6 +1178,13 @@ impl Drop for StartupLock {
 /// Daemon startup failures.
 #[derive(Debug, Error)]
 pub enum RuntimedError {
+    #[cfg(unix)]
+    #[error("failed to initialize private Machine runtime registry at {path}: {source}")]
+    InitializeMachineRuntimeRegistry {
+        path: PathBuf,
+        #[source]
+        source: machine_runtime_registry::MachineRuntimeRegistryError,
+    },
     #[error("failed to create state-store directory for {path}: {source}")]
     CreateStateStoreDir {
         path: PathBuf,
