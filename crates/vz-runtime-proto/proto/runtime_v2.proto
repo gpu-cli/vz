@@ -478,6 +478,10 @@ service TopologyService {
   // Disconnect cancels observation, not the admitted Stop. Replay with the
   // same request/idempotency IDs resumes the durable operation or its receipt.
   rpc StopEnvironment(StopEnvironmentRequest) returns (stream StopEnvironmentEvent);
+  // Delete traverses the exact Environment ownership graph. Disconnect ends
+  // observation only; exact request replay survives deletion/name reuse.
+  // Progress is bounded/coalescing: sequence strictly increases, gaps allowed.
+  rpc DeleteEnvironment(DeleteEnvironmentRequest) returns (stream DeleteEnvironmentEvent);
   // First frame opens one exact Machine execution. Subsequent frames control
   // only that execution; disconnect requests cancellation and terminal reap.
   rpc ExecMachine(stream MachineExecFrame) returns (stream MachineExecEvent);
@@ -627,6 +631,27 @@ message StopEnvironmentEvent {
   bool terminal = 5;
   // Present for a failed terminal operation, never a successful receipt.
   optional ErrorDetail error = 6;
+}
+
+message DeleteEnvironmentRequest {
+  RequestMetadata metadata = 1;
+  string project_id = 2;
+  optional string environment = 3;
+  optional string process_environment_id = 4;
+  optional string workspace_key = 5;
+  uint64 machine_timeout_millis = 6;
+}
+
+message DeleteEnvironmentEvent {
+  uint32 schema_version = 1;
+  string request_id = 2;
+  uint64 sequence = 3;
+  EnvironmentLifecycleOperation operation = 4;
+  bool terminal = 5;
+  optional ErrorDetail error = 6;
+  // Required only for successful terminal Delete. Exact owner, generation,
+  // operation, ownership digest and completion time must agree.
+  optional EnvironmentTombstone tombstone = 7;
 }
 
 message GetProjectStateRequest {

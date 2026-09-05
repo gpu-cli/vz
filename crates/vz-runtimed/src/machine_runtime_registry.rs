@@ -10,15 +10,18 @@ use std::fs::File;
 use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rustix::fs::{
-    AtFlags, FileType, Mode, OFlags, RenameFlags, fstat, mkdirat, openat, renameat_with, statat,
-    unlinkat,
+    AtFlags, FileType, Mode, OFlags, RenameFlags, fchmod, fstat, mkdirat, openat, renameat_with,
+    statat, unlinkat,
 };
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vz_runtime_contract::{
-    EnvironmentId, LifecycleOperationId, MachineId, OwnedResourceKind, OwnershipRecord, ProjectId,
+    EnvironmentId, EnvironmentLifecycleKind, EnvironmentLifecycleOperation, LifecycleOperationId,
+    MachineId, MachineIncarnation, MachineState, OwnedResourceKind, OwnershipRecord, ProjectId,
     ResourceOwner, TOPOLOGY_SCHEMA_VERSION,
 };
 
@@ -31,6 +34,14 @@ const PRIVATE_FILE: Mode = Mode::from_raw_mode(0o600);
 const MANIFEST_NAME: &str = "owner.json";
 const DATA_NAME: &str = "data";
 const MAX_MANIFEST_BYTES: u64 = 16 * 1024;
+const DELETE_NAMESPACE: &str = "topology-machine-deletions";
+const DELETE_INTENT: &str = "intent.json";
+const DELETE_RECEIPT: &str = "receipt.json";
+const DELETE_TREE: &str = "store";
+const MAX_DELETE_ENTRIES: usize = 1_000_000;
+const MAX_DELETE_DEPTH: usize = 128;
+const DELETE_WALK_LIMIT: Duration = Duration::from_secs(60);
+const MAX_DELETE_RECORD_BYTES: u64 = 256 * 1024;
 
 #[derive(Debug, Error)]
 pub enum MachineRuntimeRegistryError {
@@ -68,6 +79,179 @@ struct OwnerManifest {
     owner: ResourceOwner,
     reservation: OwnershipRecord,
     configuration_digest: String,
+}
+
+/// Filesystem identities, not path aliases, bound by a deletion receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineStoreFileIdentity {
+    pub device: u64,
+    pub inode: u64,
+}
+
+impl MachineStoreFileIdentity {
+    fn of(file: &File) -> Result<Self, MachineRuntimeRegistryError> {
+        Ok(Self::from_stat(&fstat(file)?))
+    }
+
+    #[allow(
+        clippy::unnecessary_cast,
+        reason = "libc dev_t and ino_t widths differ between supported hosts"
+    )]
+    fn from_stat(stat: &rustix::fs::Stat) -> Self {
+        Self {
+            device: stat.st_dev as u64,
+            inode: stat.st_ino as u64,
+        }
+    }
+
+    fn require(&self, file: &File) -> Result<(), MachineRuntimeRegistryError> {
+        if *self != Self::of(file)? {
+            return Err(delete_conflict("deletion directory identity changed"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeleteOperationIdentity {
+    operation_id: LifecycleOperationId,
+    generation: u64,
+    request_id: String,
+    idempotency_key: String,
+    request_hash: String,
+    definition_digest: String,
+    initial_machine_state: MachineState,
+    expected_incarnation: Option<MachineIncarnation>,
+}
+
+impl DeleteOperationIdentity {
+    fn from_operation(
+        manifest: &OwnerManifest,
+        operation: &EnvironmentLifecycleOperation,
+    ) -> Result<Self, MachineRuntimeRegistryError> {
+        operation.validate_structure().map_err(invalid)?;
+        let machine = manifest
+            .owner
+            .machine_id
+            .as_ref()
+            .ok_or_else(|| delete_conflict("missing Machine owner"))?;
+        if operation.kind != EnvironmentLifecycleKind::Delete
+            || operation.project_id != manifest.owner.project_id
+            || operation.environment_id != manifest.owner.environment_id
+            || !operation
+                .cleanup_steps
+                .iter()
+                .any(|step| step.ownership == manifest.reservation)
+        {
+            return Err(delete_conflict(
+                "Delete operation does not own this exact store",
+            ));
+        }
+        let step = operation
+            .machine_steps
+            .iter()
+            .find(|step| step.machine_id == *machine)
+            .ok_or_else(|| delete_conflict("Delete operation omits the exact Machine"))?;
+        Ok(Self {
+            operation_id: operation.operation_id.clone(),
+            generation: operation.generation,
+            request_id: operation.request_id.clone(),
+            idempotency_key: operation.idempotency_key.clone(),
+            request_hash: operation.request_hash.clone(),
+            definition_digest: operation.definition_digest.clone(),
+            initial_machine_state: step.initial_state,
+            expected_incarnation: step.expected_incarnation.clone(),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MachineStoreDeleteIntent {
+    schema_version: u32,
+    manifest: OwnerManifest,
+    operation: DeleteOperationIdentity,
+    root: MachineStoreFileIdentity,
+    namespace: MachineStoreFileIdentity,
+    store: MachineStoreFileIdentity,
+    data: MachineStoreFileIdentity,
+    quiescence: serde_json::Value,
+}
+
+/// Immutable evidence retained outside the deleted Machine store. It proves
+/// only the exact private runtime tree was removed, not external user data or
+/// the rest of the Environment ownership graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MachineStoreDeleteReceipt {
+    pub schema_version: u32,
+    pub owner: ResourceOwner,
+    pub operation_id: LifecycleOperationId,
+    pub generation: u64,
+    pub configuration_digest: String,
+    pub store: MachineStoreFileIdentity,
+    pub data: MachineStoreFileIdentity,
+    pub intent_sha256: String,
+    pub store_removed: bool,
+}
+
+/// A read-only, non-constructible claim about an exact current store or an
+/// already-admitted deletion. Absence alone never constructs this claim.
+pub(crate) struct MachineStoreDeletePreflight {
+    manifest: OwnerManifest,
+    registry_root: PathBuf,
+    lease: Option<Arc<MachineRuntimeStoreLease>>,
+    pending: Option<MachineStoreDeleteIntent>,
+}
+
+impl MachineStoreDeletePreflight {
+    pub(crate) fn owner(&self) -> &ResourceOwner {
+        &self.manifest.owner
+    }
+    pub(crate) fn configuration_digest(&self) -> &str {
+        &self.manifest.configuration_digest
+    }
+    pub(crate) fn lease(&self) -> Option<&Arc<MachineRuntimeStoreLease>> {
+        self.lease.as_ref()
+    }
+    pub(crate) fn quiescence_evidence(&self) -> Option<&serde_json::Value> {
+        self.pending.as_ref().map(|intent| &intent.quiescence)
+    }
+    pub(crate) fn delete_operation_id(&self) -> Option<&LifecycleOperationId> {
+        self.pending
+            .as_ref()
+            .map(|intent| &intent.operation.operation_id)
+    }
+    pub(crate) fn matches_operation(
+        &self,
+        operation: &EnvironmentLifecycleOperation,
+    ) -> Result<(), MachineRuntimeRegistryError> {
+        let expected = DeleteOperationIdentity::from_operation(&self.manifest, operation)?;
+        if self
+            .pending
+            .as_ref()
+            .is_some_and(|intent| intent.operation != expected)
+        {
+            return Err(delete_conflict(
+                "persisted deletion belongs to a different immutable operation",
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// An admitted deletion retains its sealed quiescence/controller authority
+/// until removal either succeeds or returns a recoverable durable failure.
+#[cfg(target_os = "macos")]
+pub(crate) struct MachineStoreDeletion<'a, R> {
+    registry: &'a MachineRuntimeRegistry<R>,
+    claim: MachineStoreDeletePreflight,
+    intent: MachineStoreDeleteIntent,
+    intent_directory: File,
+    store: Option<File>,
+    _quiescence: crate::machine_live_sessions::MachineDeleteQuiescence,
 }
 
 /// A runtime-free lease on one exactly-owned private Machine store.
@@ -242,7 +426,9 @@ impl<R> MachineRuntimeRegistry<R> {
             .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
         let root = open_trusted_registry_root(&self.root)?;
         validate_registry_root(&root)?;
+        let _admission_gate = lock_registry_gate(&root)?;
         let key = &expected.resource_id;
+        reject_delete_fence(&root, key)?;
         let namespace = match child_directory(
             &root,
             "topology-machines",
@@ -358,6 +544,9 @@ impl<R> MachineRuntimeRegistry<R> {
                 "runtime store lease does not match this registry's exact lease".into(),
             ));
         }
+        let root = open_trusted_registry_root(&self.root)?;
+        let _admission_gate = lock_registry_gate(&root)?;
+        reject_delete_fence(&root, &key)?;
         lease.validate_current()?;
         if let Some(entry) = state.entries.get(&key) {
             if !Arc::ptr_eq(&entry.lease, &lease) {
@@ -386,6 +575,577 @@ impl<R> MachineRuntimeRegistry<R> {
         let lease = self.acquire_store(owner, reservation, Some(configuration_digest), mode)?;
         self.attach_runtime(lease, factory)
     }
+
+    /// Checks an entire current private tree without writing files or creating
+    /// a backend. Call for every sibling before admitting any Delete effects.
+    /// A prior deletion is discovered from its outside-tree immutable intent.
+    pub(crate) fn preflight_delete(
+        &self,
+        owner: &ResourceOwner,
+        reservation: &OwnershipRecord,
+    ) -> Result<MachineStoreDeletePreflight, MachineRuntimeRegistryError> {
+        if Self::reservation(owner)? != *reservation {
+            return Err(delete_conflict(
+                "Delete reservation is not the exact Machine store",
+            ));
+        }
+        let root = open_trusted_registry_root(&self.root)?;
+        validate_registry_root(&root)?;
+        if let Some(directory) = delete_intent_directory(&root, &reservation.resource_id)? {
+            let intent: MachineStoreDeleteIntent = read_delete_record(&directory, DELETE_INTENT)?;
+            validate_delete_intent(&intent, owner, reservation, &root)?;
+            let namespace = child_directory(&root, "topology-machines", false)?;
+            let remaining =
+                open_delete_store(&namespace, &reservation.resource_id, &directory, &intent)?;
+            if let Some(receipt) =
+                optional_delete_record::<MachineStoreDeleteReceipt>(&directory, DELETE_RECEIPT)?
+            {
+                if receipt != delete_receipt(&intent)? || remaining.is_some() {
+                    return Err(delete_conflict(
+                        "completed Delete receipt conflicts with the exact tree",
+                    ));
+                }
+            }
+            if let Some(remaining) = remaining {
+                walk_owned_tree(&remaining, false, &mut DeleteWalk::new(), 0)?;
+            }
+            return Ok(MachineStoreDeletePreflight {
+                manifest: intent.manifest.clone(),
+                registry_root: self.root.clone(),
+                lease: None,
+                pending: Some(intent),
+            });
+        }
+        let lease = self.acquire_store(
+            owner,
+            reservation,
+            None,
+            MachineRuntimeAdmission::ExistingOnly,
+        )?;
+        walk_owned_tree(&lease.directory, false, &mut DeleteWalk::new(), 0)?;
+        lease.validate_current()?;
+        Ok(MachineStoreDeletePreflight {
+            manifest: lease.manifest.clone(),
+            registry_root: self.root.clone(),
+            lease: Some(lease),
+            pending: None,
+        })
+    }
+
+    /// Admits exact irreversible removal only after the durable Delete journal,
+    /// positive original-runtime quiescence and owned Docker context cleanup.
+    /// This permanently fences the old Machine store identity against acquire.
+    #[cfg(target_os = "macos")]
+    pub(crate) fn begin_delete(
+        &self,
+        claim: MachineStoreDeletePreflight,
+        operation: &EnvironmentLifecycleOperation,
+        quiescence: crate::machine_live_sessions::MachineDeleteQuiescence,
+    ) -> Result<MachineStoreDeletion<'_, R>, MachineRuntimeRegistryError> {
+        if claim.registry_root != self.root {
+            return Err(delete_conflict(
+                "Delete preflight belongs to another registry root",
+            ));
+        }
+        claim.matches_operation(operation)?;
+        quiescence
+            .require_store(&claim, operation)
+            .map_err(|error| delete_conflict(&error.to_string()))?;
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
+        let key = &claim.manifest.reservation.resource_id;
+        let root = open_trusted_registry_root(&self.root)?;
+        validate_registry_root(&root)?;
+        let _gate = lock_registry_gate(&root)?;
+        let namespace = child_directory(&root, "topology-machines", false)?;
+        let entry = state.entries.get(key);
+        if let Some(entry) = entry {
+            if Arc::strong_count(entry) != 1
+                || quiescence.runtime_entry_address() != Some(Arc::as_ptr(entry) as usize)
+            {
+                return Err(delete_conflict(
+                    "original runtime still has readers or differs from quiescence authority",
+                ));
+            }
+        } else if claim.pending.is_none() && quiescence.runtime_entry_address().is_some() {
+            return Err(delete_conflict(
+                "quiesced runtime is not owned by this registry",
+            ));
+        }
+        if let Some(lease) = state.leases.get(key) {
+            let expected_refs =
+                1 + usize::from(entry.is_some()) + usize::from(claim.lease.is_some());
+            if Arc::strong_count(lease) != expected_refs
+                || claim
+                    .lease
+                    .as_ref()
+                    .is_some_and(|claimed| !Arc::ptr_eq(claimed, lease))
+            {
+                return Err(delete_conflict(
+                    "Machine store still has external lease readers",
+                ));
+            }
+        } else if claim.lease.is_some() {
+            return Err(delete_conflict(
+                "preflight lease was not retained by this registry",
+            ));
+        }
+        let (intent, intent_directory, store) = if let Some(expected) = &claim.pending {
+            let directory = delete_intent_directory(&root, key)?
+                .ok_or_else(|| delete_conflict("persisted Delete intent disappeared"))?;
+            let actual: MachineStoreDeleteIntent = read_delete_record(&directory, DELETE_INTENT)?;
+            if actual != *expected {
+                return Err(delete_conflict("persisted Delete intent changed"));
+            }
+            validate_delete_intent(&actual, claim.owner(), &claim.manifest.reservation, &root)?;
+            actual.namespace.require(&namespace)?;
+            let store = open_delete_store(&namespace, key, &directory, &actual)?;
+            if let Some(store) = &store {
+                if !state.leases.contains_key(key) {
+                    fs2::FileExt::try_lock_exclusive(store).map_err(|error| {
+                        if error.kind() == std::io::ErrorKind::WouldBlock {
+                            MachineRuntimeRegistryError::Leased(key.clone())
+                        } else {
+                            error.into()
+                        }
+                    })?;
+                }
+            }
+            (actual, directory, store)
+        } else {
+            reject_delete_fence(&root, key)?;
+            let lease = claim
+                .lease
+                .as_ref()
+                .ok_or_else(|| delete_conflict("missing exact live store lease"))?;
+            lease.validate_current()?;
+            // Host-side context removal must be positively verified before
+            // deleting its intentionally retained claim and cleanup journal.
+            crate::machine_docker_context::require_deleted_for_store(lease, operation).map_err(
+                |error| {
+                    delete_conflict(&format!(
+                        "owned Docker context cleanup is not complete: {error:#}"
+                    ))
+                },
+            )?;
+            walk_owned_tree(&lease.directory, false, &mut DeleteWalk::new(), 0)?;
+            let intent = MachineStoreDeleteIntent {
+                schema_version: 1,
+                manifest: claim.manifest.clone(),
+                operation: DeleteOperationIdentity::from_operation(&claim.manifest, operation)?,
+                root: MachineStoreFileIdentity::of(&root)?,
+                namespace: MachineStoreFileIdentity::of(&namespace)?,
+                store: MachineStoreFileIdentity::of(&lease.directory)?,
+                data: MachineStoreFileIdentity::of(&lease.data_directory)?,
+                quiescence: quiescence.evidence(),
+            };
+            let directory = publish_delete_intent(&root, key, &intent)?;
+            (intent, directory, Some(lease.directory.try_clone()?))
+        };
+        // Only the registry's final strong runtime reference may be retired.
+        // The sealed token retains its Weak identity and controller fence.
+        state.entries.remove(key);
+        Ok(MachineStoreDeletion {
+            registry: self,
+            claim,
+            intent,
+            intent_directory,
+            store,
+            _quiescence: quiescence,
+        })
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl<R> MachineStoreDeletion<'_, R> {
+    /// Removes only the inode-bound private tree. A failure leaves its immutable
+    /// intent and any unremoved contents in place for exact-operation recovery.
+    pub(crate) fn remove(self) -> Result<MachineStoreDeleteReceipt, MachineRuntimeRegistryError> {
+        let root = open_trusted_registry_root(&self.registry.root)?;
+        self.intent.root.require(&root)?;
+        let _gate = lock_registry_gate(&root)?;
+        let namespace = child_directory(&root, "topology-machines", false)?;
+        self.intent.namespace.require(&namespace)?;
+        let key = &self.intent.manifest.reservation.resource_id;
+        let attached = delete_intent_directory(&root, key)?
+            .ok_or_else(|| delete_conflict("Delete intent directory disappeared"))?;
+        if !same_file(&attached, &self.intent_directory)?
+            || read_delete_record::<MachineStoreDeleteIntent>(&attached, DELETE_INTENT)?
+                != self.intent
+        {
+            return Err(delete_conflict("Delete intent was replaced"));
+        }
+        let receipt = delete_receipt(&self.intent)?;
+        if let Some(existing) =
+            optional_delete_record::<MachineStoreDeleteReceipt>(&attached, DELETE_RECEIPT)?
+        {
+            if existing != receipt
+                || open_delete_store(&namespace, key, &attached, &self.intent)?.is_some()
+            {
+                return Err(delete_conflict(
+                    "completed deletion receipt conflicts with current tree or intent",
+                ));
+            }
+            return Ok(existing);
+        }
+        if let Some(current) = open_delete_store(&namespace, key, &attached, &self.intent)? {
+            let retained = self
+                .store
+                .as_ref()
+                .ok_or_else(|| delete_conflict("tree appeared after absent-store admission"))?;
+            if !same_file(retained, &current)? {
+                return Err(delete_conflict("retained deletion tree was replaced"));
+            }
+            if optional_directory(&namespace, key)?.is_some() {
+                renameat_with(
+                    &namespace,
+                    key.as_str(),
+                    &attached,
+                    DELETE_TREE,
+                    RenameFlags::NOREPLACE,
+                )?;
+                namespace.sync_all()?;
+                attached.sync_all()?;
+            }
+            // Reopen after rename, and never follow a replacement, mount, or
+            // symlink. No file chmod is performed (including hardlinked files).
+            let moved = File::from(openat(
+                &attached,
+                DELETE_TREE,
+                DIRECTORY_FLAGS,
+                Mode::empty(),
+            )?);
+            self.intent.store.require(&moved)?;
+            walk_owned_tree(&moved, true, &mut DeleteWalk::new(), 0)?;
+            require_child_identity(&attached, DELETE_TREE, &self.intent.store)?;
+            unlinkat(&attached, DELETE_TREE, AtFlags::REMOVEDIR)?;
+            attached.sync_all()?;
+        }
+        if open_delete_store(&namespace, key, &attached, &self.intent)?.is_some() {
+            return Err(delete_conflict("Machine tree remains after removal"));
+        }
+        publish_delete_record(&attached, DELETE_RECEIPT, &receipt)?;
+        let mut state = self
+            .registry
+            .state
+            .lock()
+            .map_err(|_| MachineRuntimeRegistryError::Poisoned)?;
+        if state.entries.contains_key(key) {
+            return Err(delete_conflict("runtime reattached during deletion"));
+        }
+        state.leases.remove(key);
+        // Keep the claim and its descriptors alive through receipt fsync.
+        drop(self.claim);
+        Ok(receipt)
+    }
+}
+
+fn delete_conflict(message: &str) -> MachineRuntimeRegistryError {
+    MachineRuntimeRegistryError::Conflict(message.into())
+}
+
+// A root descriptor lock serializes the short publication/admission decision
+// across registry instances. The permanent per-owner intent is the lasting
+// fence; no global daemon lock file or path alias is adopted.
+fn lock_registry_gate(root: &File) -> Result<File, MachineRuntimeRegistryError> {
+    let gate = root.try_clone()?;
+    fs2::FileExt::try_lock_exclusive(&gate).map_err(|error| {
+        if error.kind() == std::io::ErrorKind::WouldBlock {
+            MachineRuntimeRegistryError::Leased("runtime registry admission/deletion gate".into())
+        } else {
+            error.into()
+        }
+    })?;
+    Ok(gate)
+}
+
+fn optional_directory(
+    parent: &File,
+    name: &str,
+) -> Result<Option<File>, MachineRuntimeRegistryError> {
+    match openat(parent, name, DIRECTORY_FLAGS, Mode::empty()) {
+        Ok(fd) => Ok(Some(File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn delete_intent_directory(
+    root: &File,
+    key: &str,
+) -> Result<Option<File>, MachineRuntimeRegistryError> {
+    let Some(namespace) = optional_directory(root, DELETE_NAMESPACE)? else {
+        return Ok(None);
+    };
+    validate_private_directory(&namespace)?;
+    let directory = optional_directory(&namespace, key)?;
+    if let Some(directory) = &directory {
+        validate_private_directory(directory)?;
+    }
+    Ok(directory)
+}
+
+fn reject_delete_fence(root: &File, key: &str) -> Result<(), MachineRuntimeRegistryError> {
+    if delete_intent_directory(root, key)?.is_some() {
+        return Err(delete_conflict(
+            "Machine store has a permanent admitted Delete fence",
+        ));
+    }
+    Ok(())
+}
+
+fn read_delete_record<T: serde::de::DeserializeOwned>(
+    directory: &File,
+    name: &str,
+) -> Result<T, MachineRuntimeRegistryError> {
+    let mut bytes = Vec::new();
+    private_file(directory, name)?
+        .take(MAX_DELETE_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_DELETE_RECORD_BYTES {
+        return Err(delete_conflict("Delete record exceeds bounded size"));
+    }
+    serde_json::from_slice(&bytes)
+        .map_err(|error| delete_conflict(&format!("invalid durable Delete record: {error}")))
+}
+
+fn optional_delete_record<T: serde::de::DeserializeOwned>(
+    directory: &File,
+    name: &str,
+) -> Result<Option<T>, MachineRuntimeRegistryError> {
+    match statat(directory, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(_) => read_delete_record(directory, name).map(Some),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn publish_delete_record<T: Serialize>(
+    directory: &File,
+    name: &str,
+    record: &T,
+) -> Result<(), MachineRuntimeRegistryError> {
+    let bytes = serde_json::to_vec(record).map_err(invalid)?;
+    if bytes.len() as u64 > MAX_DELETE_RECORD_BYTES {
+        return Err(delete_conflict("Delete record exceeds bounded size"));
+    }
+    let pending = format!(".pending-{}", LifecycleOperationId::generate());
+    let mut file = File::from(openat(
+        directory,
+        pending.as_str(),
+        OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        PRIVATE_FILE,
+    )?);
+    file.write_all(&bytes)?;
+    file.sync_all()?;
+    renameat_with(
+        directory,
+        pending.as_str(),
+        directory,
+        name,
+        RenameFlags::NOREPLACE,
+    )?;
+    directory.sync_all()?;
+    Ok(())
+}
+
+fn publish_delete_intent(
+    root: &File,
+    key: &str,
+    intent: &MachineStoreDeleteIntent,
+) -> Result<File, MachineRuntimeRegistryError> {
+    let namespace = child_directory(root, DELETE_NAMESPACE, true)?;
+    let pending = format!(".pending-{}", LifecycleOperationId::generate());
+    mkdirat(&namespace, pending.as_str(), PRIVATE_DIRECTORY)?;
+    let directory = child_directory(&namespace, &pending, false)?;
+    publish_delete_record(&directory, DELETE_INTENT, intent)?;
+    renameat_with(
+        &namespace,
+        pending.as_str(),
+        &namespace,
+        key,
+        RenameFlags::NOREPLACE,
+    )?;
+    namespace.sync_all()?;
+    Ok(directory)
+}
+
+fn validate_delete_intent(
+    intent: &MachineStoreDeleteIntent,
+    owner: &ResourceOwner,
+    reservation: &OwnershipRecord,
+    root: &File,
+) -> Result<(), MachineRuntimeRegistryError> {
+    if intent.schema_version != 1 || intent.quiescence.is_null() {
+        return Err(delete_conflict(
+            "unsupported Delete intent or missing positive quiescence evidence",
+        ));
+    }
+    validate_persisted_manifest(&intent.manifest, owner, reservation)?;
+    intent.root.require(root)?;
+    let namespace = child_directory(root, "topology-machines", false)?;
+    intent.namespace.require(&namespace)?;
+    Ok(())
+}
+
+fn require_child_identity(
+    parent: &File,
+    name: &str,
+    expected: &MachineStoreFileIdentity,
+) -> Result<(), MachineRuntimeRegistryError> {
+    let stat = statat(parent, name, AtFlags::SYMLINK_NOFOLLOW)?;
+    if MachineStoreFileIdentity::from_stat(&stat) != *expected {
+        return Err(delete_conflict("child changed during exact-owned removal"));
+    }
+    Ok(())
+}
+
+fn open_delete_store(
+    namespace: &File,
+    key: &str,
+    intent_directory: &File,
+    intent: &MachineStoreDeleteIntent,
+) -> Result<Option<File>, MachineRuntimeRegistryError> {
+    let original = optional_directory(namespace, key)?;
+    let moved = optional_directory(intent_directory, DELETE_TREE)?;
+    if original.is_some() && moved.is_some() {
+        return Err(delete_conflict(
+            "both original and quarantined Machine stores exist",
+        ));
+    }
+    let not_yet_moved = original.is_some();
+    let current = original.or(moved);
+    if let Some(current) = &current {
+        intent.store.require(current)?;
+        if let Some(data) = optional_directory(current, DATA_NAME)? {
+            intent.data.require(&data)?;
+        } else if not_yet_moved {
+            return Err(delete_conflict(
+                "original store data disappeared before quarantine",
+            ));
+        }
+        if not_yet_moved && read_manifest(current)? != intent.manifest {
+            return Err(delete_conflict(
+                "original store owner changed before quarantine",
+            ));
+        }
+    }
+    Ok(current)
+}
+
+fn delete_receipt(
+    intent: &MachineStoreDeleteIntent,
+) -> Result<MachineStoreDeleteReceipt, MachineRuntimeRegistryError> {
+    let encoded = serde_json::to_vec(intent).map_err(invalid)?;
+    Ok(MachineStoreDeleteReceipt {
+        schema_version: 1,
+        owner: intent.manifest.owner.clone(),
+        operation_id: intent.operation.operation_id.clone(),
+        generation: intent.operation.generation,
+        configuration_digest: intent.manifest.configuration_digest.clone(),
+        store: intent.store.clone(),
+        data: intent.data.clone(),
+        intent_sha256: format!("sha256:{:x}", Sha256::digest(encoded)),
+        store_removed: true,
+    })
+}
+
+struct DeleteWalk {
+    remaining: usize,
+    deadline: Instant,
+    device: Option<u64>,
+}
+impl DeleteWalk {
+    fn new() -> Self {
+        Self {
+            remaining: MAX_DELETE_ENTRIES,
+            deadline: Instant::now() + DELETE_WALK_LIMIT,
+            device: None,
+        }
+    }
+    fn check(&mut self, depth: usize) -> Result<(), MachineRuntimeRegistryError> {
+        if depth > MAX_DELETE_DEPTH || self.remaining == 0 || Instant::now() >= self.deadline {
+            return Err(delete_conflict(
+                "bounded private-tree deletion requires continuation",
+            ));
+        }
+        self.remaining -= 1;
+        Ok(())
+    }
+}
+
+fn walk_owned_tree(
+    directory: &File,
+    remove: bool,
+    walk: &mut DeleteWalk,
+    depth: usize,
+) -> Result<(), MachineRuntimeRegistryError> {
+    walk.check(depth)?;
+    let stat = fstat(directory)?;
+    let directory_identity = MachineStoreFileIdentity::from_stat(&stat);
+    let device = *walk.device.get_or_insert(directory_identity.device);
+    let mode = Mode::from_raw_mode(stat.st_mode);
+    if stat.st_uid != rustix::process::geteuid().as_raw()
+        || directory_identity.device != device
+        || !FileType::from_raw_mode(stat.st_mode).is_dir()
+        || mode.intersects(Mode::WGRP | Mode::WOTH | Mode::SUID | Mode::SGID | Mode::SVTX)
+    {
+        return Err(delete_conflict(
+            "private tree contains an unowned, writable, special or cross-device directory",
+        ));
+    }
+    if remove {
+        fchmod(directory, PRIVATE_DIRECTORY)?;
+    }
+    for entry in rustix::fs::Dir::read_from(directory)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        if name.to_bytes() == b"." || name.to_bytes() == b".." {
+            continue;
+        }
+        walk.check(depth)?;
+        let child = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+        let identity = MachineStoreFileIdentity::from_stat(&child);
+        if child.st_uid != rustix::process::geteuid().as_raw() || identity.device != device {
+            return Err(delete_conflict(
+                "private tree contains an unowned or cross-device entry",
+            ));
+        }
+        let kind = FileType::from_raw_mode(child.st_mode);
+        if kind.is_dir() {
+            let child_directory =
+                File::from(openat(directory, name, DIRECTORY_FLAGS, Mode::empty())?);
+            identity.require(&child_directory)?;
+            walk_owned_tree(&child_directory, remove, walk, depth + 1)?;
+        } else if matches!(kind, FileType::BlockDevice | FileType::CharacterDevice) {
+            return Err(delete_conflict(
+                "private host store unexpectedly contains a device node",
+            ));
+        }
+        if remove {
+            let current = statat(directory, name, AtFlags::SYMLINK_NOFOLLOW)?;
+            if current.st_dev != child.st_dev || current.st_ino != child.st_ino {
+                return Err(delete_conflict(
+                    "private tree entry replaced during removal",
+                ));
+            }
+            unlinkat(
+                directory,
+                name,
+                if kind.is_dir() {
+                    AtFlags::REMOVEDIR
+                } else {
+                    AtFlags::empty()
+                },
+            )?;
+        }
+    }
+    if remove {
+        directory.sync_all()?;
+    }
+    Ok(())
 }
 
 fn validate_current_lease(
@@ -393,6 +1153,7 @@ fn validate_current_lease(
 ) -> Result<(), MachineRuntimeRegistryError> {
     let root = open_trusted_registry_root(&lease.registry_root)?;
     validate_registry_root(&root)?;
+    reject_delete_fence(&root, &lease.manifest.reservation.resource_id)?;
     let namespace = child_directory(&root, "topology-machines", false)?;
     let key = &lease.manifest.reservation.resource_id;
     let directory = File::from(openat(
@@ -791,6 +1552,473 @@ mod tests {
             matches!(result, Err(MachineRuntimeRegistryError::Conflict(_))),
             "expected ownership conflict"
         );
+    }
+
+    fn deletion_intent(lease: &MachineRuntimeStoreLease) -> MachineStoreDeleteIntent {
+        let root =
+            open_trusted_registry_root(&lease.registry_root).expect("verified registry root");
+        let namespace =
+            child_directory(&root, "topology-machines", false).expect("owned namespace");
+        MachineStoreDeleteIntent {
+            schema_version: 1,
+            manifest: lease.manifest.clone(),
+            operation: DeleteOperationIdentity {
+                operation_id: LifecycleOperationId::generate(),
+                generation: 2,
+                request_id: "delete-request".into(),
+                idempotency_key: "delete-key".into(),
+                request_hash: DIGEST_A.into(),
+                definition_digest: DIGEST_B.into(),
+                initial_machine_state: MachineState::Stopped,
+                expected_incarnation: None,
+            },
+            root: MachineStoreFileIdentity::of(&root).expect("root inode"),
+            namespace: MachineStoreFileIdentity::of(&namespace).expect("namespace inode"),
+            store: MachineStoreFileIdentity::of(&lease.directory).expect("store inode"),
+            data: MachineStoreFileIdentity::of(&lease.data_directory).expect("data inode"),
+            // Filesystem-helper tests never mint production quiescence tokens.
+            quiescence: serde_json::json!({"test_only_positive_quiescence": true}),
+        }
+    }
+
+    fn delete_operation() -> EnvironmentLifecycleOperation {
+        use vz_runtime_contract::{
+            EnvironmentLifecycleStatus, EnvironmentState, LifecycleStepStatus,
+            MachineLifecycleStep, OwnershipCleanupStep,
+        };
+        EnvironmentLifecycleOperation {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            operation_id: LifecycleOperationId::generate(),
+            project_id: owner().project_id,
+            environment_id: owner().environment_id,
+            kind: EnvironmentLifecycleKind::Delete,
+            generation: 2,
+            request_id: "delete-request".into(),
+            idempotency_key: "delete-key".into(),
+            request_hash: DIGEST_A.into(),
+            definition_digest: DIGEST_B.into(),
+            initial_state: EnvironmentState::Stopped,
+            requested_target: EnvironmentState::Deleted,
+            status: EnvironmentLifecycleStatus::Running,
+            machine_steps: vec![MachineLifecycleStep {
+                machine_id: owner().machine_id.expect("Machine owner"),
+                initial_state: MachineState::Stopped,
+                target_state: None,
+                expected_incarnation: None,
+                resulting_incarnation: None,
+                resulting_activation: None,
+                status: LifecycleStepStatus::Succeeded,
+                failure_reason: None,
+            }],
+            cleanup_steps: vec![OwnershipCleanupStep {
+                ownership: reservation(),
+                status: LifecycleStepStatus::Pending,
+                failure_reason: None,
+            }],
+            created_at: 1,
+            updated_at: 2,
+            completed_at: None,
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn exact_runtime_free_delete_is_durable_and_cannot_resurrect() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let store = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        fs::write(store.data_path().join("owned"), b"private payload").expect("payload");
+        drop(store);
+        let operation = delete_operation();
+        operation
+            .validate_structure()
+            .expect("valid Delete fixture");
+        let controller =
+            crate::environment_runtime_controller::EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&owner().project_id, &owner().environment_id)
+            .await
+            .expect("controller fence");
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("preflight");
+        let token = crate::machine_live_sessions::MachineDeleteQuiescence::for_runtime_free_test(
+            &claim, &operation, &lease,
+        )
+        .expect("test-only positive authority");
+        let receipt = registry
+            .begin_delete(claim, &operation, token)
+            .expect("admit exact Delete")
+            .remove()
+            .expect("remove exact store");
+        assert!(receipt.store_removed);
+        assert_eq!(receipt.owner, owner());
+        assert_eq!(receipt.operation_id, operation.operation_id);
+        assert_eq!(receipt.configuration_digest, DIGEST_A);
+        assert!(!store_path(temp.path()).exists());
+        assert_conflict(acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        ));
+        let fresh =
+            MachineRuntimeRegistry::<usize>::new(registry.root.clone()).expect("fresh registry");
+        let claim = fresh
+            .preflight_delete(&owner(), &reservation())
+            .expect("outside-tree replay");
+        let token = crate::machine_live_sessions::MachineDeleteQuiescence::for_runtime_free_test(
+            &claim, &operation, &lease,
+        )
+        .expect("test-only exact replay authority");
+        let replay = fresh
+            .begin_delete(claim, &operation, token)
+            .expect("admit replay")
+            .remove()
+            .expect("replay receipt");
+        assert_eq!(receipt, replay);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn delete_rejects_extra_lease_before_publishing_intent() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let reader = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("retained reader");
+        let operation = delete_operation();
+        let controller =
+            crate::environment_runtime_controller::EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&owner().project_id, &owner().environment_id)
+            .await
+            .expect("controller fence");
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("preflight");
+        let token = crate::machine_live_sessions::MachineDeleteQuiescence::for_runtime_free_test(
+            &claim, &operation, &lease,
+        )
+        .expect("test-only positive authority");
+        assert_conflict(registry.begin_delete(claim, &operation, token));
+        assert!(reader.validate_current().is_ok());
+        assert!(!temp.path().join(DELETE_NAMESPACE).exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn delete_resumes_admitted_intent_and_rejects_changed_operation() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        drop(
+            acquire(
+                &registry,
+                Some(DIGEST_A),
+                MachineRuntimeAdmission::CreateOrOpen,
+            )
+            .expect("store"),
+        );
+        let operation = delete_operation();
+        let controller =
+            crate::environment_runtime_controller::EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&owner().project_id, &owner().environment_id)
+            .await
+            .expect("controller fence");
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("preflight");
+        let token = crate::machine_live_sessions::MachineDeleteQuiescence::for_runtime_free_test(
+            &claim, &operation, &lease,
+        )
+        .expect("test-only positive authority");
+        drop(
+            registry
+                .begin_delete(claim, &operation, token)
+                .expect("durable intent before first removal"),
+        );
+        assert!(store_path(temp.path()).exists());
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("intent replay");
+        let mut changed = operation.clone();
+        changed.request_hash = DIGEST_B.into();
+        assert_conflict(claim.matches_operation(&changed));
+        let token = crate::machine_live_sessions::MachineDeleteQuiescence::for_runtime_free_test(
+            &claim, &operation, &lease,
+        )
+        .expect("test-only exact replay authority");
+        let receipt = registry
+            .begin_delete(claim, &operation, token)
+            .expect("resume exact intent")
+            .remove()
+            .expect("finish admitted removal");
+        assert!(receipt.store_removed);
+    }
+
+    #[test]
+    fn delete_preflight_is_read_only_and_does_not_construct_runtime() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        fs::write(lease.data_path().join("keep"), b"retained contents").expect("private payload");
+        let manifest = fs::read(store_path(temp.path()).join(MANIFEST_NAME)).expect("owner bytes");
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("read-only preflight");
+        assert_eq!(claim.owner(), &owner());
+        assert_eq!(claim.configuration_digest(), DIGEST_A);
+        assert!(claim.quiescence_evidence().is_none());
+        assert!(Arc::ptr_eq(claim.lease().expect("current lease"), &lease));
+        assert!(registry.state.lock().expect("state").entries.is_empty());
+        assert!(!temp.path().join(DELETE_NAMESPACE).exists());
+        assert_eq!(
+            fs::read(store_path(temp.path()).join(MANIFEST_NAME)).expect("owner remains"),
+            manifest
+        );
+        assert_eq!(
+            fs::read(lease.data_path().join("keep")).expect("payload remains"),
+            b"retained contents"
+        );
+    }
+
+    #[test]
+    fn deletion_walker_preserves_external_symlink_and_hardlink_targets() {
+        let temp = TempDir::new().expect("temporary root");
+        let external = TempDir::new().expect("external user data");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        let external_file = external.path().join("user-file");
+        fs::write(&external_file, b"user-owned bytes").expect("external file");
+        fs::set_permissions(&external_file, fs::Permissions::from_mode(0o400))
+            .expect("external immutable mode");
+        symlink(external.path(), lease.data_path().join("outside-directory"))
+            .expect("owned symlink");
+        fs::hard_link(&external_file, lease.data_path().join("shared-file"))
+            .expect("owned hardlink");
+        let nested = lease.data_path().join("pinned");
+        fs::create_dir(&nested).expect("pin directory");
+        fs::write(nested.join("artifact"), b"owned bytes").expect("pin artifact");
+        fs::set_permissions(&nested, fs::Permissions::from_mode(0o500))
+            .expect("read-only pinned directory");
+        walk_owned_tree(&lease.data_directory, true, &mut DeleteWalk::new(), 0)
+            .expect("remove only owned links and private data");
+        assert_eq!(
+            fs::read(&external_file).expect("external file survives"),
+            b"user-owned bytes"
+        );
+        assert_eq!(
+            fs::metadata(&external_file)
+                .expect("external metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o400
+        );
+        assert_eq!(
+            fs::read_dir(lease.data_path())
+                .expect("empty owned data")
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn deletion_preflight_rejects_untrusted_directory_without_mutation() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        let child = lease.data_path().join("untrusted");
+        fs::create_dir(&child).expect("child directory");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o777)).expect("untrusted mode");
+        assert_conflict(registry.preflight_delete(&owner(), &reservation()));
+        assert_eq!(
+            fs::metadata(&child)
+                .expect("child preserved")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o777
+        );
+        assert!(!temp.path().join(DELETE_NAMESPACE).exists());
+    }
+
+    #[test]
+    fn deletion_walk_rejects_cross_device_and_budget_before_effects() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        fs::write(lease.data_path().join("keep"), b"preserved").expect("payload");
+        let mut cross_device = DeleteWalk::new();
+        cross_device.device = Some(
+            MachineStoreFileIdentity::of(&lease.data_directory)
+                .expect("device")
+                .device
+                .wrapping_add(1),
+        );
+        assert_conflict(walk_owned_tree(
+            &lease.data_directory,
+            true,
+            &mut cross_device,
+            0,
+        ));
+        let mut exhausted = DeleteWalk::new();
+        exhausted.remaining = 0;
+        assert_conflict(walk_owned_tree(
+            &lease.data_directory,
+            true,
+            &mut exhausted,
+            0,
+        ));
+        assert_eq!(
+            fs::read(lease.data_path().join("keep")).expect("preserved payload"),
+            b"preserved"
+        );
+    }
+
+    #[test]
+    fn durable_delete_intent_fences_cached_fresh_and_attach_admission() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        let intent = deletion_intent(&lease);
+        let root = open_trusted_registry_root(&registry.root).expect("root");
+        publish_delete_intent(&root, &reservation().resource_id, &intent).expect("durable intent");
+        assert_conflict(acquire(
+            &registry,
+            None,
+            MachineRuntimeAdmission::ExistingOnly,
+        ));
+        assert_conflict(registry.attach_runtime(Arc::clone(&lease), |_| {
+            panic!("deleted Machine must not construct runtime")
+        }));
+        let fresh =
+            MachineRuntimeRegistry::<usize>::new(registry.root.clone()).expect("fresh registry");
+        assert_conflict(acquire(
+            &fresh,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        ));
+        assert!(
+            store_path(temp.path()).exists(),
+            "admitted intent alone does not remove files"
+        );
+    }
+
+    #[test]
+    fn deletion_preflight_recovers_after_removed_tree_without_original_manifest() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        let intent = deletion_intent(&lease);
+        let root = open_trusted_registry_root(&registry.root).expect("root");
+        let namespace = child_directory(&root, "topology-machines", false).expect("namespace");
+        let directory = publish_delete_intent(&root, &reservation().resource_id, &intent)
+            .expect("durable intent");
+        renameat_with(
+            &namespace,
+            reservation().resource_id.as_str(),
+            &directory,
+            DELETE_TREE,
+            RenameFlags::NOREPLACE,
+        )
+        .expect("exact quarantine");
+        walk_owned_tree(&lease.directory, true, &mut DeleteWalk::new(), 0)
+            .expect("remove admitted tree contents");
+        unlinkat(&directory, DELETE_TREE, AtFlags::REMOVEDIR).expect("remove empty store");
+        let claim = registry
+            .preflight_delete(&owner(), &reservation())
+            .expect("recover without original tree");
+        assert!(claim.lease().is_none());
+        assert_eq!(claim.configuration_digest(), DIGEST_A);
+        assert_eq!(
+            claim.delete_operation_id(),
+            Some(&intent.operation.operation_id)
+        );
+        assert_eq!(claim.quiescence_evidence(), Some(&intent.quiescence));
+        let receipt = delete_receipt(&intent).expect("exact receipt");
+        publish_delete_record(&directory, DELETE_RECEIPT, &receipt)
+            .expect("durable terminal receipt");
+        assert!(registry.preflight_delete(&owner(), &reservation()).is_ok());
+        assert!(!store_path(temp.path()).exists());
+    }
+
+    #[test]
+    fn deletion_replay_rejects_replacement_tree_and_tampered_receipt() {
+        let temp = TempDir::new().expect("temporary root");
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .expect("admitted store");
+        let intent = deletion_intent(&lease);
+        let root = open_trusted_registry_root(&registry.root).expect("root");
+        let namespace = child_directory(&root, "topology-machines", false).expect("namespace");
+        let directory = publish_delete_intent(&root, &reservation().resource_id, &intent)
+            .expect("durable intent");
+        renameat_with(
+            &namespace,
+            reservation().resource_id.as_str(),
+            &directory,
+            DELETE_TREE,
+            RenameFlags::NOREPLACE,
+        )
+        .expect("quarantine original");
+        fs::create_dir(store_path(temp.path())).expect("foreign replacement");
+        fs::set_permissions(store_path(temp.path()), fs::Permissions::from_mode(0o700))
+            .expect("replacement mode");
+        fs::write(store_path(temp.path()).join("foreign"), b"do not delete")
+            .expect("replacement sentinel");
+        assert_conflict(registry.preflight_delete(&owner(), &reservation()));
+        assert_eq!(
+            fs::read(store_path(temp.path()).join("foreign")).expect("foreign survives"),
+            b"do not delete"
+        );
+        let mut receipt = delete_receipt(&intent).expect("receipt");
+        receipt.configuration_digest = DIGEST_B.into();
+        publish_delete_record(&directory, DELETE_RECEIPT, &receipt)
+            .expect("tampered receipt fixture");
+        assert_conflict(registry.preflight_delete(&owner(), &reservation()));
     }
 
     #[test]

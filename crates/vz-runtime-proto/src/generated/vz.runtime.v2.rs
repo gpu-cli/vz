@@ -753,6 +753,40 @@ pub struct StopEnvironmentEvent {
     pub error: ::core::option::Option<ErrorDetail>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteEnvironmentRequest {
+    #[prost(message, optional, tag = "1")]
+    pub metadata: ::core::option::Option<RequestMetadata>,
+    #[prost(string, tag = "2")]
+    pub project_id: ::prost::alloc::string::String,
+    #[prost(string, optional, tag = "3")]
+    pub environment: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "4")]
+    pub process_environment_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(string, optional, tag = "5")]
+    pub workspace_key: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(uint64, tag = "6")]
+    pub machine_timeout_millis: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DeleteEnvironmentEvent {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "3")]
+    pub sequence: u64,
+    #[prost(message, optional, tag = "4")]
+    pub operation: ::core::option::Option<EnvironmentLifecycleOperation>,
+    #[prost(bool, tag = "5")]
+    pub terminal: bool,
+    #[prost(message, optional, tag = "6")]
+    pub error: ::core::option::Option<ErrorDetail>,
+    /// Required only for successful terminal Delete. Exact owner, generation,
+    /// operation, ownership digest and completion time must agree.
+    #[prost(message, optional, tag = "7")]
+    pub tombstone: ::core::option::Option<EnvironmentTombstone>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct GetProjectStateRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<RequestMetadata>,
@@ -3702,6 +3736,30 @@ pub mod topology_service_client {
             ));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Delete traverses the exact Environment ownership graph. Disconnect ends
+        /// observation only; exact request replay survives deletion/name reuse.
+        /// Progress is bounded/coalescing: sequence strictly increases, gaps allowed.
+        pub async fn delete_environment(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DeleteEnvironmentRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DeleteEnvironmentEvent>>,
+            tonic::Status,
+        > {
+            self.inner.ready().await.map_err(|e| {
+                tonic::Status::unknown(format!("Service was not ready: {}", e.into()))
+            })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.runtime.v2.TopologyService/DeleteEnvironment",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut().insert(GrpcMethod::new(
+                "vz.runtime.v2.TopologyService",
+                "DeleteEnvironment",
+            ));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// First frame opens one exact Machine execution. Subsequent frames control
         /// only that execution; disconnect requests cancellation and terminal reap.
         pub async fn exec_machine(
@@ -6282,6 +6340,18 @@ pub mod topology_service_server {
             &self,
             request: tonic::Request<super::StopEnvironmentRequest>,
         ) -> std::result::Result<tonic::Response<Self::StopEnvironmentStream>, tonic::Status>;
+        /// Server streaming response type for the DeleteEnvironment method.
+        type DeleteEnvironmentStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DeleteEnvironmentEvent, tonic::Status>,
+            > + std::marker::Send
+            + 'static;
+        /// Delete traverses the exact Environment ownership graph. Disconnect ends
+        /// observation only; exact request replay survives deletion/name reuse.
+        /// Progress is bounded/coalescing: sequence strictly increases, gaps allowed.
+        async fn delete_environment(
+            &self,
+            request: tonic::Request<super::DeleteEnvironmentRequest>,
+        ) -> std::result::Result<tonic::Response<Self::DeleteEnvironmentStream>, tonic::Status>;
         /// Server streaming response type for the ExecMachine method.
         type ExecMachineStream: tonic::codegen::tokio_stream::Stream<
                 Item = std::result::Result<super::MachineExecEvent, tonic::Status>,
@@ -6483,6 +6553,50 @@ pub mod topology_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = StopEnvironmentSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.runtime.v2.TopologyService/DeleteEnvironment" => {
+                    #[allow(non_camel_case_types)]
+                    struct DeleteEnvironmentSvc<T: TopologyService>(pub Arc<T>);
+                    impl<T: TopologyService>
+                        tonic::server::ServerStreamingService<super::DeleteEnvironmentRequest>
+                        for DeleteEnvironmentSvc<T>
+                    {
+                        type Response = super::DeleteEnvironmentEvent;
+                        type ResponseStream = T::DeleteEnvironmentStream;
+                        type Future =
+                            BoxFuture<tonic::Response<Self::ResponseStream>, tonic::Status>;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DeleteEnvironmentRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as TopologyService>::delete_environment(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = DeleteEnvironmentSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

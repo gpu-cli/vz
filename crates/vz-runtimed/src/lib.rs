@@ -3,6 +3,8 @@
 mod btrfs_health;
 pub mod btrfs_portability;
 #[cfg(target_os = "macos")]
+pub mod environment_delete;
+#[cfg(target_os = "macos")]
 pub mod environment_runtime_controller;
 #[cfg(target_os = "macos")]
 pub mod environment_stop;

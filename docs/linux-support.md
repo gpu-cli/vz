@@ -137,9 +137,9 @@ authenticated import relay.
    typed API before exiting; the legacy `vz stack down` CLI is retired.
 
 5. **Developer Environment parity is incomplete on Linux hosts** -- the current
-   topology CLI has DEV `up`, `exec`, `status`, and `stop` adapters; `delete`
-   is absent and complete Up reconciliation remains unfinished. Up and live
-   execution currently target Linux-on-macOS, not the Linux host backend.
+   topology CLI exposes all five DEV lifecycle verbs, including `delete`, but
+   complete Up reconciliation remains unfinished. Physical Up, execution, Stop
+   and Delete adapters currently target Linux-on-macOS, not the Linux host backend.
    An unsupported backend fails explicitly. Retired `init`, `run`, VM, image,
    and debug families are absent on all hosts, not macOS-only alternatives.
 

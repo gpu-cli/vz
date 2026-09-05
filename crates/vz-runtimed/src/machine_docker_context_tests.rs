@@ -3,7 +3,589 @@
 use super::*;
 use crate::machine_runtime_registry::{MachineRuntimeAdmission, MachineRuntimeRegistry};
 use serde_json::json;
-use vz_runtime_contract::{EnvironmentId, MachineId, ProjectId};
+use vz_runtime_contract::{
+    EnvironmentId, EnvironmentLifecycleStatus, EnvironmentState, LifecycleStepStatus, MachineId,
+    MachineLifecycleStep, MachineState, ProjectId,
+};
+
+fn delete_fixture() -> Result<(
+    tempfile::TempDir,
+    Arc<MachineRuntimeStoreLease>,
+    ContextClaim,
+    std::path::PathBuf,
+)> {
+    use std::os::unix::fs::DirBuilderExt;
+    let (root, store) = fixture()?;
+    let mut expected = claim(&store)?;
+    expected.config_dir = root
+        .path()
+        .join("client")
+        .to_str()
+        .context("fixture path")?
+        .into();
+    expected.endpoint = format!("unix://{}", root.path().join("socket").display());
+    let key = format!("{:x}", Sha256::digest(expected.name.as_bytes()));
+    let directory = Path::new(&expected.config_dir)
+        .join("contexts/meta")
+        .join(key);
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&directory)?;
+    std::fs::write(
+        Path::new(&expected.config_dir).join("config.json"),
+        b"{\"currentContext\":\"unrelated\"}\n",
+    )?;
+    std::fs::write(
+        directory.join("meta.json"),
+        serde_json::to_vec(&json!({"Name": expected.name,
+        "Metadata": {"Description": format!("vz managed Machine context v1 {}", serde_json::to_string(&expected)?)},
+        "Endpoints": {"docker": {"Host": expected.endpoint, "SkipTLSVerify": false}}}))?,
+    )?;
+    publish_claim(&store, &expected)?;
+    Ok((root, store, expected, directory))
+}
+
+fn delete_operation(store: &MachineRuntimeStoreLease) -> EnvironmentLifecycleOperation {
+    EnvironmentLifecycleOperation {
+        schema_version: 1,
+        operation_id: LifecycleOperationId::generate(),
+        project_id: store.owner().project_id.clone(),
+        environment_id: store.owner().environment_id.clone(),
+        kind: EnvironmentLifecycleKind::Delete,
+        generation: 2,
+        request_id: "delete-test".into(),
+        idempotency_key: "delete-test".into(),
+        request_hash: format!("sha256:{}", "a".repeat(64)),
+        definition_digest: format!("sha256:{}", "b".repeat(64)),
+        initial_state: EnvironmentState::Stopped,
+        requested_target: EnvironmentState::Deleted,
+        status: EnvironmentLifecycleStatus::Running,
+        machine_steps: vec![MachineLifecycleStep {
+            machine_id: store.owner().machine_id.clone().expect("fixture machine"),
+            initial_state: MachineState::Stopped,
+            target_state: None,
+            expected_incarnation: None,
+            resulting_incarnation: None,
+            resulting_activation: None,
+            status: LifecycleStepStatus::Pending,
+            failure_reason: None,
+        }],
+        cleanup_steps: vec![],
+        created_at: 1,
+        updated_at: 1,
+        completed_at: None,
+    }
+}
+
+fn prepare_delete(
+    store: &Arc<MachineRuntimeStoreLease>,
+    claim: &ContextClaim,
+) -> Result<PreparedMachineDockerContextDelete> {
+    ManagedMachineDockerContext::prepare_existing_delete(
+        Arc::clone(store),
+        None,
+        Path::new(&claim.config_dir),
+        Path::new(
+            claim
+                .endpoint
+                .strip_prefix("unix://")
+                .context("fixture endpoint")?,
+        ),
+    )?
+    .context("fixture claim missing")
+}
+
+#[test]
+fn context_delete_preserves_default_sibling_claim_and_replays_exact_operation() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let sibling = directory
+        .parent()
+        .context("parent")?
+        .join("unrelated-context");
+    std::fs::create_dir(&sibling)?;
+    std::fs::write(sibling.join("meta.json"), b"foreign sentinel")?;
+    let default = Path::new(&claim.config_dir).join("config.json");
+    let before = std::fs::read(&default)?;
+    let operation = delete_operation(&store);
+    let mut prepared = prepare_delete(&store, &claim)?;
+    assert!(
+        !store.data_path().join(DELETE_INTENT).exists(),
+        "prepare mutated store"
+    );
+    prepared.remove_exact(&operation)?;
+    assert!(!directory.exists());
+    assert_eq!(std::fs::read(&default)?, before);
+    assert_eq!(
+        std::fs::read(sibling.join("meta.json"))?,
+        b"foreign sentinel"
+    );
+    assert_eq!(read_claim(&store)?, Some(claim.clone()));
+    assert!(store.data_path().join(DELETE_INTENT).is_file());
+    prepare_delete(&store, &claim)?.remove_exact(&operation)?;
+    let mut other = operation.clone();
+    other.operation_id = LifecycleOperationId::generate();
+    assert!(
+        prepare_delete(&store, &claim)?
+            .remove_exact(&other)
+            .is_err()
+    );
+    Ok(())
+}
+
+#[test]
+fn context_delete_crash_after_metadata_unlink_replays_only_recorded_directory() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let operation = delete_operation(&store);
+    let mut prepared = prepare_delete(&store, &claim)?;
+    assert!(
+        prepared
+            .remove_with_checkpoint(&operation, || anyhow::bail!("simulated crash"))
+            .is_err()
+    );
+    assert!(directory.is_dir());
+    assert!(!directory.join("meta.json").exists());
+    drop(prepared);
+    prepare_delete(&store, &claim)?.remove_exact(&operation)?;
+    assert!(!directory.exists());
+    Ok(())
+}
+
+#[test]
+fn context_delete_interruption_before_intent_publication_is_replayable() -> Result<()> {
+    for partial in [false, true] {
+        let (_root, store, claim, directory) = delete_fixture()?;
+        let operation = delete_operation(&store);
+        let default = Path::new(&claim.config_dir).join("config.json");
+        let default_before = std::fs::read(&default)?;
+        let metadata_before = std::fs::read(directory.join("meta.json"))?;
+        let sibling = directory
+            .parent()
+            .context("context parent")?
+            .join("sibling");
+        std::fs::create_dir(&sibling)?;
+        std::fs::write(sibling.join("meta.json"), b"foreign context")?;
+        let mut prepared = prepare_delete(&store, &claim)?;
+        let interrupted = prepared.remove_with_checkpoints(
+            &operation,
+            |file| {
+                if partial {
+                    // An interrupted write may leave any prefix in a pending
+                    // file; it must never become the authoritative record.
+                    file.set_len(7)?;
+                    file.sync_all()?;
+                }
+                anyhow::bail!("injected interruption before atomic publication")
+            },
+            || anyhow::bail!("metadata must not be removed before publication"),
+        );
+        assert!(interrupted.is_err());
+        assert!(prepared.previous.is_none());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+        assert_eq!(std::fs::read(directory.join("meta.json"))?, metadata_before);
+        assert_eq!(std::fs::read(&default)?, default_before);
+        assert_eq!(
+            std::fs::read(sibling.join("meta.json"))?,
+            b"foreign context"
+        );
+        let pending = std::fs::read_dir(store.data_path())?
+            .collect::<std::io::Result<Vec<_>>>()?
+            .into_iter()
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with(&format!(".{DELETE_INTENT}.pending-"))
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(pending.len(), 1);
+        let pending_path = pending[0].path();
+        let pending_bytes = std::fs::read(&pending_path)?;
+        let pending_identity = std::fs::symlink_metadata(&pending_path)?;
+        assert_eq!(pending_identity.mode() & 0o777, 0o600);
+        assert_eq!(pending_identity.nlink(), 1);
+        if partial {
+            assert_eq!(pending_bytes.len(), 7);
+        }
+        drop(prepared);
+        prepare_delete(&store, &claim)?.remove_exact(&operation)?;
+        require_deleted_for_store(&store, &operation)?;
+        assert!(!directory.exists());
+        assert_eq!(std::fs::read(&default)?, default_before);
+        assert_eq!(
+            std::fs::read(sibling.join("meta.json"))?,
+            b"foreign context"
+        );
+        assert_eq!(std::fs::read(&pending_path)?, pending_bytes);
+        assert_eq!(
+            std::fs::symlink_metadata(&pending_path)?.ino(),
+            pending_identity.ino()
+        );
+        // Only the exact runtime-tree deletion may later retire this orphan.
+        prepare_delete(&store, &claim)?.remove_exact(&operation)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn context_delete_atomic_publication_preserves_unknown_final_contender() -> Result<()> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let operation = delete_operation(&store);
+    let default = Path::new(&claim.config_dir).join("config.json");
+    let default_before = std::fs::read(&default)?;
+    let metadata_before = std::fs::read(directory.join("meta.json"))?;
+    let final_path = store.data_path().join(DELETE_INTENT);
+    let mut prepared = prepare_delete(&store, &claim)?;
+    assert!(
+        prepared
+            .remove_with_checkpoints(
+                &operation,
+                |_| {
+                    let mut contender = std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .mode(0o600)
+                        .open(&final_path)?;
+                    contender.write_all(b"unknown final contender")?;
+                    contender.sync_all()?;
+                    Ok(())
+                },
+                || anyhow::bail!("must not unlink metadata after publication conflict"),
+            )
+            .is_err()
+    );
+    assert_eq!(std::fs::read(&final_path)?, b"unknown final contender");
+    assert_eq!(std::fs::read(directory.join("meta.json"))?, metadata_before);
+    assert_eq!(std::fs::read(&default)?, default_before);
+    assert!(prepare_delete(&store, &claim).is_err());
+    Ok(())
+}
+
+#[test]
+fn context_delete_pending_content_change_cannot_be_published() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let metadata_before = std::fs::read(directory.join("meta.json"))?;
+    assert!(
+        prepare_delete(&store, &claim)?
+            .remove_with_checkpoints(
+                &delete_operation(&store),
+                |file| {
+                    file.set_len(3)?;
+                    Ok(())
+                },
+                || anyhow::bail!("must not unlink metadata after changed pending record"),
+            )
+            .is_err()
+    );
+    assert!(!store.data_path().join(DELETE_INTENT).exists());
+    assert_eq!(std::fs::read(directory.join("meta.json"))?, metadata_before);
+    Ok(())
+}
+
+#[test]
+fn context_delete_rejects_unclaimed_empty_and_tls_paths_without_mutation() -> Result<()> {
+    for case in 0..4 {
+        let (_root, store, claim, directory) = delete_fixture()?;
+        match case {
+            0 => std::fs::remove_file(store.data_path().join(CLAIM))?,
+            1 => std::fs::remove_file(directory.join("meta.json"))?,
+            2 => std::fs::write(directory.join("extra"), b"foreign")?,
+            _ => {
+                let tls = Path::new(&claim.config_dir)
+                    .join("contexts/tls")
+                    .join(directory.file_name().context("hash")?);
+                std::fs::create_dir_all(tls)?;
+            }
+        }
+        assert!(prepare_delete(&store, &claim).is_err(), "case {case}");
+        assert!(directory.is_dir());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+    }
+    let (root, store) = fixture()?;
+    assert!(
+        ManagedMachineDockerContext::prepare_existing_delete(
+            store,
+            None,
+            &root.path().join("absent-client"),
+            &root.path().join("absent-socket")
+        )?
+        .is_none()
+    );
+    assert!(!root.path().join("absent-client").exists());
+    Ok(())
+}
+
+#[test]
+fn context_delete_rejects_prepared_claim_parent_and_metadata_replacements() -> Result<()> {
+    for case in 0..4 {
+        let (root, store, claim, directory) = delete_fixture()?;
+        let mut prepared = prepare_delete(&store, &claim)?;
+        let path = match case {
+            0 => store.data_path().join(CLAIM),
+            1 => directory.join("meta.json"),
+            _ => directory.clone(),
+        };
+        let held = root.path().join("original");
+        std::fs::rename(&path, &held)?;
+        match case {
+            0 | 1 => {
+                std::fs::copy(&held, &path)?;
+            }
+            2 => {
+                std::os::unix::fs::symlink(&held, &path)?;
+            }
+            _ => {
+                std::fs::create_dir(&path)?;
+                std::fs::copy(held.join("meta.json"), path.join("meta.json"))?;
+            }
+        }
+        assert!(
+            prepared.remove_exact(&delete_operation(&store)).is_err(),
+            "case {case}"
+        );
+        assert!(std::fs::symlink_metadata(&path).is_ok());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn context_delete_rejects_wrong_operation_owner_kind_generation_and_hash() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    for case in 0..5 {
+        let mut operation = delete_operation(&store);
+        match case {
+            0 => operation.kind = EnvironmentLifecycleKind::Stop,
+            1 => operation.environment_id = EnvironmentId::generate(),
+            2 => operation.generation = 0,
+            3 => operation.request_hash = "unbound".into(),
+            _ => operation.machine_steps.clear(),
+        }
+        assert!(
+            prepare_delete(&store, &claim)?
+                .remove_exact(&operation)
+                .is_err()
+        );
+        assert!(directory.join("meta.json").is_file());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn context_delete_rejects_claim_connection_nonce_and_descriptor_drift() -> Result<()> {
+    for case in 0..5 {
+        let (_root, store, expected, directory) = delete_fixture()?;
+        let path = store.data_path().join(CLAIM);
+        let mut changed = expected.clone();
+        match case {
+            0 => changed.owner.project_id = ProjectId::generate(),
+            1 => changed.config_dir.push_str("-foreign"),
+            2 => changed.endpoint.push_str("-foreign"),
+            3 => changed.name.push_str("-foreign"),
+            _ => changed.nonce = LifecycleOperationId::generate().to_string(),
+        }
+        std::fs::write(path, serde_json::to_vec(&changed)?)?;
+        assert!(
+            prepare_delete(&store, &expected).is_err(),
+            "claim drift {case}"
+        );
+        assert!(directory.join("meta.json").is_file());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn context_delete_optional_published_descriptor_must_match_existing_claim() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let context = ManagedMachineDockerContext {
+        claim: claim.clone(),
+        store: Arc::clone(&store),
+    };
+    let descriptor = context.descriptor(
+        &MachineIncarnation {
+            schema_version: 1,
+            incarnation_id: vz_runtime_contract::MachineIncarnationId::generate(),
+            machine_id: store
+                .owner()
+                .machine_id
+                .clone()
+                .context("fixture Machine")?,
+            generation: 1,
+            created_at: 1,
+        },
+        "fixture-engine".into(),
+    )?;
+    let config = Path::new(&claim.config_dir);
+    let socket = Path::new(claim.endpoint.strip_prefix("unix://").context("socket")?);
+    assert!(
+        ManagedMachineDockerContext::prepare_existing_delete(
+            Arc::clone(&store),
+            Some(&descriptor),
+            config,
+            socket
+        )?
+        .is_some()
+    );
+    for case in 0..4 {
+        let mut changed = descriptor.clone();
+        match case {
+            0 => changed.owner.environment_id = EnvironmentId::generate(),
+            1 => changed.name.push_str("-foreign"),
+            2 => changed.config_dir.push_str("-foreign"),
+            _ => changed.endpoint.push_str("-foreign"),
+        }
+        assert!(
+            ManagedMachineDockerContext::prepare_existing_delete(
+                Arc::clone(&store),
+                Some(&changed),
+                config,
+                socket
+            )
+            .is_err()
+        );
+    }
+    std::fs::remove_file(store.data_path().join(CLAIM))?;
+    assert!(
+        ManagedMachineDockerContext::prepare_existing_delete(
+            Arc::clone(&store),
+            Some(&descriptor),
+            config,
+            socket
+        )
+        .is_err()
+    );
+    assert!(directory.join("meta.json").exists());
+    assert!(!store.data_path().join(DELETE_INTENT).exists());
+    Ok(())
+}
+
+#[test]
+fn context_delete_never_removes_replacement_after_partial_unlink() -> Result<()> {
+    let (root, store, claim, directory) = delete_fixture()?;
+    let operation = delete_operation(&store);
+    let mut prepared = prepare_delete(&store, &claim)?;
+    let held = root.path().join("original-context");
+    assert!(
+        prepared
+            .remove_with_checkpoint(&operation, || {
+                std::fs::rename(&directory, &held)?;
+                std::fs::create_dir(&directory)?;
+                std::fs::write(directory.join("foreign"), b"must survive")?;
+                Ok(())
+            })
+            .is_err()
+    );
+    assert_eq!(std::fs::read(directory.join("foreign"))?, b"must survive");
+    assert!(held.is_dir());
+    assert!(prepare_delete(&store, &claim).is_err());
+    Ok(())
+}
+
+#[test]
+fn context_delete_rejects_linked_metadata_and_symlinked_shared_ancestry() -> Result<()> {
+    for case in 0..3 {
+        let (root, store, claim, directory) = delete_fixture()?;
+        let foreign = root.path().join("foreign");
+        match case {
+            0 => std::fs::hard_link(directory.join("meta.json"), &foreign)?,
+            1 => {
+                std::fs::rename(directory.join("meta.json"), &foreign)?;
+                std::os::unix::fs::symlink(&foreign, directory.join("meta.json"))?;
+            }
+            _ => {
+                let parent = directory.parent().context("context parent")?;
+                std::fs::rename(parent, &foreign)?;
+                std::os::unix::fs::symlink(&foreign, parent)?;
+            }
+        }
+        assert!(prepare_delete(&store, &claim).is_err());
+        assert!(std::fs::symlink_metadata(&foreign).is_ok());
+        assert!(!store.data_path().join(DELETE_INTENT).exists());
+    }
+    Ok(())
+}
+
+#[test]
+fn context_delete_partial_replay_rejects_generation_hash_and_intent_replacement() -> Result<()> {
+    let (root, store, claim, directory) = delete_fixture()?;
+    let operation = delete_operation(&store);
+    let mut prepared = prepare_delete(&store, &claim)?;
+    assert!(
+        prepared
+            .remove_with_checkpoint(&operation, || anyhow::bail!("simulated crash"))
+            .is_err()
+    );
+    for case in 0..2 {
+        let mut changed = operation.clone();
+        if case == 0 {
+            changed.generation += 1;
+        } else {
+            changed.request_hash = format!("sha256:{}", "c".repeat(64));
+        }
+        assert!(
+            prepare_delete(&store, &claim)?
+                .remove_exact(&changed)
+                .is_err()
+        );
+        assert!(directory.is_dir());
+    }
+    let mut resumed = prepare_delete(&store, &claim)?;
+    let intent = store.data_path().join(DELETE_INTENT);
+    let held = root.path().join("old-intent");
+    std::fs::rename(&intent, &held)?;
+    std::fs::copy(&held, &intent)?;
+    assert!(resumed.remove_exact(&operation).is_err());
+    assert!(directory.is_dir());
+    Ok(())
+}
+
+#[test]
+fn store_delete_requires_completed_context_removal_and_same_operation() -> Result<()> {
+    let (_root, store, claim, directory) = delete_fixture()?;
+    let operation = delete_operation(&store);
+    assert!(require_deleted_for_store(&store, &operation).is_err());
+    let mut prepared = prepare_delete(&store, &claim)?;
+    assert!(
+        prepared
+            .remove_with_checkpoint(&operation, || anyhow::bail!("interrupted"))
+            .is_err()
+    );
+    assert!(
+        require_deleted_for_store(&store, &operation).is_err(),
+        "empty retained directory is incomplete deletion"
+    );
+    prepare_delete(&store, &claim)?.remove_exact(&operation)?;
+    require_deleted_for_store(&store, &operation)?;
+    let mut other = operation.clone();
+    other.operation_id = LifecycleOperationId::generate();
+    assert!(require_deleted_for_store(&store, &other).is_err());
+    std::fs::create_dir(&directory)?;
+    std::fs::write(directory.join("meta.json"), b"foreign replacement")?;
+    assert!(require_deleted_for_store(&store, &operation).is_err());
+    assert_eq!(
+        std::fs::read(directory.join("meta.json"))?,
+        b"foreign replacement"
+    );
+    Ok(())
+}
+
+#[test]
+fn store_delete_without_claim_rejects_orphaned_intent_without_mutation() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let (_root, store) = fixture()?;
+    let operation = delete_operation(&store);
+    require_deleted_for_store(&store, &operation)?;
+    let path = store.data_path().join(DELETE_INTENT);
+    assert!(!path.exists());
+    std::fs::write(&path, b"orphaned intent")?;
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    assert!(require_deleted_for_store(&store, &operation).is_err());
+    assert_eq!(std::fs::read(path)?, b"orphaned intent");
+    Ok(())
+}
 
 fn fixture() -> Result<(tempfile::TempDir, Arc<MachineRuntimeStoreLease>)> {
     let root = tempfile::Builder::new()
@@ -224,7 +806,7 @@ async fn actual_host_contexts_are_stable_owned_and_preserve_default() -> Result<
     let after = client
         .run(
             None,
-            &["context".into(), "inspect".into(), foreign_name],
+            &["context".into(), "inspect".into(), foreign_name.clone()],
             None,
             Duration::from_secs(10),
         )
@@ -232,6 +814,39 @@ async fn actual_host_contexts_are_stable_owned_and_preserve_default() -> Result<
         .success()?
         .stdout;
     assert_eq!(before, after);
+    let operation = delete_operation(&store);
+    let mut prepared = ManagedMachineDockerContext::prepare_existing_delete(
+        Arc::clone(&store),
+        None,
+        &config,
+        &socket,
+    )?
+    .context("owned host context must have an exact Delete claim")?;
+    prepared.remove_exact(&operation)?;
+    let removed = client
+        .run(
+            None,
+            &["context".into(), "inspect".into(), first.claim.name.clone()],
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    ensure!(
+        !removed.status.success(),
+        "actual host client still resolves deleted context"
+    );
+    let foreign_after_delete = client
+        .run(
+            None,
+            &["context".into(), "inspect".into(), foreign_name],
+            None,
+            Duration::from_secs(10),
+        )
+        .await?
+        .success()?
+        .stdout;
+    assert_eq!(before, foreign_after_delete);
+    require_deleted_for_store(&store, &operation)?;
     assert_eq!(std::fs::read(config.join("config.json"))?, default_bytes);
     ensure!(
         matches!(no_engine.accept(),Err(error) if error.kind()==std::io::ErrorKind::WouldBlock),
@@ -243,7 +858,7 @@ async fn actual_host_contexts_are_stable_owned_and_preserve_default() -> Result<
     );
     println!(
         "{}",
-        json!({"phase":"offline_result","owned_claim_stable":true,"foreign_context_unchanged":true,"default_config_exact_bytes":String::from_utf8_lossy(default_bytes),"engine_connections":0,"vm_started":false,"readiness_or_parity_certified":false})
+        json!({"phase":"offline_result","owned_claim_stable":true,"owned_context_deleted":true,"foreign_context_unchanged":true,"default_config_exact_bytes":String::from_utf8_lossy(default_bytes),"engine_connections":0,"vm_started":false,"readiness_or_parity_certified":false})
     );
     Ok(())
 }

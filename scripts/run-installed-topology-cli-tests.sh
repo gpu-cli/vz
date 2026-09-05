@@ -27,7 +27,7 @@ for dependency in cargo jq codesign shasum git rg; do
 done
 repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$repo_root"
-drivers=(topology_up_cli topology_exec_cli topology_stop_cli topology_status_cli bare_help_cli legacy_cli_retirement api_http_mode_e2e)
+drivers=(topology_up_cli topology_exec_cli topology_stop_cli topology_delete_cli topology_status_cli bare_help_cli legacy_cli_retirement api_http_mode_e2e)
 driver_arguments=()
 for driver in "${drivers[@]}"; do
     [[ -f "crates/vz-cli/tests/$driver.rs" ]] || fail "required driver missing: $driver"

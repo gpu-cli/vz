@@ -68,6 +68,7 @@ pub use spec::{
     ResourcesSpec, RestartPolicy, SecretDef, SecretSource, ServiceDependency, ServiceKind,
     ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
+pub use state_store::machine_boot_non_dispatch::MachineBootNonDispatchProof;
 pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
     ClaimedAllocatorNetworkIp, ClaimedAllocatorRelease, ClaimedAllocatorResources,

@@ -7,7 +7,7 @@ use std::process::{Command, Output};
 use tempfile::TempDir;
 
 const INSTALLED_CLI_ENV: &str = "VZ_TEST_INSTALLED_CLI";
-// Transitional DEV snapshot; deliberately not the five-verb release snapshot.
+// Five-verb DEV surface; backend/aggregate release conformance is still open.
 const DEV_HELP_SNAPSHOT: &str = include_str!("fixtures/dev-help.txt");
 
 fn cli_binary() -> PathBuf {

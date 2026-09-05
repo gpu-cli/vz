@@ -3,14 +3,14 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use vz_runtime_contract::types::{
-    EndpointInstance, EnvironmentInstance, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
-    EnvironmentLifecycleStatus, EnvironmentSelection, EnvironmentSelectionContext,
-    EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision, LegacyMigrationError,
-    LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus, MachineInstance,
-    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineState, NetworkInstance,
-    OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
-    ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError,
-    WorkspaceBinding, migrate_legacy_developer_sandbox,
+    EndpointInstance, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
+    EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSelection,
+    EnvironmentSelectionContext, EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision,
+    LegacyMigrationError, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
+    MachineInstance, MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineState,
+    NetworkInstance, OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
+    ProjectDefinition, ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError,
+    TopologyResolutionError, WorkspaceBinding, migrate_legacy_developer_sandbox,
 };
 
 use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
@@ -2800,6 +2800,35 @@ impl StateStore {
             store.update_environment_lifecycle_cas(&planned_operation, &operation)?;
             Ok(operation)
         })
+    }
+
+    /// A generation lookup is read-only and never supplies physical absence
+    /// authority by itself. Callers must validate the exact owner, operation,
+    /// successful Machine step and retained controller fence before effects.
+    pub fn load_environment_lifecycle_at_generation(
+        &self,
+        environment_id: &EnvironmentId,
+        generation: u64,
+    ) -> Result<Option<EnvironmentLifecycleOperation>, StackError> {
+        let operation_id: Option<String> = self.conn.query_row(
+            "SELECT operation_id FROM environment_lifecycle_operations WHERE environment_id = ?1 AND generation = ?2",
+            params![environment_id.as_str(), sqlite_u64(generation, "generation")?],
+            |row| row.get(0),
+        ).optional()?;
+        operation_id
+            .map(|id| {
+                let operation = self
+                    .load_environment_lifecycle(&id)?
+                    .ok_or_else(|| operation_not_found(&id))?;
+                if &operation.environment_id != environment_id || operation.generation != generation
+                {
+                    return Err(StackError::InvalidSpec(
+                        "lifecycle generation lookup changed identity".into(),
+                    ));
+                }
+                Ok(operation)
+            })
+            .transpose()
     }
 
     /// Load one lifecycle journal by immutable operation ID.

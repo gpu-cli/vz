@@ -14,7 +14,7 @@ pub const LEGACY_COMMAND_REMOVED_EXIT_CODE: i32 = 2;
 /// Stable machine-readable error code for a removed legacy command.
 pub const LEGACY_COMMAND_REMOVED_CODE: &str = "legacy_command_removed";
 
-const ROOT_MIGRATION: &str = "Declare Developer Environment topology in vz.json. Use vz status to inspect it, vz exec for Machine execution, and vz stop to preserve it. The complete 0.4 lifecycle adds vz up and vz delete; consult installed help for implemented DEV capabilities.";
+const ROOT_MIGRATION: &str = "Declare Developer Environment topology in vz.json. Use vz up to create it, vz status to inspect it, vz exec for Machine execution, vz stop to preserve it, and vz delete to remove owned state. Consult installed help for implemented DEV capabilities.";
 const BARE_FLAG_MIGRATION: &str = "The implicit sandbox mode was removed. Declare Developer Environment configuration in vz.json. The 0.4 public CLI is converging on explicit vz up, vz exec, vz status, vz stop, and vz delete lifecycle verbs.";
 const TYPED_API_MIGRATION: &str =
     "Use the topology-scoped typed API for operations outside the five lifecycle verbs.";

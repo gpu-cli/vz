@@ -17,7 +17,7 @@ Examples:
   vz status --json    Inspect the selected Environment topology
   vz exec -- uname -s  Execute in the selected Ready Machine
 
-Implementation status: DEV. The complete 0.4 five-verb lifecycle is not yet shipped.";
+Implementation status: DEV. All five lifecycle verbs are present; complete 0.4 topology support is not yet shipped.";
 
 /// vz — reproducible, parallel Developer Environments.
 ///
@@ -58,6 +58,9 @@ enum Commands {
     Up(commands::dev_up::DevUpArgs),
     /// Stop the selected Developer Environment, preserving identities and state.
     Stop(commands::dev_stop::DevStopArgs),
+
+    /// Delete the selected Environment and its owned resources (Linux-on-macOS DEV adapter).
+    Delete(commands::dev_delete::DevDeleteArgs),
 
     /// Execute in one selected Ready Machine (Linux-on-macOS DEV adapter).
     ///
@@ -122,6 +125,17 @@ fn main() -> anyhow::Result<()> {
             },
             Some(Commands::Stop(args)) => {
                 match commands::dev_stop::cmd_dev_stop(args, json).await {
+                    Ok(()) => Ok(()),
+                    Err(error) => {
+                        if !error.already_emitted() {
+                            eprintln!("{}", error.to_json());
+                        }
+                        std::process::exit(error.exit_code());
+                    }
+                }
+            }
+            Some(Commands::Delete(args)) => {
+                match commands::dev_delete::cmd_dev_delete(args, json).await {
                     Ok(()) => Ok(()),
                     Err(error) => {
                         if !error.already_emitted() {

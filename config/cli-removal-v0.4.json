@@ -13,6 +13,7 @@
   "implemented_dev_roots": [
     "up",
     "stop",
+    "delete",
     "exec",
     "status"
   ],

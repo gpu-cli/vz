@@ -315,6 +315,7 @@ mod tests {
             ("GetProjectState", RpcMode::Unary),
             ("UpEnvironment", RpcMode::ServerStreaming),
             ("StopEnvironment", RpcMode::ServerStreaming),
+            ("DeleteEnvironment", RpcMode::ServerStreaming),
             ("ExecMachine", RpcMode::BidirectionalStreaming),
             ("ValidateLinuxVm", RpcMode::ServerStreaming),
             ("ListLinuxVmBases", RpcMode::Unary),
@@ -354,6 +355,7 @@ mod tests {
         let _ = GetCapabilitiesRequest::default();
         let _ = GetProjectStateRequest::default();
         let _ = StopEnvironmentRequest::default();
+        let _ = DeleteEnvironmentRequest::default();
 
         // Verify response types.
         let _ = SandboxResponse::default();
@@ -375,6 +377,7 @@ mod tests {
         let _ = GetCapabilitiesResponse::default();
         let _ = GetProjectStateResponse::default();
         let _ = StopEnvironmentEvent::default();
+        let _ = DeleteEnvironmentEvent::default();
 
         // Verify payload types used in responses.
         let _ = SandboxPayload::default();
@@ -1179,6 +1182,29 @@ mod tests {
                     ("error", 6),
                 ],
             ),
+            (
+                "DeleteEnvironmentRequest",
+                &[
+                    ("metadata", 1),
+                    ("project_id", 2),
+                    ("environment", 3),
+                    ("process_environment_id", 4),
+                    ("workspace_key", 5),
+                    ("machine_timeout_millis", 6),
+                ],
+            ),
+            (
+                "DeleteEnvironmentEvent",
+                &[
+                    ("schema_version", 1),
+                    ("request_id", 2),
+                    ("sequence", 3),
+                    ("operation", 4),
+                    ("terminal", 5),
+                    ("error", 6),
+                    ("tombstone", 7),
+                ],
+            ),
             ("TopologyCandidate", &[("id", 1), ("name", 2)]),
             ("TopologyNotFoundDetail", &[("kind", 1), ("selector", 2)]),
             (
@@ -1816,6 +1842,194 @@ mod tests {
             event.encode_to_vec(),
             [0x08, 1, 0x12, 1, b'r', 0x18, 1, 0x22, 0, 0x28, 1, 0x32, 0]
         );
+    }
+
+    #[test]
+    fn runtime_v2_delete_generated_wire_tags_and_tombstone_presence_are_stable() {
+        use crate::runtime_v2::*;
+        // Literal bytes independently bind generated field tags. This fixture
+        // exercises wire presence, not semantic success/error coexistence.
+        let request = DeleteEnvironmentRequest {
+            metadata: Some(RequestMetadata::default()),
+            project_id: "p".into(),
+            environment: Some(String::new()),
+            process_environment_id: Some(String::new()),
+            workspace_key: Some(String::new()),
+            machine_timeout_millis: 1,
+        };
+        assert_eq!(
+            request.encode_to_vec(),
+            [0x0a, 0, 0x12, 1, b'p', 0x1a, 0, 0x22, 0, 0x2a, 0, 0x30, 1]
+        );
+        let event = DeleteEnvironmentEvent {
+            schema_version: 1,
+            request_id: "r".into(),
+            sequence: 1,
+            operation: Some(EnvironmentLifecycleOperation::default()),
+            terminal: true,
+            error: Some(ErrorDetail::default()),
+            tombstone: Some(EnvironmentTombstone::default()),
+        };
+        assert_eq!(
+            event.encode_to_vec(),
+            [
+                0x08, 1, 0x12, 1, b'r', 0x18, 1, 0x22, 0, 0x28, 1, 0x32, 0, 0x3a, 0
+            ]
+        );
+        assert!(
+            DeleteEnvironmentEvent::decode([].as_slice())
+                .unwrap()
+                .tombstone
+                .is_none()
+        );
+        assert_eq!(
+            DeleteEnvironmentEvent::decode([0x3a, 0].as_slice())
+                .unwrap()
+                .tombstone,
+            Some(EnvironmentTombstone::default())
+        );
+    }
+
+    #[test]
+    fn runtime_v2_delete_request_preserves_each_optional_selector_and_metadata() {
+        use crate::runtime_v2::*;
+        let values = [None, Some(String::new()), Some("exact-selector".into())];
+        for environment in &values {
+            for process_environment_id in &values {
+                for workspace_key in &values {
+                    let request = DeleteEnvironmentRequest {
+                        metadata: Some(RequestMetadata {
+                            request_id: "req-delete".into(),
+                            idempotency_key: "idem-delete".into(),
+                            trace_id: "trace-delete".into(),
+                        }),
+                        project_id: "prj_selected".into(),
+                        environment: environment.clone(),
+                        process_environment_id: process_environment_id.clone(),
+                        workspace_key: workspace_key.clone(),
+                        machine_timeout_millis: 300_000,
+                    };
+                    assert_eq!(
+                        DeleteEnvironmentRequest::decode(request.encode_to_vec().as_slice())
+                            .unwrap(),
+                        request
+                    );
+                }
+            }
+        }
+        assert!(
+            DeleteEnvironmentRequest::decode([].as_slice())
+                .unwrap()
+                .metadata
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn runtime_v2_delete_progress_and_terminal_tombstone_round_trip_exact_sequence() {
+        use crate::runtime_v2::*;
+        for (status, step_status, sequence, failure) in [
+            (
+                EnvironmentLifecycleStatus::Running,
+                LifecycleStepStatus::Pending,
+                0,
+                None,
+            ),
+            (
+                EnvironmentLifecycleStatus::Succeeded,
+                LifecycleStepStatus::Succeeded,
+                u64::MAX,
+                None,
+            ),
+            (
+                EnvironmentLifecycleStatus::Blocked,
+                LifecycleStepStatus::Failed,
+                41,
+                Some("owned cleanup uncertain"),
+            ),
+        ] {
+            let succeeded = status == EnvironmentLifecycleStatus::Succeeded;
+            let terminal = succeeded || failure.is_some();
+            let operation = EnvironmentLifecycleOperation {
+                schema_version: 1,
+                operation_id: "lop_delete".into(),
+                project_id: "prj_selected".into(),
+                environment_id: "env_selected".into(),
+                kind: EnvironmentLifecycleKind::Delete as i32,
+                generation: 8,
+                request_id: "req-delete".into(),
+                idempotency_key: "idem-delete".into(),
+                request_hash: "sha256:request".into(),
+                definition_digest: "sha256:definition".into(),
+                initial_state: EnvironmentState::Ready as i32,
+                requested_target: EnvironmentState::Deleted as i32,
+                status: status as i32,
+                machine_steps: vec![MachineLifecycleStep {
+                    machine_id: "mch_selected".into(),
+                    initial_state: MachineState::Ready as i32,
+                    target_state: None,
+                    expected_incarnation: Some(MachineIncarnation {
+                        schema_version: 1,
+                        incarnation_id: "inc_original".into(),
+                        machine_id: "mch_selected".into(),
+                        generation: 7,
+                        created_at: 100,
+                    }),
+                    resulting_incarnation: None,
+                    resulting_activation: None,
+                    status: step_status as i32,
+                    failure_reason: failure.map(str::to_owned),
+                }],
+                cleanup_steps: vec![OwnershipCleanupStep {
+                    ownership: Some(OwnershipRecord {
+                        schema_version: 1,
+                        resource_kind: OwnedResourceKind::Machine as i32,
+                        other_resource_kind: None,
+                        resource_id: "mch_selected".into(),
+                        environment_id: "env_selected".into(),
+                        machine_id: Some("mch_selected".into()),
+                    }),
+                    status: step_status as i32,
+                    failure_reason: failure.map(str::to_owned),
+                }],
+                created_at: 101,
+                updated_at: 102,
+                completed_at: succeeded.then_some(102),
+            };
+            let event = DeleteEnvironmentEvent {
+                schema_version: 1,
+                request_id: "req-delete".into(),
+                sequence,
+                operation: Some(operation),
+                terminal,
+                error: failure.map(|message| ErrorDetail {
+                    code: "backend_unavailable".into(),
+                    message: message.into(),
+                    request_id: "req-delete".into(),
+                    details: Default::default(),
+                }),
+                tombstone: succeeded.then(|| EnvironmentTombstone {
+                    schema_version: 1,
+                    project_id: "prj_selected".into(),
+                    environment_id: "env_selected".into(),
+                    name: "selected".into(),
+                    definition_digest: "sha256:definition".into(),
+                    delete_operation_id: "lop_delete".into(),
+                    lifecycle_generation: 8,
+                    ownership_digest: "sha256:ownership".into(),
+                    deleted_at: 102,
+                }),
+            };
+            let decoded = DeleteEnvironmentEvent::decode(event.encode_to_vec().as_slice()).unwrap();
+            assert_eq!(decoded, event);
+            assert_eq!(decoded.sequence, sequence);
+            assert_eq!(decoded.tombstone.is_some(), succeeded);
+            assert!(
+                decoded.operation.as_ref().unwrap().machine_steps[0]
+                    .target_state
+                    .is_none()
+            );
+        }
     }
 
     #[test]

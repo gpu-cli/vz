@@ -12,6 +12,7 @@ pub mod types;
 mod backend;
 mod checkpoint;
 mod conformance;
+mod environment_delete_request;
 mod metadata;
 
 #[cfg(test)]
@@ -30,6 +31,7 @@ pub use conformance::{
     canonical_backend_capabilities, transport_metadata_for_sequence,
     validate_backend_adapter_contract_surface, validate_backend_adapter_parity,
 };
+pub use environment_delete_request::environment_delete_request_hash;
 pub use error::{MachineErrorCode, RuntimeError};
 pub use metadata::{
     MachineError, MachineErrorDetails, MachineErrorEnvelope, PolicyDecision, RequestMetadata,

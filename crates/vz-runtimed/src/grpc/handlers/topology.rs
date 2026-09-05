@@ -18,6 +18,98 @@ impl TopologyServiceImpl {
 
 #[tonic::async_trait]
 impl runtime_v2::topology_service_server::TopologyService for TopologyServiceImpl {
+    type DeleteEnvironmentStream = std::pin::Pin<
+        Box<
+            dyn tokio_stream::Stream<Item = Result<runtime_v2::DeleteEnvironmentEvent, Status>>
+                + Send,
+        >,
+    >;
+
+    async fn delete_environment(
+        &self,
+        request: Request<runtime_v2::DeleteEnvironmentRequest>,
+    ) -> Result<Response<Self::DeleteEnvironmentStream>, Status> {
+        let intercepted = request_id_from_extensions(&request);
+        let request = request.into_inner();
+        let metadata = normalize_metadata(request.metadata.as_ref(), intercepted);
+        #[cfg(not(target_os = "macos"))]
+        {
+            Err(status_from_machine_error(MachineError::new(
+                MachineErrorCode::UnsupportedOperation,
+                "Environment Delete physical adapter is currently Linux-on-macOS only".into(),
+                metadata.request_id,
+                BTreeMap::new(),
+            )))
+        }
+        #[cfg(target_os = "macos")]
+        {
+            use tokio_stream::StreamExt;
+            use vz_runtime_contract::{
+                EnvironmentId, EnvironmentSelectionContext, EnvironmentSelector, ProjectId,
+            };
+            let invalid = |message: String| {
+                status_from_machine_error(MachineError::new(
+                    MachineErrorCode::ValidationError,
+                    message,
+                    metadata.request_id.clone(),
+                    BTreeMap::new(),
+                ))
+            };
+            let project_id =
+                ProjectId::new(request.project_id).map_err(|e| invalid(e.to_string()))?;
+            let process_environment_id = if request.environment.is_some() {
+                None
+            } else {
+                request
+                    .process_environment_id
+                    .map(EnvironmentId::new)
+                    .transpose()
+                    .map_err(|e| invalid(e.to_string()))?
+            };
+            let receiver = self
+                .daemon
+                .delete_environment(crate::environment_delete::DeleteEnvironmentInput {
+                    project_id,
+                    metadata,
+                    selection: EnvironmentSelectionContext {
+                        explicit: request.environment.map(EnvironmentSelector::NameOrId),
+                        process_environment_id,
+                        workspace_key: request.workspace_key,
+                    },
+                    machine_timeout: Duration::from_millis(request.machine_timeout_millis),
+                })
+                .await
+                .map_err(status_from_machine_error)?;
+            #[allow(clippy::result_large_err)] // tonic streams carry Status by value.
+            let stream = tokio_stream::wrappers::WatchStream::new(receiver).map(|result| {
+                result
+                    .map(|event| runtime_v2::DeleteEnvironmentEvent {
+                        schema_version: event.schema_version,
+                        request_id: event.request_id,
+                        sequence: event.sequence,
+                        operation: Some(
+                            vz_runtime_translate::environment_lifecycle_operation_to_proto(
+                                &event.operation,
+                            ),
+                        ),
+                        terminal: event.terminal,
+                        error: event
+                            .error
+                            .as_ref()
+                            .map(vz_runtime_translate::machine_error_to_proto_detail),
+                        tombstone: event
+                            .tombstone
+                            .as_ref()
+                            .map(vz_runtime_translate::environment_tombstone_to_proto),
+                    })
+                    .map_err(status_from_machine_error)
+            });
+            Ok(Response::new(
+                Box::pin(stream) as Self::DeleteEnvironmentStream
+            ))
+        }
+    }
+
     type UpEnvironmentStream = UpEnvironmentStream;
     async fn up_environment(
         &self,

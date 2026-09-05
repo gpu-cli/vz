@@ -118,11 +118,13 @@ The implemented topology CLI currently exposes:
 - `vz stop`: selected-Environment Stop with exact ownership and positive
   execution reaping. Unsupported resources and unknown live ownership fail
   closed; it is not the former single-VM Stop path.
+- `vz delete`: streamed ownership-safe removal of the selected Environment's
+  Linux-on-macOS Machines, managed Docker contexts and private stores. Positive
+  quiescence and exact ownership are required; native targets and other topology
+  cleanup adapters remain unsupported.
 
-`delete` is absent; complete Up reconciliation, installed-catalog bootstrap,
-and physical lifecycle acceptance remain unfinished. There is no compatibility
-alias to make the command count look complete. The release goal remains exactly
-`up`, `exec`, `status`, `stop`, and `delete`.
+All five lifecycle verbs are present as DEV adapters. Complete Up reconciliation,
+mixed-target topology and the full physical lifecycle release gate remain open.
 
 Bare `vz` prints static help, exits zero, and performs no project/state discovery
 or mutation. All 16 retired infrastructure roots—including `run`, `vm`,

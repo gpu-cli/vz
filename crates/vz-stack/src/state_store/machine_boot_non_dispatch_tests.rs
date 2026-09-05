@@ -531,3 +531,141 @@ fn unconsumed_failed_proof_does_not_block_positive_stop_then_up() {
         .consume_machine_boot_non_dispatch(&next, machine)
         .unwrap();
 }
+
+#[test]
+fn failed_up_delete_successor_recovers_only_unconsumed_proof_after_restart() {
+    let (directory, store, up) = fixture();
+    let a = up.machine_steps[0].machine_id.clone();
+    let b = up.machine_steps[1].machine_id.clone();
+    store.record_machine_boot_non_dispatch(&up, &a).unwrap();
+    let proof = store.record_machine_boot_non_dispatch(&up, &b).unwrap();
+    store.consume_machine_boot_non_dispatch(&up, &a).unwrap();
+    fail(&store, &up);
+    let delete = begin(
+        &store,
+        &up.environment_id,
+        EnvironmentLifecycleKind::Delete,
+        2,
+    );
+    assert!(
+        delete
+            .machine_steps
+            .iter()
+            .all(|step| step.target_state.is_none())
+    );
+    drop(store);
+    let store = StateStore::open(&directory.path().join("state.db")).unwrap();
+    let current = environment(&store, &delete);
+    let before = store.total_changes_for_test();
+    assert_eq!(
+        store
+            .require_machine_boot_non_dispatch(&current, &b)
+            .unwrap(),
+        Some(proof)
+    );
+    assert!(
+        store
+            .require_machine_boot_non_dispatch(&current, &a)
+            .unwrap()
+            .is_none()
+    );
+    assert!(store.record_machine_boot_non_dispatch(&delete, &b).is_err());
+    assert!(
+        store
+            .consume_machine_boot_non_dispatch(&delete, &b)
+            .is_err()
+    );
+    assert!(store.consume_machine_boot_non_dispatch(&up, &b).is_err());
+    assert_eq!(store.total_changes_for_test(), before);
+    acknowledge(&store, &delete, &b, LifecycleStepResult::Succeeded);
+    // Acknowledged Delete uses its own positive quiescence receipt, not a
+    // silently broadened pending non-dispatch capability.
+    assert!(
+        store
+            .require_machine_boot_non_dispatch(&environment(&store, &delete), &b)
+            .is_err()
+    );
+}
+
+#[test]
+fn delete_successor_rejects_missing_and_foreign_original_proof_without_writes() {
+    let (_directory, store, up) = fixture();
+    let a = &up.machine_steps[0].machine_id;
+    let b = &up.machine_steps[1].machine_id;
+    let proof = store.record_machine_boot_non_dispatch(&up, a).unwrap();
+    fail(&store, &up);
+    let delete = begin(
+        &store,
+        &up.environment_id,
+        EnvironmentLifecycleKind::Delete,
+        2,
+    );
+    let current = environment(&store, &delete);
+    assert!(
+        store
+            .require_machine_boot_non_dispatch(&current, b)
+            .unwrap()
+            .is_none()
+    );
+    for mutation in 0..5 {
+        let mut changed = proof.clone();
+        match mutation {
+            0 => changed.project_id = ProjectId::generate(),
+            1 => changed.machine_id = b.clone(),
+            2 => changed.generation += 1,
+            3 => changed.request_hash = format!("sha256:{}", "c".repeat(64)),
+            4 => changed.definition_digest = format!("sha256:{}", "c".repeat(64)),
+            _ => unreachable!(),
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE control_metadata SET value=?1 WHERE key=?2",
+                params![
+                    serde_json::to_string(&Record {
+                        proof: changed,
+                        consumed: false
+                    })
+                    .unwrap(),
+                    key(&up.environment_id, a).unwrap()
+                ],
+            )
+            .unwrap();
+        let before = store.total_changes_for_test();
+        assert!(
+            store
+                .require_machine_boot_non_dispatch(&current, a)
+                .is_err(),
+            "mutation {mutation}"
+        );
+        assert_eq!(store.total_changes_for_test(), before);
+    }
+}
+
+#[test]
+fn failed_up_proof_does_not_skip_an_intervening_lifecycle_to_delete() {
+    let (_directory, store, up) = fixture();
+    let machine = &up.machine_steps[0].machine_id;
+    store
+        .record_machine_boot_non_dispatch(&up, machine)
+        .unwrap();
+    fail(&store, &up);
+    let intervening = begin(
+        &store,
+        &up.environment_id,
+        EnvironmentLifecycleKind::Stop,
+        2,
+    );
+    fail(&store, &intervening);
+    let delete = begin(
+        &store,
+        &up.environment_id,
+        EnvironmentLifecycleKind::Delete,
+        3,
+    );
+    assert!(
+        store
+            .require_machine_boot_non_dispatch(&environment(&store, &delete), machine)
+            .is_err()
+    );
+}

@@ -38,8 +38,10 @@ evidence. If the required workload driver does not yet exist, that runbook or
 release gate remains incomplete; do not substitute another Machine, daemon,
 guest client, old binary, or adjacent green test.
 
-The current DEV CLI implements `up`, `exec`, `status`, and `stop`; `delete`
-is absent and complete Up reconciliation/readiness remain unfinished. Up's
+The current DEV CLI exposes `up`, `exec`, `status`, `stop`, and `delete`.
+Delete's ownership-safe Linux-on-macOS adapter is DEV; native targets and
+additional topology cleanup adapters remain unsupported. Complete Up
+reconciliation/readiness and aggregate lifecycle conformance remain unfinished. Up's
 Linux-on-macOS adapter requires an explicitly configured verified catalog and
 never promotes Engine-only evidence to Developer readiness. Bare `vz` prints
 static help without state discovery. The

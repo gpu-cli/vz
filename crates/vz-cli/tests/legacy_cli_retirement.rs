@@ -12,7 +12,7 @@ use vz_cli::legacy_cli::{
 };
 
 const INVENTORY: &str = include_str!("../../../config/cli-removal-v0.4.json");
-const EXPECTED_ROOT_MIGRATION: &str = "Declare Developer Environment topology in vz.json. Use vz status to inspect it, vz exec for Machine execution, and vz stop to preserve it. The complete 0.4 lifecycle adds vz up and vz delete; consult installed help for implemented DEV capabilities.";
+const EXPECTED_ROOT_MIGRATION: &str = "Declare Developer Environment topology in vz.json. Use vz up to create it, vz status to inspect it, vz exec for Machine execution, vz stop to preserve it, and vz delete to remove owned state. Consult installed help for implemented DEV capabilities.";
 const EXPECTED_BARE_FLAG_MIGRATION: &str = "The implicit sandbox mode was removed. Declare Developer Environment configuration in vz.json. The 0.4 public CLI is converging on explicit vz up, vz exec, vz status, vz stop, and vz delete lifecycle verbs.";
 const INSTALLED_CLI_ENV: &str = "VZ_TEST_INSTALLED_CLI";
 

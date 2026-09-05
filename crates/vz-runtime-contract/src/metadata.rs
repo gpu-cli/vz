@@ -106,6 +106,7 @@ pub enum TopologyOperation {
     Up,
     Stop,
     Exec,
+    Delete,
 }
 
 /// Exact daemon-resolved ownership supplied to topology policy hooks.

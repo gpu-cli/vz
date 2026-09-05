@@ -178,7 +178,13 @@ terminal-receipt replay (including a nonzero command exit) and unknown-runtime
 refusal, not live command execution. Its checksums bind the copied executables,
 test drivers, and raw logs. The daily installation remains unchanged.
 
-`delete` remains absent. Exec's automatic dependency reconciliation,
+`delete` now has a streamed CLI/client/daemon DEV adapter for exactly owned
+Linux-on-macOS Machines. It preflights the complete supported ownership graph,
+requires positive quiescence, removes exact managed contexts and private stores,
+and binds successful replay to the original Environment tombstone even after
+name reuse. Native targets and other topology resource cleanup adapters fail
+closed. The Delete bead remains open pending physical and aggregate evidence.
+Exec's automatic dependency reconciliation,
 physical declared-default Machine coverage, and native adapter remain required, as do
 full live status/contexts and the complete installed mixed-target lifecycle gate.
 
@@ -291,3 +297,71 @@ generation recovery, daemon teardown, Machine registry, stack and BuildKit.
 Crash-fixture socket ownership and digest-declared probe propagation corrections
 are verified; their preceding failed candidates remain retained. Public daemon
 crash recovery (`vz-ehz`) is still open and is not certified by fixture cleanup.
+
+### Streamed Delete checkpoint (2026-09-05, DEV)
+
+All five lifecycle verbs now have parser and typed daemon paths. The current
+Delete adapter preflights every supported ownership edge before admission,
+quiesces the original Linux/ARM64 Machines, retires exact managed contexts and
+private stores, and atomically records the Environment tombstone. It retains
+supervision across observer disconnects and checks the original selector,
+timeout, request, generation and ownership on replay. Reusing a human name
+cannot retarget an old completed request. Unknown live ownership, native targets
+and unsupported resource graphs fail closed; there is no force-delete fallback.
+
+The signed installed control-plane gate passed 31 checks at
+`.artifacts/topology-cli-installed-IiMGsJ/`, including eight Delete checks and
+the complete retired-parser inventory. Its checksummed CLI and daemon are
+`c3843d815eee0259c273bda4ee2a594add6109af80f14afa995b7e59b2d49c01`
+and `ec8539501786aaa5be6d03444e45872f3bc3bed701d1c1ca5d0756745561f23d`.
+The actual Mac Docker client also passed isolated owned-context deletion,
+foreign-context/default preservation and zero Engine contact at
+`.artifacts/topology-delete-n6euqZ/actual-host-context-delete-2.log`.
+Neither test claims physical VM deletion. Preceding fixture/inventory failures
+remain recorded under the same wave's artifact directory.
+
+The separate [installed Delete driver](../../scripts/helpers/installed_delete_e2e.md)
+requires fresh installed public Up/Ready Delete, name-reuse replay, Stopped
+Delete, neighboring Machine liveness, exact cleanup receipts and graceful daemon
+shutdown. Broader crash/recovery and mixed-target aggregate conformance remain
+required before the Delete task or 0.4 release can close.
+
+That driver's first physical candidate passed on the local Mac at
+`.artifacts/installed-delete-candidate-1/`, using the signed files above and
+normal public Up autostart. Two named Environments each ran two Developer Linux
+Machines. Ready Delete removed the original primary; recreating its name
+allocated new identities, and replaying the original request returned only its
+original tombstone. Public Stop/Delete removed the replacement and then the
+neighbor. All six distinct Machine stores, managed contexts and endpoint sockets
+were removed, with three exact tombstones and original-runtime quiescence
+receipts. There were zero test-case retries or cleanup errors. Both Docker
+defaults and host project/worktree sentinel bytes survived; the exact daemon
+shut down gracefully. The 128 background neighbor observations and explicit
+bracketing probes establish sampled liveness/non-restart, not uninterrupted
+packet-level availability.
+
+The result SHA256 is
+`814e47f71bfcc20699a98b46ba42d9f0c6c2a0e95003e107355a4a40b66aca62`;
+the evidence manifest SHA256 is
+`259d3f78ec39702f2770e46cd1f8887662ccb94dbf6e4ebaa7074d4a57f01888`.
+Independent replay verified all 3,360 evidence hashes, 687 bounded command
+receipts, six outside-store deletion proofs and all three persisted tombstones.
+The isolated host fixture, database and outside-store journals remain at
+`/private/tmp/vzdev-vjoll2ts`; the daily installation was not replaced.
+
+The same wave's full release-profile backend gate passed all seven lanes (50
+selected tests, zero failed or ignored) at
+`.artifacts/sandbox-vm-e2e/20260905T224239Z/summary.txt`, including the youki-only
+inventory and 18 positive exact-child/socket teardown receipts. Its complete
+`raw-evidence.sha256` manifest is
+`7d66b7feb89bfd6c472569b62dcae559590a6246c203113539724584c4d58bc1`.
+All 4,062 entries verified; raw logs, summary and socket receipts are included.
+Workspace check, formatting, strict production Clippy, protocol tests and the
+offline driver validators passed. Strict all-target Clippy remains red on
+pre-existing contract-test lints tracked in `vz-1ff`.
+
+These are scoped DEV passes, not full Docker compatibility or 0.4 certification.
+`vz-mzs.3.1.3` stays open: physical observer-disconnect and crash/ack-loss tests,
+foreign path/context replacement scenarios, other ownership adapters and the
+applicable aggregate Environment gate still require evidence. Native macOS
+and future host/target combinations need their own conformance runs.

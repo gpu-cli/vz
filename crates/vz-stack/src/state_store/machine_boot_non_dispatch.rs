@@ -325,7 +325,8 @@ impl StateStore {
     }
 
     /// Read exact boot non-dispatch authority in one snapshot. Accept the
-    /// original current Up or its immediate current Stop/Up successor only.
+    /// original current Up or its immediate current Stop/Up/Delete successor
+    /// only. Delete retains a None Machine target and cannot consume/re-arm it.
     /// This is not an effects lease; callers retain controller serialization.
     pub fn require_machine_boot_non_dispatch(
         &self,
@@ -361,10 +362,15 @@ impl StateStore {
                     let next = self
                         .load_environment_lifecycle(id.as_str())?
                         .ok_or_else(|| conflict("active journal missing"))?;
-                    matches!(
-                        next.kind,
-                        EnvironmentLifecycleKind::Stop | EnvironmentLifecycleKind::Up
-                    ) && self.boot_failed_predecessor(&record, environment, &next, machine)?
+                    let supported = match next.kind {
+                        EnvironmentLifecycleKind::Stop | EnvironmentLifecycleKind::Up => true,
+                        EnvironmentLifecycleKind::Delete => {
+                            next.validate_against_environment(environment)?;
+                            step(&next, machine)?.target_state.is_none()
+                        }
+                    };
+                    supported
+                        && self.boot_failed_predecessor(&record, environment, &next, machine)?
                 } else {
                     false
                 };

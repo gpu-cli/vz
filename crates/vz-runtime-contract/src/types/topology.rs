@@ -2885,6 +2885,40 @@ impl EnvironmentLifecycleOperation {
 }
 
 impl EnvironmentTombstone {
+    /// Validate the terminal deletion receipt against its complete immutable
+    /// ownership plan, not merely the shape of either message in isolation.
+    pub fn validate_for_operation(
+        &self,
+        operation: &EnvironmentLifecycleOperation,
+    ) -> Result<(), TopologyLifecycleError> {
+        self.validate()?;
+        operation.validate_structure()?;
+        let digest = canonical_ownership_digest(
+            operation
+                .cleanup_steps
+                .iter()
+                .map(|step| step.ownership.clone())
+                .collect(),
+        )?;
+        if operation.kind != EnvironmentLifecycleKind::Delete
+            || operation.status != EnvironmentLifecycleStatus::Succeeded
+            || operation.final_environment_state()? != EnvironmentState::Deleted
+            || self.project_id != operation.project_id
+            || self.environment_id != operation.environment_id
+            || self.delete_operation_id != operation.operation_id
+            || self.lifecycle_generation != operation.generation
+            || self.definition_digest != operation.definition_digest
+            || self.ownership_digest != digest
+            || operation.completed_at != Some(self.deleted_at)
+        {
+            return Err(TopologyLifecycleError::InvalidOperation {
+                reason: "tombstone does not certify the exact completed Delete ownership plan"
+                    .into(),
+            });
+        }
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<(), TopologyLifecycleError> {
         validate_schema(self.schema_version).map_err(|error| {
             TopologyLifecycleError::InvalidOperation {
@@ -6065,6 +6099,24 @@ mod tests {
         assert_eq!(tombstone.environment_id, environment.environment_id);
         assert_eq!(tombstone.delete_operation_id, operation.operation_id);
         tombstone.validate().unwrap();
+        tombstone.validate_for_operation(&operation).unwrap();
+        for field in 0..7 {
+            let mut forged = tombstone.clone();
+            match field {
+                0 => forged.project_id = ProjectId::generate(),
+                1 => forged.environment_id = EnvironmentId::generate(),
+                2 => forged.delete_operation_id = LifecycleOperationId::generate(),
+                3 => forged.lifecycle_generation += 1,
+                4 => forged.definition_digest.push_str("-foreign"),
+                5 => forged.ownership_digest.push_str("-foreign"),
+                _ => forged.deleted_at += 1,
+            }
+            assert!(forged.validate_for_operation(&operation).is_err());
+        }
+        let mut incomplete = operation.clone();
+        incomplete.status = EnvironmentLifecycleStatus::Running;
+        incomplete.completed_at = None;
+        assert!(tombstone.validate_for_operation(&incomplete).is_err());
     }
 
     #[test]
