@@ -127,7 +127,8 @@ validate root ownership, single-link regular files and the traversable `0755`
 parent. Host staging and runtime private-key permissions are unchanged.
 Candidate 3's four Machines were publicly stopped with clean-journal receipts;
 its failed evidence and stopped objects remain retained. Fresh positive and
-complete cache/cleanup verification are still required.
+complete cache/cleanup verification was required; the separate candidate 4
+result below supplies that evidence for the DEV SSH lane only.
 
 The authenticated OpenSSH 9.2p1 source defines Linux's locked-password prefix as
 `!` (`configure.ac`); `platform.c` checks that prefix, and `auth.c` applies the
@@ -182,3 +183,32 @@ cleanup still requires public Machine Stops and unchanged host defaults.
 Stopped Machine disks remain retained: this lane does not certify Delete.
 Implementation and helper tests alone do not pass this lane, the full
 63-scenario Docker contract, or the aggregate 0.4 release gate.
+
+## Verified DEV run: 2026-09-06
+
+Installed-Mac candidate 4 completed the SSH lane with source commit `2fae9d22`,
+fixture digest `3472d44f91ed99e3b4e32c7bbaaea2da528426889876849d25692b5e1444908a`,
+and installed `0.4.0-dev` artifacts. Evidence is retained at
+`.artifacts/linux-docker-ssh-candidate-4`; its checksum manifest is
+`b8ae31c927db2fd32c5cc3035176a0ccc73c9c36c28e85b7dcc3c06b336a476a`.
+The exact inventory contains 28,034 payloads totaling 1,461,788,534 bytes.
+The tested clients/runtime were Docker CLI and Engine 29.7.2, Buildx 0.33.0,
+and the pinned BuildKit 0.19.0/youki artifact. This does not expand the release
+contract's candidate-version range. Installed CLI SHA256 was
+`531308e1f7aa86430e217914317d8bb866f866e88fd2af1136c22662076bf287`;
+daemon SHA256 was
+`51888663520d04f36a4d567b4122a0f3a9ad061cf1d883ad6cfbd15d9f35da1f`.
+
+Three Linux Machines across two Environments each completed all four uncached
+SSH cases. Positive image and exported-cache inspection passed; three normally
+stopped builders' complete cache archives also passed bounded private-canary
+scans before publication and removal. Four Machine sentinels supplied 1,064
+observations with no recorded errors. Owned servers, agents and builder
+workloads were cleaned up; public Stops completed for all four Machines and
+both host and isolated Docker defaults remained unchanged.
+
+This is a **DEV SSH-lane result**, not the full Docker contract or aggregate
+0.4 release gate. Stopped Machine disks and contexts remain retained; Delete is
+not certified. The three earlier failed candidates remain failed and separately
+recorded, not retries within the passing candidate. No secure-erasure or
+arbitrary-encoding credential-leak claim is made.
