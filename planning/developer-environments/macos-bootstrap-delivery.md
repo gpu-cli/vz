@@ -59,7 +59,8 @@ and output hashes; the reconstructed image booted and preserved a guest marker
 across stop/start with the same VM identity. The subsequent installed DEV
 five-verb lifecycle passed with the updated native guest agent. See the
 [integration evidence](macos-bootstrap-integration.md#installed-user-validation-findings-in-progress)
-and the [pinned Swift recipe](macos-swift-toolchain.md) for the next qualification.
+and the [pinned Swift recipe](macos-swift-toolchain.md) for the subsequently passed
+Xcode/Swift installed qualification.
 Artifact publication and aggregate release acceptance remain open.
 
 ## Selected base delivery contract

@@ -2,10 +2,12 @@
 
 Tracks `vz-mzs.11.4.1`, under `vz-mzs.11.4`. Work remains on
 `feat/macos26-bootstrap`; the main worktree is reserved for the other agent.
-The operator authorized Xcode license acceptance in the maintainer VM, and
-maintainer Swift build/test/run passed. The first fresh installed run also passed
-Swift and persistence, but its negative restart exposed a lifecycle acknowledgement
-bug. The runtime fix is under fresh installed validation; this task remains open.
+The installed native Swift gate **passed** on macOS 26.3.1 / 25D2128 with Xcode
+26.3 (Swift 6.2.4, SDK 26.2). The operator authorized license acceptance inside
+the maintainer VM. Final source is `cbfdd660`; the fresh consumer required no
+manual provisioning or repair. See the [immutable evidence summary](macos-swift-dev-evidence.json).
+This qualifies the local DEV Swift path; public delivery and aggregate 0.4 gates
+remain open.
 
 ## Current candidate and evidence
 
@@ -33,6 +35,35 @@ passing test), and execution reporting `VirtualMac2,1`, macOS 26.3.1 / 25D2128.
 The fixture directory was removed and shutdown reports `provisioned: true`,
 `stopped: true`, `forced: false`. These are maintainer timings, not consumer
 first-use or cached-boot measurements.
+
+The final `installed-xcode-candidate-3` run used `installed-release-xcode-3` and a
+fresh empty cache. It passed all five public lifecycle verbs, ordinary `dev`
+Swift build/test/run, PTY/cancellation, restart persistence, two-Environment
+isolation and private platform identity checks. After verified receipt corruption,
+Up returned the exact mismatch (`backend_unavailable`, exit 5); Stop succeeded;
+another Up rejected the unchanged corrupt receipt; direct Delete succeeded. The
+first Environment still executed and was then positively deleted. The automated
+harness and platform audit both passed without continuation or consumer repair.
+
+| Installed operation | Seconds |
+| --- | ---: |
+| Cold Up, including local import and full preparation | 750.95 |
+| Ordinary release Swift build | 10.20 |
+| Ordinary Swift test (one named test) | 6.62 |
+| Stop / cached Up | 5.29 / 27.60 |
+| Second Environment from cached template | 59.74 |
+| Stop after rejected readiness | 5.23 |
+| Delete after another rejected restart | 14.12 |
+| Running first Environment Delete | 10.93 |
+
+These timings include readiness verification and exclude internet download.
+The host is Mac16,5 / macOS 26.3.1(a); each guest has four CPUs and 8 GiB RAM.
+Both Machine disks were deleted, and the completed test daemon exited. The
+redundant test base download is reclaimed; the prepared template and raw receipts
+are retained. Linux Hardened lifecycle/persistence also passed with identical
+signed binaries (`linux-swift-regression-2`).
+
+## Earlier failures and fixes
 
 The previous CLT-only candidate (Swift 6.2.1, SDK 26.1) reached installed Ready
 in **716.159 seconds**, but failed ordinary user execution because `/Users/dev`
@@ -83,11 +114,9 @@ incarnation, runtime and quiescence evidence.
 
 The complete fix passes 1,606 runtime/contract/state tests (31 existing skipped
 tests) and strict production Clippy. An initial suite attempt hit a legacy
-concurrent sandbox-create failure; the complete rerun passed. The final
-`installed-release-xcode-3` is under fresh native validation in
-`installed-xcode-candidate-3`, with Linux regression in `linux-swift-regression-2`.
-The native negative gate now requires both Stop after failed readiness and direct
-Delete after a second rejected restart.
+concurrent sandbox-create failure; the complete rerun passed. The final fresh
+installed native and Linux gates above validate the fix. The earlier failures
+and diagnostic cleanup remain recorded separately and are not counted as passes.
 
 ## Receipt and installation contract
 

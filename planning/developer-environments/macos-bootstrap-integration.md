@@ -3,7 +3,8 @@
 Tracks `vz-mzs.11.4`. This covers artifact preparation and the installed DEV
 native adapter. The native macOS and aggregate release gates remain open;
 local lifecycle evidence does not qualify a supported published release.
-The [Swift toolchain handoff](macos-swift-toolchain.md) records the next candidate.
+The [Swift toolchain handoff](macos-swift-toolchain.md) records the subsequently
+validated Xcode 26.3 / Swift 6.2.4 candidate and its installed evidence.
 
 ## Integration API
 
@@ -354,8 +355,11 @@ The final gate proves stdin/output/exit status, user/env/cwd, tmux input/resize/
 Ctrl-C, cancellation with command/child reaping, persisted restart state,
 distinct private platform identities, clone isolation and both public Deletes.
 
-This is a usable local-bundle **DEV** path. Authenticated public publication,
-guest Swift/toolchain execution, networking/workspace integration, and mixed-target
+This is a usable local-bundle **DEV** path. The subsequent
+[Swift gate](macos-swift-toolchain.md) passed on an exact Xcode-bearing patch,
+including Stop/Delete after rejected readiness. Its separate timing/evidence
+record supersedes the agent-only measurements for Swift-equipped Machines.
+Authenticated public publication, networking/workspace integration, and mixed-target
 aggregate conformance remain open; `vz-mzs.11.4` is not release-complete.
 An additional negative test found the shared pre-existing cleanup gap for an Up
 rejected before any runtime reservation (such as a nonexistent catalog pin).
