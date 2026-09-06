@@ -121,9 +121,11 @@ impl NativeMacosRuntime {
             return Err(error("native Stop identity mismatch"));
         }
         let mut state = boot.vm.state_stream();
-        if *state.borrow() != VmState::Stopped {
-            // The guest owns graceful shutdown. Transport loss during shutdown is
-            // expected; only the framework's positive Stopped state closes it.
+        tracing::info!(state = ?*state.borrow(), "checking exact native VM shutdown state");
+        if !boot.vm.has_terminal_state().await.map_err(error)? {
+            // The guest owns graceful shutdown. Transport loss is expected.
+            // A framework terminal state, followed by releasing this original
+            // VM object, is required before publishing positive teardown.
             let shutdown = async {
                 let mut client = GrpcAgentClient::connect_default(Arc::clone(&boot.vm)).await?;
                 client
@@ -140,7 +142,8 @@ impl NativeMacosRuntime {
             let _ = tokio::time::timeout(Duration::from_secs(10), shutdown).await;
             tokio::time::timeout(Duration::from_secs(60), async {
                 loop {
-                    if *state.borrow_and_update() == VmState::Stopped {
+                    state.borrow_and_update();
+                    if boot.vm.has_terminal_state().await.map_err(error)? {
                         return Ok::<(), Error>(());
                     }
                     state.changed().await.map_err(error)?;
@@ -149,6 +152,8 @@ impl NativeMacosRuntime {
             .await
             .map_err(|_| error("native graceful Stop timed out; original VM retained"))??;
         }
+        // Apple's irrecoverable Error state can only be retired by destroying
+        // its original VM. The write fence proves no execution lease survives.
         *live = None;
         Ok(())
     }
