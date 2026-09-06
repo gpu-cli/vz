@@ -38,6 +38,13 @@ REQUIRED_LOG_TESTS = (
     "test_vz_runtime_log_text_behavior_unchanged",
 )
 RUNTIME_LOG_MESSAGE = "error in executing command: container id can't be used to represent a file name (such as . or ..)"
+REQUIRED_EXEC_TESTS = (
+    "test_vz_executable_permissions_mode_matrix",
+    "test_vz_executable_permissions_default_executor_mode_matrix",
+    "test_vz_executable_permissions_reject_directory_and_missing",
+    "test_vz_executable_permissions_owner_exec_kernel_boundary",
+)
+EXEC_PROBE_PREFIX = "VZ_EXECUTABLE_PERMISSIONS_PROBE="
 
 
 def require(condition, message):
@@ -74,7 +81,8 @@ def validate_elf(data):
 def validate(candidate, source):
     names = {"youki", "features.json", "elf.txt", "version.txt", "inputs.env", "apk.sha256", "source-lock.sha256", "cargo-features.txt", "upstream-tests.txt", "seccomp-exec.patch", "seccomp-exec-tests.txt", "tenant-root.patch", "tenant-root-tests.txt",
              "runtime-log.patch", "runtime-log-tests.txt", "runtime-log.json", "runtime-log-stdout.txt",
-             "runtime-log-stderr.txt", "runtime-log-exit-status.txt"}
+             "runtime-log-stderr.txt", "runtime-log-exit-status.txt",
+             "executable-permissions.patch", "executable-permissions-tests.txt"}
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -87,7 +95,7 @@ def validate(candidate, source):
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
@@ -96,6 +104,8 @@ def validate(candidate, source):
     require(checksums["tenant-root.patch"] == inputs["YOUKI_ROOT_PATCH_SHA256"], "pinned local root patch mismatch")
     require(checksums["runtime-log.patch"] == inputs["YOUKI_LOG_PATCH_SHA256"], "pinned local runtime log patch mismatch")
     validate_runtime_log(contents)
+    require(checksums["executable-permissions.patch"] == inputs["YOUKI_EXEC_PATCH_SHA256"], "pinned local executable patch mismatch")
+    validate_executable_permissions(contents)
     root_tests = contents["tenant-root-tests.txt"].decode()
     for test in REQUIRED_ROOT_TESTS:
         require(any(line.startswith("test ") and line.endswith("::" + test + " ... ok") for line in root_tests.splitlines()), f"missing passing local root regression: {test}")
@@ -115,9 +125,47 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_elf(contents["youki"])
     return checksums["youki"]
+
+
+def validate_executable_permissions(contents):
+    tests = contents["executable-permissions-tests.txt"].decode("utf-8")
+    for test in REQUIRED_EXEC_TESTS:
+        require(len(re.findall(r"(?m)^test workload::default::tests::" + test + r" \.\.\. (?:ok$|$)", tests)) == 1,
+                f"missing passing executable regression: {test}")
+    require(len(re.findall(r"(?m)^test workload::", tests)) == 4 and "FAILED" not in tests
+            and "test result: ok. 4 passed; 0 failed; 0 ignored;" in tests, "failed executable tests")
+    def unique(pairs):
+        row = {}
+        for key, value in pairs:
+            require(key not in row, "duplicate executable probe field")
+            row[key] = value
+        return row
+    rows = [json.loads(line[len(EXEC_PROBE_PREFIX):], object_pairs_hook=unique)
+            for line in tests.splitlines() if line.startswith(EXEC_PROBE_PREFIX)]
+    require(len(rows) == 2, "expected two actual executable probes")
+    scaffold = "\nrunning 1 test\ntest workload::default::tests::" + REQUIRED_EXEC_TESTS[-1] + " ... \n"
+    for row, case, mode, code, marker, opposite in zip(
+            rows, ("owner-exec", "denied"), ("0700", "0600"), (37, 0),
+            ("vz-owner-exec-0700", "vz-kernel-denied-0600"), ("vz-kernel-denied-0600", "vz-owner-exec-0700")):
+        require(isinstance(row, dict) and set(row) == {"schema_version", "case", "mode", "uid", "gid", "exit_code", "stdout", "stderr"},
+                "wrong executable probe schema")
+        require(all(type(row[key]) is int for key in ("schema_version", "uid", "gid", "exit_code"))
+                and (row["schema_version"], row["case"], row["mode"], row["uid"], row["gid"], row["exit_code"])
+                == (1, case, mode, 0, 0, code), "wrong executable probe outcome")
+        stdout = row["stdout"]
+        require(isinstance(stdout, str) and len(stdout.encode()) <= 16384 and row["stderr"] == ""
+                and stdout.startswith(scaffold), "unexpected executable probe streams")
+        payload = stdout[len(scaffold):]
+        if case == "owner-exec":
+            require(payload == marker + "\n", "owner-only executable did not produce exact output")
+        else:
+            lines = payload.splitlines()
+            require(len(lines) == 2 and lines[0].startswith("VZ_EXECUTABLE_PERMISSIONS_KERNEL_ERROR=error 'EACCES: Permission denied' executing ")
+                    and lines[1] == marker and payload.endswith("\n"), "missing actual kernel execution denial")
+        require(opposite not in stdout.splitlines(), "executable probe contains opposite outcome")
 
 
 def validate_runtime_log(contents):

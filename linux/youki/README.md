@@ -26,7 +26,8 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1` suffix so it cannot be mistaken for vanilla upstream.
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1`
+suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
 Version 2 also corrects the parent-side seccomp listener setup: ordinary filters
@@ -61,6 +62,20 @@ invalid-create failure are required candidate evidence. The independent
 [pinned-containerd decoder replay](runtime-log-decoder.md) checks the actual
 failure output on the host. This diagnostic fix does not certify successful
 BuildKit startup or Docker parity.
+
+`executable-permissions.patch` is a fourth **locally authored vz patch**.
+Upstream's executable preflight incorrectly checks only the other-execute bit;
+vz's private, root-owned `0700` Docker init binary therefore fails before exec.
+The correction accepts any execute bit on a regular file. The unchanged kernel
+exec call still enforces credentials, DAC, ACLs, and mount execution policy;
+host artifact modes, isolation, and `--init` are not changed. Four regressions
+cover exact mode matrices, real default-executor validation, directory/missing
+rejection, and actual owner-only `0700` execution paired with `0600` kernel
+denial. The last requires the pinned Alpine builder's real BusyBox and root
+ownership, observes exact output/exit 37, and retains both child streams/status
+as JSON proof lines in `executable-permissions-tests.txt`; it never skips.
+The candidate validator independently checks those proofs. These build-time
+checks do not replace the fresh installed Mac Buildx gate.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

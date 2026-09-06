@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
+from validate import EXEC_PROBE_PREFIX, REQUIRED_EXEC_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -22,6 +22,22 @@ def elf(kind=1, dynamic_tag=0):
     return bytes(data)
 
 
+def executable_probes():
+    scaffold = "\nrunning 1 test\ntest workload::default::tests::" + REQUIRED_EXEC_TESTS[-1] + " ... \n"
+    return [
+        {"schema_version": 1, "case": "owner-exec", "mode": "0700", "uid": 0, "gid": 0, "exit_code": 37,
+         "stdout": scaffold + "vz-owner-exec-0700\n", "stderr": ""},
+        {"schema_version": 1, "case": "denied", "mode": "0600", "uid": 0, "gid": 0, "exit_code": 0,
+         "stdout": scaffold + "VZ_EXECUTABLE_PERMISSIONS_KERNEL_ERROR=error 'EACCES: Permission denied' executing '/fixture/busybox' with args 'printf vz-owner-exec-0700'\nvz-kernel-denied-0600\n", "stderr": ""},
+    ]
+
+
+def executable_tests(rows):
+    return ("\n".join("test workload::default::tests::" + name + " ... ok" for name in REQUIRED_EXEC_TESTS)
+            + "\n" + "\n".join(EXEC_PROBE_PREFIX + json.dumps(row) for row in rows)
+            + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 261 filtered out;\n").encode()
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -33,7 +49,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -49,6 +65,8 @@ class CandidateTests(unittest.TestCase):
             "runtime-log-stdout.txt": b"",
             "runtime-log-stderr.txt": ("Error: " + RUNTIME_LOG_MESSAGE.removeprefix("error in executing command: ") + "\n").encode(),
             "runtime-log-exit-status.txt": b"1\n",
+            "executable-permissions.patch": (self.source / "executable-permissions.patch").read_bytes(),
+            "executable-permissions-tests.txt": executable_tests(executable_probes()),
         }
         self.publish()
 
@@ -190,8 +208,42 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
             self.files[name] = old
 
+    def test_executable_patch_and_every_regression_are_required(self):
+        original = self.files["executable-permissions-tests.txt"]
+        for test in REQUIRED_EXEC_TESTS:
+            self.files["executable-permissions-tests.txt"] = original.replace((test + " ... ok").encode(), (test + " ... ignored").encode())
+            self.publish()
+            with self.subTest(test=test), self.assertRaisesRegex(ValueError, "missing passing executable regression"):
+                validate(self.root, self.source)
+        self.files["executable-permissions-tests.txt"] = original
+        self.files["executable-permissions.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_executable_probes_require_exact_mode_exit_streams_and_kernel_denial(self):
+        for index in (0, 1):
+            for key, value in (("schema_version", True), ("case", "unknown"), ("mode", "0755"), ("uid", 1),
+                               ("gid", 1), ("exit_code", 1), ("stdout", ""), ("stderr", "unexpected"), ("extra", True)):
+                rows = executable_probes()
+                rows[index][key] = value
+                self.files["executable-permissions-tests.txt"] = executable_tests(rows)
+                self.publish()
+                with self.subTest(index=index, key=key), self.assertRaises(ValueError):
+                    validate(self.root, self.source)
+        original = executable_tests(executable_probes())
+        invalid = [executable_tests([]), executable_tests(executable_probes()[:1]),
+                   executable_tests(executable_probes() * 2), executable_tests(list(reversed(executable_probes()))),
+                   original.replace(b"EACCES", b"ENOENT"), original.replace(b"4 passed; 0 failed", b"3 passed; 1 failed"),
+                   original.replace(b'"uid": 0', b'"uid": 1, "uid": 0')]
+        for raw in invalid:
+            self.files["executable-permissions-tests.txt"] = raw
+            self.publish()
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                validate(self.root, self.source)
+
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest

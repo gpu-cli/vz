@@ -1,0 +1,285 @@
+Locally authored vz executable permission preflight correction for pinned youki 0.7.0.
+Apply AFTER seccomp-exec.patch, tenant-root.patch and runtime-log.patch.
+Not an upstream-reviewed backport. Runtime change is only 0001 -> 0111.
+
+Rationale: vz privately stages Docker binaries at mode 0700; Moby's --init binds
+that same docker-init inode to /sbin/docker-init. Upstream's other-execute-only
+preflight rejects it despite valid owner/root execution. Retain regular-file
+validation and permit any execute bit. The existing execvp syscall continues
+to enforce actual credentials, DAC, ACLs, and mount execution policy. No artifact
+mode, ownership, credential, namespace, seccomp, or init configuration changes.
+
+--- a/crates/libcontainer/src/workload/default.rs
++++ b/crates/libcontainer/src/workload/default.rs
+@@ -130,21 +130,267 @@
+     use std::os::unix::fs::PermissionsExt;
+     let metadata = path.metadata()?;
+     let permissions = metadata.permissions();
+-    // we have to check if the path is file and the execute bit
+-    // is set. In case of directories, the execute bit is also set,
+-    // so have to check if this is a file or not
+-    Ok(metadata.is_file() && permissions.mode() & 0o001 != 0)
++    // This is a structural preflight, not an authorization decision. Requiring
++    // other-execute rejects valid owner/group-only executables, such as a
++    // private 0700 docker-init bind mount. Keep the regular-file requirement
++    // and accept any execute bit; the unchanged execvp call lets the kernel
++    // enforce actual credentials, DAC, ACLs and mount execution policy.
++    Ok(metadata.is_file() && permissions.mode() & 0o111 != 0)
+ }
+ 
+ #[cfg(test)]
+ mod tests {
+     use std::collections::HashMap;
+     use std::env;
++    use std::os::unix::fs::PermissionsExt;
+ 
+     use serial_test::serial;
+ 
+     use super::*;
++
++    const EXECUTABLE_PERMISSION_CASES: &[(u32, bool)] = &[
++        (0o700, true),
++        (0o710, true),
++        (0o010, true),
++        (0o001, true),
++        (0o755, true),
++        (0o600, false),
++        (0o000, false),
++    ];
++
++    fn executable_permission_spec(command: String, search_path: &Path) -> Spec {
++        let mut process = oci_spec::runtime::Process::default();
++        process.set_args(Some(vec![command]));
++        process.set_env(Some(vec![format!("PATH={}", search_path.display())]));
++        let mut spec = Spec::default();
++        spec.set_process(Some(process));
++        spec
++    }
++
++    #[test]
++    fn test_vz_executable_permissions_mode_matrix() {
++        let directory = tempfile::tempdir().expect("private fixture directory");
++        let path = directory.path().join("docker-init-fixture");
++        std::fs::write(&path, b"permission preflight fixture").expect("regular fixture file");
++        for &(mode, expected) in EXECUTABLE_PERMISSION_CASES {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
++                .expect("set exact fixture permissions");
++            assert_eq!(
++                is_executable(&path).expect("stat fixture"),
++                expected,
++                "regular file with mode {mode:04o}"
++            );
++            assert_eq!(
++                path.metadata().unwrap().permissions().mode() & 0o777,
++                mode,
++                "validation must not change permissions"
++            );
++        }
++    }
++
++    #[test]
++    fn test_vz_executable_permissions_default_executor_mode_matrix() {
++        let directory = tempfile::tempdir().expect("private fixture directory");
++        let path = directory.path().join("docker-init-fixture");
++        std::fs::write(&path, b"permission preflight fixture").expect("regular fixture file");
++        let absolute =
++            executable_permission_spec(path.to_string_lossy().into_owned(), directory.path());
++        let searched =
++            executable_permission_spec("docker-init-fixture".to_owned(), directory.path());
++        let executor = get_executor();
++        for &(mode, expected) in EXECUTABLE_PERMISSION_CASES {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode))
++                .expect("set exact fixture permissions");
++            for (kind, spec) in [("absolute", &absolute), ("PATH", &searched)] {
++                assert_eq!(
++                    executor.validate(spec).is_ok(),
++                    expected,
++                    "actual default executor {kind} validation with mode {mode:04o}"
++                );
++            }
++            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, mode);
++        }
++        // Acceptance here is not a claim that this test user may execute every
++        // accepted mode. Kernel exec, not this preflight, decides that question.
++    }
++
++    #[test]
++    fn test_vz_executable_permissions_reject_directory_and_missing() {
++        let directory = tempfile::tempdir().expect("private fixture directory");
++        let executable_directory = directory.path().join("not-a-file");
++        std::fs::create_dir(&executable_directory).expect("directory fixture");
++        std::fs::set_permissions(
++            &executable_directory,
++            std::fs::Permissions::from_mode(0o755),
++        )
++        .expect("executable directory permissions");
++        assert!(!is_executable(&executable_directory).expect("stat directory"));
++        let executor = get_executor();
++        for path in [&executable_directory, &directory.path().join("missing")] {
++            let spec =
++                executable_permission_spec(path.to_string_lossy().into_owned(), directory.path());
++            assert!(executor.validate(&spec).is_err(), "must reject {path:?}");
++        }
++        assert!(is_executable(&directory.path().join("missing")).is_err());
++    }
++
++    #[test]
++    fn test_vz_executable_permissions_owner_exec_kernel_boundary() {
++        use std::io::Write;
++        use std::os::unix::fs::MetadataExt;
++        use std::process::{Command, Stdio};
++        use std::time::{Duration, Instant};
++
++        const CHILD_CASE: &str = "VZ_EXECUTABLE_PERMISSIONS_CHILD_CASE";
++        const CHILD_PATH: &str = "VZ_EXECUTABLE_PERMISSIONS_CHILD_PATH";
++        const TEST: &str =
++            "workload::default::tests::test_vz_executable_permissions_owner_exec_kernel_boundary";
++        const ALLOWED: &str = "vz-owner-exec-0700";
++        const DENIED: &str = "vz-kernel-denied-0600";
++
++        assert!(
++            unistd::geteuid().is_root(),
++            "pinned Alpine builder must run this test as root; never skip"
++        );
++        if let Some(case) = env::var_os(CHILD_CASE) {
++            let path = PathBuf::from(env::var_os(CHILD_PATH).expect("exact child fixture path"));
++            assert!(path.is_absolute());
++            let metadata = std::fs::symlink_metadata(&path).expect("child fixture inode");
++            assert!(metadata.is_file());
++            assert_eq!(metadata.uid(), 0);
++            assert_eq!(metadata.gid(), 0);
++            let mode = match case.to_str().expect("UTF-8 test case") {
++                "owner-exec" => 0o700,
++                "denied" => 0o600,
++                other => panic!("unexpected test case: {other}"),
++            };
++            assert_eq!(metadata.permissions().mode() & 0o777, mode);
++            let mut spec = executable_permission_spec(
++                path.to_string_lossy().into_owned(),
++                Path::new("/usr/bin:/bin"),
++            );
++            spec.process_mut().as_mut().unwrap().set_args(Some(vec![
++                path.to_string_lossy().into_owned(),
++                "sh".to_owned(),
++                "-c".to_owned(),
++                format!("printf '{ALLOWED}\\n'; exit 37"),
++            ]));
++            let executor = get_executor();
++            assert_eq!(executor.validate(&spec).is_ok(), mode == 0o700);
++            // setup_envs replaces process-wide environment; this is an isolated
++            // reexecuted test child, never the parent test runner.
++            executor
++                .setup_envs(HashMap::from([(
++                    "PATH".to_owned(),
++                    "/usr/bin:/bin".to_owned(),
++                )]))
++                .unwrap();
++            println!();
++            std::io::stdout().flush().unwrap();
++            let error = executor
++                .exec(&spec)
++                .expect_err("successful exec replaces this process");
++            assert_eq!(mode, 0o600, "0700 payload must execute, not return {error}");
++            let detail = match error {
++                ExecutorError::Execution(source) => source.to_string(),
++                other => panic!("expected actual kernel execution error, got {other:?}"),
++            };
++            assert!(
++                detail.starts_with("error 'EACCES: Permission denied' executing '"),
++                "kernel must reject 0600 execution with EACCES: {detail}"
++            );
++            println!("VZ_EXECUTABLE_PERMISSIONS_KERNEL_ERROR={detail}");
++            println!("{DENIED}");
++            std::process::exit(0);
++        }
+ 
++        let directory = tempfile::tempdir().expect("private fixture directory");
++        let path = directory.path().join("busybox");
++        let source =
++            std::fs::read("/bin/busybox").expect("pinned Alpine BusyBox must exist; never skip");
++        assert!(!source.is_empty() && source.len() < 16 * 1024 * 1024);
++        std::fs::write(&path, &source).expect("copy actual executable bytes");
++        for (case, mode, code, marker) in [
++            ("owner-exec", 0o700, 37, ALLOWED),
++            ("denied", 0o600, 0, DENIED),
++        ] {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
++            let before = std::fs::symlink_metadata(&path).unwrap();
++            assert!(before.is_file());
++            assert_eq!(before.uid(), 0);
++            assert_eq!(before.gid(), 0);
++            assert_eq!(before.permissions().mode() & 0o777, mode);
++            assert_eq!(std::fs::read(&path).unwrap(), source);
++            let mut child = Command::new(env::current_exe().expect("current test executable"))
++                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
++                .env_clear()
++                .env(CHILD_CASE, case)
++                .env(CHILD_PATH, &path)
++                .env("PATH", "/usr/bin:/bin")
++                .stdin(Stdio::null())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped())
++                .spawn()
++                .expect("spawn exact isolated test child");
++            let deadline = Instant::now() + Duration::from_secs(10);
++            while child.try_wait().expect("observe test child").is_none() {
++                if Instant::now() >= deadline {
++                    child.kill().expect("kill only the timed-out test child");
++                    let output = child.wait_with_output().expect("reap timed-out test child");
++                    panic!("test child timed out: {output:?}");
++                }
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            let output = child.wait_with_output().expect("collect test child");
++            assert_eq!(output.status.code(), Some(code), "child output: {output:?}");
++            assert!(output.stdout.len() <= 16384 && output.stderr.len() <= 16384);
++            let stdout = String::from_utf8(output.stdout).expect("UTF-8 child output");
++            let stderr = String::from_utf8(output.stderr).expect("UTF-8 child stderr");
++            assert!(stderr.is_empty(), "unexpected child stderr: {stderr}");
++            assert_eq!(
++                stdout.lines().filter(|line| *line == marker).count(),
++                1,
++                "{stdout}"
++            );
++            let opposite = if mode == 0o700 { DENIED } else { ALLOWED };
++            assert!(
++                !stdout.lines().any(|line| line == opposite),
++                "unexpected executed marker line: {stdout}"
++            );
++            let after = std::fs::symlink_metadata(&path).unwrap();
++            assert_eq!(
++                (
++                    before.dev(),
++                    before.ino(),
++                    before.uid(),
++                    before.gid(),
++                    before.mode()
++                ),
++                (
++                    after.dev(),
++                    after.ino(),
++                    after.uid(),
++                    after.gid(),
++                    after.mode()
++                )
++            );
++            assert_eq!(std::fs::read(&path).unwrap(), source);
++            println!(
++                "\nVZ_EXECUTABLE_PERMISSIONS_PROBE={}",
++                serde_json::json!({
++                    "schema_version": 1,
++                    "case": case,
++                    "mode": format!("{mode:04o}"),
++                    "uid": before.uid(),
++                    "gid": before.gid(),
++                    "exit_code": output.status.code().unwrap(),
++                    "stdout": stdout,
++                    "stderr": stderr,
++                })
++            );
++        }
++    }
++
+     #[test]
+     fn test_get_executable_path() {
+         let non_existing_abs_path = "/some/non/existent/absolute/path";
