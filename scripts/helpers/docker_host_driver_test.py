@@ -654,6 +654,33 @@ int main(int argc, char **argv) {
         self.assertTrue(item.record.receipts[0]["secret_leak_detected"])
         self.assertFalse(item.record.receipts[0]["raw_streams_retained"])
 
+    def test_escaped_private_arguments_and_environments_rejected_before_intent(self):
+        for secret in ('private\ncanary', 'private"canary', 'private\\canary'):
+            for location in ('argv', 'environment', 'base_environment'):
+                with self.subTest(secret=secret, location=location):
+                    record = driver.Recorder(self.root, {"PRIVATE": secret} if location == 'base_environment' else {},
+                                             [secret.encode()])
+                    argv = ['fake', secret] if location == 'argv' else ['fake']
+                    env = {"PRIVATE": secret} if location == 'environment' else {}
+                    with patch.object(driver, 'execute') as execute, self.assertRaises(driver.Rejected):
+                        record.run(argv, executable='/pinned/fake', extra_env=env)
+                    execute.assert_not_called()
+                    self.assertEqual(record.count, 0)
+                    self.assertEqual(record.receipts, [])
+                    self.assertFalse(list(self.root.glob('command-*')))
+
+    def test_unicode_escaped_json_output_is_withheld(self):
+        item = self.bare_driver()
+        item.record.canaries = [b'PRIVATE-CANARY']
+        raw = b'{"message":"\\u0050RIVATE-CANARY"}\n'
+        with patch.object(driver, 'execute', return_value=subprocess.CompletedProcess([], 0, b'', raw)), \
+                self.assertRaises(driver.Rejected):
+            item.command(['version'])
+        for path in self.root.glob('command-*'):
+            self.assertNotIn(raw.strip(), path.read_bytes())
+        self.assertTrue(item.record.receipts[0]['secret_leak_detected'])
+        self.assertFalse(item.record.receipts[0]['raw_streams_retained'])
+
     def test_wrong_context_rejected_before_engine_contact(self):
         item = self.bare_driver()
         with patch.object(item, "json_command", return_value=[{
@@ -773,6 +800,39 @@ class AssertionTests(unittest.TestCase):
         raw = b"\n".join(json.dumps({"logs": [{"data": base64.b64encode(part).decode()}]}).encode()
                          for part in (b"PRIVATE-", b"CANARY"))
         self.assertTrue(driver.contains_canary((raw,), [b"PRIVATE-CANARY"]))
+
+    def test_decoded_json_strings_keys_arrays_and_duplicate_keys_are_scanned(self):
+        rows = [b'{"message":"\\u0050RIVATE-CANARY"}', b'["\\u0050RIVATE-CANARY"]',
+                b'{"\\u0050RIVATE-CANARY":false}',
+                b'{"message":"\\u0050RIVATE-CANARY","message":"ordinary"}',
+                b'{"message":[["\\u0050RIVATE-CANARY"]],"message":"ordinary"}']
+        for raw in rows:
+            with self.subTest(raw=raw):
+                self.assertTrue(driver.contains_canary((raw,), [b'PRIVATE-CANARY']))
+        self.assertFalse(driver.contains_canary((b'{"message":"ordinary"}',), [b'PRIVATE-CANARY']))
+
+    def test_decoded_buildkit_json_metadata_is_scanned(self):
+        raw = json.dumps({'logs': [{'data': base64.b64encode(
+            b'{"message":"\\u0050RIVATE-CANARY"}\n').decode()}]}).encode()
+        self.assertTrue(driver.contains_canary((raw,), [b'PRIVATE-CANARY']))
+
+    def test_pretty_json_documents_and_duplicate_keys_are_scanned(self):
+        secret = b'PRIVATE-CANARY'
+        rows = [json.dumps({'message': secret.decode()}, indent=2).encode().replace(b'PRIVATE', b'\\u0050RIVATE'),
+                json.dumps([{'message': secret.decode()}], indent=2).encode().replace(b'PRIVATE', b'\\u0050RIVATE'),
+                b'{\n  "message": "\\u0050RIVATE-CANARY",\n  "message": "ordinary"\n}\n']
+        for raw in rows:
+            with self.subTest(raw=raw):
+                self.assertTrue(driver.contains_canary((raw,), [secret]))
+        self.assertFalse(driver.contains_canary((json.dumps({'message': ['ordinary']}, indent=2).encode(),), [secret]))
+
+    def test_nested_base64_and_excessive_json_depth_fail_closed(self):
+        raw = b'ordinary'
+        for _ in range(20):
+            raw = json.dumps({'data': base64.b64encode(raw).decode()}).encode()
+        self.assertTrue(driver.contains_canary((raw,), [b'PRIVATE-CANARY']))
+        self.assertTrue(driver.contains_canary((b'[' * 2000 + b'0' + b']' * 2000,), [b'PRIVATE-CANARY']))
+        self.assertTrue(driver._contains_canary((b'ordinary',), [b'PRIVATE-CANARY'], 0, [1]))
 
     def event(self, actor, action, timestamp):
         return {"Type": "container", "Actor": {"ID": actor, "Attributes": {"com.docker.compose.project": "owned"}},

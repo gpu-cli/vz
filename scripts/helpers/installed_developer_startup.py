@@ -192,8 +192,14 @@ def execute_observer(argv, **kwargs):
 class Recorder:
     def __init__(self, root, env):
         self.root, self.env, self.receipts = root, env, []
+        self.canaries = []
 
     def run(self, label, argv, *, cwd, executable=None, timeout=60, stdin=None, success=True, observer_only=False):
+        from docker_host_driver import contains_canary
+        private_inputs = (*map(str, argv), str(executable or argv[0]), str(cwd),
+                          *self.env.keys(), *self.env.values())
+        require(not contains_canary(tuple(value.encode() for value in private_inputs), self.canaries),
+                "private canary rejected before command intent/dispatch")
         index = len(self.receipts) + 1
         stem = f"{index:03}-{label}"
         row = {"index": index, "label": label, "argv": list(map(str, argv)), "argv0": str(argv[0]),
@@ -215,11 +221,16 @@ class Recorder:
         except BaseException as exception:
             error = exception
             stdout, stderr = getattr(exception, "stdout", b"") or b"", getattr(exception, "stderr", b"") or b""
+        if contains_canary((stdout, stderr), self.canaries):
+            error = ValueError("private canary detected; command streams withheld")
+            stdout, stderr = b"[private stream withheld]\n", b"[private stream withheld]\n"
+            row.update(effects_uncertain=True, capture_complete=False, secret_leak_detected=True)
         row.update(exit_code=code, elapsed_ns=time.monotonic_ns() - started,
                    error=None if error is None else f"{type(error).__name__}: {error}",
                    stdout_sha256=hashlib.sha256(stdout).hexdigest(), stderr_sha256=hashlib.sha256(stderr).hexdigest(),
                    retained_stdout_bytes=len(stdout), retained_stderr_bytes=len(stderr),
-                   hashes_cover="complete_streams" if row["capture_complete"] else "retained_observed_prefixes")
+                   hashes_cover="redacted_placeholders_not_original_streams" if row.get("secret_leak_detected") else
+                   "complete_streams" if row["capture_complete"] else "retained_observed_prefixes")
         write(self.root / (stem + ".stdout"), stdout)
         write(self.root / (stem + ".stderr"), stderr)
         document(self.root / (stem + ".result.json"), row)
@@ -599,14 +610,18 @@ class Harness:
 
 
 def collect_runtime_receipts(harness):
+    from docker_host_driver import contains_canary, regular
     retained = private(harness.evidence / "runtime-receipts")
     for path in harness.runtime.rglob("*"):
         if path.suffix not in (".log", ".json", ".stdout", ".stderr"):
             continue
         require(not path.is_symlink() and path.is_file() and path.stat().st_size <= 32 * 1024 * 1024, "unbounded/redirected runtime receipt")
+        content = regular(path, 32 * 1024 * 1024)
+        require(not contains_canary((content,), getattr(harness, "sensitive_canaries", [])),
+                "private canary in runtime receipt; source retained outside evidence")
         destination = retained / path.relative_to(harness.runtime)
         destination.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
-        shutil.copyfile(path, destination)
+        write(destination, content)
 def checksum_evidence(harness):
     rows = []
     for path in sorted(harness.evidence.rglob("*")):

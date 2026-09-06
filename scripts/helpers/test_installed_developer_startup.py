@@ -1,6 +1,7 @@
 """Offline adversarial harness checks; no Docker daemon, VM, or product process."""
 
 import argparse
+import base64
 import copy
 import hashlib
 import json
@@ -126,6 +127,69 @@ class InstalledStartupTests(unittest.TestCase):
             self.assertTrue(record.receipts[0]["effects_uncertain"])
             self.assertFalse(record.receipts[0]["capture_complete"])
             self.assertEqual(record.receipts[0]["hashes_cover"], "retained_observed_prefixes")
+
+    def test_private_canary_in_arguments_or_environment_rejected_before_intent(self):
+        for env, argv in (({}, ["fake", "disposable-private-key"]),
+                          ({"PRIVATE": "disposable-private-key"}, ["fake"])):
+            record = driver.Recorder(self.root, env)
+            record.canaries = [b"disposable-private-key"]
+            with patch.object(driver, "execute") as execute, self.assertRaises(ValueError):
+                record.run("private", argv, cwd=self.root)
+            execute.assert_not_called()
+            self.assertFalse(list(self.root.iterdir()))
+
+    def test_escaped_private_argument_and_environment_rejected_before_intent(self):
+        for secret in ('private\ncanary', 'private"canary', 'private\\canary'):
+            for env, argv in (({}, ['fake', secret]), ({'PRIVATE': secret}, ['fake'])):
+                with self.subTest(secret=secret, env=bool(env)):
+                    record = driver.Recorder(self.root, env)
+                    record.canaries = [secret.encode()]
+                    with patch.object(driver, 'execute') as execute, self.assertRaises(ValueError):
+                        record.run('private', argv, cwd=self.root)
+                    execute.assert_not_called()
+                    self.assertFalse(record.receipts)
+                    self.assertFalse(list(self.root.iterdir()))
+
+    def test_private_raw_or_decoded_buildkit_stream_is_withheld(self):
+        secret = b"disposable-private-key"
+        encoded = json.dumps({"logs": [{"data": base64.b64encode(secret).decode()}]}).encode() + b"\n"
+        escaped = b'{"message":"\\u0064isposable-private-key"}\n'
+        pretty = b'{\n  "message": "\\u0064isposable-private-key"\n}\n'
+        for index, raw in enumerate((secret, encoded, escaped, pretty)):
+            root = self.root / str(index)
+            root.mkdir()
+            record = driver.Recorder(root, {})
+            record.canaries = [secret]
+            output = subprocess.CompletedProcess(["fake"], 0, b"", raw)
+            with patch.object(driver, "execute", return_value=output), self.assertRaisesRegex(ValueError, "withheld"):
+                record.run("private", ["fake"], cwd=root)
+            row = record.receipts[0]
+            self.assertTrue(row["effects_uncertain"] and row["secret_leak_detected"])
+            self.assertFalse(row["capture_complete"])
+            self.assertEqual(row["hashes_cover"], "redacted_placeholders_not_original_streams")
+            for path in root.iterdir():
+                self.assertNotIn(secret, path.read_bytes())
+                self.assertNotIn(base64.b64encode(secret), path.read_bytes())
+                self.assertNotIn(escaped.strip(), path.read_bytes())
+                self.assertNotIn(pretty.strip(), path.read_bytes())
+
+    def test_runtime_retention_writes_exact_scanned_bytes_not_reopened_source(self):
+        from types import SimpleNamespace
+        runtime, evidence = self.root / 'runtime', self.root / 'evidence'
+        runtime.mkdir(); evidence.mkdir()
+        source = runtime / 'runtime.log'
+        source.write_bytes(b'original public receipt\n')
+        harness = SimpleNamespace(runtime=runtime, evidence=evidence, sensitive_canaries=[b'private-canary'])
+        import docker_host_driver
+        original = docker_host_driver.contains_canary
+        def scan(streams, canaries):
+            result = original(streams, canaries)
+            source.write_bytes(b'private-canary')
+            return result
+        with patch.object(docker_host_driver, 'contains_canary', side_effect=scan):
+            driver.collect_runtime_receipts(harness)
+        self.assertEqual((evidence / 'runtime-receipts/runtime.log').read_bytes(), b'original public receipt\n')
+        self.assertEqual(source.read_bytes(), b'private-canary')
 
     def test_real_bounded_noisy_host_process_fails_with_prefix_receipt(self):
         record = driver.Recorder(self.root, {"PATH": "/usr/bin:/bin"})

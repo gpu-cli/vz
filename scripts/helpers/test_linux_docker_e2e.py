@@ -1,5 +1,6 @@
 """Offline admission/ownership regressions, not physical Docker evidence."""
 import contextlib
+import copy
 import io
 import json
 from pathlib import Path
@@ -113,6 +114,49 @@ class AdmissionTests(unittest.TestCase):
         for suite in ("build", "compose", "artifacts"):
             with self.assertRaisesRegex(driver.Rejected, "parallel-fixture"):
                 gate.arguments(["--suite", suite, "--parallel-fixture", "/owned/parallel"])
+
+    def test_ssh_inputs_are_explicit_and_unavailable_to_other_suites(self):
+        with self.assertRaisesRegex(ValueError, "ssh-packages"):
+            gate.arguments(["--suite", "ssh"])
+        common = [part for name in gate.startup.OPTIONS for part in ("--" + name, "/owned/input")]
+        args = gate.arguments(["--suite", "ssh", *common, "--ssh-packages", "/owned/packages",
+                               "--buildkit-archive", "/owned/buildkit.tar"])
+        self.assertEqual(args.suite, "ssh")
+        for suite in ("compose", "build", "artifacts", "parallel"):
+            for option in ("ssh-fixture", "ssh-packages", "ssh-gpgv"):
+                with self.subTest(suite=suite, option=option), self.assertRaisesRegex(ValueError, "SSH options"):
+                    gate.arguments(["--suite", suite, "--" + option, "/owned/value"])
+        with self.assertRaisesRegex(ValueError, "duplicate"):
+            gate.arguments(["--suite", "ssh", "--ssh-packages", "/owned/a", "--ssh-packages=/owned/b"])
+
+    def test_ssh_preflight_freezes_inputs_without_dispatched_verification(self):
+        rows = [{"filename": name, "sha256": "a" * 64} for name in ("keyring", "release", "index", "package", "source")]
+        pin = {"base": {"keyring": rows[0]}, "release": rows[1], "packages_index": rows[2],
+               "packages": [rows[3]], "source_proofs": [rows[4]]}
+        args = types.SimpleNamespace(suite="ssh", fixture="/owned/fixture", image_input="/owned/pin",
+            buildkit_archive="/owned/buildkit.tar", run_id="ssh-owned", ssh_packages="/owned/packages", ssh_gpgv="/owned/gpgv")
+        with patch.object(gate.startup, "preflight", return_value={"inputs": {}}), \
+             patch.object(gate.startup, "canonical", side_effect=lambda value, **kwargs: Path(value)), \
+             patch.object(gate.startup, "digest", return_value="a" * 64), \
+             patch.object(gate.image_input, "load", return_value={}), \
+             patch.object(gate, "public_ca_input", return_value={}), \
+             patch.object(gate.driver, "tree_digest", return_value="a" * 64), \
+             patch("linux_docker_buildkit_builder.preflight_archive", return_value={}), \
+             patch("linux_docker_build_ssh.fixture_contract", return_value={}), \
+             patch("linux_docker_ssh_input.load", return_value=pin), \
+             patch("linux_docker_ssh_input.read_input") as read, \
+             patch("linux_docker_ssh_input.verify") as verify, \
+             patch("linux_docker_ssh_agent.tool_inputs", return_value={"ssh-agent": {"path": "/owned/ssh-agent", "sha256": "a" * 64}}):
+            info = gate.preflight(args, require_host=False)
+        self.assertEqual(info["scope"], gate.SSH_SCOPE)
+        self.assertEqual(read.call_count, 5)
+        verify.assert_not_called()
+        for row in rows:
+            self.assertIn("/owned/packages/" + row["filename"], info["inputs"])
+        for name in ("linux_docker_ssh_server.py", "linux_docker_ssh_evidence.py", "linux_docker_ssh_cache.py",
+                     "linux_docker_ssh_cache_capture.py", "linux_docker_ssh_agent.py", "linux_docker_build_ssh.py",
+                     "linux_docker_parallel_evidence.py"):
+            self.assertIn(str(gate.REPO / "scripts/helpers" / name), info["inputs"])
 
     def test_python_repo_aliases_are_exact(self):
         pin = {"reference": "docker.io/library/python@sha256:" + "a" * 64, "id": "sha256:" + "a" * 64,
@@ -443,6 +487,9 @@ class UncertaintyTests(unittest.TestCase):
     def harness(self):
         h = gate.ComposeHarness.__new__(gate.ComposeHarness)
         h.effects_uncertain = False
+        h.ssh_cache_requests = []
+        h.ssh_cache_proofs = []
+        h.ssh_cache_captures = []
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         h.evidence = Path(temporary.name)
@@ -546,6 +593,89 @@ class UncertaintyTests(unittest.TestCase):
             h.remove_owned()
         first.remove_owned.assert_not_called()
         h.docker.assert_not_called()
+
+    def cache_cleanup(self):
+        h = self.harness()
+        h.root = h.evidence / 'private-root'
+        calls = []
+        stopped, stop_proof = {'Id': 'owned-builder'}, {'container_id': 'owned-builder', 'signal': 'SIGTERM'}
+        owner = {'descriptor': {'owner': {'machine_id': 'owned-machine'}}, 'role': 'source'}
+        result = {'owner': copy.deepcopy(owner), 'normal_stop': copy.deepcopy(stop_proof),
+                  'scan': {'complete': True}, 'capture': {'owned_process_reaped': True,
+                    'capture_complete': True, 'archive_published': True, 'effects_uncertain': False},
+                  'guard_receipts_complete': True, 'builder_restarted': False}
+        capture = types.SimpleNamespace(owner=owner, pending_process=None, run=Mock())
+        def run(observed, receipt):
+            self.assertEqual(observed, stopped)
+            self.assertEqual(receipt, stop_proof)
+            # Registration must precede dispatch, including an eventual throw.
+            self.assertEqual(h.ssh_cache_captures, [capture])
+            calls.append('capture')
+            return result
+        capture.run.side_effect = run
+        def remove(*, before_remove):
+            calls.append('positive-stop')
+            accepted = before_remove(stopped, stop_proof)
+            self.assertEqual(accepted, result)
+            self.assertEqual(h.ssh_cache_proofs, [result])
+            calls.append('builder-delete')
+        builder = Mock(remove_owned=Mock(side_effect=remove))
+        h.builders = [builder]
+        h.ssh_cache_requests = [{'builder': builder, 'canaries': (b'private-test-canary',), 'index': 2}]
+        descriptor = {'name': 'owned-context'}
+        h.owned = [{'descriptor': descriptor, 'token': 'owned', 'tag': 'owned:fixture', 'image_id': 'sha256:'+'a'*64}]
+        h.docker.return_value = (json.dumps([{'Id': h.owned[0]['image_id'], 'Config': {'Labels': {gate.LABEL: 'owned'}}}]).encode(), b'', 0)
+        h.mutate = Mock(side_effect=lambda *args: calls.append('ordinary-delete'))
+        h.exact_absent = Mock()
+        return h, builder, capture, result, calls
+
+    def test_ssh_stopped_cache_accepted_before_builder_and_ordinary_deletion(self):
+        h, builder, capture, result, calls = self.cache_cleanup()
+        with patch('linux_docker_ssh_cache_capture.Capture', return_value=capture) as create:
+            h.remove_owned()
+        self.assertEqual(calls, ['positive-stop', 'capture', 'builder-delete', 'ordinary-delete'])
+        create.assert_called_once_with(builder, (b'private-test-canary',),
+            h.root/'ssh-cache-private-2', h.evidence/'ssh-cache-2')
+        self.assertEqual(h.ssh_cache_proofs, [result])
+        self.assertEqual(h.ssh_cache_captures, [capture])
+
+    def test_ssh_stopped_cache_incomplete_or_foreign_result_prevents_any_deletion(self):
+        mutations = [('owner',), ('normal_stop',), ('scan', 'complete'),
+                     ('capture', 'owned_process_reaped'), ('capture', 'capture_complete'),
+                     ('capture', 'archive_published'), ('capture', 'effects_uncertain'),
+                     ('guard_receipts_complete',), ('builder_restarted',)]
+        for keys in mutations:
+            with self.subTest(keys=keys):
+                h, _, capture, result, calls = self.cache_cleanup()
+                if keys == ('owner',): result['owner']['descriptor']['owner']['machine_id'] = 'foreign'
+                elif keys == ('normal_stop',): result['normal_stop']['container_id'] = 'foreign'
+                elif len(keys) == 1: result[keys[0]] = not result[keys[0]]
+                else: result[keys[0]][keys[1]] = not result[keys[0]][keys[1]]
+                with patch('linux_docker_ssh_cache_capture.Capture', return_value=capture):
+                    with self.assertRaises(ValueError): h.remove_owned()
+                self.assertEqual(calls, ['positive-stop', 'capture'])
+                self.assertEqual(h.ssh_cache_proofs, [])
+                self.assertEqual(h.ssh_cache_captures, [capture])
+                h.mutate.assert_not_called(); h.docker.assert_not_called()
+
+    def test_ssh_cache_capture_failure_retains_instance_and_pending_process_handle(self):
+        h, _, capture, _, calls = self.cache_cleanup()
+        pending = object()
+        error = RuntimeError('bounded capture failure')
+        def failed(stopped, proof):
+            self.assertEqual(h.ssh_cache_captures, [capture])
+            capture.pending_process = pending
+            error.capture_pending_process = pending
+            calls.append('capture-failed')
+            raise error
+        capture.run.side_effect = failed
+        with patch('linux_docker_ssh_cache_capture.Capture', return_value=capture):
+            with self.assertRaises(RuntimeError) as raised: h.remove_owned()
+        self.assertIs(raised.exception, error)
+        self.assertEqual(calls, ['positive-stop', 'capture-failed'])
+        self.assertIs(h.ssh_cache_captures[0].pending_process, pending)
+        self.assertEqual(h.ssh_cache_proofs, [])
+        h.mutate.assert_not_called(); h.docker.assert_not_called()
 
     def test_liveness_requires_every_neighbor_during_exact_interval(self):
         monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEV installed Linux-on-macOS Compose/Buildx/artifact slices; not certification.
+"""DEV installed Linux-on-macOS Compose/Buildx/artifact/SSH slices; not certification.
 
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
@@ -26,6 +26,7 @@ SCOPE = "DEV_INSTALLED_LINUX_COMPOSE_NOT_RELEASE_CERTIFICATION"
 BUILD_SCOPE = "DEV_INSTALLED_LINUX_BUILDX_NOT_RELEASE_CERTIFICATION"
 ARTIFACT_SCOPE = "DEV_INSTALLED_LINUX_BUILD_ARTIFACTS_NOT_RELEASE_CERTIFICATION"
 PARALLEL_SCOPE = "DEV_INSTALLED_LINUX_PARALLEL_BUILD_NOT_RELEASE_CERTIFICATION"
+SSH_SCOPE = "DEV_INSTALLED_LINUX_SSH_BUILD_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -33,13 +34,14 @@ require = driver.require
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture")
+    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
+             "ssh-fixture", "ssh-packages", "ssh-gpgv")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -47,28 +49,34 @@ def arguments(argv):
     parser.add_argument("--run-id")
     parser.add_argument("--buildkit-archive")
     parser.add_argument("--parallel-fixture")
+    parser.add_argument("--ssh-fixture")
+    parser.add_argument("--ssh-packages")
+    parser.add_argument("--ssh-gpgv")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build", "artifacts", "parallel"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
     require(args.parallel_fixture is None or args.suite == "parallel", "parallel-fixture requires the parallel suite")
+    require(args.suite == "ssh" or all(getattr(args, name) is None for name in ("ssh_fixture", "ssh_packages", "ssh_gpgv")),
+            "SSH options require the ssh suite")
+    require(args.suite != "ssh" or args.ssh_packages is not None, "--ssh-packages is required for the ssh suite")
     if args.run_id is None:
         args.run_id = args.suite + "-" + uuid.uuid4().hex[:24]
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
-    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel"}),
+    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel", "ssh"}),
             "--buildkit-archive is required only for Buildx suites")
     return args
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build", "artifacts", "parallel"}, "full contract unavailable")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh"}, "full contract unavailable")
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
     pin = image_input.load(pin_path)
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
-    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE}
+    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE, "ssh": SSH_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -79,7 +87,7 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
-    if args.suite in {"build", "artifacts", "parallel"}:
+    if args.suite in {"build", "artifacts", "parallel", "ssh"}:
         import linux_docker_buildkit_builder as builder
         archive = startup.canonical(args.buildkit_archive)
         info["buildkit"] = builder.preflight_archive(archive)
@@ -91,7 +99,7 @@ def preflight(args, require_host=True):
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)
-    if args.suite in {"artifacts", "parallel"}:
+    if args.suite in {"artifacts", "parallel", "ssh"}:
         for name in ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                      "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py"):
             path = REPO / "scripts/helpers" / name
@@ -108,6 +116,31 @@ def preflight(args, require_host=True):
         for path in selected.rglob("*"):
             if path.is_file():
                 info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == "ssh":
+        from linux_docker_build_ssh import fixture_contract
+        from linux_docker_ssh_agent import tool_inputs
+        import linux_docker_ssh_input as ssh_input
+        selected = startup.canonical(getattr(args, "ssh_fixture", None) or str(REPO / "tests/fixtures/vz-0.4/docker-ssh"))
+        fixture_contract(selected)
+        source = startup.canonical(args.ssh_packages)
+        pin = ssh_input.load(image_path=pin_path)
+        package_rows = [pin["base"]["keyring"], pin["release"], pin["packages_index"], *pin["packages"], *pin["source_proofs"]]
+        for row in package_rows:
+            ssh_input.read_input(source, row)
+            info["inputs"][str(source / row["filename"])] = row["sha256"]
+        gpgv = startup.canonical(getattr(args, "ssh_gpgv", None) or "/opt/homebrew/bin/gpgv", links=True)
+        info.update(ssh_fixture=str(selected), ssh_fixture_sha256=driver.tree_digest(selected), ssh_packages=str(source),
+                    ssh_tools=tool_inputs(), ssh_gpgv={"path": str(gpgv), "sha256": startup.digest(gpgv)})
+        for row in [info["ssh_gpgv"], *info["ssh_tools"].values()]:
+            info["inputs"][row["path"]] = row["sha256"]
+        for name in ("linux_docker_build_ssh.py", "linux_docker_ssh_agent.py", "linux_docker_ssh_server.py",
+                     "linux_docker_ssh_evidence.py", "linux_docker_ssh_cache.py", "linux_docker_ssh_cache_capture.py",
+                     "linux_docker_ssh_input.py", "linux_docker_debian.py", "linux_docker_parallel_evidence.py"):
+            path = REPO / "scripts/helpers" / name
+            info["inputs"][str(path)] = startup.digest(path)
+        info["inputs"][str(ssh_input.PIN)] = startup.digest(ssh_input.PIN)
+        for path in selected.iterdir():
+            info["inputs"][str(path)] = startup.digest(path)
     return info
 
 
@@ -335,6 +368,10 @@ class ComposeHarness(startup.Harness):
         self.builders = []
         self.builder_by_owner_role = {}
         self.keep_proofs_verified = []
+        self.sensitive_canaries = []
+        self.ssh_cache_requests = []
+        self.ssh_cache_proofs = []
+        self.ssh_cache_captures = []
 
     @staticmethod
     def builder_key(descriptor, role):
@@ -508,7 +545,29 @@ class ComposeHarness(startup.Harness):
         self.assert_certain()
         for builder in reversed(getattr(self, "builders", [])):
             self.assert_certain()
-            builder.remove_owned()
+            jobs = [job for job in self.ssh_cache_requests if job["builder"] is builder]
+            require(len(jobs) <= 1, "ambiguous SSH worker-cache ownership")
+            if jobs:
+                from linux_docker_ssh_cache_capture import Capture
+                job = jobs[0]
+                def capture(stopped, stop_proof):
+                    item = Capture(builder, job["canaries"], self.root / ("ssh-cache-private-" + str(job["index"])),
+                                   self.evidence / ("ssh-cache-" + str(job["index"])))
+                    self.ssh_cache_captures.append(item)
+                    result = item.run(stopped, stop_proof)
+                    require(result["owner"] == item.owner and result["normal_stop"] == stop_proof and
+                            result["scan"]["complete"] is True and result["guard_receipts_complete"] is True and
+                            result["builder_restarted"] is False and
+                            all(result["capture"][key] is True for key in
+                                ("owned_process_reaped", "capture_complete", "archive_published")) and
+                            result["capture"]["effects_uncertain"] is False,
+                            "SSH worker-cache proof incomplete or foreign")
+                    self.ssh_cache_proofs.append(result)
+                    return result
+                builder.remove_owned(before_remove=capture)
+            else:
+                builder.remove_owned()
+        require(len(self.ssh_cache_proofs) == len(self.ssh_cache_requests), "SSH worker-cache scan not complete")
         for row in reversed(self.owned):
             self.assert_certain()
             descriptor, token = row["descriptor"], row["token"]
@@ -565,11 +624,13 @@ class ComposeHarness(startup.Harness):
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
                 images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel"}:
+                if suite in {"artifacts", "parallel", "ssh"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
-                    else:
+                    elif suite == "parallel":
                         from linux_docker_build_parallel import run_machine
+                    else:
+                        from linux_docker_build_ssh import run_machine
                     begin = time.time_ns()
                     observation = run_machine(self, descriptor, scope, proof, images, index)
                     end = time.time_ns()
@@ -696,6 +757,10 @@ def run(info):
               "cleanup_errors": [], "docker_parity_certified": False, "aggregate_release_certified": False,
               "release_scenarios_passed": [], "test_case_retries": 0, "retained_root": str(harness.root)}
     try:
+        if info["suite"] == "ssh":
+            import linux_docker_ssh_input as ssh_input
+            result["ssh_input_verification"] = ssh_input.verify(Path(info["ssh_packages"]),
+                harness.evidence / "ssh-input-verification", info["ssh_gpgv"], image_path=Path(info["image_input"]))
         harness.stage()
         result["scenario"] = harness.scenario()
         for path, expected in (info["inputs"] | harness.staged_inputs).items():
@@ -704,12 +769,17 @@ def run(info):
         if info["suite"] == "parallel":
             require(driver.tree_digest(Path(info["parallel_fixture"])) == info["parallel_fixture_sha256"],
                     "parallel fixture changed during run")
+        if info["suite"] == "ssh":
+            require(driver.tree_digest(Path(info["ssh_fixture"])) == info["ssh_fixture_sha256"], "SSH fixture changed during run")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
         try:
             require(harness.monitor is None or not harness.monitor.thread.is_alive(), "live monitor prevents cleanup")
             harness.remove_owned()
+            if info["suite"] == "ssh":
+                require(len(harness.ssh_cache_proofs) == 3, "three stopped SSH worker-cache proofs required")
+                result["ssh_stopped_cache_validation"] = harness.ssh_cache_proofs
             result["cleanup"] = harness.cleanup() | {"owned_workload_objects_removed": True,
                 "retained_stopped_machine_disks_and_contexts": True, "delete_certified": False}
         except BaseException as error:

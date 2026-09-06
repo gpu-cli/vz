@@ -390,7 +390,8 @@ class Builder:
         startup.document(self.harness.evidence / f"{self.token}-runtime-{self.verifications:03}.json", proof)
         return proof
 
-    def remove_owned(self):
+    def remove_owned(self, *, before_remove=None):
+        require(before_remove is None or callable(before_remove), "invalid stopped-builder capture hook")
         if not self.effects:
             return
         self.harness.assert_certain()
@@ -426,6 +427,11 @@ class Builder:
                           role=self.role, identity_sha256=self.identity_sha256,
                           engine_id=self.descriptor["engine_id"], contract_sha256=sha(contract_raw))
         startup.document(self.harness.evidence / (self.token + "-normal-stop.json"), stop_proof)
+        if before_remove is not None:
+            # A failed content capture must leave the stopped exact container
+            # and its volume intact. Never restart or delete to repair a proof.
+            before_remove(item, stop_proof)
+            require(self.inspect_owned(running=False) == item, "stopped builder changed during cache capture")
         self.command("container-remove", ["container", "rm", self.container_id], mutate=True)
         self.absent("container", self.container_name)
         raw, _, _ = self.command("container-id-absent", ["container", "ls", "--all", "--quiet", "--no-trunc", "--filter", "id=" + self.container_id])

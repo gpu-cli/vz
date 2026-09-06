@@ -327,11 +327,57 @@ def execute(argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess:
 
 
 def contains_canary(streams: tuple[bytes, ...], canaries: list[bytes]) -> bool:
+    """Fail closed on private strings or an exhausted bounded decoding budget."""
+    return _contains_canary(streams, canaries, 0, [128 * 1024 * 1024])
+
+
+def _contains_canary(streams, canaries, depth, remaining):
+    if not canaries:
+        return False
+    remaining[0] -= sum(len(stream) for stream in streams)
+    if depth > 16 or remaining[0] < 0:
+        return True
+    def matches(data):
+        return any(canary and canary in data for canary in canaries)
+
+    if any(matches(data) for data in streams):
+        return True
+    decoded_private = False
+    def strings(value):
+        nonlocal decoded_private
+        pending = [value]
+        while pending:
+            item = pending.pop()
+            if isinstance(item, str):
+                decoded_private = decoded_private or matches(item.encode("utf-8", errors="surrogatepass"))
+            elif isinstance(item, list):
+                pending.extend(item)
+            # Objects are scanned by object_pairs before duplicate keys can
+            # replace an earlier diagnostic. Do not recursively rescan them.
+
+    def object_pairs(pairs):
+        for key, value in pairs:
+            strings(key)
+            strings(value)
+        return dict(pairs)
+
     decoded_logs = []
     for stream in streams:
-        for line in stream.splitlines():
+        # Inspect a complete JSON document first (including pretty-printed
+        # objects/arrays). Only fall back to individual NDJSON/text lines when
+        # the whole stream is not one document.
+        candidates = iter((stream,))
+        whole = True
+        while True:
             try:
-                row = json.loads(line)
+                line = next(candidates)
+            except StopIteration:
+                break
+            try:
+                row = json.loads(line, object_pairs_hook=object_pairs)
+                strings(row)
+                if decoded_private:
+                    return True
                 if isinstance(row, dict):
                     logs = row.get("logs", [])
                     if isinstance(row.get("data"), str):
@@ -345,12 +391,20 @@ def contains_canary(streams: tuple[bytes, ...], canaries: list[bytes]) -> bool:
                                     # A malformed sibling must not conceal a
                                     # later valid encoded canary in this batch.
                                     continue
+            except RecursionError:
+                return True
             except (ValueError, TypeError):
+                if decoded_private:
+                    return True
+                if whole:
+                    candidates = iter(stream.splitlines())
+                    whole = False
                 continue
+            if decoded_private:
+                return True
     # BuildKit rawjson log payloads are base64; inspect decoded bytes as well
     # as raw output. This does not replace decompressed OCI/cache blob scans.
-    all_data = (*streams, b"".join(decoded_logs))
-    return any(canary and canary in data for canary in canaries for data in all_data)
+    return _contains_canary((b"".join(decoded_logs),), canaries, depth + 1, remaining) if decoded_logs else False
 
 
 class Recorder:
@@ -378,6 +432,10 @@ class Recorder:
 
     def run(self, argv: list[str], *, executable: str, timeout: int = 120,
             extra_env: dict[str, str] | None = None, mutation: bool = True) -> Command:
+        private_inputs = (*argv, executable, *self.env.keys(), *self.env.values(),
+                          *(extra_env or {}).keys(), *(extra_env or {}).values())
+        require(not contains_canary(tuple(value.encode() for value in private_inputs), self.canaries),
+                "private canary rejected before command intent/dispatch")
         self.count += 1
         index = self.count
         start_wall, start = time.time_ns(), time.monotonic_ns()

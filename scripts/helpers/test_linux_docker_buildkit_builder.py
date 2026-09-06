@@ -481,6 +481,34 @@ class LifecycleTests(unittest.TestCase):
                        "--filter", "container=" + self.b.container_id, "--format", builder.shutdown.EVENT_FORMAT], reads)
         self.assertIn(["logs", "--timestamps", "--since", SINCE, "--until", UNTIL, self.b.container_id], reads)
 
+    def test_stopped_capture_occurs_after_normal_stop_before_any_removal(self):
+        self.b.prepare()
+        observed = []
+        def capture(item, proof):
+            self.assertFalse(item["State"]["Running"])
+            self.assertEqual(item["State"]["Pid"], 0)
+            self.assertEqual(proof["owner"], self.descriptor["owner"])
+            self.assertTrue((self.harness.evidence / (self.b.token + "-normal-stop.json")).exists())
+            self.assertIn("container", self.harness.objects)
+            self.assertIn("volume", self.harness.objects)
+            commands = [args for _, _, _, args in self.harness.calls]
+            self.assertNotIn(["container", "rm", self.b.container_id], commands)
+            observed.append(True)
+        self.b.remove_owned(before_remove=capture)
+        self.assertEqual(observed, [True])
+
+    def test_failed_stopped_capture_retains_container_and_cache(self):
+        self.b.prepare()
+        def capture(item, proof):
+            raise ValueError("cache canary proof failed")
+        with self.assertRaisesRegex(ValueError, "cache canary"):
+            self.b.remove_owned(before_remove=capture)
+        self.assertFalse(self.harness.objects["container"]["State"]["Running"])
+        self.assertIn("volume", self.harness.objects)
+        commands = [args for _, _, _, args in self.harness.calls]
+        self.assertNotIn(["container", "rm", self.b.container_id], commands)
+        self.assertNotIn(["volume", "rm", self.b.volume_name], commands)
+
     def test_missing_stop_logs_withholds_all_object_deletion(self):
         self.b.prepare()
         self.harness.stop_logs = (b"", b"")

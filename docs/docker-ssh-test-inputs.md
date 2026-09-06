@@ -98,3 +98,35 @@ and `ssh-keygen -f ... -R ...` lines to changed-host-key output. `log.c` writes
 CRLF per log record while the fingerprint message contains an embedded LF.
 Retain and validate those exact bytes; do not broaden a negative test to accept
 unrelated connection or authentication failures.
+
+## Installed-Mac SSH lane
+
+The explicit `scripts/run-linux-docker-e2e.sh --suite ssh` DEV lane takes the
+normal installed-release, Developer/Hardened bundle, host Docker/plugin, and
+fresh evidence-directory arguments, plus `--buildkit-archive` and
+`--ssh-packages`. The latter names the retained, descriptor-verified input
+directory described above, not an arbitrary package directory. Optional
+`--ssh-gpgv` selects the verifier executable; its bytes are frozen before use.
+
+Three Linux Machines each run four uncached builds against their own builder
+and disposable, unexposed SSH server: supplied agent without a Dockerfile
+mount, required mount without a supplied provider, wrong pinned host key, and
+successful declared forwarding. The Mac's normal SSH agent, keys, Keychain,
+and Docker default context are not selected. This is build-time agent
+forwarding, not a new SSH login or public lifecycle command.
+
+Exact negative diagnostics and raw Buildx progress are independently replayed
+before a nonzero build can be acknowledged as an expected denial. The positive
+OCI output and exported cache are inspected. After normal builder shutdown,
+its complete cache archive is streamed into a private quarantine and scanned
+before publication or builder removal. The scanner checks literal private-key
+canaries through supported nested archive/compression formats; unsupported
+formats and exceeded limits fail closed. It does not claim secure erasure,
+arbitrary encoding detection, deleted-sector inspection, or live-memory review.
+
+Failures retain uncertain guest objects and private quarantine bytes; there is
+no automatic retry, builder restart, or global prune. Successful workload
+cleanup still requires public Machine Stops and unchanged host defaults.
+Stopped Machine disks remain retained: this lane does not certify Delete.
+Implementation and helper tests alone do not pass this lane, the full
+63-scenario Docker contract, or the aggregate 0.4 release gate.
