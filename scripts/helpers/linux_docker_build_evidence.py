@@ -6,7 +6,7 @@ authorities, builder/cache cleanup, secret absence in image blobs, or parity.
 """
 from contextlib import contextmanager
 import base64
-from datetime import datetime
+from datetime import datetime, timezone
 import json
 from pathlib import Path
 import re
@@ -100,6 +100,108 @@ def progress(raw, secret_dockerfile=None):
         excerpt += ["--------------------", footer]
         require(trailer in ([footer], excerpt), "foreign or malformed Buildx failure trailer")
     return vertices, b"".join(logs)
+
+
+def progress_ns(value):
+    parsed = progress_timestamp(value)
+    elapsed = parsed - datetime(1970, 1, 1, tzinfo=timezone.utc)
+    fraction = re.search(r"\.([0-9]+)", value)
+    tail = (fraction[1] if fraction else "").ljust(9, "0")[6:9]
+    return (elapsed.days * 86400 + elapsed.seconds) * 10**9 + parsed.microsecond * 1000 + int(tail)
+
+
+def payload_graph(raw, base_reference, cached):
+    """Derive operation identity independently of solve-local progress digests.
+
+    BuildKit 0.19 puts LocalUniqueID in each local source operation. Descendant
+    progress digests are therefore not content cache keys. The caller must also
+    authenticate the fixture and exact command: graph labels alone do not bind
+    source bytes or build arguments.
+    """
+    reference, separator, pin = base_reference.partition("@sha256:")
+    require(separator and hex64(pin), "unpinned payload base")
+    if "/" not in reference:
+        reference = "docker.io/library/" + reference
+    elif not ("." in reference.split("/")[0] or ":" in reference.split("/")[0]
+              or reference.split("/")[0] == "localhost"):
+        reference = "docker.io/" + reference
+    if reference.startswith("index.docker.io/"):
+        reference = "docker.io/" + reference[len("index.docker.io/"):]
+    if reference.startswith("docker.io/") and reference.count("/") == 1:
+        reference = "docker.io/library/" + reference[len("docker.io/"):]
+    reference += "@sha256:" + pin
+    names = {
+        "base": "[build 1/3] FROM " + reference,
+        "context": "[internal] load build context",
+        "copy": "[build 2/3] COPY tools.py input.txt intermediate-canary.txt /fixture/",
+        "run": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
+        "output": "[output 1/1] COPY --from=build /out/payload.txt /payload.txt",
+    }
+    auxiliary = {"[internal] load build definition from Dockerfile", "[internal] load .dockerignore",
+                 "[internal] load metadata for " + reference, "exporting to client directory"}
+    vertices, _ = progress(raw)
+    grouped, name_ids = {}, {}
+    for vertex in vertices:
+        identity, name = vertex["digest"], vertex["name"]
+        require(name in set(names.values()) | auxiliary and not vertex.get("error"), "foreign payload operation")
+        edges = vertex.get("inputs", [])
+        require(isinstance(edges, list) and all(isinstance(x, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", x)
+                                               for x in edges) and len(edges) == len(set(edges)), "invalid payload edges")
+        prior = grouped.setdefault(identity, [])
+        require(not prior or (prior[0]["name"] == name and prior[0].get("inputs", []) == edges), "payload identity drift")
+        require(name not in name_ids or name_ids[name] == identity, "duplicate payload role")
+        name_ids[name] = identity
+        prior.append(vertex)
+        if "completed" in vertex:
+            require("started" in vertex and progress_ns(vertex["started"]) <= progress_ns(vertex["completed"]),
+                    "invalid payload operation lifetime")
+    require(set(names.values()) <= set(name_ids), "missing payload graph role")
+    ids = {role: name_ids[name] for role, name in names.items()}
+    edges = {"base": [], "context": [], "copy": ["base", "context"], "run": ["copy"], "output": ["run"]}
+    terminal = {}
+    for role, identity in ids.items():
+        rows = grouped[identity]
+        require(rows[0].get("inputs", []) == [ids[x] for x in edges[role]], "disconnected payload graph")
+        done = [x for x in rows if "completed" in x]
+        require(done, "payload role never completed")
+        # Source progress includes repeated completions for download/resolve.
+        # Executable/copy operations have exactly one terminal record.
+        if role in ("copy", "run", "output"):
+            require(len(done) == 1 and rows[-1] is done[0], "duplicate or stale payload terminal")
+            starts = {x["started"] for x in rows if "started" in x}
+            require(len(starts) == 1, "payload process lifetime drift")
+            seen_cached = False
+            for row in rows:
+                require(not seen_cached or row.get("cached", False), "payload cache state regressed")
+                seen_cached = seen_cached or row.get("cached", False)
+        terminal[role] = done[-1]
+    for name in auxiliary & set(name_ids):
+        rows = grouped[name_ids[name]]
+        require(not rows[0].get("inputs", []) and any("completed" in x for x in rows), "invalid auxiliary payload node")
+    for role in ("copy", "run", "output"):
+        require(all(max(progress_ns(x["completed"]) for x in grouped[ids[parent]] if "completed" in x)
+                    <= progress_ns(terminal[role]["started"])
+                    for parent in edges[role]), "payload dependency completed after consumer started")
+    run = terminal["run"]
+    require(run.get("cached", False) is cached, "payload cache state differs")
+    if cached:
+        require(all(terminal[role].get("cached", False) is True for role in ("copy", "output")),
+                "cache reuse did not preserve payload chain")
+    frames = []
+    for line in raw.splitlines():
+        batch = decode(line)
+        for frame in batch.get("logs", []):
+            require(set(frame) == {"vertex", "stream", "data", "timestamp"} and frame["vertex"] == ids["run"]
+                    and type(frame["stream"]) is int and frame["stream"] == 1, "unbound payload execution log")
+            require(progress_ns(run["started"]) <= progress_ns(frame["timestamp"]) <= progress_ns(run["completed"]),
+                    "stale payload execution log")
+            frames.append(base64.b64decode(frame["data"], validate=True))
+    require(not frames if cached else b"".join(frames) == b"vz04-payload-step-executed\n",
+            "payload execution marker missing, duplicated or replayed from cache")
+    return {"normalized": [(role, names[role], edges[role]) for role in names], "base_digest": ids["base"],
+            "ids": ids, "started_ns": progress_ns(run["started"]), "completed_ns": progress_ns(run["completed"]),
+            "solve_started_ns": min(progress_ns(x["started"]) for x in vertices if "started" in x),
+            "solve_last_observed_ns": max(progress_ns(x[key]) for x in vertices for key in ("started", "completed") if key in x)}
 
 
 class Replay:
@@ -204,6 +306,10 @@ class Replay:
 
     def builder_guard(self):
         self.guard()
+        engine = decode(self.rows[self.i - 1]["_stdout"])
+        self.build_engine_ns = progress_ns(engine["SystemTime"])
+        require(getattr(self, "payload_completed_ns", 0) <= self.build_engine_ns,
+                "payload completion is outside subsequent Engine clock")
         raw = self.take(["buildx", "inspect", self.builder["name"]])["_stdout"].decode()
         sections = raw.split("\nNodes:\n")
         require(len(sections) == 2, "ambiguous builder nodes")
@@ -270,6 +376,7 @@ class Replay:
                         for kind in ("services", "networks", "volumes")}
             require(decode(self.files["compose-owner.json"]) == expected, "foreign owner overlay")
         require(fixture == self.fixture, "mixed fixture roots")
+        require(fixture_digest(fixture) == self.inputs["fixture_sha256"], "fixture changed between builds")
         args = ["buildx", "build", "--builder", self.builder["name"], "--platform", "linux/arm64", "--progress", "rawjson",
                 "--file", str(fixture / "build" / dockerfile), "--output", "type=local,dest=" + str(self.directory / ("export-" + suffix)),
                 "--build-arg", "FIXTURE_BASE=" + self.inputs["images"]["base"]["reference"]]
@@ -281,6 +388,22 @@ class Replay:
         require(self.secret not in logs, "secret leaked into decoded BuildKit logs")
         if code == 0:
             require(all(not x.get("error") for x in vertices), "successful build contains error")
+        if dockerfile == "Dockerfile":
+            proof = payload_graph(row["_stderr"], self.inputs["images"]["base"]["reference"], suffix == "alpha-reuse")
+            require(proof["solve_started_ns"] >= self.build_engine_ns, "payload predates authenticated Engine clock")
+            binding = list(row["_args"])
+            # Exact argv was checked above; normalize only its known output
+            # destination. Fixture bytes and all other arguments remain bound.
+            binding[11] = "type=local,dest=<selected-export>"
+            prior = getattr(self, "payload_proof", None)
+            if prior is not None:
+                require(proof["normalized"] == prior["normalized"] and proof["base_digest"] == prior["base_digest"],
+                        "payload operation/source graph changed")
+                require(proof["solve_started_ns"] >= prior["solve_last_observed_ns"], "stale cross-solve payload progress")
+                if suffix == "alpha-reuse":
+                    require(binding == self.payload_binding, "cache reuse command/source changed")
+            self.payload_proof, self.payload_binding = proof, binding
+            self.payload_completed_ns = proof["solve_last_observed_ns"]
         return vertices
 
     @staticmethod
@@ -320,22 +443,20 @@ class Replay:
         with self.observation(0):
             rows = self.build("alpha", "Dockerfile", args)
             self.export("alpha", b"vz04-build-v1\nvariant=alpha\n")
-            first = self.vertex(rows, "python3 /fixture/tools.py payload")
+            self.vertex(rows, "python3 /fixture/tools.py payload")
         with self.observation(1):
             rows = self.build("alpha-reuse", "Dockerfile", args)
             self.export("alpha-reuse", b"vz04-build-v1\nvariant=alpha\n")
-            require(self.vertex(rows, "python3 /fixture/tools.py payload", True) == first, "cache reused different vertex")
+            self.vertex(rows, "python3 /fixture/tools.py payload", True)
         with self.observation(2):
             rows = self.build("beta", "Dockerfile", args | {"FIXTURE_VARIANT": "beta"})
             self.export("beta", b"vz04-build-v1\nvariant=beta\n")
-            require(self.vertex(rows, "python3 /fixture/tools.py payload") != first, "build argument did not change vertex")
+            self.vertex(rows, "python3 /fixture/tools.py payload")
         with self.observation(3):
-            ids = []
             for state, step in (("cold", "first"), ("warm", "second")):
                 rows = self.build("cache-" + state, "Dockerfile.cache", {"FIXTURE_OWNER": self.owner, "FIXTURE_CACHE_EXPECT": state, "FIXTURE_CACHE_STEP": step})
                 self.export("cache-" + state, f"vz04-cache-v1\nowner={self.owner}\nstate={state}\nstep={step}\n".encode())
-                ids.append(self.vertex(rows, "python3 /fixture/tools.py cache"))
-            require(ids[0] != ids[1], "cache mount second step did not execute a changed vertex")
+                self.vertex(rows, "python3 /fixture/tools.py cache")
         with self.observation(4):
             args = {"FIXTURE_SECRET_SHA256": self.spec["secret_input_sha256"]}
             rows = self.build("secret", "Dockerfile.secret", args, ["--no-cache", "--secret", "id=fixture,src=" + str(self.fixture / "inputs/secret.txt")])

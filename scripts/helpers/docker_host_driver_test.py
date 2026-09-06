@@ -913,5 +913,198 @@ class AssertionTests(unittest.TestCase):
         compose.assert_not_called()
 
 
+class PayloadGraphTests(unittest.TestCase):
+    base = "python@sha256:" + "f" * 64
+    fixture_digest = "e" * 64
+
+    def graph(self, *, cached=False, solve=0):
+        names = {
+            "base": "[build 1/3] FROM docker.io/library/" + self.base,
+            "context": "[internal] load build context",
+            "copy": "[build 2/3] COPY tools.py input.txt intermediate-canary.txt /fixture/",
+            "run": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
+            "output": "[output 1/1] COPY --from=build /out/payload.txt /payload.txt",
+        }
+        edges = {"base": [], "context": [], "copy": ["base", "context"], "run": ["copy"], "output": ["run"]}
+        ids = {role: "sha256:" + driver.sha256((role + str(solve if role != "base" else 0)).encode()) for role in names}
+        stamp = lambda second: f"2026-09-06T06:00:{solve * 10 + second:02d}.123456789Z"
+        periods = {"base": (1, 2), "context": (1, 2), "copy": (2, 3), "run": (3, 4), "output": (4, 5)}
+        vertices = [{"digest": ids[role], "name": name, "inputs": [ids[p] for p in edges[role]],
+                     "started": stamp(periods[role][0]), "completed": stamp(periods[role][1]), "cached": cached}
+                    for role, name in names.items()]
+        logs = [] if cached else [{"vertex": ids["run"], "stream": 1, "timestamp": stamp(3),
+                                  "data": base64.b64encode(b"vz04-payload-step-executed\n").decode()}]
+        return {"vertexes": vertices, "logs": logs}
+
+    def encoded(self, batch):
+        return json.dumps(batch).encode() + b"\n"
+
+    def proof(self, batch, cached=False):
+        return driver.assert_payload_graph(self.encoded(batch), self.base, cached=cached)
+
+    def command(self, batch, *, solve=0, variant="alpha"):
+        dest = Path(f"/private/owned/export-{solve}")
+        argv = ["docker", "--config", "/private/owned/docker", "--context", "owned-machine", "buildx", "build",
+                "--builder", "owned-builder", "--platform", "linux/arm64", "--file", "/private/fixture/Dockerfile",
+                "--output", "type=local,dest=" + str(dest), "--build-arg", "FIXTURE_BASE=" + self.base,
+                "--build-arg", "FIXTURE_RUN=owned-run", "--build-arg", "FIXTURE_VARIANT=" + variant, "/private/fixture"]
+        result = driver.Command(solve + 1, argv, 0, b"", self.encoded(batch))
+        result.build_binding = driver.bind_build_command(argv, list(argv), dest, self.fixture_digest, b"exact Dockerfile")
+        result.build_engine_ns = driver.build_timestamp(f"2026-09-06T06:00:{solve * 10:02d}Z")
+        return result
+
+    def test_changed_solve_ids_preserve_only_proven_operation_identity(self):
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        a, b = self.proof(first), self.proof(second, True)
+        self.assertNotEqual(a["vertices"]["run"], b["vertices"]["run"])
+        driver.assert_payload_pair(self.command(first), a, self.command(second, solve=1), b)
+        beta = self.graph(solve=2)
+        driver.assert_payload_pair(self.command(first), a, self.command(beta, solve=2, variant="beta"), self.proof(beta), variant=True)
+
+    def test_source_multi_phase_progress_is_accepted_without_identity_drift(self):
+        batch = self.graph()
+        base = copy.deepcopy(batch["vertexes"][0]); context = copy.deepcopy(batch["vertexes"][1])
+        batch["vertexes"] = [dict(base, completed="2026-09-06T06:00:02Z"), context, *batch["vertexes"]]
+        self.proof(batch)
+
+    def test_missing_duplicate_unknown_alias_and_wrong_edges_rejected(self):
+        changes = [lambda b: b["vertexes"].pop(1),
+                   lambda b: b["vertexes"].append(copy.deepcopy(b["vertexes"][3])),
+                   lambda b: b["vertexes"].append(dict(b["vertexes"][3], digest="sha256:" + "9" * 64)),
+                   lambda b: b["vertexes"][3].update(name="[build 3/3] RUN echo cached"),
+                   lambda b: b["vertexes"][3].update(inputs=[b["vertexes"][0]["digest"]]),
+                   lambda b: b["vertexes"][2].update(inputs=list(reversed(b["vertexes"][2]["inputs"]))),
+                   lambda b: b["vertexes"][3].update(inputs=[b["vertexes"][3]["digest"]]),
+                   lambda b: b["vertexes"][4].update(inputs=["sha256:" + "9" * 64]),
+                   lambda b: b["vertexes"][3].update(inputs=b["vertexes"][3]["inputs"] * 2),
+                   lambda b: b["vertexes"][3].update(inputs="not an array"),
+                   lambda b: b["vertexes"][3].update(error="execution failed"),
+                   lambda b: b["vertexes"][3].pop("completed"),
+                   lambda b: b["vertexes"][3].update(started="2026-09-06T06:00:09Z"),
+                   lambda b: b["vertexes"][0].update(name=b["vertexes"][0]["name"].replace("f" * 64, "e" * 64))]
+        for change in changes:
+            batch = self.graph(); change(batch)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.proof(batch)
+
+    def test_intermediate_name_or_edge_drift_rejected(self):
+        for field, value in (("name", "[internal] load build context"), ("inputs", [])):
+            batch = self.graph(); early = copy.deepcopy(batch["vertexes"][3]); early.pop("completed")
+            early[field] = value; batch["vertexes"].insert(0, early)
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                self.proof(batch)
+
+    def test_operation_start_terminal_order_and_dependency_times_are_strict(self):
+        for mode in ("start", "cache", "after-terminal", "dependency"):
+            batch = self.graph()
+            early = copy.deepcopy(batch["vertexes"][3]); early.pop("completed")
+            if mode == "start":
+                early["started"] = "2026-09-06T06:00:02Z"
+                batch["vertexes"].insert(0, early)
+            elif mode == "cache":
+                early["cached"] = True; batch["vertexes"].insert(0, early)
+            elif mode == "after-terminal":
+                batch["vertexes"].append(early)
+            else:
+                batch["vertexes"][2]["completed"] = "2026-09-06T06:00:05Z"
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                self.proof(batch)
+        for role in (2, 4):
+            batch = self.graph(cached=True); batch["vertexes"][role]["cached"] = False
+            with self.subTest(role=role), self.assertRaises(ValueError):
+                self.proof(batch, True)
+
+    def test_execution_marker_exact_stream_vertex_time_and_cache_state(self):
+        changes = [lambda b: b.update(logs=[]),
+                   lambda b: b["logs"].append(copy.deepcopy(b["logs"][0])),
+                   lambda b: b["logs"][0].update(vertex=b["vertexes"][2]["digest"]),
+                   lambda b: b["logs"][0].update(stream=2), lambda b: b["logs"][0].update(stream=True),
+                   lambda b: b["logs"][0].update(data="not base64"),
+                   lambda b: b["logs"][0].update(timestamp="2026-09-06T05:59:59Z"),
+                   lambda b: b["logs"][0].update(data=base64.b64encode(b"forged\n").decode()),
+                   lambda b: b["vertexes"][3].update(cached=True)]
+        for change in changes:
+            batch = self.graph(); change(batch)
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                self.proof(batch)
+        batch = self.graph(cached=True); batch["logs"] = self.graph()["logs"]
+        with self.assertRaises(ValueError):
+            self.proof(batch, True)
+
+    def test_fragmented_marker_attached_to_run_is_accepted(self):
+        batch = self.graph(); template = batch["logs"][0]
+        batch["logs"] = [dict(template, data=base64.b64encode(part).decode()) for part in
+                         (b"vz04-payload-", b"step-executed\n")]
+        self.proof(batch)
+
+    def test_exact_command_fixture_and_variant_binding_reject_drift(self):
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        a, b = self.proof(first), self.proof(second, True)
+        for field in ("fixture_sha256", "dockerfile_sha256"):
+            command = self.command(second, solve=1); command.build_binding[field] = "a" * 64
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                driver.assert_payload_pair(self.command(first), a, command, b)
+        for old in ("owned-machine", "owned-builder", "linux/arm64", "FIXTURE_RUN=owned-run", "FIXTURE_VARIANT=alpha", "/private/fixture"):
+            command = self.command(second, solve=1)
+            index = command.build_binding["argv"].index(old); command.build_binding["argv"][index] = "foreign"
+            with self.subTest(argument=old), self.assertRaises(ValueError):
+                driver.assert_payload_pair(self.command(first), a, command, b)
+        command = self.command(first)
+        expected = list(command.argv); changed = list(expected); changed[-1] = "/foreign"
+        with self.assertRaises(ValueError):
+            driver.bind_build_command(changed, expected, Path("/private/owned/export-0"), self.fixture_digest, b"exact Dockerfile")
+        with self.assertRaises(ValueError):
+            driver.bind_build_command(expected, expected, Path("/foreign"), self.fixture_digest, b"exact Dockerfile")
+
+    def test_stale_progress_engine_clock_and_base_identity_rejected(self):
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        a, b = self.proof(first), self.proof(second, True)
+        for field, value in (("base_vertex", "sha256:" + "7" * 64), ("progress_sha256", a["progress_sha256"]),
+                             ("started_ns", a["started_ns"]), ("cached", False)):
+            changed = dict(b, **{field: value})
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                driver.assert_payload_pair(self.command(first), a, self.command(second, solve=1), changed)
+        for engine in (None, True, a["started_ns"], b["started_ns"] + 1):
+            command = self.command(second, solve=1); command.build_engine_ns = engine
+            with self.subTest(engine=engine), self.assertRaises(ValueError):
+                driver.assert_payload_pair(self.command(first), a, command, b)
+
+    def test_other_successful_recipe_runs_must_really_execute(self):
+        instruction = "RUN --network=none test ! -e /run/secrets/fixture"
+        batch = {"vertexes": [{"digest": "sha256:" + "a" * 64, "name": "[build 4/4] " + instruction,
+                                "completed": "2026-09-06T06:00:02Z"}]}
+        driver.assert_uncached_run(self.encoded(batch), instruction)
+        for changed in ({"cached": True}, {"error": "failed"}, {"completed": "2026-99-99T06:00:02Z"}):
+            bad = copy.deepcopy(batch); bad["vertexes"][0].update(changed)
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                driver.assert_uncached_run(self.encoded(bad), instruction)
+
+    def test_whole_solve_source_and_output_bounded_by_engine_observations(self):
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        late = copy.deepcopy(first)
+        late["vertexes"][4].update(started="2030-01-01T00:00:00Z", completed="2030-01-01T00:00:01Z")
+        graph = self.proof(late)
+        with self.assertRaises(ValueError):
+            driver.assert_payload_pair(self.command(late), graph, self.command(second, solve=1), self.proof(second, True))
+        item = driver.Driver.__new__(driver.Driver)
+        item.builder_guard = lambda: None
+        item._engine_system_time = "2026-09-06T06:00:10Z"
+        item._last_payload_graph = graph
+        with self.assertRaisesRegex(ValueError, "subsequent Engine"):
+            item.build("cache-cold", "Dockerfile.cache", {})
+        early = copy.deepcopy(first)
+        early["vertexes"][1].update(started="2026-09-06T05:59:59Z")
+        with self.assertRaises(ValueError):
+            driver.assert_payload_pair(self.command(early), self.proof(early), self.command(second, solve=1), self.proof(second, True))
+
+    def test_unfinished_source_future_update_is_bounded(self):
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        unfinished = dict(first["vertexes"][0], started="2030-01-01T00:00:00Z")
+        unfinished.pop("completed")
+        first["vertexes"].append(unfinished)
+        with self.assertRaises(ValueError):
+            driver.assert_payload_pair(self.command(first), self.proof(first), self.command(second, solve=1), self.proof(second, True))
+
+
 if __name__ == "__main__":
     unittest.main()

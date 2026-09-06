@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import calendar
 import dataclasses
 from datetime import datetime
 import hashlib
@@ -236,6 +237,8 @@ class Command:
     stdout: bytes
     stderr: bytes
     timed_out: bool = False
+    build_binding: dict[str, Any] | None = None
+    build_engine_ns: int | None = None
 
 
 class OutputLimitExceeded(Rejected):
@@ -579,6 +582,7 @@ class Driver:
                 all(runtimes[name] == {"path": "runc"} for name in inert), "unexpected or executable alternate runtime metadata")
         inventory = self.inputs.verify_runtime_evidence()
         require(not inert or inventory is not None, "inert stock runtime metadata requires authenticated startup executable inventory")
+        self._engine_system_time = info.get("SystemTime")
 
     def verify_images(self) -> None:
         for pin in self.inputs.raw["images"].values():
@@ -940,6 +944,11 @@ class Driver:
     def build(self, suffix: str, dockerfile: str, arguments: dict[str, str], *,
               extra: list[str] | None = None, expected: int | None = 0) -> tuple[Command, Path]:
         self.builder_guard()
+        require(isinstance(getattr(self, "_engine_system_time", None), str), "missing build Engine clock")
+        engine_ns = build_timestamp(self._engine_system_time)
+        previous_graph = getattr(self, "_last_payload_graph", None)
+        require(previous_graph is None or previous_graph["solve_last_observed_ns"] <= engine_ns,
+                "previous payload solve exceeds subsequent Engine observation")
         require(tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "fixture changed")
         dest = self.output / ("export-" + suffix)
         require(not dest.exists(), "build destination already exists")
@@ -950,17 +959,26 @@ class Driver:
         for key, value in sorted(arguments.items()):
             args.extend(["--build-arg", key + "=" + value])
         result = self.command([*args, *(extra or []), str(self.fixture / "build")], expected=expected, timeout=300)
+        require(tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "fixture changed during build")
+        expected_argv = ["docker", "--config", self.inputs.raw["docker_config"], "--context",
+                         self.inputs.scope["docker_context"], *args, *(extra or []), str(self.fixture / "build")]
+        result.build_binding = bind_build_command(result.argv, expected_argv, dest,
+            self.inputs.raw["fixture_sha256"], regular(self.fixture / "build" / dockerfile))
+        result.build_engine_ns = engine_ns
         return result, dest
 
     def build_workloads(self) -> None:
         expected = self.fixture_spec["expected"]
         arguments = {"FIXTURE_RUN": self.inputs.raw["run_id"], "FIXTURE_VARIANT": "alpha"}
         first_result: list[Command] = []
+        first_graph: list[dict[str, Any]] = []
 
         def stage() -> list[str]:
             result, dest = self.build("alpha", "Dockerfile", arguments)
             assert_export(dest, "payload.txt", expected["build_alpha"].encode())
-            assert_payload_vertex(result.stderr, cached=False)
+            first_graph.append(assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=False))
+            require(result.build_engine_ns <= first_graph[0]["solve_started_ns"], "payload predates authenticated Engine observation")
+            self._last_payload_graph = first_graph[0]
             first_result.append(result)
             return ["local final stage contains only exact alpha payload", "payload vertex actually executed"]
 
@@ -969,16 +987,21 @@ class Driver:
         def reuse() -> list[str]:
             result, dest = self.build("alpha-reuse", "Dockerfile", arguments)
             assert_export(dest, "payload.txt", expected["build_alpha"].encode())
-            first_id = assert_payload_vertex(first_result[0].stderr, cached=False)
-            second_id = assert_payload_vertex(result.stderr, cached=True)
-            require(first_id == second_id, "cache observations refer to different vertices")
-            return ["identical payload vertex cached on second build", "local payload unchanged"]
+            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=True)
+            assert_payload_pair(first_result[0], first_graph[0], result, graph)
+            first_graph.append(graph)
+            self._last_payload_graph = graph
+            return ["same fixture/command-bound payload graph cached on second build", "local payload unchanged"]
 
         self.observe("build-cache-reuse", ["docker.build.cache_reuse"], reuse)
 
         def variation() -> list[str]:
-            _, dest = self.build("beta", "Dockerfile", arguments | {"FIXTURE_VARIANT": "beta"})
+            result, dest = self.build("beta", "Dockerfile", arguments | {"FIXTURE_VARIANT": "beta"})
             assert_export(dest, "payload.txt", expected["build_beta"].encode())
+            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=False)
+            assert_payload_pair(first_result[0], first_graph[0], result, graph, variant=True)
+            require(first_graph[-1]["completed_ns"] <= result.build_engine_ns, "payload solve chronology regressed")
+            self._last_payload_graph = graph
             require(expected["build_alpha"] != expected["build_beta"], "fixture argument variants identical")
             return ["alpha and beta arguments produce exact distinct payloads; OCI layer comparison still required"]
 
@@ -987,7 +1010,9 @@ class Driver:
         def cache_mount() -> list[str]:
             for state, step in (("cold", "first"), ("warm", "second")):
                 args = {"FIXTURE_OWNER": self.inputs.owner, "FIXTURE_CACHE_EXPECT": state, "FIXTURE_CACHE_STEP": step}
-                _, dest = self.build("cache-" + state, "Dockerfile.cache", args)
+                result, dest = self.build("cache-" + state, "Dockerfile.cache", args)
+                assert_uncached_run(result.stderr,
+                    "RUN --network=none --mount=type=cache,id=vz04-cache-probe,target=/cache,sharing=locked python3 /fixture/tools.py cache")
                 payload = f"vz04-cache-v1\nowner={self.inputs.owner}\nstate={state}\nstep={step}\n".encode()
                 assert_export(dest, "cache.txt", payload)
             return ["same builder cache mount cold-to-warm owner sentinel preserved; sibling isolation still required"]
@@ -996,9 +1021,12 @@ class Driver:
 
         def secret() -> list[str]:
             args = {"FIXTURE_SECRET_SHA256": self.fixture_spec["secret_input_sha256"]}
-            _, dest = self.build("secret", "Dockerfile.secret", args,
+            positive, dest = self.build("secret", "Dockerfile.secret", args,
                                  extra=["--no-cache", "--secret", "id=fixture,src=" + str(self.fixture / "inputs/secret.txt")])
             assert_export(dest, "secret.txt", expected["secret_output"].encode())
+            assert_uncached_run(positive.stderr,
+                "RUN --network=none --mount=type=secret,id=fixture,required=true python3 /fixture/tools.py secret")
+            assert_uncached_run(positive.stderr, "RUN --network=none test ! -e /run/secrets/fixture")
             result, _ = self.build("secret-missing", "Dockerfile.secret", args, extra=["--no-cache"], expected=None)
             require(not result.timed_out and result.returncode > 0, "missing required secret did not fail normally")
             assert_required_secret_failure(result.stderr, regular(self.fixture / "build/Dockerfile.secret"))
@@ -1216,6 +1244,163 @@ def assert_required_secret_failure(raw: bytes, dockerfile: bytes) -> str:
                     "unrelated BuildKit failure in required-secret build")
     require(len(matches) == 1, "missing or duplicated terminal required-secret vertex")
     return matches[0]
+
+
+def bind_build_command(argv: list[str], expected: list[str], destination: Path,
+                       fixture_digest: str, dockerfile: bytes) -> dict[str, Any]:
+    """Bind actual dispatch to authenticated inputs; normalize only its export path."""
+    require(argv == expected, "build dispatch differs from exact fixture command")
+    require(argv.count("--output") == 1, "ambiguous build output")
+    normalized = list(argv)
+    index = normalized.index("--output") + 1
+    require(normalized[index] == "type=local,dest=" + str(destination), "foreign build destination")
+    normalized[index] = "type=local,dest=<owned-export>"
+    checked_text(fixture_digest, r"[0-9a-f]{64}", "fixture digest")
+    return {"argv": normalized, "fixture_sha256": fixture_digest, "dockerfile_sha256": sha256(dockerfile)}
+
+
+def build_timestamp(value: str) -> int:
+    match = re.fullmatch(r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]{1,9}))?Z", value)
+    require(match is not None, "invalid BuildKit UTC timestamp")
+    parsed = datetime.fromisoformat(match[1])
+    require(parsed.year > 1970, "uninitialized BuildKit timestamp")
+    return calendar.timegm(parsed.timetuple()) * 10**9 + int((match[2] or "").ljust(9, "0"))
+
+
+def assert_payload_graph(raw: bytes, base_reference: str, *, cached: bool) -> dict[str, Any]:
+    """Prove this fixture's connected operation, not cross-solve progress hashes.
+
+    BuildKit 0.19.0 embeds per-solve LocalUniqueID in local source operations
+    (client/llb/state.go, source.go). Those hashes propagate through inputs;
+    solver cache maps instead incorporate operation and selected content hashes.
+    """
+    checked_text(base_reference, r"[^\s@]+@sha256:[0-9a-f]{64}", "pinned build base")
+    repository, digest = base_reference.split("@")
+    if "/" not in repository or not any(c in repository.split("/")[0] for c in (".", ":")) and not repository.startswith("localhost/"):
+        repository = "docker.io/" + repository
+    if repository.startswith("docker.io/") and repository.count("/") == 1:
+        repository = "docker.io/library/" + repository.split("/", 1)[1]
+    reference = repository + "@" + digest
+    names = {
+        "base": "[build 1/3] FROM " + reference,
+        "context": "[internal] load build context",
+        "copy": "[build 2/3] COPY tools.py input.txt intermediate-canary.txt /fixture/",
+        "run": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
+        "output": "[output 1/1] COPY --from=build /out/payload.txt /payload.txt",
+        "definition": "[internal] load build definition from Dockerfile",
+        "ignore": "[internal] load .dockerignore",
+        "metadata": "[internal] load metadata for " + reference,
+        "export": "exporting to client directory",
+    }
+    role_by_name = {name: role for role, name in names.items()}
+    vertices: dict[str, tuple[str, list[str]]] = {}
+    ids: dict[str, str] = {}
+    terminals: dict[str, list[dict[str, Any]]] = {}
+    operation_starts: dict[str, str] = {}
+    cached_operations: set[str] = set()
+    solve_starts, solve_completions = [], []
+    logs = []
+    for line in buildkit_lines(raw):
+        rows = buildkit_vertices(line)  # Duplicate-key/schema/type refusal before plain decode.
+        batch = json.loads(line)
+        logs.extend(batch.get("logs", []))
+        for row in rows:
+            require(row["name"] in role_by_name and not row.get("error"), "foreign or failed payload graph vertex")
+            role, vertex_id = role_by_name[row["name"]], row["digest"]
+            if "started" in row:
+                solve_starts.append(build_timestamp(row["started"]))
+            if "completed" in row:
+                solve_completions.append(build_timestamp(row["completed"]))
+                require(isinstance(row.get("started"), str) and
+                        build_timestamp(row["started"]) <= build_timestamp(row["completed"]),
+                        "source/operation time interval reversed or incomplete")
+            if role in ("copy", "run", "output"):
+                require(not terminals.get(role), "operation update follows completion")
+                if "started" in row:
+                    require(role not in operation_starts or operation_starts[role] == row["started"],
+                            "operation start timestamp changed")
+                    operation_starts[role] = row["started"]
+                require(role not in cached_operations or row.get("cached", False) is True,
+                        "operation cache status regressed")
+                if row.get("cached", False):
+                    cached_operations.add(role)
+            inputs = row.get("inputs", [])
+            require(isinstance(inputs, list) and all(isinstance(x, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", x) for x in inputs)
+                    and len(inputs) == len(set(inputs)), "invalid or duplicate graph edge")
+            identity = (role, inputs)
+            require(vertex_id not in vertices or vertices[vertex_id] == identity, "vertex name or input drift")
+            require(role not in ids or ids[role] == vertex_id, "duplicate graph role")
+            vertices[vertex_id], ids[role] = identity, vertex_id
+            if row.get("completed"):
+                terminals.setdefault(role, []).append(row)
+    required = {"base", "context", "copy", "run", "output"}
+    require(required <= set(ids), "incomplete payload graph")
+    edges = {"base": [], "context": [], "copy": ["base", "context"], "run": ["copy"], "output": ["run"]}
+    for role, vertex_id in ids.items():
+        require(vertices[vertex_id][1] == [ids[parent] for parent in edges.get(role, [])], "payload graph edge differs")
+        require(terminals.get(role), "unfinished payload graph vertex")
+        if role in ("copy", "run", "output"):
+            require(len(terminals[role]) == 1, "duplicate terminal operation")
+    run = terminals["run"][0]
+    require(run.get("cached", False) is cached, "payload vertex cache status differs")
+    if cached:
+        require(all(terminals[role][0].get("cached", False) is True for role in ("copy", "output")),
+                "cached payload lacks cached dependency/output operations")
+    for role in ("copy", "run", "output"):
+        terminal = terminals[role][0]
+        require(isinstance(terminal.get("started"), str), "missing operation start timestamp")
+        operation_start = build_timestamp(terminal["started"])
+        require(operation_start <= build_timestamp(terminal["completed"]), "operation time interval reversed")
+        for parent in edges[role]:
+            require(max(build_timestamp(value["completed"]) for value in terminals[parent]) <= operation_start,
+                    "operation predates completed dependency")
+    require(isinstance(run.get("started"), str), "missing payload start timestamp")
+    started, completed = build_timestamp(run["started"]), build_timestamp(run["completed"])
+    require(started <= completed, "payload time interval reversed")
+    payload = bytearray()
+    for log in logs:
+        require(set(log) == {"vertex", "stream", "data", "timestamp"} and log["vertex"] == ids["run"] and
+                type(log["stream"]) is int and log["stream"] == 1 and isinstance(log["data"], str) and
+                isinstance(log["timestamp"], str), "foreign payload execution log")
+        require(started <= build_timestamp(log["timestamp"]) <= completed, "stale payload execution log")
+        payload.extend(base64.b64decode(log["data"], validate=True))
+    require((not logs if cached else bytes(payload) == b"vz04-payload-step-executed\n"),
+            "payload execution marker differs from cache state")
+    return {"graph": edges, "base_vertex": ids["base"], "vertices": ids,
+            "started_ns": started, "completed_ns": completed, "cached": cached,
+            "solve_started_ns": min(solve_starts), "solve_last_observed_ns": max(solve_starts + solve_completions),
+            "progress_sha256": sha256(raw)}
+
+
+def assert_payload_pair(first: Command, first_graph: dict[str, Any], second: Command,
+                        second_graph: dict[str, Any], *, variant: bool = False) -> None:
+    require(first.build_binding is not None and second.build_binding is not None, "missing authenticated build binding")
+    for graph in (first_graph, second_graph):
+        require(graph["solve_started_ns"] <= graph["started_ns"] <= graph["completed_ns"] <= graph["solve_last_observed_ns"],
+                "payload interval differs from whole solve interval")
+    wanted = dict(first.build_binding)
+    wanted["argv"] = list(wanted["argv"])
+    if variant:
+        require(wanted["argv"].count("FIXTURE_VARIANT=alpha") == 1, "ambiguous variant argument")
+        wanted["argv"][wanted["argv"].index("FIXTURE_VARIANT=alpha")] = "FIXTURE_VARIANT=beta"
+    require(wanted == second.build_binding, "payload fixture or command identity drift")
+    require(first.index < second.index and first_graph["progress_sha256"] != second_graph["progress_sha256"] and
+            type(first.build_engine_ns) is int and type(second.build_engine_ns) is int and
+            first.build_engine_ns <= first_graph["solve_started_ns"] and
+            first_graph["solve_last_observed_ns"] <= second.build_engine_ns <= second_graph["solve_started_ns"],
+            "stale or reordered payload solve")
+    require(first_graph["cached"] is False and second_graph["cached"] is (not variant), "wrong payload solve cache transition")
+    require(first_graph["graph"] == second_graph["graph"] and first_graph["base_vertex"] == second_graph["base_vertex"],
+            "payload operation graph or pinned base changed")
+
+
+def assert_uncached_run(raw: bytes, instruction: str) -> None:
+    rows = [row for line in buildkit_lines(raw) for row in buildkit_vertices(line)]
+    require(all(not row.get("error") for row in rows), "successful build contains vertex error")
+    matches = [row for row in rows if re.fullmatch(r"\[build [0-9]+/[0-9]+\] " + re.escape(instruction), row["name"])
+               and row.get("completed")]
+    require(len(matches) == 1 and matches[0].get("cached", False) is False, "uncached fixture RUN not proven")
+    build_timestamp(matches[0]["completed"])
 
 
 def assert_payload_vertex(raw: bytes, *, cached: bool) -> str:
