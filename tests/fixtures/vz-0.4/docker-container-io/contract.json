@@ -1,0 +1,55 @@
+{
+  "schema_version": 1,
+  "scope": "DEV_CONTAINER_IO_FIXTURE_NOT_DOCKER_CERTIFICATION",
+  "token_pattern": "vzio-[0-9a-f]{24}",
+  "base_reference": "docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9",
+  "binary_input": {
+    "formula": "bytes(range(256)) * 257",
+    "size": 65792,
+    "sha256": "120c518a83325c66464701a6ee080302f332bc768ea3f60473b209f1bfb091df",
+    "maximum_size": 1048576
+  },
+  "stream": {
+    "stdout": "vzio|TOKEN|stdout-begin\n + INPUT + \nvzio|TOKEN|stdout-end\n",
+    "stderr": "vzio|TOKEN|stderr-begin\nvzio|TOKEN|stderr-end\n",
+    "post_eof_delay_ns": 100000000,
+    "exit_code": 37,
+    "timeout_seconds": 30
+  },
+  "tty": {
+    "initial_size": [24, 80],
+    "resized_size": [40, 120],
+    "commands": ["size\n", "exit\n"],
+    "maximum_commands": 4,
+    "exit_code": 37,
+    "sigint_exit_code": 130,
+    "timeout_seconds": 30,
+    "echo": false,
+    "icanon": true,
+    "isig": true
+  },
+  "service": {
+    "health_path": "/run/vz-container-io-health.json",
+    "initial_health_state": "starting",
+    "health_states": ["starting", "healthy", "unhealthy"],
+    "health_exit_codes": [1, 0, 1],
+    "host_health_start_period_seconds": 30,
+    "lifetime_seconds": 300,
+    "SIGUSR1": "healthy",
+    "SIGUSR2": "unhealthy",
+    "SIGTERM": 143
+  },
+  "exec": {
+    "cwd": "/workspace",
+    "root_marker_path": "/vz-container-io-root.txt",
+    "root_marker": "vz-container-io-root-v1\n",
+    "namespaces": ["cgroup", "ipc", "mnt", "net", "pid", "user", "uts"],
+    "nonroot_pid1_namespace_permission_denial": "typed_observation_not_namespace_equality_proof",
+    "exit_code": 37
+  },
+  "exit_codes": [0, 37, 130, 137, 143],
+  "missing_command": "/fixture/does-not-exist",
+  "non_executable_command": "/fixture/not-executable",
+  "contract_rejection_exit_code": 70,
+  "signal_claim_requires_actual_host_signal": true
+}

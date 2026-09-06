@@ -3,8 +3,13 @@
 `docker_host_driver.py` executes the checked-in Docker fixtures through the
 unmodified installed Mac Docker CLI and its Compose/buildx plugins. It is **not**
 `run-linux-docker-e2e.sh`, a compatibility report, or a release-gate substitute.
-No physical Docker workload has verified this implementation yet. The 63 required
-catalog scenarios, fixture freeze and full aggregate remain open.
+Standalone driver output does not certify the installed physical boundary; see
+[the installed harness](linux_docker_e2e.md) for its qualified DEV slices. The 63
+required catalog scenarios and full aggregate remain open.
+
+The recorder also supports explicit bounded stdin/PTY action plans. Their
+[capture and replay contract](../../docs/docker-container-io-evidence.md) remains
+test infrastructure: the installed container-lifecycle lane is not yet complete.
 
 The executable subset currently covers:
 

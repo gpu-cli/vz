@@ -416,6 +416,7 @@ class Recorder:
         self.max_stream_bytes = max_stream_bytes
         self.count = 0
         self.receipts: list[dict[str, Any]] = []
+        self.pending_interactions: list[subprocess.Popen] = []
 
     def persist(self, path: Path, value: dict[str, Any], *, create: bool = False) -> None:
         """Publish a durable intent before dispatch, or a terminal observation."""
@@ -431,11 +432,26 @@ class Recorder:
             os.close(directory)
 
     def run(self, argv: list[str], *, executable: str, timeout: int = 120,
-            extra_env: dict[str, str] | None = None, mutation: bool = True) -> Command:
+            extra_env: dict[str, str] | None = None, mutation: bool = True,
+            interaction_plan: dict[str, Any] | None = None) -> Command:
         private_inputs = (*argv, executable, *self.env.keys(), *self.env.values(),
                           *(extra_env or {}).keys(), *(extra_env or {}).values())
         require(not contains_canary(tuple(value.encode() for value in private_inputs), self.canaries),
                 "private canary rejected before command intent/dispatch")
+        plan_bytes = None
+        interaction = None
+        if interaction_plan is not None:
+            import linux_docker_interactive_capture as interactive
+            from linux_docker_interactive_evidence import encode_plan
+            interaction_plan = interactive.validate_plan(interaction_plan)
+            require(interaction_plan["timeout_seconds"] == timeout and
+                    interaction_plan["output_limit"] == self.max_stream_bytes,
+                    "interactive deadline/output bound differs from recorder")
+            writes = tuple(action["data"] for action in interaction_plan["actions"] if action["kind"] == "write")
+            markers = tuple(action["after"]["marker"] for action in interaction_plan["actions"] if "after" in action)
+            require(not contains_canary((*writes, *markers, b"".join(writes), b"".join(markers)), self.canaries),
+                    "private interactive input rejected before dispatch")
+            plan_bytes = encode_plan(interaction_plan)
         self.count += 1
         index = self.count
         start_wall, start = time.time_ns(), time.monotonic_ns()
@@ -454,14 +470,36 @@ class Recorder:
         # An exception at any later boundary must never make cleanup assume
         # that the absence of a completed receipt means no dispatch occurred.
         self.receipts.append(receipt)
+        if plan_bytes is not None:
+            plan_name = stem + ".interaction-plan.json"
+            receipt["started_monotonic_ns"] = start
+            # The public plan is fsynced before intent and dispatch. It binds
+            # actual bytes, not just a claimed input digest or action count.
+            self.persist(self.root / plan_name, json.loads(plan_bytes), create=True)
+            receipt["interaction_plan"] = plan_name
+            receipt["interaction_plan_sha256"] = sha256(regular(self.root / plan_name, 8 * 1024 * 1024))
         self.persist(self.root / (stem + ".intent.json"), receipt, create=True)
-        # No shell, terminal, inherited stdin, Docker environment or user SSH agent.
+        # No shell, inherited stdin, Docker environment or user SSH agent.
+        # A terminal exists only for an explicit plan on a fresh owned PTY.
         try:
-            result = execute(argv, executable=executable, env=self.env | (extra_env or {}),
+            if interaction_plan is not None:
+                captured = interactive.capture(argv, executable=executable, env=self.env | (extra_env or {}),
+                                               cwd=self.root, plan=interaction_plan)
+                interaction = captured.receipt
+                if captured.pending_process is not None:
+                    self.pending_interactions.append(captured.pending_process)
+                code = captured.returncode if captured.returncode is not None else -1
+                stdout, stderr = captured.stdout, captured.stderr
+                if not interaction["capture_complete"] or captured.pending_process is not None:
+                    pending_error = Rejected("interactive capture incomplete: " + str(interaction["error"]))
+                    timed_out = interaction["error"] == "deadline"
+                    output_limit_exceeded = interaction["error"] == "output_limit"
+            else:
+                result = execute(argv, executable=executable, env=self.env | (extra_env or {}),
                                     cwd=self.root, stdin=subprocess.DEVNULL,
                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                     timeout=timeout, max_stream_bytes=self.max_stream_bytes, check=False)
-            code, stdout, stderr = result.returncode, result.stdout, result.stderr
+                code, stdout, stderr = result.returncode, result.stdout, result.stderr
         except subprocess.TimeoutExpired as error:
             timed_out = True
             code, stdout, stderr = -1, error.stdout or b"", error.stderr or b""
@@ -507,6 +545,10 @@ class Recorder:
                    "raw_stderr_sha256": sha256(stderr) if not timed_out and pending_error is None else None,
                    "dispatch_error": str(pending_error) if pending_error else None,
                    "secret_leak_detected": leaked, "raw_streams_retained": not leaked and not timed_out and pending_error is None}
+        if plan_bytes is not None:
+            terminal.update(interaction_plan=receipt["interaction_plan"],
+                            interaction_plan_sha256=receipt["interaction_plan_sha256"], interaction_capture=interaction,
+                            started_monotonic_ns=receipt["started_monotonic_ns"])
         self.persist(self.root / (stem + ".json"), terminal, create=True)
         # Only a durably retained normal host completion clears in-memory
         # uncertainty. The separate intent remains for crash/recovery auditing.
@@ -597,7 +639,7 @@ class Driver:
         return sha256(data)
 
     def command(self, args: list[str], *, expected: int | None = 0, timeout: int = 120,
-                env: dict[str, str] | None = None) -> Command:
+                env: dict[str, str] | None = None, interaction_plan: dict[str, Any] | None = None) -> Command:
         require(self.validate_config() == self.config_snapshot, "client config changed")
         for pin in self.inputs.raw["clients"].values():
             require(sha256(regular(Path(pin["path"]))) == pin["sha256"], "client executable changed")
@@ -608,7 +650,9 @@ class Driver:
             ["context", "inspect"], ["image", "inspect"], ["container", "inspect"], ["container", "ls"],
             ["network", "inspect"], ["network", "ls"], ["volume", "inspect"], ["volume", "ls"],
             ["buildx", "inspect"], ["compose", "version"]]
-        result = self.record.run(argv, executable=executable, timeout=timeout, extra_env=env, mutation=not readonly)
+        options = {"interaction_plan": interaction_plan} if interaction_plan is not None else {}
+        result = self.record.run(argv, executable=executable, timeout=timeout, extra_env=env,
+                                 mutation=not readonly, **options)
         if expected is not None:
             require(not result.timed_out and result.returncode == expected,
                     f"command {result.index} exit {result.returncode}, expected {expected}")
