@@ -40,6 +40,8 @@ async fn execute(
     script: &str,
     seconds: u64,
 ) -> Result<vz::protocol::ExecOutput> {
+    let started = std::time::Instant::now();
+    tracing::info!(script, seconds, "running guest setup command");
     let output = tokio::time::timeout(Duration::from_secs(seconds), async {
         client
             .exec_stream(
@@ -52,7 +54,12 @@ async fn execute(
             .await
     })
     .await
-    .context("setup command deadline")??;
+    .with_context(|| format!("guest setup command exceeded {seconds}s: {script}"))??;
+    tracing::info!(
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        exit_code = output.exit_code,
+        "guest setup command completed"
+    );
     ensure!(output.exit_code == 0, "setup command failed: {output:?}");
     Ok(output)
 }
@@ -285,8 +292,10 @@ pub async fn run(args: Args) -> Result<()> {
         execute(&mut client, "mkdir -m 700 /private/var/tmp/vz-toolchain-inputs", 30).await?;
         upload(&mut client, &archive, "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz").await?;
         upload(&mut client, &payload.join("toolchain.json"), "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.json").await?;
-        let hash = execute(&mut client, "/usr/bin/shasum -a 256 /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz", 120).await?;
-        ensure!(hash.stdout == format!("{}  /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz\n", manifest.archive.sha256), "guest archive digest mismatch");
+        // Use the native digest implementation for the multi-gigabyte archive.
+        // This also avoids depending on Perl before Xcode has been installed.
+        let hash = execute(&mut client, "/usr/bin/openssl dgst -sha256 -r /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz", 120).await?;
+        ensure!(hash.stdout == format!("{} */private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz\n", manifest.archive.sha256), "guest archive digest mismatch");
         let (installation, parent) = match manifest.layout {
             vz_macos_provision::toolchain::ToolchainLayout::Clt => ("/Library/Developer/CommandLineTools", "/Library/Developer"),
             vz_macos_provision::toolchain::ToolchainLayout::Xcode => ("/Applications/Xcode.app", "/Applications"),
@@ -295,9 +304,16 @@ pub async fn run(args: Args) -> Result<()> {
         let install = execute(&mut client, &script, 600).await?;
         fs::write(args.output.join("install.json"), serde_json::to_vec_pretty(&install)?)?;
         }
+        if manifest.layout == vz_macos_provision::toolchain::ToolchainLayout::Xcode {
+            let signature = execute(&mut client, "/usr/bin/codesign --verify --strict /Applications/Xcode.app", 600).await?;
+            fs::write(args.output.join("signature.json"), serde_json::to_vec_pretty(&signature)?)?;
+        }
         if args.accept_xcode_license {
             ensure!(manifest.layout == vz_macos_provision::toolchain::ToolchainLayout::Xcode, "license acceptance requires an Xcode receipt");
-            let accepted = execute(&mut client, "/usr/bin/xcodebuild -license accept", 60).await?;
+            // A fresh guest must assess the copied application on first launch.
+            // Invoke the selected Xcode directly rather than the system shim's
+            // preliminary license-status subprocess, and bound this one-time work.
+            let accepted = execute(&mut client, "/Applications/Xcode.app/Contents/Developer/usr/bin/xcodebuild -license accept", 600).await?;
             fs::write(args.output.join("license-acceptance.json"), serde_json::to_vec_pretty(&accepted)?)?;
         }
         let (script, expected) = manifest.verification()?;
@@ -309,6 +325,24 @@ pub async fn run(args: Args) -> Result<()> {
         }
         Ok::<_, anyhow::Error>(())
     }.await;
+    if result.is_err() {
+        // Capture the guest state before the disposable candidate is removed.
+        // Diagnostics never turn a failed preparation into a publishable image.
+        let diagnostics = async {
+            let mut client = GrpcAgentClient::connect_default(Arc::clone(&vm)).await?;
+            execute(
+                &mut client,
+                "/bin/ps -axo pid,ppid,state,etime,time,command; /bin/df -h /; /usr/bin/log show --last 2m --style compact --predicate 'process == \"syspolicyd\" OR process == \"amfid\"' 2>&1 | /usr/bin/tail -100",
+                10,
+            )
+            .await
+        }
+        .await;
+        match diagnostics {
+            Ok(diagnostics) => tracing::error!(?diagnostics, "guest setup failed before shutdown"),
+            Err(error) => tracing::warn!(%error, "guest setup diagnostics unavailable"),
+        }
+    }
     let shutdown = async {
         let mut client = GrpcAgentClient::connect_default(Arc::clone(&vm)).await?;
         let _ = client

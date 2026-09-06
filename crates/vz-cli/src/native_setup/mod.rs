@@ -492,6 +492,7 @@ pub async fn run(args: Args) -> Result<()> {
     for name in [
         "guest-os.json",
         "verification.json",
+        "signature.json",
         "preflight-build.json",
         "preflight-test.json",
         "preflight-run.json",
