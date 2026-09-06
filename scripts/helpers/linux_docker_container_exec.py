@@ -49,7 +49,8 @@ def operations(cid, token):
          'plan': plan('pty', [{'kind': 'resize', 'rows': 40, 'cols': 120,
              'after': {'stream': 'tty', 'marker': ready}},
              {'kind': 'write', 'data': b'size\n', 'after': {'stream': 'tty', 'marker': resized}},
-             {'kind': 'write', 'data': b'exit\n', 'after': {'stream': 'tty', 'marker': sized}}], 10)},
+             {'kind': 'write', 'data': b'exit\n', 'after': {'stream': 'tty', 'marker': sized}}], 10) |
+                 {'defer_sigwinch': True}},
         {'name': 'tty-sigint', 'args': args('tty', ['--interactive', '--tty']), 'exit': 130,
          'plan': plan('pty', [{'kind': 'write', 'data': b'\x03',
              'after': {'stream': 'tty', 'marker': ready}}])},

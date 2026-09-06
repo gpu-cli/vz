@@ -119,6 +119,9 @@ class Exec(unittest.TestCase):
         self.assertIn('--tty', tty['args'])
         self.assertEqual(tty['plan']['actions'][0]['rows'], 40)
         self.assertEqual(tty['plan']['actions'][0]['cols'], 120)
+        self.assertIs(tty['plan']['defer_sigwinch'], True)
+        for operation in (root, nonroot, stream, interrupt):
+            self.assertNotIn('defer_sigwinch', operation['plan'])
         resized = fixture.encode({'schema_version': 1, 'type': 'tty_resized', 'token': TOKEN,
                                   'rows': 40, 'cols': 120}) + b'\r\n'
         self.assertEqual(tty['plan']['actions'][1], {'kind': 'write', 'data': b'size\n',

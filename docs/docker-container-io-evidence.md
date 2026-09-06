@@ -777,3 +777,61 @@ Manifest SHA-256:
 `7bfbccc53a92926a1fe36cef2f199060ae01caeb374a5e6aace60e372d9e178e`.
 This local terminal test is not an installed-Docker pass. Runtime/guest bundles
 are unchanged; fresh installed-Mac lifecycle acceptance remains required.
+
+### Candidate 9: missing resize acknowledgement; queued-signal launch
+
+Installed source `688a83cf` again passes all four fresh Machine enrollments,
+but first-Machine command 76 emits only initial `24×80` readiness. The single
+host resize to `40×120` completes; no guest acknowledgement arrives, and neither
+the size query nor exit query is sent. The original 30-second deadline expires;
+owned client PID 4463 is killed and positively reaped. Terminal restoration
+fails. This attempt remains failed, with no final runtime-journal capture.
+
+Original evidence `.artifacts/linux-docker-lifecycle-candidate-9` independently
+verifies 3,185 payloads / 3,603,106 bytes, manifest SHA-256
+`53d57441fc643f485581b708779968132f625d326505cc4b76de6b9938c20546`.
+Separate disposition `.artifacts/linux-docker-lifecycle-candidate-9-disposition`
+verifies 513 payloads / 944,413 bytes, manifest SHA-256
+`b3f25a5675ddb1c66b999b8f1ad6c93d7d980c9abffc98f5eb1fb3f455e15b29`.
+All four exact-owner public Stops have distinct clean filesystem journals;
+the daemon, five sockets and PID file are gone, and defaults are unchanged.
+The diagnostic retains a nonquiescent journal prefix, not a final capture.
+Failed evidence, Docker objects and stopped disks are preserved.
+
+Pinned upstream Docker CLI 29.4.0 starts the exec I/O goroutine before
+`MonitorTtySize`. That function sends its initial resize HTTP request before
+subscribing to `SIGWINCH`. An early host resize can therefore be lost while
+initial dimensions are still being sent. Guest output readiness does not prove
+that the client has subscribed. This source ordering also remains in upstream
+29.8.0; no fixed-version upgrade is claimed. The installed OrbStack multicall
+wrapper's private startup code has not been audited, so upstream source alone
+does not prove its entire signal-subscription history.
+
+The narrowly selected `tty-exit` launch now inherits a blocked `SIGWINCH` mask.
+The parent thread adds only that signal around `Popen` and immediately restores
+its exact original mask; the child handle is retained even if restoration fails.
+Go preserves this inherited mask until a subscriber enables the signal, allowing
+the one early resize to remain pending. This is not a resend or timeout increase.
+The guest acknowledgement, dimensions, single query and exit remain unchanged.
+Other plans, including SIGINT and `docker run`, do not select this behavior.
+Durable plans select the opt-in before dispatch; replay verifies exact mask
+union/restoration and launch ordering. The receipt explicitly describes parent
+thread inheritance, not observation of every child runtime thread.
+
+The bounded native experiment `.artifacts/queued-sigwinch-probe/evidence` uses
+Go 1.25.4 with cgo on this Mac: one owned signal becomes pending before Notify
+and one notification is observed afterward; the child exits zero and is reaped,
+and the parent mask is unchanged. This does not exhaustively observe subsequent
+duplicate delivery. Its five payloads / 7,131 bytes verify against manifest
+`4c8835470d7badfa4283a2af300724a55a569af10c0337eb539c359b2737565d`.
+The installed Docker wrapper was built with
+Go 1.25.5, so this experiment is not an exact-binary Docker proof. Actual owned
+Python PTY tests additionally prove queueing, `40×120`, termios restoration,
+spawn-failure restoration and bounded child cleanup on restoration failure.
+Fresh installed-Mac acceptance is still required.
+
+The reviewed launch change passes all 840 affected host tests in 60.802 seconds,
+including the image-helper foundation tests then present. Log:
+`.artifacts/container-queued-winch-host-1.log`, SHA-256
+`27fd0bca8612707810ea862e97d0c1166c845ddf8faae08bf654cf71bdbcbf39`.
+These host tests do not certify installed Docker behavior.

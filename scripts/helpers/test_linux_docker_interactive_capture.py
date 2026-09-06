@@ -20,6 +20,32 @@ def after(stream, marker):
     return {'stream': stream, 'marker': marker}
 
 
+QUEUED_CHILD = '''import os,signal,termios,tty,fcntl,struct
+assert signal.SIGWINCH in signal.pthread_sigmask(signal.SIG_BLOCK,set())
+original=termios.tcgetattr(0)
+notices=[]
+def resized(a,b): notices.append(a)
+signal.signal(signal.SIGWINCH,resized)
+try:
+ tty.setraw(0)
+ os.write(1,b'READY')
+ assert os.read(0,1)==b'u'
+ assert not notices and signal.SIGWINCH in signal.sigpending()
+ assert struct.unpack('HHHH',fcntl.ioctl(0,termios.TIOCGWINSZ,b'\\0'*8))[:2]==(40,120)
+ signal.pthread_sigmask(signal.SIG_UNBLOCK,{signal.SIGWINCH})
+ assert notices==[signal.SIGWINCH]
+ assert signal.SIGWINCH not in signal.sigpending()
+ os.write(1,b'QUEUED_ONCE')
+finally:termios.tcsetattr(0,termios.TCSANOW,original)
+'''
+
+
+def queued_plan():
+    return plan('pty', [
+        {'kind': 'resize', 'rows': 40, 'cols': 120, 'after': after('tty', b'READY')},
+        {'kind': 'write', 'data': b'u', 'after': after('tty', b'READY')}]) | {'defer_sigwinch': True}
+
+
 class Interactive(unittest.TestCase):
     def run_child(self, script, selected, env=None):
         with tempfile.TemporaryDirectory(prefix='vz-interactive-unit-') as root:
@@ -163,11 +189,72 @@ os.write(2,b'DONE')
                         [{'kind': 'write', 'data': b''}]):
             bad.append(plan(actions=actions))
         bad.append(plan('pty', [{'kind': 'close_stdin'}]))
+        bad.extend([plan() | {'defer_sigwinch': True}, plan('pty') | {'defer_sigwinch': True}])
+        bad.extend(queued_plan() | {'defer_sigwinch': value} for value in (False, 1, 'true', None))
         with patch.object(io.subprocess, 'Popen') as spawn:
             for p in bad:
                 with self.subTest(plan=p), self.assertRaises(io.CaptureError):
                     io.capture(['/fake'], executable='/fake', cwd='/tmp', env={}, plan=p)
             spawn.assert_not_called()
+
+    def test_deferred_sigwinch_real_child_queues_once_and_preserves_parent_mask(self):
+        original = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        try:
+            before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            result = self.run_child(QUEUED_CHILD, queued_plan())
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout, b'READYQUEUED_ONCE')
+            self.assertTrue(result.receipt['capture_complete'])
+            launch = result.receipt['deferred_sigwinch']
+            self.assertEqual(launch['before'], sorted(int(s) for s in before))
+            self.assertEqual(launch['child_inherited'], sorted(int(s) for s in before | {signal.SIGWINCH}))
+            self.assertEqual(launch['after'], launch['before'])
+            self.assertTrue(launch['restored'])
+            self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), before)
+            self.assertLessEqual(launch['completed']['monotonic_ns'],
+                                 result.receipt['actions'][0]['triggered']['monotonic_ns'])
+        finally:
+            signal.pthread_sigmask(signal.SIG_SETMASK, original)
+
+    def test_deferred_spawn_failure_restores_exact_parent_mask_without_signal(self):
+        before = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        with patch.object(io.subprocess, 'Popen', side_effect=OSError('not echoed')) as spawn, \
+             patch.object(io.os, 'killpg') as kill:
+            result = io.capture(['/fake'], executable='/fake', cwd='/tmp', env={}, plan=queued_plan())
+        self.assertEqual(result.receipt['error'], 'OSError')
+        self.assertEqual(signal.pthread_sigmask(signal.SIG_BLOCK, set()), before)
+        self.assertTrue(result.receipt['deferred_sigwinch']['restored'])
+        self.assertIsNone(result.pending_process)
+        self.assertNotIn('preexec_fn', spawn.call_args.kwargs)
+        kill.assert_not_called()
+
+    def test_deferred_restore_failure_preserves_child_handle_for_owned_reap(self):
+        real_mask = signal.pthread_sigmask
+        before = real_mask(signal.SIG_BLOCK, set())
+        def failing_restore(how, values):
+            if how == signal.SIG_SETMASK:
+                raise OSError('private restoration diagnostic')
+            return real_mask(how, values)
+        try:
+            with patch.object(io.signal, 'pthread_sigmask', side_effect=failing_restore):
+                result = self.run_child('import time;time.sleep(30)', queued_plan())
+            self.assertEqual(result.returncode, -signal.SIGKILL)
+            self.assertEqual(result.receipt['error'], 'OSError')
+            self.assertTrue(result.receipt['termination']['dispatched'])
+            self.assertTrue(result.receipt['owned_direct_child'])
+            self.assertTrue(result.receipt['owned_process_reaped'])
+            self.assertFalse(result.receipt['capture_complete'])
+            self.assertFalse(result.receipt['deferred_sigwinch']['restored'])
+            self.assertIsNone(result.receipt['deferred_sigwinch']['after'])
+            self.assertNotIn('private restoration diagnostic', json.dumps(result.receipt))
+        finally:
+            real_mask(signal.SIG_SETMASK, before)
+
+    def test_unselected_launch_never_changes_signal_mask_or_receipt(self):
+        with patch.object(io.signal, 'pthread_sigmask', side_effect=AssertionError('unplanned mask')):
+            result = self.run_child('print("ok")', plan('pty'))
+        self.assertTrue(result.receipt['capture_complete'])
+        self.assertNotIn('deferred_sigwinch', result.receipt)
 
     def test_reaped_nonzero_child_never_signaled(self):
         process = Mock(pid=123, returncode=37)

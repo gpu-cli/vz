@@ -6,6 +6,7 @@ particular a CLI signal receipt alone does not prove delivery to a container.
 import base64
 import hashlib
 import json
+import signal as host_signal
 
 MAX_BYTES = 4 * 1024 * 1024
 MAX_PLAN_BYTES = 8 * 1024 * 1024
@@ -75,7 +76,7 @@ def encode_plan(plan):
 
 def decode_plan(raw):
     plan = parse(raw)
-    require(type(plan) is dict and set(plan) == {'schema_version', 'mode', 'timeout_seconds',
+    require(type(plan) is dict and set(plan) - {'defer_sigwinch'} == {'schema_version', 'mode', 'timeout_seconds',
             'input_limit', 'output_limit', 'actions'}, 'plan fields differ')
     require(type(plan['schema_version']) is int and plan['schema_version'] == 1 and
             plan['mode'] in ('pipes', 'pty'), 'plan schema or mode differs')
@@ -111,6 +112,9 @@ def decode_plan(raw):
                     for k in ('rows', 'cols')), 'invalid resize')
         else:
             require(row['name'] in ('SIGINT', 'SIGTERM'), 'unapproved signal')
+    if 'defer_sigwinch' in plan:
+        require(plan['defer_sigwinch'] is True and plan['mode'] == 'pty' and
+                any(row['kind'] == 'resize' for row in plan['actions']), 'deferred SIGWINCH scope differs')
     return plan
 
 
@@ -161,9 +165,34 @@ def validate_capture(plan_raw, receipt, stdout, stderr, *, argv, executable, cwd
             'capture exceeds its deadline')
     require(start_wall <= end_wall and abs((end_wall - start_wall) - (end - start)) <= CLOCK_TOLERANCE_NS,
             'capture wall clock is incoherent with monotonic time')
+    launch_end, launch_wall = start, start_wall
+    if plan.get('defer_sigwinch') is True:
+        launch = receipt.get('deferred_sigwinch')
+        require(type(launch) is dict and set(launch) == {'signal', 'signal_number', 'scope',
+                'before', 'child_inherited', 'after', 'restored', 'started', 'spawn_started',
+                'spawn_completed', 'completed'} and launch['signal'] == 'SIGWINCH' and
+                type(launch['signal_number']) is int and launch['signal_number'] == int(host_signal.SIGWINCH) and
+                launch['scope'] == 'parent_thread_mask_inherited_at_exec_not_child_runtime_observation' and
+                launch['restored'] is True, 'deferred SIGWINCH launch differs')
+        for key in ('before', 'child_inherited', 'after'):
+            values = launch[key]
+            require(type(values) is list and len(values) <= 128 and
+                    all(type(value) is int and 0 < value < host_signal.NSIG for value in values) and
+                    values == sorted(set(values)), 'invalid launch signal mask')
+        require(launch['before'] == launch['after'] and launch['child_inherited'] ==
+                sorted(set(launch['before']) | {int(host_signal.SIGWINCH)}), 'launch signal mask union or restoration differs')
+        for key in ('started', 'spawn_started', 'spawn_completed', 'completed'):
+            current = timestamp(launch[key])
+            wall = launch[key]['unix_ns']
+            require(launch_end <= current <= end and launch_wall <= wall <= end_wall and
+                    abs((wall - start_wall) - (current - start)) <= CLOCK_TOLERANCE_NS,
+                    'launch signal mask timeline differs')
+            launch_end, launch_wall = current, wall
+    else:
+        require('deferred_sigwinch' not in receipt, 'unplanned deferred SIGWINCH launch')
     actions = receipt.get('actions')
     require(type(actions) is list and len(actions) == len(plan['actions']), 'missing or extra actions')
-    previous, previous_wall, eof, counts = start, start_wall, 0, {k: 0 for k in outputs}
+    previous, previous_wall, eof, counts = launch_end, launch_wall, 0, {k: 0 for k in outputs}
     for index, (planned, actual) in enumerate(zip(plan['actions'], actions)):
         require(actual.get('index') == index and type(actual.get('index')) is int and
                 actual.get('kind') == planned['kind'] and actual.get('complete') is True,

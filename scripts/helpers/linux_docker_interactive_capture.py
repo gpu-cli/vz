@@ -5,6 +5,7 @@ Only a newly allocated terminal is touched. The supplied environment is complete
 Invalid plans raise before spawn; dispatched failures return uncertain receipts.
 """
 import copy
+from contextlib import contextmanager
 from dataclasses import dataclass
 import errno
 import fcntl
@@ -41,7 +42,7 @@ def stamp():
 
 
 def validate_plan(plan):
-    require(type(plan) is dict and set(plan) == {
+    require(type(plan) is dict and set(plan) - {'defer_sigwinch'} == {
         'schema_version', 'mode', 'timeout_seconds', 'input_limit', 'output_limit', 'actions'}, 'plan_fields')
     require(type(plan['schema_version']) is int and plan['schema_version'] == 1, 'plan_schema')
     require(plan['mode'] in ('pipes', 'pty'), 'plan_mode')
@@ -75,7 +76,47 @@ def validate_plan(plan):
                     for k in ('rows', 'cols')), 'resize_dimensions')
         else:
             require(action['name'] in ('SIGINT', 'SIGTERM'), 'signal_not_allowed')
+    if 'defer_sigwinch' in plan:
+        require(plan['defer_sigwinch'] is True and plan['mode'] == 'pty' and
+                any(action['kind'] == 'resize' for action in plan['actions']), 'defer_sigwinch_scope')
     return copy.deepcopy(plan)
+
+
+@contextmanager
+def deferred_sigwinch_launch(receipt):
+    """Queue early WINCH for an explicitly selected child's later subscription.
+
+    Only the calling thread is masked, only across Popen; no preexec_fn runs.
+    Go preserves inherited WINCH blocking until Notify enables it. This is not
+    proof that an arbitrary client wrapper has no earlier signal subscriber.
+    The caller must assign its child handle *inside* this context so even a
+    failed parent-mask restoration leaves that child available for cleanup.
+    """
+    observation = {'signal': 'SIGWINCH', 'signal_number': int(signal.SIGWINCH),
+        'scope': 'parent_thread_mask_inherited_at_exec_not_child_runtime_observation',
+        'before': None, 'child_inherited': None, 'after': None, 'restored': False,
+        'started': stamp(), 'spawn_started': None, 'spawn_completed': None, 'completed': None}
+    receipt['deferred_sigwinch'] = observation
+    previous = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGWINCH})
+    try:
+        observation['before'] = sorted(int(value) for value in previous)
+        inherited = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+        observation['child_inherited'] = sorted(int(value) for value in inherited)
+        require(inherited == previous | {signal.SIGWINCH}, 'deferred_sigwinch_mask_differs')
+        observation['spawn_started'] = stamp()
+        try:
+            yield
+        finally:
+            observation['spawn_completed'] = stamp()
+    finally:
+        try:
+            signal.pthread_sigmask(signal.SIG_SETMASK, previous)
+            restored = signal.pthread_sigmask(signal.SIG_BLOCK, set())
+            observation['after'] = sorted(int(value) for value in restored)
+            require(restored == previous, 'deferred_sigwinch_parent_not_restored')
+            observation['restored'] = True
+        finally:
+            observation['completed'] = stamp()
 
 
 def signal_owned(process, owned_pid, number):
@@ -147,9 +188,17 @@ def capture(argv, *, executable, cwd, env, plan, progress_observer=None):
                 'client_restored_attributes': False, 'restored_verified': False,
                 'repaired_by_harness': False}
             fcntl.ioctl(master, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
-            process = subprocess.Popen(argv, executable=executable, cwd=cwd, env=dict(env),
-                stdin=slave, stdout=slave, stderr=slave, start_new_session=True, close_fds=True)
-            owned_pid = process.pid
+            if plan.get('defer_sigwinch') is True:
+                with deferred_sigwinch_launch(receipt):
+                    process = subprocess.Popen(argv, executable=executable, cwd=cwd, env=dict(env),
+                        stdin=slave, stdout=slave, stderr=slave, start_new_session=True, close_fds=True)
+                    owned_pid = process.pid
+                    receipt.update(pid=owned_pid, process_group=owned_pid, session_id=owned_pid,
+                                   owned_direct_child=True)
+            else:
+                process = subprocess.Popen(argv, executable=executable, cwd=cwd, env=dict(env),
+                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True, close_fds=True)
+                owned_pid = process.pid
             os.close(slave); slave = None
             input_fd = master
             os.set_blocking(master, False)

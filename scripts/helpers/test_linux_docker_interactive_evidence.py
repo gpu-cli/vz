@@ -9,6 +9,7 @@ import unittest
 
 import linux_docker_interactive_capture as capture
 import linux_docker_interactive_evidence as evidence
+from test_linux_docker_interactive_capture import QUEUED_CHILD, queued_plan
 
 
 class Evidence(unittest.TestCase):
@@ -52,6 +53,15 @@ os.write(2,b'DONE')
                 raise AssertionError('finite capture failed: ' + str(result.receipt['error']))
             cls.fixtures[mode] = {'plan_raw': evidence.encode_plan(plan), 'receipt': result.receipt,
                 'stdout': result.stdout, 'stderr': result.stderr, **arguments, 'expected_exit': expected}
+        arguments = {'argv': [sys.executable, '-c', QUEUED_CHILD], 'executable': sys.executable,
+                     'cwd': cls.temporary.name, 'env': {'PATH': '/usr/bin:/bin'}}
+        result = capture.capture(**arguments, plan=queued_plan())
+        if result.pending_process is not None:
+            result.pending_process.wait(timeout=3)
+        if not result.receipt['capture_complete']:
+            raise AssertionError('deferred capture failed: ' + str(result.receipt['error']))
+        cls.fixtures['deferred'] = {'plan_raw': evidence.encode_plan(queued_plan()), 'receipt': result.receipt,
+            'stdout': result.stdout, 'stderr': result.stderr, **arguments, 'expected_exit': 0}
 
     def fixture(self, mode='pipes'):
         return copy.deepcopy(self.fixtures[mode])
@@ -81,6 +91,56 @@ os.write(2,b'DONE')
         self.assertEqual(row['stderr'], b'')
         self.assertEqual(proof['mode'], 'pty')
         self.assertTrue(row['receipt']['terminal']['client_restored_attributes'])
+
+    def test_deferred_real_capture_replays_mask_union_and_launch_timing(self):
+        row = self.fixture('deferred')
+        self.assertEqual(self.verify(row)['exit_code'], 0)
+        self.assertEqual(row['stdout'], b'READYQUEUED_ONCE')
+        self.assertEqual(evidence.encode_plan(evidence.decode_plan(row['plan_raw'])), row['plan_raw'])
+
+    def test_deferred_mask_missing_foreign_unrestored_or_malformed_rejected(self):
+        for mutation in ('missing', 'extra', 'signal', 'bool-signal', 'scope', 'unrestored',
+                         'no-winch', 'extra-signal', 'after', 'duplicate', 'bool-mask', 'out-of-range'):
+            row = self.fixture('deferred'); launch = row['receipt']['deferred_sigwinch']
+            if mutation == 'missing': del row['receipt']['deferred_sigwinch']
+            elif mutation == 'extra': launch['extra'] = True
+            elif mutation == 'signal': launch['signal'] = 'SIGINT'
+            elif mutation == 'bool-signal': launch['signal_number'] = True
+            elif mutation == 'scope': launch['scope'] = 'all_parent_threads'
+            elif mutation == 'unrestored': launch['restored'] = False
+            elif mutation == 'no-winch': launch['child_inherited'].remove(int(signal.SIGWINCH))
+            elif mutation == 'extra-signal':
+                launch['child_inherited'] = sorted(set(launch['child_inherited']) | {int(signal.SIGUSR2)})
+            elif mutation == 'after': launch['after'] = launch['child_inherited']
+            elif mutation == 'duplicate': launch['child_inherited'] *= 2
+            elif mutation == 'bool-mask': launch['before'] = [True]
+            else: launch['before'] = [signal.NSIG]
+            with self.subTest(mutation=mutation): self.reject(row)
+
+    def test_deferred_launch_time_outside_capture_or_after_first_action_rejected(self):
+        for mutation in ('before', 'after', 'reversed', 'wall-drift', 'late-restore'):
+            row = self.fixture('deferred'); receipt = row['receipt']; launch = receipt['deferred_sigwinch']
+            if mutation == 'before': launch['started']['monotonic_ns'] = receipt['started']['monotonic_ns'] - 1
+            elif mutation == 'after': launch['completed']['monotonic_ns'] = receipt['completed']['monotonic_ns'] + 1
+            elif mutation == 'reversed':
+                launch['spawn_completed']['monotonic_ns'] = launch['spawn_started']['monotonic_ns'] - 1
+            elif mutation == 'wall-drift': launch['spawn_started']['unix_ns'] += 2 * evidence.CLOCK_TOLERANCE_NS
+            else:
+                launch['completed'] = dict(receipt['actions'][0]['triggered'])
+                launch['completed']['monotonic_ns'] += 1
+            with self.subTest(mutation=mutation): self.reject(row)
+
+    def test_deferred_plan_scope_and_receipt_cannot_be_silently_added_or_removed(self):
+        row = self.fixture('pty')
+        row['receipt']['deferred_sigwinch'] = self.fixture('deferred')['receipt']['deferred_sigwinch']
+        self.reject(row)
+        row = self.fixture('deferred'); plan = evidence.decode_plan(row['plan_raw'])
+        del plan['defer_sigwinch']; row['plan_raw'] = evidence.encode_plan(plan)
+        self.reject(row)
+        for selected in (evidence.decode_plan(self.fixture()['plan_raw']) | {'defer_sigwinch': True},
+                         queued_plan() | {'actions': []},
+                         *(queued_plan() | {'defer_sigwinch': value} for value in (False, 1, None, 'true'))):
+            with self.subTest(plan=selected), self.assertRaises(ValueError): evidence.encode_plan(selected)
 
     def test_raw_output_digest_and_stream_exchange_rejected(self):
         for mutation in ('stdout', 'stderr', 'digest', 'size', 'stream-swap'):
