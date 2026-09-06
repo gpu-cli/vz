@@ -150,6 +150,12 @@ def run_ack(raw, error, token, case, code):
             and error == b"", "missing exact payload marker/acknowledged exit or unexpected runtime error")
 
 
+def has_keep_patch(raw):
+    """The hash-bound runtime may carry additional source patches after keep."""
+    commits = re.findall(rb"^commit: ([^\r\n]+)$", raw, re.MULTILINE)
+    return len(commits) == 1 and b"vz-run-keep-v1" in commits[0].split(b"+")[1:]
+
+
 WORKER_LOG = "/var/lib/buildkit/runc-overlayfs/executor/runc-log.json"
 WORKER_LOG_SCRIPT = '''set -eu
 set -o pipefail
@@ -245,7 +251,7 @@ def run(builder):
 
     binaries("runtime-before")
     raw, error, _ = guarded("version", ["exec", cid, "/usr/bin/youki", "--version"])
-    require(not error and b"+vz-run-keep-v1\n" in raw, "runtime lacks source-pinned keep correction")
+    require(not error and has_keep_patch(raw), "runtime lacks source-pinned keep correction")
     history_script = 'if test -f /var/lib/buildkit/vz-youki-invocations.log; then /bin/busybox head -c 32769 /var/lib/buildkit/vz-youki-invocations.log; fi'
     history, error, _ = guarded("wrapper-before", ["exec", cid, "/bin/busybox", "sh", "-c", history_script])
     require(not error and len(history) <= LIMIT, "unbounded wrapper history")

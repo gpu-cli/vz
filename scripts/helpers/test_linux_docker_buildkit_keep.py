@@ -35,6 +35,16 @@ def frame(values):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_keep_marker_is_a_commit_component_not_necessarily_last(self):
+        prefix = b"youki version: 0.7.0\ncommit: 0.7.0-pinned"
+        for suffix in (b"+vz-run-keep-v1", b"+vz-run-keep-v1+vz-foreground-wait-v1"):
+            self.assertTrue(keep.has_keep_patch(prefix + suffix + b"\nspec: 1.1.0\n"))
+        for raw in (prefix + b"+vz-run-keep-v10\n", prefix + b"+not-vz-run-keep-v1\n",
+                    b"spec: +vz-run-keep-v1\n", prefix + b"\n+vz-run-keep-v1\n",
+                    prefix + b"+vz-run-keep-v1\ncommit: different\n"):
+            with self.subTest(raw=raw):
+                self.assertFalse(keep.has_keep_patch(raw))
+
     def test_deterministic_scoped_bundle(self):
         data = keep.bundle(TOKEN)
         self.assertEqual(data, keep.bundle(TOKEN))
