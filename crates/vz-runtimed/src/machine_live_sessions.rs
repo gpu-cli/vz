@@ -5,6 +5,9 @@
 //! Missing registrations after restart are uncertain, never `AlreadyAbsent`.
 //! This trusted controller API does not authorize RPCs or acknowledge journals.
 
+mod failed_up;
+use failed_up::{FailedUpRuntime, require_session_identity};
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
@@ -72,6 +75,7 @@ struct Session {
     owner: ResourceOwner,
     identity: StackRuntimeIdentity,
     configuration_digest: String,
+    failed_up: Mutex<Option<FailedUpRuntime>>,
     original_entry: Weak<MachineRuntimeEntry<MacosRuntimeBackend>>,
     resources: Mutex<Option<LiveResources>>,
     // Keep the original Runtime/store lock even after a failed or cancelled
@@ -115,6 +119,8 @@ enum DeleteAbsenceAuthority {
 enum DeleteQuiescenceAuthority {
     Drained {
         runtime_identity: StackRuntimeIdentity,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        failed_up: Option<FailedUpRuntime>,
         endpoint: Option<DeleteEndpointProof>,
         outcome: StackRuntimeShutdownOutcome,
     },
@@ -337,18 +343,7 @@ impl MachineLiveSessions {
                 .iter()
                 .find(|row| &row.machine_id == machine_id)
                 .ok_or_else(|| error("Delete preflight Machine absent"))?;
-            if let Some(identity) = &machine.runtime_identity {
-                if serde_json::from_str::<StackRuntimeIdentity>(&identity.opaque_id)
-                    .map_err(error)?
-                    != session.identity
-                {
-                    return Err(error(
-                        "Delete preflight runtime identity differs from original session",
-                    ));
-                }
-            } else if machine.incarnation.is_some() {
-                return Err(error("Delete preflight runtime identity missing"));
-            }
+            require_session_identity(state, machine, session)?;
             return Ok(None);
         }
         let machine = environment
@@ -550,6 +545,7 @@ impl MachineLiveSessions {
                     operation: operation.clone(),
                     authority: DeleteQuiescenceAuthority::Drained {
                         runtime_identity: receipt.runtime_identity,
+                        failed_up: session.failed_up.lock().map_err(error)?.clone(),
                         endpoint,
                         outcome: receipt.outcome,
                     },
@@ -560,7 +556,14 @@ impl MachineLiveSessions {
             require_acknowledged_delete(&environment, operation, machine_id)?;
             let proof: DeleteQuiescenceEvidence =
                 serde_json::from_value(raw.clone()).map_err(error)?;
-            validate_quiescence_evidence(&proof, claim, operation, &environment, machine_id)?;
+            validate_quiescence_evidence(
+                state,
+                &proof,
+                claim,
+                operation,
+                &environment,
+                machine_id,
+            )?;
             (proof, None)
         } else if let Some(absence) = absence {
             if !Arc::ptr_eq(&absence.controller, lease.controller_identity())
@@ -638,7 +641,7 @@ impl MachineLiveSessions {
                 None,
             )
         };
-        validate_quiescence_evidence(&proof, claim, operation, &environment, machine_id)?;
+        validate_quiescence_evidence(state, &proof, claim, operation, &environment, machine_id)?;
         let evidence = serde_json::to_value(&proof).map_err(error)?;
         let original_entry = original_entry.or_else(|| {
             sessions
@@ -995,17 +998,7 @@ impl MachineLiveSessions {
                 .as_ref()
                 .ok_or_else(|| error("Machine live resources are absent"))?;
             resources.entry.validate_current().map_err(error)?;
-            if let Some(persisted) = &machine.runtime_identity {
-                let identity: StackRuntimeIdentity =
-                    serde_json::from_str(&persisted.opaque_id).map_err(error)?;
-                if identity != session.identity {
-                    return Err(error(
-                        "persisted Machine activation differs from registered runtime",
-                    ));
-                }
-            } else if machine.incarnation.is_some() {
-                return Err(error("persisted incarnation has no exact runtime identity"));
-            }
+            failed_up::preflight_session_identity(machine, session)?;
         }
         Ok(())
     }
@@ -1056,6 +1049,7 @@ impl MachineLiveSessions {
                 owner,
                 identity,
                 configuration_digest,
+                failed_up: Mutex::new(None),
                 original_entry,
                 resources: Mutex::new(Some(resources)),
                 retained_entry: Mutex::new(Some(retained_entry)),
@@ -1063,6 +1057,38 @@ impl MachineLiveSessions {
                 executions: Arc::new(MachineExecutionActivities::default()),
             }),
         );
+        Ok(())
+    }
+
+    /// Bind a failed Up journal to its original registered boot for cleanup.
+    /// This grants no execution/Ready evidence and cannot adopt another Runtime.
+    pub(crate) fn record_failed_up<S: EnvironmentStateStore>(
+        &self,
+        lease: &EnvironmentControllerLease,
+        state: &S,
+        operation: &EnvironmentLifecycleOperation,
+        machine: &vz_runtime_contract::MachineInstance,
+    ) -> Result<(), MachineLiveSessionError> {
+        let mut sessions = self.sessions.lock().map_err(error)?;
+        require_controller(&mut sessions.controller, lease.controller_identity())?;
+        let Some(session) = sessions.machines.get(&machine.machine_id) else {
+            return Ok(());
+        };
+        lease.require_owner(&session.owner).map_err(error)?;
+        let resources = session.resources.lock().map_err(error)?;
+        let Some(resources) = resources.as_ref() else {
+            return Ok(());
+        };
+        resources.entry.validate_current().map_err(error)?;
+        let actual = state
+            .access(|store| store.load_environment_lifecycle(operation.operation_id.as_str()))
+            .map_err(error)?
+            .ok_or_else(|| error("failed Up journal missing"))?;
+        if &actual != operation || resources.activation.runtime_identity() != &session.identity {
+            return Err(error("failed Up cleanup original authority changed"));
+        }
+        *session.failed_up.lock().map_err(error)? =
+            Some(FailedUpRuntime::capture(operation, machine, session)?);
         Ok(())
     }
 
@@ -1193,17 +1219,7 @@ impl MachineLiveSessions {
                     .iter()
                     .find(|machine| &machine.machine_id == machine_id)
                     .ok_or_else(|| error("Machine disappeared from fenced Environment"))?;
-                if let Some(persisted) = &machine.runtime_identity {
-                    let exact: StackRuntimeIdentity =
-                        serde_json::from_str(&persisted.opaque_id).map_err(error)?;
-                    if exact != session.identity {
-                        return Err(error(
-                            "persisted Machine activation differs from registered runtime",
-                        ));
-                    }
-                } else if machine.incarnation.is_some() {
-                    return Err(error("persisted incarnation has no exact runtime identity"));
-                }
+                require_session_identity(state, machine, &session)?;
                 // Failed Up may have an owned, registered boot that never
                 // advertised Ready. Its registration still proves the exact
                 // original runtime; absent persisted evidence never authorizes
@@ -1421,7 +1437,8 @@ fn require_delete_store_fence<S: EnvironmentStateStore>(
     Ok(())
 }
 
-fn validate_quiescence_evidence(
+fn validate_quiescence_evidence<S: EnvironmentStateStore>(
+    state: &S,
     proof: &DeleteQuiescenceEvidence,
     claim: &MachineStoreDeletePreflight,
     operation: &EnvironmentLifecycleOperation,
@@ -1443,6 +1460,7 @@ fn validate_quiescence_evidence(
     match &proof.authority {
         DeleteQuiescenceAuthority::Drained {
             runtime_identity,
+            failed_up,
             endpoint,
             outcome,
         } => {
@@ -1451,16 +1469,7 @@ fn validate_quiescence_evidence(
                 .iter()
                 .find(|row| &row.machine_id == machine)
                 .ok_or_else(|| error("Delete Machine absent"))?;
-            if let Some(identity) = &current.runtime_identity {
-                if serde_json::from_str::<StackRuntimeIdentity>(&identity.opaque_id)
-                    .map_err(error)?
-                    != *runtime_identity
-                {
-                    return Err(error("Delete quiescence runtime changed"));
-                }
-            } else if current.incarnation.is_some() {
-                return Err(error("Delete runtime identity missing"));
-            }
+            failed_up::require_identity(state, current, runtime_identity, failed_up.as_ref())?;
             let reservation =
                 MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(&proof.owner)
                     .map_err(error)?;
@@ -1583,19 +1592,7 @@ fn require_delete_fence<S: EnvironmentStateStore>(
     if machine.incarnation != step.expected_incarnation {
         return Err(error("Delete expected incarnation changed"));
     }
-    if let Some(persisted) = &machine.runtime_identity {
-        let identity: StackRuntimeIdentity =
-            serde_json::from_str(&persisted.opaque_id).map_err(error)?;
-        if identity != session.identity {
-            return Err(error(
-                "Delete runtime identity differs from exact live owner",
-            ));
-        }
-    } else if machine.incarnation.is_some() {
-        return Err(error(
-            "Delete incarnation has no persisted runtime identity",
-        ));
-    }
+    require_session_identity(state, machine, session)?;
     Ok(())
 }
 
@@ -2589,6 +2586,190 @@ mod tests {
         assert!(successful_replay(&attempt, Some(&progressed), machine));
     }
 
+    #[test]
+    fn failed_restart_cleanup_requires_exact_journal_and_original_binding() {
+        use vz_runtime_contract::{
+            CapabilitySet, LifecycleStepResult, MachineActivationEvidence, MachineBackend,
+            MachineCapability, MachineIncarnation, MachineIncarnationId,
+            MachineLifecycleStepAcknowledgement, MachineRuntimeIdentity,
+        };
+        let (_root, state, registry, first, owner) = recovery_fixture(true);
+        let machine_id = owner.machine_id.as_ref().unwrap();
+        let vm = MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(&owner)
+            .unwrap()
+            .resource_id;
+        let old = StackRuntimeIdentity::new(vm.clone()).unwrap();
+        let next = StackRuntimeIdentity::new(vm).unwrap();
+        let incarnation = MachineIncarnation {
+            schema_version: 1,
+            incarnation_id: MachineIncarnationId::generate(),
+            machine_id: machine_id.clone(),
+            generation: 1,
+            created_at: 3,
+        };
+        let mut latest = first;
+        for phase in 0..3 {
+            if phase != 0 {
+                latest = state
+                    .begin_environment_lifecycle(
+                        owner.environment_id.as_str(),
+                        if phase == 1 {
+                            EnvironmentLifecycleKind::Stop
+                        } else {
+                            EnvironmentLifecycleKind::Up
+                        },
+                        &format!("request-{phase}"),
+                        &format!("key-{phase}"),
+                        &format!("hash-{phase}"),
+                        3 + phase * 3,
+                    )
+                    .unwrap();
+            }
+            let step = latest.machine_steps[0].clone();
+            latest = state
+                .acknowledge_environment_machine_step(
+                    &MachineLifecycleStepAcknowledgement {
+                        operation_id: latest.operation_id.clone(),
+                        generation: latest.generation,
+                        machine_id: machine_id.clone(),
+                        initial_state: step.initial_state,
+                        target_state: step.target_state,
+                        expected_incarnation: step.expected_incarnation,
+                        resulting_incarnation: (phase == 0).then(|| incarnation.clone()),
+                        resulting_activation: (phase == 0).then(|| MachineActivationEvidence {
+                            schema_version: 1,
+                            backend: MachineBackend::MacosVirtualizationLinux,
+                            incarnation: incarnation.clone(),
+                            negotiated_capabilities: CapabilitySet::new([
+                                MachineCapability::PosixExec,
+                            ]),
+                            docker_context: None,
+                            runtime_identity: MachineRuntimeIdentity {
+                                schema_version: 1,
+                                opaque_id: serde_json::to_string(&old).unwrap(),
+                            },
+                        }),
+                        result: if phase == 2 {
+                            LifecycleStepResult::Failed {
+                                reason: "toolchain mismatch".into(),
+                            }
+                        } else {
+                            LifecycleStepResult::Succeeded
+                        },
+                    },
+                    4 + phase * 3,
+                )
+                .unwrap();
+            if phase < 2 {
+                state
+                    .finish_environment_lifecycle(
+                        latest.operation_id.as_str(),
+                        latest.generation,
+                        5 + phase * 3,
+                    )
+                    .unwrap();
+            }
+        }
+        let machine = load_delete_environment(&state, &owner)
+            .unwrap()
+            .machines
+            .remove(0);
+        assert_eq!(machine.incarnation, Some(incarnation));
+        let session = passive(owner.clone(), next.clone());
+        assert!(require_session_identity(&state, &machine, &session).is_err());
+        let proof = FailedUpRuntime::capture(&latest, &machine, &session).unwrap();
+        assert!(
+            proof.require(&state, &machine, &next).is_err(),
+            "unfinished journal cannot authorize teardown"
+        );
+        state
+            .finish_environment_lifecycle(latest.operation_id.as_str(), latest.generation, 12)
+            .unwrap();
+        proof.require(&state, &machine, &next).unwrap();
+        *session.failed_up.lock().unwrap() = Some(proof.clone());
+        require_session_identity(&state, &machine, &session).unwrap();
+        failed_up::preflight_session_identity(&machine, &session).unwrap();
+        let raw = serde_json::to_value(&proof).unwrap();
+        for field in [
+            "generation",
+            "operation_id",
+            "owner",
+            "previous_incarnation",
+            "previous_runtime_identity",
+            "runtime_identity",
+        ] {
+            let mut changed = raw.clone();
+            match field {
+                "generation" => changed[field] = serde_json::json!(999),
+                "operation_id" => changed[field] = serde_json::json!("lop_missing"),
+                "owner" => changed[field]["project_id"] = serde_json::json!(ProjectId::generate()),
+                "previous_incarnation" => changed[field]["generation"] = serde_json::json!(999),
+                "previous_runtime_identity" => {
+                    changed[field]["opaque_id"] = serde_json::json!("foreign")
+                }
+                "runtime_identity" => changed[field] = serde_json::to_value(&old).unwrap(),
+                _ => unreachable!(),
+            }
+            let changed: FailedUpRuntime = serde_json::from_value(changed).unwrap();
+            assert!(
+                changed.require(&state, &machine, &next).is_err(),
+                "accepted changed {field}"
+            );
+        }
+        let delete = state
+            .begin_environment_lifecycle(
+                owner.environment_id.as_str(),
+                EnvironmentLifecycleKind::Delete,
+                "delete-request",
+                "delete-key",
+                "delete-hash",
+                13,
+            )
+            .unwrap();
+        let environment = load_delete_environment(&state, &owner).unwrap();
+        let claim = registry
+            .preflight_delete(
+                &owner,
+                &MachineRuntimeRegistry::<MacosRuntimeBackend>::reservation(&owner).unwrap(),
+            )
+            .unwrap();
+        let mut drained = DeleteQuiescenceEvidence {
+            schema_version: 1,
+            owner,
+            configuration_digest: claim.configuration_digest().into(),
+            operation: delete.clone(),
+            authority: DeleteQuiescenceAuthority::Drained {
+                runtime_identity: next,
+                failed_up: Some(proof),
+                endpoint: None,
+                outcome: StackRuntimeShutdownOutcome::Stopped,
+            },
+        };
+        validate_quiescence_evidence(
+            &state,
+            &drained,
+            &claim,
+            &delete,
+            &environment,
+            &machine.machine_id,
+        )
+        .unwrap();
+        if let DeleteQuiescenceAuthority::Drained { failed_up, .. } = &mut drained.authority {
+            *failed_up = None;
+        }
+        assert!(
+            validate_quiescence_evidence(
+                &state,
+                &drained,
+                &claim,
+                &delete,
+                &environment,
+                &machine.machine_id
+            )
+            .is_err()
+        );
+    }
+
     // A passive record exercises the same admission decision as production,
     // without manufacturing an activation or claiming a physical VM test.
     fn passive(owner: ResourceOwner, identity: StackRuntimeIdentity) -> Arc<Session> {
@@ -2596,6 +2777,7 @@ mod tests {
             owner,
             identity,
             configuration_digest: "sha256:passive-test".into(),
+            failed_up: Mutex::new(None),
             original_entry: Weak::new(),
             resources: Mutex::new(None),
             retained_entry: Mutex::new(None),

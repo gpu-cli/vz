@@ -306,8 +306,17 @@ def main():
             run("second-stop", [binary_dir / "vz", "stop", "--environment", "native-second",
                                 "--timeout", "120"], timeout=150)
             run("altered-toolchain-up", [binary_dir / "vz", "up", "--environment", "native-second",
-                                         "--timeout", "120"], timeout=150, expected=2)
-            assert "native toolchain receipt SHA-256 mismatch" in (evidence / "altered-toolchain-up.stderr").read_text()
+                                         "--timeout", "120"], timeout=150, expected=5)
+            rejection = json.loads((evidence / "altered-toolchain-up.stderr").read_text())["error"]
+            assert rejection["code"] == "backend_unavailable"
+            assert rejection["message"] == "native toolchain receipt SHA-256 mismatch"
+            run("altered-toolchain-stop", [binary_dir / "vz", "stop", "--environment", "native-second",
+                                           "--timeout", "120"], timeout=150)
+            run("altered-toolchain-up-again", [binary_dir / "vz", "up", "--environment", "native-second",
+                                               "--timeout", "120"], timeout=150, expected=5)
+            rejection = json.loads((evidence / "altered-toolchain-up-again.stderr").read_text())["error"]
+            assert rejection["code"] == "backend_unavailable"
+            assert rejection["message"] == "native toolchain receipt SHA-256 mismatch"
         run("second-delete", [binary_dir / "vz", "delete", "--environment", "native-second",
                               "--timeout", "120"], timeout=150)
         assert cli("first-survives", "exec", "--no-stdin", "--", "/bin/cat",

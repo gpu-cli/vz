@@ -316,6 +316,7 @@ impl RuntimeDaemon {
                     (None, LifecycleStepResult::Failed { reason })
                 }
             };
+            let readiness_failed = matches!(&result, LifecycleStepResult::Failed { .. });
             operation = self
                 .with_state_store(|store| {
                     store.acknowledge_environment_machine_step(
@@ -338,6 +339,11 @@ impl RuntimeDaemon {
                     )
                 })
                 .map_err(state_error)?;
+            if readiness_failed {
+                self.machine_live_sessions
+                    .record_failed_up(prepared.lease(), &self.state_store, &operation, machine)
+                    .map_err(|error| backend_error(error.to_string()))?;
+            }
             run.publish("machine_acknowledged", Some(operation.clone()), None);
             if uncertain {
                 break;

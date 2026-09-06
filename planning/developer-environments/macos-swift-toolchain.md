@@ -66,10 +66,28 @@ the previous incarnation remains the expected fence. The unaffected Environment
 was positively deleted; the failed daemon was terminated and its disposable
 images retired. That run is not qualification evidence.
 
-The fix passes 1,605 runtime/contract/state tests (31 existing skipped tests),
-strict production Clippy, and installed Linux Hardened lifecycle/persistence
-(`linux-swift-regression-1`). The rebuilt `installed-release-xcode-2` is running
-from a fresh empty cache in `installed-xcode-candidate-2`.
+The next fresh run (`installed-xcode-candidate-2`) passed Swift and persistence
+and returned the exact mismatch diagnostic. The harness was corrected to expect
+the established `backend_unavailable` exit code 5. Delete then exposed a second
+failure: the durable identity described the previous successful boot, while the
+daemon held the new, unready boot. That run also required diagnostic retirement
+and is not qualification evidence.
+
+Cleanup now retains a sealed record of the failed Up journal, prior persisted
+incarnation/runtime identity, and exact registered VM identity. Stop/Delete
+validate that binding and the terminal failed journal before draining the
+original session. Positive Delete quiescence retains the same record for retries.
+This does not publish Ready or adopt a replacement Runtime. A regression test
+checks the real state-journal sequence and rejects changed operation, owner,
+incarnation, runtime and quiescence evidence.
+
+The complete fix passes 1,606 runtime/contract/state tests (31 existing skipped
+tests) and strict production Clippy. An initial suite attempt hit a legacy
+concurrent sandbox-create failure; the complete rerun passed. The final
+`installed-release-xcode-3` is under fresh native validation in
+`installed-xcode-candidate-3`, with Linux regression in `linux-swift-regression-2`.
+The native negative gate now requires both Stop after failed readiness and direct
+Delete after a second rejected restart.
 
 ## Receipt and installation contract
 
