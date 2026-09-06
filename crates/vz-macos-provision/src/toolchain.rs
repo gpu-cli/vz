@@ -180,8 +180,10 @@ impl ToolchainManifest {
         let mut script = format!("set -eu; export DEVELOPER_DIR='{developer}'; ");
         let mut expected = String::new();
         for (path, hash) in &self.files {
-            script.push_str(&format!("/usr/bin/shasum -a 256 '{developer}/{path}'; "));
-            expected.push_str(&format!("{hash}  {developer}/{path}\n"));
+            script.push_str(&format!(
+                "/usr/bin/openssl dgst -sha256 -r '{developer}/{path}'; "
+            ));
+            expected.push_str(&format!("{hash} *{developer}/{path}\n"));
         }
         script.push_str("/usr/bin/xcrun --find swift; /usr/bin/xcrun swift --version 2>&1; /usr/bin/xcrun --sdk macosx --show-sdk-version");
         expected.push_str(&format!(
