@@ -89,8 +89,8 @@ pins bind tmux, Python, Docker and the helper sources. Independent raw replay
 requires the ready/resize/done records, pane exit 37, normal server exit/reap,
 socket retirement and no fallback. Ten source-selected Machine/service guard
 commands bracket the separate terminal ledger; unresolved children prevent
-cleanup. The terminal-testing skill informed these interaction and exit-state
-checks. This integration still needs its physical Docker run.
+cleanup. Its first-Machine physical results are recorded below; the full
+three-Machine workload remains unverified.
 
 The physical run must still establish these assertions. Numeric fixture exits
 alone cannot prove signal handling. Require three tested Machines, four continuous sentinels,
@@ -162,8 +162,8 @@ Its 500 payloads / 575,289 bytes are in
 The separately retained failed-container inspect shows `ConsoleSize: [24, 80]`,
 TTY enabled, and stopped exit 70 / PID 0. Although Docker starts its resize
 monitor after container start, it also sends the initial console size at create
-time ([run source](https://raw.githubusercontent.com/docker/cli/v29.7.2/cli/command/container/run.go),
-[create source](https://raw.githubusercontent.com/docker/cli/v29.7.2/cli/command/container/create.go)).
+time ([run source](https://raw.githubusercontent.com/docker/cli/v29.4.0/cli/command/container/run.go),
+[create source](https://raw.githubusercontent.com/docker/cli/v29.4.0/cli/command/container/create.go)).
 The pinned youki source provides a concrete defect to investigate:
 [`setup_console`](https://github.com/youki-dev/youki/blob/94ba653efbb180ce04650f6ae01a8e6bc8f96d92/crates/libcontainer/src/tty.rs#L286)
 calls `openpty(None, None)` without the OCI console dimensions. Both init and
@@ -283,4 +283,45 @@ closure, and a source-bound negative-exit acknowledgement. The invalid self-kill
 fixture is removed from the workload; the frozen probe itself is unchanged.
 All 105 container-focused tests and 690 affected Docker/host/startup regressions
 pass; the latter output is `.artifacts/container-kill-host-regression-1.log`.
-Physical verification of this revised observer is still required.
+These unit results alone do not establish physical acceptance; the next section
+records the first installed attempt with this revised observer.
+
+## Candidate 4: signal propagation proved, error classification still failing
+
+Source `c36c4bbc` passed the revised attached-run phase on the first Machine.
+Independent replay binds the five-command observer ledger to original main
+command 139's exact-CID KILL and timestamp, with both ready streams observed
+before that command. The attached client, wait result and same-generation
+container inspection all report 137; its observer is reaped/joined and the
+negative result is acknowledged only after semantic validation.
+
+The candidate then failed at command 145: `/fixture/not-executable` returned
+host CLI 125 instead of required 126. The actual host client is Docker 29.4.0
+build `9d7ad9f`; the guest Engine is 29.7.2. These versions must not be conflated.
+Raw stderr preserves youki's `does not have correct permissions` diagnostic.
+The pinned runtime's structural permission rejection lacks the text recognized
+by Docker's [error classifier](https://raw.githubusercontent.com/docker/cli/v29.4.0/cli/command/container/run.go),
+which maps `permission denied` to 126 and missing-command diagnostics to 127.
+Youki's missing-path diagnostic has the analogous source-confirmed risk;
+candidate 4 did not reach that physical case.
+
+Next: preserve the rejection predicates, correct those diagnostic contracts,
+add native executor/classification regressions, rebuild both guest profiles,
+pass the full signed backend gate, and require a fresh installed run to prove
+126 and 127. Do not accept 125 or change file permissions to bypass the failure.
+Full workload/provenance/aggregate acceptance remains open.
+
+Original evidence: `.artifacts/linux-docker-lifecycle-candidate-4`; manifest
+SHA-256 `b4b285c997e59e5289bc2d1a6e82228321da0d43a81362a8187e6574ad92fdc6`.
+Its exact inventory is 3,380 payloads / 3,970,606 bytes. Separate diagnostic
+inspection confirms the failed object remains `created`, PID 0, with Engine
+`ExitCode: 128` and the original permission error; that Engine state is distinct
+from the host client's 125.
+
+The separate public-Stop disposition passed: four original-owner/incarnation
+clean-journal receipts, graceful daemon retirement, socket absence and unchanged
+defaults. Its 500 payloads / 584,759 bytes are under
+`.artifacts/linux-docker-lifecycle-candidate-4-disposition`; manifest SHA-256
+`1ae859df6ef3a73bf464931f247f658a570fbdf699aa3ff641693818357bff84`.
+Both complete inventories/hashes were independently verified. Objects and disks
+remain retained; no failed result was retried or reclassified.
