@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEV installed Linux-on-macOS Compose slice; not full Docker certification.
+"""DEV installed Linux-on-macOS Compose/Buildx slices; not Docker certification.
 
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
@@ -22,6 +22,7 @@ import installed_developer_startup as startup
 import linux_docker_image_input as image_input
 
 SCOPE = "DEV_INSTALLED_LINUX_COMPOSE_NOT_RELEASE_CERTIFICATION"
+BUILD_SCOPE = "DEV_INSTALLED_LINUX_BUILDX_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -29,35 +30,41 @@ require = driver.require
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id")
+    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
     parser.add_argument("--image-input", default=str(REPO / "tests/fixtures/vz-0.4/docker/python-image-input.json"))
-    parser.add_argument("--run-id", default="compose-" + uuid.uuid4().hex[:24])
+    parser.add_argument("--run-id")
+    parser.add_argument("--buildkit-archive")
     args = parser.parse_args(argv)
-    require(args.suite == "compose", "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    if args.run_id is None:
+        args.run_id = args.suite + "-" + uuid.uuid4().hex[:24]
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
+    require((args.buildkit_archive is not None) == (args.suite == "build"),
+            "--buildkit-archive is required only for the build suite")
     return args
 
 
 def preflight(args, require_host=True):
-    require(args.suite == "compose", "full contract unavailable")
+    require(args.suite in {"compose", "build"}, "full contract unavailable")
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
     pin = image_input.load(pin_path)
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
-    info.update(scope=SCOPE, suite="compose", run_id=args.run_id, fixture=str(fixture),
+    info.update(scope=SCOPE if args.suite == "compose" else BUILD_SCOPE, suite=args.suite,
+                run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
                 public_ca=ca_pin)
     for path in (Path(__file__).resolve(), REPO / "scripts/run-linux-docker-e2e.sh", pin_path,
@@ -66,6 +73,15 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == "build":
+        import linux_docker_buildkit_builder as builder
+        archive = startup.canonical(args.buildkit_archive)
+        info["buildkit"] = builder.preflight_archive(archive)
+        info["inputs"][str(archive)] = startup.digest(archive)
+        for path in (REPO / "scripts/helpers/linux_docker_buildkit_builder.py",
+                     REPO / "scripts/helpers/linux_docker_build_evidence.py",
+                     REPO / "config/buildkit-artifact-v0.19.0.json"):
+            info["inputs"][str(path)] = startup.digest(path)
     return info
 
 
@@ -290,6 +306,24 @@ class ComposeHarness(startup.Harness):
         self.driver_cleanup_verified = []
         self.monitor = None
         self.mutations = []
+        self.builders = []
+
+    def driver_inputs(self, descriptor, scope, proof, images):
+        inputs = input_mapping(self, scope, proof, images)
+        if self.info.get("suite", "compose") == "build":
+            from linux_docker_buildkit_builder import Builder
+            builder = Builder(self, descriptor)
+            # Retain the owner before any effects, including partial failures.
+            self.builders.append(builder)
+            inputs["builder"] = builder.prepare()
+        return inputs
+
+    def validate_driver(self, output, inputs):
+        if self.info.get("suite", "compose") == "build":
+            from linux_docker_build_evidence import validate
+        else:
+            from linux_docker_compose_evidence import validate
+        return validate(output, inputs)
 
     def mutate(self, label, descriptor, args, **kwargs):
         # A failed mutation is never presumed rolled back merely because the
@@ -411,10 +445,13 @@ class ComposeHarness(startup.Harness):
         require(not self.effects_uncertain and all(not any(x["effects_uncertain"] for x in r.receipts) for r in recorders),
                 "uncertain mutation: resources retained; cleanup withheld")
         require(len(self.driver_cleanup_verified) == len(self.drivers) and all(self.driver_cleanup_verified),
-                "Compose cleanup lacks successful independent replay; resources retained")
+                "Docker fixture cleanup lacks successful independent replay; resources retained")
 
     def remove_owned(self):
         self.assert_certain()
+        for builder in reversed(getattr(self, "builders", [])):
+            self.assert_certain()
+            builder.remove_owned()
         for row in reversed(self.owned):
             self.assert_certain()
             descriptor, token = row["descriptor"], row["token"]
@@ -438,8 +475,8 @@ class ComposeHarness(startup.Harness):
                 self.mutate("owned-base-remove", descriptor, ["image", "rm", row["base_reference"]])
 
     def scenario(self):
-        from linux_docker_compose_evidence import validate
-        project = self.project("compose", "developer", 2)
+        suite = self.info.get("suite", "compose")
+        project = self.project(suite, "developer", 2)
         primary = self.up(project, "primary")
         self.daemon_identity = self.daemon_fingerprint()
         neighbor = self.up(project, "neighbor")
@@ -471,26 +508,34 @@ class ComposeHarness(startup.Harness):
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
                 images = self.prepare_image(descriptor)
-                inputs = input_mapping(self, scope, proof, images)
-                admitted = driver.Inputs(inputs, suite="compose")
+                inputs = self.driver_inputs(descriptor, scope, proof, images)
+                admitted = driver.Inputs(inputs, suite=suite)
                 admitted.verify_runtime_evidence()
-                output = self.evidence / ("compose-machine-" + str(index))
+                output = self.evidence / (suite + "-machine-" + str(index))
                 selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
                 self.drivers.append(selected)
                 self.driver_cleanup_verified.append(False)
                 begin = time.time_ns()
-                result = selected.run("compose")
+                result = selected.run(suite)
                 end = time.time_ns()
-                require(result["outcome"] == "fixture_assertions_passed", "Compose slice failed: " +
+                require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
                         str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
-                require(result["cleanup_errors"] == [], "Compose cleanup failed semantically")
-                replay = validate(output, inputs)
+                require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
+                builder_runtime = None
+                if suite == "build":
+                    require(len(self.builders) == index + 1, "builder ownership inventory differs from selected Machine")
+                    builder_runtime = self.builders[-1].verify(require_invocation=True)
+                replay = self.validate_driver(output, inputs)
                 self.driver_cleanup_verified[-1] = True
                 self.monitor.check_interval(begin, end, descriptor["name"])
-                observations.append({"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end, "independent_validation": replay})
+                observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
+                               "independent_validation": replay}
+                if builder_runtime is not None:
+                    observation["builder_runtime"] = builder_runtime
+                observations.append(observation)
             require(self.inspect(self.status(project, primary["environment_id"])) == primary_contexts and
                     self.inspect(self.status(project, neighbor["environment_id"])) == neighbor_contexts,
-                    "topology identity changed during Compose work")
+                    "topology identity changed during Docker fixture work")
         finally:
             self.monitor.stop()
         return {"machine_slices": observations, "continuous_sentinels": self.monitor.summary(),
@@ -577,7 +622,7 @@ def run(info):
     os.umask(0o077)
     harness = ComposeHarness(info)
     startup.document(harness.evidence / "inputs.json", info)
-    result = {"schema_version": 1, "scope": SCOPE, "suite": "compose", "outcome": "failed", "error": None,
+    result = {"schema_version": 1, "scope": info["scope"], "suite": info["suite"], "outcome": "failed", "error": None,
               "cleanup_errors": [], "docker_parity_certified": False, "aggregate_release_certified": False,
               "release_scenarios_passed": [], "test_case_retries": 0, "retained_root": str(harness.root)}
     try:
@@ -601,7 +646,7 @@ def run(info):
         except BaseException as error:
             result["cleanup_errors"].append(f"runtime evidence: {type(error).__name__}: {error}")
         if result["error"] is None and not result["cleanup_errors"]:
-            result["outcome"] = "passed_dev_installed_compose_slice"
+            result["outcome"] = "passed_dev_installed_" + info["suite"] + "_slice"
         startup.document(harness.evidence / "result.json", result)
         startup.checksum_evidence(harness)
     print(json.dumps(result), flush=True)

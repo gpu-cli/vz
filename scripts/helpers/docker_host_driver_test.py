@@ -707,7 +707,17 @@ class AssertionTests(unittest.TestCase):
         raw = b"\n".join(json.dumps({"data": base64.b64encode(part).decode()}).encode()
                          for part in (b"PRIVATE-", b"CANARY"))
         self.assertTrue(driver.contains_canary((raw,), [b"PRIVATE-CANARY"]))
+
+    def test_invalid_log_cannot_hide_later_encoded_canary(self):
+        raw = json.dumps({"logs": [{"data": "not base64"},
+                                   {"data": base64.b64encode(b"PRIVATE-CANARY").decode()}]}).encode()
+        self.assertTrue(driver.contains_canary((raw,), [b"PRIVATE-CANARY"]))
         self.assertFalse(driver.contains_canary((b"ordinary output",), [b"PRIVATE-CANARY"]))
+
+    def test_batched_buildkit_logs_are_scanned_across_status_frames(self):
+        raw = b"\n".join(json.dumps({"logs": [{"data": base64.b64encode(part).decode()}]}).encode()
+                         for part in (b"PRIVATE-", b"CANARY"))
+        self.assertTrue(driver.contains_canary((raw,), [b"PRIVATE-CANARY"]))
 
     def event(self, actor, action, timestamp):
         return {"Type": "container", "Actor": {"ID": actor, "Attributes": {"com.docker.compose.project": "owned"}},
@@ -728,15 +738,67 @@ class AssertionTests(unittest.TestCase):
                 driver.assert_health_order(events, {"db": "db", "api": "api", "worker": "worker"}, "owned")
 
     def test_cache_requires_terminal_exact_vertex_and_observed_cached_boolean(self):
-        vertex = {"id": "sha256:" + "a" * 64, "name": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
+        vertex = {"digest": "sha256:" + "a" * 64, "name": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
                   "completed": "2026-09-05T00:00:00Z", "cached": True}
-        raw = json.dumps(vertex).encode()
+        raw = json.dumps({"vertexes": [vertex]}).encode()
         driver.assert_payload_vertex(raw, cached=True)
         with self.assertRaises(driver.Rejected):
             driver.assert_payload_vertex(raw, cached=False)
-        for bad in (b"", b"CACHED", json.dumps(vertex | {"completed": None}).encode(), raw + b"\n" + raw):
+        for bad in (b"", b"CACHED", json.dumps({"vertexes": [vertex | {"completed": None}]}).encode(),
+                    raw + b"\n" + raw, json.dumps(vertex).encode(),
+                    json.dumps({"vertexes": [vertex | {"cached": "true"}]}).encode()):
             with self.subTest(bad=bad), self.assertRaises((driver.Rejected, ValueError)):
                 driver.assert_payload_vertex(bad, cached=True)
+
+    def test_batched_payload_omitted_false_cache_and_log_frames(self):
+        vertex = {"digest": "sha256:" + "a" * 64,
+                  "name": "[build 3/3] RUN --network=none python3 /fixture/tools.py payload",
+                  "completed": "2026-09-05T00:00:00.123456789Z"}
+        raw = json.dumps({"logs": [{"data": "aGk="}]}).encode() + b"\n" + json.dumps({"vertexes": [vertex]}).encode()
+        self.assertEqual(driver.assert_payload_vertex(raw, cached=False), vertex["digest"])
+
+    def secret_failure(self, *, excerpt=True):
+        source = (Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker/build/Dockerfile.secret").read_bytes()
+        vertex = {"digest": "sha256:" + "a" * 64, "name": "[build 2/3] " + source.decode().splitlines()[5],
+                  "completed": "2026-09-05T00:00:00Z", "error": "secret fixture: not found"}
+        lines = [json.dumps({"vertexes": [vertex]})]
+        if excerpt:
+            lines += ["Dockerfile.secret:6", "--------------------",
+                      "   4 |     ARG FIXTURE_SECRET_SHA256",
+                      "   5 |     COPY tools.py /fixture/tools.py",
+                      "   6 | >>> " + source.decode().splitlines()[5],
+                      "   7 |     RUN --network=none test ! -e /run/secrets/fixture",
+                      "   8 |     FROM scratch AS output", "--------------------"]
+        lines += ["ERROR: failed to solve: secret fixture: not found"]
+        return source, vertex, ("\n".join(lines) + "\n").encode()
+
+    def test_required_secret_accepts_pinned_rawjson_with_exact_cli_trailer(self):
+        for excerpt in (True, False):
+            source, vertex, raw = self.secret_failure(excerpt=excerpt)
+            self.assertEqual(driver.assert_required_secret_failure(raw, source), vertex["digest"])
+
+    def test_required_secret_rejects_unproven_errors_and_malformed_trailers(self):
+        source, vertex, raw = self.secret_failure()
+        mutations = [b"", b"x" * (driver.MAX_STREAM_BYTES + 1), raw + b"unexpected\n",
+                     raw.replace(b"Dockerfile.secret:6", b"Dockerfile.secret:5"),
+                     raw.replace(b"FROM scratch AS output", b"FROM unexpected"),
+                     raw.replace(b"ERROR: failed to solve:", b"ERROR: unavailable:"),
+                     raw[:raw.index(b"ERROR:")], raw[raw.index(b"Dockerfile.secret:"):],
+                     b'{malformed}\n' + raw, b'[]\n' + raw,
+                     b'{"vertexes":[],"vertexes":[]}\n' + raw,
+                     b'{"vertexes":null}\n' + raw, b'{"logs":[null]}\n' + raw,
+                     b'{"unknown":[]}\n' + raw, b'{"vertexes":[NaN]}\n' + raw,
+                     raw + json.dumps({"vertexes": [vertex]}).encode() + b"\n"]
+        for change in ({"error": "secret fixture: permission denied"}, {"error": "secret other: not found"},
+                       {"error": "connection refused"}, {"cached": True}, {"cached": "false"},
+                       {"completed": None}, {"completed": "yes"}, {"digest": "not-a-digest"},
+                       {"name": "[build 2/3] RUN echo secret fixture not found"}, {"error": ""}):
+            mutations.append(json.dumps({"vertexes": [vertex | change]}).encode() + b"\n" + raw.split(b"\n", 1)[1])
+        mutations.append(json.dumps({"vertexes": [vertex, vertex]}).encode() + b"\n" + raw.split(b"\n", 1)[1])
+        mutations.append(json.dumps({"vertexes": [vertex | {"name": "[internal] load metadata", "error": "registry unavailable"}]}).encode() + b"\n" + raw)
+        for bad in mutations:
+            with self.subTest(bad=bad[:180]), self.assertRaises(ValueError):
+                driver.assert_required_secret_failure(bad, source)
 
     def test_builder_single_exact_node(self):
         builder = {"name": "builder", "node": "builder0"}

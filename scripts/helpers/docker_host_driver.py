@@ -328,8 +328,19 @@ def contains_canary(streams: tuple[bytes, ...], canaries: list[bytes]) -> bool:
         for line in stream.splitlines():
             try:
                 row = json.loads(line)
-                if isinstance(row, dict) and isinstance(row.get("data"), str):
-                    decoded_logs.append(base64.b64decode(row["data"], validate=True))
+                if isinstance(row, dict):
+                    logs = row.get("logs", [])
+                    if isinstance(row.get("data"), str):
+                        logs = [row]
+                    if isinstance(logs, list):
+                        for log in logs:
+                            if isinstance(log, dict) and isinstance(log.get("data"), str):
+                                try:
+                                    decoded_logs.append(base64.b64decode(log["data"], validate=True))
+                                except ValueError:
+                                    # A malformed sibling must not conceal a
+                                    # later valid encoded canary in this batch.
+                                    continue
             except (ValueError, TypeError):
                 continue
     # BuildKit rawjson log payloads are base64; inspect decoded bytes as well
@@ -966,10 +977,7 @@ class Driver:
             assert_export(dest, "secret.txt", expected["secret_output"].encode())
             result, _ = self.build("secret-missing", "Dockerfile.secret", args, extra=["--no-cache"], expected=None)
             require(not result.timed_out and result.returncode > 0, "missing required secret did not fail normally")
-            errors = [json.loads(line).get("error", "") for line in result.stderr.splitlines()]
-            require(any("secret" in error and "fixture" in error and
-                        ("not found" in error or "required" in error) for error in errors),
-                    "negative build failed for an unproven reason, not the required secret mount")
+            assert_required_secret_failure(result.stderr, regular(self.fixture / "build/Dockerfile.secret"))
             self.record.acknowledge_negative(result, "terminal BuildKit required fixture secret mount error")
             return ["secret digest checked inside mount; next RUN lacks mount; exact public payload",
                     "uncached missing-secret build rejected; image/cache blob scanning still required"]
@@ -1107,17 +1115,94 @@ def assert_export(root: Path, name: str, expected: bytes) -> None:
     require(regular(root / name) == expected, "exported payload differs")
 
 
-def assert_payload_vertex(raw: bytes, *, cached: bool) -> str:
-    # buildx --progress rawjson emits SolveStatus-shaped vertex objects as
-    # individual lines. A terminal vertex receipt is mandatory; text/timing is
-    # never used as a cache-hit heuristic. Unknown shapes fail closed.
+def buildkit_vertices(line: str) -> list[dict[str, Any]]:
+    """Decode the pinned Buildx v0.33.0 SolveStatus batch shape."""
+    def unique_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+        result: dict[str, Any] = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate BuildKit JSON field")
+            result[key] = value
+        return result
+
+    def reject_constant(value: str) -> None:
+        raise Rejected("invalid BuildKit JSON constant: " + value)
+
+    row = json.loads(line, object_pairs_hook=unique_object, parse_constant=reject_constant)
+    require(isinstance(row, dict), "BuildKit progress must be an object")
+    require(set(row) <= {"vertexes", "statuses", "logs", "warnings"}, "unknown BuildKit progress shape")
+    for members in row.values():
+        require(isinstance(members, list) and all(isinstance(member, dict) for member in members),
+                "malformed BuildKit progress batch")
+    vertices = row.get("vertexes", [])
+    for vertex in vertices:
+        checked_text(vertex.get("digest"), r"sha256:[0-9a-f]{64}", "BuildKit vertex ID")
+        require(isinstance(vertex.get("name"), str), "missing BuildKit vertex name")
+        require(type(vertex.get("cached", False)) is bool, "invalid BuildKit cached boolean")
+        require(isinstance(vertex.get("error", ""), str), "invalid BuildKit vertex error")
+        for field in ("started", "completed"):
+            if field in vertex:
+                checked_text(vertex[field], r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})",
+                             "BuildKit " + field)
+    return vertices
+
+
+def buildkit_lines(raw: bytes) -> list[str]:
+    require(0 < len(raw) <= MAX_STREAM_BYTES, "missing or oversized BuildKit output")
+    lines = raw.decode("utf-8").splitlines()
+    require(len(lines) <= 20000 and all(lines), "empty or excessive BuildKit progress lines")
+    return lines
+
+
+def assert_required_secret_failure(raw: bytes, dockerfile: bytes) -> str:
+    """Require a terminal missing-secret vertex and the pinned CLI error trailer.
+
+    Buildx v0.33.0 cmd/buildx/main.go prints solver source excerpts and ERROR
+    after its rawjson stream. Only this fixture's exact excerpt is accepted;
+    malformed JSON is never reclassified as an ignorable human diagnostic.
+    """
+    command = "RUN --network=none --mount=type=secret,id=fixture,required=true python3 /fixture/tools.py secret"
+    failure = "secret fixture: not found"
+    lines = buildkit_lines(raw)
+    vertices = []
+    prefix_length = 0
+    for line in lines:
+        if not line.startswith("{"):
+            break
+        vertices.extend(buildkit_vertices(line))
+        prefix_length += 1
+    lines = lines[prefix_length:]
+    source = dockerfile.decode("utf-8").splitlines()
+    require(len(source) >= 8 and source[5] == command, "required-secret fixture source changed")
+    excerpt = ["Dockerfile.secret:6", "--------------------"]
+    excerpt += [f" {number:3d} | {'>>>' if number == 6 else '   '} {source[number - 1]}"
+                for number in range(4, 9)]
+    excerpt.append("--------------------")
+    trailer = ["ERROR: failed to solve: " + failure]
+    require(lines in (trailer, excerpt + trailer), "missing or unrecognized required-secret error trailer")
     matches = []
-    for line in raw.splitlines():
-        row = json.loads(line)
-        if row.get("name", "").endswith("python3 /fixture/tools.py payload") and row.get("completed"):
+    for vertex in vertices:
+        target = re.fullmatch(r"\[build [0-9]+/[0-9]+\] " + re.escape(command), vertex["name"])
+        if target and "completed" in vertex:
+            require(vertex.get("cached", False) is False and vertex.get("error") == failure,
+                    "required-secret vertex did not fail for the exact missing mount")
+            matches.append(vertex["digest"])
+        elif vertex.get("error"):
+            # Other concurrently canceled work is not proof of this failure.
+            require(vertex["error"] in {"context canceled", "context cancelled"},
+                    "unrelated BuildKit failure in required-secret build")
+    require(len(matches) == 1, "missing or duplicated terminal required-secret vertex")
+    return matches[0]
+
+
+def assert_payload_vertex(raw: bytes, *, cached: bool) -> str:
+    # v0.33.0 rawjson encodes batched SolveStatus, with cached:false omitted.
+    # A terminal vertex is mandatory; text/timing is never a cache-hit heuristic.
+    matches = []
+    for row in (vertex for line in buildkit_lines(raw) for vertex in buildkit_vertices(line)):
+        if re.fullmatch(r"\[build [0-9]+/[0-9]+\] RUN --network=none python3 /fixture/tools.py payload", row["name"]) and row.get("completed"):
             require("error" not in row or not row["error"], "payload vertex failed")
-            require(bool(row.get("cached", False)) is cached, "payload vertex cache status differs")
-            matches.append(row["id"])
+            require(row.get("cached", False) is cached, "payload vertex cache status differs")
+            matches.append(row["digest"])
     require(len(set(matches)) == 1 and len(matches) == 1, "missing or duplicated terminal payload vertex")
     return checked_text(matches[0], r"sha256:[0-9a-f]{64}", "BuildKit vertex ID")
 
