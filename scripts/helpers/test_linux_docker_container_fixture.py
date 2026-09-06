@@ -23,7 +23,8 @@ def lines(rows, newline=b'\n'):
 
 def tty_rows(mode='exit'):
     result = [record('tty_ready', isatty=[True]*3, rows=24, cols=80)]
-    return result + ([record('tty_size', rows=40, cols=120), record('tty_done', exit_code=37)] if mode == 'exit'
+    return result + ([record('tty_resized', rows=40, cols=120), record('tty_size', rows=40, cols=120),
+                      record('tty_done', exit_code=37)] if mode == 'exit'
                      else [record('observed_signal', signal='SIGINT', exit_code=130)])
 
 
@@ -127,10 +128,15 @@ class ProtocolTests(unittest.TestCase):
         fixture.validate_tty(lines(tty_rows()), 37, TOKEN, newline=b'\n')
 
     def test_tty_wrong_dimensions_order_boolean_types_and_foreign_output(self):
-        for change in ('initial', 'resized', 'bool', 'order', 'extra', 'missing', 'token'):
+        for change in ('initial', 'resized', 'query-size', 'ack-bool', 'duplicate-ack', 'ack-order',
+                       'bool', 'order', 'extra', 'missing', 'token'):
             rows = tty_rows()
             if change == 'initial': rows[0]['rows'] = 25
             elif change == 'resized': rows[1]['cols'] = 121
+            elif change == 'query-size': rows[2]['cols'] = 121
+            elif change == 'ack-bool': rows[1]['rows'] = True
+            elif change == 'duplicate-ack': rows.insert(2, rows[1])
+            elif change == 'ack-order': rows[1], rows[2] = rows[2], rows[1]
             elif change == 'bool': rows[0]['isatty'] = [1, 1, 1]
             elif change == 'order': rows.reverse()
             elif change == 'extra': rows.append(rows[-1])

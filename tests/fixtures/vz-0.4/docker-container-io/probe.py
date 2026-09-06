@@ -90,18 +90,49 @@ def tty(owner):
     changed = saved[:]
     changed[3] &= ~termios.ECHO
     previous = signal.getsignal(signal.SIGINT)
+    previous_resize = signal.getsignal(signal.SIGWINCH)
+    wake_read = wake_write = None
     def interrupt(number, frame):
         raise ObservedSignal(number)
+    def resize(number, frame):
+        # Do not emit from a Python signal handler: it can interrupt an active
+        # buffered stdout write. The private self-pipe wakes normal select flow.
+        try:
+            os.write(wake_write, b'w')
+        except BlockingIOError:
+            pass  # An already pending byte still wakes the bounded reader.
     try:
+        wake_read, wake_write = os.pipe()
+        for fd in (wake_read, wake_write):
+            os.set_blocking(fd, False)
+            os.set_inheritable(fd, False)
         signal.signal(signal.SIGINT, interrupt)
+        signal.signal(signal.SIGWINCH, resize)
         termios.tcsetattr(0, termios.TCSANOW, changed)
         emit('tty_ready', owner, isatty=[True, True, True], **size())
         deadline = time.monotonic() + IO_TIMEOUT
         pending = bytearray()
         commands = 0
+        acknowledged = queried = False
+        resize_notices = 0
         while True:
             remaining = deadline - time.monotonic()
-            require(remaining > 0 and select.select([0], [], [], remaining)[0])
+            require(remaining > 0)
+            readable = select.select([0, wake_read], [], [], remaining)[0]
+            require(readable)
+            if wake_read in readable:
+                notices = os.read(wake_read, 128)
+                require(notices and notices == b'w' * len(notices))
+                resize_notices += len(notices)
+                require(resize_notices <= 16)
+                observed = size()
+                if observed != {'rows': 24, 'cols': 80} or acknowledged:
+                    require(observed == {'rows': 40, 'cols': 120})
+                    if not acknowledged:
+                        emit('tty_resized', owner, **observed)
+                        acknowledged = True
+            if 0 not in readable:
+                continue
             block = os.read(0, 128)
             require(block and len(pending) + len(block) <= 128)
             pending.extend(block)
@@ -111,9 +142,11 @@ def tty(owner):
                 command, _, rest = pending.partition(b'\n')
                 pending = bytearray(rest)
                 if command == b'size':
+                    require(acknowledged and not queried)
                     emit('tty_size', owner, **size())
+                    queried = True
                 elif command == b'exit':
-                    require(not pending)
+                    require(queried and not pending)
                     emit('tty_done', owner, exit_code=37)
                     return 37
                 else:
@@ -123,8 +156,12 @@ def tty(owner):
         emit('observed_signal', owner, signal='SIGINT', exit_code=130)
         return 130
     finally:
-        termios.tcsetattr(0, termios.TCSANOW, saved)
         signal.signal(signal.SIGINT, previous)
+        signal.signal(signal.SIGWINCH, previous_resize)
+        for fd in (wake_read, wake_write):
+            if fd is not None:
+                os.close(fd)
+        termios.tcsetattr(0, termios.TCSANOW, saved)
 
 
 def health_document(owner, state):

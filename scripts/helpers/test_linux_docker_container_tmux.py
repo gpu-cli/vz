@@ -107,6 +107,7 @@ class Adapter(unittest.TestCase):
         original = {'server_pid': 500, 'session_id': '$0', 'pane_id': pane, 'pane_pid': 501,
                     'tty': '/dev/ttys001', 'cols': 80, 'rows': 24}
         records = [dict(schema_version=1, token=TOKEN, type='tty_ready', cols=80, rows=24, isatty=[True]*3),
+                   dict(schema_version=1, token=TOKEN, type='tty_resized', cols=120, rows=40),
                    dict(schema_version=1, token=TOKEN, type='tty_size', cols=120, rows=40),
                    dict(schema_version=1, token=TOKEN, type='tty_done', exit_code=37)]
         self.write(directory / 'result.json', {'schema_version': 1, 'passed': True, 'error': None,
@@ -129,9 +130,11 @@ class Adapter(unittest.TestCase):
             ('identity', ['display-message', '-p', '-t', session,
                 '#{pid}|#{session_id}|#{pane_id}|#{pane_pid}|#{pane_tty}|#{pane_width}|#{pane_height}'],
                 b'500|$0|%0|501|/dev/ttys001|120|40\n'),
+            ('frame-resized', ['capture-pane', '-p', '-J', '-S', '-', '-t', pane], b''.join(map(m.evidence.canonical, records[:2]))),
+            ('ansi-resized', ['capture-pane', '-p', '-e', '-S', '-', '-t', pane], b'raw visible frame'),
             ('send-size', ['send-keys', '-t', pane, '-l', 'size'], b''),
             ('size-enter', ['send-keys', '-t', pane, 'Enter'], b''),
-            ('frame-size', ['capture-pane', '-p', '-J', '-S', '-', '-t', pane], b''.join(map(m.evidence.canonical, records[:2]))),
+            ('frame-size', ['capture-pane', '-p', '-J', '-S', '-', '-t', pane], b''.join(map(m.evidence.canonical, records[:3]))),
             ('ansi-size', ['capture-pane', '-p', '-e', '-S', '-', '-t', pane], b'raw visible frame'),
             ('send-exit', ['send-keys', '-t', pane, '-l', 'exit'], b''),
             ('exit-enter', ['send-keys', '-t', pane, 'Enter'], b''),
@@ -189,7 +192,7 @@ class Adapter(unittest.TestCase):
 
     def test_complete_synthetic_ledger_replays_but_makes_no_physical_claim(self):
         proof = self.replay(self.fixture())
-        self.assertEqual(proof['command_count'], 21)
+        self.assertEqual(proof['command_count'], 23)
         self.assertEqual(proof['pane_dead_status'], 37)
         self.assertFalse(proof['host_termios_restoration_certified'])
         self.assertIn('external_service_guard', proof['scope'])
@@ -210,7 +213,7 @@ class Adapter(unittest.TestCase):
             mutate(row); self.write(path, row); self.seal(root)
             with self.subTest(name=name), self.assertRaises(ValueError): self.replay(root)
             path.write_bytes(original); self.seal(root)
-        path = root / 'smoke/017-frame-done.stdout'; original = path.read_bytes()
+        path = root / 'smoke/019-frame-done.stdout'; original = path.read_bytes()
         path.write_bytes(original.replace(b'tty_done', b'input_echo')); self.seal(root)
         with self.assertRaises(ValueError): self.replay(root)
 
@@ -221,6 +224,22 @@ class Adapter(unittest.TestCase):
         path.write_bytes(m.LAUNCHER)
         (root / 'smoke/extra').write_bytes(b'foreign')
         with self.assertRaises(ValueError): self.replay(root)
+
+    def test_resealed_local_resize_without_guest_acknowledgement_rejected(self):
+        root = self.fixture()
+        directory = root / 'smoke'
+        path = directory / '011-frame-resized.stdout'
+        # Keep the complete host resize/control ledger, but remove the guest's
+        # acknowledgement. Reseal transport hashes so semantic replay must fail.
+        raw = path.read_bytes().splitlines(keepends=True)[0]
+        path.write_bytes(raw)
+        receipt_path = directory / '011-frame-resized.result.json'
+        receipt = json.loads(receipt_path.read_bytes())
+        receipt['outputs']['stdout'] = {'size': len(raw), 'sha256': m.core.sha(raw)}
+        self.write(receipt_path, receipt)
+        self.seal(root)
+        with self.assertRaisesRegex(ValueError, 'ordered terminal workflow incomplete'):
+            self.replay(root)
 
 
 if __name__ == '__main__':

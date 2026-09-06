@@ -18,8 +18,16 @@ on stderr and exits 70. No network or downloaded runtime inputs are used.
   and `stderr-end` lines. Exit 37. The standard input is `bytes(range(256))*257`.
 - `tty`: requires all three descriptors to be terminals, ICANON and ISIG already
   enabled; disables only ECHO and restores guest termios in `finally`.
-  `tty_ready` has `isatty:[true,true,true],rows,cols`; `size\n` emits
-  `tty_size` with rows/cols; `exit\n` emits `tty_done` with exit_code 37.
+  `tty_ready` has `isatty:[true,true,true],rows:24,cols:80`. A SIGWINCH
+  handler is installed before readiness and wakes a private nonblocking pipe;
+  only normal control flow emits `tty_resized` after reading actual rows 40,
+  cols 120. Initial unchanged-size notices produce no acknowledgement; wrong
+  dimensions fail, and at most 16 notices are admitted. The host must wait for
+  this acknowledgement before its single `size\n` query, which emits
+  `tty_size` with actual rows/cols; `exit\n` then emits `tty_done` with exit_code 37.
+  No sleeps, repeated size queries or requested-size substitutions synchronize
+  this exchange. Both signal handlers are restored and the exact pipe descriptors
+  are closed in `finally`.
   At most four complete commands are admitted within the fixed 30-second window.
   Actual SIGINT emits `observed_signal` with signal `SIGINT`, exit_code 130.
   Terminal ONLCR translation belongs to the host PTY recorder, not this JSON

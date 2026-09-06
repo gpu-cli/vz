@@ -250,18 +250,22 @@ class Smoke:
                 return json.dumps(dict(schema_version=1, token=self.token, type=kind, **values),
                                   sort_keys=True, separators=(',', ':')).encode()
             ready = record('tty_ready', cols=80, rows=24, isatty=[True, True, True])
+            acknowledged = record('tty_resized', cols=120, rows=40)
             sized = record('tty_size', cols=120, rows=40)
             done = record('tty_done', exit_code=37)
             self.wait_rows([ready], 'ready')
             self.command('resize', ['resize-window', '-t', self.pane, '-x', '120', '-y', '40'])
             resized = self.identity()
             require((resized['cols'], resized['rows']) == (120, 40), 'resized pane size')
+            # A local window resize is not acknowledgement from a remote Docker
+            # PTY. Observe its actual dimensions before sending the one query.
+            self.wait_rows([ready, acknowledged], 'resized')
             self.command('send-size', ['send-keys', '-t', self.pane, '-l', 'size'])
             self.command('size-enter', ['send-keys', '-t', self.pane, 'Enter'])
-            self.wait_rows([ready, sized], 'size')
+            self.wait_rows([ready, acknowledged, sized], 'size')
             self.command('send-exit', ['send-keys', '-t', self.pane, '-l', 'exit'])
             self.command('exit-enter', ['send-keys', '-t', self.pane, 'Enter'])
-            self.wait_rows([ready, sized, done], 'done')
+            self.wait_rows([ready, acknowledged, sized, done], 'done')
             deadline = time.monotonic() + 5
             while True:
                 dead = self.command('pane-exit', ['display-message', '-p', '-t', self.pane,
@@ -270,7 +274,7 @@ class Smoke:
                 require(dead == b'0|\n' and time.monotonic() < deadline, 'wrong or missing pane exit')
                 time.sleep(.05)
             outcome.update(passed=True, original_identity=original, resized_identity=resized,
-                           pane_dead_status=37, records=[json.loads(v) for v in (ready, sized, done)])
+                           pane_dead_status=37, records=[json.loads(v) for v in (ready, acknowledged, sized, done)])
         except BaseException as error:
             outcome['error'] = type(error).__name__ + ': ' + str(error)
         finally:

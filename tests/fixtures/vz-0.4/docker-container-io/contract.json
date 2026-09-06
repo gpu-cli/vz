@@ -19,6 +19,9 @@
   "tty": {
     "initial_size": [24, 80],
     "resized_size": [40, 120],
+    "resize_acknowledgement": "tty_resized",
+    "resize_ack_requires": "SIGWINCH_and_actual_40x120_before_size_command",
+    "resize_maximum_notices": 16,
     "commands": ["size\n", "exit\n"],
     "maximum_commands": 4,
     "exit_code": 37,

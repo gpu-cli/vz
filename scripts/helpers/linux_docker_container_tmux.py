@@ -155,6 +155,7 @@ def replay_tmux(root, inputs, cid, token, *, environment, tmux_path):
     pane = original['pane_id']
     require(re.fullmatch(r'%[0-9]+', pane), 'pane identifier differs')
     records = [dict(schema_version=1, token=token, type='tty_ready', cols=80, rows=24, isatty=[True]*3),
+               dict(schema_version=1, token=token, type='tty_resized', cols=120, rows=40),
                dict(schema_version=1, token=token, type='tty_size', cols=120, rows=40),
                dict(schema_version=1, token=token, type='tty_done', exit_code=37)]
     require(evidence.canonical(result['records']) == evidence.canonical(records), 'canonical guest records differ')
@@ -208,13 +209,13 @@ def replay_tmux(root, inputs, cid, token, *, environment, tmux_path):
             identity_sizes.add(size)
         elif label.startswith(('frame-', 'ansi-')):
             phase = label.split('-', 1)[1]
-            require(phase in ('ready', 'size', 'done'), 'unknown pane phase')
+            require(phase in ('ready', 'resized', 'size', 'done'), 'unknown pane phase')
             args = ['capture-pane', '-p', *(['-J'] if label.startswith('frame-') else ['-e']), '-S', '-', '-t', pane]
             if label.startswith('ansi-'):
                 ansi_phases.add(phase)
             if label.startswith('frame-'):
                 observed = [line for line in stdout.splitlines() if line]
-                expected = lines[:{'ready': 1, 'size': 2, 'done': 3}[phase]]
+                expected = lines[:{'ready': 1, 'resized': 2, 'size': 3, 'done': 4}[phase]]
                 require(observed == expected[:len(observed)] or
                         (0 < len(observed) <= len(expected) and observed[:-1] == expected[:len(observed)-1]
                          and expected[len(observed)-1].startswith(observed[-1])), 'raw guest frame differs')
@@ -236,11 +237,12 @@ def replay_tmux(root, inputs, cid, token, *, environment, tmux_path):
         previous_mono = receipt['completed']['monotonic_ns']
         previous_wall = receipt['completed']['unix_ns']
         require(not stderr, 'tmux diagnostic unexpected')
-    require(observed_controls == list(controls) and set(complete_frames) == {'ready', 'size', 'done'} and
-            complete_frames['ready'] < complete_frames['size'] < complete_frames['done'] and dead and
-            identity_sizes == {(80, 24), (120, 40)} and ansi_phases == {'ready', 'size', 'done'},
+    require(observed_controls == list(controls) and set(complete_frames) == {'ready', 'resized', 'size', 'done'} and
+            complete_frames['ready'] < complete_frames['resized'] < complete_frames['size'] < complete_frames['done'] and dead and
+            identity_sizes == {(80, 24), (120, 40)} and ansi_phases == {'ready', 'resized', 'size', 'done'},
             'ordered terminal workflow incomplete')
     require(control_indices['manual-size'] < complete_frames['ready'] < control_indices['resize'] and
+            control_indices['resize'] < complete_frames['resized'] < control_indices['send-size'] and
             control_indices['size-enter'] < complete_frames['size'] < control_indices['send-exit'] and
             control_indices['exit-enter'] < complete_frames['done'] < control_indices['cleanup-server-identity'],
             'guest completion did not precede dependent control')

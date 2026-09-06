@@ -84,17 +84,22 @@ class ProbeTests(unittest.TestCase):
     def test_tty_requires_actual_three_terminal_descriptors(self):
         self.assertEqual(self.run_probe('tty', TOKEN).returncode, 70)
 
-    def tty_session(self, interrupt=False):
+    def tty_session(self, interrupt=False, resize_case='valid'):
         master, slave = os.openpty()
         saved = termios.tcgetattr(slave)
         initial = copy.deepcopy(saved)
         initial[3] |= termios.ECHO | termios.ICANON | termios.ISIG
         termios.tcsetattr(slave, termios.TCSANOW, initial)
         fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 24, 80, 0, 0))
-        process = subprocess.Popen([sys.executable, '-B', str(ROOT / 'probe.py'), 'tty', TOKEN],
+        command = [sys.executable, '-B', str(ROOT / 'probe.py'), 'tty', TOKEN]
+        if resize_case == 'deadline':
+            command = [sys.executable, '-B', '-c',
+                       'import sys;sys.path.insert(0,sys.argv[1]);import probe;'
+                       'probe.IO_TIMEOUT=.2;raise SystemExit(probe.main(["tty",sys.argv[2]]))', str(ROOT), TOKEN]
+        process = subprocess.Popen(command,
                                    stdin=slave, stdout=slave, stderr=slave, start_new_session=True)
         pending = bytearray()
-        def line():
+        def raw_line():
             end = time.monotonic() + 3
             while b'\n' not in pending:
                 remaining = end-time.monotonic()
@@ -102,7 +107,9 @@ class ProbeTests(unittest.TestCase):
                 self.assertTrue(select.select([master], [], [], remaining)[0])
                 pending.extend(os.read(master, 4096))
             raw, _, rest = pending.partition(b'\n'); pending[:] = rest
-            return json.loads(raw.rstrip(b'\r'))
+            return bytes(raw.rstrip(b'\r'))
+        def line():
+            return json.loads(raw_line())
         try:
             ready = line()
             self.assertEqual(ready, {'schema_version': 1, 'type': 'tty_ready', 'token': TOKEN,
@@ -116,12 +123,29 @@ class ProbeTests(unittest.TestCase):
                                           'signal': 'SIGINT', 'exit_code': 130})
                 expected = 130
             else:
-                fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40, 120, 0, 0))
-                os.write(master, b'size\n')
-                self.assertEqual(line(), {'schema_version': 1, 'type': 'tty_size', 'token': TOKEN, 'rows': 40, 'cols': 120})
-                os.write(master, b'exit\n')
-                self.assertEqual(line(), {'schema_version': 1, 'type': 'tty_done', 'token': TOKEN, 'exit_code': 37})
-                expected = 37
+                if resize_case == 'deadline':
+                    self.assertEqual(raw_line(), b'VZ_CONTAINER_IO_CONTRACT_REJECTED')
+                    expected = 70
+                else:
+                    # No controlling terminal was assigned to this owned child;
+                    # deliver the actual SIGWINCH explicitly after changing size.
+                    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 40,
+                                121 if resize_case == 'wrong' else 120, 0, 0))
+                    if resize_case != 'missing-signal':
+                        process.send_signal(signal.SIGWINCH)
+                    if resize_case in ('wrong', 'missing-signal'):
+                        if resize_case == 'missing-signal':
+                            os.write(master, b'size\n')
+                        self.assertEqual(raw_line(), b'VZ_CONTAINER_IO_CONTRACT_REJECTED')
+                        expected = 70
+                    else:
+                        self.assertEqual(line(), {'schema_version': 1, 'type': 'tty_resized', 'token': TOKEN,
+                                                 'rows': 40, 'cols': 120})
+                        os.write(master, b'size\n')
+                        self.assertEqual(line(), {'schema_version': 1, 'type': 'tty_size', 'token': TOKEN, 'rows': 40, 'cols': 120})
+                        os.write(master, b'exit\n')
+                        self.assertEqual(line(), {'schema_version': 1, 'type': 'tty_done', 'token': TOKEN, 'exit_code': 37})
+                        expected = 37
             self.assertEqual(process.wait(timeout=3), expected)
             self.assertEqual(termios.tcgetattr(slave), initial)
         finally:
@@ -135,6 +159,62 @@ class ProbeTests(unittest.TestCase):
 
     def test_actual_owned_sigint_and_guest_restoration(self):
         self.tty_session(interrupt=True)
+
+    def test_actual_pty_wrong_resize_is_not_acknowledged(self):
+        self.tty_session(resize_case='wrong')
+
+    def test_actual_pty_correct_size_without_signal_is_not_acknowledged(self):
+        self.tty_session(resize_case='missing-signal')
+
+    def test_actual_pty_missing_resize_has_finite_deadline_and_restores(self):
+        self.tty_session(resize_case='deadline')
+
+    def test_resize_during_ready_emit_is_deferred_and_handlers_and_pipe_are_restored(self):
+        previous = {number: signal.getsignal(number) for number in (signal.SIGINT, signal.SIGWINCH)}
+        original_pipe, original_read = os.pipe, os.read
+        pipes, emitted, depths = [], [], []
+        depth = 0
+        selections = 0
+        def pipe():
+            pair = original_pipe()
+            pipes.extend(pair)
+            return pair
+        def emit(kind, owner, **fields):
+            nonlocal depth
+            depth += 1
+            depths.append(depth)
+            emitted.append(kind)
+            if kind == 'tty_ready':
+                signal.getsignal(signal.SIGWINCH)(signal.SIGWINCH, None)
+            depth -= 1
+        def select_ready(readers, *_args):
+            nonlocal selections
+            selections += 1
+            if selections == 1:
+                return [pipes[0]], [], []  # Initial unchanged-size notice.
+            signal.getsignal(signal.SIGWINCH)(signal.SIGWINCH, None)
+            signal.getsignal(signal.SIGWINCH)(signal.SIGWINCH, None)  # Coalesced duplicate, one acknowledgement.
+            return readers, [], []
+        attributes = [0, 0, 0, termios.ICANON | termios.ISIG | termios.ECHO, 0, 0, []]
+        with mock.patch.object(probe.os, 'pipe', side_effect=pipe), \
+             mock.patch.object(probe.os, 'isatty', return_value=True), \
+             mock.patch.object(probe.os, 'read', side_effect=lambda fd, count:
+                               b'size\nexit\n' if fd == 0 else original_read(fd, count)), \
+             mock.patch.object(probe.termios, 'tcgetattr', return_value=attributes), \
+             mock.patch.object(probe.termios, 'tcsetattr'), \
+             mock.patch.object(probe, 'size', side_effect=[{'rows': 24, 'cols': 80},
+                 {'rows': 24, 'cols': 80}, {'rows': 40, 'cols': 120}, {'rows': 40, 'cols': 120}]), \
+             mock.patch.object(probe, 'emit', side_effect=emit), \
+             mock.patch.object(probe.select, 'select', side_effect=select_ready):
+            self.assertEqual(probe.tty(TOKEN), 37)
+        self.assertEqual(emitted, ['tty_ready', 'tty_resized', 'tty_size', 'tty_done'])
+        self.assertEqual(max(depths), 1)
+        self.assertEqual({number: signal.getsignal(number) for number in previous}, previous)
+        self.assertEqual(len(pipes), 2)
+        for fd in pipes:
+            with self.assertRaises(OSError) as error:
+                os.fstat(fd)
+            self.assertEqual(error.exception.errno, errno.EBADF)
 
     def test_exact_health_state_and_foreign_malformed_links_rejected(self):
         with tempfile.TemporaryDirectory() as temporary, mock.patch.object(probe, 'HEALTH', Path(temporary)/'health'):

@@ -11,13 +11,13 @@ import re
 import stat
 
 FIXTURE = Path(__file__).resolve().parents[2] / 'tests/fixtures/vz-0.4/docker-container-io'
-FIXTURE_SHA256 = '7c964069b26ff1dac16fd1ef3a951c11c7758da97c0bf6b46a1d37d12b48e4da'
+FIXTURE_SHA256 = '60a9c9b1f27c489c28ee272f04fd6916e34544a93482c82de8ee0a7f3d39701a'
 FILES = {
     'Dockerfile': 'ef2679e4bb53c0fbe99773f2f21ecc637e21b86dce5282221d4a7fab497454e3',
-    'README.md': 'e2d14ae958c76510b9fd31d7bef2befc152caa3fbe3c1b15303e4f3a2b47201f',
-    'contract.json': '83f17609eee73632a0b8f7660aec5442bee0bce02d3395f31f80a8ac3a183ca0',
-    'probe.py': '5746e12767aab3e1b82e6e8097af01f3fbf349dce1c5a5b14940dd9628d6cc9e',
-    'test_probe.py': '2a043c1ff2bc3f96ec4a0a56e58a710abdee19e7a7cee947fdda720722cb7b1b',
+    'README.md': '92647980283fb7eafcb11423252aa15fbba31e8570711d3b404749d25195abf6',
+    'contract.json': 'ad90e03cb1a729aa8a5ed5759ea765b782cff6e7309c17ee46be4c1d9bdee188',
+    'probe.py': '1d240ff2e5964cdc7d95ab1b015c419618b3f6495a2ca5aa84447015737362f1',
+    'test_probe.py': '9c9c866df02321a42e1ade9d57daaa9f2798bf33d0a0f70e629322b1a90243be',
 }
 BASE = 'docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9'
 INPUT = bytes(range(256)) * 257
@@ -154,7 +154,8 @@ def validate_tty(raw, exit_code, owner, *, mode='exit', newline=b'\r\n'):
     ready = {'schema_version': 1, 'type': 'tty_ready', 'token': owner,
              'isatty': [True, True, True], 'rows': 24, 'cols': 80}
     if mode == 'exit':
-        expected = [ready, {'schema_version': 1, 'type': 'tty_size', 'token': owner, 'rows': 40, 'cols': 120},
+        expected = [ready, {'schema_version': 1, 'type': 'tty_resized', 'token': owner, 'rows': 40, 'cols': 120},
+                    {'schema_version': 1, 'type': 'tty_size', 'token': owner, 'rows': 40, 'cols': 120},
                     {'schema_version': 1, 'type': 'tty_done', 'token': owner, 'exit_code': 37}]
         exact_exit(exit_code, 37)
     else:

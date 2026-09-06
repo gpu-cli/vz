@@ -708,3 +708,72 @@ The final broad host regression passes 750 tests in 193.446 seconds:
 `8badb487fa739a7b589d34eb0777294b0f126bfb4068485d8e4d4ae6d59f3682`.
 Runtime/guest artifacts are unchanged; fresh installed-Mac verification remains
 required before this corrected acquisition path can pass.
+
+### Candidate 8: enrollment passes; asynchronous resize ordering fails
+
+Installed source `2c14c55f`, unchanged runtime `dcf891fa…20a84`, completed all
+four fresh Machine-bound enrollments. Independent inert replay verified exact
+owners, incarnations, boots, sessions, protected metadata and empty initial
+journals. This establishes enrollment, not final runtime capture.
+
+The same run failed at first-Machine command 70, `docker exec --interactive
+--tty`, after the preceding root/nonroot/binary-stream checks. The guest emitted
+initial `24×80` readiness. The host resized its local PTY to `40×120` and wrote
+the single `size` query 11.42 ms later; the guest answered `24×80`. No matching
+`40×120` record arrived, so the dependent `exit` write was never dispatched.
+At the original 30-second deadline, the owned client PID 4621 was killed and
+positively reaped. Its terminal restoration checks failed; no successful
+restoration or workload completion is claimed.
+
+Local PTY resize completion is not acknowledgement of the asynchronous remote
+Docker resize. The fixture only reports dimensions when queried, so these bytes
+do not establish that the guest never resized later. The correction requires a
+distinct guest `SIGWINCH`/actual-dimensions acknowledgement before that one size
+query, while preserving the initial size, queried final size and exit assertions.
+It must not add sleeps, repeated size queries or a fallback transport.
+
+Original evidence `.artifacts/linux-docker-lifecycle-candidate-8` independently
+verifies 3,439 payloads / 3,827,651 bytes, manifest SHA-256
+`34805a462ec6d5339e3f8633f5cceefd650bfc3e59dbb7700583ba3aa2b7c7c6`.
+No final journal capture ran; the original attempt remains failed.
+
+Separate disposition `.artifacts/linux-docker-lifecycle-candidate-8-disposition`
+retains a bounded, nonquiescent runtime-journal diagnostic and completes four
+exact-owner/incarnation public Stops, distinct clean filesystem journals,
+graceful daemon retirement, five absent sockets/PID file and unchanged defaults.
+Its 513 payloads / 939,606 bytes independently verify against manifest SHA-256
+`8752ae3f605717e9c1b47b957ab49030b4ab38d46ee03409ab7486b73ed90b46`.
+Diagnostic SHA-256:
+`b2f745948b7e303629bd55347c46f0be4883b71f0eb0dfdcb7d579017aaeb065`.
+No Docker objects or disks were deleted, and no enrollment or workload was retried.
+
+The standalone runtime-correlation helper validates raw journals and finds exact
+CID/operation candidates in externally supplied Engine-clock windows. It keeps
+ambiguous healthcheck/exec candidates and unmatched background invocations
+explicit, never equates runtime admission with payload exit, and does not yet
+authenticate those request windows or integrate them into lifecycle acceptance.
+Its 12 offline adversarial tests pass; it is not a physical Docker proof.
+
+The resize correction uses a private nonblocking self-pipe: the `SIGWINCH`
+handler never writes buffered output, and normal control flow samples the real
+guest dimensions before emitting `tty_resized`. Both direct host input and tmux
+wait for this exact record before sending `size`; replay requires the same
+ordering. Missing/wrong acknowledgements remain failures. Both signal handlers,
+the exact pipe descriptors and guest termios are restored on exit.
+
+Updated fixture tree SHA-256:
+`60a9c9b1f27c489c28ee272f04fd6916e34544a93482c82de8ee0a7f3d39701a`;
+probe SHA-256:
+`1d240ff2e5964cdc7d95ab1b015c419618b3f6495a2ca5aa84447015737362f1`.
+All 145 container-family tests and 21 fixture tests pass, including real owned
+PTY success, wrong dimensions, missing signal, deadline and restoration checks.
+The broader affected host suite passes all 800 tests in 69.500 seconds, log
+`.artifacts/container-resize-handshake-host-1.log`, SHA-256
+`d2e8fa70ccd1c6732863f03a75243a84b1a330669bdfa51b31e71768c722144f`.
+
+Actual local tmux evidence `.artifacts/container-resize-handshake-tmux-1` passes
+the four-record handshake, pane exit 37 and normal owned-server retirement.
+Manifest SHA-256:
+`7bfbccc53a92926a1fe36cef2f199060ae01caeb374a5e6aace60e372d9e178e`.
+This local terminal test is not an installed-Docker pass. Runtime/guest bundles
+are unchanged; fresh installed-Mac lifecycle acceptance remains required.

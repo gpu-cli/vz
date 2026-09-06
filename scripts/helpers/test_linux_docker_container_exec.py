@@ -53,7 +53,8 @@ class Exec(unittest.TestCase):
         rows = [{'schema_version': 1, 'type': 'tty_ready', 'token': TOKEN,
                  'isatty': [True, True, True], 'rows': 24, 'cols': 80}]
         if name == 'tty-exit':
-            rows.extend([{'schema_version': 1, 'type': 'tty_size', 'token': TOKEN, 'rows': 40, 'cols': 120},
+            rows.extend([{'schema_version': 1, 'type': 'tty_resized', 'token': TOKEN, 'rows': 40, 'cols': 120},
+                         {'schema_version': 1, 'type': 'tty_size', 'token': TOKEN, 'rows': 40, 'cols': 120},
                          {'schema_version': 1, 'type': 'tty_done', 'token': TOKEN, 'exit_code': 37}])
         else:
             rows.append({'schema_version': 1, 'type': 'observed_signal', 'token': TOKEN,
@@ -118,6 +119,10 @@ class Exec(unittest.TestCase):
         self.assertIn('--tty', tty['args'])
         self.assertEqual(tty['plan']['actions'][0]['rows'], 40)
         self.assertEqual(tty['plan']['actions'][0]['cols'], 120)
+        resized = fixture.encode({'schema_version': 1, 'type': 'tty_resized', 'token': TOKEN,
+                                  'rows': 40, 'cols': 120}) + b'\r\n'
+        self.assertEqual(tty['plan']['actions'][1], {'kind': 'write', 'data': b'size\n',
+            'after': {'stream': 'tty', 'marker': resized}})
         self.assertEqual(interrupt['plan']['actions'][0]['data'], b'\x03')
         self.assertFalse(any(a['kind'] == 'signal' for a in interrupt['plan']['actions']))
         for operation in (root, nonroot, stream, tty, interrupt):

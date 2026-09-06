@@ -28,6 +28,8 @@ def operations(cid, token):
                             'isatty': [True, True, True], 'rows': 24, 'cols': 80}) + b'\r\n'
     sized = fixture.encode({'schema_version': 1, 'type': 'tty_size', 'token': token,
                             'rows': 40, 'cols': 120}) + b'\r\n'
+    resized = fixture.encode({'schema_version': 1, 'type': 'tty_resized', 'token': token,
+                              'rows': 40, 'cols': 120}) + b'\r\n'
     def plan(mode, actions, size=1):
         return {'schema_version': 1, 'mode': mode, 'timeout_seconds': TIMEOUT,
                 'input_limit': size, 'output_limit': LIMIT, 'actions': actions}
@@ -46,7 +48,7 @@ def operations(cid, token):
         {'name': 'tty-exit', 'args': args('tty', ['--interactive', '--tty']), 'exit': 37,
          'plan': plan('pty', [{'kind': 'resize', 'rows': 40, 'cols': 120,
              'after': {'stream': 'tty', 'marker': ready}},
-             {'kind': 'write', 'data': b'size\n'},
+             {'kind': 'write', 'data': b'size\n', 'after': {'stream': 'tty', 'marker': resized}},
              {'kind': 'write', 'data': b'exit\n', 'after': {'stream': 'tty', 'marker': sized}}], 10)},
         {'name': 'tty-sigint', 'args': args('tty', ['--interactive', '--tty']), 'exit': 130,
          'plan': plan('pty', [{'kind': 'write', 'data': b'\x03',
