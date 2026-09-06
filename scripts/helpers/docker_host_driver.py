@@ -1229,7 +1229,8 @@ def assert_required_secret_failure(raw: bytes, dockerfile: bytes) -> str:
     excerpt += [f" {number:3d} | {'>>>' if number == 6 else '   '} {source[number - 1]}"
                 for number in range(4, 9)]
     excerpt.append("--------------------")
-    trailer = ["ERROR: failed to solve: " + failure]
+    # Pinned Buildx commands/build.go wraps RunBuild errors before main prints them.
+    trailer = ["ERROR: failed to build: failed to solve: " + failure]
     require(lines in (trailer, excerpt + trailer), "missing or unrecognized required-secret error trailer")
     matches = []
     for vertex in vertices:

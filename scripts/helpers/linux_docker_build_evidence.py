@@ -93,7 +93,7 @@ def progress(raw, secret_dockerfile=None):
                 and re.fullmatch(r"sha256:[0-9a-f]{64}", terminal[0]["digest"]), "unproven required-secret vertex error")
         require(all(not v.get("error") or v is terminal[0] or v["error"] in {"context canceled", "context cancelled"}
                     for v in vertices), "unrelated concurrent BuildKit failure")
-        footer = "ERROR: failed to solve: secret fixture: not found"
+        footer = "ERROR: failed to build: failed to solve: secret fixture: not found"
         excerpt = [f"Dockerfile.secret:{number}", "--------------------"]
         for n in range(max(1, number - 2), min(len(lines), number + 2) + 1):
             excerpt.append(f"{n:4} | " + (">>> " if n == number else "    ") + lines[n - 1])

@@ -58,7 +58,7 @@ class SyntheticBuilder(SyntheticEngine):
         if suffix == "secret-missing":
             error = vertex("--mount=type=secret,id=fixture,required=true python3 /fixture/tools.py secret", "secret")
             error["error"] = "secret fixture: not found"
-            return subprocess.CompletedProcess(argv, 1, b"", data({"vertexes": [error]}) + b"\nERROR: failed to solve: secret fixture: not found\n")
+            return subprocess.CompletedProcess(argv, 1, b"", data({"vertexes": [error]}) + b"\nERROR: failed to build: failed to solve: secret fixture: not found\n")
         if suffix in {"alpha", "alpha-reuse", "beta"}:
             variant = "beta" if suffix == "beta" else "alpha"
             payload = f"vz04-build-v1\nvariant={variant}\n".encode()
@@ -443,12 +443,25 @@ class BuildEvidenceTests(unittest.TestCase):
         source = (self.fixture / "build/Dockerfile.secret").read_text().splitlines()
         excerpt = ["Dockerfile.secret:6", "--------------------"]
         excerpt += [f" {n:3d} | {'>>>' if n == 6 else '   '} {source[n - 1]}" for n in range(4, 9)]
-        excerpt += ["--------------------", "ERROR: failed to solve: secret fixture: not found"]
+        excerpt += ["--------------------", "ERROR: failed to build: failed to solve: secret fixture: not found"]
         self.raw(39, "stderr", lambda b: b.splitlines()[0] + b"\n" + "\n".join(excerpt).encode() + b"\n")
         evidence.validate(self.directory, self.inputs)
 
     def test_negative_plain_footer_is_not_vertex_proof(self):
         self.raw(39, "stderr", lambda b: b.splitlines()[-1] + b"\n"); self.rejected()
+
+    def test_negative_requires_exact_pinned_build_wrapper(self):
+        footer = b"ERROR: failed to build: failed to solve: secret fixture: not found\n"
+        original = (self.directory / "command-00039.stderr").read_bytes()
+        self.assertTrue(original.endswith(footer))
+        for replacement in (
+                b"ERROR: failed to solve: secret fixture: not found\n",
+                b"ERROR: failed to build: failed to build: failed to solve: secret fixture: not found\n",
+                b"ERROR: unrelated failure: failed to solve: secret fixture: not found\n",
+                footer + footer, footer + b"unexpected trailing diagnostic\n"):
+            with self.subTest(replacement=replacement):
+                self.raw(39, "stderr", lambda _, value=replacement: original[:-len(footer)] + value)
+                self.rejected()
 
     def test_negative_missing_cli_footer(self):
         self.raw(39, "stderr", lambda b: b.splitlines()[0] + b"\n"); self.rejected()

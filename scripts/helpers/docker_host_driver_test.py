@@ -824,7 +824,7 @@ class AssertionTests(unittest.TestCase):
                       "   6 | >>> " + source.decode().splitlines()[5],
                       "   7 |     RUN --network=none test ! -e /run/secrets/fixture",
                       "   8 |     FROM scratch AS output", "--------------------"]
-        lines += ["ERROR: failed to solve: secret fixture: not found"]
+        lines += ["ERROR: failed to build: failed to solve: secret fixture: not found"]
         return source, vertex, ("\n".join(lines) + "\n").encode()
 
     def test_required_secret_accepts_pinned_rawjson_with_exact_cli_trailer(self):
@@ -837,7 +837,7 @@ class AssertionTests(unittest.TestCase):
         mutations = [b"", b"x" * (driver.MAX_STREAM_BYTES + 1), raw + b"unexpected\n",
                      raw.replace(b"Dockerfile.secret:6", b"Dockerfile.secret:5"),
                      raw.replace(b"FROM scratch AS output", b"FROM unexpected"),
-                     raw.replace(b"ERROR: failed to solve:", b"ERROR: unavailable:"),
+                     raw.replace(b"ERROR: failed to build: failed to solve:", b"ERROR: unavailable:"),
                      raw[:raw.index(b"ERROR:")], raw[raw.index(b"Dockerfile.secret:"):],
                      b'{malformed}\n' + raw, b'[]\n' + raw,
                      b'{"vertexes":[],"vertexes":[]}\n' + raw,
@@ -854,6 +854,22 @@ class AssertionTests(unittest.TestCase):
         for bad in mutations:
             with self.subTest(bad=bad[:180]), self.assertRaises(ValueError):
                 driver.assert_required_secret_failure(bad, source)
+
+    def test_required_secret_rejects_unpinned_outer_wrapper_and_extra_footer(self):
+        for excerpt in (True, False):
+            source, _, raw = self.secret_failure(excerpt=excerpt)
+            footer = b"ERROR: failed to build: failed to solve: secret fixture: not found\n"
+            self.assertTrue(raw.endswith(footer))
+            alternatives = (
+                b"ERROR: failed to solve: secret fixture: not found\n",
+                b"ERROR: failed to build: failed to build: failed to solve: secret fixture: not found\n",
+                b"ERROR: unrelated failure: failed to solve: secret fixture: not found\n",
+                footer + footer,
+                footer + b"unexpected trailing diagnostic\n",
+            )
+            for replacement in alternatives:
+                with self.subTest(excerpt=excerpt, replacement=replacement), self.assertRaises(ValueError):
+                    driver.assert_required_secret_failure(raw[:-len(footer)] + replacement, source)
 
     def test_builder_single_exact_node(self):
         builder = {"name": "builder", "node": "builder0"}
