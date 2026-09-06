@@ -22,13 +22,21 @@ def main():
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--xcode", type=Path, default=Path("/Applications/Xcode.app"))
     parser.add_argument("--ipsw", type=Path)
+    parser.add_argument("--reuse-download-cache", action="store_true", help="retry with verified downloads only; no prepared images or setup receipts may exist")
     parser.add_argument("--accept-xcode-license", action="store_true")
     args = parser.parse_args()
     assert args.accept_xcode_license, "explicit Xcode license authorization required"
     prefix = args.prefix.resolve(strict=True)
     evidence = args.evidence.resolve()
     evidence.mkdir(mode=0o700)
-    assert not (prefix / "macos-local").exists(), "fresh setup cache required"
+    cache = prefix / "macos-local"
+    if args.reuse_download_cache:
+        assert not list(cache.glob("*.json")), "no completed setup receipt may exist"
+        assert not list(cache.glob("setup-*")), "no interrupted setup stage may exist"
+        assert not (cache / "images").exists(), "no prepared images may exist"
+        assert not list((cache / "cache/templates").glob("*")), "no prepared template may exist"
+    else:
+        assert not cache.exists(), "fresh setup cache required"
     binary = prefix / "bin/vz-macos-setup"
     env = os.environ | {"PATH": f"{prefix}/bin:/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C"}
     base = [str(binary), "--prefix", str(prefix), "--xcode", str(args.xcode), "--json"]
@@ -36,7 +44,10 @@ def main():
         base += ["--ipsw", str(args.ipsw.resolve(strict=True))]
     results = []
     summary = dict(scope="INSTALLED_LOCAL_MACOS_SETUP", passed=False,
-                   apple_https_download=args.ipsw is None, prefix=str(prefix), results=results,
+                   default_apple_acquisition=args.ipsw is None,
+                   fresh_download_cache=not args.reuse_download_cache,
+                   apple_https_download=args.ipsw is None and not args.reuse_download_cache,
+                   prefix=str(prefix), results=results,
                    binary_sha256={name: hashlib.file_digest((prefix / "bin" / name).open("rb"), "sha256").hexdigest()
                                   for name in ["vz", "vz-runtimed", "vz-macos-setup", "vz-agent-loader", "vz-guest-agent"]})
 

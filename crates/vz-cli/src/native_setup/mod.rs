@@ -165,7 +165,8 @@ fn event(json: bool, phase: &str, completed: u64, total: u64) -> Result<()> {
         writeln!(
             std::io::stdout().lock(),
             "{}",
-            serde_json::json!({"phase":phase,"completed":completed,"total":total})
+            serde_json::json!({"phase":phase,"completed":completed,"total":total,
+                "timestamp_unix_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis()})
         )?;
     } else if total > 0 {
         eprint!(
@@ -338,8 +339,21 @@ pub async fn run(args: Args) -> Result<()> {
     };
     check_cancelled()?;
     event(args.json, "Installing pinned macOS locally", 0, 0)?;
+    // Virtualization.framework identifies restore media by its .ipsw suffix.
+    // Cache blobs use digest-only names; preserve their verified bytes in a
+    // private COW clone with the required suffix, without another full copy.
+    let restore = stage.path().join("restore.ipsw");
+    ensure!(
+        Command::new("/bin/cp")
+            .arg("-c")
+            .arg(&ipsw)
+            .arg(&restore)
+            .status()?
+            .success(),
+        "prepare named IPSW clone (APFS required)"
+    );
     let installed = vz::install_macos(
-        vz::IpswSource::Path(ipsw),
+        vz::IpswSource::Path(restore),
         &stage.path().join("base.img"),
         DISK_SIZE,
     )

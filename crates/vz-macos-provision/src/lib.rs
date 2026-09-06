@@ -438,15 +438,13 @@ fn enable_auto_login(mount_point: &Path, username: &str, password: &str) -> anyh
 /// a base64-encoded binary plist suitable for the `ShadowHashData` field in a
 /// dslocal user plist.
 ///
-/// Uses the system plist converter; no Python installation is required.
+/// Generates the binary plist directly in Rust; no external tools are required.
 fn generate_shadow_hash_data(password: &str) -> anyhow::Result<String> {
     use base64::{Engine, engine::general_purpose::STANDARD};
     use ring::{
         pbkdf2,
         rand::{SecureRandom, SystemRandom},
     };
-    use std::io::Write;
-    use std::process::{Command, Stdio};
     let mut salt = [0_u8; 32];
     SystemRandom::new()
         .fill(&mut salt)
@@ -461,29 +459,18 @@ fn generate_shadow_hash_data(password: &str) -> anyhow::Result<String> {
         password.as_bytes(),
         &mut entropy,
     );
-    let xml = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>SALTED-SHA512-PBKDF2</key><dict><key>entropy</key><data>{}</data><key>salt</key><data>{}</data><key>iterations</key><integer>40000</integer></dict></dict></plist>"#,
-        STANDARD.encode(entropy),
-        STANDARD.encode(salt)
+    let mut fields = plist::Dictionary::new();
+    fields.insert("entropy".into(), plist::Value::Data(entropy.to_vec()));
+    fields.insert("salt".into(), plist::Value::Data(salt.to_vec()));
+    fields.insert("iterations".into(), plist::Value::Integer(40000_u64.into()));
+    let mut root = plist::Dictionary::new();
+    root.insert(
+        "SALTED-SHA512-PBKDF2".into(),
+        plist::Value::Dictionary(fields),
     );
-    let mut child = Command::new("/usr/bin/plutil")
-        .args(["-convert", "binary1", "-o", "-", "--", "-"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()?;
-    child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("missing plist converter stdin"))?
-        .write_all(xml.as_bytes())?;
-    let result = child.wait_with_output()?;
-    anyhow::ensure!(
-        result.status.success() && result.stdout.starts_with(b"bplist00"),
-        "password plist conversion failed: {}",
-        String::from_utf8_lossy(&result.stderr)
-    );
-    Ok(STANDARD.encode(result.stdout))
+    let mut bytes = Vec::new();
+    plist::Value::Dictionary(root).to_writer_binary(&mut bytes)?;
+    Ok(STANDARD.encode(bytes))
 }
 
 /// Encode a password using macOS kcpassword XOR cipher.
@@ -1524,6 +1511,41 @@ mod tests {
         assert!(decoded.len() > 50, "binary plist should be substantial");
         // Binary plist magic: "bplist"
         assert_eq!(&decoded[..6], b"bplist", "should be a binary plist");
+        let value = plist::Value::from_reader(std::io::Cursor::new(&decoded)).unwrap();
+        let fields = value.as_dictionary().unwrap()["SALTED-SHA512-PBKDF2"]
+            .as_dictionary()
+            .unwrap();
+        let salt = fields["salt"].as_data().unwrap();
+        let entropy = fields["entropy"].as_data().unwrap();
+        assert_eq!(salt.len(), 32);
+        assert_eq!(entropy.len(), 128);
+        assert_eq!(fields["iterations"].as_unsigned_integer(), Some(40000));
+        let count = std::num::NonZeroU32::new(40000).unwrap();
+        assert!(
+            ring::pbkdf2::verify(
+                ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                count,
+                salt,
+                b"dev",
+                entropy
+            )
+            .is_ok()
+        );
+        assert!(
+            ring::pbkdf2::verify(
+                ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                count,
+                salt,
+                b"wrong",
+                entropy
+            )
+            .is_err()
+        );
+        assert_ne!(
+            b64,
+            generate_shadow_hash_data("dev").unwrap(),
+            "fresh password salts required"
+        );
     }
 
     #[test]

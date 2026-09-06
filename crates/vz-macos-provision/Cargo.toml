@@ -22,6 +22,7 @@ fs2 = { workspace = true }
 vz-agent-loader-client = { workspace = true }
 
 ring = "0.17.14"
+plist = "1.8"
 base64 = { workspace = true }
 
 [dev-dependencies]
