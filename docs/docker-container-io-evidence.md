@@ -497,7 +497,7 @@ file-descriptor references or actual Engine-to-youki invocation history. The
 kernel-exec error transport gap and full aggregate release gate remain open.
 Stopped Machine disks and contexts are retained; this run does not certify Delete.
 
-## Runtime invocation journal: native verification in progress
+## Runtime invocation journal: native verification passed, Machine integration pending
 
 Source `29886b79` adds an opt-in internal youki journal, a strict independent host
 parser and source-pinned native CLI probes; see
@@ -514,8 +514,41 @@ audit test: pinned upstream `CommonCmd::Checkpointt` exposes `checkpointt`, not
 `checkpoint`. Five audit groups passed; this attempt is not a passing candidate.
 The complete failure log remains `.artifacts/youki-runtime-audit-build-1.console.log`
 (SHA-256 `3b9e14f3ba5cc2ef664ffe6b62a078dab9d5d6ff0db800d59234b9f22c15f79f`).
-The fixture correction must exercise the actual pinned spelling while retaining
-the journal's typed `checkpoint` operation, without claiming that the upstream
-public spelling was fixed. No installed runtime was replaced. Exact-Machine
+The corrected fixture exercises the actual pinned spelling while retaining the
+journal's typed `checkpoint` operation, without claiming that the upstream public
+spelling was fixed. The verifier also handles the exact static audit warning
+interleaved with native test-status lines; original raw logs remain unchanged,
+and the first failed attempt remains rejected. The revised offline validator
+passes 43 tests in 3.429 seconds; log
+`.artifacts/runtime-audit-candidate-validator-2.log` SHA-256:
+`eaca3fd3127d2f9f087db79f7fe66e5d2ab9dbfcd33c8964056ac73e862bf328`.
+
+Source `809123a0` passed native build attempt 2. Independent audit verifies all
+87 distinct selected tests (81 prior plus six audit groups), zero failed/ignored,
+and the exact 57 evidence payloads totaling 6,999,384 bytes. Candidate:
+`linux/.cache/youki-source/builds/84dacbcdaff11736597e024c6e4efe7dbc74f871afbbe0eda8d79a75868cd59c`.
+The static ARM64 runtime SHA-256 is
+`dcf891fa177f5b3e4326ba89ebe3455506a577b6707e70a8be63a75e65a20a84`;
+manifest SHA-256 is
+`cfcc5f5cc274fe5b9d74cdceb62816ff4f21a19a215d58ee05011a68f3d97f15`.
+Console `.artifacts/youki-runtime-audit-build-2.console.log` SHA-256:
+`a404d8686f3063cc62139780a592df41dae83bccab4aca24470f89c254fccd60`.
+The authenticated ten-patch chain leaves Cargo.lock unchanged and applies with
+zero fuzz; GNU patch reports the existing tenant-root +2 and console-size +22
+line offsets, not a zero-offset chain.
+
+Independent replay with dispatch/writes forbidden validates eight journal records
+from four actual compiled CLI calls: version 0, invalid-bundle create 1,
+missing-container exec 255 and invalid-bundle run 255. Four process births,
+exact arguments, boot, timestamps, source pins, unchanged protected file metadata
+and canary exclusion match; status remains complete. The journal has 3,569 bytes,
+SHA-256 `cbd58f6df0e4c877eca3fc60872f605acf883d486b7f3a1fc5bfbf7641c7d51e`.
+These are early-return and error-routing probes, not successful OCI payloads.
+
+No installed runtime was replaced by these native builds. Exact-Machine
 enrollment/retrieval, rebuilt backend verification, installed Docker invocation
-mapping and the aggregate release gate remain open.
+mapping and the aggregate release gate remain open. Fresh workload enrollment
+must precede all fixture/sentinel Docker mutations; persisted recovery additionally
+needs enrollment before daemon restore can invoke the runtime, explicit retained
+old-session disposition and a new-boot transition. Post-Ready enrollment alone
+cannot establish that recovery coverage.
