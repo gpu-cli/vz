@@ -81,6 +81,7 @@ def preflight(args, require_host=True):
         for path in (REPO / "scripts/helpers/linux_docker_buildkit_builder.py",
                      REPO / "scripts/helpers/linux_docker_buildkit_cgroup.py",
                      REPO / "scripts/helpers/linux_docker_buildkit_shutdown.py",
+                     REPO / "scripts/helpers/linux_docker_buildkit_keep.py",
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)
@@ -309,6 +310,7 @@ class ComposeHarness(startup.Harness):
         self.monitor = None
         self.mutations = []
         self.builders = []
+        self.keep_proofs_verified = []
 
     def driver_inputs(self, descriptor, scope, proof, images):
         inputs = input_mapping(self, scope, proof, images)
@@ -318,6 +320,10 @@ class ComposeHarness(startup.Harness):
             # Retain the owner before any effects, including partial failures.
             self.builders.append(builder)
             inputs["builder"] = builder.prepare()
+            from linux_docker_buildkit_keep import run as verify_keep
+            self.keep_proofs_verified.append(False)
+            verify_keep(builder)
+            self.keep_proofs_verified[-1] = True
         return inputs
 
     def validate_driver(self, output, inputs):
@@ -440,6 +446,8 @@ class ComposeHarness(startup.Harness):
                 "compose": {"reference": row["image_id"], "id": row["image_id"], "platform": "linux/arm64"}}
 
     def assert_certain(self):
+        require(all(getattr(self, "keep_proofs_verified", [])),
+                "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
         if self.monitor is not None:
             require(not self.monitor.thread.is_alive(), "live monitor prevents cleanup")
@@ -527,6 +535,8 @@ class ComposeHarness(startup.Harness):
                 if suite == "build":
                     require(len(self.builders) == index + 1, "builder ownership inventory differs from selected Machine")
                     builder_runtime = self.builders[-1].verify(require_invocation=True)
+                    from linux_docker_buildkit_keep import verify_worker_log
+                    builder_runtime["post_workload_log"] = verify_worker_log(self.builders[-1])
                 replay = self.validate_driver(output, inputs)
                 self.driver_cleanup_verified[-1] = True
                 self.monitor.check_interval(begin, end, descriptor["name"])
