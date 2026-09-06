@@ -111,3 +111,18 @@ The 1,339-file evidence manifest SHA256 is
 This proves persisted recovery after positive Stop, not adoption of active
 Machines after a crash, automatic repair of unclean filesystems, full Docker
 compatibility, or aggregate 0.4 certification. `vz-u0u` and `vz-ehz` remain open.
+
+After integrating the remote native-macOS preparation commits, the rebuilt
+CLI changed bytes, so fresh candidate 4 repeated this complete scenario with
+`topology-cli-installed-gLq7X5`. It also passes, with 130 commands, six exact
+Stop proofs, both original neighbor workloads preserved, two Deletes, and zero
+retries, unresolved requests or cleanup errors. Its daemon and all nine guest
+artifact files match the passing backend `20260906T020915Z`; these are still
+separate DEV runs, not the single aggregate release gate.
+
+Candidate 4 result SHA256:
+`f2ec4bb524e7353f2239ac59ca5339da91665a4baf7f9cc93699782d287244da`.
+Its 1,339-file evidence manifest SHA256 is
+`7c28eb6e4ad8cf9728779fbab46921fb4e6fc6b5802c7e6adbf57ea002c7419f`.
+The retained evidence fixture is `/private/tmp/vzdev-0_06fx7v`; owned Machine
+stores, contexts and endpoints were removed by the product lifecycle.

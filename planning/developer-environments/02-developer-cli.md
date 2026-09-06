@@ -506,3 +506,15 @@ the stricter registry evidence validation, stack lifecycle and BuildKit lanes.
 Its signed production daemon matches the installed recovery candidate's bytes.
 This closes neither the full 63-case host Docker matrix nor the aggregate 0.4
 gate; `vz-u0u` and `vz-ehz` retain their unfinished recovery requirements.
+
+The backend raw manifest includes both exact retained guest bundles and all
+4,071 evidence files. Its SHA256 is
+`d617d098bd34422d65778c13bcc96fd7a80cf0374876c5adc07c70f2580506a7`.
+
+Post-integration workspace compilation, formatting and strict production
+Clippy pass. `topology-cli-installed-gLq7X5` passes all 31 CLI checks. Because
+the rebuilt CLI changed bytes, fresh installed recovery candidate 4 repeats
+the physical scenario and passes with the integrated CLI and the backend's
+exact daemon/guest artifact bytes. Its 1,339-file manifest is
+`7c28eb6e4ad8cf9728779fbab46921fb4e6fc6b5802c7e6adbf57ea002c7419f`.
+These are separate DEV gates, not an aggregate 0.4 release certification.
