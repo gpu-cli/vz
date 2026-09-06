@@ -11,8 +11,11 @@ fn main() -> Result<()> {
     }
     let callback = |progress| -> Result<()> {
         use std::io::Write;
-        serde_json::to_writer(std::io::stderr(), &progress)?;
-        writeln!(std::io::stderr())?;
+        // Serialize first: writing JSON token by token to unbuffered stderr
+        // adds many syscalls to every large-image verification checkpoint.
+        let mut line = serde_json::to_vec(&progress)?;
+        line.push(b'\n');
+        std::io::stderr().lock().write_all(&line)?;
         Ok(())
     };
     let base = Path::new(&args[1]);

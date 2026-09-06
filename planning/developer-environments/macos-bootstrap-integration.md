@@ -177,17 +177,27 @@ stopped installed base, with the release loader and guest agent. Its root-only
 mount/ownership step belongs to artifact production, never consumer setup.
 The first authenticated run failed during Data-volume discovery: hdiutil returned
 a container before the whole disk. The helper now selects the unique GUID whole
-disk explicitly, with an ordering regression test. Its retry is waiting for macOS
-administrator authentication; the original base is preserved. The mount helper now allocates a separate private directory
-per attachment and removes only the empty directory after a successful detach.
-The existing unit suite passes with this change, which awaits real mounting
-verification before main integration.
+disk explicitly, with an ordering regression test. The authenticated retry
+successfully mounted, provisioned and detached the owned clone. The original base
+is preserved. The mount helper allocates a separate private directory per
+attachment and removes only the empty directory after a successful detach.
 
-After provisioning, sign and run the `vz-cli` example `native_bootstrap_probe`
+Two independently cloned macOS 26.3.1 / 25D2128 VMs booted with the copied
+auxiliary seed and fresh identifiers. Both loader pings and guest-agent execution
+succeeded; boot to the agent probe took about 12 and 14 seconds. The guest reports
+`VirtualMac2,1`; both VM identifiers differ from the installer and each other.
+The second guest's loader and agent SHA-256 values match the prepared binaries.
+No Xcode/Command Line Tools developer directory is installed, so the Swift gate
+remains open. The second probe records a forced stop after a 30-second power-button
+shutdown deadline; this is not graceful installed Stop evidence.
+
+To repeat the prerequisite test, sign and run the `vz-cli` example `native_bootstrap_probe`
 with the patched disk, installed hardware model, auxiliary seed and a new private
 Machine directory. It creates a disk clone and fresh VM identifier, checks the
 loader and guest agent over vsock, reads the guest version/hardware model, and
-stops its owned VM. Its output explicitly marks this as prerequisite evidence,
+stops its owned VM, then repeats boot and verifies a persisted guest marker with
+the same identity. Shutdown receipts distinguish forced fallback from graceful
+shutdown. Its output explicitly marks this as prerequisite evidence,
 not installed consumer E2E. Do not publish a base/patch until this succeeds and
 the exact patch has been applied and booted independently.
 
@@ -195,3 +205,41 @@ Current branch checks: provisioning nextest 48 passed, zero skipped; strict
 library/example Clippy and Rust formatting passed. The Swift fixture passes its
 host syntax/unit check and its executable correctly rejects this physical
 `Mac16,5` host. These checks do not close the native lifecycle gate.
+
+### Real local patch round trip
+
+The 26.3.1 / 25D2128 candidate now passes a local base → delta → reconstructed
+disk → native boot → stop/start prerequisite test. The unprivileged patcher
+(UID 501) verified the entire pristine base and reconstructed output. The
+reconstructed image's private clone booted its loader and agent, executed guest
+commands, then retained a guest-written marker and the same VM identifier across
+stop/start. A third fresh identity differs from both earlier probes and the
+installer identity. Both stops used the recorded force-stop fallback; this does
+not qualify graceful installed Stop.
+
+Local artifact pins, relative to `.artifacts/macos26-bootstrap/native-e2e/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `base-candidate-2/base.img` (85,899,345,920 bytes) | `f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858` |
+| `bootstrap-26.3.1.vzdelta` (24,963,357 bytes; 18 changed chunks) | `60112dc7bba4ecf354d24e592498fe02302ce1e8c31e90f08ba13dca2845a148` |
+| `reconstructed.img` (85,899,345,920 bytes) | `ce1335ae436f7bd7435ad8ecf05a4457f3a356450f8e87631e2d6135966d7ad0` |
+| Guest loader | `f454fba42b94072f825e03b804633b6d52fc1af83b226a8e0d4281b86df7aee6` |
+| Guest agent | `e7be3f4196dd03d34d834cd34c998efedc42ea2124589dac53321e7deaf20d97` |
+
+Patch creation took approximately 362 seconds. Cold application took 930 seconds
+with the original progress logger; two process samples showed substantial time
+in token-by-token stderr writes. The example now serializes each JSON event into
+one write. Debug/release format checks and matching patch bytes pass; the cold
+timing has not been remeasured with this logging change. APFS cloning of the real
+80 GiB reconstructed disk took 0.0039 seconds, and its boot/agent/exec probes took
+17.23 seconds initially and 12.18 seconds after restart. These are local backend
+measurements, not installed download or full Up timings.
+
+`summary.json`, `patch-receipt.json`, `delta-apply-timing.json`, per-boot probes
+and shutdown receipts retain the results; `summarize-prerequisites.py` checks the
+receipts. The original base and reconstructed template remain separate from all
+booted writable copies. Nothing is published or certified as a consumer release.
+Remaining gates are authenticated publication/catalog selection, native installed
+five-verb integration, pinned guest Swift/toolchain execution, graceful shutdown,
+and mixed-target conformance. All further changes remain on the feature branch.

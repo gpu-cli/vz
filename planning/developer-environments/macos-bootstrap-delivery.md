@@ -38,14 +38,26 @@ an ACTIVE capability or a certified macOS version. The complete download matched
 that SHA-256, and its Restore.plist identifies 26.6.2 / 25G83 and VirtualMac2,1.
 A signed read-only Virtualization.framework probe on the local Apple-silicon
 macOS 26.3.1(a) host accepted the restore hardware model and reported minimums of
-2 CPUs and 4 GiB RAM. Installation, loader bootstrap, Xcode/Swift execution and
-the installed physical gate still need proof.
+2 CPUs and 4 GiB RAM. Actual installation subsequently failed with
+VZErrorDomain 10006 (host software update required). Metadata compatibility did
+not establish installer compatibility; this candidate is not qualified on this host.
 
 The framework requires a `.ipsw` filename even for valid archive bytes. Native
 preparation must stage a verified cache blob under that suffix in its owned
 workspace. The probe used a task-owned hard link; it did not copy the 19.8 GB
 archive, mount a disk, install or boot a VM. Evidence is retained under
 `.artifacts/macos26-bootstrap/verification/` in this worktree.
+
+The current physical-test candidate is **26.3.1 / 25D2128**, pinned in
+`config/macos-26.3.1-25D2128-ipsw.json` (19,330,833,456 bytes, SHA-256
+`4ff171ba3fa6db4758a2a7cedc8f24d44f4e3de8051a84400984872619abd6bc`).
+Its full download verified, installation completed in 281 seconds, and two
+independent clones of the provisioned image booted their loader and guest agent
+on this host. The real matching block patch applied as UID 501 with verified base
+and output hashes; the reconstructed image booted and preserved a guest marker
+across stop/start with the same VM identity. Native Swift, artifact publication
+and the installed user lifecycle remain unvalidated. See the
+[integration evidence](macos-bootstrap-integration.md#installed-user-validation-findings-in-progress).
 
 ## Selected base delivery contract
 
@@ -70,7 +82,7 @@ without resolving `latest` again. Keep prior published artifact sets obtainable
 for pinned recreation. A supported release with no matching artifacts cannot be
 advertised as ready.
 
-The first milestone is the manually prepared macOS 26.6.2 / 25G83 base plus loader
+The first milestone is the manually prepared macOS 26.3.1 / 25D2128 base plus loader
 patch, followed by a fresh download/apply/boot proof. Artifact publication and
 native integration remain unimplemented; this decision selects their contract.
 
@@ -95,7 +107,7 @@ Maintainer examples, run from `crates/`:
 
 ```sh
 cargo run -p vz-macos-provision --release --example fetch_artifact -- \
-  ../config/macos-26.6.2-25G83-ipsw.json /absolute/private/artifact-cache
+  ../config/macos-26.3.1-25D2128-ipsw.json /absolute/private/artifact-cache
 cargo run -p vz-macos-provision --release --example image_delta -- \
   create /absolute/base.img /absolute/prepared.img /absolute/bootstrap.vzdelta
 cargo run -p vz-macos-provision --release --example image_delta -- \
@@ -115,8 +127,8 @@ for the exact API, trust boundary, cache layout, runnable example and next work.
 
 ## Next integration and acceptance
 
-Prepare the exact candidate base on this host and create its real loader-bearing
-patch. Publish the authenticated pair and immutable release manifest. Bind all
+Add the pinned native toolchain to the candidate recipe, regenerate its patch and
+repeat reconstruction/boot verification. Publish the authenticated pair and immutable release manifest. Bind all
 artifacts and platform resources to the native target catalog and Machine ownership. Connect the operation-owned
 prepared-template cache and clone API to streamed Up progress and native
 exec/lifecycle adapters. Automate the proven maintainer recipe in a release
