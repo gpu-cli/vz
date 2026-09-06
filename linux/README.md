@@ -89,6 +89,25 @@ make -C linux docker-build-all
 
 ## Kernel Profiles
 
+Developer initramfs builds also include real, static Linux/arm64 e2fsprogs
+`mke2fs` and `dumpe2fs` under `/sbin`. `make e2fsprogs` uses the same explicit
+`LINUX_DOCKER_CONTEXT` on macOS. The helper pins e2fsprogs 1.47.3 to the upstream
+archive SHA-256, builds offline in the local Linux builder, rejects dynamic or
+foreign ELF output, and revalidates source/recipe/binary hashes on cache reuse.
+The provenance record ships as `/etc/vz-e2fsprogs.json`; the initramfs digest
+binds both tools and this record. Hardened initramfs builds omit these tools.
+
+Private Docker disks are formatted only with an exact outstanding format
+intent. New disks use journaled ext4 with eager inode/journal initialization;
+both new and existing disks must pass a read-only feature, UUID, clean-state,
+and recorded-error check before Docker admission. Existing ext2/ext3, dirty,
+or corrupt disks are preserved and refused, never automatically repaired or
+reformatted. A formatter build test is not persistence conformance: that still
+requires the installed local-vz Machine Stop/restart workload gate.
+
+Offline packaging tests: `PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover
+-s linux -p test_e2fsprogs_build.py`.
+
 | Profile | Output | Baseline | Intended use |
 | --- | --- | --- | --- |
 | `developer` | `linux/out/` | arm64 `defconfig` + `vz-linux.config` | **Primary.** Broad Linux Developer Environment kernel, including nested KVM, TUN/TAP, user namespaces, and pinned static iptables userspace for private Docker bridge/NAT. |

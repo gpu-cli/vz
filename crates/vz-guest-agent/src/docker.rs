@@ -7,13 +7,14 @@
 use std::fs::OpenOptions;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, bail};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixStream;
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock, watch};
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
@@ -28,7 +29,6 @@ const DOCKER_DAEMON_CONFIG: &str = "/var/lib/docker/config/daemon.json";
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(60);
 const CONTAINERD_STARTUP_TIMEOUT: Duration = Duration::from_secs(20);
 const HEALTH_POLL_INTERVAL: Duration = Duration::from_millis(200);
-const RESTART_BACKOFF: Duration = Duration::from_secs(1);
 const ENGINE_PING_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_ENGINE_PING_RESPONSE_BYTES: u64 = 16 * 1024;
 const YOUKI_RUNTIME_NAME: &str = "youki";
@@ -49,54 +49,190 @@ const REQUIRED_BINARIES: [&str; 5] = [
 
 /// Lazily owns the background Docker daemon supervisor task.
 pub(crate) struct DockerSupervisor {
-    worker: Mutex<Option<JoinHandle<()>>>,
+    worker: Mutex<Option<JoinHandle<anyhow::Result<()>>>>,
+    shutdown: watch::Sender<bool>,
+    stop_daemons: watch::Sender<bool>,
+    forwards: Arc<RwLock<()>>,
+    retained_children: Arc<Mutex<Vec<Child>>>,
+    completed: Mutex<Option<vz_agent_proto::DockerShutdownComplete>>,
 }
 
 impl DockerSupervisor {
     /// Forwarding never starts Docker or selects a caller-provided destination.
-    pub(crate) async fn connect_forward(&self) -> anyhow::Result<UnixStream> {
+    pub(crate) async fn connect_forward(
+        &self,
+    ) -> anyhow::Result<(UnixStream, OwnedRwLockReadGuard<()>, watch::Receiver<bool>)> {
         let worker = self.worker.lock().await;
+        if *self.shutdown.borrow() {
+            bail!("Docker shutdown has fenced forwarding for this Machine incarnation");
+        }
         if !worker.as_ref().is_some_and(|worker| !worker.is_finished()) {
             bail!("Docker forwarding requires an active, explicitly provisioned supervisor");
         }
         validate_runtime_invariants()?;
-        UnixStream::connect(DOCKER_SOCKET_PATH)
+        let permit = Arc::clone(&self.forwards).read_owned().await;
+        let stream = UnixStream::connect(DOCKER_SOCKET_PATH)
             .await
-            .context("connect to provisioned private Docker Engine")
+            .context("connect to provisioned private Docker Engine")?;
+        Ok((stream, permit, self.shutdown.subscribe()))
     }
 
     pub(crate) fn new() -> Self {
         Self {
             worker: Mutex::new(None),
+            shutdown: watch::channel(false).0,
+            stop_daemons: watch::channel(false).0,
+            forwards: Arc::new(RwLock::new(())),
+            retained_children: Arc::new(Mutex::new(Vec::new())),
+            completed: Mutex::new(None),
         }
     }
 
     /// Validate the layout and start supervision if it is not already active.
     pub(crate) async fn ensure_started(&self) -> anyhow::Result<()> {
+        let mut worker = self.worker.lock().await;
+        if *self.shutdown.borrow() {
+            bail!("Docker shutdown has permanently fenced Ensure for this Machine incarnation");
+        }
         prepare_persistent_layout().await?;
         validate_runtime_invariants()?;
 
-        {
-            let mut worker = self.worker.lock().await;
-            if worker.as_ref().is_none_or(JoinHandle::is_finished) {
-                *worker = Some(tokio::spawn(supervise_docker()));
-            }
+        if worker.is_none() {
+            *worker = Some(tokio::spawn(supervise_docker(
+                self.stop_daemons.subscribe(),
+                Arc::clone(&self.retained_children),
+            )));
+        } else if worker.as_ref().is_some_and(JoinHandle::is_finished) {
+            bail!("Docker supervisor terminated; Machine recovery is required");
         }
         Ok(())
     }
 
     /// Wait for the supervised Engine API to answer its health endpoint.
     pub(crate) async fn wait_ready(&self) -> anyhow::Result<&'static str> {
+        let _worker = self.worker.lock().await;
+        if *self.shutdown.borrow() {
+            bail!("Docker shutdown has fenced readiness");
+        }
         wait_for_engine(Path::new(DOCKER_SOCKET_PATH), STARTUP_TIMEOUT)
             .await
             .context("dockerd did not return OK from its Engine API /_ping endpoint")?;
         Ok(DOCKER_SOCKET_PATH)
     }
 
+    /// Fence first, retain uncertain ownership on every error, and never turn a
+    /// lost observer into a cancellation of filesystem closure.
+    pub(crate) async fn shutdown(
+        &self,
+        request_id: String,
+    ) -> anyhow::Result<vz_agent_proto::DockerShutdownComplete> {
+        let mut worker = self.worker.lock().await;
+        if *self.shutdown.borrow() {
+            if let Some(receipt) = self.completed.lock().await.as_ref()
+                && receipt.request_id == request_id
+            {
+                return Ok(receipt.clone());
+            }
+            bail!("Docker shutdown already admitted; reconcile the original operation");
+        }
+        self.shutdown.send_replace(true);
+        let _forwards = tokio::time::timeout(Duration::from_secs(10), self.forwards.write())
+            .await
+            .context("Docker forwarding did not drain")?;
+        // Forwarding admission is fenced and every relay has relinquished its
+        // owned socket halves. Only now may the daemon supervisor send TERM.
+        self.stop_daemons.send_replace(true);
+        let started = worker.is_some();
+        if let Some(handle) = worker.as_mut() {
+            tokio::time::timeout(Duration::from_secs(100), handle)
+                .await
+                .context("Docker shutdown did not complete; supervisor ownership retained")?
+                .context("Docker supervisor failed during shutdown")??;
+        }
+        let mounted = close_persistent_filesystem(started).await?;
+        let header = Command::new("/sbin/dumpe2fs")
+            .args(["-h", "/dev/vda"])
+            .env("LC_ALL", "C")
+            .output()
+            .await
+            .context("inspect closed Docker filesystem")?;
+        if !header.status.success() {
+            bail!(
+                "closed Docker filesystem inspection failed: {}",
+                String::from_utf8_lossy(&header.stderr)
+            );
+        }
+        let (filesystem_uuid, filesystem_features) = validate_closed_filesystem_header(
+            std::str::from_utf8(&header.stdout).context("filesystem header is not UTF-8")?,
+        )?;
+        let receipt = vz_agent_proto::DockerShutdownComplete {
+            request_id,
+            data_device: "/dev/vda".to_string(),
+            data_mount: DOCKER_DATA_ROOT.to_string(),
+            supervisor_started: started,
+            dockerd_reaped: started,
+            containerd_reaped: started,
+            filesystem_synced: mounted,
+            filesystem_unmounted: mounted,
+            never_started_unmounted: !started && !mounted,
+            filesystem_uuid,
+            filesystem_features,
+            filesystem_state: "clean".to_string(),
+        };
+        *self.completed.lock().await = Some(receipt.clone());
+        Ok(receipt)
+    }
+
     #[cfg(test)]
     async fn worker_started(&self) -> bool {
         self.worker.lock().await.is_some()
     }
+}
+
+fn validate_closed_filesystem_header(header: &str) -> anyhow::Result<(String, Vec<String>)> {
+    let field = |key: &str| -> anyhow::Result<&str> {
+        let values: Vec<_> = header
+            .lines()
+            .filter_map(|line| line.split_once(':'))
+            .filter_map(|(name, value)| (name.trim() == key).then_some(value.trim()))
+            .collect();
+        if values.len() != 1 || values[0].is_empty() {
+            bail!("filesystem header requires one {key}");
+        }
+        Ok(values[0])
+    };
+    let uuid = field("Filesystem UUID")?;
+    if uuid::Uuid::parse_str(uuid)
+        .context("invalid filesystem UUID")?
+        .is_nil()
+    {
+        bail!("Docker filesystem UUID must not be nil");
+    }
+    if field("Filesystem state")? != "clean" {
+        bail!("closed Docker filesystem is not clean");
+    }
+    let features: Vec<String> = field("Filesystem features")?
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    if !["has_journal", "extent"]
+        .iter()
+        .all(|required| features.iter().any(|feature| feature == required))
+    {
+        bail!("Docker filesystem requires journaled ext4");
+    }
+    if features.iter().any(|feature| feature == "needs_recovery") {
+        bail!("Docker filesystem still requires journal recovery");
+    }
+    let errors: Vec<_> = header
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .filter_map(|(name, value)| (name.trim() == "FS Error count").then_some(value.trim()))
+        .collect();
+    if errors.len() > 1 || errors.first().is_some_and(|value| *value != "0") {
+        bail!("Docker filesystem reports historical filesystem errors");
+    }
+    Ok((uuid.to_string(), features))
 }
 
 async fn prepare_persistent_layout() -> anyhow::Result<()> {
@@ -248,48 +384,159 @@ fn validate_exact_mount(
     Ok(())
 }
 
-async fn supervise_docker() {
-    loop {
-        if docker_engine_is_ready(Path::new(DOCKER_SOCKET_PATH)).await {
-            while docker_engine_is_ready(Path::new(DOCKER_SOCKET_PATH)).await {
-                tokio::time::sleep(Duration::from_secs(1)).await;
-            }
-            warn!("existing Docker facade stopped responding; restarting supervision");
-        }
-        if let Err(error) = run_daemons_once().await {
-            warn!(%error, "Docker facade daemon cycle failed");
-        }
-        tokio::time::sleep(RESTART_BACKOFF).await;
-    }
-}
-
-async fn run_daemons_once() -> anyhow::Result<()> {
+async fn supervise_docker(
+    mut shutdown: watch::Receiver<bool>,
+    retained: Arc<Mutex<Vec<Child>>>,
+) -> anyhow::Result<()> {
     remove_stale_socket(Path::new(CONTAINERD_SOCKET_PATH)).await?;
     remove_stale_socket(Path::new(DOCKER_SOCKET_PATH)).await?;
     let mut containerd = spawn_containerd()?;
-    wait_for_socket_or_exit(
+    if let Err(error) = wait_for_socket_or_exit(
         Path::new(CONTAINERD_SOCKET_PATH),
         CONTAINERD_STARTUP_TIMEOUT,
         &mut containerd,
         "containerd",
     )
-    .await?;
-    let mut dockerd = spawn_dockerd()?;
+    .await
+    {
+        retained.lock().await.push(containerd);
+        return Err(error);
+    }
+    let mut dockerd = match spawn_dockerd() {
+        Ok(child) => child,
+        Err(error) => {
+            retained.lock().await.push(containerd);
+            return Err(error);
+        }
+    };
     info!("Docker facade containerd and dockerd started");
+    let result: anyhow::Result<()> = async {
+        tokio::select! {
+            status = containerd.wait() => {
+                let status = status.context("failed waiting for containerd")?;
+                warn!(%status, "Docker facade containerd exited");
+                bail!("owned containerd exited outside shutdown: {status}");
+            }
+            status = dockerd.wait() => {
+                let status = status.context("failed waiting for dockerd")?;
+                warn!(%status, "Docker facade dockerd exited");
+                bail!("owned dockerd exited outside shutdown: {status}");
+            }
+            _ = shutdown.wait_for(|value| *value) => {}
+        }
+        graceful_reap(&mut dockerd, "dockerd").await?;
+        graceful_reap(&mut containerd, "containerd").await?;
+        Ok(())
+    }
+    .await;
+    if result.is_err() {
+        // Keep the actual child handles on every uncertain exit. Dropping a
+        // failure result never becomes an implicit SIGKILL or a restart.
+        retained.lock().await.extend([dockerd, containerd]);
+    }
+    result
+}
 
-    tokio::select! {
-        status = containerd.wait() => {
-            let status = status.context("failed waiting for containerd")?;
-            warn!(%status, "Docker facade containerd exited");
-            let _ = dockerd.kill().await;
-        }
-        status = dockerd.wait() => {
-            let status = status.context("failed waiting for dockerd")?;
-            warn!(%status, "Docker facade dockerd exited");
-            let _ = containerd.kill().await;
-        }
+async fn graceful_reap(child: &mut Child, name: &str) -> anyhow::Result<()> {
+    if child
+        .try_wait()
+        .context("poll owned Docker child")?
+        .is_some()
+    {
+        bail!("{name} exited before its ordered shutdown signal");
+    }
+    let pid = child.id().context("owned Docker child has no PID")?;
+    let pid = i32::try_from(pid).context("Docker child PID out of range")?;
+    // SAFETY: this is a directly owned, unreaped Child. No other task waits for
+    // it, so its PID cannot be recycled before this signal and wait sequence.
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("signal exact owned Docker child");
+    }
+    let status = tokio::time::timeout(Duration::from_secs(40), child.wait())
+        .await
+        .with_context(|| {
+            format!("{name} graceful shutdown timed out; no forced termination is proof")
+        })?
+        .with_context(|| format!("reap owned {name}"))?;
+    if !status.success() {
+        bail!("{name} shutdown returned {status}; filesystem closure is unproven");
     }
     Ok(())
+}
+
+async fn close_persistent_filesystem(started: bool) -> anyhow::Result<bool> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = started;
+        bail!("Docker filesystem closure is supported only in Linux guests");
+    }
+    #[cfg(target_os = "linux")]
+    tokio::task::spawn_blocking(move || {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let mounts = std::fs::read_to_string("/proc/self/mounts")?;
+        let mounted = mounts
+            .lines()
+            .any(|line| line.split_whitespace().nth(1) == Some(DOCKER_DATA_ROOT));
+        if !mounted {
+            if started {
+                bail!("Docker data mount disappeared before syncfs; closure is unproven");
+            }
+            return Ok(false);
+        }
+        validate_persistent_mount(&mounts, DOCKER_DATA_ROOT)?;
+        let data = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(DOCKER_DATA_ROOT)
+            .context("pin Docker filesystem before syncfs")?;
+        let device = data.metadata()?.dev();
+        let block = std::fs::metadata("/dev/vda")?.rdev();
+        if device != block {
+            bail!("Docker mount device identity differs from its exact attached data disk");
+        }
+        // SAFETY: data owns a live descriptor to the verified exact filesystem.
+        if unsafe { libc::syncfs(data.as_raw_fd()) } != 0 {
+            return Err(std::io::Error::last_os_error()).context("sync exact Docker filesystem");
+        }
+        drop(data);
+        let target = c"/var/lib/docker";
+        // SAFETY: target is a static NUL-terminated path; flags=0 is a normal
+        // unmount. EBUSY and every other failure leave Stop unproven.
+        if unsafe { libc::umount2(target.as_ptr(), 0) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("normal unmount of exact Docker filesystem");
+        }
+        let device_key = format!("{}:{}", libc::major(device), libc::minor(device));
+        for entry in std::fs::read_dir("/proc")? {
+            let entry = entry?;
+            if !entry
+                .file_name()
+                .to_string_lossy()
+                .bytes()
+                .all(|byte| byte.is_ascii_digit())
+            {
+                continue;
+            }
+            let mountinfo = match std::fs::read_to_string(entry.path().join("mountinfo")) {
+                Ok(value) => value,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    return Err(error)
+                        .context("inspect remaining Docker filesystem namespace consumers");
+                }
+            };
+            if mountinfo
+                .lines()
+                .any(|line| line.split_whitespace().nth(2) == Some(device_key.as_str()))
+            {
+                bail!("Docker data filesystem remains mounted in a live process namespace");
+            }
+        }
+        Ok(true)
+    })
+    .await
+    .context("Docker filesystem closure worker failed")?
 }
 
 fn spawn_containerd() -> anyhow::Result<Child> {
@@ -297,7 +544,7 @@ fn spawn_containerd() -> anyhow::Result<Child> {
     containerd_command()
         .stdout(stdout)
         .stderr(stderr)
-        .kill_on_drop(true)
+        .kill_on_drop(false)
         .spawn()
         .context("failed to spawn Docker facade containerd")
 }
@@ -324,7 +571,7 @@ fn spawn_dockerd() -> anyhow::Result<Child> {
     dockerd_command()
         .stdout(stdout)
         .stderr(stderr)
-        .kill_on_drop(true)
+        .kill_on_drop(false)
         .spawn()
         .context("failed to spawn Docker facade dockerd")
 }
@@ -495,6 +742,104 @@ async fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_filesystem_requires_one_clean_journaled_ext4_header() {
+        let header = "Filesystem UUID: 80145f4c-5bb6-4220-bb9a-a01c19c8e178\nFilesystem features: has_journal extent filetype\nFilesystem state: clean\n";
+        assert!(validate_closed_filesystem_header(header).is_ok());
+        for invalid in [
+            header.replace("has_journal ", ""),
+            header.replace("extent ", ""),
+            header.replace("filetype", "filetype needs_recovery"),
+            header.replace(
+                "80145f4c-5bb6-4220-bb9a-a01c19c8e178",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            header.replace("clean", "not clean with errors"),
+            header.replace("80145f4c-5bb6-4220-bb9a-a01c19c8e178", "invalid"),
+            format!("{header}Filesystem state: clean\n"),
+            format!("{header}FS Error count: 7\n"),
+            format!("{header}FS Error count: 0\nFS Error count: 0\n"),
+        ] {
+            assert!(
+                validate_closed_filesystem_header(&invalid).is_err(),
+                "accepted {invalid}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn shutdown_fence_precedes_mounts_ensure_and_forwarding() {
+        let supervisor = DockerSupervisor::new();
+        supervisor.shutdown.send_replace(true);
+        assert!(
+            supervisor
+                .ensure_started()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fenced")
+        );
+        assert!(
+            supervisor
+                .connect_forward()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fenced")
+        );
+        assert!(
+            supervisor
+                .wait_ready()
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("fenced")
+        );
+        assert!(!supervisor.worker_started().await);
+    }
+
+    #[tokio::test]
+    async fn shutdown_replay_is_bound_to_original_request_only() {
+        let supervisor = DockerSupervisor::new();
+        supervisor.shutdown.send_replace(true);
+        let receipt = vz_agent_proto::DockerShutdownComplete {
+            request_id: "original".into(),
+            ..Default::default()
+        };
+        *supervisor.completed.lock().await = Some(receipt.clone());
+        assert_eq!(
+            supervisor.shutdown("original".into()).await.unwrap(),
+            receipt
+        );
+        assert!(supervisor.shutdown("different".into()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn daemon_stop_notification_waits_for_every_forwarding_permit() {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            let supervisor = Arc::new(DockerSupervisor::new());
+            let mut forwards_fenced = supervisor.shutdown.subscribe();
+            let mut daemons_stopping = supervisor.stop_daemons.subscribe();
+            let mut daemon_control = supervisor.stop_daemons.subscribe();
+            *supervisor.worker.lock().await = Some(tokio::spawn(async move {
+                daemon_control.wait_for(|value| *value).await.unwrap();
+                bail!("injected post-drain daemon failure prevents filesystem effects");
+            }));
+            let permit = Arc::clone(&supervisor.forwards).read_owned().await;
+            let owner = Arc::clone(&supervisor);
+            let shutdown = tokio::spawn(async move { owner.shutdown("ordered-stop".into()).await });
+            forwards_fenced.wait_for(|value| *value).await.unwrap();
+            assert!(!*daemons_stopping.borrow());
+            assert!(!shutdown.is_finished());
+            drop(permit);
+            daemons_stopping.wait_for(|value| *value).await.unwrap();
+            let error = shutdown.await.unwrap().unwrap_err();
+            assert!(format!("{error:#}").contains("injected post-drain daemon failure"));
+        })
+        .await
+        .unwrap();
+    }
 
     #[test]
     fn persistent_mount_rejects_initramfs_and_accepts_virtio_ext4() {

@@ -56,6 +56,10 @@ service AgentService {
   // waits for containerd plus dockerd readiness.
   rpc EnsureDocker(DockerEnsureRequest) returns (stream DockerEnsureEvent);
 
+  // Irreversibly fence this guest's Docker supervisor and positively close its
+  // persistent filesystem before the host may stop the exact Machine.
+  rpc ShutdownDocker(DockerShutdownRequest) returns (stream DockerShutdownEvent);
+
   // Opaque, half-close preserving connection to the provisioned private Engine.
   // No caller-selected destination; Open/Connected precede Data and directional Eof.
   rpc DockerForward(stream DockerForwardFrame) returns (stream DockerForwardFrame);
@@ -287,6 +291,31 @@ message ResizeExecPtyRequest {
 message ResizeExecPtyResponse {}
 
 // ─── Docker Facade ─────────────────────────────────────────────
+
+message DockerShutdownRequest {
+  string request_id = 1;
+}
+
+message DockerShutdownEvent {
+  string request_id = 1;
+  string message = 2;
+  DockerShutdownComplete complete = 3;
+}
+
+message DockerShutdownComplete {
+  string request_id = 1;
+  string data_device = 2;
+  string data_mount = 3;
+  bool supervisor_started = 4;
+  bool dockerd_reaped = 5;
+  bool containerd_reaped = 6;
+  bool filesystem_synced = 7;
+  bool filesystem_unmounted = 8;
+  bool never_started_unmounted = 9;
+  string filesystem_uuid = 10;
+  repeated string filesystem_features = 11;
+  string filesystem_state = 12;
+}
 
 message DockerEnsureRequest {
   TransportMetadata metadata = 1;

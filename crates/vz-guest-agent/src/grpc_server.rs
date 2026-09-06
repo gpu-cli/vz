@@ -1761,10 +1761,10 @@ impl AgentServiceImpl {
         let child = match spawn_result {
             Ok(child) => child,
             Err(e) => {
-                warn!(request_id = %request_id, command = %launch.command, error = %e, "grpc: exec spawn failed");
+                warn!(request_id = %request_id, command = %launch.command, error = %format_args!("{e:#}"), "grpc: exec spawn failed");
                 return Ok(definite_exec_rejection(
                     &request_id,
-                    format!("exec rejected before spawn: {e}"),
+                    format!("exec rejected before spawn: {e:#}"),
                 ));
             }
         };
@@ -2682,6 +2682,47 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         }
     }
 
+    type ShutdownDockerStream = ReceiverStream<Result<DockerShutdownEvent, Status>>;
+
+    async fn shutdown_docker(
+        &self,
+        request: Request<DockerShutdownRequest>,
+    ) -> Result<Response<Self::ShutdownDockerStream>, Status> {
+        let request_id = request.into_inner().request_id;
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(Status::invalid_argument(
+                "Docker shutdown requires a bounded exact request ID",
+            ));
+        }
+        let supervisor = Arc::clone(&self.state.docker_supervisor);
+        let (sender, receiver) = tokio::sync::mpsc::channel(4);
+        // The admitted shutdown owns its task, not its response observer. A
+        // dropped host stream cannot abort midway through filesystem closure.
+        tokio::spawn(async move {
+            let _ = sender
+                .send(Ok(DockerShutdownEvent {
+                    request_id: request_id.clone(),
+                    message:
+                        "Fencing Docker, draining owned daemons, and closing persistent storage"
+                            .to_string(),
+                    complete: None,
+                }))
+                .await;
+            let result = supervisor.shutdown(request_id.clone()).await;
+            let event = result
+                .map(|complete| DockerShutdownEvent {
+                    request_id,
+                    message: "Docker shutdown and storage closure proven".to_string(),
+                    complete: Some(complete),
+                })
+                .map_err(|error| {
+                    Status::failed_precondition(format!("Docker shutdown unproven: {error:#}"))
+                });
+            let _ = sender.send(event).await;
+        });
+        Ok(Response::new(ReceiverStream::new(receiver)))
+    }
+
     async fn ensure_docker(
         &self,
         request: Request<DockerEnsureRequest>,
@@ -3002,7 +3043,9 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             .map_err(|error| {
                 Status::failed_precondition(format!("Docker forwarding unavailable: {error}"))
             })?;
-        Ok(Response::new(crate::docker_forward::start(inbound, target)))
+        Ok(Response::new(crate::docker_forward::start_owned(
+            inbound, target,
+        )))
     }
 
     type PortForwardStream = ReceiverStream<Result<PortForwardFrame, Status>>;
@@ -3864,6 +3907,36 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::*;
+
+    #[tokio::test]
+    async fn ordinary_spawn_rejection_preserves_os_error_chain_in_error_frame() {
+        use tokio_stream::StreamExt as _;
+        let directory = tempfile::tempdir().unwrap();
+        let service = AgentServiceImpl::new(SharedState {
+            process_table: Arc::new(Mutex::new(ProcessTable::new())),
+            docker_supervisor: Arc::new(crate::docker::DockerSupervisor::new()),
+        });
+        let mut request = exec_request(None, false);
+        request.command = directory
+            .path()
+            .join("missing-executable")
+            .to_string_lossy()
+            .into_owned();
+        request.working_dir.clear();
+        let mut stream = service
+            .exec_pipe(request, "spawn-diagnostic".into(), None)
+            .await
+            .unwrap()
+            .into_inner();
+        let frame = stream.next().await.unwrap().unwrap();
+        assert_eq!(frame.exec_id, 0);
+        let Some(exec_event::Event::Error(detail)) = frame.event else {
+            panic!("spawn rejection must not be a process exit");
+        };
+        assert!(detail.contains("failed to spawn process"));
+        assert!(detail.contains("os error 2"));
+        assert!(stream.next().await.is_none());
+    }
 
     fn test_exec_id() -> u64 {
         static NEXT_EXEC_ID: AtomicU64 = AtomicU64::new(10_000);

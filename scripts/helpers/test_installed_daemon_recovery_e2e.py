@@ -41,6 +41,20 @@ def encode(rows):
     return b"\n".join(json.dumps(row).encode() for row in rows) + b"\n"
 
 
+def physical_stop():
+    _, binding, _, _, stop, _, _, _ = fixture()
+    receipt = {"owner": copy.deepcopy(binding["owner"]), "operation_id": stop["operation_id"],
+               "generation": stop["generation"], "runtime_identity": json.loads(binding["runtime_identity"]["opaque_id"]),
+               "outcome": "stopped", "endpoint": {"accepted_connections": 12, "completed_connections": 8,
+                   "cancelled_connections": 1, "failed_connections": 3, "active_connections": 0, "socket_removed": True},
+               "docker_shutdown": {"request_id": stop["operation_id"], "data_device": "/dev/vda",
+                   "data_mount": "/var/lib/docker", "supervisor_started": True, "dockerd_reaped": True,
+                   "containerd_reaped": True, "filesystem_synced": True, "filesystem_unmounted": True,
+                   "never_started_unmounted": False, "filesystem_uuid": "31fd32e6-e95b-422c-973f-54c79ded35ea",
+                   "filesystem_features": ["has_journal", "extent", "filetype"], "filesystem_state": "clean"}}
+    return binding, stop, receipt
+
+
 def process(pid=400, seconds=100):
     return {"pid": pid, "uid": 501, "start_seconds": seconds, "start_microseconds": 123456,
             "boot_session_uuid": "31fd32e6-e95b-422c-973f-54c79ded35ea"}
@@ -70,6 +84,108 @@ def owners():
 
 
 class RecoveryEvidenceTests(unittest.TestCase):
+    def test_physical_stop_requires_original_runtime_and_all_positive_boundaries(self):
+        binding, stop, receipt = physical_stop()
+        result = driver.validate_stop_receipt(binding, stop, receipt)
+        self.assertEqual(result, receipt)
+        result["docker_shutdown"]["filesystem_unmounted"] = False
+        self.assertTrue(receipt["docker_shutdown"]["filesystem_unmounted"])
+
+    def test_physical_stop_rejects_foreign_absent_or_forged_authority(self):
+        mutations = (
+            lambda r: r.update(extra=True), lambda r: r.pop("docker_shutdown"),
+            lambda r: r.update(docker_shutdown=None), lambda r: r.update(outcome="already_absent"),
+            lambda r: r.update(operation_id="foreign"), lambda r: r.update(generation=True),
+            lambda r: r["owner"].update(machine_id="foreign"),
+            lambda r: r["runtime_identity"].update(incarnation_id="replacement"),
+            lambda r: r["docker_shutdown"].update(request_id="foreign"),
+            lambda r: r["docker_shutdown"].update(data_device="/dev/vdb"),
+            lambda r: r["docker_shutdown"].update(data_mount="/foreign"),
+            lambda r: r["docker_shutdown"].update(never_started_unmounted=True),
+            lambda r: r["docker_shutdown"].update(never_started_unmounted=0),
+            lambda r: r["docker_shutdown"].update(extra=True))
+        for mutate in mutations:
+            binding, stop, receipt = physical_stop()
+            mutate(receipt)
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                driver.validate_stop_receipt(binding, stop, receipt)
+        for key in ("supervisor_started", "dockerd_reaped", "containerd_reaped", "filesystem_synced", "filesystem_unmounted"):
+            for value in (False, 1, None, "true"):
+                binding, stop, receipt = physical_stop()
+                receipt["docker_shutdown"][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    driver.validate_stop_receipt(binding, stop, receipt)
+
+    def test_physical_stop_rejects_unjournaled_corrupt_or_unidentified_filesystem(self):
+        for key, values in {
+            "filesystem_uuid": [None, "", "foreign", "00000000-0000-0000-0000-000000000000"],
+            "filesystem_state": [None, "not clean", "clean with errors", "not clean with errors"],
+            "filesystem_features": [None, "has_journal extent", [], ["extent"], ["has_journal"],
+                ["has_journal", "extent", "needs_recovery"],
+                ["has_journal", "extent", "extent"], ["has_journal", "extent", True],
+                ["has_journal", "extent", "bad feature"], ["ext_attr", "dir_index", "filetype", "sparse_super"]],
+        }.items():
+            for value in values:
+                binding, stop, receipt = physical_stop()
+                receipt["docker_shutdown"][key] = value
+                with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                    driver.validate_stop_receipt(binding, stop, receipt)
+
+    def test_restarted_machine_must_retain_original_filesystem_uuid_and_features(self):
+        binding, stop, receipt = physical_stop()
+        previous = {key: copy.deepcopy(receipt["docker_shutdown"][key])
+                    for key in ("filesystem_uuid", "filesystem_features")}
+        self.assertEqual(driver.validate_stop_receipt(binding, stop, receipt, previous), receipt)
+        for key, value in (("filesystem_uuid", "41fd32e6-e95b-422c-973f-54c79ded35ea"),
+                           ("filesystem_features", ["has_journal", "extent"])):
+            changed = dict(previous, **{key: value})
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                driver.validate_stop_receipt(binding, stop, receipt, changed)
+
+    def test_physical_stop_rejects_live_endpoint_or_nonmatching_public_stop(self):
+        for key, value in (("socket_removed", False), ("socket_removed", 1), ("active_connections", 1),
+                           ("active_connections", False), ("accepted_connections", 13), ("completed_connections", -1)):
+            binding, stop, receipt = physical_stop()
+            receipt["endpoint"][key] = value
+            with self.subTest(endpoint=key), self.assertRaises(ValueError):
+                driver.validate_stop_receipt(binding, stop, receipt)
+        for mutate in (lambda o: o.update(status="running"), lambda o: o.update(kind="delete"),
+                       lambda o: o.update(project_id="foreign"), lambda o: o.update(environment_id="foreign"),
+                       lambda o: o["machine_steps"].clear(),
+                       lambda o: o["machine_steps"].append(copy.deepcopy(o["machine_steps"][0])),
+                       lambda o: o["machine_steps"][0].update(initial_state="stopped"),
+                       lambda o: o["machine_steps"][0]["expected_incarnation"].update(generation=2)):
+            binding, stop, receipt = physical_stop()
+            mutate(stop)
+            with self.subTest(mutation=mutate), self.assertRaises(ValueError):
+                driver.validate_stop_receipt(binding, stop, receipt)
+
+    def test_writable_layer_marker_uses_exact_host_docker_container_without_sync(self):
+        harness = object.__new__(driver.RecoveryHarness)
+        descriptor = {"name": "owned-context"}
+        row = {"descriptor": descriptor, "container_id": "a" * 64, "token": "unique-marker"}
+        with patch.object(driver.base.DeleteHarness, "sentinel", return_value=row), \
+                patch.object(harness, "docker", side_effect=[(b"", b"", 0), (b"unique-marker\n", b"", 0)]) as docker:
+            self.assertIs(harness.sentinel(descriptor), row)
+        self.assertEqual(docker.call_count, 2)
+        self.assertEqual(docker.call_args_list[0].args, (
+            "sentinel-write-writable-layer", descriptor, ["exec", row["container_id"], "/bin/sh", "-c",
+                'printf "%s\\n" "$1" > "$2"', "sh", row["token"], driver.WRITABLE_SENTINEL]))
+        self.assertEqual(docker.call_args_list[1].args, (
+            "sentinel-observe-writable-layer", descriptor,
+            ["exec", row["container_id"], "/bin/cat", driver.WRITABLE_SENTINEL]))
+
+    def test_writable_layer_marker_rejects_missing_changed_or_diagnostic_output(self):
+        harness = object.__new__(driver.RecoveryHarness)
+        row = {"descriptor": {"name": "owned-context"}, "container_id": "a" * 64, "token": "unique-marker"}
+        for stdout, stderr in ((b"", b""), (b"unique-marker", b""), (b"other-marker\n", b""),
+                               (b"unique-marker\n", b"untrusted warning")):
+            with self.subTest(stdout=stdout, stderr=stderr), \
+                    patch.object(harness, "docker", return_value=(stdout, stderr, 0)) as docker, \
+                    self.assertRaises(ValueError):
+                harness.check_writable_sentinel(row)
+            docker.assert_called_once()
+
     def test_help_does_not_preflight_or_execute(self):
         with patch.object(driver, "preflight", side_effect=AssertionError("unexpected preflight")), \
                 patch.object(driver, "run", side_effect=AssertionError("unexpected execution")), \

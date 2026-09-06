@@ -26,6 +26,7 @@ import installed_developer_startup as startup
 require = startup.require
 SCOPE = "DEV_INSTALLED_DEAD_DAEMON_RECOVERY_AFTER_POSITIVE_STOP_NOT_RELEASE_CERTIFICATION"
 CONTROL_SCOPE = "control_socket_only_not_VM_quiescence"
+WRITABLE_SENTINEL = "/vz-recovery-writable-sentinel"
 
 
 def arguments(argv):
@@ -120,6 +121,61 @@ def stop_terminal(raw, environment, bindings, request, selector):
     return terminal
 
 
+def validate_stop_receipt(binding, operation, receipt, previous_filesystem=None):
+    """Bind physical shutdown to the original live Machine and public Stop.
+
+    This fresh Ready-to-Stopped gate cannot substitute an AlreadyAbsent result
+    or prior control-daemon closure for physical Docker/filesystem shutdown.
+    """
+    quiescence.shape(receipt, {"owner", "operation_id", "generation", "runtime_identity",
+                               "endpoint", "outcome", "docker_shutdown"})
+    require(quiescence.exact(receipt["owner"], binding["owner"]) and
+            receipt["operation_id"] == operation["operation_id"] and
+            type(receipt["generation"]) is int and receipt["generation"] == operation["generation"] and
+            quiescence.exact(receipt["runtime_identity"], json.loads(binding["runtime_identity"]["opaque_id"])) and
+            receipt["outcome"] == "stopped", "physical Stop changed owner, operation, runtime or positive outcome")
+    machine_id = binding["owner"]["machine_id"]
+    steps = [step for step in operation["machine_steps"] if step["machine_id"] == machine_id]
+    require(operation["kind"] == "stop" and operation["status"] == "succeeded" and
+            operation["project_id"] == binding["owner"]["project_id"] and
+            operation["environment_id"] == binding["owner"]["environment_id"] and
+            len(steps) == 1 and steps[0]["initial_state"] == "ready" and steps[0]["target_state"] == "stopped" and
+            steps[0]["status"] == "succeeded" and quiescence.exact(steps[0]["expected_incarnation"], binding["incarnation"]),
+            "physical Stop does not match exact Ready-to-Stopped incarnation")
+    endpoint = receipt["endpoint"]
+    quiescence.shape(endpoint, {"accepted_connections", "completed_connections", "cancelled_connections",
+                               "failed_connections", "active_connections", "socket_removed"})
+    for key in set(endpoint) - {"socket_removed"}:
+        quiescence.integer(endpoint[key])
+    require(endpoint["socket_removed"] is True and endpoint["active_connections"] == 0 and
+            endpoint["accepted_connections"] == endpoint["completed_connections"] +
+            endpoint["cancelled_connections"] + endpoint["failed_connections"],
+            "physical Stop retains endpoint socket, handlers or unaccounted connections")
+    shutdown = receipt["docker_shutdown"]
+    quiescence.shape(shutdown, {"request_id", "data_device", "data_mount", "supervisor_started", "dockerd_reaped",
+                               "containerd_reaped", "filesystem_synced", "filesystem_unmounted", "never_started_unmounted",
+                               "filesystem_uuid", "filesystem_features", "filesystem_state"})
+    require(shutdown["request_id"] == operation["operation_id"] and shutdown["data_device"] == "/dev/vda" and
+            shutdown["data_mount"] == "/var/lib/docker" and
+            shutdown["never_started_unmounted"] is False and
+            all(shutdown[key] is True for key in ("supervisor_started", "dockerd_reaped", "containerd_reaped",
+                                                 "filesystem_synced", "filesystem_unmounted")),
+            "physical Stop lacks exact guest Docker reap and synced normal-unmount proof")
+    features = shutdown["filesystem_features"]
+    require(isinstance(shutdown["filesystem_uuid"], str) and
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", shutdown["filesystem_uuid"]) and
+            shutdown["filesystem_uuid"] != "00000000-0000-0000-0000-000000000000" and
+            type(features) is list and 2 <= len(features) <= 128 and
+            all(type(feature) is str and re.fullmatch(r"[a-z0-9_]+", feature) for feature in features) and
+            len(set(features)) == len(features) and {"has_journal", "extent"} <= set(features) and
+            "needs_recovery" not in features and
+            shutdown["filesystem_state"] == "clean", "physical Stop lacks clean journaled ext4 identity/features")
+    filesystem = {key: shutdown[key] for key in ("filesystem_uuid", "filesystem_features")}
+    require(previous_filesystem is None or quiescence.exact(previous_filesystem, filesystem),
+            "restarted Machine replaced its persistent filesystem identity/features")
+    return copy.deepcopy(receipt)
+
+
 def validate_prior_stop_quiescence(binding, final_operation, proof, prior_stop):
     """Only the exact observed precrash positive Stop can authorize absence.
 
@@ -202,6 +258,22 @@ class RecoveryHarness(base.DeleteHarness):
         self.crashed_environments = set()
         self.recovery_pending = False
         self.replacement_owner = None
+        self.filesystem_identities = {}
+
+    def sentinel(self, descriptor):
+        row = super().sentinel(descriptor)
+        # The named-volume marker does not cover the container's overlayfs
+        # writable layer, which was corrupted in physical candidate 2.
+        self.docker("sentinel-write-writable-layer", descriptor, ["exec", row["container_id"],
+            "/bin/sh", "-c", 'printf "%s\\n" "$1" > "$2"', "sh", row["token"], WRITABLE_SENTINEL])
+        self.check_writable_sentinel(row)
+        return row
+
+    def check_writable_sentinel(self, row):
+        raw, stderr, _ = self.docker("sentinel-observe-writable-layer", row["descriptor"],
+            ["exec", row["container_id"], "/bin/cat", WRITABLE_SENTINEL], timeout=20)
+        require(raw == (row["token"] + "\n").encode() and not stderr,
+                "original container writable-layer bytes changed")
 
     def stopped_with_authority(self, project, environment, bindings):
         start = len(self.record.receipts)
@@ -221,9 +293,28 @@ class RecoveryHarness(base.DeleteHarness):
                 stopped["environment_id"] == environment["environment_id"] and
                 {row["machine_id"] for row in stopped["machines"]} == {row["machine_id"] for row in environment["machines"]},
                 "public stopped topology differs from exact Stop operation")
+        physical = []
+        for binding in bindings:
+            store = Path(binding["store_path"])
+            require(base.identity(store) == binding["store_identity"] and
+                    base.identity(store / "data") == binding["data_identity"], "Stop changed owned persistent store")
+            path = store / "data/linux-lifecycle/stops" / (operation["operation_id"] + ".json")
+            identity = path_identity(path, "file")
+            receipt_raw = startup.read_private_regular(path, startup.LIMIT)
+            machine_id = binding["owner"]["machine_id"]
+            receipt = validate_stop_receipt(binding, operation, json.loads(receipt_raw),
+                                            self.filesystem_identities.get(machine_id))
+            filesystem = {key: receipt["docker_shutdown"][key] for key in ("filesystem_uuid", "filesystem_features")}
+            self.filesystem_identities[machine_id] = copy.deepcopy(filesystem)
+            require(path_identity(path, "file") == identity, "physical Stop receipt replaced during capture")
+            evidence_name = binding["owner"]["machine_id"] + "-" + operation["operation_id"] + "-physical-stop.json"
+            startup.write(self.evidence / evidence_name, receipt_raw)
+            physical.append({"record": receipt, "path": str(path), "identity": identity,
+                             "sha256": hashlib.sha256(receipt_raw).hexdigest(), "evidence": evidence_name})
         self.positive_stops[environment["environment_id"]] = operation
         startup.document(self.evidence / (environment["environment_id"] + "-" + operation["operation_id"] + "-positive-stop.json"),
-                         {"environment": stopped, "operation": operation, "raw_stdout_sha256": hashlib.sha256(raw).hexdigest()})
+                         {"environment": stopped, "operation": operation, "physical_stops": physical,
+                          "raw_stdout_sha256": hashlib.sha256(raw).hexdigest()})
         return stopped
 
     def capture_owner(self, label, fingerprint):
@@ -391,7 +482,9 @@ class RecoveryHarness(base.DeleteHarness):
         require(len(items) == 1 and items[0]["Id"] == previous["container_id"], "restarted container identity changed")
         observed = dict(previous, descriptor=descriptor, started_at=items[0]["State"]["StartedAt"])
         self.check_sentinel(observed)
-        return {"before": previous, "after": observed, "scope": "explicit_restart_of_exact_owned_persisted_container_and_volume"}
+        self.check_writable_sentinel(observed)
+        return {"before": previous, "after": observed, "writable_layer_sentinel": WRITABLE_SENTINEL,
+                "scope": "explicit_restart_of_exact_owned_persisted_container_writable_layer_and_volume"}
 
     def scenario(self):
         self.public_inventory()

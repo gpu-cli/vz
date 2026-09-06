@@ -526,6 +526,12 @@ struct StackVmRecord {
     identity: vz_runtime_contract::StackRuntimeIdentity,
     verified_linux_profile: Option<KernelProfile>,
     docker_provisioned: bool,
+    // Published before start: an interrupted formatter/bootstrap is owned but
+    // is never reusable or safely power-stoppable without reconciliation.
+    boot_complete: bool,
+    // Positive guest closure survives a later host VM-stop failure while the
+    // exact incarnation remains owned. Never reconstruct this from VM absence.
+    docker_shutdown: Arc<Mutex<Option<vz_linux::DockerShutdownComplete>>>,
     boot_ports: Vec<PortMapping>,
     boot_resources: vz_runtime_contract::StackResourceHint,
     vm: Arc<LinuxVm>,

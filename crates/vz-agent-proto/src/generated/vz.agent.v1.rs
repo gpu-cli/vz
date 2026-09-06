@@ -318,6 +318,49 @@ pub struct ResizeExecPtyRequest {
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct ResizeExecPtyResponse {}
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerShutdownRequest {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerShutdownEvent {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub message: ::prost::alloc::string::String,
+    #[prost(message, optional, tag = "3")]
+    pub complete: ::core::option::Option<DockerShutdownComplete>,
+}
+#[derive(serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct DockerShutdownComplete {
+    #[prost(string, tag = "1")]
+    pub request_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "2")]
+    pub data_device: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub data_mount: ::prost::alloc::string::String,
+    #[prost(bool, tag = "4")]
+    pub supervisor_started: bool,
+    #[prost(bool, tag = "5")]
+    pub dockerd_reaped: bool,
+    #[prost(bool, tag = "6")]
+    pub containerd_reaped: bool,
+    #[prost(bool, tag = "7")]
+    pub filesystem_synced: bool,
+    #[prost(bool, tag = "8")]
+    pub filesystem_unmounted: bool,
+    #[prost(bool, tag = "9")]
+    pub never_started_unmounted: bool,
+    #[prost(string, tag = "10")]
+    pub filesystem_uuid: ::prost::alloc::string::String,
+    #[prost(string, repeated, tag = "11")]
+    pub filesystem_features: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(string, tag = "12")]
+    pub filesystem_state: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct DockerEnsureRequest {
     #[prost(message, optional, tag = "1")]
     pub metadata: ::core::option::Option<TransportMetadata>,
@@ -962,6 +1005,32 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "EnsureDocker"));
             self.inner.server_streaming(req, path, codec).await
         }
+        /// Irreversibly fence this guest's Docker supervisor and positively close its
+        /// persistent filesystem before the host may stop the exact Machine.
+        pub async fn shutdown_docker(
+            &mut self,
+            request: impl tonic::IntoRequest<super::DockerShutdownRequest>,
+        ) -> std::result::Result<
+            tonic::Response<tonic::codec::Streaming<super::DockerShutdownEvent>>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/ShutdownDocker",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(GrpcMethod::new("vz.agent.v1.AgentService", "ShutdownDocker"));
+            self.inner.server_streaming(req, path, codec).await
+        }
         /// Opaque, half-close preserving connection to the provisioned private Engine.
         /// No caller-selected destination; Open/Connected precede Data and directional Eof.
         pub async fn docker_forward(
@@ -1520,6 +1589,21 @@ pub mod agent_service_server {
             request: tonic::Request<super::DockerEnsureRequest>,
         ) -> std::result::Result<
             tonic::Response<Self::EnsureDockerStream>,
+            tonic::Status,
+        >;
+        /// Server streaming response type for the ShutdownDocker method.
+        type ShutdownDockerStream: tonic::codegen::tokio_stream::Stream<
+                Item = std::result::Result<super::DockerShutdownEvent, tonic::Status>,
+            >
+            + std::marker::Send
+            + 'static;
+        /// Irreversibly fence this guest's Docker supervisor and positively close its
+        /// persistent filesystem before the host may stop the exact Machine.
+        async fn shutdown_docker(
+            &self,
+            request: tonic::Request<super::DockerShutdownRequest>,
+        ) -> std::result::Result<
+            tonic::Response<Self::ShutdownDockerStream>,
             tonic::Status,
         >;
         /// Server streaming response type for the DockerForward method.
@@ -2156,6 +2240,52 @@ pub mod agent_service_server {
                     let inner = self.inner.clone();
                     let fut = async move {
                         let method = EnsureDockerSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.server_streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/ShutdownDocker" => {
+                    #[allow(non_camel_case_types)]
+                    struct ShutdownDockerSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::ServerStreamingService<super::DockerShutdownRequest>
+                    for ShutdownDockerSvc<T> {
+                        type Response = super::DockerShutdownEvent;
+                        type ResponseStream = T::ShutdownDockerStream;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::ResponseStream>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::DockerShutdownRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::shutdown_docker(&inner, request).await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ShutdownDockerSvc(inner);
                         let codec = tonic::codec::ProstCodec::default();
                         let mut grpc = tonic::server::Grpc::new(codec)
                             .apply_compression_config(

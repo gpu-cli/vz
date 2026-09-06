@@ -92,7 +92,7 @@ Its bounded client supervisor retains the activation until every relay has
 joined, then removes only the recorded socket inode. An unverified staging path
 is preserved and reported, never silently deleted or counted as clean teardown.
 
-`DockerForward`, introduced in protocol revision 7 and retained in revision 8,
+`DockerForward`, introduced in protocol revision 7 and retained in revision 9,
 is a dedicated bidirectional byte stream
 to the already provisioned `/run/vz-docker/docker.sock`. Callers cannot supply
 guest paths, hosts or ports. Bounded data frames, directional EOF and a guest
@@ -107,6 +107,56 @@ after a daemon crash remain unfinished. Same-UID host processes and directory
 ACL configuration remain trusted; there is no new cross-user authorization claim.
 
 ## Pending integration and evidence
+
+### Docker persistence correction (DEV, `vz-u0u`)
+
+New Developer Docker disks use pinned static e2fsprogs, not BusyBox's
+non-journaled formatter. Admission requires clean ext4 with `has_journal` and
+`extent`; legacy ext2/ext3, erroneous, or unclean disks are preserved and refused.
+This does not implement automatic journal recovery or authorize reformatting.
+
+The Developer init verifies the formatter binaries against their pinned
+provenance and installs them into the Machine's overlay root before entering
+the guest-agent chroot. Missing, modified, or unsafe tool paths fail boot;
+there is no fallback formatter. The first backend candidate
+`.artifacts/sandbox-vm-e2e/20260906T010254Z/` failed because the tools were
+present only in the outer initramfs. Its raw evidence and both exact guest
+bundles remain retained. Checked bootstrap execution now preserves spawn and
+transport errors instead of reporting a synthetic process exit code.
+
+Protocol revision 9 adds streaming `ShutdownDocker`. The exact owning guest
+fences Ensure and forwarding, drains relays, gracefully reaps its dockerd and
+containerd children, calls `syncfs`, normally unmounts its data disk, checks
+remaining process mount namespaces, and reports the filesystem UUID, features,
+and clean state. Host Stop requires this proof before VM power-off. A private,
+immutable `data/linux-lifecycle/stops/<operation_id>.json` in the exact Machine
+store binds the closure to the owner, runtime incarnation, and lifecycle
+operation before acknowledgement. Missing or failed proof is uncertainty, not
+successful Stop. Forced/lazy unmount and forced daemon termination are not
+fallbacks.
+
+Lifecycle receipts live beside, never inside, the immutable `linux-target`
+artifact pin. Backend candidate `.artifacts/sandbox-vm-e2e/20260906T013530Z/`
+passed its runtime and generation/teardown lanes but failed Machine reopen
+because the first receipt location violated the pin's exact inventory.
+The corrected layout preserves strict pin validation; a regression test covers
+receipt publication, catalog-independent reopen, and unexpected-entry refusal.
+Forwarding admission and daemon-stop notifications are separate: the supervisor
+may terminate its daemon children only after all forwarding permits drain.
+
+Unexpected daemon-child exit now retains ownership and requires recovery;
+the former automatic sibling-kill/restart loop is not safe recovery evidence.
+That recovery behavior and interrupted disk preparation remain unfinished.
+The installed persistence gate checks original container writable-layer and
+named-volume bytes after restart. Passing unit or formatter tests alone does
+not certify this correction or full Docker compatibility; failed installed
+candidates 1 and 2 remain retained.
+
+Fresh [installed recovery candidate 3](../scripts/helpers/installed_daemon_recovery_e2e.md#passing-scoped-candidate-2026-09-06-dev)
+passes positive Stop on four Machines, exact dead-daemon recovery, restart of
+the neighbor's two original containers with writable-layer and volume bytes,
+and two ownership-safe Deletes. This is scoped DEV persistence evidence, not
+active-Machine crash recovery or full Docker compatibility.
 
 Runtime admission now initializes only proven-new private ext4 disks and
 materializes the containerd and Docker configurations. Existing disks are never

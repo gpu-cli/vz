@@ -40,6 +40,6 @@ pub use vm::LinuxVm;
 pub use vz::protocol::ExecEvent as MachineExecOutputEvent;
 pub use vz::protocol::{NetworkServiceConfig, OciContainerState};
 pub use vz_agent_proto::{
-    ContainerGeneration, ContainerNamespaceIdentity, KernelObjectIdentity, ReconcileExecResponse,
-    reconcile_exec_response,
+    ContainerGeneration, ContainerNamespaceIdentity, DockerShutdownComplete, DockerShutdownEvent,
+    KernelObjectIdentity, ReconcileExecResponse, reconcile_exec_response,
 };

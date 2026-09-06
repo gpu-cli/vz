@@ -39,6 +39,13 @@ def live_session_fixture(machines):
             "receipts": [{"owner": machine["owner"], "operation_id": "lop_stop_fixture",
                           "generation": 2, "runtime_identity": machine["first_identity"],
                           "endpoint": copy.deepcopy(host["shutdown"][0]) if name != "hardened" else None,
+                          "docker_shutdown": {"request_id": "lop_stop_fixture", "data_device": "/dev/vda",
+                              "data_mount": "/var/lib/docker", "supervisor_started": True, "dockerd_reaped": True,
+                              "containerd_reaped": True, "filesystem_synced": True, "filesystem_unmounted": True,
+                              "never_started_unmounted": False, "filesystem_state": "clean",
+                              "filesystem_features": ["has_journal", "extent", "filetype"],
+                              "filesystem_uuid": ("a" if name == "developer_a" else "b") + "74d56ba-57cf-4c43-bf89-f9347397e18b"}
+                              if name != "hardened" else None,
                           "outcome": "stopped"} for name, machine in machines.items()]}
 
 
@@ -322,6 +329,51 @@ class EvidenceTests(unittest.TestCase):
             mutate(value)
             with self.assertRaises(InvalidEvidence):
                 validate_live_sessions(value, baseline["machines"])
+
+    def test_live_session_docker_closure_rejects_missing_foreign_and_hardened_authority(self):
+        baseline = fixture()
+        for mutate in [
+            lambda r: r[0].pop("docker_shutdown"), lambda r: r[0].update(docker_shutdown=None),
+            lambda r: r[0]["docker_shutdown"].update(extra=True),
+            lambda r: r[0]["docker_shutdown"].update(request_id="another-operation"),
+            lambda r: r[0]["docker_shutdown"].update(data_device="/dev/vdb"),
+            lambda r: r[0]["docker_shutdown"].update(data_mount="/foreign"),
+            lambda r: r[2].update(docker_shutdown=copy.deepcopy(r[0]["docker_shutdown"])),
+            lambda r: r[1].update(docker_shutdown=copy.deepcopy(r[0]["docker_shutdown"])),
+        ]:
+            value = copy.deepcopy(baseline["live_sessions"])
+            mutate(value["receipts"])
+            with self.subTest(mutation=mutate), self.assertRaises(InvalidEvidence):
+                validate_live_sessions(value, baseline["machines"])
+
+    def test_live_session_docker_closure_requires_strict_positive_boolean_boundaries(self):
+        baseline = fixture()
+        for field in ["supervisor_started", "dockerd_reaped", "containerd_reaped", "filesystem_synced", "filesystem_unmounted"]:
+            for changed in [False, 1, "true", None]:
+                value = copy.deepcopy(baseline["live_sessions"])
+                value["receipts"][0]["docker_shutdown"][field] = changed
+                with self.subTest(field=field, changed=changed), self.assertRaises(InvalidEvidence):
+                    validate_live_sessions(value, baseline["machines"])
+        for changed in [True, 0, None]:
+            value = copy.deepcopy(baseline["live_sessions"])
+            value["receipts"][0]["docker_shutdown"]["never_started_unmounted"] = changed
+            with self.subTest(changed=changed), self.assertRaises(InvalidEvidence):
+                validate_live_sessions(value, baseline["machines"])
+
+    def test_live_session_docker_closure_rejects_corrupt_unjournaled_or_replaced_filesystem(self):
+        baseline = fixture()
+        for field, variants in {
+            "filesystem_uuid": [None, "", "foreign", "00000000-0000-0000-0000-000000000000"],
+            "filesystem_state": [None, "not clean", "clean with errors"],
+            "filesystem_features": [None, [], "has_journal extent", ["has_journal"], ["extent"],
+                ["has_journal", "extent", "needs_recovery"], ["has_journal", "extent", "extent"],
+                ["has_journal", "extent", True], ["has_journal", "extent", "bad feature"]],
+        }.items():
+            for changed in variants:
+                value = copy.deepcopy(baseline["live_sessions"])
+                value["receipts"][0]["docker_shutdown"][field] = changed
+                with self.subTest(field=field, changed=changed), self.assertRaises(InvalidEvidence):
+                    validate_live_sessions(value, baseline["machines"])
 
     def test_domain_separated_identity_vectors(self):
         artifact = {"kernel_sha256": "6" * 64, "initramfs_sha256": "2" * 64,
