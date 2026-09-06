@@ -18,7 +18,7 @@ import linux_docker_image_input as image_input
 require = driver.require
 REPO = Path(__file__).resolve().parents[2]
 PIN = REPO / "config/docker-ssh-packages-bookworm-arm64.json"
-PIN_SHA256 = "891435e35077731a38f7c42ccb45665593fa5b5ea9c9fc594cfc7cc5eb991903"
+PIN_SHA256 = "aa751b309dfb8a0c7c0c3ab61c30bc9efd9ea2ec67fe15b7bc252a321e6cb4ca"
 IMAGE = REPO / "tests/fixtures/vz-0.4/docker/python-image-input.json"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 
@@ -56,6 +56,8 @@ def read_input(root, row):
 
 def guest_manifest(pin):
     return {"schema_version": 1, "dpkg_deb_sha256": pin["base"]["dpkg_deb"]["sha256"],
+            "extraction": {"aliases": dict(pin["base"]["extraction"]["aliases"]),
+                           **{key: dict(pin["base"]["extraction"][key]) for key in ("tar", "loader")}},
             "packages": [{key: row[key] for key in ("architecture", "filename", "package", "sha256", "size", "version")}
                          for row in pin["packages"]]}
 

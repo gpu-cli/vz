@@ -142,6 +142,32 @@ class Protocol(unittest.TestCase):
                 'import os; assert "HOME" not in os.environ; assert "SSH_AUTH_SOCK" not in os.environ; assert "PRIVATE_CANARY" not in os.environ; print("public")'])
         self.assertEqual((code, stdout, stderr), (0, b'public\n', b''))
 
+    def test_package_stdout_limit_does_not_change_environment(self):
+        with mock.patch.dict(os.environ, {'TAR_OPTIONS': '--unsafe', 'SSH_AUTH_SOCK': '/ambient'}):
+            result = probe.capture([sys.executable, '-c',
+                'import os; assert "TAR_OPTIONS" not in os.environ; assert "SSH_AUTH_SOCK" not in os.environ; os.write(1,b"p"*16384)'], stdout_limit=16384)
+        self.assertEqual(result, (0, b'p' * 16384, b''))
+
+    def test_package_stdout_limit_is_bounded_before_spawn(self):
+        for value in (True, 0, -1, 32 * 1024 * 1024 + 1, 'large'):
+            with self.subTest(value=value), mock.patch.object(probe.subprocess, 'Popen') as spawn, self.assertRaises(ValueError):
+                probe.capture(['/fake'], stdout_limit=value)
+            spawn.assert_not_called()
+
+    def test_enlarged_package_stdout_never_enlarges_stderr(self):
+        process = mock.Mock(pid=123456); process.poll.return_value = -9
+        selector = mock.MagicMock(); selector.__enter__.return_value = selector
+        selector.get_map.return_value = {1: True}
+        selector.select.return_value = [(mock.Mock(fd=1, data=1), None)]
+        with mock.patch.object(probe.subprocess, 'Popen', return_value=process), \
+             mock.patch.object(probe.selectors, 'DefaultSelector', return_value=selector), \
+             mock.patch.object(probe.os, 'set_blocking'), \
+             mock.patch.object(probe.os, 'read', return_value=b'x' * (probe.LIMIT + 1)), \
+             mock.patch.object(probe.os, 'killpg') as kill, self.assertRaises(ValueError):
+            probe.capture(['/fake'], stdout_limit=16 * 1024 * 1024)
+        kill.assert_called_once_with(process.pid, probe.signal.SIGKILL)
+        process.wait.assert_called_once_with(timeout=5)
+
     def test_subprocess_overflow_fails_and_reaps_owned_child(self):
         process = mock.Mock(pid=123456)
         process.poll.return_value = -9
@@ -257,10 +283,23 @@ class Recipe(unittest.TestCase):
 
 class Packages(unittest.TestCase):
     def fixture(self, root):
+        for patcher in getattr(self, '_fixture_patches', []):
+            patcher.stop()
+        self._fixture_patches = []
+        self.metadata_overrides = {}
         directory = root / 'packages'; directory.mkdir()
-        extractor = root / 'dpkg-deb'; extractor.write_bytes(b'fake extractor'); extractor.chmod(0o755)
+        (root / 'usr/bin').mkdir(parents=True)
+        (root / 'usr/sbin').mkdir()
+        (root / 'usr/lib/aarch64-linux-gnu').mkdir(parents=True)
+        extractor = root / 'usr/bin/dpkg-deb'; extractor.write_bytes(b'fake extractor'); extractor.chmod(0o755)
+        extraction = {'aliases': dict(packages.ALIASES)}
+        for name, path in [('tar', '/usr/bin/tar'), ('loader', '/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1')]:
+            file = root / path.lstrip('/'); file.write_bytes(('fake ' + name).encode()); file.chmod(0o755)
+            extraction[name] = {'path': path, 'size': file.stat().st_size, 'sha256': hashlib.sha256(file.read_bytes()).hexdigest()}
+        for path, target in packages.ALIASES.items():
+            (root / path.lstrip('/')).symlink_to(target)
         pins = {'schema_version': 1, 'dpkg_deb_sha256': hashlib.sha256(extractor.read_bytes()).hexdigest(),
-                'packages': []}
+                'packages': [], 'extraction': extraction}
         for index in range(8):
             name = 'p' + str(index); filename = name + '_1_arm64.deb'; data = name.encode()
             (directory / filename).write_bytes(data)
@@ -269,18 +308,53 @@ class Packages(unittest.TestCase):
                                      'size': len(data)})
         pinfile = root / 'pins.json'; pinfile.write_text(json.dumps(pins))
         (directory / 'manifest.json').write_bytes(pinfile.read_bytes())
+        original_guard, original_read = packages.runtime_guard, packages.read_regular
+        # Guard still checks real temporary symlinks/files/hashes. Only their
+        # host ownership is represented as guest root; never inspect host /lib.
+        original_lstat, original_readlink = os.lstat, os.readlink
+        def mapped(path):
+            path = Path(path)
+            return path if root in path.parents else root / str(path).lstrip('/')
+        def lstat(path):
+            info = original_lstat(mapped(path))
+            values = list(info); values[4] = values[5] = 0
+            if stat.S_ISLNK(info.st_mode):
+                values[0] = stat.S_IFLNK | 0o777
+            for index, value in self.metadata_overrides.get(str(path), {}).items():
+                values[index] = value
+            return os.stat_result(values)
+        def guarded(value):
+            with mock.patch.object(packages.os, 'lstat', side_effect=lstat), \
+                 mock.patch.object(packages.os, 'readlink', side_effect=lambda p: original_readlink(mapped(p))), \
+                 mock.patch.object(packages, 'read_regular', side_effect=lambda p, limit: original_read(mapped(p), limit)):
+                return original_guard(value)
+        patcher = mock.patch.object(packages, 'runtime_guard', side_effect=guarded)
+        patcher.start(); self.addCleanup(patcher.stop)
+        self._fixture_patches.append(patcher)
+        original_temp = tempfile.mkdtemp
+        def temporary(*args, **kwargs):
+            if kwargs.get('prefix') == 'vz-ssh-package-':
+                return original_temp(prefix='spool-', dir=root)
+            return original_temp(*args, **kwargs)
+        temp_patch = mock.patch.object(packages.tempfile, 'mkdtemp', side_effect=temporary)
+        temp_patch.start(); self.addCleanup(temp_patch.stop)
+        self._fixture_patches.append(temp_patch)
         return directory, pinfile, extractor
 
     def test_extract_only_exact_admitted_bytes_and_never_install(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory); pkg, pins, extractor = self.fixture(root)
-            runner = mock.Mock(return_value=(0, b'', b''))
+            runner = mock.Mock(side_effect=lambda argv, **kwargs: (0, b'inert tar fixture' if '--fsys-tarfile' in argv else b'', b''))
             with mock.patch.object(packages, 'DPKG', str(extractor)), contextlib.redirect_stdout(io.StringIO()):
                 packages.extract(pkg, pins, runner)
-            self.assertEqual(runner.call_count, 8)
-            for call in runner.call_args_list:
-                self.assertEqual(call.args[0][:2], [str(extractor), '--extract'])
-                self.assertEqual(call.args[0][-1], '/')
+            self.assertEqual(runner.call_count, 16)
+            for first, second in zip(runner.call_args_list[::2], runner.call_args_list[1::2]):
+                self.assertEqual(first.args[0][:2], [str(extractor), '--fsys-tarfile'])
+                self.assertEqual(first.kwargs, {'stdout_limit': 16 * 1024 * 1024})
+                self.assertEqual(second.args[0][:3], ['/usr/bin/tar', '--extract', '--preserve-permissions'])
+                self.assertEqual(second.args[0][-4:], ['--directory', '/', '--keep-directory-symlink', '--warning=no-timestamp'])
+                self.assertEqual(second.kwargs, {})
+            self.assertFalse(list(root.glob('spool-*')))
 
     def test_package_drift_missing_extra_and_symlink_fail_before_first_effect(self):
         for mutation in ('bytes', 'extra', 'missing', 'symlink', 'extractor'):
@@ -315,6 +389,91 @@ class Packages(unittest.TestCase):
                     (pkg / 'manifest.json').write_text(json.dumps(value))
                 else:
                     (pkg / 'manifest.json').write_bytes(pins.read_bytes()[:-1] + b',"schema_version":1}')
+                runner = mock.Mock()
+                with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(ValueError):
+                    packages.extract(pkg, pins, runner)
+                runner.assert_not_called()
+
+    def test_alias_tool_and_loader_drift_rejected_before_any_runner(self):
+        for kind in ('alias-target', 'alias-directory', 'tar-bytes', 'loader-bytes', 'tool-mode', 'alias-owner', 'tool-owner'):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); pkg, pins, extractor = self.fixture(root)
+                if kind.startswith('alias-') and kind != 'alias-owner':
+                    (root / 'lib').unlink()
+                    if kind == 'alias-directory': (root / 'lib').mkdir()
+                    else: (root / 'lib').symlink_to('usr/bin')
+                elif kind == 'tar-bytes': (root / 'usr/bin/tar').write_bytes(b'changed')
+                elif kind == 'loader-bytes': (root / 'usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1').write_bytes(b'changed')
+                elif kind == 'tool-mode': (root / 'usr/bin/tar').chmod(0o700)
+                elif kind == 'alias-owner': self.metadata_overrides['/lib'] = {4: 1}
+                elif kind == 'tool-owner': self.metadata_overrides['/usr/bin/tar'] = {5: 1}
+                runner = mock.Mock()
+                with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises((ValueError, OSError)):
+                    packages.extract(pkg, pins, runner)
+                runner.assert_not_called()
+
+    def test_alias_replaced_during_tar_is_not_repaired_or_accepted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); pkg, pins, extractor = self.fixture(root)
+            def execute(argv, **kwargs):
+                if '--fsys-tarfile' in argv: return 0, b'inert tar fixture', b''
+                (root / 'lib').rename(root / 'old-lib')
+                (root / 'lib').symlink_to('usr/lib')
+                return 0, b'', b''
+            runner = mock.Mock(side_effect=execute)
+            with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(ValueError):
+                packages.extract(pkg, pins, runner)
+            self.assertEqual(runner.call_count, 2)
+            self.assertTrue((root / 'old-lib').is_symlink())
+            self.assertFalse(list(root.glob('spool-*')))
+
+    def test_spool_is_private_exact_and_absent_after_completed_tar_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); pkg, pins, extractor = self.fixture(root)
+            def execute(argv, **kwargs):
+                if '--fsys-tarfile' in argv: return 0, b'inert tar fixture', b''
+                spool = Path(argv[argv.index('--file') + 1])
+                self.assertEqual(spool.read_bytes(), b'inert tar fixture')
+                self.assertEqual(stat.S_IMODE(spool.stat().st_mode), 0o600)
+                self.assertEqual(stat.S_IMODE(spool.parent.stat().st_mode), 0o700)
+                return 1, b'', b'error'
+            runner = mock.Mock(side_effect=execute)
+            with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(ValueError):
+                packages.extract(pkg, pins, runner)
+            self.assertEqual(runner.call_count, 2)
+            self.assertFalse(list(root.glob('spool-*')))
+
+    def test_capture_exception_retains_spool_without_retry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory); pkg, pins, extractor = self.fixture(root)
+            runner = mock.Mock(side_effect=[(0, b'inert tar fixture', b''), TimeoutError('unproven reap')])
+            with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(TimeoutError):
+                packages.extract(pkg, pins, runner)
+            self.assertEqual(runner.call_count, 2)
+            spools = list(root.glob('spool-*/data.tar'))
+            self.assertEqual(len(spools), 1)
+            self.assertEqual(spools[0].read_bytes(), b'inert tar fixture')
+
+    def test_passthrough_bounds_and_unexpected_diagnostics_prevent_tar(self):
+        for result in ((0, b'', b''), (0, b'x' * (packages.LIMIT + 1), b''), (0, b'tar', b'warning'), (False, b'tar', b'')):
+            with self.subTest(size=len(result[1])), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); pkg, pins, extractor = self.fixture(root)
+                runner = mock.Mock(return_value=result)
+                with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(ValueError):
+                    packages.extract(pkg, pins, runner)
+                self.assertEqual(runner.call_count, 1)
+                self.assertFalse(list(root.glob('spool-*')))
+
+    def test_extraction_contract_rejects_unknown_keys_paths_and_boolean_sizes(self):
+        for change in ('extra', 'path', 'size', 'alias'):
+            with self.subTest(change=change), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory); pkg, pins, extractor = self.fixture(root)
+                value = json.loads(pins.read_bytes())
+                if change == 'extra': value['extraction']['extra'] = False
+                elif change == 'path': value['extraction']['tar']['path'] = '/bin/tar'
+                elif change == 'size': value['extraction']['tar']['size'] = True
+                else: value['extraction']['aliases']['/lib'] = 'foreign'
+                pins.write_text(json.dumps(value)); (pkg / 'manifest.json').write_bytes(pins.read_bytes())
                 runner = mock.Mock()
                 with mock.patch.object(packages, 'DPKG', str(extractor)), self.assertRaises(ValueError):
                     packages.extract(pkg, pins, runner)

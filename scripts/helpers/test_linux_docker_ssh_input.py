@@ -23,6 +23,13 @@ class SSHInputTests(unittest.TestCase):
         fixture = inputs.REPO / "tests/fixtures/vz-0.4/docker-ssh/package-pins.json"
         self.assertEqual(inputs.guest_manifest(pin), json.loads(fixture.read_bytes()))
         self.assertEqual(sum(row["size"] for row in pin["packages"]), 1763884)
+        extraction = inputs.guest_manifest(pin)["extraction"]
+        self.assertEqual(extraction["tar"]["path"], "/usr/bin/tar")
+        self.assertEqual(extraction["aliases"]["/lib"], "usr/lib")
+        extraction["aliases"]["/lib"] = "foreign"
+        extraction["tar"]["sha256"] = "0" * 64
+        self.assertEqual(pin["base"]["extraction"]["aliases"]["/lib"], "usr/lib")
+        self.assertNotEqual(pin["base"]["extraction"]["tar"]["sha256"], "0" * 64)
 
     def test_modified_pin_is_not_admitted(self):
         path = self.root / "pin.json"
@@ -73,7 +80,8 @@ class SSHInputTests(unittest.TestCase):
         raw, row = self.row()
         (self.root / "must-not-copy").write_bytes(b"unrelated")
         destination = self.root / "packages"
-        pin = {"packages": [row], "base": {"dpkg_deb": {"sha256": "1" * 64}}}
+        pin = {"packages": [row], "base": {"dpkg_deb": {"sha256": "1" * 64},
+               "extraction": inputs.load()["base"]["extraction"]}}
         with patch.object(inputs, "load", return_value=pin):
             proof = inputs.stage_packages(self.root, destination)
         self.assertEqual({item.name for item in destination.iterdir()}, {"test.deb", "manifest.json"})

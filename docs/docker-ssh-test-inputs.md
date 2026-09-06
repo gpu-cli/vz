@@ -4,10 +4,10 @@ The SSH forwarding fixture uses an authenticated, offline Debian ARM64 runtime
 overlay. Its exact inputs and finite byte limits are recorded in
 [the package pin](../config/docker-ssh-packages-bookworm-arm64.json). This is test
 input admission, not evidence that SSH forwarding or the full Docker gate passed.
-The checked-in pin is 13,742 bytes with SHA256
-`891435e35077731a38f7c42ccb45665593fa5b5ea9c9fc594cfc7cc5eb991903`.
-Its only byte-level difference from the retained candidate pin is a final
-newline; the original candidate remains unchanged.
+The checked-in pin is 14,332 bytes with SHA256
+`aa751b309dfb8a0c7c0c3ab61c30bc9efd9ea2ec67fe15b7bc252a321e6cb4ca`.
+It additionally authenticates the base's GNU tar, ELF loader, and merged-`/usr`
+aliases. The original candidate and its evidence remain unchanged.
 
 ## Immutable inputs and trust
 
@@ -54,9 +54,12 @@ Reproduction uses the pin's exact descriptors and bounds:
    and control identity. Keep size/decompression limits finite; do not install
    or execute downloaded code during host-side admission.
 4. Stage regular DEB files plus the exact guest manifest. Inside the owned test
-   image, verify all staged bytes and the pinned `/usr/bin/dpkg-deb` before any
-   `dpkg-deb --extract` operation. Extraction is offline and runs no maintainer
-   scripts. There is no `apt`, `dpkg -i`, or mutable package resolution.
+   image, verify all staged bytes, tools, loader, and directory aliases before
+   any extraction. Capture `dpkg-deb --fsys-tarfile` with a 16 MiB limit into a
+   private spool, then invoke pinned GNU tar with `--keep-directory-symlink`.
+   Recheck identities and bytes around each package. Extraction is offline and
+   runs no maintainer scripts. There is no `apt`, `dpkg -i`, or mutable package
+   resolution.
 
 The pin's `source_proofs` is a finite list of filename/size/SHA256 descriptors:
 base metadata and installed status, signature transcripts, the closure summary,
@@ -78,7 +81,7 @@ positive/negative forwarding tests remain separate required evidence.
 ## Account and diagnostic policy
 
 The first installed-Mac SSH candidate failed before reaching an SSH operation:
-the current direct `dpkg-deb --extract` path does not preserve the base's
+the original direct `dpkg-deb --extract` path did not preserve the base's
 merged-`/usr` directory aliases. A separate public-input diagnostic passed
 admission and seven extractions, then the next executable failed with ENOENT.
 The OpenSSH server archive contains a `./lib/` directory, while the admitted
@@ -88,11 +91,13 @@ failure. All four Machines were subsequently stopped with clean-journal
 receipts; this attempt remains failed, not an SSH compatibility pass.
 
 Setting `TAR_OPTIONS` is not a fix: dpkg 1.21.23's `extracthalf` explicitly
-removes it before invoking tar. The remaining extraction work is a bounded
+removes it before invoking tar. The replacement extractor uses a bounded
 `dpkg-deb --fsys-tarfile` path followed by independently pinned GNU tar with
 explicit `--keep-directory-symlink`, preserving and verifying the known
 directory aliases and loader/tool identities before and after extraction.
-This replacement is not yet implemented or physically verified. See
+All eight admitted archives fit the 16 MiB per-package limit (9,830,400 bytes
+total uncompressed). Source review and fixture tests cover the replacement;
+fresh installed-Mac verification remains required. See
 [GNU tar's option semantics](https://www.gnu.org/software/tar/manual/html_node/Option-Summary.html)
 and the [matching dpkg source archive](https://deb.debian.org/debian/pool/main/d/dpkg/dpkg_1.21.23.tar.xz).
 

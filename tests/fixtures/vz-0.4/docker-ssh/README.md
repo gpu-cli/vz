@@ -8,8 +8,18 @@ builder, disposable agent, server host key and package/base inputs.
 Stage the eight authenticated offline Debian OpenSSH DEBs at `packages/` with
 `packages/manifest.json` equal to the checked-in `package-pins.json`. Server and
 clients use the same registry-resolvable pinned Python ARM64 base. A network-none
-RUN verifies every DEB and the base-owned `dpkg-deb` binary before extracting
-data only. No mutable apt operation or maintainer script runs. `server.py`
+RUN verifies every DEB and the base-owned `dpkg-deb`, GNU tar and ELF loader
+before extracting data only. Each `dpkg-deb --fsys-tarfile` capture is limited to
+16 MiB stdout, 8 KiB stderr and 15 seconds, then spooled into an owned private
+guest directory. Explicit GNU tar `--keep-directory-symlink` preserves the
+authenticated merged-/usr aliases; their root ownership, targets and identities,
+and the pinned tool/loader bytes are checked before and after every extraction.
+`dpkg-deb --extract` cannot be used here: it unsets `TAR_OPTIONS` and its default
+tar invocation replaces `/lib` with a directory, hiding the ELF loader.
+No inherited `TAR_OPTIONS`, mutable apt operation or maintainer script runs.
+SSH subprocess limits and sanitized environment are unchanged. If process
+reaping is unproven, its private spool is retained for Machine lifecycle cleanup.
+`server.py`
 installs fresh dedicated `vzssh` (10001) and privilege-separation `sshd` (10002)
 accounts, rejecting any existing name/ID instead of repairing or unlocking it.
 The Linux OpenSSH build treats shadow `!` as locked; shadow `*` is not a usable

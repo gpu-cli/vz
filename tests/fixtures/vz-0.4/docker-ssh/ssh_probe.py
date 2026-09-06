@@ -142,8 +142,9 @@ def classify(item, code, stdout, stderr):
     return 'operational_failure'
 
 
-def capture(command):
+def capture(command, *, stdout_limit=LIMIT):
     """Bound both pipes while reading; on failure kill only owned process and reap."""
+    require(type(stdout_limit) is int and 0 < stdout_limit <= 32 * 1024 * 1024)
     env = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C',
            'SSH_ASKPASS_REQUIRE': 'never'}
     process = subprocess.Popen(command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
@@ -164,7 +165,7 @@ def capture(command):
                         selector.unregister(key.fileobj)
                     else:
                         buffers[key.data].extend(chunk)
-                        require(len(buffers[key.data]) <= LIMIT)
+                        require(len(buffers[key.data]) <= (stdout_limit if key.data == 0 else LIMIT))
         code = process.wait(timeout=max(0.001, deadline - time.monotonic()))
         return code, bytes(buffers[0]), bytes(buffers[1])
     except BaseException:

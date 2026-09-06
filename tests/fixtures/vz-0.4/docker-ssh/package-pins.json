@@ -1,5 +1,23 @@
 {
   "dpkg_deb_sha256": "b85e5cbe3dbb1cb9af9319994fdedf00d3dfac6234191e8b2e5ba0e90f5fa197",
+  "extraction": {
+    "aliases": {
+      "/bin": "usr/bin",
+      "/lib": "usr/lib",
+      "/sbin": "usr/sbin",
+      "/usr/lib/ld-linux-aarch64.so.1": "aarch64-linux-gnu/ld-linux-aarch64.so.1"
+    },
+    "loader": {
+      "path": "/usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+      "sha256": "17538b8f9889a470c061f69a8fea8124da89627311cd16546c133a89f09056df",
+      "size": 202912
+    },
+    "tar": {
+      "path": "/usr/bin/tar",
+      "sha256": "fa2df5eddc2295398bf869b103818b45184cfaa99ec66ae1af7ed3bdf4c94423",
+      "size": 539896
+    }
+  },
   "packages": [
     {
       "architecture": "arm64",
