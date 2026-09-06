@@ -4,7 +4,7 @@
 //! - Streamed solve/output events are forwarded in receive order.
 //! - `buildctl` raw-json decode callbacks are emitted before terminal status handling.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::ffi::OsStr;
 use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
@@ -1684,8 +1684,184 @@ async fn start_buildkit_vm(
         return Err(err.into());
     }
 
+    // init starts DHCP in the background: agent readiness does not establish
+    // the route needed by a newly created (including context-switched) builder.
+    if let Err(error) = wait_for_buildkit_network(
+        config.default_network_enabled,
+        config.agent_ready_timeout,
+        |timeout| {
+            vm.exec_collect(
+                "/bin/busybox".to_string(),
+                vec![
+                    "sh".to_string(),
+                    "-c".to_string(),
+                    BUILDKIT_NETWORK_SAMPLE.to_string(),
+                ],
+                timeout,
+            )
+        },
+    )
+    .await
+    {
+        if vm.stop().await.is_ok() {
+            runtime_guard.cleanup_on_drop();
+        }
+        return Err(error);
+    }
+
     let runtime_dir = runtime_guard.into_runtime_dir()?;
     Ok(StartedBuildkitVm { vm, runtime_dir })
+}
+
+// Local configuration observations only; never resolve DNS, contact an external
+// endpoint, restart DHCP, or infer offline policy from a missing interface.
+const BUILDKIT_NETWORK_SAMPLE: &str = r#"
+set -eu
+printf 'addresses\n'
+/bin/busybox ip -4 addr show dev eth0
+printf 'routes\n'
+/bin/busybox ip -4 route show default
+printf 'dhcp_pids\n'
+/bin/busybox pidof udhcpc || true
+"#;
+
+fn buildkit_network_sample_ready(sample: &str) -> bool {
+    fn usable_ipv4(value: &str) -> bool {
+        value.parse::<std::net::Ipv4Addr>().is_ok_and(|address| {
+            let octets = address.octets();
+            octets[0] != 0 && !address.is_loopback() && !address.is_link_local() && octets[0] < 224
+        })
+    }
+
+    let Some(sample) = sample.strip_prefix("addresses\n") else {
+        return false;
+    };
+    let Some((addresses, remainder)) = sample.split_once("routes\n") else {
+        return false;
+    };
+    let Some((routes, _dhcp)) = remainder.split_once("dhcp_pids\n") else {
+        return false;
+    };
+    let link_up = addresses.lines().next().is_some_and(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.get(1) == Some(&"eth0:")
+            && fields.get(2).is_some_and(|flags| {
+                flags
+                    .trim_matches(['<', '>'])
+                    .split(',')
+                    .any(|flag| flag == "UP")
+            })
+    });
+    let address_ready = addresses.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.first() == Some(&"inet")
+            && fields.get(1).is_some_and(|cidr| {
+                cidr.split_once('/').is_some_and(|(ip, prefix)| {
+                    usable_ipv4(ip) && prefix.parse::<u8>().is_ok_and(|bits| bits <= 32)
+                })
+            })
+            && fields.windows(2).any(|pair| pair == ["scope", "global"])
+            && fields.last() == Some(&"eth0")
+            && !fields
+                .iter()
+                .any(|field| matches!(*field, "tentative" | "dadfailed"))
+    });
+    let route_ready = routes.lines().any(|line| {
+        let fields: Vec<_> = line.split_whitespace().collect();
+        fields.first() == Some(&"default")
+            && fields.windows(2).any(|pair| pair == ["dev", "eth0"])
+            && fields
+                .windows(2)
+                .any(|pair| pair[0] == "via" && usable_ipv4(pair[1]))
+            && !fields.contains(&"linkdown")
+    });
+    link_up && address_ready && route_ready
+}
+
+async fn wait_for_buildkit_network<F, Fut, E>(
+    enabled: bool,
+    timeout: Duration,
+    mut sample: F,
+) -> Result<(), BuildkitError>
+where
+    F: FnMut(Duration) -> Fut,
+    Fut: std::future::Future<Output = Result<ExecOutput, E>>,
+    E: std::fmt::Display,
+{
+    if !enabled {
+        return Ok(());
+    }
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut observations = VecDeque::new();
+    loop {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(buildkit_network_readiness_error(
+                timeout,
+                "deadline expired",
+                &observations,
+            ));
+        }
+        let probe_timeout = remaining.min(Duration::from_secs(2));
+        let output = match tokio::time::timeout(probe_timeout, sample(probe_timeout)).await {
+            Ok(Ok(output)) => output,
+            Ok(Err(error)) => {
+                return Err(buildkit_network_readiness_error(
+                    timeout,
+                    &format!("sample execution failed: {error}"),
+                    &observations,
+                ));
+            }
+            Err(_) => {
+                return Err(buildkit_network_readiness_error(
+                    timeout,
+                    "sample execution timed out",
+                    &observations,
+                ));
+            }
+        };
+        let ready = output.exit_code == 0 && buildkit_network_sample_ready(&output.stdout);
+        let observation = format!(
+            "elapsed_ms={} exit={} stdout={:?} stderr={:?}",
+            started.elapsed().as_millis(),
+            output.exit_code,
+            output.stdout.chars().take(2048).collect::<String>(),
+            output.stderr.chars().take(2048).collect::<String>(),
+        );
+        tracing::info!(sample = %observation, ready, "BuildKit guest local network readiness sample");
+        if observations.len() == 4 {
+            observations.pop_front();
+        }
+        observations.push_back(observation);
+        if output.exit_code != 0 {
+            return Err(buildkit_network_readiness_error(
+                timeout,
+                "sample command failed",
+                &observations,
+            ));
+        }
+        if ready {
+            tracing::info!(samples = ?observations, "BuildKit guest eth0 IPv4 address and default route ready");
+            return Ok(());
+        }
+        tokio::time::sleep_until(
+            (tokio::time::Instant::now() + BUILDKIT_VM_RETRY_DELAY).min(deadline),
+        )
+        .await;
+    }
+}
+
+fn buildkit_network_readiness_error(
+    timeout: Duration,
+    reason: &str,
+    observations: &VecDeque<String>,
+) -> BuildkitError {
+    std::io::Error::other(format!(
+        "BuildKit guest network readiness failed (budget {timeout:?}): {}; expected usable eth0 IPv4 address and default route; last local samples: {observations:?}",
+        reason.chars().take(2048).collect::<String>(),
+    ))
+    .into()
 }
 
 async fn run_guest_build(
@@ -2210,6 +2386,132 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+
+    const NETWORK_READY: &str = "addresses\n2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500\n    inet 192.168.64.2/24 brd 192.168.64.255 scope global eth0\n       valid_lft forever preferred_lft forever\nroutes\ndefault via 192.168.64.1 dev eth0\ndhcp_pids\n";
+
+    fn network_output(stdout: &str) -> ExecOutput {
+        ExecOutput {
+            stdout: stdout.to_string(),
+            stderr: String::new(),
+            exit_code: 0,
+        }
+    }
+
+    #[test]
+    fn buildkit_network_readiness_requires_address_and_route_on_up_eth0() {
+        assert!(buildkit_network_sample_ready(NETWORK_READY));
+        for bad in [
+            NETWORK_READY.replace("UP,LOWER_UP", "LOWER_UP"),
+            NETWORK_READY.replace("scope global", "scope host"),
+            NETWORK_READY.replace("192.168.64.2/24", "127.0.0.1/8"),
+            NETWORK_READY.replace("192.168.64.2/24", "169.254.1.2/16"),
+            NETWORK_READY.replace("192.168.64.2/24", "0.0.0.0/0"),
+            NETWORK_READY.replace("192.168.64.2/24", "224.0.0.1/24"),
+            NETWORK_READY.replace("192.168.64.2/24", "192.168.64.2/33"),
+            NETWORK_READY.replace("scope global eth0", "scope global eth1"),
+            NETWORK_READY.replace("scope global", "scope global tentative"),
+            NETWORK_READY.replace("dev eth0", "dev eth1"),
+            NETWORK_READY.replace("via 192.168.64.1 ", ""),
+            NETWORK_READY.replace("via 192.168.64.1", "via 0.0.0.0"),
+            NETWORK_READY.replace("dev eth0", "dev eth0 linkdown"),
+            NETWORK_READY.replace("default via 192.168.64.1 dev eth0\n", ""),
+            NETWORK_READY.replace("addresses\n", ""),
+        ] {
+            assert!(!buildkit_network_sample_ready(&bad), "accepted {bad}");
+        }
+        // DHCP can successfully exit after obtaining a lease. Its process is
+        // diagnostic, neither necessary nor sufficient to declare readiness.
+        assert!(buildkit_network_sample_ready(&format!(
+            "{NETWORK_READY}42\n"
+        )));
+        assert!(!buildkit_network_sample_ready(
+            "addresses\nroutes\ndhcp_pids\n42\n"
+        ));
+    }
+
+    #[tokio::test]
+    async fn buildkit_network_readiness_offline_never_samples() {
+        wait_for_buildkit_network(false, Duration::ZERO, |_| async {
+            panic!("offline VM must not execute a network probe");
+            #[allow(unreachable_code)]
+            Ok::<_, String>(network_output(""))
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn buildkit_network_readiness_waits_through_dhcp_configuration() {
+        let mut calls = 0;
+        wait_for_buildkit_network(true, Duration::from_secs(3), |_| {
+            calls += 1;
+            let output = match calls {
+                1 => network_output("addresses\n2: eth0: <UP> mtu 1500\nroutes\ndhcp_pids\n42\n"),
+                2 => network_output(
+                    &NETWORK_READY.replace("default via 192.168.64.1 dev eth0\n", ""),
+                ),
+                _ => network_output(NETWORK_READY),
+            };
+            async { Ok::<_, String>(output) }
+        })
+        .await
+        .unwrap();
+        assert_eq!(calls, 3);
+    }
+
+    #[tokio::test]
+    async fn buildkit_network_readiness_deadline_retains_bounded_samples() {
+        let output = format!("addresses\nroutes\ndhcp_pids\n42\n{}", "x".repeat(20_000));
+        let error = wait_for_buildkit_network(true, Duration::from_millis(10), |_| {
+            let output = network_output(&output);
+            async { Ok::<_, String>(output) }
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("deadline expired"));
+        assert!(error.contains("dhcp_pids"));
+        assert!(error.contains("42"));
+        assert!(error.contains("elapsed_ms="));
+        assert!(error.len() < 5000);
+    }
+
+    #[tokio::test]
+    async fn buildkit_network_readiness_bounds_hung_probe() {
+        let mut calls = 0;
+        let error = wait_for_buildkit_network(true, Duration::from_millis(10), |_| {
+            calls += 1;
+            std::future::pending::<Result<ExecOutput, String>>()
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("sample execution timed out"));
+        assert_eq!(calls, 1);
+    }
+
+    #[tokio::test]
+    async fn buildkit_network_readiness_command_and_transport_errors_fail_closed() {
+        let error = wait_for_buildkit_network(true, Duration::from_secs(1), |_| async {
+            let mut output = network_output(NETWORK_READY);
+            output.exit_code = 1;
+            output.stderr = "eth0 missing".to_string();
+            Ok::<_, String>(output)
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("sample command failed"));
+        assert!(error.contains("eth0 missing"));
+
+        let error = wait_for_buildkit_network(true, Duration::from_secs(1), |_| async {
+            Err::<ExecOutput, _>("checked exec stream truncated")
+        })
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("checked exec stream truncated"));
+    }
 
     #[test]
     fn context_mount_compatibility_allows_cache_without_context() {

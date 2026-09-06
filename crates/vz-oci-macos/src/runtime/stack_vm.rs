@@ -299,7 +299,9 @@ mod docker_filesystem_tests {
     #[test]
     fn incomplete_boot_is_owned_but_cannot_be_reused_or_power_stopped() {
         assert!(require_complete_shared_vm_boot("exact-machine", true).is_ok());
-        let error = require_complete_shared_vm_boot("exact-machine", false).unwrap_err();
+        let Err(error) = require_complete_shared_vm_boot("exact-machine", false) else {
+            panic!("incomplete boot must refuse reuse");
+        };
         assert!(
             error
                 .to_string()
@@ -313,13 +315,17 @@ mod docker_filesystem_tests {
         let source = include_str!("stack_vm.rs");
         let boot = source
             .rsplit_once("async fn boot_shared_vm_locked(")
-            .unwrap()
+            .unwrap_or_else(|| panic!("shared VM bootstrap function must exist"))
             .1
             .split_once("/// Create and start an OCI container")
-            .unwrap()
+            .unwrap_or_else(|| panic!("container creation boundary must follow bootstrap"))
             .0;
-        let published = boot.find("self.stack_vms.lock().await.insert(").unwrap();
-        let started = boot.find("vm.start().await?").unwrap();
+        let published = boot
+            .find("self.stack_vms.lock().await.insert(")
+            .unwrap_or_else(|| panic!("bootstrap must publish ownership"));
+        let started = boot
+            .find("vm.start().await?")
+            .unwrap_or_else(|| panic!("bootstrap must start its VM"));
         assert!(published < started);
         assert!(!boot.contains("vm.stop()"));
         assert!(boot.contains("boot_complete: false"));
