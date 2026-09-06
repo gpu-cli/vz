@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEV installed Linux-on-macOS Compose/Buildx/artifact/SSH slices; not certification.
+"""DEV installed Linux-on-macOS Docker slices; not certification.
 
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
@@ -27,6 +27,7 @@ BUILD_SCOPE = "DEV_INSTALLED_LINUX_BUILDX_NOT_RELEASE_CERTIFICATION"
 ARTIFACT_SCOPE = "DEV_INSTALLED_LINUX_BUILD_ARTIFACTS_NOT_RELEASE_CERTIFICATION"
 PARALLEL_SCOPE = "DEV_INSTALLED_LINUX_PARALLEL_BUILD_NOT_RELEASE_CERTIFICATION"
 SSH_SCOPE = "DEV_INSTALLED_LINUX_SSH_BUILD_NOT_RELEASE_CERTIFICATION"
+LIFECYCLE_SCOPE = "DEV_INSTALLED_LINUX_CONTAINER_LIFECYCLE_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -35,13 +36,13 @@ require = driver.require
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
-             "ssh-fixture", "ssh-packages", "ssh-gpgv")
+             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -52,8 +53,10 @@ def arguments(argv):
     parser.add_argument("--ssh-fixture")
     parser.add_argument("--ssh-packages")
     parser.add_argument("--ssh-gpgv")
+    parser.add_argument("--container-fixture")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.container_fixture is None or args.suite == "lifecycle", "container-fixture requires the lifecycle suite")
     require(args.parallel_fixture is None or args.suite == "parallel", "parallel-fixture requires the parallel suite")
     require(args.suite == "ssh" or all(getattr(args, name) is None for name in ("ssh_fixture", "ssh_packages", "ssh_gpgv")),
             "SSH options require the ssh suite")
@@ -69,14 +72,15 @@ def arguments(argv):
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh"}, "full contract unavailable")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full contract unavailable")
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
     pin = image_input.load(pin_path)
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
-    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE, "ssh": SSH_SCOPE}
+    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
+              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -139,6 +143,21 @@ def preflight(args, require_host=True):
             path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
         info["inputs"][str(ssh_input.PIN)] = startup.digest(ssh_input.PIN)
+        for path in selected.iterdir():
+            info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == "lifecycle":
+        from linux_docker_container_fixture import fixture_contract
+        selected = startup.canonical(getattr(args, "container_fixture", None) or
+                                     str(REPO / "tests/fixtures/vz-0.4/docker-container-io"))
+        fixture_contract(selected)
+        info.update(container_fixture=str(selected), container_fixture_sha256=driver.tree_digest(selected))
+        for name in ("linux_docker_container_lifecycle.py", "linux_docker_container_state.py",
+                     "linux_docker_container_commands.py", "linux_docker_container_fixture.py",
+                     "linux_docker_container_exec.py", "linux_docker_container_follow.py",
+                     "linux_docker_interactive_capture.py", "linux_docker_interactive_evidence.py",
+                     "linux_docker_buildkit_shutdown.py"):
+            path = REPO / "scripts/helpers" / name
+            info["inputs"][str(path)] = startup.digest(path)
         for path in selected.iterdir():
             info["inputs"][str(path)] = startup.digest(path)
     return info
@@ -536,6 +555,11 @@ class ComposeHarness(startup.Harness):
         if self.monitor is not None:
             require(not self.monitor.thread.is_alive(), "live monitor prevents cleanup")
             recorders.append(self.monitor.record)
+        for selected in self.drivers:
+            follower = getattr(selected, "follow_thread", None)
+            require(follower is None or not follower.is_alive(), "live log follower prevents cleanup")
+        require(all(not getattr(record, "pending_interactions", []) for record in recorders),
+                "pending interactive process prevents cleanup")
         require(not self.effects_uncertain and all(not any(x["effects_uncertain"] for x in r.receipts) for r in recorders),
                 "uncertain mutation: resources retained; cleanup withheld")
         require(len(self.driver_cleanup_verified) == len(self.drivers) and all(self.driver_cleanup_verified),
@@ -624,13 +648,15 @@ class ComposeHarness(startup.Harness):
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
                 images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh"}:
+                if suite in {"artifacts", "parallel", "ssh", "lifecycle"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
                     elif suite == "parallel":
                         from linux_docker_build_parallel import run_machine
-                    else:
+                    elif suite == "ssh":
                         from linux_docker_build_ssh import run_machine
+                    else:
+                        from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()
                     observation = run_machine(self, descriptor, scope, proof, images, index)
                     end = time.time_ns()
@@ -771,6 +797,11 @@ def run(info):
                     "parallel fixture changed during run")
         if info["suite"] == "ssh":
             require(driver.tree_digest(Path(info["ssh_fixture"])) == info["ssh_fixture_sha256"], "SSH fixture changed during run")
+        if info["suite"] == "lifecycle":
+            from linux_docker_container_fixture import fixture_contract
+            selected = Path(info["container_fixture"])
+            fixture_contract(selected)
+            require(driver.tree_digest(selected) == info["container_fixture_sha256"], "container fixture changed during run")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:

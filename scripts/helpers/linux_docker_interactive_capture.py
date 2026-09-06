@@ -109,8 +109,9 @@ class CaptureResult:
     pending_process: object = None
 
 
-def capture(argv, *, executable, cwd, env, plan):
+def capture(argv, *, executable, cwd, env, plan, progress_observer=None):
     plan = validate_plan(plan)
+    require(progress_observer is None or callable(progress_observer), 'progress_observer_shape')
     require(type(argv) is list and bool(argv) and all(type(x) is str and '\0' not in x for x in argv),
             'argv_shape')
     require(type(env) is dict and all(type(k) is type(v) is str and k and '=' not in k and
@@ -125,6 +126,8 @@ def capture(argv, *, executable, cwd, env, plan):
                'effects_uncertain': True, 'owned_process_reaped': False,
                'error': None, 'cleanup_error': None, 'stdin_eof_count': 0,
                'terminal': None, 'termination': None}
+    if progress_observer is not None:
+        receipt['read_progress'] = []
     process = None
     owned_pid = None
     master = slave = None
@@ -237,6 +240,16 @@ def capture(argv, *, executable, cwd, env, plan):
                     room = plan['output_limit'] - len(output[key.data])
                     output[key.data].extend(chunk[:room])
                     require(len(chunk) <= room, 'output_limit')
+                    if progress_observer is not None:
+                        require(len(receipt['read_progress']) < 2048, 'progress_observation_limit')
+                        observation = {'index': len(receipt['read_progress']), 'stream': key.data,
+                            'observed_bytes': {name: len(data) for name, data in output.items()},
+                            'observed': stamp()}
+                        receipt['read_progress'].append(observation)
+                        # Only public counts/clocks reach the source-owned hook;
+                        # no bytes and no mutable reference to retained evidence.
+                        progress_observer({**observation, 'observed_bytes': dict(observation['observed_bytes']),
+                                           'observed': dict(observation['observed'])})
         receipt.update(capture_complete=True, effects_uncertain=False, owned_process_reaped=True)
     except BaseException as error:
         receipt['error'] = str(error) if isinstance(error, CaptureError) else type(error).__name__

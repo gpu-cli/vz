@@ -433,7 +433,9 @@ class Recorder:
 
     def run(self, argv: list[str], *, executable: str, timeout: int = 120,
             extra_env: dict[str, str] | None = None, mutation: bool = True,
-            interaction_plan: dict[str, Any] | None = None) -> Command:
+            interaction_plan: dict[str, Any] | None = None, progress_observer=None) -> Command:
+        require(progress_observer is None or (callable(progress_observer) and interaction_plan is not None),
+                "progress observer requires interactive capture")
         private_inputs = (*argv, executable, *self.env.keys(), *self.env.values(),
                           *(extra_env or {}).keys(), *(extra_env or {}).values())
         require(not contains_canary(tuple(value.encode() for value in private_inputs), self.canaries),
@@ -483,8 +485,9 @@ class Recorder:
         # A terminal exists only for an explicit plan on a fresh owned PTY.
         try:
             if interaction_plan is not None:
+                progress_options = {"progress_observer": progress_observer} if progress_observer is not None else {}
                 captured = interactive.capture(argv, executable=executable, env=self.env | (extra_env or {}),
-                                               cwd=self.root, plan=interaction_plan)
+                                               cwd=self.root, plan=interaction_plan, **progress_options)
                 interaction = captured.receipt
                 if captured.pending_process is not None:
                     self.pending_interactions.append(captured.pending_process)
@@ -639,7 +642,8 @@ class Driver:
         return sha256(data)
 
     def command(self, args: list[str], *, expected: int | None = 0, timeout: int = 120,
-                env: dict[str, str] | None = None, interaction_plan: dict[str, Any] | None = None) -> Command:
+                env: dict[str, str] | None = None, interaction_plan: dict[str, Any] | None = None,
+                progress_observer=None) -> Command:
         require(self.validate_config() == self.config_snapshot, "client config changed")
         for pin in self.inputs.raw["clients"].values():
             require(sha256(regular(Path(pin["path"]))) == pin["sha256"], "client executable changed")
@@ -651,6 +655,8 @@ class Driver:
             ["network", "inspect"], ["network", "ls"], ["volume", "inspect"], ["volume", "ls"],
             ["buildx", "inspect"], ["compose", "version"]]
         options = {"interaction_plan": interaction_plan} if interaction_plan is not None else {}
+        if progress_observer is not None:
+            options["progress_observer"] = progress_observer
         result = self.record.run(argv, executable=executable, timeout=timeout, extra_env=env,
                                  mutation=not readonly, **options)
         if expected is not None:

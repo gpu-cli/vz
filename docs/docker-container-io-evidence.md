@@ -2,8 +2,9 @@
 
 Tracked by `vz-mzs.7.1.6`. This is test infrastructure for the 16
 `docker.container.*` scenarios, not a completed Docker compatibility lane.
-The installed lifecycle dispatcher and its physical Docker acceptance remain
-unfinished. `run-linux-docker-e2e.sh --suite all` still rejects before provisioning.
+The installed lifecycle dispatcher is available as the explicit DEV
+`run-linux-docker-e2e.sh --suite lifecycle` slice; its physical Docker acceptance
+remains unfinished. `--suite all` still rejects before provisioning.
 
 ## Implemented capture boundary
 
@@ -68,14 +69,24 @@ authenticated container incarnation.
 
 ## Remaining acceptance
 
-Connect these primitives to the installed Mac topology harness and execute the
-entire container block: lifecycle identity/process generations, health polling,
+The lifecycle dispatcher now connects these primitives to the installed Mac
+topology harness: lifecycle identity/process generations, health polling,
 followed logs/events, binary attach and exec stdin, TTY resize/restoration,
-signals, and exits 0/37/130/137/143/126/127. Numeric fixture exits alone cannot
-prove signal handling. Require three tested Machines, four continuous sentinels,
+signals, and exits 0/37/130/137/143/126/127. It independently reads retained
+command, state and interaction evidence in source-selected order before and
+after owned cleanup. The concurrent logs follower has its own command ledger
+and must observe the exact ready prefixes before the source-selected TERM
+command begins. Attach uses a public kickoff byte to prevent output racing ahead
+of attachment, and explicitly requests stdin attachment for Docker's
+`StdinOnce` EOF behavior.
+
+The physical run must still establish these assertions. Numeric fixture exits
+alone cannot prove signal handling. Require three tested Machines, four continuous sentinels,
 independent raw replay, owned cleanup, clean public Stops, unchanged defaults,
-and checksummed evidence. Local Python or tmux tests do not close this issue or
-the full 63-scenario Docker/release gate.
+and checksummed evidence. Full runtime/process provenance and actual Docker tmux
+acceptance also remain; Engine configuration and stopped container inspection
+alone do not certify all youki invocations or process absence. Local Python or
+tmux tests do not close this issue or the full 63-scenario Docker/release gate.
 
 ## Verified local checkpoint, 2026-09-06
 

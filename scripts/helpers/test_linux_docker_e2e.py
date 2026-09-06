@@ -15,6 +15,63 @@ import linux_docker_e2e as gate
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_lifecycle_admission_requires_no_external_builder_and_scopes_fixture_option(self):
+        common = [part for name in gate.startup.OPTIONS for part in ('--'+name, '/owned/value')]
+        args = gate.arguments(['--suite', 'lifecycle', *common])
+        self.assertIsNone(args.buildkit_archive)
+        self.assertIsNone(args.container_fixture)
+        selected = gate.arguments(['--suite', 'lifecycle', *common, '--container-fixture', '/owned/container'])
+        self.assertEqual(selected.container_fixture, '/owned/container')
+        with self.assertRaisesRegex(ValueError, 'Buildx suites'):
+            gate.arguments(['--suite', 'lifecycle', *common, '--buildkit-archive', '/owned/archive'])
+        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh'):
+            with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, 'container-fixture'):
+                gate.arguments(['--suite', suite, '--container-fixture', '/owned/container'])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            gate.arguments(['--suite', 'lifecycle', '--container-fixture=a', '--container-fixture=b'])
+
+    def test_lifecycle_preflight_freezes_transitive_helpers_and_both_fixtures(self):
+        args = types.SimpleNamespace(suite='lifecycle', fixture='/owned/base', image_input='/owned/pin',
+            buildkit_archive=None, run_id='lifecycle-owned')
+        with patch.object(gate.startup, 'preflight', return_value={'inputs': {}}), \
+                patch.object(gate.startup, 'canonical', side_effect=Path), \
+                patch.object(gate.startup, 'digest', side_effect=lambda path: str(path)), \
+                patch.object(gate.image_input, 'load', return_value={}), \
+                patch.object(gate, 'public_ca_input', return_value={}), \
+                patch.object(gate.driver, 'tree_digest', side_effect=lambda path: 'tree:'+str(path)), \
+                patch('linux_docker_buildkit_builder.preflight_archive') as archive:
+            info = gate.preflight(args, require_host=False)
+        archive.assert_not_called()
+        self.assertNotIn('buildkit', info)
+        self.assertEqual(info['scope'], gate.LIFECYCLE_SCOPE)
+        self.assertEqual(info['fixture'], '/owned/base')
+        selected = gate.REPO/'tests/fixtures/vz-0.4/docker-container-io'
+        self.assertEqual(info['container_fixture'], str(selected))
+        self.assertEqual(info['container_fixture_sha256'], 'tree:'+str(selected))
+        for name in ('linux_docker_container_lifecycle.py', 'linux_docker_container_state.py',
+                     'linux_docker_container_commands.py', 'linux_docker_container_fixture.py',
+                     'linux_docker_container_exec.py', 'linux_docker_container_follow.py',
+                     'linux_docker_interactive_capture.py', 'linux_docker_interactive_evidence.py',
+                     'linux_docker_buildkit_shutdown.py', 'linux_docker_image_input.py',
+                     'linux_docker_compose_evidence.py'):
+            self.assertIn(str(gate.REPO/'scripts/helpers'/name), info['inputs'])
+        for name in ('Dockerfile', 'README.md', 'contract.json', 'probe.py', 'test_probe.py'):
+            self.assertIn(str(selected/name), info['inputs'])
+
+    def test_lifecycle_fixture_rejection_prevents_runtime_dispatch(self):
+        args = types.SimpleNamespace(suite='lifecycle', fixture='/owned/base', image_input='/owned/pin',
+            buildkit_archive=None, run_id='lifecycle-owned', container_fixture='/foreign/fixture')
+        with patch.object(gate.startup, 'preflight', return_value={'inputs': {}}), \
+                patch.object(gate.startup, 'canonical', side_effect=Path), \
+                patch.object(gate.startup, 'digest', return_value='hash'), \
+                patch.object(gate.image_input, 'load', return_value={}), \
+                patch.object(gate, 'public_ca_input', return_value={}), \
+                patch.object(gate.driver, 'tree_digest', return_value='hash'), \
+                patch('linux_docker_container_fixture.fixture_contract', side_effect=ValueError('fixture rejected')), \
+                patch.object(gate, 'run') as run:
+            with self.assertRaisesRegex(ValueError, 'fixture rejected'): gate.preflight(args, require_host=False)
+            run.assert_not_called()
+
     def test_artifact_helpers_are_hashed_only_for_explicit_artifacts_suite(self):
         names = ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                  "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py")
@@ -193,6 +250,33 @@ class AdmissionTests(unittest.TestCase):
 
 
 class ResultScopeTests(unittest.TestCase):
+    def test_lifecycle_end_rehash_cannot_promote_changed_fixture_or_full_contract(self):
+        info = {'scope': gate.LIFECYCLE_SCOPE, 'suite': 'lifecycle', 'inputs': {},
+                'fixture': '/owned/base', 'fixture_sha256': 'base-hash',
+                'container_fixture': '/owned/container', 'container_fixture_sha256': 'container-hash'}
+        for changed in (False, True):
+            with self.subTest(changed=changed):
+                harness = types.SimpleNamespace(evidence=Path('/owned/evidence'), root=Path('/owned/root'),
+                    staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
+                    remove_owned=Mock(), cleanup=Mock(return_value={}))
+                with patch.object(gate, 'ComposeHarness', return_value=harness), \
+                        patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
+                        patch.object(gate.startup, 'collect_runtime_receipts'), \
+                        patch.object(gate.startup, 'checksum_evidence'), \
+                        patch.object(gate.driver, 'tree_digest', side_effect=['base-hash', 'changed' if changed else 'container-hash']) as tree, \
+                        patch('linux_docker_container_fixture.fixture_contract') as contract, \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = gate.run(info)
+                result = json.loads(output.getvalue())
+                contract.assert_called_once_with(Path('/owned/container'))
+                self.assertEqual(tree.call_args_list, [unittest.mock.call(Path('/owned/base')),
+                                                     unittest.mock.call(Path('/owned/container'))])
+                self.assertEqual(code, int(changed))
+                self.assertFalse(result['docker_parity_certified'])
+                self.assertFalse(result['aggregate_release_certified'])
+                self.assertEqual(result['release_scenarios_passed'], [])
+                self.assertEqual(result['outcome'], 'failed' if changed else 'passed_dev_installed_lifecycle_slice')
+
     def test_cleanup_reports_retained_machine_disks_not_removed_builder_cache(self):
         info = {"scope": gate.BUILD_SCOPE, "suite": "build", "inputs": {},
                 "fixture": "/owned/fixture", "fixture_sha256": "fixture-digest"}
@@ -312,6 +396,9 @@ class PrePullTrustTests(unittest.TestCase):
 
 
 class BuildDispatchTests(unittest.TestCase):
+    def test_lifecycle_branch_calls_only_lifecycle_and_monitors_every_machine(self):
+        self.check_owned_orchestrator('lifecycle', 'linux_docker_container_lifecycle')
+
     def test_artifacts_branch_calls_only_artifact_orchestrator_and_monitors_every_machine(self):
         self.check_owned_orchestrator("artifacts", "linux_docker_build_artifacts")
 
@@ -484,6 +571,23 @@ class BuildDispatchTests(unittest.TestCase):
 
 
 class UncertaintyTests(unittest.TestCase):
+    def test_live_follower_and_pending_capture_prevent_cleanup_despite_verified_flags(self):
+        for live, pending in ((True, []), (False, [object()])):
+            h = self.harness()
+            h.drivers = [types.SimpleNamespace(follow_thread=Mock(is_alive=Mock(return_value=live)),
+                record=types.SimpleNamespace(receipts=[], pending_interactions=pending))]
+            h.driver_cleanup_verified = [True]
+            with self.subTest(live=live), self.assertRaisesRegex(ValueError, 'prevents cleanup'):
+                h.remove_owned()
+            h.docker.assert_not_called()
+
+    def test_joined_follower_and_reaped_interactions_allow_cleanup_guard(self):
+        h = self.harness()
+        h.drivers = [types.SimpleNamespace(follow_thread=Mock(is_alive=Mock(return_value=False)),
+            record=types.SimpleNamespace(receipts=[], pending_interactions=[]))]
+        h.driver_cleanup_verified = [True]
+        h.assert_certain()
+
     def harness(self):
         h = gate.ComposeHarness.__new__(gate.ComposeHarness)
         h.effects_uncertain = False
@@ -494,7 +598,7 @@ class UncertaintyTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         h.evidence = Path(temporary.name)
         h.mutations = []
-        h.record = Mock(receipts=[])
+        h.record = Mock(receipts=[], pending_interactions=[])
         h.monitor = None
         h.drivers = []
         h.driver_cleanup_verified = []
@@ -520,7 +624,7 @@ class UncertaintyTests(unittest.TestCase):
     def test_parent_and_monitor_unknown_effects_prevent_cleanup(self):
         for source in ("parent", "monitor"):
             h = self.harness()
-            unknown = Mock(receipts=[{"effects_uncertain": True}])
+            unknown = Mock(receipts=[{"effects_uncertain": True}], pending_interactions=[])
             if source == "parent":
                 h.record = unknown
             else:
@@ -531,7 +635,7 @@ class UncertaintyTests(unittest.TestCase):
 
     def test_driver_uncertainty_prevents_cleanup(self):
         h = self.harness()
-        h.drivers = [Mock(record=Mock(receipts=[{"effects_uncertain": True}]))]
+        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": True}], pending_interactions=[]))]
         h.driver_cleanup_verified = [True]
         with self.assertRaisesRegex(driver.Rejected, "uncertain"):
             h.remove_owned()
@@ -542,7 +646,7 @@ class UncertaintyTests(unittest.TestCase):
                              (2, [True]), (2, [True, False]), (2, [False, True])):
             with self.subTest(drivers=count, verified=flags):
                 h = self.harness()
-                h.drivers = [Mock(record=Mock(receipts=[{"effects_uncertain": False}])) for _ in range(count)]
+                h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(count)]
                 h.driver_cleanup_verified = flags
                 # An owned object ensures the test catches any cleanup dispatch,
                 # not merely successful return from an empty ownership loop.
@@ -557,7 +661,7 @@ class UncertaintyTests(unittest.TestCase):
 
     def test_all_driver_cleanup_proofs_allow_exact_owned_parent_removal(self):
         h = self.harness()
-        h.drivers = [Mock(record=Mock(receipts=[{"effects_uncertain": False}])) for _ in range(2)]
+        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(2)]
         h.driver_cleanup_verified = [True, True]
         descriptor = {"name": "exact-context"}
         image_id = "sha256:" + "a" * 64
@@ -574,7 +678,7 @@ class UncertaintyTests(unittest.TestCase):
         calls = []
         h.builders = [Mock(remove_owned=Mock(side_effect=lambda: calls.append("first"))),
                       Mock(remove_owned=Mock(side_effect=lambda: calls.append("second")))]
-        h.drivers = [Mock(record=Mock(receipts=[{"effects_uncertain": False}]))]
+        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[]))]
         h.driver_cleanup_verified = [False]
         with self.assertRaisesRegex(driver.Rejected, "independent replay"):
             h.remove_owned()
