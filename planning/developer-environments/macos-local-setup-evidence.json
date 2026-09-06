@@ -4,7 +4,7 @@
   "source_commit": "de356312",
   "branch": "feat/macos26-bootstrap",
   "passed": false,
-  "pending": "Fresh optional Xcode setup and lifecycle preserving the validated clean selection",
+  "pending": "Fresh optional Xcode setup completed IPSW installation and is waiting at the macOS administrator authentication dialog before provisioning; full Xcode lifecycle/coexistence gate pending",
   "host": {
     "os": "macos",
     "architecture": "aarch64",
@@ -113,6 +113,11 @@
       "path": ".artifacts/macos-local-setup-2/clean-terminal-lifecycle",
       "scope": "exact framework terminal-state cleanup and clean installed lifecycle",
       "result": "PASS: five verbs, PTY/cancel, restart persistence, clean absence, two private clones, third-start rejection followed by successful Stop/Delete with both survivors usable, platform audit, all public Deletes and daemon cleanup"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
+      "scope": "fresh optional Xcode setup preserving validated clean template, final signed runtime",
+      "result": "license-required and cancellation/retry gates passed; local Xcode archive and pinned cached IPSW verification passed; fresh macOS installation completed in approximately 208 seconds; waiting for administrator authentication before provisioning"
     }
   ],
   "regression_evidence": ".artifacts/macos-local-setup-2/linux-terminal-regression",
@@ -127,7 +132,8 @@
     "Both live primary VMs from the colliding runs were publicly Stopped; only exact owned test daemons were terminated afterwards. Failed-start directories and logs are retained; no successful public Delete is claimed for those old failed-start cases.",
     "Clean setup, shared readiness, and optional Xcode verification used explicitly recorded binary updates. Per-run raw layout and update records retain exact hashes; no immutable-binary claim spans an update.",
     "The final 495-test framework/runtime suite passed with one nextest lingering-handle warning in an unchanged Linux artifact-copy cancellation test. Focused rerun passed without warning; raw logs retained.",
-    "Apple documents the exact framework Error state as irrecoverable and requiring VM destruction. Retirement queries the original VM on its dispatch queue, rejects unknown states, and releases the original object under the native lifecycle write fence."
+    "Apple documents the exact framework Error state as irrecoverable and requiring VM destruction. Retirement queries the original VM on its dispatch queue, rejects unknown states, and releases the original object under the native lifecycle write fence.",
+    "Public feature-branch and Beads sync were rejected by automatic approval review, which requires explicit approval for public disclosure of source/tests/sanitized evidence to the verified existing public gpu-cli/vz GitHub origin. Approval requested; local commits retained, main untouched."
   ],
   "clean": {
     "setup_evidence": ".artifacts/macos-local-setup-2/clean-evidence",
