@@ -171,9 +171,14 @@ Existing macOS VM primitives are **ACTIVE**; their integration into the shared
 topology contract is **DEV**.
 
 The 0.4 native macOS release gate requires at least one exact macOS 26+ guest
-version/build with obtainable pinned restore media/base, an authenticated
-published matching bootstrap patch, and installed first-use evidence. Normal
-Machine creation must apply that patch and start the guest agent without manual
+version/build with an obtainable exact published base image, an authenticated
+published matching bootstrap patch, and installed first-use evidence. The product
+downloads and prepares this pair automatically with streamed progress, caching an
+immutable prepared template per pinned release for subsequent Machine creation.
+A latest-supported pointer resolves to a pinned compatible pair; existing
+Environments retain that resolution until an explicit update. IPSW installation
+is a maintainer preparation step. First-use preparation must apply the patch
+and Machine creation must start the guest agent without manual
 host sudo, disk mounting, ownership repair, or agent injection. Patcher code or
 a manually prepared VM alone does not establish this supported path.
 

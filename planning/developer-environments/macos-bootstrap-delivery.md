@@ -10,7 +10,8 @@ an owned image, produce the matching patch, and verify a fresh consumer run.
 Once that candidate works, a release workflow reproduces the same preparation,
 verification, signing, and artifact publication. End users do none of this work.
 
-The user declares the pinned native Machine and runs `vz up`. Its stream presents
+The user selects a supported native macOS release and runs `vz up`. The product
+resolves and persists its exact artifact pins automatically. Its stream presents
 plain phases with byte progress where measurable: download macOS, verify,
 prepare image, apply patch, start Machine. Non-TTY consumers receive equivalent
 structured progress. Cancellation must not leave a partial artifact marked ready.
@@ -46,22 +47,32 @@ workspace. The probe used a task-owned hard link; it did not copy the 19.8 GB
 archive, mount a disk, install or boot a VM. Evidence is retained under
 `.artifacts/macos26-bootstrap/verification/` in this worktree.
 
-## Base compatibility decision
+## Selected base delivery contract
 
-The existing VZDELTA1 block format requires the complete base image to match its
-SHA-256. Pinning an IPSW version does not prove independently installed disks are
-byte-identical. There are two distinct delivery paths to resolve before the
-consumer bootstrap can be connected:
+Users download an exact published base image and its matching VZDELTA1 block
+patch. This is the selected delivery path. Apple IPSW acquisition and installation
+belong to the maintainer artifact recipe; users do not install an IPSW locally or
+prepare their own base. The entire base must match the patch's SHA-256 precondition.
+A fresh consumer run must download the published pair and prove compatibility.
 
-- An exact prepared base artifact and its matching block delta.
-- Apple IPSW acquisition plus local installation, requiring provisioning that
-  tolerates install-specific layout and identity while retaining exact supported
-  build and authenticated patch preconditions.
+A `latest` pointer selects the latest verified release supported by the host,
+resolving to one authenticated immutable manifest. That manifest binds the exact
+macOS version/build, base and patch URLs, sizes and digests, expected patched-image
+digest, platform requirements/resources, guest agent and toolchain pins. Base and
+patch are selected together; separate moving URLs cannot choose incompatible
+versions. Apple's latest available OS is a maintainer discovery input, not an
+unverified consumer release.
 
-The first path cannot be silently substituted for the second. A successful patch
-roundtrip on the maintainer's own base is insufficient: the consumer must obtain
-or produce the compatible base through the supported clean flow. The consumer base strategy remains open; the prerequisite APIs do not select a
-distribution path.
+Persist the resolved manifest identity and pins before preparation. Existing
+Machines and Environments retain their resolved release when the pointer advances;
+upgrades require explicit selection. A cached pinned release remains usable
+without resolving `latest` again. Keep prior published artifact sets obtainable
+for pinned recreation. A supported release with no matching artifacts cannot be
+advertised as ready.
+
+The first milestone is the manually prepared macOS 26.6.2 / 25G83 base plus loader
+patch, followed by a fresh download/apply/boot proof. Artifact publication and
+native integration remain unimplemented; this decision selects their contract.
 
 ## Implemented prerequisite APIs
 
@@ -97,9 +108,9 @@ a patch, or satisfy the native release gate.
 
 ## Next integration and acceptance
 
-Resolve the consumer base strategy, validate the candidate on this host, and
-prepare the real loader-bearing patch. Bind all artifacts and platform resources
-to the native target catalog and Machine ownership. Add the operation-owned
+Prepare the exact candidate base on this host and create its real loader-bearing
+patch. Publish the authenticated pair and immutable release manifest. Bind all
+artifacts and platform resources to the native target catalog and Machine ownership. Add the operation-owned
 prepared-template cache, streamed Up progress, clone-based creation, and native
 exec/lifecycle adapters. Automate the proven maintainer recipe in a release
 workflow. Finish with a clean consumer download/bootstrap and the pinned Swift

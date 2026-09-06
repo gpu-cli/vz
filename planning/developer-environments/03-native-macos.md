@@ -41,9 +41,11 @@ fingerprint is not a supported release entry.
 From a clean supported installation, the product must obtain the artifacts,
 verify and apply the matching patch, create the native Machine, and start its
 agent without manual host sudo, disk mounting, ownership repair, or agent
-injection. The patch must match the actual base obtained or produced by this
-flow, including any install-specific variability. Privileged artifact preparation
-must be handled before publication rather than left as a user setup step.
+injection. Users download the exact published base and matching block patch;
+maintainers perform IPSW installation before publication. Resolve a latest-supported
+pointer to an authenticated immutable artifact set and persist its pins, keeping
+existing Environments stable when that pointer advances. Privileged artifact
+preparation must be handled before publication rather than left as a user setup step.
 
 Reuse the image patcher and guest loader behind typed provisioning APIs. The
 existing patch code in retired CLI modules and mac-agent's LoaderManifest

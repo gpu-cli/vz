@@ -19,8 +19,8 @@ stop/up/delete, update/retirement, and recovery.
 
 Include a required clean bootstrap scenario for at least one exact macOS 26+
 guest version/build. Start without a preconfigured guest or manually installed
-loader. Through supported installed product interfaces, obtain the pinned Apple
-restore media/base and published authenticated matching patch, verify their
+loader. Through supported installed product interfaces, download the exact
+published base image and authenticated matching block patch, verify their
 digests and compatibility, apply the patch, boot the selected Machine, and
 observe its agent becoming ready. No manual host sudo, disk mounting, ownership
 repair, or agent injection is permitted. Record artifact sources, authentication,
@@ -32,7 +32,11 @@ Build/test the pinned native Swift fixture in that Machine, execute its expected
 protocol/version output, then prove Stop/Up persistence and ownership-safe Delete
 in the aggregate staged run. Wrong-base or tampered patches fail before Machine
 activation. The clean-path result must demonstrate that the distributed patch
-matches the base the user actually obtains or produces.
+matches the exact base the user downloads. Exercise latest-supported resolution
+to a persisted immutable pair, then prove a pointer advance leaves an existing
+Environment pinned. Measure cold preparation, cached clone creation and warm
+Stop/Up separately; cached creation must reuse the prepared template without
+repeating downloads, IPSW installation or patch application.
 
 ## Step 2: Run shared and target suites
 

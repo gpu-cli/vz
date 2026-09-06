@@ -143,13 +143,17 @@ required E2E scenario and retained evidence:
 4. **Target-native execution:** Linux commands execute on Linux. The checked-in
    native macOS happy path pins at least one specific macOS version and build
    with major version 26 or later, its Apple restore IPSW and digest, exact
-   compatible base identity, and a published, authenticated matching bootstrap
-   patch with digest. A clean vz installation on a supported Mac obtains them
-   through the supported product flow, verifies and applies the patch, boots the
+   published base image identity, and a published, authenticated matching bootstrap
+   patch with digest. A clean vz installation on a supported Mac downloads the
+   exact published base/patch pair through the supported product flow, verifies
+   and applies the patch, boots the
    selected macOS Machine, and starts its guest agent without manual host sudo,
    disk mounting, ownership repair, or agent injection. The patch must apply to
-   the base produced or obtained by that clean flow; a manually prepared image,
-   placeholder hashes, a moving latest selector, or patcher code alone cannot
+   the exact base downloaded by that clean flow. IPSW installation is maintainer
+   preparation. A latest-supported pointer resolves and persists one authenticated
+   immutable artifact set; advancing it leaves existing Environment pins intact.
+   A manually preconfigured consumer VM, placeholder hashes, an unresolved latest
+   selector, or patcher code alone cannot
    satisfy this criterion. Artifact availability and compatibility are exercised
    by the installed release gate and retained in its evidence.
    The checked-in native fixture
