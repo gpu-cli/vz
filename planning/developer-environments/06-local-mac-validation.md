@@ -83,6 +83,13 @@ candidate verification remains required. Cache export/import and denial,
 parallel builds, SSH, and full image/cache secret scans are not covered by
 these five recipes.
 
+Installed Buildx candidate 1 reached four ready Machines but failed starting
+the exact owned `docker-container` builder through youki, before recipe dispatch.
+Its 1,497-file failed evidence is retained at
+`.artifacts/linux-docker-build-candidate-1`; a separate disposition positively
+stopped all four Machines and closed the daemon while preserving disk/object
+state. This source integration has no passing physical Buildx-slice claim yet.
+
 `--suite all` fails before provisioning: the 63-scenario dispatcher, full cache
 runtime inventory, and remaining target/aggregate acceptance are unfinished.
 See [runner usage and evidence limits](../../scripts/helpers/linux_docker_e2e.md).

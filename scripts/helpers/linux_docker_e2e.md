@@ -91,3 +91,26 @@ No result certifies Docker parity or emits release-scenario PASS. Full fixture
 freezing, all63 scenarios, full OCI/cache/runtime audits, host binds/forwarding,
 recovery, native macOS, the five-verb Delete path, and the canonical three-phase
 aggregate with measured hardware sleep remain separate required work.
+
+## Buildx candidate 1: failed, retained
+
+`.artifacts/linux-docker-build-candidate-1` exercised the signed installed
+`topology-cli-installed-gLq7X5` artifacts on the local Mac. All four Developer
+Machines became ready, their sentinels started, and the first Machine pulled
+and executed the pinned Python input and built the preparatory image through
+its embedded builder. The separate BuildKit builder container then failed OCI
+create through pinned youki (command 080). None of the five-recipe Buildx slices
+ran. This is a failed candidate, not a passing compatibility demonstration.
+
+All 1,497 raw artifact hashes and 80 command receipts were independently
+verified. Its evidence manifest SHA256 is
+`65c2ea986b44e7fad09719d7b64b15f59a9c46cedda8853c9711ee50d5530b62`.
+The failed mutation remained uncertain and withheld Docker-object cleanup.
+
+A separate `.artifacts/linux-docker-build-candidate-1-disposition` captured
+bounded guest daemon logs through public Exec, positively stopped all four
+Machines, and gracefully closed the exact original daemon. Docker defaults
+were unchanged. The original failed evidence, Docker objects and stopped disks
+at `/private/tmp/vzdev-c4q2h8zh` remain preserved; no retry, disk repair, resource
+deletion or candidate promotion was performed. The generic OCI-create error
+still needs a concrete runtime diagnosis before the next candidate.
