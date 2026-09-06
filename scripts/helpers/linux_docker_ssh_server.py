@@ -319,7 +319,7 @@ class Server:
             before = self.verify()
             self.guard()
             since = self.driver._engine_system_time
-            stopped = self.command(['container', 'stop', '--signal', 'SIGTERM', '--time', '30', self.container_id], timeout=40)
+            stopped = self.command(['container', 'stop', '--signal', 'SIGTERM', '--timeout', '30', self.container_id], timeout=40)
             require(stopped.stdout == (self.container_id + '\n').encode() and not stopped.stderr, 'SSH stop acknowledgement differs')
             after = self.inspect('exited')
             self.guard()

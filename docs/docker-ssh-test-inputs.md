@@ -77,6 +77,25 @@ positive/negative forwarding tests remain separate required evidence.
 
 ## Account and diagnostic policy
 
+The first installed-Mac SSH candidate failed before reaching an SSH operation:
+the current direct `dpkg-deb --extract` path does not preserve the base's
+merged-`/usr` directory aliases. A separate public-input diagnostic passed
+admission and seven extractions, then the next executable failed with ENOENT.
+The OpenSSH server archive contains a `./lib/` directory, while the admitted
+base has `/lib -> usr/lib` and uses `/lib/ld-linux-aarch64.so.1` as its ELF
+interpreter. GNU tar's default directory-symlink replacement explains this
+failure. All four Machines were subsequently stopped with clean-journal
+receipts; this attempt remains failed, not an SSH compatibility pass.
+
+Setting `TAR_OPTIONS` is not a fix: dpkg 1.21.23's `extracthalf` explicitly
+removes it before invoking tar. The remaining extraction work is a bounded
+`dpkg-deb --fsys-tarfile` path followed by independently pinned GNU tar with
+explicit `--keep-directory-symlink`, preserving and verifying the known
+directory aliases and loader/tool identities before and after extraction.
+This replacement is not yet implemented or physically verified. See
+[GNU tar's option semantics](https://www.gnu.org/software/tar/manual/html_node/Option-Summary.html)
+and the [matching dpkg source archive](https://deb.debian.org/debian/pool/main/d/dpkg/dpkg_1.21.23.tar.xz).
+
 The authenticated OpenSSH 9.2p1 source defines Linux's locked-password prefix as
 `!` (`configure.ac`); `platform.c` checks that prefix, and `auth.c` applies the
 check when PAM is disabled. Therefore a dedicated fixture account with shadow

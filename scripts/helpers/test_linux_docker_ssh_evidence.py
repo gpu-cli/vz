@@ -164,6 +164,28 @@ class SSHEvidenceTests(unittest.TestCase):
                 if ack.exists():
                     ack.unlink()
 
+    def test_engine_repo_alias_normalizes_graph_names_without_digest_relaxation(self):
+        pin = self.inputs['images']['base']['reference'].split('@sha256:')[1]
+        reference = 'docker.io/library/python@sha256:' + pin
+        self.inputs['images']['base']['reference'] = reference
+        self.make('declared')
+        raw = canonical(self.batch) + self.footer
+        def replay(selected):
+            return evidence.ssh_progress(raw, reference=selected, case='declared', request=self.request,
+                package_manifest=(self.fixture / 'package-pins.json').read_bytes(),
+                dockerfile=(self.fixture / 'Dockerfile.ssh').read_bytes(),
+                guest_lower=evidence.progress_ns(SyntheticBuilder.stamp(0)),
+                guest_upper=evidence.progress_ns(SyntheticBuilder.stamp(9)),
+                host_lower=evidence.progress_ns(SyntheticBuilder.stamp(0)),
+                host_upper=evidence.progress_ns(SyntheticBuilder.stamp(9)))
+        expected = replay(reference)
+        for name in ('python', 'library/python', 'docker.io/library/python'):
+            with self.subTest(name=name):
+                self.assertEqual(replay(name + '@sha256:' + pin), expected)
+        for bad in ('python:latest', 'python@sha256:' + '0' * 64, 'other/python@sha256:' + pin):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                replay(bad)
+
     def test_missing_ack_preack_only(self):
         self.make('undeclared')
         (self.directory / 'command-00005.acknowledgement.json').unlink()

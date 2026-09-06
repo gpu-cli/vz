@@ -132,6 +132,16 @@ def ssh_progress(raw, *, reference, case, request, package_manifest, dockerfile,
     require(case in CASES and type(raw) is bytes and 0 < len(raw) <= MAX, 'SSH progress scope/bound')
     public_request(request)
     require(0 < guest_lower <= guest_upper and 0 < host_lower <= host_upper, 'SSH clock bounds')
+    # Engine RepoDigests may omit Docker Hub's canonical namespace; BuildKit
+    # renders the full name. Normalize names only, never the admitted digest or
+    # the original command's exact build argument.
+    base, separator, pin = reference.partition('@sha256:')
+    require(separator and hex64(pin), 'SSH base must remain digest-pinned')
+    if '/' not in base:
+        base = 'docker.io/library/' + base
+    elif not ('.' in base.split('/')[0] or ':' in base.split('/')[0] or base.startswith('localhost/')):
+        base = 'docker.io/' + base
+    reference = base + '@sha256:' + pin
     CanaryScanner(secret_canaries).feed(raw)
     batches, trailer = [], []
     for line in raw.splitlines():

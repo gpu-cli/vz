@@ -183,6 +183,9 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(proof['exit_code'], 0)
         calls = [call.args[0] for call in selected.command.call_args_list]
         self.assertEqual(sum(args[:2] == ['container', 'stop'] for args in calls), 1)
+        stop = next(args for args in calls if args[:2] == ['container', 'stop'])
+        self.assertEqual(stop, ['container', 'stop', '--signal', 'SIGTERM', '--timeout', '30', CID])
+        self.assertNotIn('--time', stop)
         self.assertIn(['container', 'rm', CID], calls)
         self.assertIn(['image', 'rm', TOKEN+':server'], calls)
         self.assertLess(calls.index(['logs', CID]), calls.index(['container', 'rm', CID]))
