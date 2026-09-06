@@ -1,5 +1,12 @@
 # macOS bootstrap integration handoff (DEV)
 
+> **Delivery decision updated 2026-09-06:** the supported 0.4 path is now
+> pinned IPSW → local install → scoped privileged provisioning → native validation
+> → cached template → private Machine clones. See [local macOS setup](macos-local-setup.md).
+> Earlier published-base/patch requirements below describe the previous design;
+> the delta implementation remains optional. The product contract and 0.4 gate
+> carry the current acceptance criteria.
+
 Tracks `vz-mzs.11.4`. This covers artifact preparation and the installed DEV
 native adapter. The native macOS and aggregate release gates remain open;
 local lifecycle evidence does not qualify a supported published release.

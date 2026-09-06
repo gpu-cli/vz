@@ -438,42 +438,52 @@ fn enable_auto_login(mount_point: &Path, username: &str, password: &str) -> anyh
 /// a base64-encoded binary plist suitable for the `ShadowHashData` field in a
 /// dslocal user plist.
 ///
-/// Shells out to python3 (always available on macOS) to compute the PBKDF2 hash
-/// and create the binary plist format.
+/// Uses the system plist converter; no Python installation is required.
 fn generate_shadow_hash_data(password: &str) -> anyhow::Result<String> {
-    let script = r#"
-import hashlib, os, plistlib, base64, sys
-password = sys.argv[1]
-salt = os.urandom(32)
-iterations = 40000
-entropy = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, iterations, dklen=128)
-shadow_hash = {
-    'SALTED-SHA512-PBKDF2': {
-        'entropy': entropy,
-        'salt': salt,
-        'iterations': iterations,
-    }
-}
-binary_plist = plistlib.dumps(shadow_hash, fmt=plistlib.FMT_BINARY)
-print(base64.b64encode(binary_plist).decode())
-"#;
-
-    let output = std::process::Command::new("python3")
-        .args(["-c", script, password])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to generate ShadowHashData: {}", stderr.trim());
-    }
-
-    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if b64.is_empty() {
-        anyhow::bail!("ShadowHashData generation produced empty output");
-    }
-
-    debug!(len = b64.len(), "generated ShadowHashData");
-    Ok(b64)
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use ring::{
+        pbkdf2,
+        rand::{SecureRandom, SystemRandom},
+    };
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    let mut salt = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| anyhow::anyhow!("password salt generation failed"))?;
+    let mut entropy = [0_u8; 128];
+    let iterations = std::num::NonZeroU32::new(40000)
+        .ok_or_else(|| anyhow::anyhow!("invalid iteration count"))?;
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA512,
+        iterations,
+        &salt,
+        password.as_bytes(),
+        &mut entropy,
+    );
+    let xml = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?><plist version="1.0"><dict><key>SALTED-SHA512-PBKDF2</key><dict><key>entropy</key><data>{}</data><key>salt</key><data>{}</data><key>iterations</key><integer>40000</integer></dict></dict></plist>"#,
+        STANDARD.encode(entropy),
+        STANDARD.encode(salt)
+    );
+    let mut child = Command::new("/usr/bin/plutil")
+        .args(["-convert", "binary1", "-o", "-", "--", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing plist converter stdin"))?
+        .write_all(xml.as_bytes())?;
+    let result = child.wait_with_output()?;
+    anyhow::ensure!(
+        result.status.success() && result.stdout.starts_with(b"bplist00"),
+        "password plist conversion failed: {}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    Ok(STANDARD.encode(result.stdout))
 }
 
 /// Encode a password using macOS kcpassword XOR cipher.

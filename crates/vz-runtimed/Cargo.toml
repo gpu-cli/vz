@@ -12,6 +12,7 @@ test-backend = []
 e2e-test-hooks = ["vz-stack/e2e-test-hooks"]
 
 [dependencies]
+libc = { workspace = true }
 fs2 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }

@@ -786,6 +786,7 @@ async fn installed_public_up_exec_stop_machine_lifecycle() -> Result<()> {
         channels: BTreeSet::new(),
     };
     let catalog = MachineTargetCatalog {
+        source_path: None,
         macos: Vec::new(),
         schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
         linux: vec![

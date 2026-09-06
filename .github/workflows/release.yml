@@ -62,6 +62,7 @@ jobs:
           cargo build --release -p vz-cli
           cargo build --release -p vz-runtimed
           cargo build --release -p vz-guest-agent
+          cargo build --release -p vz-agent-loader
 
       - name: Import code signing certificate
         env:
@@ -119,10 +120,21 @@ jobs:
           codesign --verify --verbose crates/target/release/vz-runtimed
           echo "vz-runtimed signed successfully"
 
+      - name: Sign local macOS setup with Developer ID
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+        run: |
+          codesign --sign "$APPLE_SIGNING_IDENTITY" --keychain "$KEYCHAIN_PATH" \
+            --entitlements entitlements/vz-cli.entitlements.plist --options runtime \
+            --timestamp --force crates/target/release/vz-macos-setup
+          codesign --verify --verbose crates/target/release/vz-macos-setup
+
       - name: Sign vz-guest-agent (ad-hoc, no entitlements)
         run: |
           codesign --sign - --force crates/target/release/vz-guest-agent
           codesign --verify --verbose crates/target/release/vz-guest-agent
+          codesign --sign - --force crates/target/release/vz-agent-loader
+          codesign --verify --verbose crates/target/release/vz-agent-loader
 
       - name: Notarize vz-cli and vz-runtimed
         env:
@@ -148,6 +160,12 @@ jobs:
             --wait
           rm vz-runtimed-notarize.zip
 
+          ditto -c -k --keepParent crates/target/release/vz-macos-setup vz-macos-setup-notarize.zip
+          xcrun notarytool submit vz-macos-setup-notarize.zip \
+            --apple-id "$APPLE_ID" --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" --wait
+          rm vz-macos-setup-notarize.zip
+
           echo "Notarization complete"
 
       - name: Prepare release artifacts
@@ -168,6 +186,10 @@ jobs:
           cp crates/target/release/vz-guest-agent "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
           chmod +x "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
           shasum -a 256 "dist/vz-guest-agent-v${VERSION}-darwin-arm64" > "dist/vz-guest-agent-v${VERSION}-darwin-arm64.sha256"
+          for name in vz-macos-setup vz-agent-loader; do
+            cp "crates/target/release/$name" "dist/${name}-v${VERSION}-darwin-arm64"
+            shasum -a 256 "dist/${name}-v${VERSION}-darwin-arm64" > "dist/${name}-v${VERSION}-darwin-arm64.sha256"
+          done
 
       - name: Upload release artifacts
         uses: actions/upload-artifact@v4

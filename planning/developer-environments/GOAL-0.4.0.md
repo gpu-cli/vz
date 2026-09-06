@@ -142,20 +142,22 @@ required E2E scenario and retained evidence:
    context are absent from the other and from every other Environment.
 4. **Target-native execution:** Linux commands execute on Linux. The checked-in
    native macOS happy path pins at least one specific macOS version and build
-   with major version 26 or later, its Apple restore IPSW and digest, exact
-   published base image identity, and a published, authenticated matching bootstrap
-   patch with digest. A clean vz installation on a supported Mac downloads the
-   exact published base/patch pair through the supported product flow, verifies
-   and applies the patch, boots the
-   selected macOS Machine, and starts its guest agent without manual host sudo,
-   disk mounting, ownership repair, or agent injection. The patch must apply to
-   the exact base downloaded by that clean flow. IPSW installation is maintainer
-   preparation. A latest-supported pointer resolves and persists one authenticated
-   immutable artifact set; advancing it leaves existing Environment pins intact.
-   A manually preconfigured consumer VM, placeholder hashes, an unresolved latest
-   selector, or patcher code alone cannot
-   satisfy this criterion. Artifact availability and compatibility are exercised
-   by the installed release gate and retained in its evidence.
+   with major version 26 or later and its Apple restore IPSW digest. A clean vz
+   installation runs the supported local setup operation: obtain and verify the
+   IPSW, install macOS locally, request scoped administrator authorization to
+   provision the new guest disk, install the selected local Xcode/toolchain,
+   validate native guest execution, then atomically register a prepared template.
+   Record the locally produced image, platform, agent, toolchain and recipe pins.
+   Ordinary Up creates private clones with separate identities and starts the
+   agent without further sudo, mounting, ownership repair or agent injection.
+   Repeated setup and subsequent Machines reuse the template without installation
+   or patch work. Interrupted/failed setup cannot register a partial image;
+   concurrent setup serializes preparation. Existing Environment pins remain
+   stable when a newer local template becomes the default. A manually repaired
+   VM, placeholder pins, or helper-only tests cannot satisfy this gate.
+   Public base/patch distribution is not required; retain the optional delta
+   crate and validate this local path through installed binaries.
+
    The checked-in native fixture
    `tests/fixtures/vz-0.4/native-macos-swift/` builds and tests
    with the exact Xcode/Swift toolchain digest pinned by the release contract,
@@ -305,9 +307,9 @@ before its acceptance gate can close:
   runtime provenance, resource inventories, and receipts.
 
 The gate contract binds the macOS 26+ happy path to an exact guest version/build,
-host compatibility requirements, IPSW source/digest, base identity, published
-bootstrap patch location/digest and authentication metadata, guest-agent digest,
-and Xcode/Swift toolchain digest. These must be real obtainable artifacts. The
+host compatibility requirements, IPSW source/digest, local setup recipe and
+prepared-image identity, guest-agent digest, and local Xcode/Swift toolchain
+digest. Record the explicit privilege and license steps. The
 clean-provision phase verifies their availability and compatibility from fresh
 state; persisted-recovery and final-cleanup exercise that same native Machine.
 

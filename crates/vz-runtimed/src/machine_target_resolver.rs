@@ -30,6 +30,9 @@ const LINUX_BUNDLE_DIGEST_DOMAIN: &[u8] = b"vz.linux.kernel-bundle.v1\0";
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct MachineTargetCatalog {
+    /// Trusted source retained only in memory for new-Environment resolution.
+    #[serde(skip)]
+    pub source_path: Option<PathBuf>,
     pub schema_version: u32,
     pub linux: Vec<LinuxTargetCatalogEntry>,
     #[serde(default)]
@@ -39,6 +42,7 @@ pub struct MachineTargetCatalog {
 impl Default for MachineTargetCatalog {
     fn default() -> Self {
         Self {
+            source_path: None,
             schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
             linux: Vec::new(),
             macos: Vec::new(),
@@ -146,9 +150,10 @@ impl MachineTargetCatalog {
                 "catalog exceeds 1 MiB".into(),
             ));
         }
-        let catalog: Self = serde_json::from_slice(&bytes)
+        let mut catalog: Self = serde_json::from_slice(&bytes)
             .map_err(|error| TargetResolutionError::InvalidCatalog(error.to_string()))?;
         catalog.validate()?;
+        catalog.source_path = Some(path.to_path_buf());
         Ok(catalog)
     }
 
@@ -201,7 +206,7 @@ impl MachineTargetCatalog {
                     .as_ref()
                     .is_some_and(|p| !absolute_without_traversal(p))
                 || entry.channels.iter().any(|c| !label(c))
-                || !native_versions.insert(entry.version.clone())
+                || !native_versions.insert((entry.version.clone(), entry.manifest.sha256.clone()))
                 || entry
                     .channels
                     .iter()
@@ -412,6 +417,17 @@ impl MachineTargetResolver {
     /// factory or mutation callback in this API. Network/workspace planning and
     /// lifecycle capability negotiation remain separate controller obligations.
     pub async fn resolve_project(
+        &self,
+        definition: &ProjectDefinition,
+    ) -> Result<ResolvedProjectTargets, TargetResolutionError> {
+        if let Some(path) = &self.catalog.source_path {
+            let refreshed = Self::new(self.host, MachineTargetCatalog::from_file(path)?)?;
+            return refreshed.resolve_project_snapshot(definition).await;
+        }
+        self.resolve_project_snapshot(definition).await
+    }
+
+    async fn resolve_project_snapshot(
         &self,
         definition: &ProjectDefinition,
     ) -> Result<ResolvedProjectTargets, TargetResolutionError> {
@@ -836,6 +852,7 @@ mod tests {
         MachineTargetResolver::new(
             host(),
             MachineTargetCatalog {
+                source_path: None,
                 macos: Vec::new(),
                 schema_version: 1,
                 linux: entries,
@@ -871,6 +888,7 @@ mod tests {
         let definition: ProjectDefinition = serde_json::from_value(json!({"schema_version":1,"project_id":"prj_native","name":"native","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"mac","profile":"developer","target":{"os":"macos","arch":"aarch64","image":"vz-macos","channel":"latest"}}]}})).unwrap();
         let digest = "a".repeat(64);
         let catalog = MachineTargetCatalog {
+            source_path: None,
             macos: vec![NativeMacosCatalogEntry {
                 image: "vz-macos".into(),
                 version: "26.3.1".into(),
@@ -910,6 +928,51 @@ mod tests {
         )
         .unwrap();
         assert!(changed.resolve_project(&definition).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn explicit_catalog_refresh_affects_new_resolution_and_rejects_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let path = root.join("catalog.json");
+        let mut catalog = MachineTargetCatalog::default();
+        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let resolver =
+            MachineTargetResolver::new(host(), MachineTargetCatalog::from_file(&path).unwrap())
+                .unwrap();
+        let definition: ProjectDefinition = serde_json::from_value(json!({"schema_version":1,"project_id":"prj_native","name":"native","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"mac","profile":"developer","target":{"os":"macos","arch":"aarch64","image":"vz-macos","channel":"latest"}}]}})).unwrap();
+        assert!(resolver.resolve_project(&definition).await.is_err());
+        let digest = "a".repeat(64);
+        catalog.macos.push(NativeMacosCatalogEntry {
+            image: "vz-macos".into(),
+            version: "26.3.1".into(),
+            manifest: vz_macos_provision::artifact_cache::Artifact {
+                url: format!("bundle:{digest}"),
+                sha256: digest,
+                size_bytes: 100,
+            },
+            installed_bundle: Some(root.join("bundle")),
+            channels: BTreeSet::from(["latest".into()]),
+        });
+        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let original = resolver.resolve_project(&definition).await.unwrap();
+        let mut next = catalog.macos[0].clone();
+        next.manifest.sha256 = "b".repeat(64);
+        next.manifest.url = format!("bundle:{}", next.manifest.sha256);
+        catalog.macos[0].channels.clear();
+        catalog.macos.push(next);
+        fs::write(&path, serde_json::to_vec(&catalog).unwrap()).unwrap();
+        let updated = resolver.resolve_project(&definition).await.unwrap();
+        assert_ne!(
+            original.native["mac"].configuration.manifest,
+            updated.native["mac"].configuration.manifest
+        );
+        assert_eq!(
+            original.native["mac"].configuration.manifest.sha256,
+            "a".repeat(64)
+        );
+        fs::write(&path, b"corrupted catalog").unwrap();
+        assert!(resolver.resolve_project(&definition).await.is_err());
     }
 
     #[tokio::test]
@@ -1016,6 +1079,7 @@ mod tests {
                                 arch: host_arch,
                             },
                             MachineTargetCatalog {
+                                source_path: None,
                                 macos: Vec::new(),
                                 schema_version: 1,
                                 linux: vec![entry.clone()],
@@ -1327,14 +1391,18 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let entry = bundle(&root.join("bundle"), MachineProfile::Developer).await;
         let catalog = MachineTargetCatalog {
+            source_path: None,
             macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry.clone()],
         };
         let file = root.join("catalog.json");
         fs::write(&file, serde_json::to_vec(&catalog).unwrap()).unwrap();
-        assert_eq!(MachineTargetCatalog::from_file(&file).unwrap(), catalog);
+        let mut loaded = MachineTargetCatalog::from_file(&file).unwrap();
+        assert_eq!(loaded.source_path.take(), Some(file.clone()));
+        assert_eq!(loaded, catalog);
         let duplicate = MachineTargetCatalog {
+            source_path: None,
             macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry.clone(), entry.clone()],
@@ -1343,6 +1411,7 @@ mod tests {
         let mut other = entry;
         other.version = "other-version".into();
         let channels = MachineTargetCatalog {
+            source_path: None,
             macos: Vec::new(),
             schema_version: 1,
             linux: vec![catalog.linux[0].clone(), other],

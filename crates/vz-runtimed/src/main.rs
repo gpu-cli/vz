@@ -58,6 +58,11 @@ struct Cli {
     #[arg(long, requires = "installed_native_bundle")]
     installed_native_manifest_sha256: Option<String>,
 
+    /// Register a local macOS template without replacing installed Linux entries.
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires = "installed_native_bundle")]
+    preserve_installed_catalog: bool,
+
     /// Maximum retained untagged checkpoints in daemon GC loop.
     #[arg(long, default_value_t = 128)]
     checkpoint_retention_max_untagged_count: usize,
@@ -76,17 +81,28 @@ async fn main() -> Result<()> {
             .installed_release_version
             .as_deref()
             .context("installed release version required")?;
-        let path = tokio::time::timeout(
-            std::time::Duration::from_secs(120),
-            vz_runtimed::installed_machine_catalog::write_installed_catalog_with_native(
-                prefix,
-                version,
-                &cli.installed_linux_profile,
-                cli.installed_native_bundle
-                    .as_deref()
-                    .zip(cli.installed_native_manifest_sha256.as_deref()),
-            ),
-        )
+        let path = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            let native = cli
+                .installed_native_bundle
+                .as_deref()
+                .zip(cli.installed_native_manifest_sha256.as_deref());
+            if cli.preserve_installed_catalog {
+                vz_runtimed::installed_machine_catalog::register_local_catalog(
+                    prefix,
+                    version,
+                    native.context("native setup input required")?,
+                )
+                .await
+            } else {
+                vz_runtimed::installed_machine_catalog::write_installed_catalog_with_native(
+                    prefix,
+                    version,
+                    &cli.installed_linux_profile,
+                    native,
+                )
+                .await
+            }
+        })
         .await
         .context("installed catalog verification exceeded its 120-second deadline")??;
         use std::io::Write;

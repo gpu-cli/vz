@@ -60,9 +60,14 @@ pub struct ReleaseManifest {
     /// Exact Apple build identifier.
     pub macos_build: String,
     /// Uncompressed exact base disk bytes downloaded by consumers.
-    pub base: Artifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<Artifact>,
     /// VZDELTA1 patch bound to that base and the expected prepared image.
-    pub patch: Artifact,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub patch: Option<Artifact>,
+    /// Locally provisioned quiescent disk. Schema 2 never requires a block patch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub local_image: Option<Artifact>,
     /// Expected patched output, checked against the header before application.
     pub prepared_image: ImageIdentity,
     /// Native platform requirements and immutable seed artifacts.
@@ -75,11 +80,24 @@ pub struct ReleaseManifest {
 }
 
 impl ReleaseManifest {
+    /// Exact image and platform inputs in preparation order.
+    pub fn artifacts(&self) -> Vec<&Artifact> {
+        self.base
+            .iter()
+            .chain(self.patch.iter())
+            .chain(self.local_image.iter())
+            .chain([
+                &self.platform.hardware_model,
+                &self.platform.auxiliary_storage_seed,
+            ])
+            .collect()
+    }
+
     /// Validate the complete contract before acquiring image artifacts.
     /// This establishes syntax and pin consistency, not host or guest readiness.
     pub fn validate(&self) -> Result<()> {
         ensure!(
-            self.schema_version == 1,
+            matches!(self.schema_version, 1 | 2),
             "unsupported bootstrap manifest version"
         );
         ensure!(version(&self.macos_version)? >= 26, "macOS 26+ is required");
@@ -89,8 +107,34 @@ impl ReleaseManifest {
                 && self.macos_build.bytes().all(|b| b.is_ascii_alphanumeric()),
             "invalid macOS build"
         );
-        self.base.validate()?;
-        self.patch.validate()?;
+        match (
+            &self.base,
+            &self.patch,
+            &self.local_image,
+            self.schema_version,
+        ) {
+            (Some(base), Some(patch), None, 1) => {
+                base.validate()?;
+                patch.validate()?;
+            }
+            (None, None, Some(image), 2) => {
+                image.validate()?;
+                ensure!(
+                    image.url == format!("bundle:{}", image.sha256),
+                    "local image requires an installed bundle"
+                );
+                ensure!(
+                    image.sha256 == self.prepared_image.sha256
+                        && image.size_bytes == self.prepared_image.size_bytes,
+                    "local image differs from prepared identity"
+                );
+                ensure!(
+                    !self.toolchain_sha256.is_empty(),
+                    "local setup requires a validated toolchain"
+                );
+            }
+            _ => anyhow::bail!("manifest must select exactly one versioned preparation source"),
+        }
         self.prepared_image.validate()?;
         ensure!(
             self.platform.architecture == "aarch64",
@@ -107,16 +151,11 @@ impl ReleaseManifest {
         if !self.development || !self.toolchain_sha256.is_empty() {
             digest(&self.toolchain_sha256)?;
         }
-        if !self.development {
+        if !self.development && self.schema_version == 1 {
             ensure!(
-                [
-                    &self.base,
-                    &self.patch,
-                    &self.platform.hardware_model,
-                    &self.platform.auxiliary_storage_seed
-                ]
-                .iter()
-                .all(|a| a.url.starts_with("https://")),
+                self.artifacts()
+                    .iter()
+                    .all(|a| a.url.starts_with("https://")),
                 "qualified release artifacts require HTTPS locations"
             );
         }

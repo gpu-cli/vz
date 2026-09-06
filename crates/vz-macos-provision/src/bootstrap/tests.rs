@@ -49,8 +49,9 @@ impl Fixture {
             schema_version: 1,
             macos_version: "26.6.2".into(),
             macos_build: "25G83".into(),
-            base: artifact(&base),
-            patch: artifact(&patch),
+            base: Some(artifact(&base)),
+            patch: Some(artifact(&patch)),
+            local_image: None,
             prepared_image: ImageIdentity {
                 sha256: artifact(&expected).sha256,
                 size_bytes: expected.len() as u64,
@@ -124,12 +125,7 @@ async fn concurrent_preparation_commits_once_and_warm_hit_needs_no_large_blobs()
     assert_eq!(a.manifest_sha256(), b.manifest_sha256());
     assert_eq!(preparations.load(Ordering::SeqCst), 1);
     assert_eq!(fs::read(f.template().join("disk.img"))?, f.expected);
-    for pin in [
-        &f.manifest.base,
-        &f.manifest.patch,
-        &f.manifest.platform.hardware_model,
-        &f.manifest.platform.auxiliary_storage_seed,
-    ] {
+    for pin in f.manifest.artifacts() {
         fs::remove_file(f.root.join("cache/downloads").join(&pin.sha256))?;
     }
     let mut events = Vec::new();
@@ -392,8 +388,8 @@ async fn installed_bundle_verifies_then_reuses_template_without_source_blobs() -
     f.manifest.development = true;
     f.manifest.toolchain_sha256.clear();
     for a in [
-        &mut f.manifest.base,
-        &mut f.manifest.patch,
+        f.manifest.base.as_mut().context("base")?,
+        f.manifest.patch.as_mut().context("patch")?,
         &mut f.manifest.platform.hardware_model,
         &mut f.manifest.platform.auxiliary_storage_seed,
     ] {
@@ -420,6 +416,136 @@ fn missing_toolchain_is_only_accepted_for_explicit_development() -> Result<()> {
     f.manifest.development = true;
     f.manifest.validate()?;
     f.manifest.toolchain_sha256 = "unverified".into();
+    assert!(f.manifest.validate().is_err());
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn local_image_needs_no_delta_and_warm_reuse_needs_no_source_disk() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let bundle = f.root.join("local-inputs");
+    private_directory(&bundle)?;
+    f.manifest.schema_version = 2;
+    f.manifest.base = None;
+    f.manifest.patch = None;
+    let mut image = artifact(&f.expected);
+    image.url = format!("bundle:{}", image.sha256);
+    f.manifest.local_image = Some(image.clone());
+    f.manifest.validate()?;
+    fs::write(bundle.join(&image.sha256), &f.expected)?;
+    f.save_manifest()?;
+    for a in [
+        &f.manifest.platform.hardware_model,
+        &f.manifest.platform.auxiliary_storage_seed,
+    ] {
+        fs::copy(
+            f.root.join("cache/downloads").join(&a.sha256),
+            bundle.join(&a.sha256),
+        )?;
+    }
+    let mut delta_seen = false;
+    let mut commits = 0;
+    let template = f
+        .cache
+        .prepare_installed(&f.pin, &bundle, |p| {
+            delta_seen |= matches!(p, Progress::PreparingImage { .. });
+            if p == Progress::PublishingTemplate {
+                commits += 1;
+            }
+            Ok(())
+        })
+        .await?;
+    assert!(!delta_seen);
+    assert_eq!(commits, 1);
+    assert_eq!(fs::read(f.template().join("disk.img"))?, f.expected);
+    fs::set_permissions(&f.root, fs::Permissions::from_mode(0o700))?;
+    let first = f.root.join("first.img");
+    let second = f.root.join("second.img");
+    template.clone_disk(&first)?;
+    template.clone_disk(&second)?;
+    assert_ne!(fs::metadata(&first)?.ino(), fs::metadata(&second)?.ino());
+    fs::write(&first, b"private mutation")?;
+    assert_eq!(fs::read(&second)?, f.expected);
+    fs::remove_dir_all(bundle)?;
+    f.cache
+        .prepare_installed(&f.pin, &f.root.join("removed"), |_| Ok(()))
+        .await?
+        .validate_cached()?;
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+#[tokio::test]
+async fn corrupted_local_image_never_publishes_and_retry_succeeds() -> Result<()> {
+    let mut f = Fixture::new()?;
+    let bundle = f.root.join("local-inputs");
+    private_directory(&bundle)?;
+    f.manifest.schema_version = 2;
+    f.manifest.base = None;
+    f.manifest.patch = None;
+    let mut image = artifact(&f.expected);
+    image.url = format!("bundle:{}", image.sha256);
+    f.manifest.local_image = Some(image.clone());
+    f.save_manifest()?;
+    for a in [
+        &f.manifest.platform.hardware_model,
+        &f.manifest.platform.auxiliary_storage_seed,
+    ] {
+        fs::copy(
+            f.root.join("cache/downloads").join(&a.sha256),
+            bundle.join(&a.sha256),
+        )?;
+    }
+    fs::write(bundle.join(&image.sha256), vec![55; f.expected.len()])?;
+    let error = f
+        .cache
+        .prepare_installed(&f.pin, &bundle, |_| Ok(()))
+        .await
+        .err()
+        .context("corruption rejected")?;
+    assert!(error.to_string().contains("checksum mismatch"));
+    assert!(!f.template().exists() && !f.stage().exists());
+    fs::write(bundle.join(&image.sha256), &f.expected)?;
+    let error = f
+        .cache
+        .prepare_installed(&f.pin, &bundle, |p| {
+            if matches!(
+                p,
+                Progress::Artifact {
+                    component: Component::LocalImage,
+                    ..
+                }
+            ) {
+                anyhow::bail!("cancel local verification");
+            }
+            Ok(())
+        })
+        .await
+        .err()
+        .context("cancelled")?;
+    assert!(error.to_string().contains("cancel local verification"));
+    assert!(!f.template().exists() && !f.stage().exists());
+    f.cache
+        .prepare_installed(&f.pin, &bundle, |_| Ok(()))
+        .await?
+        .validate_cached()?;
+    Ok(())
+}
+
+#[test]
+fn local_and_delta_sources_cannot_be_mixed_or_downloaded_as_local_images() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.manifest.schema_version = 2;
+    let mut image = artifact(&f.expected);
+    image.url = format!("bundle:{}", image.sha256);
+    f.manifest.local_image = Some(image);
+    assert!(f.manifest.validate().is_err());
+    f.manifest.base = None;
+    f.manifest.patch = None;
+    f.manifest.validate()?;
+    f.manifest.local_image.as_mut().context("local image")?.url =
+        "https://example.invalid/image".into();
     assert!(f.manifest.validate().is_err());
     Ok(())
 }

@@ -25,6 +25,7 @@ import uuid
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--release-dir", type=Path, required=True)
+    parser.add_argument("--installed-prefix", type=Path, help="use an existing installation and its registered catalog without rewriting it")
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
@@ -42,8 +43,12 @@ def main():
     evidence.mkdir(mode=0o700)
     retained = json.loads(args.resume_layout.read_text()) if args.resume_layout else None
     root = Path(retained["root"]) if retained else Path(tempfile.mkdtemp(prefix="vzmac-cli-", dir="/private/tmp"))
-    binary_dir = root / "install/bin"
-    binary_dir.mkdir(parents=True, mode=0o700, exist_ok=retained is not None)
+    binary_dir = Path(retained.get("binary_dir", root / "install/bin")) if retained else (
+        args.installed_prefix.resolve() / "bin" if args.installed_prefix else root / "install/bin")
+    if not args.installed_prefix and not retained:
+        binary_dir.mkdir(parents=True, mode=0o700)
+    else:
+        assert binary_dir.is_dir()
     runtime = root / "r"
     runtime.mkdir(mode=0o700, exist_ok=retained is not None)
     project = root / "project"
@@ -142,18 +147,23 @@ def main():
         destination = binary_dir / name
         if retained:
             assert hashlib.sha256(destination.read_bytes()).hexdigest() == retained["binary_sha256"][name]
-        else:
+        elif not args.installed_prefix:
             destination.write_bytes((args.release_dir / name).read_bytes())
             destination.chmod(0o700)
         run(name + "-signature", ["/usr/bin/codesign", "--verify", "--strict",
                                  destination], cwd=root)
-    if not retained:
+    if not retained and not args.installed_prefix:
         run("catalog", [binary_dir / "vz-runtimed", "--write-installed-machine-target-catalog",
                     root / "install", "--installed-release-version", "0.4.0-dev",
                     "--installed-native-bundle", args.bundle.resolve(),
                         "--installed-native-manifest-sha256", args.manifest], cwd=root)
-    else:
+    elif retained:
         assert args.manifest == retained["manifest"] and str(args.bundle.resolve()) == retained["bundle"]
+    if args.installed_prefix:
+        catalog = json.loads((args.installed_prefix / "machine-target-catalog.json").read_text())
+        assert any(entry["manifest"]["sha256"] == args.manifest and
+                   entry["installed_bundle"] == str(args.bundle.resolve()) and "latest" in entry["channels"]
+                   for entry in catalog["macos"]), "setup did not register the selected local image"
     release = json.loads((args.bundle / args.manifest).read_text())
     if args.require_swift:
         assert release["toolchain_sha256"], "Swift gate requires a release-pinned toolchain"
@@ -176,7 +186,7 @@ def main():
         (project / "vz.json").write_text(json.dumps(definition, indent=2) + "\n")
         run("git-init", ["/usr/bin/git", "init", "--quiet"])
     (evidence / "layout.json").write_text(json.dumps(dict(
-        root=str(root), definition=definition, environment=env, manifest=args.manifest,
+        root=str(root), binary_dir=str(binary_dir), definition=definition, environment=env, manifest=args.manifest,
         bundle=str(args.bundle.resolve()), euid=os.geteuid(), binary_sha256={
             name: hashlib.sha256((binary_dir / name).read_bytes()).hexdigest()
             for name in ["vz", "vz-runtimed"]}), indent=2))

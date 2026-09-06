@@ -239,28 +239,75 @@ pub(super) fn build(
     key: &str,
     manifest: ReleaseManifest,
     bytes: &[u8],
-    [base, patch, hardware, auxiliary]: [&Path; 4],
+    inputs: &[PathBuf],
     mut progress: impl FnMut(Progress) -> Result<()>,
 ) -> Result<PreparedTemplate> {
-    let info = image_delta::inspect(patch)?;
-    let hex = |digest: &[u8]| {
-        digest
-            .iter()
-            .map(|b| format!("{b:02x}"))
-            .collect::<String>()
-    };
-    ensure!(
-        info.base_size == manifest.base.size_bytes
-            && hex(&info.base_sha256) == manifest.base.sha256
-            && info.target_size == manifest.prepared_image.size_bytes
-            && hex(&info.target_sha256) == manifest.prepared_image.sha256,
-        "delta header does not match pinned base/output"
-    );
     private_directory(staging)?;
     let _stage = Stage(staging.to_owned());
-    image_delta::apply(base, patch, &staging.join(FILES[0]), |p| {
-        progress(Progress::PreparingImage { progress: p })
-    })?;
+    let (hardware, auxiliary) = if let Some(local) = &manifest.local_image {
+        let [image, hardware, auxiliary] = inputs else {
+            anyhow::bail!("missing local image inputs")
+        };
+        let metadata = open_regular(image)?.metadata()?;
+        ensure!(
+            metadata.len() == local.size_bytes && metadata.nlink() == 1,
+            "invalid local image input"
+        );
+        let disk = staging.join(FILES[0]);
+        clone_file(image, &disk)?;
+        let mut input = open_regular(&disk)?;
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0; 4 * 1024 * 1024];
+        let mut completed = 0;
+        loop {
+            progress(Progress::Artifact {
+                component: Component::LocalImage,
+                progress: crate::artifact_cache::Progress {
+                    phase: crate::artifact_cache::Phase::VerifyingCache,
+                    completed,
+                    total: local.size_bytes,
+                },
+            })?;
+            let count = input.read(&mut buffer)?;
+            if count == 0 {
+                break;
+            }
+            completed += count as u64;
+            ensure!(
+                completed <= local.size_bytes,
+                "local image exceeded size pin"
+            );
+            hash.update(&buffer[..count]);
+        }
+        ensure!(
+            completed == local.size_bytes && format!("{:x}", hash.finalize()) == local.sha256,
+            "local image checksum mismatch"
+        );
+        (hardware, auxiliary)
+    } else {
+        let [base, patch, hardware, auxiliary] = inputs else {
+            anyhow::bail!("missing delta inputs")
+        };
+        let expected = manifest.base.as_ref().context("missing base pin")?;
+        let info = image_delta::inspect(patch)?;
+        let hex = |digest: &[u8]| {
+            digest
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>()
+        };
+        ensure!(
+            info.base_size == expected.size_bytes
+                && hex(&info.base_sha256) == expected.sha256
+                && info.target_size == manifest.prepared_image.size_bytes
+                && hex(&info.target_sha256) == manifest.prepared_image.sha256,
+            "delta header does not match pinned base/output"
+        );
+        image_delta::apply(base, patch, &staging.join(FILES[0]), |p| {
+            progress(Progress::PreparingImage { progress: p })
+        })?;
+        (hardware, auxiliary)
+    };
     for (source, name, artifact, component) in [
         (
             hardware,

@@ -31,6 +31,26 @@ pub async fn write_installed_catalog_with_native(
     profiles: &[String],
     native: Option<(&Path, &str)>,
 ) -> Result<PathBuf> {
+    write_catalog(prefix, version, profiles, native, false).await
+}
+
+/// Register a prepared local image while retaining all installed Linux profiles
+/// and older native pins. A single catalog lock serializes installer writes.
+pub async fn register_local_catalog(
+    prefix: &Path,
+    version: &str,
+    native: (&Path, &str),
+) -> Result<PathBuf> {
+    write_catalog(prefix, version, &[], Some(native), true).await
+}
+
+async fn write_catalog(
+    prefix: &Path,
+    version: &str,
+    profiles: &[String],
+    native: Option<(&Path, &str)>,
+    preserve: bool,
+) -> Result<PathBuf> {
     ensure!(
         prefix.is_absolute() && prefix.canonicalize()? == prefix,
         "installation prefix must be canonical and absolute"
@@ -41,7 +61,28 @@ pub async fn write_installed_catalog_with_native(
         "explicitly installed Linux profiles or a native bundle required"
     );
     let mut seen = BTreeSet::new();
-    let mut catalog = MachineTargetCatalog::default();
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(prefix.join("machine-target-catalog.lock"))?;
+    ensure!(
+        lock.metadata()?.is_file() && lock.metadata()?.nlink() == 1,
+        "invalid catalog lock"
+    );
+    fs2::FileExt::lock_exclusive(&lock)?;
+    let mut catalog = if prefix.join("machine-target-catalog.json").exists() {
+        MachineTargetCatalog::from_file(&prefix.join("machine-target-catalog.json"))?
+    } else {
+        MachineTargetCatalog::default()
+    };
+    if !preserve {
+        catalog.linux.clear();
+    }
     for name in profiles {
         ensure!(seen.insert(name), "duplicate installed profile");
         let (kernel_profile, profile) = match name.as_str() {
@@ -96,12 +137,7 @@ pub async fn write_installed_catalog_with_native(
             release.development,
             "installed native bundles are explicitly DEV until release qualification"
         );
-        for artifact in [
-            &release.base,
-            &release.patch,
-            &release.platform.hardware_model,
-            &release.platform.auxiliary_storage_seed,
-        ] {
+        for artifact in release.artifacts() {
             let source = bundle.join(&artifact.sha256);
             trusted_metadata(&source, false)?;
             ensure!(
@@ -109,6 +145,18 @@ pub async fn write_installed_catalog_with_native(
                 "installed native input size mismatch"
             );
         }
+        if preserve {
+            ensure!(
+                release.schema_version == 2,
+                "local setup requires a local-image manifest"
+            );
+        }
+        for entry in &mut catalog.macos {
+            entry.channels.remove("latest");
+        }
+        catalog
+            .macos
+            .retain(|entry| entry.manifest.sha256 != digest);
         catalog
             .macos
             .push(crate::machine_target_resolver::NativeMacosCatalogEntry {
@@ -269,5 +317,85 @@ mod tests {
             );
             assert!(!prefix.join("machine-target-catalog.json").exists());
         }
+    }
+    #[tokio::test]
+    async fn local_registration_preserves_linux_old_pins_and_survives_reinstallation() {
+        use vz_macos_provision::{
+            artifact_cache::Artifact,
+            bootstrap::{ImageIdentity, Platform, ReleaseManifest},
+        };
+        let root = tempfile::tempdir().unwrap();
+        let prefix = root.path().canonicalize().unwrap();
+        fixture(&prefix, KernelProfile::Developer);
+        write_installed_catalog(&prefix, "0.4.0", &["developer".into()])
+            .await
+            .unwrap();
+        let bundle = prefix.join("local");
+        std::fs::create_dir(&bundle).unwrap();
+        let blob = |bytes: &[u8]| {
+            let sha256 = format!("{:x}", Sha256::digest(bytes));
+            std::fs::write(bundle.join(&sha256), bytes).unwrap();
+            Artifact {
+                url: format!("bundle:{sha256}"),
+                sha256,
+                size_bytes: bytes.len() as u64,
+            }
+        };
+        let image = blob(b"local image");
+        let manifest = ReleaseManifest {
+            schema_version: 2,
+            development: true,
+            macos_version: "26.3.1".into(),
+            macos_build: "25D2128".into(),
+            base: None,
+            patch: None,
+            local_image: Some(image.clone()),
+            prepared_image: ImageIdentity {
+                sha256: image.sha256,
+                size_bytes: image.size_bytes,
+            },
+            platform: Platform {
+                architecture: "aarch64".into(),
+                minimum_host_version: "26.3.1".into(),
+                minimum_cpu_count: 2,
+                minimum_memory_bytes: 4096,
+                hardware_model: blob(b"hardware"),
+                auxiliary_storage_seed: blob(b"auxiliary"),
+            },
+            guest_agent_sha256: "a".repeat(64),
+            toolchain_sha256: "b".repeat(64),
+        };
+        let first = blob(&serde_json::to_vec(&manifest).unwrap());
+        let path = register_local_catalog(&prefix, "0.4.0", (&bundle, &first.sha256))
+            .await
+            .unwrap();
+        let first_catalog = MachineTargetCatalog::from_file(&path).unwrap();
+        assert_eq!(first_catalog.linux.len(), 1);
+        assert_eq!(first_catalog.macos.len(), 1);
+        let mut updated = manifest;
+        updated.toolchain_sha256 = "c".repeat(64);
+        let second = blob(&serde_json::to_vec(&updated).unwrap());
+        register_local_catalog(&prefix, "0.4.0", (&bundle, &second.sha256))
+            .await
+            .unwrap();
+        let catalog = MachineTargetCatalog::from_file(&path).unwrap();
+        assert_eq!(catalog.linux, first_catalog.linux);
+        assert_eq!(catalog.macos.len(), 2);
+        assert!(catalog.macos[0].channels.is_empty());
+        assert!(catalog.macos[1].channels.contains("latest"));
+        write_installed_catalog(&prefix, "0.4.1", &["developer".into()])
+            .await
+            .unwrap();
+        let reinstalled = MachineTargetCatalog::from_file(&path).unwrap();
+        assert_eq!(reinstalled.macos, catalog.macos);
+        assert_eq!(reinstalled.linux[0].version, "0.4.1");
+        let before = std::fs::read(&path).unwrap();
+        std::fs::write(bundle.join(&second.sha256), b"corrupted").unwrap();
+        assert!(
+            register_local_catalog(&prefix, "0.4.1", (&bundle, &second.sha256))
+                .await
+                .is_err()
+        );
+        assert_eq!(before, std::fs::read(path).unwrap());
     }
 }
