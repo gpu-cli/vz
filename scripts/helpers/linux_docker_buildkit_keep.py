@@ -228,6 +228,42 @@ def verify_worker_log(builder):
     return proof
 
 
+def verify_cached_worker_log(builder):
+    """Observe an unused importer worker, not successful OCI execution.
+
+    The caller independently proves the cached solve. Re-authenticate runtime
+    inventory here rather than trusting an earlier or caller-asserted history.
+    A present log, even empty, contradicts this deliberately narrower claim.
+    """
+    require(builder.role == "importer" and builder.prepared is True,
+            "cached worker proof requires the prepared importer role")
+    runtime = builder.verify(require_invocation=False)
+    require(runtime["role"] == "importer" and runtime["builder"] == builder.mapping and
+            runtime["owner"] == builder.descriptor["owner"] and
+            runtime["youki_invocations"] == builder.invocations == [],
+            "cached importer has nested runtime invocation history")
+    before = builder.inspect_owned()
+    raw, error, _ = builder.command("cached-worker-runtime-log",
+        ["exec", builder.container_id, "/bin/busybox", "sh", "-c", WORKER_LOG_SCRIPT], timeout=15)
+    after = builder.inspect_owned()
+    require(not error and before["State"]["Pid"] == after["State"]["Pid"] and
+            before["State"]["StartedAt"] == after["State"]["StartedAt"], "cached worker log owner lifetime changed")
+    content = worker_log_bytes(raw)
+    proof = {"schema_version": 1, "role": "importer", "owner": builder.descriptor["owner"],
+             "context": builder.descriptor["name"], "engine_id": builder.descriptor["engine_id"],
+             "builder_id": builder.container_id, "path": WORKER_LOG,
+             "runtime_sha256": builder.inventory["usr/bin/youki"]["sha256"],
+             "fresh_runtime_verification": runtime,
+             "present": content is not None, "size": len(content) if content is not None else None,
+             "sha256": hashlib.sha256(content).hexdigest() if content is not None else None,
+             "no_worker_execution_observed": content is None}
+    if content is not None:
+        startup.write(builder.harness.evidence / (builder.token + "-cached-worker-runtime-log.json"), content)
+    startup.document(builder.harness.evidence / (builder.token + "-cached-worker-runtime-log-proof.json"), proof)
+    require(content is None, "cached importer has unexplained worker runtime log; raw log retained")
+    return proof
+
+
 def run(builder):
     """Run once; caller must keep automatic cleanup withheld until this succeeds."""
     h, token, descriptor, cid = builder.harness, builder.token, builder.descriptor, builder.container_id

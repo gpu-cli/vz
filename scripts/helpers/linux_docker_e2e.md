@@ -1,7 +1,7 @@
 # Installed local-Mac Compose and Buildx slices (DEV)
 
-`scripts/run-linux-docker-e2e.sh` is the host entry point. `--suite compose`
-and `--suite build` select distinct DEV slices. `--suite all` rejects before client execution, state creation,
+`scripts/run-linux-docker-e2e.sh` is the host entry point. `--suite compose`,
+`--suite build`, and `--suite artifacts` select distinct DEV slices. `--suite all` rejects before client execution, state creation,
 or VM provisioning; it never aliases the full 63-scenario contract to a subset.
 
 Pass absolute paths for every artifact/client and a fresh evidence directory:
@@ -83,6 +83,34 @@ steps disable networking; this does not make the complete build offline.
 These recipes do not establish cache export/import, cross-Machine cache denial,
 parallel builds, SSH forwarding or secret absence from all image/cache blobs.
 Source integration and offline tests alone are not physical Buildx evidence.
+
+The separate `--suite artifacts` lane also requires `--buildkit-archive`. It
+preserves the five-recipe build contract and uses three distinct owned builder
+roles per tested Machine: source, cold-control, and importer. Source exports
+alpha OCI plus local cache, beta OCI, and an uncached secret build's OCI plus
+local cache. Identical alpha inputs must execute on the fresh no-import control
+and hit on the different fresh importer using only the exact source export.
+The same run token and fixture bytes are used on all three tested Machines;
+owner identity never becomes an argument that manufactures a cold miss.
+
+This bounded exporter policy is pinned to BuildKit 0.19: OCI directory output
+(`tar=false`), OCI media types, forced gzip layers, no provenance/SBOM, and fresh
+local cache output with `mode=max,image-manifest=true`. It does not claim
+timestamp normalization or byte-reproducible image manifests. Streaming checks
+verify descriptor hashes/sizes, config diff IDs, complete cache graph references,
+exact final scratch payload, changed alpha/beta layers, and secret canaries in
+metadata plus all raw/decompressed exported blobs. Intermediate canaries are
+excluded from final OCI files, not from the cache where they legitimately belong.
+Unsupported formats, unreferenced blobs, unfinished ingest files, links in the
+host artifact tree, and changed exports fail closed. Exported-cache inspection
+is not a complete worker-cache audit.
+
+Each artifact operation has nine raw commands: four identity/process guards,
+one solve, and four post-solve guards. Independent replay binds exact arguments,
+Engine clocks, cache-hit/miss execution markers, continuous builder identity,
+and the before/after imported cache inventory. Normal cleanup is withheld until
+all five operations and role ownership checks pass. This lane's implementation
+and offline tests are not a physical pass; consult its retained candidate result.
 
 Four additional containers are started once before workload execution. A
 separate recorder continuously checks their Engine identity, unchanged start

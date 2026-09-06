@@ -8,6 +8,7 @@ from pathlib import Path
 import shlex
 import socket
 import signal
+import stat
 import tempfile
 import time
 import unittest
@@ -72,6 +73,55 @@ class FixtureTests(unittest.TestCase):
                     with self.assertRaises(ValueError):
                         tools.main("secret")
                     output.assert_not_called()
+
+    def test_public_output_mode_and_bytes_are_independent_of_inherited_umask(self):
+        tools = module("fixture_output_mode", ROOT / "build/tools.py")
+        payload = b"public-fixture-output\x00\n"
+        for mask in (0o000, 0o022, 0o077):
+            with self.subTest(mask=oct(mask)), tempfile.TemporaryDirectory(prefix="vz04-output-mode-") as directory:
+                destination_root = Path(directory) / "out"
+
+                def container_path(*parts):
+                    self.assertEqual(parts[0], "/out")
+                    return destination_root.joinpath(*parts[1:])
+
+                previous = os.umask(mask)
+                try:
+                    with patch.object(tools, "Path", side_effect=container_path):
+                        for name in ("payload.txt", "secret.txt", "cache.txt", "ssh.txt"):
+                            tools.output(name, payload)
+                            selected = destination_root / name
+                            self.assertEqual(selected.read_bytes(), payload)
+                            self.assertTrue(selected.is_file())
+                            self.assertEqual(stat.S_IMODE(selected.stat().st_mode), 0o644)
+                    self.assertEqual(os.umask(mask), mask, "output must not change process umask")
+                finally:
+                    os.umask(previous)
+
+    def test_public_output_normalizes_existing_file_mode(self):
+        tools = module("fixture_existing_output_mode", ROOT / "build/tools.py")
+        with tempfile.TemporaryDirectory(prefix="vz04-existing-output-") as directory:
+            destination_root = Path(directory) / "out"
+            destination_root.mkdir()
+            selected = destination_root / "payload.txt"
+            for mode in (0o600, 0o666, 0o755):
+                with self.subTest(mode=oct(mode)):
+                    selected.write_bytes(b"previous payload")
+                    selected.chmod(mode)
+
+                    def container_path(*parts):
+                        self.assertEqual(parts[0], "/out")
+                        return destination_root.joinpath(*parts[1:])
+
+                    previous = os.umask(0o077)
+                    try:
+                        with patch.object(tools, "Path", side_effect=container_path):
+                            tools.output("payload.txt", b"new payload\n")
+                        self.assertEqual(selected.read_bytes(), b"new payload\n")
+                        self.assertEqual(stat.S_IMODE(selected.stat().st_mode), 0o644)
+                        self.assertEqual(os.umask(0o077), 0o077)
+                    finally:
+                        os.umask(previous)
 
     def test_compose_owner_records_and_exit_payloads_are_exact(self):
         service = module("fixture_service", ROOT / "compose/service.py")

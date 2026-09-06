@@ -75,6 +75,11 @@ be absent. Use the same final stage for local output and OCI output, retaining
 actual content, configuration and layer digests. Byte-identical payloads alone
 do not establish reproducible image metadata.
 
+The build tool explicitly sets each public output payload to mode `0644` after
+writing its exact bytes. This applies to payload, secret-success, cache and SSH
+output files; it does not change secret input permissions or the process umask.
+OCI validation checks the declared mode rather than assuming an inherited umask.
+
 For layer-cache reuse, the harness records BuildKit vertex results and requires
 the payload RUN to execute once and be cached on an identical second build.
 Export with `--cache-to type=local,dest=<owned-directory>,mode=max`; a fresh

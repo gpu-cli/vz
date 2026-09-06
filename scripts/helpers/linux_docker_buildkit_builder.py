@@ -171,10 +171,19 @@ def volume_identity(item, name, token):
 
 
 class Builder:
-    def __init__(self, harness, descriptor):
+    def __init__(self, harness, descriptor, *, role="source"):
+        require(type(role) is str and role in ("source", "cold-control", "importer"),
+                "unsupported builder ownership role")
         self.harness, self.descriptor = harness, descriptor
-        token = sha(json.dumps({"run_id": harness.info["run_id"], "owner": descriptor["owner"]},
-                              sort_keys=True).encode())[:24]
+        self.role = role
+        material = {"run_id": harness.info["run_id"], "owner": descriptor["owner"]}
+        # Keep the source builder's existing names byte-for-byte. Additional
+        # roles separate runtime/cache ownership, never workload inputs.
+        if role != "source":
+            material["role"] = role
+        self.identity_bytes = json.dumps(material, sort_keys=True).encode()
+        self.identity_sha256 = sha(self.identity_bytes)
+        token = self.identity_sha256[:24]
         self.token = "vzbuild-" + token
         self.name, self.node = self.token, self.token + "-node"
         self.container_name = "buildx_buildkit_" + self.node
@@ -187,6 +196,12 @@ class Builder:
         self.invocations = []
         self.inventory = None
         self.live_instance = None
+        self.ownership = {"schema_version": 1, "role": role,
+                          "identity_material": json.loads(self.identity_bytes),
+                          "identity_sha256": self.identity_sha256,
+                          "builder_name": self.name, "node": self.node,
+                          "container_name": self.container_name, "image_tag": self.tag,
+                          "cache_volume_name": self.volume_name}
 
     def command(self, label, args, mutate=False, **kwargs):
         call = self.harness.mutate if mutate else self.harness.docker
@@ -210,6 +225,12 @@ class Builder:
         require(not raw.strip(), "candidate builder object preexists or remains after removal")
 
     def engine_guard(self):
+        material = {"run_id": self.harness.info["run_id"], "owner": self.descriptor["owner"]}
+        if self.role != "source":
+            material["role"] = self.role
+        require(self.role == self.ownership["role"] and
+                json.dumps(material, sort_keys=True).encode() == self.identity_bytes,
+                "builder role/run/owner identity changed")
         raw, _, _ = self.command("engine", ["info", "--format", "{{json .}}"])
         info = image_input.parse(raw)
         require(info["ID"] == self.descriptor["engine_id"] and info["OSType"] == "linux" and
@@ -273,8 +294,10 @@ class Builder:
         payload, self.inventory = rootfs_payload(self.harness)
         rootfs = self.harness.evidence / (self.token + "-rootfs.tar")
         startup.write(rootfs, payload)
+        startup.document(self.harness.evidence / (self.token + "-ownership.json"), self.ownership)
         startup.document(self.harness.evidence / (self.token + "-image-input.json"),
                          {"owner": self.descriptor["owner"], "context": self.descriptor["name"],
+                          "role": self.role, "identity_sha256": self.identity_sha256,
                           "rootfs_archive": rootfs.name, "rootfs_sha256": sha(payload), "inventory": self.inventory,
                           "buildkit": self.harness.info["buildkit"], "worker_flags": FLAGS,
                           "image_env": ENV, "cgroup_namespace": "private"})
@@ -359,6 +382,7 @@ class Builder:
         self.invocations = invocations
         self.verifications += 1
         proof = {"scope": "owned_buildkit_builder_and_worker_cache_not_full_release_runtime_attestation",
+                 "role": self.role, "identity_sha256": self.identity_sha256,
                  "owner": self.descriptor["owner"], "context": self.descriptor["name"], "engine_id": self.descriptor["engine_id"],
                  "builder": self.mapping, "cache_volume": self.volume, "runtime_hashes": observed,
                  "cgroup": cgroup_proof,
@@ -399,6 +423,7 @@ class Builder:
         stop_proof = shutdown.validate(before, item, since, until, stop_elapsed_ns,
                                        event_raw, log_stdout, log_stderr, self.token)
         stop_proof.update(owner=self.descriptor["owner"], context=self.descriptor["name"],
+                          role=self.role, identity_sha256=self.identity_sha256,
                           engine_id=self.descriptor["engine_id"], contract_sha256=sha(contract_raw))
         startup.document(self.harness.evidence / (self.token + "-normal-stop.json"), stop_proof)
         self.command("container-remove", ["container", "rm", self.container_id], mutate=True)
@@ -417,6 +442,7 @@ class Builder:
         require(self.image_id not in raw.decode().split(), "builder image remains under another reference")
         startup.document(self.harness.evidence / (self.token + "-cleanup.json"),
                          {"builder": self.mapping, "cache_volume": self.volume, "owner": self.descriptor["owner"],
+                          "role": self.role, "identity_sha256": self.identity_sha256,
                           "buildx_registration_absent": True,
                           "normal_stop": stop_proof,
                           "exact_owned_builder_container_volume_image_removed": True})

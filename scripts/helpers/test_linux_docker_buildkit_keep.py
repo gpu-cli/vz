@@ -194,11 +194,98 @@ class WorkerLogTests(unittest.TestCase):
             self.assertNotIn(forbidden, keep.WORKER_LOG_SCRIPT)
 
 
+class CachedWorkerLogTests(unittest.TestCase):
+    def builder(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        builder = Mock(token=TOKEN, container_id="exact", role="importer", prepared=True, invocations=[],
+                       descriptor={"owner": {"machine_id": "exact"}, "name": "context", "engine_id": "engine"},
+                       inventory={"usr/bin/youki": {"sha256": "a" * 64}}, mapping={"container_id": "exact"})
+        builder.harness.evidence = Path(temporary.name)
+        builder.verify.return_value = {"role": "importer", "builder": builder.mapping,
+                                       "owner": builder.descriptor["owner"], "youki_invocations": []}
+        builder.inspect_owned.return_value = {"State": {"Pid": 1, "StartedAt": "exact"}}
+        builder.command.return_value = (b"absent\n", b"", 0)
+        return builder
+
+    def test_absence_and_fresh_empty_history_are_scoped_not_workload_success(self):
+        builder = self.builder()
+        proof = keep.verify_cached_worker_log(builder)
+        builder.verify.assert_called_once_with(require_invocation=False)
+        self.assertEqual(builder.inspect_owned.call_count, 2)
+        builder.command.assert_called_once_with("cached-worker-runtime-log",
+            ["exec", "exact", "/bin/busybox", "sh", "-c", keep.WORKER_LOG_SCRIPT], timeout=15)
+        self.assertTrue(proof["no_worker_execution_observed"])
+        self.assertFalse(proof["present"])
+        self.assertNotIn("no_runtime_errors", proof)
+        self.assertIsNone(proof["size"])
+        self.assertIsNone(proof["sha256"])
+        self.assertEqual(proof["fresh_runtime_verification"], builder.verify.return_value)
+        path = builder.harness.evidence / (TOKEN + "-cached-worker-runtime-log-proof.json")
+        self.assertEqual(json.loads(path.read_bytes()), proof)
+        self.assertFalse((builder.harness.evidence / (TOKEN + "-cached-worker-runtime-log.json")).exists())
+
+    def test_even_present_empty_log_is_retained_and_rejected(self):
+        for raw, content in ((b"present\n12:34:0:1:1\n\n", b""),
+                             (b"present\n12:34:3:1:1\neHl6\n", b"xyz")):
+            with self.subTest(content=content):
+                builder = self.builder()
+                builder.command.return_value = (raw, b"", 0)
+                with self.assertRaisesRegex(ValueError, "unexplained worker runtime log"):
+                    keep.verify_cached_worker_log(builder)
+                prefix = builder.harness.evidence / (TOKEN + "-cached-worker-runtime-log.json")
+                self.assertEqual(prefix.read_bytes(), content)
+                proof = json.loads((builder.harness.evidence / (TOKEN + "-cached-worker-runtime-log-proof.json")).read_bytes())
+                self.assertFalse(proof["no_worker_execution_observed"])
+
+    def test_wrong_role_or_unprepared_fails_before_observation(self):
+        for key, value in (("role", "source"), ("role", "cold-control"), ("prepared", False), ("prepared", 1)):
+            builder = self.builder()
+            setattr(builder, key, value)
+            with self.assertRaisesRegex(ValueError, "prepared importer"):
+                keep.verify_cached_worker_log(builder)
+            builder.verify.assert_not_called()
+            builder.command.assert_not_called()
+
+    def test_fresh_runtime_history_and_identity_cannot_be_asserted_empty(self):
+        for key, value in (("youki_invocations", ["vz-youki-invocation pid=2"]),
+                           ("role", "source"), ("owner", {}), ("builder", {})):
+            builder = self.builder()
+            builder.verify.return_value[key] = value
+            with self.assertRaisesRegex(ValueError, "invocation history"):
+                keep.verify_cached_worker_log(builder)
+            builder.command.assert_not_called()
+        builder = self.builder()
+        builder.invocations = ["vz-youki-invocation pid=2"]
+        with self.assertRaisesRegex(ValueError, "invocation history"):
+            keep.verify_cached_worker_log(builder)
+        builder.command.assert_not_called()
+
+    def test_replaced_lifetime_stderr_and_partial_capture_fail(self):
+        for changes in ("lifetime", "stderr", "partial", "verification"):
+            builder = self.builder()
+            if changes == "lifetime":
+                builder.inspect_owned.side_effect = [{"State": {"Pid": 1, "StartedAt": "exact"}},
+                                                    {"State": {"Pid": 2, "StartedAt": "later"}}]
+            elif changes == "stderr":
+                builder.command.return_value = (b"absent\n", b"warning\n", 0)
+            elif changes == "partial":
+                builder.command.return_value = (b"absent", b"", 0)
+            else:
+                builder.verify.side_effect = ValueError("inventory rejected")
+            with self.subTest(changes=changes), self.assertRaises(ValueError):
+                keep.verify_cached_worker_log(builder)
+            self.assertEqual(list(builder.harness.evidence.iterdir()), [])
+
+
 class IntegrationTests(unittest.TestCase):
     def test_keep_failure_withholds_cleanup_and_success_marks_verified(self):
         for fails in (True, False):
             h = gate.ComposeHarness.__new__(gate.ComposeHarness)
             h.info, h.builders, h.keep_proofs_verified = {"suite": "build"}, [], []
+            h.builder_by_owner_role = {}
+            descriptor = {"owner": {"project_id": "owned-project", "environment_id": "owned-environment",
+                                    "machine_id": "owned-machine"}}
             builder = Mock()
             module = types.SimpleNamespace(Builder=Mock(return_value=builder))
             def verify(selected):
@@ -210,11 +297,11 @@ class IntegrationTests(unittest.TestCase):
                     patch.object(gate, "input_mapping", return_value={}), patch.object(keep, "run", side_effect=verify):
                 if fails:
                     with self.assertRaisesRegex(ValueError, "keep probe failed"):
-                        h.driver_inputs({}, {}, {}, {})
+                        h.driver_inputs(descriptor, {}, {}, {})
                     with self.assertRaisesRegex(Exception, "keep fixture"):
                         h.assert_certain()
                 else:
-                    h.driver_inputs({}, {}, {}, {})
+                    h.driver_inputs(descriptor, {}, {}, {})
             self.assertEqual(h.keep_proofs_verified, [not fails])
 
 

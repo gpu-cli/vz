@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""DEV installed Linux-on-macOS Compose/Buildx slices; not Docker certification.
+"""DEV installed Linux-on-macOS Compose/Buildx/artifact slices; not certification.
 
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
@@ -24,6 +24,7 @@ import linux_docker_image_input as image_input
 
 SCOPE = "DEV_INSTALLED_LINUX_COMPOSE_NOT_RELEASE_CERTIFICATION"
 BUILD_SCOPE = "DEV_INSTALLED_LINUX_BUILDX_NOT_RELEASE_CERTIFICATION"
+ARTIFACT_SCOPE = "DEV_INSTALLED_LINUX_BUILD_ARTIFACTS_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -37,7 +38,7 @@ def arguments(argv):
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -45,26 +46,27 @@ def arguments(argv):
     parser.add_argument("--run-id")
     parser.add_argument("--buildkit-archive")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build", "artifacts"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
     if args.run_id is None:
         args.run_id = args.suite + "-" + uuid.uuid4().hex[:24]
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
-    require((args.buildkit_archive is not None) == (args.suite == "build"),
-            "--buildkit-archive is required only for the build suite")
+    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts"}),
+            "--buildkit-archive is required only for the build and artifacts suites")
     return args
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build"}, "full contract unavailable")
+    require(args.suite in {"compose", "build", "artifacts"}, "full contract unavailable")
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
     pin = image_input.load(pin_path)
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
-    info.update(scope=SCOPE if args.suite == "compose" else BUILD_SCOPE, suite=args.suite,
+    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE}
+    info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
                 public_ca=ca_pin)
@@ -74,7 +76,7 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
-    if args.suite == "build":
+    if args.suite in {"build", "artifacts"}:
         import linux_docker_buildkit_builder as builder
         archive = startup.canonical(args.buildkit_archive)
         info["buildkit"] = builder.preflight_archive(archive)
@@ -85,6 +87,11 @@ def preflight(args, require_host=True):
                      REPO / "scripts/helpers/linux_docker_buildkit_keep.py",
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
+            info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == "artifacts":
+        for name in ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
+                     "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py"):
+            path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
     return info
 
@@ -311,23 +318,47 @@ class ComposeHarness(startup.Harness):
         self.monitor = None
         self.mutations = []
         self.builders = []
+        self.builder_by_owner_role = {}
         self.keep_proofs_verified = []
 
-    def driver_inputs(self, descriptor, scope, proof, images):
-        inputs = input_mapping(self, scope, proof, images)
-        if self.info.get("suite", "compose") == "build":
-            from linux_docker_buildkit_builder import Builder
-            builder = Builder(self, descriptor)
-            # Retain the owner before any effects, including partial failures.
-            self.builders.append(builder)
-            inputs["builder"] = builder.prepare()
+    @staticmethod
+    def builder_key(descriptor, role):
+        require(type(role) is str and role in {"source", "cold-control", "importer"}, "unknown builder role")
+        return (json.dumps(descriptor["owner"], sort_keys=True, separators=(",", ":")), role)
+
+    def get_builder(self, descriptor, role="source"):
+        key = self.builder_key(descriptor, role)
+        require(key in self.builder_by_owner_role, "builder owner/role was not prepared")
+        builder = self.builder_by_owner_role[key]
+        require(builder.descriptor == descriptor, "builder descriptor changed after admission")
+        return builder
+
+    def prepare_builder(self, descriptor, role="source", keep_probe=True):
+        key = self.builder_key(descriptor, role)
+        require(type(keep_probe) is bool, "invalid keep probe selection")
+        require(key not in self.builder_by_owner_role, "builder owner/role already registered")
+        from linux_docker_buildkit_builder import Builder
+        builder = Builder(self, json.loads(json.dumps(descriptor)), role=role)
+        # Both inventories retain exact ownership before any partial effects.
+        self.builders.append(builder)
+        self.builder_by_owner_role[key] = builder
+        builder.prepare()
+        if role == "source" and keep_probe:
             from linux_docker_buildkit_keep import run as verify_keep
             self.keep_proofs_verified.append(False)
             verify_keep(builder)
             self.keep_proofs_verified[-1] = True
+        return builder
+
+    def driver_inputs(self, descriptor, scope, proof, images):
+        inputs = input_mapping(self, scope, proof, images)
+        if self.info.get("suite", "compose") == "build":
+            inputs["builder"] = self.prepare_builder(descriptor).mapping
         return inputs
 
     def validate_driver(self, output, inputs):
+        require(self.info.get("suite", "compose") in {"build", "compose"},
+                "artifact replay belongs to the artifact orchestrator")
         if self.info.get("suite", "compose") == "build":
             from linux_docker_build_evidence import validate
         else:
@@ -519,6 +550,14 @@ class ComposeHarness(startup.Harness):
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
                 images = self.prepare_image(descriptor)
+                if suite == "artifacts":
+                    from linux_docker_build_artifacts import run_machine
+                    begin = time.time_ns()
+                    observation = run_machine(self, descriptor, scope, proof, images, index)
+                    end = time.time_ns()
+                    self.monitor.check_interval(begin, end, descriptor["name"])
+                    observations.append(observation)
+                    continue
                 inputs = self.driver_inputs(descriptor, scope, proof, images)
                 admitted = driver.Inputs(inputs, suite=suite)
                 admitted.verify_runtime_evidence()
@@ -534,10 +573,10 @@ class ComposeHarness(startup.Harness):
                 require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
                 builder_runtime = None
                 if suite == "build":
-                    require(len(self.builders) == index + 1, "builder ownership inventory differs from selected Machine")
-                    builder_runtime = self.builders[-1].verify(require_invocation=True)
+                    builder = self.get_builder(descriptor)
+                    builder_runtime = builder.verify(require_invocation=True)
                     from linux_docker_buildkit_keep import verify_worker_log
-                    builder_runtime["post_workload_log"] = verify_worker_log(self.builders[-1])
+                    builder_runtime["post_workload_log"] = verify_worker_log(builder)
                 replay = self.validate_driver(output, inputs)
                 self.driver_cleanup_verified[-1] = True
                 self.monitor.check_interval(begin, end, descriptor["name"])

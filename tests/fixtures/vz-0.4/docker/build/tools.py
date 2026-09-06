@@ -16,7 +16,11 @@ def required(name, pattern):
 
 def output(name, value):
     Path("/out").mkdir(exist_ok=True)
-    Path("/out", name).write_bytes(value)
+    destination = Path("/out", name)
+    destination.write_bytes(value)
+    # These are public fixture payloads. Their export mode must not depend on
+    # the inherited BuildKit/runtime umask (and secret input modes are separate).
+    destination.chmod(0o644)
 
 
 def main(mode):

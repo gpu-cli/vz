@@ -14,6 +14,28 @@ import linux_docker_e2e as gate
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_artifact_helpers_are_hashed_only_for_explicit_artifacts_suite(self):
+        names = ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
+                 "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py")
+        for suite, scope in (("compose", gate.SCOPE), ("build", gate.BUILD_SCOPE),
+                             ("artifacts", gate.ARTIFACT_SCOPE)):
+            with self.subTest(suite=suite):
+                args = types.SimpleNamespace(suite=suite, fixture="/owned/fixture", image_input="/owned/pin",
+                                             buildkit_archive="/owned/buildkit.tar", run_id="owned-run")
+                with patch.object(gate.startup, "preflight", return_value={"inputs": {}}), \
+                        patch.object(gate.startup, "canonical", side_effect=Path), \
+                        patch.object(gate.startup, "digest", side_effect=lambda path: str(path)), \
+                        patch.object(gate.image_input, "load", return_value={}), \
+                        patch.object(gate, "public_ca_input", return_value={}), \
+                        patch.object(gate.driver, "tree_digest", return_value="fixture-hash"), \
+                        patch("linux_docker_buildkit_builder.preflight_archive", return_value={"archive": "exact"}) as archive:
+                    info = gate.preflight(args, require_host=False)
+                self.assertEqual(info["scope"], scope)
+                for name in names:
+                    self.assertEqual(str(gate.REPO / "scripts/helpers" / name) in info["inputs"], suite == "artifacts")
+                self.assertEqual("buildkit" in info, suite != "compose")
+                self.assertEqual(archive.call_count, int(suite != "compose"))
+
     def test_public_ca_accepts_public_source_modes_but_not_tamper_or_symlink(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary).resolve()
@@ -70,11 +92,12 @@ class AdmissionTests(unittest.TestCase):
         common = []
         for name in gate.startup.OPTIONS:
             common.extend(["--" + name, "/absolute/input"])
-        with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
-            gate.arguments(["--suite", "build", *common])
-        args = gate.arguments(["--suite", "build", *common, "--buildkit-archive", "/owned/buildkit.tar"])
-        self.assertEqual(args.suite, "build")
-        self.assertEqual(args.buildkit_archive, "/owned/buildkit.tar")
+        for suite in ("build", "artifacts"):
+            with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
+                gate.arguments(["--suite", suite, *common])
+            args = gate.arguments(["--suite", suite, *common, "--buildkit-archive", "/owned/buildkit.tar"])
+            self.assertEqual(args.suite, suite)
+            self.assertEqual(args.buildkit_archive, "/owned/buildkit.tar")
         with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
             gate.arguments(["--suite", "compose", *common, "--buildkit-archive", "/owned/buildkit.tar"])
         with self.assertRaisesRegex(driver.Rejected, "duplicate"):
@@ -235,14 +258,58 @@ class PrePullTrustTests(unittest.TestCase):
 
 
 class BuildDispatchTests(unittest.TestCase):
+    def test_artifacts_branch_calls_only_artifact_orchestrator_and_monitors_every_machine(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.info = {"suite": "artifacts", "public_ca": {"bundle_sha256": "a" * 64}}
+        harness.cli, harness.evidence = Path("/owned/bin/vz"), Path("/owned/evidence")
+        contexts = [{"name": "context-" + str(i), "endpoint": "endpoint-" + str(i),
+                     "engine_id": "engine-" + str(i)} for i in range(4)]
+        environments = [{"environment_id": "env-" + str(i), "machines": [
+            {"machine_id": "machine-" + str(2*i+j), "name": "worker-" + str(j),
+             "docker_context": contexts[2*i+j]} for j in range(2)]} for i in range(2)]
+        project = Path("/owned/project")
+        harness.project, harness.up = Mock(return_value=project), Mock(side_effect=environments)
+        harness.daemon_fingerprint = Mock(return_value="daemon")
+        harness.inspect = Mock(side_effect=[contexts[:2], contexts[2:], contexts[:2], contexts[2:]])
+        harness.status = Mock()
+        harness.command = Mock(return_value=(("a" * 64 + "  /etc/vz/ca-certificates.crt\n").encode(), b"", 0))
+        harness.sentinel = Mock(side_effect=lambda descriptor: {"descriptor": descriptor})
+        harness.prepare_image = Mock(return_value={"exact": "images"})
+        harness.driver_inputs, harness.validate_driver = Mock(), Mock()
+        monitor = Mock()
+        monitor.summary.return_value = {"samples": "observed"}
+        observations = [{"operation": i} for i in range(3)]
+        module = types.SimpleNamespace(run_machine=Mock(side_effect=observations))
+        with patch.dict("sys.modules", {"linux_docker_build_artifacts": module}), \
+                patch.object(gate, "SentinelMonitor", return_value=monitor), \
+                patch.object(gate.startup, "exact_developer_topology"), \
+                patch.object(gate.startup, "document"), \
+                patch.object(gate, "authenticated_proof", return_value=({"scope": "exact"}, {"proof": "exact"})), \
+                patch.object(gate.time, "time_ns", side_effect=range(10, 16)), \
+                patch.object(gate.driver, "Driver") as selected:
+            result = harness.scenario()
+        self.assertEqual(result["machine_slices"], observations)
+        self.assertEqual(module.run_machine.call_args_list, [unittest.mock.call(
+            harness, contexts[i], {"scope": "exact"}, {"proof": "exact"}, {"exact": "images"}, i) for i in range(3)])
+        self.assertEqual(monitor.check_interval.call_args_list, [unittest.mock.call(
+            10+2*i, 11+2*i, contexts[i]["name"]) for i in range(3)])
+        monitor.start.assert_called_once_with()
+        monitor.stop.assert_called_once_with()
+        harness.driver_inputs.assert_not_called()
+        harness.validate_driver.assert_not_called()
+        selected.assert_not_called()
+        self.assertEqual(harness.status.call_count, 2)
+
     def test_builder_owner_is_retained_before_prepare_effects(self):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
         harness.info = {"suite": "build"}
         harness.builders = []
-        descriptor = {"name": "private"}
+        harness.builder_by_owner_role = {}
+        descriptor = {"name": "private", "owner": {"machine_id": "exact"}}
         builder = Mock()
         def prepare():
             self.assertEqual(harness.builders, [builder])
+            self.assertIs(harness.builder_by_owner_role[harness.builder_key(descriptor, "source")], builder)
             raise driver.Rejected("partial builder mutation")
         builder.prepare.side_effect = prepare
         module = types.SimpleNamespace(Builder=Mock(return_value=builder))
@@ -250,8 +317,73 @@ class BuildDispatchTests(unittest.TestCase):
                 patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
             with self.assertRaisesRegex(driver.Rejected, "partial builder"):
                 harness.driver_inputs(descriptor, {}, {}, {})
-        module.Builder.assert_called_once_with(harness, descriptor)
+        module.Builder.assert_called_once_with(harness, descriptor, role="source")
         self.assertEqual(harness.builders, [builder])
+
+    def test_role_lookup_and_keep_probe_are_exact_not_list_position(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.builders, harness.builder_by_owner_role, harness.keep_proofs_verified = [], {}, []
+        descriptors = [{"owner": {"project_id": "p", "environment_id": "e", "machine_id": name},
+                        "name": name, "engine_id": name + "-engine"} for name in ("first", "second")]
+        created = []
+        def construct(harness, descriptor, role):
+            builder = Mock(descriptor=descriptor, mapping={"name": descriptor["name"] + role})
+            created.append(builder)
+            return builder
+        module = types.SimpleNamespace(Builder=Mock(side_effect=construct))
+        keep = types.SimpleNamespace(run=Mock())
+        with patch.dict("sys.modules", {"linux_docker_buildkit_builder": module,
+                                         "linux_docker_buildkit_keep": keep}):
+            for descriptor in descriptors:
+                for role in ("source", "cold-control", "importer"):
+                    selected = harness.prepare_builder(descriptor, role=role)
+                    self.assertIs(harness.get_builder(descriptor, role), selected)
+                    selected.prepare.assert_called_once_with()
+            self.assertIs(harness.get_builder(descriptors[0]), created[0])
+            self.assertEqual(keep.run.call_args_list, [unittest.mock.call(created[0]), unittest.mock.call(created[3])])
+            self.assertEqual(harness.keep_proofs_verified, [True, True])
+            for role in ("source", "cold-control", "importer"):
+                with self.assertRaisesRegex(driver.Rejected, "already registered"):
+                    harness.prepare_builder(descriptors[0], role=role)
+            self.assertEqual(module.Builder.call_count, 6)
+            with self.assertRaisesRegex(driver.Rejected, "unknown builder role"):
+                harness.prepare_builder(descriptors[0], role="default")
+            with self.assertRaisesRegex(driver.Rejected, "descriptor changed"):
+                harness.get_builder(descriptors[0] | {"engine_id": "foreign"})
+            with self.assertRaisesRegex(driver.Rejected, "not prepared"):
+                harness.get_builder(descriptors[0] | {"owner": {"machine_id": "foreign"}})
+            descriptors[0]["endpoint"] = "rerouted-in-place"
+            with self.assertRaisesRegex(driver.Rejected, "descriptor changed"):
+                harness.get_builder(descriptors[0])
+            self.assertNotIn("endpoint", created[0].descriptor)
+
+    def test_build_driver_mapping_remains_exact_source_mapping(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.info = {"suite": "build"}
+        mapping = {"name": "owned", "node": "owned-node", "container_id": "c" * 64,
+                   "image_id": "sha256:" + "a" * 64}
+        harness.prepare_builder = Mock(return_value=Mock(mapping=mapping))
+        descriptor = {"owner": {"machine_id": "exact"}}
+        with patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
+            self.assertEqual(harness.driver_inputs(descriptor, {}, {}, {}),
+                             {"scope": "exact", "builder": mapping})
+        harness.prepare_builder.assert_called_once_with(descriptor)
+
+    def test_failed_keep_proof_retains_owner_and_blocks_cleanup(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.builders, harness.builder_by_owner_role, harness.keep_proofs_verified = [], {}, []
+        descriptor = {"owner": {"machine_id": "exact"}}
+        builder = Mock(descriptor=descriptor)
+        with patch.dict("sys.modules", {
+                "linux_docker_buildkit_builder": types.SimpleNamespace(Builder=Mock(return_value=builder)),
+                "linux_docker_buildkit_keep": types.SimpleNamespace(run=Mock(side_effect=RuntimeError("keep failed")))}):
+            with self.assertRaisesRegex(RuntimeError, "keep failed"):
+                harness.prepare_builder(descriptor)
+        self.assertIs(harness.get_builder(descriptor), builder)
+        self.assertEqual(harness.keep_proofs_verified, [False])
+        with self.assertRaisesRegex(driver.Rejected, "keep"):
+            harness.remove_owned()
+        builder.remove_owned.assert_not_called()
 
     def test_compose_never_provisions_build_builder(self):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)

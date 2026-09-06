@@ -88,7 +88,7 @@ the exact owned `docker-container` builder through youki, before recipe dispatch
 Its 1,497-file failed evidence is retained at
 `.artifacts/linux-docker-build-candidate-1`; a separate disposition positively
 stopped all four Machines and closed the daemon while preserving disk/object
-state. This source integration has no passing physical Buildx-slice claim yet.
+state. That candidate made no passing physical Buildx-slice claim.
 
 Candidate 4 subsequently reached the running OCI worker after the Developer
 IPv4 raw-table fix, but its first nested RUN failed at cgroup PID admission
@@ -99,6 +99,19 @@ restores the pinned upstream BuildKit cgroup-root setup setting and explicitly
 requires a private cgroup namespace. The accompanying youki tenant-cgroup fix,
 external cgroup observations, and fresh installed verification are tracked by
 `vz-amq`; source and offline checks alone are not a passing physical slice.
+
+Candidate 9 subsequently passed the unchanged five recipes on all three tested
+Machines, independent raw replay, direct youki lifecycle probes, normal owned
+builder/cache-volume removal, and positive public Stops. Its immutable evidence
+is `.artifacts/linux-docker-build-candidate-9` (manifest SHA256
+`81acf811304fa2e2a4c13de52a4eae37f9ace4f28e1bc8fbd85e938ae0a13163`).
+This is DEV installed-Mac evidence, not all Docker scenarios or Delete acceptance.
+
+The separate `--suite artifacts` implementation adds OCI descriptor/layer and
+exported-cache validation, plus distinct fresh source/control/importer builder
+roles with identical inputs. It must earn its own fresh installed-Mac result;
+candidate 9 does not certify this new path. See `vz-mzs.7.1.3` for the exact
+acceptance criteria and retained verification status.
 
 `--suite all` fails before provisioning: the 63-scenario dispatcher, full cache
 runtime inventory, and remaining target/aggregate acceptance are unfinished.

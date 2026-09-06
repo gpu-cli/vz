@@ -101,6 +101,8 @@ class Harness:
         self.stop_state = {}
         self.stop_events = None
         self.stop_logs = (b"", ACTUAL_LOG)
+        self.image_id = "sha256:" + "a" * 64
+        self.container_id = "b" * 64
 
     def assert_certain(self):
         if self.uncertain:
@@ -113,16 +115,16 @@ class Harness:
             raise ValueError("injected mutation failure")
         b = self.b
         if args[:2] == ["image", "import"]:
-            self.objects["image"] = {"Id": "sha256:" + "a" * 64, "Architecture": "arm64", "Os": "linux",
+            self.objects["image"] = {"Id": self.image_id, "Architecture": "arm64", "Os": "linux",
                 "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"],
                            "Env": list(builder.ENV)}}
-            return ("sha256:" + "a" * 64 + "\n").encode(), b"", 0
+            return (self.image_id + "\n").encode(), b"", 0
         if args[:2] == ["volume", "create"]:
             self.objects["volume"] = {"Name": b.volume_name, "Driver": "local", "Scope": "local",
                 "Labels": {builder.LABEL: b.token}, "Options": None, "CreatedAt": "2026-09-06T00:00:00Z",
                 "Mountpoint": "/var/lib/docker/engine/volumes/" + b.volume_name + "/_data"}
         if args[:2] == ["container", "create"]:
-            self.objects["container"] = {"Id": "b" * 64, "Name": "/" + b.container_name, "Image": b.image_id,
+            self.objects["container"] = {"Id": self.container_id, "Name": "/" + b.container_name, "Image": b.image_id,
                 "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"],
                            "Cmd": list(builder.FLAGS), "Env": list(builder.ENV)},
                 "HostConfig": {"Runtime": "youki", "Privileged": True, "Init": True, "NetworkMode": "bridge",
@@ -132,7 +134,7 @@ class Harness:
                 "State": {"Running": False, "Status": "created", "ExitCode": 0,
                           "Paused": False, "Restarting": False, "Dead": False, "OOMKilled": False, "Error": "",
                           "Pid": 737, "StartedAt": START}, "RestartCount": 0}
-            return ("b" * 64 + "\n").encode(), b"", 0
+            return (self.container_id + "\n").encode(), b"", 0
         if args[:2] in (["container", "start"], ["container", "stop"]):
             running = args[1] == "start"
             self.objects["container"]["State"].update(Running=running, Status="running" if running else "exited")
@@ -204,6 +206,126 @@ class LifecycleTests(unittest.TestCase):
         self.cgroup = patch.object(builder.cgroup, "capture", return_value={"offline_test_only": True})
         self.capture = self.cgroup.start()
         self.addCleanup(self.cgroup.stop)
+
+    def test_source_role_preserves_legacy_identity_and_mapping(self):
+        legacy = json.dumps({"run_id": "builder-fixture", "owner": self.descriptor["owner"]},
+                            sort_keys=True).encode()
+        explicit = builder.Builder(self.harness, self.descriptor, role="source")
+        self.assertEqual(self.b.token, "vzbuild-" + builder.sha(legacy)[:24])
+        self.assertEqual(self.b.token, explicit.token)
+        self.assertEqual(self.b.identity_bytes, legacy)
+        mapping = self.b.prepare()
+        self.assertEqual(set(mapping), {"name", "node", "container_id", "image_id"})
+        ownership = json.loads((self.harness.evidence / (self.b.token + "-ownership.json")).read_bytes())
+        self.assertEqual(ownership["role"], "source")
+        self.assertEqual(ownership["identity_material"], json.loads(legacy))
+        self.assertNotIn("role", ownership["identity_material"])
+
+    def test_three_roles_provision_and_cleanup_exact_distinct_owned_objects(self):
+        identities, containers, images = [], [], []
+        for index, role in enumerate(("source", "cold-control", "importer"), 1):
+            with self.subTest(role=role):
+                root = Path(self.temp.name).resolve() / role
+                root.mkdir()
+                harness = Harness(root)
+                # Distinct synthetic Engine-assigned IDs, not derived from the
+                # implementation's role hash. No real Docker execution claimed.
+                harness.container_id = str(index) * 64
+                harness.image_id = "sha256:" + str(index + 3) * 64
+                selected = builder.Builder(harness, copy.deepcopy(self.descriptor), role=role)
+                harness.b = selected
+                mapping = selected.prepare()
+                identities.append((selected.name, selected.node, selected.container_name,
+                                   selected.volume_name, selected.tag, selected.token))
+                containers.append(mapping["container_id"])
+                images.append(mapping["image_id"])
+                ownership = json.loads((harness.evidence / (selected.token + "-ownership.json")).read_bytes())
+                self.assertEqual(ownership["role"], role)
+                self.assertEqual(ownership["identity_material"]["owner"], self.descriptor["owner"])
+                self.assertEqual(ownership["identity_material"]["run_id"], "builder-fixture")
+                self.assertEqual(ownership["cache_volume_name"], selected.volume_name)
+                if role != "source":
+                    self.assertEqual(ownership["identity_material"]["role"], role)
+                for suffix in ("image-input", "runtime-001"):
+                    proof = json.loads((harness.evidence / (selected.token + "-" + suffix + ".json")).read_bytes())
+                    self.assertEqual(proof["role"], role)
+                    self.assertEqual(proof["identity_sha256"], ownership["identity_sha256"])
+                commands = [args for _, _, _, args in harness.calls]
+                create = next(args for args in commands if args[:2] == ["container", "create"])
+                self.assertEqual(create[create.index("--name") + 1], selected.container_name)
+                self.assertEqual(create[create.index("--label") + 1], builder.LABEL + "=" + selected.token)
+                self.assertEqual(create[create.index("--mount") + 1],
+                                 "type=volume,source=" + selected.volume_name + ",target=/var/lib/buildkit")
+                selected.remove_owned()
+                mutations = [args for mutate, _, _, args in harness.calls if mutate]
+                self.assertIn(["container", "rm", mapping["container_id"]], mutations)
+                self.assertIn(["volume", "rm", selected.volume_name], mutations)
+                self.assertIn(["image", "rm", selected.tag], mutations)
+                self.assertIn(["buildx", "rm", "--keep-daemon", "--keep-state", selected.name], mutations)
+                self.assertEqual(harness.objects, {})
+                self.assertEqual(harness.info["run_id"], "builder-fixture")
+                self.assertTrue(all(scope == self.descriptor for _, _, scope, _ in harness.calls))
+                cleanup = json.loads((harness.evidence / (selected.token + "-cleanup.json")).read_bytes())
+                self.assertEqual(cleanup["role"], role)
+                self.assertEqual(cleanup["normal_stop"]["role"], role)
+                self.assertEqual(cleanup["builder"], mapping)
+                self.assertTrue(cleanup["exact_owned_builder_container_volume_image_removed"])
+                self.assertFalse(any("prune" in args or "--force" in args or "--use" in args
+                                     for args in mutations))
+        self.assertEqual(len(set(containers)), 3)
+        self.assertEqual(len(set(images)), 3)
+        for column in zip(*identities):
+            self.assertEqual(len(set(column)), 3)
+
+    def test_role_identity_changes_with_each_owner_component_and_run(self):
+        for role in ("source", "cold-control", "importer"):
+            original = builder.Builder(self.harness, self.descriptor, role=role)
+            for key in ("project_id", "environment_id", "machine_id"):
+                descriptor = copy.deepcopy(self.descriptor)
+                descriptor["owner"][key] += "_other"
+                self.assertNotEqual(builder.Builder(self.harness, descriptor, role=role).token, original.token)
+            self.harness.info["run_id"] = "different-run"
+            self.assertNotEqual(builder.Builder(self.harness, self.descriptor, role=role).token, original.token)
+            self.harness.info["run_id"] = "builder-fixture"
+
+    def test_unknown_role_refused_without_commands_or_evidence(self):
+        for role in (None, True, "", "SOURCE", "cold", "source ", [], {}):
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "ownership role"):
+                builder.Builder(self.harness, self.descriptor, role=role)
+        self.assertEqual(self.harness.calls, [])
+        self.assertEqual(list(self.harness.evidence.iterdir()), [])
+
+    def test_non_source_preexisting_volume_refused_before_any_mutation(self):
+        for role in ("cold-control", "importer"):
+            selected = builder.Builder(self.harness, self.descriptor, role=role)
+            self.harness.b = selected
+            self.harness.objects["volume"] = {"Name": selected.volume_name}
+            with self.subTest(role=role), self.assertRaisesRegex(ValueError, "preexists"):
+                selected.prepare()
+            self.assertFalse(selected.effects)
+            self.assertFalse(any(mutate for mutate, *_ in self.harness.calls))
+            self.assertIn(["volume", "ls", "--quiet", "--filter", "name=^" + selected.volume_name + "$"],
+                          [args for _, _, _, args in self.harness.calls])
+            self.assertEqual(list(self.harness.evidence.iterdir()), [])
+
+    def test_non_source_role_run_or_owner_drift_refuses_cleanup_without_mutation(self):
+        self.b = builder.Builder(self.harness, self.descriptor, role="importer")
+        self.harness.b = self.b
+        self.b.prepare()
+        for target, key, value in ((self.harness.info, "run_id", "other"),
+                                   (self.descriptor["owner"], "machine_id", "other")):
+            previous = target[key]
+            target[key] = value
+            before = len(self.harness.calls)
+            with self.assertRaisesRegex(ValueError, "identity changed"):
+                self.b.remove_owned()
+            self.assertEqual(len(self.harness.calls), before)
+            target[key] = previous
+        self.b.role = "cold-control"
+        before = len(self.harness.calls)
+        with self.assertRaisesRegex(ValueError, "identity changed"):
+            self.b.remove_owned()
+        self.assertEqual(len(self.harness.calls), before)
 
     def test_exact_precreated_builder_has_no_pull_default_or_runtime_fallback(self):
         mapping = self.b.prepare()
