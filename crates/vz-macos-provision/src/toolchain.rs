@@ -12,8 +12,21 @@ use std::collections::BTreeMap;
 pub const RECEIPT_PATH: &str = "/usr/local/share/vz/toolchain.json";
 /// Fixed native developer directory; consumer requests cannot choose host paths.
 pub const DEVELOPER_DIR: &str = "/Library/Developer/CommandLineTools";
+/// Fixed location for an explicitly supplied complete Xcode candidate.
+pub const XCODE_DEVELOPER_DIR: &str = "/Applications/Xcode.app/Contents/Developer";
 /// Maximum receipt size accepted before JSON deserialization.
 pub const MAX_RECEIPT_BYTES: usize = 32 * 1024;
+
+/// Supported fixed installation layouts; arbitrary guest or host paths are excluded.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolchainLayout {
+    /// Apple Command Line Tools; the default for legacy receipt bytes.
+    #[default]
+    Clt,
+    /// A complete, explicitly supplied Xcode application bundle.
+    Xcode,
+}
 
 /// Exact toolchain input identity, independent of its installation location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -32,6 +45,9 @@ pub struct ArchiveIdentity {
 pub struct ToolchainManifest {
     /// Format version, currently one.
     pub schema_version: u32,
+    /// Fixed installation layout. Missing legacy fields select Command Line Tools.
+    #[serde(default)]
+    pub layout: ToolchainLayout,
     /// Complete normalized combined output of `xcrun swift --version`.
     pub swift_version: String,
     /// Exact selected macOS SDK version.
@@ -51,6 +67,30 @@ fn digest(value: &str) -> bool {
 }
 
 impl ToolchainManifest {
+    /// Fixed developer directory selected by the authenticated layout.
+    pub fn developer_dir(&self) -> &'static str {
+        match self.layout {
+            ToolchainLayout::Clt => DEVELOPER_DIR,
+            ToolchainLayout::Xcode => XCODE_DEVELOPER_DIR,
+        }
+    }
+
+    /// Relative compiler directory within the selected developer directory.
+    pub fn binary_dir(&self) -> &'static str {
+        match self.layout {
+            ToolchainLayout::Clt => "usr/bin",
+            ToolchainLayout::Xcode => "Toolchains/XcodeDefault.xctoolchain/usr/bin",
+        }
+    }
+
+    /// Relative SDK settings anchor for the exact selected version.
+    pub fn sdk_settings_path(&self) -> String {
+        let prefix = match self.layout {
+            ToolchainLayout::Clt => "SDKs",
+            ToolchainLayout::Xcode => "Platforms/MacOSX.platform/Developer/SDKs",
+        };
+        format!("{prefix}/MacOSX{}.sdk/SDKSettings.json", self.sdk_version)
+    }
     /// Check bounds, required tools, and literal shell-safe relative paths.
     pub fn validate(&self) -> Result<()> {
         ensure!(
@@ -105,15 +145,13 @@ impl ToolchainManifest {
             "ld",
         ] {
             ensure!(
-                self.files.contains_key(&format!("usr/bin/{name}")),
+                self.files
+                    .contains_key(&format!("{}/{name}", self.binary_dir())),
                 "missing native toolchain binary: {name}"
             );
         }
         ensure!(
-            self.files.contains_key(&format!(
-                "SDKs/MacOSX{}.sdk/SDKSettings.json",
-                self.sdk_version
-            )),
+            self.files.contains_key(&self.sdk_settings_path()),
             "missing selected SDK anchor"
         );
         Ok(())
@@ -138,18 +176,19 @@ impl ToolchainManifest {
     /// stdout. Validate paths before interpolation; no shell syntax is admitted.
     pub fn verification(&self) -> Result<(String, String)> {
         self.validate()?;
-        let mut script = format!("set -eu; export DEVELOPER_DIR='{DEVELOPER_DIR}'; ");
+        let developer = self.developer_dir();
+        let mut script = format!("set -eu; export DEVELOPER_DIR='{developer}'; ");
         let mut expected = String::new();
         for (path, hash) in &self.files {
-            script.push_str(&format!(
-                "/usr/bin/shasum -a 256 '{DEVELOPER_DIR}/{path}'; "
-            ));
-            expected.push_str(&format!("{hash}  {DEVELOPER_DIR}/{path}\n"));
+            script.push_str(&format!("/usr/bin/shasum -a 256 '{developer}/{path}'; "));
+            expected.push_str(&format!("{hash}  {developer}/{path}\n"));
         }
         script.push_str("/usr/bin/xcrun --find swift; /usr/bin/xcrun swift --version 2>&1; /usr/bin/xcrun --sdk macosx --show-sdk-version");
         expected.push_str(&format!(
-            "{DEVELOPER_DIR}/usr/bin/swift\n{}\n{}\n",
-            self.swift_version, self.sdk_version
+            "{developer}/{}/swift\n{}\n{}\n",
+            self.binary_dir(),
+            self.swift_version,
+            self.sdk_version
         ));
         Ok((script, expected))
     }
@@ -175,6 +214,7 @@ mod tests {
         );
         ToolchainManifest {
             schema_version: 1,
+            layout: ToolchainLayout::Clt,
             swift_version: "Apple Swift version 6.2.1\nTarget: arm64-apple-macosx26.0".into(),
             sdk_version: "26.1".into(),
             files,
@@ -204,6 +244,41 @@ mod tests {
         );
         Ok(())
     }
+    #[test]
+    fn xcode_layout_binds_its_own_compiler_and_sdk_paths() -> Result<()> {
+        let mut manifest = fixture();
+        manifest.layout = ToolchainLayout::Xcode;
+        assert!(manifest.validate().is_err());
+        manifest.files = manifest
+            .files
+            .into_iter()
+            .map(|(path, hash)| {
+                let path = if path.starts_with("usr/") {
+                    format!("Toolchains/XcodeDefault.xctoolchain/{path}")
+                } else {
+                    format!("Platforms/MacOSX.platform/Developer/{path}")
+                };
+                (path, hash)
+            })
+            .collect();
+        let (script, expected) = manifest.verification()?;
+        assert!(script.contains(XCODE_DEVELOPER_DIR));
+        assert!(expected.contains("/Applications/Xcode.app/Contents/Developer/Toolchains/XcodeDefault.xctoolchain/usr/bin/swift\n"));
+        assert!(!expected.contains(DEVELOPER_DIR));
+        let mut legacy = serde_json::to_value(fixture())?;
+        legacy
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("fixture is not an object"))?
+            .remove("layout");
+        let bytes = serde_json::to_vec(&legacy)?;
+        let restored = ToolchainManifest::from_verified_bytes(
+            &bytes,
+            &format!("{:x}", Sha256::digest(&bytes)),
+        )?;
+        assert_eq!(restored.layout, ToolchainLayout::Clt);
+        Ok(())
+    }
+
     #[test]
     fn receipt_rejects_escape_paths_shell_syntax_and_unbound_sdk() {
         for path in [

@@ -27,6 +27,15 @@ mod native {
         payload: PathBuf,
         #[arg(long)]
         toolchain_sha256: String,
+        /// Verify an already-installed matching receipt in a new private clone.
+        #[arg(long)]
+        reuse_installed_toolchain: bool,
+        /// Accept the supplied Xcode license only after explicit operator approval.
+        #[arg(long)]
+        accept_xcode_license: bool,
+        /// Run the checked-in Swift fixture as dev before publishing a candidate.
+        #[arg(long)]
+        fixture: Option<PathBuf>,
     }
 
     async fn execute(
@@ -100,6 +109,89 @@ mod native {
         })
         .await
         .context("maintainer upload deadline")?
+    }
+
+    async fn preflight(
+        client: &mut GrpcAgentClient,
+        fixture: &std::path::Path,
+        output: &std::path::Path,
+    ) -> Result<()> {
+        const ROOT: &str = "/Users/dev/.vz-toolchain-preflight";
+        execute(client, "set -eu; test ! -e /Users/dev/.vz-toolchain-preflight; install -d -m 700 -o dev -g staff /Users/dev/.vz-toolchain-preflight /Users/dev/.vz-toolchain-preflight/Sources/NativeProbe /Users/dev/.vz-toolchain-preflight/Tests/NativeProbeTests", 30).await?;
+        for relative in [
+            "Package.swift",
+            "Sources/NativeProbe/NativeProbe.swift",
+            "Tests/NativeProbeTests/NativeProbeTests.swift",
+        ] {
+            upload(
+                client,
+                &fixture.join(relative),
+                &format!("set -eu; cat > '{ROOT}/{relative}'; chmod 644 '{ROOT}/{relative}'"),
+            )
+            .await?;
+        }
+        for (name, command, arguments) in [
+            (
+                "build",
+                "/usr/bin/xcrun",
+                vec!["swift", "build", "-c", "release"],
+            ),
+            ("test", "/usr/bin/xcrun", vec!["swift", "test"]),
+            ("run", "./.build/release/native-probe", vec![]),
+        ] {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(600);
+            let observed = tokio::time::timeout_at(deadline, async {
+                let ticket = client.prepare_machine_exec_request().await?;
+                let (stream, _) = client
+                    .exec_machine_stream_ready_for_request(
+                        vz_linux::ContainerExecDispatchGate::new(deadline),
+                        ticket,
+                        command.into(),
+                        arguments.into_iter().map(str::to_string).collect(),
+                        vz_linux::ExecOptions {
+                            user: Some("dev".into()),
+                            working_dir: Some(ROOT.into()),
+                            ..Default::default()
+                        },
+                        None,
+                    )
+                    .await?;
+                Ok::<_, anyhow::Error>(stream.collect_checked().await?)
+            })
+            .await
+            .context("maintainer Swift fixture deadline")??;
+            fs::write(
+                output.join(format!("preflight-{name}.json")),
+                serde_json::to_vec_pretty(&observed)?,
+            )?;
+            ensure!(
+                observed.exit_code == 0,
+                "maintainer Swift {name} failed: {observed:?}"
+            );
+            if name == "test" {
+                ensure!(
+                    observed
+                        .stdout
+                        .contains("physicalMacCannotSatisfyGuestProbe")
+                        && observed.stdout.contains("passed"),
+                    "expected Swift test did not run"
+                );
+            }
+            if name == "run" {
+                let record: serde_json::Value = serde_json::from_str(&observed.stdout)?;
+                ensure!(
+                    record["hardware_model"] == "VirtualMac2,1",
+                    "preflight did not run in a native VM"
+                );
+            }
+        }
+        execute(
+            client,
+            "rm -rf /Users/dev/.vz-toolchain-preflight; sync",
+            30,
+        )
+        .await?;
+        Ok(())
     }
 
     pub async fn run() -> Result<()> {
@@ -183,17 +275,43 @@ mod native {
                 }
                 tokio::time::sleep(Duration::from_millis(250)).await;
             };
+            // Older agent-only DEV images created the account but left its
+            // home owned by root. Repair this while producing the artifact;
+            // installed consumers must never need a chown step.
+            execute(&mut client, "set -eu; test \"$(id -u dev)\" = 501; test \"$(dscl . -read /Users/dev NFSHomeDirectory)\" = 'NFSHomeDirectory: /Users/dev'; test ! -L /Users/dev; chown dev:staff /Users/dev; chmod 700 /Users/dev", 30).await?;
+            let home = client.exec_stream("/bin/sh".into(), vec!["-c".into(), "set -eu; test \"$HOME\" = /Users/dev; test -w \"$HOME\"; directory=$(mktemp -d \"$HOME/vz-home-check.XXXXXX\"); rmdir \"$directory\"".into()], vz_linux::ExecOptions { user: Some("dev".into()), working_dir: Some("/Users/dev".into()), ..Default::default() }).await?.collect_checked().await?;
+            ensure!(home.exit_code == 0, "native dev home is not usable: {home:?}");
+            fs::write(args.output.join("dev-home.json"), serde_json::to_vec_pretty(&home)?)?;
+            if args.reuse_installed_toolchain {
+                let receipt = execute(&mut client, "head -c 32769 /usr/local/share/vz/toolchain.json", 10).await?;
+                let installed = ToolchainManifest::from_verified_bytes(receipt.stdout.as_bytes(), &args.toolchain_sha256)?;
+                ensure!(installed == manifest, "existing toolchain receipt differs");
+            } else {
             execute(&mut client, "mkdir -m 700 /private/var/tmp/vz-toolchain-inputs", 30).await?;
             upload(&mut client, &archive, "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz").await?;
             upload(&mut client, &payload.join("toolchain.json"), "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.json").await?;
             let hash = execute(&mut client, "/usr/bin/shasum -a 256 /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz", 120).await?;
             ensure!(hash.stdout == format!("{}  /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz\n", manifest.archive.sha256), "guest archive digest mismatch");
-            let install = execute(&mut client, "set -eu; test ! -e /Library/Developer/CommandLineTools; mkdir -p /Library/Developer; /usr/bin/tar -xzf /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz -C /Library/Developer; /usr/bin/xcode-select -s /Library/Developer/CommandLineTools; mkdir -p /usr/local/share/vz; cp /private/var/tmp/vz-toolchain-inputs/toolchain.json /usr/local/share/vz/toolchain.json; chmod 644 /usr/local/share/vz/toolchain.json; rm /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz /private/var/tmp/vz-toolchain-inputs/toolchain.json; rmdir /private/var/tmp/vz-toolchain-inputs; sync", 600).await?;
+            let (installation, parent) = match manifest.layout {
+                vz_macos_provision::toolchain::ToolchainLayout::Clt => ("/Library/Developer/CommandLineTools", "/Library/Developer"),
+                vz_macos_provision::toolchain::ToolchainLayout::Xcode => ("/Applications/Xcode.app", "/Applications"),
+            };
+            let script = format!("set -eu; test ! -e '{installation}'; mkdir -p '{parent}'; /usr/bin/tar -xzf /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz -C '{parent}'; /usr/bin/xcode-select -s '{}'; mkdir -p /usr/local/share/vz; cp /private/var/tmp/vz-toolchain-inputs/toolchain.json /usr/local/share/vz/toolchain.json; chmod 644 /usr/local/share/vz/toolchain.json; rm /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz /private/var/tmp/vz-toolchain-inputs/toolchain.json; rmdir /private/var/tmp/vz-toolchain-inputs; sync", manifest.developer_dir());
+            let install = execute(&mut client, &script, 600).await?;
             fs::write(args.output.join("install.json"), serde_json::to_vec_pretty(&install)?)?;
+            }
+            if args.accept_xcode_license {
+                ensure!(manifest.layout == vz_macos_provision::toolchain::ToolchainLayout::Xcode, "license acceptance requires an Xcode receipt");
+                let accepted = execute(&mut client, "/usr/bin/xcodebuild -license accept", 60).await?;
+                fs::write(args.output.join("license-acceptance.json"), serde_json::to_vec_pretty(&accepted)?)?;
+            }
             let (script, expected) = manifest.verification()?;
             let output = execute(&mut client, &script, 60).await?;
             fs::write(args.output.join("verification.json"), serde_json::to_vec_pretty(&output)?)?;
             ensure!(output.stdout == expected && output.stderr.is_empty(), "installed Swift identity differs from pinned receipt: {output:?}");
+            if let Some(fixture) = &args.fixture {
+                preflight(&mut client, fixture, &args.output).await?;
+            }
             Ok::<_, anyhow::Error>(())
         }.await;
         let shutdown = async {

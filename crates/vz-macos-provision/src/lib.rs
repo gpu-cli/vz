@@ -349,6 +349,29 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
     // Create home directory
     let home_dir = mount_point.join(config.home.strip_prefix('/').unwrap_or(&config.home));
     std::fs::create_dir_all(&home_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&home_dir)?.is_dir(),
+            "guest home must be a directory"
+        );
+        let mounted_root = mount_point.canonicalize()?;
+        let resolved_home = home_dir.canonicalize()?;
+        anyhow::ensure!(
+            resolved_home != mounted_root && resolved_home.starts_with(&mounted_root),
+            "guest home must remain inside the mounted image"
+        );
+        std::os::unix::fs::chown(&home_dir, Some(config.uid), Some(config.gid)).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "set guest home ownership at {}: {error}",
+                    home_dir.display()
+                )
+            },
+        )?;
+        std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     info!(
         user = %config.username,
@@ -1731,5 +1754,51 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "mac-agent-guest-agent")
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod user_home_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn account_creation_makes_the_guest_home_private_and_owned() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = root.path().metadata()?;
+        std::fs::create_dir_all(
+            root.path()
+                .join("private/var/db/dslocal/nodes/Default/users"),
+        )?;
+        let home = root.path().join("Users/dev");
+        std::fs::create_dir_all(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))?;
+        let config = UserConfig {
+            uid: owner.uid(),
+            gid: owner.gid(),
+            ..Default::default()
+        };
+        create_user_account(root.path(), &config)?;
+        let metadata = home.metadata()?;
+        assert_eq!((metadata.uid(), metadata.gid()), (config.uid, config.gid));
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn home_ownership_never_follows_a_link_outside_the_image() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::create_dir_all(
+            root.path()
+                .join("private/var/db/dslocal/nodes/Default/users"),
+        )?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("Users"))?;
+        let home = outside.path().join("dev");
+        std::fs::create_dir(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))?;
+        assert!(create_user_account(root.path(), &UserConfig::default()).is_err());
+        assert_eq!(home.metadata()?.permissions().mode() & 0o777, 0o755);
+        Ok(())
     }
 }

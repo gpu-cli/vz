@@ -1,106 +1,127 @@
 # Pinned native Swift toolchain (DEV)
 
-Tracks `vz-mzs.11.4.1`, under `vz-mzs.11.4`. This work qualifies a local
-Apple-silicon macOS host → native macOS Machine development path. Public
-artifact publication and the aggregate 0.4 gate remain separate requirements.
+Tracks `vz-mzs.11.4.1`, under `vz-mzs.11.4`. Work remains on
+`feat/macos26-bootstrap`; the main worktree is reserved for the other agent.
+**The installed Swift gate is not yet complete.** The complete Xcode candidate
+is installed in a stopped maintainer image, but Xcode requires explicit acceptance
+of its license before its tools will run. No new candidate is release-qualified.
 
-## Recipe and trust boundary
+## Current candidate and evidence
 
-The maintainer supplies an explicit local Apple Command Line Tools directory.
-`scripts/prepare-native-swift-toolchain.py` packages its `usr` and `Library`
-trees and the selected macOS SDK. It normalizes archive order, ownership and
-timestamps, rejects absolute or escaping symlinks, and omits the obsolete
-`usr/bin/crashlog` alias that points outside the CLT installation. Other installed
-SDK versions are excluded. This is Swift build/test tooling, not full Xcode or
-debugger qualification.
+The target remains **macOS 26.3.1 / 25D2128** on this Apple-silicon macOS
+26.3.1(a) host. The explicit local input is **Xcode 26.3 / 17C529**, containing
+Apple Swift **6.2.4** (`swiftlang-6.2.4.1.4`, driver `1.127.15`) and SDK **26.2**.
+Only Swift build/test/run qualification is intended; packaging the application
+bundle does not certify its GUI, debugger, simulators or other targets.
 
-The archive and a bounded JSON receipt have separate SHA-256 pins. The receipt
-binds the archive size/digest, Swift version, SDK version, and the compiler,
-driver, package manager, Clang, linker and selected SDK settings hashes. The
-release manifest's `toolchain_sha256` is the SHA-256 of the **exact receipt
-bytes**, installed at `/usr/local/share/vz/toolchain.json`.
+| Input | SHA-256 |
+| --- | --- |
+| Exact toolchain receipt | `4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c` |
+| Complete archive, 4,442,355,108 bytes | `c8a3d1a14f255462e0d0f75f3dee305e7785650980456661f663a28d89c45619` |
+| Pristine 80 GiB base | `f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858` |
 
-`prepare_native_swift` verifies the archive, makes a private disk clone with a
-fresh VM identity, boots it without networking or host shares, and transfers the
-archive over ticketed guest-agent stdin. It verifies the transferred archive,
-installs CLT and the receipt, selects the developer directory, removes temporary
-inputs, verifies the installed toolchain, and requires a graceful VM shutdown.
-Only a stopped successful candidate may be used to generate a release patch.
-The original base and source installation stay intact.
+Raw artifacts live under `.artifacts/macos26-bootstrap/native-e2e/`:
+`swift-toolchain-xcode-1/` contains the archive and pinned JSON;
+`swift-image-xcode-1/` contains the installed image, private platform state,
+home-write and install receipts, and a graceful shutdown receipt. Its final
+verification exited 69 with Xcode's license requirement; `provisioned` is false.
+Do not produce a qualifying patch from that failed verification alone.
 
-On every native Up, a nonempty release toolchain pin requires an exact receipt
-match and an in-guest hash/version verification before Ready. The base/patch
-authentication covers the complete initial installation; boot anchor checks
-do not attest every mutable SDK file. Existing local DEV releases with empty
-toolchain pins retain their lifecycle support but do not qualify Swift builds.
+The previous CLT-only candidate (Swift 6.2.1, SDK 26.1) reached installed Ready
+in **716.159 seconds**, but failed ordinary user execution because `/Users/dev`
+was owned by root. Account creation now sets configured guest ownership and mode
+0700; the maintainer also repairs older source images and proves `dev` can write
+its home. Ownership changes refuse paths resolving outside the mounted image.
 
-These tools consume local maintainer inputs. They do not discover, download,
-license, sign or publish a public Apple toolchain distribution. Consumers receive
-the complete toolchain through their exact base image and matching block patch;
-they run no provisioning commands.
+A diagnostic-only home repair allowed a release Swift build (31.95 seconds), but
+plain `swift test` could not discover Testing.framework. Explicit framework flags
+passed; a compatibility layout still failed linking. Those repaired diagnostics
+are **not** acceptance evidence. SwiftPM's
+[6.2 toolchain search logic](https://raw.githubusercontent.com/swiftlang/swift-package-manager/release/6.2/Sources/PackageModel/UserToolchain.swift)
+provides context for the observed framework/directory mismatch. The candidate
+was deleted through its original installed daemon, that daemon was stopped, and
+its disposable cache was reclaimed. Logs remain in `installed-swift-candidate-2/`.
+The final gate must use ordinary commands with the complete Xcode candidate.
 
-## Maintainer commands
+## Receipt and installation contract
 
-From the repository root, with new absolute output directories:
+`scripts/prepare-native-swift-toolchain.py` accepts explicit local developer tools.
+`--layout xcode` archives the complete application; `--layout clt` archives its
+`usr`, `Library` and selected SDK trees. It normalizes ownership, ordering and
+mtime, rejects absolute or escaping symlinks, and leaves source files untouched.
+The CLT recipe omits its obsolete external `usr/bin/crashlog` alias.
+
+`ToolchainManifest` selects one of two fixed layouts: CLT under
+`/Library/Developer/CommandLineTools`, or Xcode under `/Applications/Xcode.app`.
+Arbitrary installation paths are not accepted. The receipt binds the archive,
+Swift and SDK versions, compiler, driver, package manager, Clang, linker and SDK
+settings hashes. `toolchain_sha256` in the release manifest is the hash of the
+**exact receipt bytes** installed at `/usr/local/share/vz/toolchain.json`.
+
+Every native Up with a nonempty toolchain pin verifies that receipt and its
+in-guest tool/SDK anchors before Ready. The base/patch pins authenticate the
+complete initial installation; anchor checks do not attest every mutable file.
+Missing legacy `layout` fields select CLT. Empty legacy DEV toolchain pins retain
+lifecycle compatibility and do not qualify Swift execution.
+
+The maintainer helper verifies the archive, makes a new private disk clone and
+VM identity, and uses ticketed guest-agent stdin for transfer. It uses neither
+networking nor host shares. It selects the developer directory, removes temporary
+inputs, checks identity and requires a graceful VM shutdown. With `--fixture`,
+it builds, tests and runs the checked-in project as `dev` and removes its fixture
+directory before shutdown. This catches toolchain failures before an expensive
+patch/installed-consumer cycle; it does not replace that final cycle.
+
+## Maintainer continuation
+
+From the repository root, package an explicit input into a new private directory:
 
 ```sh
-python3 scripts/prepare-native-swift-toolchain.py \
-  --source /Library/Developer/CommandLineTools \
-  --output /absolute/private/toolchain-inputs
+python3 scripts/prepare-native-swift-toolchain.py --layout xcode \
+  --source /Applications/Xcode.app --output /absolute/private/toolchain-inputs
 ```
 
-Build `vz-cli`'s release example `prepare_native_swift` from `crates/`, and sign
-the resulting executable with `entitlements/vz-cli.entitlements.plist`. Invoke
-it with a stopped image that already contains the native guest agent:
+Build the release `vz-cli` example `prepare_native_swift` from `crates/`, then
+sign it with `entitlements/vz-cli.entitlements.plist`. Supply a stopped native
+agent image and the exact receipt pin:
 
 ```sh
 crates/target/release/examples/prepare_native_swift \
-  --disk /absolute/private/agent-image/disk.img \
-  --hardware /absolute/private/agent-image/hardware-model \
-  --auxiliary /absolute/private/agent-image/auxiliary-storage \
+  --disk /absolute/private/source/disk.img \
+  --hardware /absolute/private/source/hardware-model \
+  --auxiliary /absolute/private/source/auxiliary-storage \
   --payload /absolute/private/toolchain-inputs \
   --toolchain-sha256 RECEIPT_SHA256 \
-  --output /absolute/private/swift-image
+  --fixture tests/fixtures/vz-0.4/native-macos-swift \
+  --output /absolute/private/new-swift-image
 ```
 
-Require `shutdown.json` to report `provisioned: true`, `stopped: true` and
-`forced: false`. Generate the delta from the pristine pinned base to this stopped
-disk using the `vz-macos-provision` `image_delta` example. Update the complete
-release manifest together: patch digest/length, prepared-image digest/length,
-auxiliary seed, and toolchain receipt pin. The existing guest-agent and hardware
-pins must still match. Assemble a content-addressed installed DEV bundle using
-the [native integration contract](macos-bootstrap-integration.md).
+Use `--reuse-installed-toolchain` to continue from the stopped Xcode candidate
+above in another new clone. It requires the installed receipt to match exactly.
+The separate `--accept-xcode-license` switch runs `xcodebuild -license accept`
+**inside the maintainer VM** and must only be supplied after the operator has
+reviewed and explicitly approved that agreement. It is off by default; no
+license acceptance occurred in the recorded candidate. The exact local terms
+are `/Applications/Xcode.app/Contents/Resources/en.lproj/License.pdf`.
 
-Validate a **fresh** installed bundle with signed release binaries:
+After identity, fixture and graceful-shutdown receipts pass, generate a delta
+from the pristine base to that stopped image. Update the complete release
+manifest together: patch/output identities, auxiliary seed and toolchain pin.
+Use private single-link files (APFS copies, not hard links) in the installed DEV
+bundle. Retain guest-agent and hardware pins from the matching source image.
+
+Run a fresh installed gate using signed release binaries:
 
 ```sh
 python3 scripts/run-installed-native-macos-e2e.py \
   --release-dir /absolute/private/signed-release \
-  --bundle /absolute/private/installed-bundle \
-  --manifest MANIFEST_SHA256 \
-  --evidence /absolute/private/fresh-native-swift-evidence \
-  --require-swift
+  --bundle /absolute/private/installed-bundle --manifest MANIFEST_SHA256 \
+  --evidence /absolute/private/fresh-native-swift-evidence --require-swift
 ```
 
-The gate imports and applies the exact pair, then transfers only the checked-in
-Swift project source through ordinary `vz exec` stdin. It builds release output,
-tests and executes it as `dev` inside `VirtualMac2,1`, verifies persisted output
-and toolchain identity after Stop/Up, and checks independent Machine state and
-Delete. It also alters the disposable second Machine's SDK settings and requires
-the next Up to reject that pin mismatch before deleting it. No host Swift build
-or hidden toolchain installation can satisfy this gate.
-
-## Candidate pins
-
-The current local maintainer candidate uses guest **macOS 26.3.1 / 25D2128**,
-Apple Swift **6.2.1** (`swiftlang-6.2.1.4.8`, driver `1.127.14.1`) and macOS SDK
-**26.1**. Its receipt SHA-256 is
-`4e28af6ec0c68a46f2dc2d17655a2ad0350119e3161396029aefe3cc6b989c61`.
-The archive is 1,433,323,751 bytes, SHA-256
-`71bd783d5c4ec40646159f5125a3fc59623a0404301a097d67c92a72fb10731c`.
-
-Raw maintainer evidence is retained in the macOS worktree under
-`.artifacts/macos26-bootstrap/native-e2e/swift-toolchain-3/` and
-`swift-image-candidate-2/`. The first attempted VirtioFS transfer failed with
-`Operation not permitted`; its VM stopped gracefully. The successful candidate
-uses the guest-agent transfer described above.
+This imports/applies the exact pair, transfers only project source through public
+`vz exec`, builds/tests/runs inside VirtualMac, verifies persistence after Stop/Up,
+and checks separate Machines and Delete. It deliberately changes the second
+Machine's SDK anchor and requires the next Up to reject it before Delete.
+Public artifact publication, authenticated channel delivery, native networking,
+workspace integration and aggregate 0.4 conformance remain parent-issue work.

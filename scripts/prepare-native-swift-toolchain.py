@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Package explicitly supplied local Apple Command Line Tools for a DEV image.
+"""Package explicitly supplied local Apple developer tools for a DEV image.
 
 This is maintainer preparation, not an installer download or publication step.
-The archive contains the selected SDK, usr and Library trees. Root ownership,
+CLT archives contain the selected SDK, usr and Library trees; Xcode archives
+contain the complete application bundle. Root ownership,
 timestamps and archive ordering are normalized; source files remain untouched.
 """
 import argparse
@@ -20,9 +21,10 @@ def digest(path):
         return hashlib.file_digest(stream, "sha256").hexdigest()
 
 
-def write_archive(source, archive, selected_sdk):
+def write_archive(source, archive, selected_sdk, layout="clt"):
     """Write normalized inputs; reject links that escape the selected toolchain."""
     source = source.resolve(strict=True)
+    root_name = "Xcode.app" if layout == "xcode" else "CommandLineTools"
 
     def normalize(info):
         # This obsolete CLT alias points outside the toolchain at a missing
@@ -31,7 +33,7 @@ def write_archive(source, archive, selected_sdk):
             return None
         assert info.isfile() or info.isdir() or info.issym() or info.islnk(), info.name
         if info.issym():
-            path = source / Path(info.name).relative_to("CommandLineTools")
+            path = source / Path(info.name).relative_to(root_name)
             assert path.resolve().is_relative_to(source), "external toolchain symlink: " + info.name
             assert not Path(info.linkname).is_absolute(), "absolute toolchain symlink: " + info.name
         info.uid = info.gid = 0
@@ -44,20 +46,27 @@ def write_archive(source, archive, selected_sdk):
     with archive.open("xb") as raw, gzip.GzipFile(fileobj=raw, mode="wb", filename="",
                                                 mtime=0, compresslevel=1) as compressed:
         with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as tar:
-            for entry in ["usr", "Library", selected_sdk, "SDKs/MacOSX.sdk"]:
-                tar.add(source / entry, arcname="CommandLineTools/" + entry, filter=normalize)
+            if layout == "xcode":
+                tar.add(source, arcname=root_name, filter=normalize)
+            else:
+                for entry in ["usr", "Library", selected_sdk, "SDKs/MacOSX.sdk"]:
+                    tar.add(source / entry, arcname=root_name + "/" + entry, filter=normalize)
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--layout", choices=["clt", "xcode"], default="clt")
     args = parser.parse_args()
     source = args.source.resolve(strict=True)
     output = args.output.resolve()
     assert not output.is_relative_to(source), "output must be outside source"
     output.mkdir(mode=0o700)
-    env = {"DEVELOPER_DIR": str(source), "LC_ALL": "C", "HOME": os.environ["HOME"],
+    developer = source / "Contents/Developer" if args.layout == "xcode" else source
+    binaries = "Toolchains/XcodeDefault.xctoolchain/usr/bin" if args.layout == "xcode" else "usr/bin"
+    sdks = "Platforms/MacOSX.platform/Developer/SDKs" if args.layout == "xcode" else "SDKs"
+    env = {"DEVELOPER_DIR": str(developer), "LC_ALL": "C", "HOME": os.environ["HOME"],
            "PATH": "/usr/bin:/bin:/usr/sbin:/sbin"}
 
     def query(*command):
@@ -65,21 +74,21 @@ def main():
 
     sdk = query("/usr/bin/xcrun", "--sdk", "macosx", "--show-sdk-version")
     assert sdk and len(sdk) <= 32 and all(part.isascii() and part.isdecimal() for part in sdk.split('.'))
-    selected_sdk = "SDKs/MacOSX" + sdk + ".sdk"
-    assert (source / "SDKs/MacOSX.sdk").resolve() == (source / selected_sdk).resolve()
-    anchors = ["usr/bin/" + name for name in
+    selected_sdk = sdks + "/MacOSX" + sdk + ".sdk"
+    assert (developer / sdks / "MacOSX.sdk").resolve() == (developer / selected_sdk).resolve()
+    anchors = [binaries + "/" + name for name in
                ["swift-frontend", "swift-driver", "swift-package", "clang", "ld"]]
     anchors.append(selected_sdk + "/SDKSettings.json")
-    swift_version = subprocess.check_output([str(source / "usr/bin/swift"), "--version"],
+    swift_version = subprocess.check_output([str(developer / binaries / "swift"), "--version"],
                                            env=env, stderr=subprocess.STDOUT, text=True).strip()
-    manifest = dict(schema_version=1,
+    manifest = dict(schema_version=1, layout=args.layout,
                     swift_version=swift_version,
-                    sdk_version=sdk, files={name: digest(source / name) for name in anchors})
+                    sdk_version=sdk, files={name: digest(developer / name) for name in anchors})
 
     archive = output / "toolchain.tar.gz"
-    write_archive(source, archive, selected_sdk)
+    write_archive(source, archive, selected_sdk, args.layout)
     # Reject source drift in the actual compiler/SDK anchors during packaging.
-    assert manifest["files"] == {name: digest(source / name) for name in anchors}
+    assert manifest["files"] == {name: digest(developer / name) for name in anchors}
     manifest["archive"] = dict(sha256=digest(archive), size_bytes=archive.stat().st_size)
     data = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
     (output / "toolchain.json").write_bytes(data)

@@ -10,6 +10,7 @@ import hashlib
 import io
 import json
 import os
+import re
 from pathlib import Path
 import shlex
 import shutil
@@ -223,7 +224,7 @@ def main():
                 *arguments, timeout=630)
         test_log = ((evidence / "swift-test.stdout").read_text() +
                     (evidence / "swift-test.stderr").read_text())
-        assert "physicalMacCannotSatisfyGuestProbe" in test_log and "1 test passed" in test_log
+        assert "physicalMacCannotSatisfyGuestProbe" in test_log and re.search(r"Test run with 1 test(?: in \d+ suites)? passed", test_log)
         summary["swift"] = dict(toolchain_sha256=release["toolchain_sha256"], identity=identity,
                                 source_sha256={str(p.relative_to(fixture)): hashlib.sha256(p.read_bytes()).hexdigest()
                                                for p in sources}, probe=swift_probe("swift-run"))
@@ -294,7 +295,9 @@ def main():
             # the next boot refuses Ready while positive Delete still works.
             sdk = summary["swift"]["identity"]["sdk_version"]
             assert sdk and all(c in "0123456789." for c in sdk)
-            anchor = f"/Library/Developer/CommandLineTools/SDKs/MacOSX{sdk}.sdk/SDKSettings.json"
+            developer = "/Applications/Xcode.app/Contents/Developer" if summary["swift"]["identity"].get("layout") == "xcode" else "/Library/Developer/CommandLineTools"
+            sdk_prefix = "Platforms/MacOSX.platform/Developer/SDKs" if summary["swift"]["identity"].get("layout") == "xcode" else "SDKs"
+            anchor = f"{developer}/{sdk_prefix}/MacOSX{sdk}.sdk/SDKSettings.json"
             run("second-alter-sdk", [binary_dir / "vz", "exec", "--environment", "native-second",
                                     "--no-stdin", "--", "/bin/sh", "-c",
                                     "printf ' ' >> " + shlex.quote(anchor) + "; sync"])

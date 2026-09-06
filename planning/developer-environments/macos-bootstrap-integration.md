@@ -1,8 +1,9 @@
 # macOS bootstrap integration handoff (DEV)
 
-Tracks `vz-mzs.11.4`. This is the artifact preparation foundation. The native
-macOS and aggregate release gates remain open; a prepared template is not a
-booted Machine or a supported published release.
+Tracks `vz-mzs.11.4`. This covers artifact preparation and the installed DEV
+native adapter. The native macOS and aggregate release gates remain open;
+local lifecycle evidence does not qualify a supported published release.
+The [Swift toolchain handoff](macos-swift-toolchain.md) records the next candidate.
 
 ## Integration API
 
@@ -33,12 +34,13 @@ storage. There is no new public CLI verb.
    private Machine directory on the same clone-capable filesystem. This uses
    `clonefile`, creates a distinct writable inode, refuses existing destinations,
    and does not fall back to a full copy. It copies no identity sidecars.
-5. The native adapter allocates Machine identity, MAC, credentials and private
-   auxiliary state, binds the workspace, boots the VM and verifies the agent.
+5. The native adapter allocates fresh Machine identity and private auxiliary
+   state, boots the VM and verifies the agent and any nonempty toolchain pin.
    `hardware_model_path()` and `auxiliary_storage_seed_path()` expose immutable
-   inputs. Never attach the shared auxiliary seed directly to a VM. Proving the
-   seed's compatibility with fresh Machine identity is still native integration
-   work; this layer does not claim that arbitrary copied platform state boots.
+   inputs. Never attach the shared auxiliary seed directly to a VM. The installed
+   DEV gate proves the chosen seed boots with fresh identities; arbitrary copied
+   platform state still requires qualification. Native networking and workspace
+   bindings remain integration work.
 6. Stop/Up reuses the Machine's private disk and state. Delete removes exactly
    that Machine's state, preserving templates and other Machines.
 
@@ -103,13 +105,13 @@ to stdout. Invoke again with a different new disk path to measure cached creatio
 It does not boot a VM and reports `native_machine_ready: false`. Existing
 `image_delta` and `fetch_artifact` examples remain available for artifact work.
 
-The next agent should prepare the real 26.6.2 / 25G83 base and loader/toolchain
-patch, retain compatible platform resources, publish/sign the complete manifest
-and artifact set, and wire this API into the native target adapter and Up stream.
-Add persisted catalog resolution and test advancing the latest pointer without
-changing existing Environment pins. Then prove a fresh installed download,
-no-sudo bootstrap, guest agent/Swift execution, private platform identity,
-Stop/Up/Delete, mixed-target isolation and the required native/aggregate gates.
+Continue from the qualified local **26.3.1 / 25D2128** candidate; 26.6.2 / 25G83
+failed actual installation on this host. The native target adapter, Up stream
+and persisted catalog resolution are implemented. Add the qualified
+[Swift toolchain](macos-swift-toolchain.md) to the publication recipe, then
+publish/sign the complete manifest and artifact set. Prove a fresh installed
+public download, no-sudo bootstrap, guest agent/Swift execution, private platform
+identity, Stop/Up/Delete, mixed-target isolation and the required native/aggregate gates.
 Record cold preparation, cached clone creation, and warm VM start independently.
 
 ## Verification checkpoint

@@ -55,6 +55,19 @@ class ToolchainArchiveTests(unittest.TestCase):
                     self.write("rejected-" + str(len(target)) + ".tar.gz")
                 link.unlink()
 
+    def test_xcode_layout_preserves_the_complete_application_root(self):
+        source = self.root / "Xcode.app"
+        developer = source / "Contents/Developer"
+        developer.mkdir(parents=True)
+        (source / "Contents/Info.plist").write_text("app identity")
+        (developer / "compiler").write_bytes(b"compiler")
+        (developer / "alias").symlink_to("compiler")
+        destination = self.root / "xcode.tar.gz"
+        toolchain.write_archive(source, destination, "unused SDK path", layout="xcode")
+        with tarfile.open(destination) as archive:
+            self.assertIn("Xcode.app/Contents/Info.plist", archive.getnames())
+            self.assertEqual(archive.getmember("Xcode.app/Contents/Developer/alias").linkname, "compiler")
+
     def test_only_obsolete_crashlog_alias_is_omitted(self):
         (self.source / "usr/bin/crashlog").symlink_to("../../../SharedFrameworks/missing")
         with tarfile.open(self.write("without-crashlog.tar.gz")) as archive:
