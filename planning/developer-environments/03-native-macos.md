@@ -52,6 +52,10 @@ the five public lifecycle verbs. Completion requires the available matching
 patch and the installed physical happy-path evidence, as specified in
 `GOAL-0.4.0.md` and `06-macos-target-validation.md`.
 
+See [automated bootstrap delivery](macos-bootstrap-delivery.md) for the maintainer
+artifact workflow, user progress/cache behavior, current candidate and remaining
+base compatibility decision.
+
 ## Validation
 
 - Contract tests for macOS Machine TargetSpec, capabilities, lifecycle, and

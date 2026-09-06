@@ -3835,11 +3835,18 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "fs2",
+ "indicatif",
  "libc",
+ "reqwest",
+ "serde",
  "serde_json",
+ "sha2",
  "tempfile",
+ "tokio",
  "tracing",
  "vz-agent-loader-client",
+ "zstd",
 ]
 
 [[package]]

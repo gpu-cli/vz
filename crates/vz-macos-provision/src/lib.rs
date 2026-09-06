@@ -11,6 +11,9 @@ use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
 
+pub mod artifact_cache;
+pub mod image_delta;
+
 /// Default binary name for the guest agent.
 const DEFAULT_AGENT_BINARY_NAME: &str = "vz-guest-agent";
 

@@ -12,11 +12,19 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 libc = { workspace = true }
 serde_json = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+tempfile = { workspace = true }
+zstd = "0.13"
+reqwest = { workspace = true }
+tokio = { workspace = true }
+fs2 = { workspace = true }
 vz-agent-loader-client = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 base64 = { workspace = true }
+indicatif = { workspace = true }
 
 [lints]
 workspace = true
