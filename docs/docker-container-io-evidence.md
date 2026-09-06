@@ -118,3 +118,51 @@ owned socket and empty private directory. Neither failure was reclassified.
 An unrelated scanner-depth test also fails on Homebrew Python 3.14.6 and was
 reproduced on unchanged HEAD. The installed interpreter passes that test;
 `vz-mzs.7.1.7` tracks making the JSON-depth bound independent of parser recursion.
+
+## Installed Mac candidate 1, 2026-09-06: failed, retained
+
+Source commit `351e452b` passed 747 affected regression tests before the final
+health-timing patch; all 79 container-focused tests passed with that patch.
+The installed signed `0.4.0-dev` build then provisioned two Environments with
+four Linux Machines. This is a local DEV build, not a notarized release claim.
+
+On the first Machine, the workload reached `docker run -it` after health
+transitions, all five exec phases (including TTY resize, Ctrl-C, and exact host
+terminal restoration), binary attach/stdin, and run exits 0 and 37. Command 110
+failed: the frozen guest probe returned 70 with
+`VZ_CONTAINER_IO_CONTRACT_REJECTED` before its ready record or Ctrl-C input.
+The capture correctly retained uncertainty instead of acknowledging success.
+All eight interactive host clients were positively reaped. The four sentinels
+produced 96 samples / 384 raw commands with no liveness errors. Neither the first
+Machine workload nor the three-Machine slice passed independent final replay.
+
+Retained evidence is `.artifacts/linux-docker-lifecycle-candidate-1`:
+2,753 payloads, 3,325,530 bytes; manifest SHA-256
+`a19eea2a635c9005e9c3c21477571744a9687fb159096af8e260781f04924894`.
+A separate exact-owner disposition performed two public Environment Stops,
+verified four distinct clean-journal shutdowns, observed graceful daemon
+shutdown, and confirmed unchanged daily and isolated Docker defaults. It
+retained all objects and disks and did not reclassify the failed candidate.
+Its 500 payloads / 575,289 bytes are in
+`.artifacts/linux-docker-lifecycle-candidate-1-disposition`; manifest SHA-256
+`7214542bd16aac4ec4912328cee7b9ef73f50cb320abbd2bdf7546b476c5b432`.
+
+The separately retained failed-container inspect shows `ConsoleSize: [24, 80]`,
+TTY enabled, and stopped exit 70 / PID 0. Although Docker starts its resize
+monitor after container start, it also sends the initial console size at create
+time ([run source](https://raw.githubusercontent.com/docker/cli/v29.7.2/cli/command/container/run.go),
+[create source](https://raw.githubusercontent.com/docker/cli/v29.7.2/cli/command/container/create.go)).
+The pinned youki source provides a concrete defect to investigate:
+[`setup_console`](https://github.com/youki-dev/youki/blob/94ba653efbb180ce04650f6ae01a8e6bc8f96d92/crates/libcontainer/src/tty.rs#L286)
+calls `openpty(None, None)` without the OCI console dimensions. Both init and
+exec use this path; none of our seven local patches changes it. Moby forwards
+the configured size into the OCI process specification. The authenticated
+youki source archive SHA-256 is
+`bbf134e568c6cc2672c687c93176a1f0a67df332d416feb5f3a078fb39762b42`.
+
+Ignoring the requested initial size is a source-confirmed runtime defect; its
+causal link to this generic probe failure remains unproven. Next, observe actual
+guest dimensions, terminal flags, and `isatty` values at entry, then implement
+and verify the runtime correction with rebuilt guest artifacts and the backend
+gate. Do not add a wait or relax the frozen probe merely to obtain a passing
+candidate.
