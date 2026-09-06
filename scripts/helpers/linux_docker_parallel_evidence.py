@@ -18,7 +18,7 @@ TRANSCRIPT_KEYS |= {phase + clock for phase in PHASES for clock in ("_unix_ns", 
 RUN_NAME = "[build 3/3] RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /fixture/parallel.py"
 
 
-def barrier_transcript(raw, operation, run_start, run_end):
+def barrier_transcript(raw, operation, guest_lower, guest_upper):
     prefix = b"VZ_PARALLEL_BARRIER="
     require(raw.startswith(prefix) and raw.endswith(b"\n") and raw.count(b"\n") == 1,
             "not one exact parallel barrier transcript")
@@ -32,8 +32,8 @@ def barrier_transcript(raw, operation, run_start, run_end):
     for clock in ("_unix_ns", "_monotonic_ns"):
         times = [value[phase + clock] for phase in PHASES]
         require(all(type(t) is int and t > 0 for t in times) and times == sorted(times), "barrier phase time invalid")
-    require(run_start <= value["started_unix_ns"] <= value["completed_unix_ns"] <= run_end,
-            "barrier transcript outside authoritative RUN")
+    require(guest_lower <= value["started_unix_ns"] <= value["completed_unix_ns"] <= guest_upper,
+            "barrier transcript outside guest Engine window")
     require(value["released_monotonic_ns"] - value["all_ready_monotonic_ns"] >= 10**9
             and value["completed_monotonic_ns"] - value["started_monotonic_ns"] <= 60 * 10**9,
             "barrier dwell or deadline unproven")
@@ -75,9 +75,12 @@ def barrier_transcript(raw, operation, run_start, run_end):
     return value
 
 
-def parallel_progress(raw, reference, operation, lower, upper):
+def parallel_progress(raw, reference, operation, guest_lower, guest_upper, host_lower=None, host_upper=None):
     vertices, _ = progress(raw)
-    require(lower <= upper, "reversed parallel Engine clocks")
+    require(guest_lower <= guest_upper, "reversed parallel Engine clocks")
+    require(type(host_lower) is int and type(host_upper) is int and host_lower <= host_upper,
+            "parallel client command clock bounds required")
+    lower, upper = host_lower, host_upper
     base, separator, pin = reference.partition("@sha256:")
     require(separator and hex64(pin), "unpinned parallel base")
     if "/" not in base:
@@ -92,30 +95,83 @@ def parallel_progress(raw, reference, operation, lower, upper):
                  "[internal] load metadata for " + base}
     grouped, names = {}, {}
     for vertex in vertices:
-        require(not vertex.get("error") and set(vertex) <= {"digest", "name", "inputs", "started", "completed", "cached", "error"},
+        require((not vertex.get("error") or (vertex["name"] == wanted["copy"]
+                and vertex["error"] == "context canceled: context canceled"))
+                and set(vertex) <= {"digest", "name", "inputs", "started", "completed", "cached", "error"},
                 "parallel vertex error or unknown field")
         identity, name, inputs = vertex["digest"], vertex["name"], vertex.get("inputs", [])
         require(type(inputs) is list and all(isinstance(x, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", x) for x in inputs)
                 and len(inputs) == len(set(inputs)), "invalid parallel edges")
         rows = grouped.setdefault(identity, [])
         require(not rows or (rows[0]["name"] == name and rows[0].get("inputs", []) == inputs), "parallel graph drift")
-        require(name not in names or names[name] == identity, "duplicate parallel graph role")
-        names[name] = identity
+        identities = names.setdefault(name, [])
+        if identity not in identities:
+            identities.append(identity)
+        require(len(identities) == 1 or (name == wanted["copy"] and len(identities) == 2),
+                "duplicate parallel graph role")
         rows.append(vertex)
         for key in ("started", "completed"):
             if key in vertex:
-                require(lower <= progress_ns(vertex[key]) <= upper, "parallel progress outside Engine clocks")
+                require(lower <= progress_ns(vertex[key]) <= upper, "parallel progress outside client command clocks")
         if "completed" in vertex:
             require("started" in vertex and progress_ns(vertex["started"]) <= progress_ns(vertex["completed"]), "parallel lifetime reversed")
     require(set(wanted.values()) <= set(names) <= set(wanted.values()) | auxiliary, "missing or foreign parallel operation")
-    ids = {role: names[name] for role, name in wanted.items()}
+    ids = {role: names[name][0] for role, name in wanted.items()}
+    # BuildKit v0.19 scheduler.mergeTo cancels the losing COPY edge and
+    # state.setEdge/addJobs forwards the winner's progress into this solve.
+    # The RUN still names the original edge. Only the group can authenticate
+    # the adopted COPY/context against a successful origin in these four jobs.
+    original_copy = ids["copy"]
+    copies = names[wanted["copy"]]
+    copy_alias = None
+    if len(copies) == 2:
+        canceled = [identity for identity in copies if any(row.get("error") for row in grouped[identity])]
+        require(len(canceled) == 1, "parallel COPY alias lacks one canceled original")
+        original_copy = canceled[0]
+        ids["copy"] = next(identity for identity in copies if identity != original_copy)
+        rows = grouped[original_copy]
+        done = [row for row in rows if "completed" in row]
+        require(len(done) == 1 and rows[-1] is done[0]
+                and done[0].get("error") == "context canceled: context canceled"
+                and all(not row.get("cached", False) for row in rows)
+                and all(not row.get("error") for row in rows[:-1])
+                and len({row["started"] for row in rows if "started" in row}) == 1
+                and rows[0].get("inputs", []) == [ids["base"], ids["context"]],
+                "parallel canceled COPY lifetime or graph differs")
+        copy_alias = {"original": original_copy, "adopted": ids["copy"], "original_rows": rows}
+    else:
+        require(all(not row.get("error") for row in grouped[original_copy]), "parallel canceled COPY has no adopted success")
     edges = {"base": [], "context": [], "copy": ["base", "context"], "run": ["copy"], "output": ["run"], "export": []}
     terminal = {}
     for role, identity in ids.items():
         rows = grouped[identity]
-        require(rows[0].get("inputs", []) == [ids[x] for x in edges[role]], "parallel graph disconnected")
+        expected_edges = [ids[x] for x in edges[role]]
+        if role == "run":
+            expected_edges = [original_copy]
+        if role == "copy" and copy_alias is not None:
+            actual_edges = rows[0].get("inputs", [])
+            require(len(actual_edges) == 2 and actual_edges[0] == ids["base"]
+                    and actual_edges[1] != ids["context"] and actual_edges[1] not in grouped,
+                    "adopted COPY does not have one external context")
+            expected_edges = actual_edges
+        require(rows[0].get("inputs", []) == expected_edges, "parallel graph disconnected")
         done = [row for row in rows if "completed" in row]
         require(done, "parallel graph role unfinished")
+        if role in ("base", "context"):
+            current, finished, previous_end = None, False, None
+            for row in rows:
+                if "started" not in row:
+                    require(current is None, "parallel source reset after execution")
+                    continue
+                started = progress_ns(row["started"])
+                if current != started:
+                    require(current is None or finished, "parallel source lifetime abandoned")
+                    require(previous_end is None or previous_end <= started, "parallel source lifetimes overlap")
+                    current, finished = started, False
+                require(not finished, "parallel source updated after terminal")
+                if "completed" in row:
+                    previous_end, finished = progress_ns(row["completed"]), True
+            require(finished, "parallel source final lifetime unfinished")
         if role not in ("base", "context"):
             require(len(done) == 1 and rows[-1] is done[0] and len({row["started"] for row in rows if "started" in row}) == 1,
                     "parallel operation repeated/lifetime drift")
@@ -128,8 +184,16 @@ def parallel_progress(raw, reference, operation, lower, upper):
                     hit = hit or row.get("cached", False)
             terminal[role] = done[0]
             for parent in edges[role]:
+                if role == "copy" and copy_alias is not None and parent == "context":
+                    continue  # Authenticated by the winner's full source graph in validate_group.
                 require(max(progress_ns(row["completed"]) for row in grouped[ids[parent]] if "completed" in row)
                         <= progress_ns(done[0]["started"]), "parallel dependency time reversed")
+    if copy_alias is not None:
+        canceled = grouped[original_copy][-1]
+        require(max(progress_ns(row["completed"]) for row in grouped[ids["context"]] if "completed" in row)
+                <= progress_ns(canceled["started"])
+                and progress_ns(canceled["completed"]) <= progress_ns(terminal["copy"]["started"]),
+                "parallel COPY cancellation/adoption time reversed")
     require(progress_ns(terminal["output"]["completed"]) <= progress_ns(terminal["export"]["started"]), "parallel export precedes output")
     run = terminal["run"]
     began, ended = progress_ns(run["started"]), progress_ns(run["completed"])
@@ -143,14 +207,34 @@ def parallel_progress(raw, reference, operation, lower, upper):
                 require(row.get("vertex") in grouped, "unbound parallel progress frame")
                 for key in ("timestamp", "started", "completed"):
                     if key in row:
-                        require(lower <= progress_ns(row[key]) <= upper, "parallel frame outside Engine clocks")
+                        require(lower <= progress_ns(row[key]) <= upper, "parallel frame outside client command clocks")
                 if category == "logs":
                     require(row["vertex"] == ids["run"] and type(row.get("stream")) is int and row["stream"] == 1
                             and set(row) <= {"vertex", "stream", "data", "timestamp"}
                             and began <= progress_ns(row["timestamp"]) <= ended, "foreign parallel execution log")
                     log.append(base64.b64decode(row["data"], validate=True))
+    barrier = barrier_transcript(b"".join(log), operation, guest_lower, guest_upper)
+    started, completed = barrier["started_unix_ns"], barrier["completed_unix_ns"]
+    duration = ended - began
+    # Pinned Buildx progress.ResetTime shifts Vertex/Status/Log timestamps by
+    # one client-side offset per solve; it preserves durations and log.Data.
+    # Script [S,E] executes inside RUN [R,R+D], hence R is in [E-D,S].
+    # This envelope contains the whole guest RUN without inventing an offset.
+    require(0 < completed - started <= duration
+            and 0 < barrier["completed_monotonic_ns"] - barrier["started_monotonic_ns"] <= duration,
+            "parallel script cannot fit inside authoritative RUN duration")
+    envelope_start, envelope_end = completed - duration, started + duration
+    require(guest_lower <= envelope_start < envelope_end <= guest_upper,
+            "parallel guest RUN envelope outside Engine clocks")
     return {"run_interval": {"digest": ids["run"], "started_ns": began, "completed_ns": ended},
-            "barrier": barrier_transcript(b"".join(log), operation, began, ended)}
+            "progress_clock": "buildx-client-translated",
+            "guest_run_envelope": {"started_ns": envelope_start, "completed_ns": envelope_end,
+                                   "duration_ns": envelope_end - envelope_start},
+            "guest_script_interval": {"started_ns": started, "completed_ns": completed, "duration_ns": completed - started},
+            "copy_graph": {"alias": copy_alias, "copy": terminal["copy"],
+                           "copy_rows": grouped[ids["copy"]],
+                           "local_context": grouped[ids["context"]], "base": ids["base"]},
+            "barrier": barrier}
 
 
 def absolute(value):
@@ -246,7 +330,8 @@ class Replay(BuildReplay):
                 "parallel builder configuration/volume drift")
         require(before["State"].get("OOMKilled") is False and after["State"].get("OOMKilled") is False,
                 "parallel builder OOM")
-        graph = parallel_progress(build["_stderr"], self.inputs["images"]["base"]["reference"], op, lower, upper)
+        graph = parallel_progress(build["_stderr"], self.inputs["images"]["base"]["reference"], op, lower, upper,
+                                  build["started_unix_ns"], build["started_unix_ns"] + build["elapsed_ns"])
         image = layout.validate_oci(self.directory / "oci", expected_path="payload.txt", expected_sha256=sha(payload), expected_size=len(payload))
         require(decode(read(self.directory / "artifact-validation.json", 16 * 1024 * 1024)) == {"oci": image},
                 "parallel recorded artifact proof differs")
@@ -256,13 +341,18 @@ class Replay(BuildReplay):
                 "builder_process": {"pid": self.builder_process[0], "started_at": self.builder_process[1]},
                 "parallel_fixture_sha256": op["parallel_fixture_sha256"], "command_count": 9,
                 "progress_sha256": sha(build["_stderr"]), "run_interval": graph["run_interval"],
-                "barrier": graph["barrier"], "oci": image, "parent_provisioning_and_cleanup_required": True,
+                "progress_clock": graph["progress_clock"], "guest_run_envelope": graph["guest_run_envelope"],
+                "guest_script_interval": graph["guest_script_interval"],
+                "copy_graph": graph["copy_graph"], "barrier": graph["barrier"], "oci": image, "parent_provisioning_and_cleanup_required": True,
+                "group_validation_required": True,
                 "compatibility_certified": False}
 
 
 def validate_slot(directory, expected_inputs, expected_operation):
     try:
         return Replay(directory, expected_inputs, expected_operation).run()
+    except Invalid as error:
+        raise Invalid("parallel slot evidence rejected: " + str(error)) from error
     except (OSError, ValueError, KeyError, IndexError, TypeError, UnicodeError) as error:
         raise Invalid("parallel slot evidence rejected: " + type(error).__name__) from error
 
@@ -277,7 +367,9 @@ def validate_group(rows):
         first = selected[0]
         for row in selected:
             require(type(row["schema_version"]) is int and row["schema_version"] == 1 and row["command_count"] == 9
-                    and row["compatibility_certified"] is False, "invalid parallel proof schema or scope")
+                    and row["compatibility_certified"] is False and row["group_validation_required"] is True
+                    and row["progress_clock"] == "buildx-client-translated",
+                    "invalid parallel proof schema or scope")
             for field in ("scope", "builder", "builder_process", "run_id", "parallel_fixture_sha256"):
                 require(row[field] == first[field], "parallel builder/Engine/run/fixture identity differs")
             barrier = row["barrier"]
@@ -285,17 +377,41 @@ def validate_group(rows):
                     and barrier["participants"] == first["barrier"]["participants"]
                     and barrier["generation_sha256"] == first["barrier"]["generation_sha256"], "parallel barrier generation differs")
         require(len({row["run_interval"]["digest"] for row in selected}) == 4, "parallel RUN identity reused")
-        began = max(row["run_interval"]["started_ns"] for row in selected)
-        ended = min(row["run_interval"]["completed_ns"] for row in selected)
+        for row in selected:
+            graph = row["copy_graph"]
+            alias = graph["alias"]
+            if alias is None:
+                continue
+            origins = [candidate for candidate in selected if candidate["slot"] != row["slot"]
+                       and candidate["copy_graph"]["alias"] is None
+                       and candidate["copy_graph"]["copy"]["digest"] == alias["adopted"]]
+            require(len(origins) == 1, "adopted parallel COPY lacks unique successful group origin")
+            origin = origins[0]["copy_graph"]
+            adopted, original = graph["copy"], origin["copy"]
+            require({key: value for key, value in adopted.items() if key not in ("started", "completed")}
+                    == {key: value for key, value in original.items() if key not in ("started", "completed")}
+                    and graph["base"] == origin["base"]
+                    and adopted["inputs"][1] == origin["local_context"][0]["digest"]
+                    and progress_ns(adopted["completed"]) - progress_ns(adopted["started"])
+                    == progress_ns(original["completed"]) - progress_ns(original["started"]),
+                    "adopted parallel COPY differs from successful origin")
+        began = max(row["guest_script_interval"]["started_ns"] for row in selected)
+        ended = min(row["guest_script_interval"]["completed_ns"] for row in selected)
         ready = max(row["barrier"]["ready_monotonic_ns"] for row in selected)
         release = min(row["barrier"]["released_monotonic_ns"] for row in selected)
-        require(began < ended and ready < release, "four-way concurrent RUN/barrier overlap unproven")
+        ready_wall = max(row["barrier"]["ready_unix_ns"] for row in selected)
+        release_wall = min(row["barrier"]["released_unix_ns"] for row in selected)
+        require(began < ended and ready < release and ready_wall < release_wall,
+                "four-way concurrent RUN/barrier overlap unproven")
         return {"schema_version": 1, "outcome": "four_parallel_solves_validated", "slots": [0, 1, 2, 3],
                 "scope": first["scope"], "builder": first["builder"], "builder_process": first["builder_process"],
                 "run_id": first["run_id"], "parallel_fixture_sha256": first["parallel_fixture_sha256"],
                 "generation_sha256": first["barrier"]["generation_sha256"],
-                "run_overlap": {"started_ns": began, "completed_ns": ended, "duration_ns": ended - began},
+                "run_overlap": {"clock": "guest-unix", "started_ns": began, "completed_ns": ended, "duration_ns": ended - began},
                 "barrier_overlap_monotonic": {"started_ns": ready, "completed_ns": release, "duration_ns": release - ready},
+                "barrier_overlap_unix": {"started_ns": ready_wall, "completed_ns": release_wall, "duration_ns": release_wall - ready_wall},
                 "command_count": 36, "parent_provisioning_and_cleanup_required": True, "compatibility_certified": False}
+    except Invalid as error:
+        raise Invalid("parallel group evidence rejected: " + str(error)) from error
     except (ValueError, KeyError, IndexError, TypeError) as error:
         raise Invalid("parallel group evidence rejected: " + type(error).__name__) from error

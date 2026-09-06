@@ -15,6 +15,10 @@ HERE = Path(__file__).resolve().parent
 spec = importlib.util.spec_from_file_location("parallel_fixture", HERE / "parallel.py")
 parallel = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(parallel)
+image_spec = importlib.util.spec_from_file_location("parallel_image_input",
+    HERE.parents[3] / "scripts/helpers/linux_docker_image_input.py")
+image_input = importlib.util.module_from_spec(image_spec)
+image_spec.loader.exec_module(image_input)
 BASE = "python:3@sha256:" + "a" * 64
 
 
@@ -53,6 +57,7 @@ class ParallelFixtureTests(unittest.TestCase):
             os.close(fd)
 
     def test_contract_and_exact_graph(self):
+        pinned = image_input.load(HERE.parent / "docker/python-image-input.json")
         contract = json.loads((HERE / "contract.json").read_text())
         self.assertEqual(contract["barrier"], {"workers": parallel.WORKERS,
             "timeout_ns": parallel.TIMEOUT_NS, "poll_interval_ns": parallel.POLL_INTERVAL_NS,
@@ -64,10 +69,25 @@ class ParallelFixtureTests(unittest.TestCase):
         self.assertEqual((HERE / ".dockerignore").read_text().splitlines(),
                          ["*", "!Dockerfile.parallel", "!parallel.py"])
         self.assertEqual((HERE / "Dockerfile.parallel").read_text().splitlines(), [
-            "ARG FIXTURE_BASE", "FROM ${FIXTURE_BASE} AS build", "ARG FIXTURE_BASE",
+            "ARG FIXTURE_BASE=" + pinned["reference"], "FROM ${FIXTURE_BASE} AS build", "ARG FIXTURE_BASE",
             "ARG FIXTURE_RUN", "ARG FIXTURE_SLOT", "COPY parallel.py /fixture/parallel.py",
             "RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /fixture/parallel.py",
             "FROM scratch AS output", "COPY --from=build /out/payload.txt /payload.txt"])
+
+    def test_default_is_verified_arm64_manifest_not_index_or_mutable_fallback(self):
+        pinned = image_input.load(HERE.parent / "docker/python-image-input.json")
+        self.assertEqual(pinned["platform"], "linux/arm64")
+        self.assertEqual(pinned["id"], pinned["manifest_descriptor"]["digest"])
+        self.assertEqual(pinned["reference"], "docker.io/library/python@" + pinned["id"])
+        self.assertNotEqual(pinned["id"], pinned["metadata_hashes"]["index"])
+        lines = (HERE / "Dockerfile.parallel").read_text().splitlines()
+        expected = "ARG FIXTURE_BASE=" + pinned["reference"]
+        self.assertEqual(lines[0], expected)
+        for invalid in ["ARG FIXTURE_BASE", "ARG FIXTURE_BASE=", "ARG FIXTURE_BASE=python:latest",
+                        "ARG FIXTURE_BASE=scratch", "ARG FIXTURE_BASE=python@sha256:" + "a" * 64,
+                        "ARG FIXTURE_BASE=docker.io/library/python@" + pinned["metadata_hashes"]["index"]]:
+            with self.subTest(invalid=invalid):
+                self.assertNotEqual(invalid, expected)
 
     def test_four_real_processes_release_same_generation_and_exact_payloads(self):
         code = ("import importlib.util,json,pathlib,sys; "

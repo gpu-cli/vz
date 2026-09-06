@@ -5,15 +5,30 @@ Build four distinct slots (0 through 3) on one fresh, explicitly owned builder,
 with the same unique `FIXTURE_RUN` and digest-pinned Python `FIXTURE_BASE`.
 Each solve uses the `output` target and exports a gzip OCI directory with
 attestations disabled. `contract.json` fixes timing and public evidence.
+The global base argument defaults to the exact selected ARM64 manifest verified
+by `../docker/python-image-input.json`, not its multi-platform index or a tag.
+BuildKit 0.19 validates `FROM` using argument defaults before applying supplied
+build arguments; this pinned default avoids `InvalidDefaultArgInFrom` without
+suppressing warnings. The host still supplies and verifies the explicit base
+argument. No other graph, mount, or command behavior changes.
 
 Each network-disabled RUN claims one exclusive directory in the explicitly
 shared BuildKit cache. Atomic, bounded ready records bind the run and slot.
 Every worker must observe all four immutable records, then dwell at least one
 second before writing its slot-specific public payload with mode 0644. All
 four transcripts must agree on ordered participants and their canonical SHA256.
-Per-slot wall/monotonic timestamps and bounded readiness samples permit replay
-against raw BuildKit RUN intervals; a cached or sequential substitute cannot
-prove the barrier. No host networking or implicit host service is involved.
+Per-slot guest wall/monotonic timestamps and bounded readiness samples prove a
+common interval inside four distinct uncached RUNs; a cached or sequential
+substitute cannot prove the barrier. Buildx translates each solve's progress
+timestamps independently, but preserves durations and log payloads. Replay keeps
+those raw timestamps separate from guest clocks. For RUN duration `D` and its
+authenticated guest script interval `[S, C]`, `[C-D, S+D]` conservatively encloses
+the entire RUN. The one-second HTTP observer must bracket all four of these
+guest-clock envelopes; overlapping envelopes alone never prove concurrency.
+Shared speculative COPY steps may merge only when the canceled local edge and
+adopted successful edge are bound to an unaliased winner in this same four-slot
+group. Warnings, arbitrary cancellations, cached RUNs, and unresolved foreign
+origins still fail. No host networking or implicit host service is involved.
 
 Failure leaves claims and other artifacts intact: no retry, repair, or worker
 cleanup occurs. Reusing a successful or failed barrier cache is an error; the

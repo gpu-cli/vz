@@ -176,8 +176,11 @@ def run_machine(harness, descriptor, scope, proof, images, index):
             rows.append({"operation_contract": copy.deepcopy(operation), "artifact_validation": artifact_proof,
                          "independent_validation": replay})
         group = validate_group([row["independent_validation"] for row in rows])
-        intervals = [(row["independent_validation"]["run_interval"]["started_ns"],
-                      row["independent_validation"]["run_interval"]["completed_ns"]) for row in rows]
+        # Buildx translates each solve's progress clock independently. The
+        # replay derives conservative whole-RUN bounds on the guest clock
+        # from the unchanged duration and authenticated in-RUN transcript.
+        intervals = [(row["independent_validation"]["guest_run_envelope"]["started_ns"],
+                      row["independent_validation"]["guest_run_envelope"]["completed_ns"]) for row in rows]
     except BaseException as error:
         work_error = error
         raise

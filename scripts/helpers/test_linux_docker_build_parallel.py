@@ -189,7 +189,9 @@ class ParallelTests(unittest.TestCase):
             replay_calls += 1
             if failure == "replay" or (failure == "late-replay" and replay_calls == 5):
                 raise ValueError("replay failure")
-            return {"slot": operation["slot"], "run_interval": {"started_ns": 100, "completed_ns": 200}}
+            return {"slot": operation["slot"],
+                    "run_interval": {"started_ns": 100, "completed_ns": 200},
+                    "guest_run_envelope": {"started_ns": 80, "completed_ns": 230}}
         def execute(selected, operations):
             self.assertEqual(harness.driver_cleanup_verified, [False] * 5)
             if failure in ("solve", "solve-and-health"):
@@ -214,7 +216,8 @@ class ParallelTests(unittest.TestCase):
         self.assertEqual(harness.driver_cleanup_verified, [True] * 5)
         self.assertEqual(len(result["operations"]), 4)
         self.assertFalse(result["docker_parity_certified"])
-        health.finish.assert_called_once_with([(100, 200)] * 4)
+        # A plausible client-translated interval is not guest-clock evidence.
+        health.finish.assert_called_once_with([(80, 230)] * 4)
         builder.verify.assert_called_once_with(require_invocation=True)
 
     def test_each_failure_withholds_cleanup_and_joins_observer(self):

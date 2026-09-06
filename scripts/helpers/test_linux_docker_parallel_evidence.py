@@ -103,6 +103,9 @@ class ParallelEvidenceTests(unittest.TestCase):
                 "--build-arg", "FIXTURE_RUN=" + operation["run_id"], "--build-arg", "FIXTURE_SLOT=" + str(slot),
                 "--network=none", str(self.fixture)]
         self.raw.change(5, lambda row: row.update(argv=argv), True)
+        for index, seconds in enumerate((0, .1, .2, .3, .4, 8.5, 8.6, 8.7, 8.8), 1):
+            self.raw.change(index, lambda row, seconds=seconds, index=index:
+                            row.update(started_unix_ns=self.wall(seconds), elapsed_ns=8 * 10**9 if index == 5 else 10**7), True)
         self.raw.stream(5, "stderr", encode(self.batch(slot)))
 
     def validate(self):
@@ -164,13 +167,92 @@ class ParallelEvidenceTests(unittest.TestCase):
         self.raw.stream(5, "stderr", encode(batch))
         with self.assertRaises(evidence.Invalid): self.validate()
 
+    def test_source_lifetimes_complete_and_do_not_overlap(self):
+        for role_index in (0, 1):
+            self.make(0)
+            batch = self.batch(0)
+            original = batch["vertexes"][role_index]
+            first = dict(original, completed=SyntheticBuilder.stamp(1.2))
+            second = dict(original, started=SyntheticBuilder.stamp(1.3))
+            batch["vertexes"][role_index:role_index + 1] = [first, second]
+            self.raw.stream(5, "stderr", encode(batch))
+            self.validate()
+            for mutation in ("unfinished", "duplicate", "overlap", "abandoned", "reset"):
+                changed = copy.deepcopy(batch)
+                a, b = changed["vertexes"][role_index:role_index + 2]
+                if mutation == "unfinished": b.pop("completed")
+                elif mutation == "duplicate": changed["vertexes"].insert(role_index + 1, copy.deepcopy(a))
+                elif mutation == "overlap": b["started"] = SyntheticBuilder.stamp(1.1)
+                elif mutation == "abandoned": a.pop("completed")
+                else: changed["vertexes"].append({"digest": b["digest"], "name": b["name"], "inputs": []})
+                self.raw.stream(5, "stderr", encode(changed))
+                with self.subTest(role=role_index, mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+
+    def merged_batch(self, slot):
+        batch = self.batch(slot)
+        origin = self.batch(0)
+        base = origin["vertexes"][0]["digest"]
+        batch["vertexes"][0]["digest"] = base
+        batch["vertexes"][2]["inputs"][0] = base
+        if slot == 0:
+            batch["vertexes"][2]["started"] = SyntheticBuilder.stamp(2.2)
+            return batch
+        canceled = batch["vertexes"][2]
+        canceled.update(completed=SyntheticBuilder.stamp(2.1), error="context canceled: context canceled")
+        adopted = copy.deepcopy(origin["vertexes"][2])
+        adopted["started"] = SyntheticBuilder.stamp(2.2)
+        batch["vertexes"].insert(3, adopted)
+        return batch
+
+    def test_cross_slot_copy_merge_requires_successful_origin(self):
+        proofs = []
+        for slot in range(4):
+            self.make(slot)
+            self.raw.stream(5, "stderr", encode(self.merged_batch(slot)))
+            proofs.append(self.validate())
+        self.assertIsNone(proofs[0]["copy_graph"]["alias"])
+        self.assertEqual(proofs[1]["copy_graph"]["alias"]["adopted"], proofs[0]["copy_graph"]["copy"]["digest"])
+        self.assertEqual(evidence.validate_group(proofs)["command_count"], 36)
+        for mutation in ("foreign-origin", "origin-alias", "foreign-context", "duration", "base", "extra-error"):
+            changed = copy.deepcopy(proofs)
+            graph = changed[1]["copy_graph"]
+            if mutation == "foreign-origin": graph["alias"]["adopted"] = "sha256:" + "f" * 64
+            elif mutation == "origin-alias": changed[0]["copy_graph"]["alias"] = copy.deepcopy(graph["alias"])
+            elif mutation == "foreign-context": graph["copy"]["inputs"][1] = "sha256:" + "f" * 64
+            elif mutation == "duration": graph["copy"]["completed"] = SyntheticBuilder.stamp(3.1)
+            elif mutation == "base": graph["base"] = "sha256:" + "f" * 64
+            else: graph["copy"]["error"] = "error"
+            with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid): evidence.validate_group(changed)
+
+    def test_copy_merge_raw_adversaries(self):
+        for mutation in ("wrong-error", "cached", "unfinished", "duplicate", "post-terminal", "uncanceled",
+                         "foreign-base", "local-context", "late-cancel", "early-cancel", "run-winner", "third-copy"):
+            self.make(1)
+            batch = self.merged_batch(1)
+            canceled, adopted = batch["vertexes"][2:4]
+            if mutation == "wrong-error": canceled["error"] = "context canceled"
+            elif mutation == "cached": canceled["cached"] = True
+            elif mutation == "unfinished": canceled.pop("completed")
+            elif mutation == "duplicate": batch["vertexes"].append(copy.deepcopy(canceled))
+            elif mutation == "post-terminal":
+                later = copy.deepcopy(canceled); later.pop("completed"); later.pop("error"); batch["vertexes"].append(later)
+            elif mutation == "uncanceled": canceled.pop("error")
+            elif mutation == "foreign-base": adopted["inputs"][0] = "sha256:" + "f" * 64
+            elif mutation == "local-context": adopted["inputs"][1] = canceled["inputs"][1]
+            elif mutation == "late-cancel": canceled["completed"] = SyntheticBuilder.stamp(2.3)
+            elif mutation == "early-cancel": canceled["started"] = SyntheticBuilder.stamp(1.9)
+            elif mutation == "run-winner": batch["vertexes"][4]["inputs"] = [adopted["digest"]]
+            else: batch["vertexes"].append(dict(adopted, digest="sha256:" + "f" * 64))
+            self.raw.stream(5, "stderr", encode(batch))
+            with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+
     def test_barrier_adversaries(self):
         changes = (lambda t: t.update(slot=1), lambda t: t.update(run_id="foreign"), lambda t: t.update(outcome="timeout"),
                    lambda t: t.update(error_code="error"), lambda t: t.update(generation_sha256="f" * 64),
                    lambda t: t["participants"].pop(), lambda t: t["participants"][1].update(slot=0),
                    lambda t: t["participants"][0].update(ready_unix_ns=1), lambda t: t.update(ready_monotonic_ns=True),
                    lambda t: t.update(released_monotonic_ns=t["all_ready_monotonic_ns"]),
-                   lambda t: t.update(completed_unix_ns=self.wall(5.1)), lambda t: t["payload"].update(mode=0o600),
+                   lambda t: t.update(completed_unix_ns=self.wall(6.1)), lambda t: t["payload"].update(mode=0o600),
                    lambda t: t["payload"].update(sha256="f" * 64), lambda t: t["samples"].clear(),
                    lambda t: t["samples"][-1].update(ready_slots=[0]),
                    lambda t: t["samples"][-1].update(unix_ns=t["all_ready_unix_ns"]-1),
@@ -201,6 +283,65 @@ class ParallelEvidenceTests(unittest.TestCase):
         batch["logs"] = [dict(log, data=base64.b64encode(part).decode()) for part in (raw[:middle], raw[middle:])]
         self.raw.stream(5, "stderr", encode(batch))
         self.assertEqual(self.validate()["barrier"], self.transcript(0))
+
+    def shift_client_clock(self, batch, seconds):
+        for category in ("vertexes", "statuses", "logs"):
+            for row in batch[category]:
+                for key in ("started", "completed", "timestamp"):
+                    if key in row:
+                        row[key] = SyntheticBuilder.stamp((evidence.progress_ns(row[key]) - self.wall(0)) / 10**9 + seconds)
+        for index in range(1, 10):
+            self.raw.change(index, lambda row: row.update(started_unix_ns=row["started_unix_ns"] + seconds * 10**9), True)
+
+    def test_disjoint_client_clocks_preserve_guest_overlap_and_copy_merge(self):
+        proofs = []
+        for slot in range(4):
+            self.make(slot)
+            batch = self.merged_batch(slot)
+            self.shift_client_clock(batch, slot * 100)
+            self.raw.stream(5, "stderr", encode(batch))
+            proofs.append(self.validate())
+        self.assertGreater(proofs[3]["run_interval"]["started_ns"], proofs[0]["run_interval"]["completed_ns"])
+        group = evidence.validate_group(proofs)
+        self.assertEqual(group["run_overlap"]["clock"], "guest-unix")
+        self.assertGreater(group["run_overlap"]["duration_ns"], 0)
+        for proof in proofs:
+            raw, guest = proof["run_interval"], proof["guest_script_interval"]
+            duration = raw["completed_ns"] - raw["started_ns"]
+            self.assertEqual(proof["guest_run_envelope"], {
+                "started_ns": guest["completed_ns"] - duration,
+                "completed_ns": guest["started_ns"] + duration,
+                "duration_ns": 2 * duration - guest["duration_ns"]})
+
+    def test_clock_domain_and_envelope_adversaries(self):
+        for mutation in ("client-window", "short-duration", "engine-envelope", "guest-past", "guest-future"):
+            self.make(0)
+            batch = self.batch(0)
+            if mutation == "client-window":
+                self.raw.change(5, lambda row: row.update(elapsed_ns=4 * 10**9))
+            elif mutation == "short-duration":
+                batch["vertexes"][3]["completed"] = SyntheticBuilder.stamp(4)
+                batch["logs"][0]["timestamp"] = SyntheticBuilder.stamp(3.9)
+            elif mutation == "engine-envelope":
+                value = json.loads((self.directory / "command-00002.stdout").read_text())
+                value["SystemTime"] = SyntheticBuilder.stamp(3)
+                self.raw.stream(2, "stdout", encode(value))
+            else:
+                transcript = self.transcript(0)
+                delta = (-20 if mutation == "guest-past" else 20) * 10**9
+                for key in transcript:
+                    if key.endswith("_unix_ns"): transcript[key] += delta
+                for participant in transcript["participants"]:
+                    for key in participant:
+                        if key.endswith("_unix_ns"): participant[key] += delta
+                for sample in transcript["samples"]: sample["unix_ns"] += delta
+                transcript["generation_sha256"] = hashlib.sha256(json.dumps(transcript["participants"], sort_keys=True, separators=(",", ":")).encode()).hexdigest()
+                batch["logs"][0]["data"] = base64.b64encode(b"VZ_PARALLEL_BARRIER=" + encode(transcript)).decode()
+            self.raw.stream(5, "stderr", encode(batch))
+            with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+        with self.assertRaisesRegex(evidence.Invalid, "client command clock bounds required"):
+            evidence.parallel_progress(encode(self.batch(0)), self.inputs["images"]["base"]["reference"],
+                                       self.operations[0], self.wall(0), self.wall(10))
 
     def test_operation_schema_and_export_substeps_fail_closed(self):
         for key, value in (("schema_version", True), ("slot", True), ("slot", 4), ("run_id", "foreign"),
@@ -250,7 +391,7 @@ class ParallelEvidenceTests(unittest.TestCase):
             elif mutation == "run": row["run_id"] = "other"
             elif mutation == "fixture": row["parallel_fixture_sha256"] = "f" * 64
             elif mutation == "digest": row["run_interval"]["digest"] = rows[0]["run_interval"]["digest"]
-            elif mutation == "overlap": row["run_interval"]["started_ns"] = rows[0]["run_interval"]["completed_ns"]
+            elif mutation == "overlap": row["guest_script_interval"]["started_ns"] = rows[0]["guest_script_interval"]["completed_ns"]
             elif mutation == "generation": row["barrier"]["generation_sha256"] = "f" * 64
             elif mutation == "participants": row["barrier"]["participants"][0]["run_id"] = "other"
             else: row["barrier"]["ready_monotonic_ns"] = rows[0]["barrier"]["released_monotonic_ns"]

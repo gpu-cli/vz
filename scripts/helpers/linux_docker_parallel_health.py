@@ -24,7 +24,14 @@ def unique(pairs):
 
 
 def validate(raw, stderr, token, timing, run_intervals):
-    """Replay exact raw samples; RUN intervals use the same Machine wall clock."""
+    """Bracket authenticated conservative whole-RUN envelopes in guest time.
+
+    The positional intervals are [C-D, S+D], not displayed Buildx timestamps:
+    S/C are the authenticated guest script start/completion and D is the exact
+    RUN duration preserved by pinned Buildx's constant per-solve translation.
+    Envelope construction, Engine bounds and overlap proof belong to the slot
+    and group validators; this validator must cover each supplied whole envelope.
+    """
     require(timing == TIMING and all(type(v) is int for v in timing.values()), 'unknown health timing contract')
     require(type(raw) is bytes and 0 < len(raw) <= LIMIT and raw.endswith(b'\n') and stderr == b'',
             'incomplete, oversized or erroneous health stream')
@@ -63,16 +70,20 @@ def validate(raw, stderr, token, timing, run_intervals):
             previous_wall <= last['unix_ns'] and
             abs((last['unix_ns'] - first['unix_ns']) - (last['monotonic_ns'] - first['monotonic_ns'])) <= timing['max_lateness_ns'],
             'invalid health terminal clock/deadline')
-    require(type(run_intervals) in (list, tuple) and len(run_intervals) == 4, 'four authenticated RUN intervals required')
+    require(type(run_intervals) in (list, tuple) and len(run_intervals) == 4,
+            'four authenticated guest RUN envelopes required')
     for interval in run_intervals:
         require(type(interval) in (list, tuple) and len(interval) == 2 and
                 all(type(value) is int for value in interval) and
                 rows[1]['finished_unix_ns'] <= interval[0] < interval[1] <= rows[-2]['started_unix_ns'],
-                'health samples do not bracket each RUN interval')
+                'health samples do not bracket each conservative guest RUN envelope')
     return {'schema_version': 1, 'scope': 'OWNED_LOOPBACK_HTTP_DURING_FOUR_RUNS_NOT_NETWORK_CONFORMANCE',
             'samples': timing['samples'], 'sample_errors': 0, 'missed_deadlines': 0,
             'first_sample_unix_ns': rows[1]['started_unix_ns'], 'last_sample_unix_ns': rows[-2]['finished_unix_ns'],
-            'run_intervals': [list(x) for x in run_intervals], 'timing': dict(timing),
+            'guest_run_envelopes': [list(x) for x in run_intervals],
+            'clock_basis': 'SAME_MACHINE_GUEST_WALL_TIME_NOT_SHIFTED_BUILDX_DISPLAY_TIME',
+            'run_coverage': 'CONSERVATIVE_WHOLE_RUN_ENVELOPES_FROM_GUEST_SCRIPT_AND_PRESERVED_DURATION',
+            'timing': dict(timing),
             'stdout_sha256': hashlib.sha256(raw).hexdigest(), 'stderr_sha256': hashlib.sha256(stderr).hexdigest()}
 
 

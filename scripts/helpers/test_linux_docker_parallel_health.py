@@ -46,7 +46,9 @@ class ProtocolTests(unittest.TestCase):
         proof = self.check()
         self.assertEqual(proof['samples'], 60)
         self.assertEqual(proof['missed_deadlines'], 0)
-        self.assertEqual(proof['run_intervals'], [list(x) for x in INTERVALS])
+        self.assertEqual(proof['guest_run_envelopes'], [list(x) for x in INTERVALS])
+        self.assertNotIn('run_intervals', proof)
+        self.assertIn('NOT_SHIFTED_BUILDX_DISPLAY_TIME', proof['clock_basis'])
         self.assertIn('NOT_NETWORK_CONFORMANCE', proof['scope'])
 
     def test_failed_marker_status_schedule_duration_identity_and_clock_rejected(self):
@@ -81,6 +83,22 @@ class ProtocolTests(unittest.TestCase):
                           [(True, EPOCH + 3)] * 4, [(EPOCH + 3, EPOCH + 2)] * 4):
             with self.subTest(intervals=intervals), self.assertRaises(ValueError):
                 self.check(intervals=intervals)
+
+    def test_plausible_display_interval_cannot_replace_out_of_coverage_guest_envelope(self):
+        # A translated display interval happens to fit within the HTTP window.
+        # Guest S=+5s,C=+50s and preserved D=55s yield [-5s,+60s], however:
+        # the full conservative envelope is not covered and must be rejected.
+        displayed = (EPOCH + 2_000_000_000, EPOCH + 57_000_000_000)
+        self.check(intervals=[displayed] * 4)
+        start, completed = EPOCH + 5_000_000_000, EPOCH + 50_000_000_000
+        duration = displayed[1] - displayed[0]
+        envelope = (completed - duration, start + duration)
+        with self.assertRaisesRegex(ValueError, 'conservative guest RUN envelope'):
+            self.check(intervals=[envelope] * 4)
+        # A different authenticated solve S=+10s,C=+50s,D=48s yields [+2s,+58s].
+        inside = (EPOCH + 2_000_000_000, EPOCH + 58_000_000_000)
+        proof = self.check(intervals=[inside] * 4)
+        self.assertEqual(proof['guest_run_envelopes'], [list(inside)] * 4)
 
 
 class LifecycleTests(unittest.TestCase):
