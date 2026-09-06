@@ -32,6 +32,24 @@ EXPORTS = {"alpha": "payload.txt", "alpha-reuse": "payload.txt", "beta": "payloa
            "cache-cold": "cache.txt", "cache-warm": "cache.txt", "secret": "secret.txt"}
 
 
+def progress_timestamp(value):
+    """Validate RFC3339 nanoseconds using Python 3.9's microsecond parser."""
+    require(isinstance(value, str), "invalid vertex timestamp")
+    matched = re.fullmatch(
+        r"([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})"
+        r"(?:\.([0-9]{1,9}))?(Z|[+-](?:[01][0-9]|2[0-3]):[0-5][0-9])", value)
+    require(matched is not None, "invalid vertex timestamp")
+    calendar, fraction, offset = matched.groups()
+    # Normalize only after validating the entire original value. Preserve its
+    # offset, and never mutate the raw vertex or its retained timestamp bytes.
+    normalized = calendar + ("." + fraction[:6].ljust(6, "0") if fraction else "")
+    normalized += "+00:00" if offset == "Z" else offset
+    try:
+        return datetime.fromisoformat(normalized)
+    except ValueError as error:
+        raise Invalid("invalid vertex timestamp calendar") from error
+
+
 def progress(raw, secret_dockerfile=None):
     """Pinned Buildx SolveStatus JSON prefix; no arbitrary diagnostic fallback."""
     vertices, logs, trailer = [], [], []
@@ -54,9 +72,7 @@ def progress(raw, secret_dockerfile=None):
                     and isinstance(vertex.get("error", ""), str), "invalid vertex identity/cache/error")
             for key in ("started", "completed"):
                 if key in vertex:
-                    require(isinstance(vertex[key], str) and re.fullmatch(
-                        r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", vertex[key]), "invalid vertex timestamp")
-                    datetime.fromisoformat(vertex[key].replace("Z", "+00:00"))
+                    progress_timestamp(vertex[key])
             vertices.append(vertex)
         for log in batch.get("logs", []):
             require(isinstance(log, dict) and isinstance(log.get("data"), str), "invalid progress log data")
@@ -122,6 +138,7 @@ class Replay:
                 and re.fullmatch(r"sha256:[0-9a-f]{64}", self.builder["image_id"]), "invalid builder identity")
         self.owner = "vz04-" + sha(json.dumps([inputs["run_id"], self.scope], sort_keys=True).encode())[:24]
         self.rows, self.acknowledged, self.i, self.fixture = [], set(), 0, None
+        self.builder_process = None
         require(type(result["command_count"]) is int and result["command_count"] == 39,
                 "expected four initial observations and seven five-command builds")
         expected = {"inputs.json", "result.json", "compose-owner.json"}
@@ -209,6 +226,30 @@ class Replay:
         require(len(items) == 1 and items[0]["Id"] == self.builder["container_id"]
                 and items[0]["Image"] == self.builder["image_id"] and items[0]["State"]["Running"] is True
                 and items[0]["Name"] == "/buildx_buildkit_" + self.builder["node"], "foreign builder container")
+        item = items[0]
+        require(item.get("Config", {}).get("Env") == [
+            "PATH=/usr/bin:/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+            "BUILDKIT_SETUP_CGROUPV2_ROOT=1"], "builder setup environment is missing, duplicated or changed")
+        host = item.get("HostConfig", {})
+        require(host.get("CgroupnsMode") == "private" and host.get("Runtime") == "youki" and
+                host.get("Privileged") is True and host.get("Init") is True, "builder cgroup/runtime policy changed")
+        state = item["State"]
+        started = state.get("StartedAt")
+        require(type(state.get("Pid")) is int and state["Pid"] > 0 and
+                type(item.get("RestartCount")) is int and item["RestartCount"] == 0 and
+                state.get("Status") == "running" and state.get("Paused") is False and
+                state.get("Restarting") is False and state.get("Dead") is False and
+                isinstance(started, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", started),
+                "builder process identity missing or not continuously running")
+        try:
+            # UTC/fraction syntax was checked above; Python 3.9 does not accept
+            # nanoseconds. Keep full timestamp bytes for identity comparison.
+            require(datetime.fromisoformat(started[:19]).year > 1970, "invalid builder start time")
+        except ValueError as error:
+            raise Invalid("invalid builder start time") from error
+        identity = (state["Pid"], started)
+        require(self.builder_process is None or self.builder_process == identity, "builder process changed between recipes")
+        self.builder_process = identity
 
     def build(self, suffix, dockerfile, arguments, extra=None, code=0):
         self.builder_guard()
@@ -256,7 +297,7 @@ class Replay:
                 and not value.get("error") and isinstance(value["completed"], str), "RUN failed or cache state invalid")
         require(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})", value["completed"]),
                 "invalid RUN completion timestamp")
-        datetime.fromisoformat(value["completed"].replace("Z", "+00:00"))
+        progress_timestamp(value["completed"])
         return value["digest"]
 
     def export(self, suffix, payload):

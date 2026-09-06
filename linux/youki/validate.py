@@ -45,6 +45,11 @@ REQUIRED_EXEC_TESTS = (
     "test_vz_executable_permissions_owner_exec_kernel_boundary",
 )
 EXEC_PROBE_PREFIX = "VZ_EXECUTABLE_PERMISSIONS_PROBE="
+REQUIRED_CGROUP_TESTS = tuple("test_vz_tenant_cgroup_" + name for name in (
+    "parser_and_owned_subtree", "routing_preserves_explicit_and_nonfilesystem",
+    "base_success_and_only_ebusy_fallback", "path_replacement_and_symlinks",
+    "membership_change_and_dead_proc", "descriptors_preserved_and_closed",
+))
 
 
 def require(condition, message):
@@ -82,7 +87,8 @@ def validate(candidate, source):
     names = {"youki", "features.json", "elf.txt", "version.txt", "inputs.env", "apk.sha256", "source-lock.sha256", "cargo-features.txt", "upstream-tests.txt", "seccomp-exec.patch", "seccomp-exec-tests.txt", "tenant-root.patch", "tenant-root-tests.txt",
              "runtime-log.patch", "runtime-log-tests.txt", "runtime-log.json", "runtime-log-stdout.txt",
              "runtime-log-stderr.txt", "runtime-log-exit-status.txt",
-             "executable-permissions.patch", "executable-permissions-tests.txt"}
+             "executable-permissions.patch", "executable-permissions-tests.txt",
+             "tenant-cgroup.patch", "tenant-cgroup-tests.txt"}
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -95,7 +101,7 @@ def validate(candidate, source):
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
@@ -106,6 +112,16 @@ def validate(candidate, source):
     validate_runtime_log(contents)
     require(checksums["executable-permissions.patch"] == inputs["YOUKI_EXEC_PATCH_SHA256"], "pinned local executable patch mismatch")
     validate_executable_permissions(contents)
+    require(checksums["tenant-cgroup.patch"] == inputs["YOUKI_CGROUP_PATCH_SHA256"], "pinned local tenant cgroup patch mismatch")
+    cgroup_tests = contents["tenant-cgroup-tests.txt"].decode()
+    expected_tests = {"test container::tenant_cgroup::tests::" + test + " ... ok" for test in REQUIRED_CGROUP_TESTS}
+    actual_tests = [line for line in cgroup_tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
+    summaries = [line for line in cgroup_tests.splitlines() if line.startswith("test result:")]
+    require(len(actual_tests) == len(expected_tests) and set(actual_tests) == expected_tests and
+            "FAILED" not in cgroup_tests and len(summaries) == 1 and re.fullmatch(
+                r"test result: ok\. 6 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
+                summaries[0]),
+            "missing or failed tenant cgroup regressions")
     root_tests = contents["tenant-root-tests.txt"].decode()
     for test in REQUIRED_ROOT_TESTS:
         require(any(line.startswith("test ") and line.endswith("::" + test + " ... ok") for line in root_tests.splitlines()), f"missing passing local root regression: {test}")
@@ -125,7 +141,7 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_elf(contents["youki"])
     return checksums["youki"]
 

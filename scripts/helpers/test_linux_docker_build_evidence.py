@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import types
 import unittest
+from datetime import timedelta
 from unittest.mock import patch
 
 import docker_host_driver as driver
@@ -25,7 +26,13 @@ class SyntheticBuilder(SyntheticEngine):
             return subprocess.CompletedProcess(argv, 0, out, b"")
         if args == ["container", "inspect", builder["container_id"]]:
             out = data([{"Id": builder["container_id"], "Image": builder["image_id"],
-                         "Name": "/buildx_buildkit_" + builder["node"], "State": {"Running": True}}])
+                         "Name": "/buildx_buildkit_" + builder["node"], "RestartCount": 0,
+                         "Config": {"Env": ["PATH=/usr/bin:/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                                            "BUILDKIT_SETUP_CGROUPV2_ROOT=1"]},
+                         "HostConfig": {"CgroupnsMode": "private", "Runtime": "youki", "Privileged": True, "Init": True},
+                         "State": {"Running": True, "Status": "running", "Pid": 737,
+                                   "StartedAt": "2026-09-06T05:50:57.314727448Z", "Paused": False,
+                                   "Restarting": False, "Dead": False}}])
             return subprocess.CompletedProcess(argv, 0, out, b"")
         if args[:2] != ["buildx", "build"]:
             return super().__call__(argv, **kwargs)
@@ -169,6 +176,40 @@ class BuildEvidenceTests(unittest.TestCase):
     def test_foreign_builder_container(self):
         self.raw(8, "stdout", lambda b: data([json.loads(b)[0] | {"Image": "sha256:" + "0" * 64}])); self.rejected()
 
+    def test_resealed_builder_cgroup_policy_adversaries(self):
+        original = json.loads((self.directory / "command-00008.stdout").read_bytes())
+        cases = [
+            ("Config", "Env", original[0]["Config"]["Env"][:-1]),
+            ("Config", "Env", original[0]["Config"]["Env"] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=1"]),
+            ("Config", "Env", original[0]["Config"]["Env"] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=0"]),
+            ("Config", "Env", original[0]["Config"]["Env"][:-1] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=0"]),
+            ("Config", "Env", None),
+            ("HostConfig", "CgroupnsMode", "host"), ("HostConfig", "CgroupnsMode", ""),
+            ("HostConfig", "CgroupnsMode", None), ("HostConfig", "Runtime", "runc"),
+            ("HostConfig", "Privileged", False), ("HostConfig", "Privileged", 1),
+            ("HostConfig", "Init", False), ("HostConfig", "Init", 1),
+            ("State", "Pid", 0), ("State", "Pid", -1), ("State", "Pid", True),
+            ("State", "Pid", "737"), ("State", "StartedAt", "0001-01-01T00:00:00Z"),
+            ("State", "StartedAt", "2026-99-06T05:50:57Z"), ("State", "StartedAt", None),
+            ("State", "Paused", True), ("State", "Restarting", True), ("State", "Dead", True),
+            ("State", "Status", "exited"), ("State", "Running", 1),
+        ]
+        for section, key, value in cases:
+            with self.subTest(section=section, key=key, value=value):
+                changed = copy.deepcopy(original); changed[0][section][key] = value
+                self.raw(8, "stdout", lambda _, value=changed: data(value)); self.rejected()
+        for value in (1, True, None):
+            with self.subTest(restart_count=value):
+                changed = copy.deepcopy(original); changed[0]["RestartCount"] = value
+                self.raw(8, "stdout", lambda _, value=changed: data(value)); self.rejected()
+
+    def test_resealed_builder_process_replacement_between_recipes(self):
+        original = json.loads((self.directory / "command-00013.stdout").read_bytes())
+        for key, value in (("Pid", 738), ("StartedAt", "2026-09-06T05:50:58.314727448Z")):
+            with self.subTest(key=key):
+                changed = copy.deepcopy(original); changed[0]["State"][key] = value
+                self.raw(13, "stdout", lambda _, value=changed: data(value)); self.rejected()
+
     def test_intent_drift(self):
         self.change("command-00009.intent.json", lambda x: x["argv"].append("--load")); self.rejected()
 
@@ -223,6 +264,33 @@ class BuildEvidenceTests(unittest.TestCase):
 
     def test_invalid_terminal_timestamp(self):
         self.raw(9, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"completed": "not-a-timestamp"}]})); self.rejected()
+
+    def test_nanosecond_progress_and_offset_preserved_on_python39(self):
+        original = json.loads((self.directory / "command-00009.stderr").read_bytes())
+        for fraction in ("", ".1", ".12", ".1234", ".123456", ".123456789"):
+            for offset, minutes in (("Z", 0), ("+05:30", 330), ("-07:00", -420)):
+                with self.subTest(fraction=fraction, offset=offset):
+                    stamp = "2026-09-06T00:00:01" + fraction + offset
+                    parsed = evidence.progress_timestamp(stamp)
+                    self.assertEqual(parsed.utcoffset(), timedelta(minutes=minutes))
+                    self.assertEqual(parsed.microsecond, int(fraction[1:7].ljust(6, "0") or "0"))
+                    changed = copy.deepcopy(original); changed["vertexes"][0]["completed"] = stamp
+                    self.raw(9, "stderr", lambda _, value=changed: data(value))
+                    evidence.validate(self.directory, self.inputs)
+                    vertices, _ = evidence.progress(data(changed))
+                    self.assertEqual(vertices[0]["completed"], stamp)
+
+    def test_resealed_progress_invalid_calendar_fraction_and_offset(self):
+        original = json.loads((self.directory / "command-00009.stderr").read_bytes())
+        for stamp in ("2026-02-30T00:00:01.123456789Z", "2025-02-29T00:00:01Z",
+                      "2026-99-06T00:00:01Z", "2026-09-06T24:00:01Z", "2026-09-06T00:60:01Z",
+                      "2026-09-06T00:00:60Z", "0000-09-06T00:00:01Z",
+                      "2026-09-06T00:00:01.1234567890Z", "2026-09-06T00:00:01.Z",
+                      "2026-09-06T00:00:01.123456789+24:00", "2026-09-06T00:00:01.123456789+01:60",
+                      "2026-09-06T00:00:01.123456789", "2026-09-06T00:00:01.123456789Zjunk"):
+            with self.subTest(stamp=stamp):
+                changed = copy.deepcopy(original); changed["vertexes"][0]["completed"] = stamp
+                self.raw(9, "stderr", lambda _, value=changed: data(value)); self.rejected()
 
     def test_negative_error_wrong_reason(self):
         self.raw(39, "stderr", lambda b: data({"error": "network unavailable"})); self.rejected()

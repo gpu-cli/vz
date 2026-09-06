@@ -6,6 +6,7 @@ and Buildx operations go through its recorded docker()/mutate() interfaces.
 from __future__ import annotations
 
 import hashlib
+from datetime import datetime
 import io
 import json
 import os
@@ -18,6 +19,7 @@ import tarfile
 import docker_host_driver as driver
 import installed_developer_startup as startup
 import linux_docker_image_input as image_input
+import linux_docker_buildkit_cgroup as cgroup
 
 REPO = Path(__file__).resolve().parents[2]
 CONTRACT = REPO / "config/buildkit-artifact-v0.19.0.json"
@@ -25,6 +27,11 @@ LABEL = "dev.vz.buildkit-proof"
 LIMIT = 256 * 1024 * 1024
 FLAGS = ["--oci-worker=true", "--containerd-worker=false",
          "--oci-worker-binary=/usr/bin/vz-youki", "--oci-worker-snapshotter=overlayfs"]
+# Match the pinned upstream image's cgroup initialization contract. This moves
+# only the private builder namespace's processes into /init before enabling
+# domain controllers; omitting it leaves nested OCI cgroups inadmissible.
+ENV = ["PATH=/usr/bin:/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+       "BUILDKIT_SETUP_CGROUPV2_ROOT=1"]
 WRAPPER = b'''#!/bin/busybox sh
 set -eu
 printf 'vz-youki-invocation pid=%s\n' "$$" >> /var/lib/buildkit/vz-youki-invocations.log
@@ -177,6 +184,7 @@ class Builder:
         self.verifications = 0
         self.invocations = []
         self.inventory = None
+        self.live_instance = None
 
     def command(self, label, args, mutate=False, **kwargs):
         call = self.harness.mutate if mutate else self.harness.docker
@@ -211,23 +219,43 @@ class Builder:
         image = self.object("image", self.tag)
         require(image["Id"] == self.image_id and image["Architecture"] == "arm64" and image["Os"] == "linux" and
                 image["Config"]["Labels"] == {LABEL: self.token} and
+                image["Config"].get("Env") == ENV and
                 image["Config"]["Entrypoint"] == ["/usr/bin/buildkitd"], "builder image ownership/configuration drift")
         volume = volume_identity(self.object("volume", self.volume_name), self.volume_name, self.token)
         require(volume == self.volume, "builder cache volume replaced")
         item = self.object("container", self.container_id)
         require(item["Id"] == self.container_id and item["Name"] == "/" + self.container_name and
                 item["Image"] == self.image_id and item["Config"]["Labels"] == {LABEL: self.token} and
+                item["Config"].get("Env") == ENV and
                 item["Config"]["Entrypoint"] == ["/usr/bin/buildkitd"] and item["Config"]["Cmd"] == FLAGS,
                 "builder container identity/configuration drift")
         host = item["HostConfig"]
         require(host["Runtime"] == "youki" and host["Privileged"] is True and host["Init"] is True and
+                host.get("CgroupnsMode") == "private" and
                 host["NetworkMode"] == "bridge" and not host.get("Binds") and not host.get("PortBindings") and
                 host["RestartPolicy"]["Name"] == "no", "builder execution/network policy drift")
         mounts = item["Mounts"]
         require(len(mounts) == 1 and mounts[0]["Type"] == "volume" and mounts[0]["Name"] == self.volume_name and
                 mounts[0]["Destination"] == "/var/lib/buildkit" and mounts[0]["Source"] == self.volume["Mountpoint"] and
                 mounts[0]["RW"] is True, "builder cache mount is not exact owned volume")
-        require(item["State"]["Running"] is running and item["RestartCount"] == 0, "builder lifecycle drift")
+        require(item["State"]["Running"] is running and type(item["RestartCount"]) is int and
+                item["RestartCount"] == 0, "builder lifecycle drift")
+        if running:
+            state = item["State"]
+            require(type(state.get("Pid")) is int and state["Pid"] > 0 and
+                    state.get("Status") == "running" and state.get("Paused") is False and
+                    state.get("Restarting") is False and state.get("Dead") is False and
+                    isinstance(state.get("StartedAt"), str) and
+                    re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
+                                 state["StartedAt"]), "missing live builder process identity")
+            # Python 3.9 rejects Docker's nanosecond precision. The regex has
+            # already checked the fraction and UTC suffix; validate the calendar
+            # independently while retaining the complete identity string.
+            require(datetime.fromisoformat(state["StartedAt"][:19]).year > 1970,
+                    "invalid builder start time")
+            current = (state["Pid"], state["StartedAt"])
+            require(self.live_instance is None or current == self.live_instance, "builder process incarnation drift")
+            self.live_instance = current
         return item
 
     def prepare(self):
@@ -244,12 +272,14 @@ class Builder:
         startup.document(self.harness.evidence / (self.token + "-image-input.json"),
                          {"owner": self.descriptor["owner"], "context": self.descriptor["name"],
                           "rootfs_archive": rootfs.name, "rootfs_sha256": sha(payload), "inventory": self.inventory,
-                          "buildkit": self.harness.info["buildkit"], "worker_flags": FLAGS})
+                          "buildkit": self.harness.info["buildkit"], "worker_flags": FLAGS,
+                          "image_env": ENV, "cgroup_namespace": "private"})
         self.effects = True
         with rootfs.open("rb") as source:
             raw, _, _ = self.command("image-import", ["image", "import", "--platform", "linux/arm64",
                 "--change", "ENTRYPOINT [\"/usr/bin/buildkitd\"]", "--change", "ENV PATH=/usr/bin:/bin",
                 "--change", "ENV SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                "--change", "ENV BUILDKIT_SETUP_CGROUPV2_ROOT=1",
                 "--change", "LABEL " + LABEL + "=" + self.token, "-", self.tag], mutate=True, stdin=source, timeout=300)
         require(startup.digest(rootfs) == sha(payload), "retained builder rootfs changed during import")
         self.image_id = startup.image_id(raw)
@@ -257,6 +287,7 @@ class Builder:
         self.volume = volume_identity(self.object("volume", self.volume_name), self.volume_name, self.token)
         raw, _, _ = self.command("container-create", ["container", "create", "--name", self.container_name,
             "--label", LABEL + "=" + self.token, "--privileged", "--init", "--network", "bridge", "--restart", "no",
+            "--cgroupns", "private",
             "--mount", "type=volume,source=" + self.volume_name + ",target=/var/lib/buildkit",
             self.image_id, *FLAGS], mutate=True)
         self.container_id = driver.checked_text(raw.decode().strip(), r"[0-9a-f]{64}", "builder container ID")
@@ -267,7 +298,21 @@ class Builder:
             "--driver", "docker-container", "--driver-opt", "image=" + self.image_id,
             "--buildkitd-flags", " ".join(FLAGS), self.descriptor["name"]], mutate=True)
         self.registered = True
-        raw, _, _ = self.command("bootstrap", ["buildx", "inspect", "--bootstrap", self.name], mutate=True, timeout=120)
+        try:
+            raw, _, _ = self.command("bootstrap", ["buildx", "inspect", "--bootstrap", self.name], mutate=True, timeout=120)
+        except Exception:
+            # Bootstrap itself uses ordinary Docker exec. If that fails, retain
+            # a separate external observation without retrying bootstrap or
+            # changing the failed builder. Preserve the original exception.
+            try:
+                inspected = self.inspect_owned()
+                diagnostic = cgroup.capture(self.harness, self.descriptor, inspected,
+                                            label=self.token + "-bootstrap-failure-cgroup")
+                self.inspect_owned()
+            except Exception as error:
+                diagnostic = {"observation_failed": str(error)}
+            startup.document(self.harness.evidence / (self.token + "-bootstrap-failure-cgroup.json"), diagnostic)
+            raise
         self.mapping = {"name": self.name, "node": self.node, "container_id": self.container_id, "image_id": self.image_id}
         driver.assert_builder_inspect(raw, self.mapping, self.descriptor["name"])
         self.prepared = True
@@ -276,6 +321,9 @@ class Builder:
 
     def verify(self, require_invocation=True):
         require(self.prepared, "builder readiness incomplete")
+        inspected = self.inspect_owned()
+        cgroup_proof = cgroup.capture(self.harness, self.descriptor, inspected,
+                                     label=f"{self.token}-cgroup-{self.verifications + 1:03}")
         self.inspect_owned()
         raw, _, _ = self.command("inspect", ["buildx", "inspect", self.name])
         driver.assert_builder_inspect(raw, self.mapping, self.descriptor["name"])
@@ -309,6 +357,7 @@ class Builder:
         proof = {"scope": "owned_buildkit_builder_and_worker_cache_not_full_release_runtime_attestation",
                  "owner": self.descriptor["owner"], "context": self.descriptor["name"], "engine_id": self.descriptor["engine_id"],
                  "builder": self.mapping, "cache_volume": self.volume, "runtime_hashes": observed,
+                 "cgroup": cgroup_proof,
                  "youki_invocations": invocations, "post_workload": require_invocation}
         startup.document(self.harness.evidence / f"{self.token}-runtime-{self.verifications:03}.json", proof)
         return proof

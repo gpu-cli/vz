@@ -64,6 +64,20 @@ vertex cache reuse, build arguments, cold/warm cache mounts, and required-secret
 positive/negative behavior. Independent replay checks raw command evidence and
 retained export bytes before parent cleanup is admitted.
 
+The imported builder reproduces the pinned upstream image's
+`BUILDKIT_SETUP_CGROUPV2_ROOT=1` setting and explicitly selects a private cgroup
+namespace. Image/container inspection rejects missing, duplicate or altered
+environment values and namespace/runtime drift. Each recipe also binds the
+same live builder PID and complete start timestamp with zero restarts.
+Before and after the workload slice, a recorded public Machine Exec reads the
+builder's projected cgroup filesystem externally. It requires an empty domain
+root, enabled controllers and the inspected init process in its domain leaf;
+it does not migrate processes or enter the builder's namespace. This proves
+initialized root state, not a snapshot of each ephemeral workload cgroup.
+Ordinary Docker exec and all recipe assertions remain required. A failed
+bootstrap retains a separate external diagnostic without retrying or repairing
+the failed builder.
+
 The builder may fetch the exact pinned base image using HTTPS. Fixture RUN
 steps disable networking; this does not make the complete build offline.
 These recipes do not establish cache export/import, cross-Machine cache denial,

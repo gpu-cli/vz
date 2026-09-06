@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import EXEC_PROBE_PREFIX, REQUIRED_EXEC_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
+from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -49,7 +49,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -67,6 +67,9 @@ class CandidateTests(unittest.TestCase):
             "runtime-log-exit-status.txt": b"1\n",
             "executable-permissions.patch": (self.source / "executable-permissions.patch").read_bytes(),
             "executable-permissions-tests.txt": executable_tests(executable_probes()),
+            "tenant-cgroup.patch": (self.source / "tenant-cgroup.patch").read_bytes(),
+            "tenant-cgroup-tests.txt": ("\n".join("test container::tenant_cgroup::tests::" + name + " ... ok" for name in REQUIRED_CGROUP_TESTS)
+                                        + "\ntest result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
         }
         self.publish()
 
@@ -243,7 +246,7 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
 
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
@@ -269,6 +272,31 @@ class CandidateTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("hardlinked", result.stderr)
         self.assertEqual(destination.stat().st_ino, alias.stat().st_ino)
+
+    def test_tenant_cgroup_patch_and_all_regressions_required(self):
+        original = self.files["tenant-cgroup-tests.txt"]
+        for test in REQUIRED_CGROUP_TESTS:
+            self.files["tenant-cgroup-tests.txt"] = original.replace((test + " ... ok").encode(), (test + " ... ignored").encode())
+            self.publish()
+            with self.subTest(test=test), self.assertRaisesRegex(ValueError, "tenant cgroup regressions"):
+                validate(self.root, self.source)
+        self.files["tenant-cgroup-tests.txt"] = original
+        self.files["tenant-cgroup.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_tenant_cgroup_duplicate_results_and_nonzero_failures_rejected(self):
+        original = self.files["tenant-cgroup-tests.txt"]
+        for bad in (original + original.splitlines(keepends=True)[0],
+                    original + original.splitlines(keepends=True)[-1],
+                    original + b"test result: ok. 6 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+                    original.replace(b"0 failed", b"1 failed"),
+                    original.replace(b"0 ignored", b"1 ignored"), b"test result: ok.\n"):
+            self.files["tenant-cgroup-tests.txt"] = bad
+            self.publish()
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "tenant cgroup regressions"):
+                validate(self.root, self.source)
 
     def test_advisory_lock_rejects_live_owner_then_releases(self):
         import fcntl

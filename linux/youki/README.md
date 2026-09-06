@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -76,6 +76,22 @@ ownership, observes exact output/exit 37, and retains both child streams/status
 as JSON proof lines in `executable-permissions-tests.txt`; it never skips.
 The candidate validator independently checks those proofs. These build-time
 checks do not replace the fresh installed Mac Buildx gate.
+
+`tenant-cgroup.patch` is a fifth **locally authored vz patch**. BuildKit's pinned
+image enables `BUILDKIT_SETUP_CGROUPV2_ROOT=1`: it moves its processes into an
+`init` child before enabling domain controllers at its private cgroup root.
+The original container cgroup then cannot accept ordinary processes. For an
+implicit filesystem-v2 exec only, the patch permits an `EBUSY` fallback into
+the live init process's strict descendant cgroup. Explicit sub-cgroup choices,
+including the root override, and v1/systemd behavior remain unchanged.
+The proc and cgroup handles are pinned, descendant traversal rejects symlinks,
+and membership/identity checks fail closed. This path creates no cgroups,
+enables no controllers, and never converts a domain to threaded mode.
+Six native regressions cover routing, error discrimination, ownership and
+descriptor lifetime; they do not replace actual nested BuildKit and Docker exec
+verification on the Mac. The installed builder gate separately requires a
+private cgroup namespace, exact setup environment, and external read-only
+cgroup observations. This integration remains DEV until its physical gate passes.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

@@ -90,6 +90,16 @@ Its 1,497-file failed evidence is retained at
 stopped all four Machines and closed the daemon while preserving disk/object
 state. This source integration has no passing physical Buildx-slice claim yet.
 
+Candidate 4 subsequently reached the running OCI worker after the Developer
+IPv4 raw-table fix, but its first nested RUN failed at cgroup PID admission
+(`EOPNOTSUPP`), before Python executed. Its evidence and separate positive Stop
+disposition remain under `.artifacts/linux-docker-build-candidate-4` and
+`.artifacts/linux-docker-build-candidate-4-disposition`. The current integration
+restores the pinned upstream BuildKit cgroup-root setup setting and explicitly
+requires a private cgroup namespace. The accompanying youki tenant-cgroup fix,
+external cgroup observations, and fresh installed verification are tracked by
+`vz-amq`; source and offline checks alone are not a passing physical slice.
+
 `--suite all` fails before provisioning: the 63-scenario dispatcher, full cache
 runtime inventory, and remaining target/aggregate acceptance are unfinished.
 See [runner usage and evidence limits](../../scripts/helpers/linux_docker_e2e.md).

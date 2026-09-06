@@ -62,6 +62,61 @@ class BoundaryTests(unittest.TestCase):
         process.assert_not_called()
         self.assertTrue(inputs.owner.startswith("vz04-"))
 
+    def builder_snapshot(self):
+        builder = self.raw["builder"]
+        return {"Id": builder["container_id"], "Image": builder["image_id"],
+                "Name": "/buildx_buildkit_" + builder["node"], "RestartCount": 0,
+                "Config": {"Env": ["PATH=/usr/bin:/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+                                   "BUILDKIT_SETUP_CGROUPV2_ROOT=1"]},
+                "HostConfig": {"CgroupnsMode": "private", "Runtime": "youki", "Privileged": True, "Init": True},
+                "State": {"Running": True, "Status": "running", "Pid": 737,
+                          "StartedAt": "2026-09-06T05:50:57.314727448Z", "Paused": False,
+                          "Restarting": False, "Dead": False}}
+
+    def guarded_builder(self, item, snapshots):
+        builder = self.raw["builder"]
+        raw = (f"Name: {builder['name']}\nDriver: docker-container\n\nNodes:\nName: {builder['node']}\n"
+               "Endpoint: vz-owned-machine\nStatus: running\n").encode()
+        with patch.object(item, "guard"), patch.object(item, "command", return_value=subprocess.CompletedProcess([], 0, raw)), \
+                patch.object(item, "json_command", side_effect=snapshots):
+            for _ in snapshots:
+                item.builder_guard()
+
+    def test_builder_guards_require_private_setup_and_one_stable_process(self):
+        original = self.builder_snapshot()
+        self.assertEqual(original["State"]["StartedAt"], "2026-09-06T05:50:57.314727448Z")
+        self.guarded_builder(self.bare_driver(), [[original], [copy.deepcopy(original)]])
+        for key, value in (("Pid", 738), ("StartedAt", "2026-09-06T05:50:58.314727448Z")):
+            with self.subTest(key=key):
+                changed = copy.deepcopy(original); changed["State"][key] = value
+                with self.assertRaisesRegex(ValueError, "process identity changed"):
+                    self.guarded_builder(self.bare_driver(), [[original], [changed]])
+
+    def test_builder_guard_rejects_cgroup_and_process_adversaries(self):
+        original = self.builder_snapshot()
+        cases = [("Config", "Env", original["Config"]["Env"][:-1]),
+                 ("Config", "Env", original["Config"]["Env"] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=1"]),
+                 ("Config", "Env", original["Config"]["Env"] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=0"]),
+                 ("HostConfig", "CgroupnsMode", "host"), ("HostConfig", "CgroupnsMode", None),
+                 ("HostConfig", "Runtime", "runc"), ("HostConfig", "Privileged", False),
+                 ("HostConfig", "Init", False), ("HostConfig", "Init", 1),
+                 ("State", "Pid", 0), ("State", "Pid", True), ("State", "Pid", "737"),
+                 ("State", "StartedAt", "0001-01-01T00:00:00Z"),
+                 ("State", "StartedAt", "2026-99-06T05:50:57Z"),
+                 ("State", "Paused", True), ("State", "Restarting", True), ("State", "Dead", True)]
+        for section, key, value in cases:
+            with self.subTest(section=section, key=key, value=value):
+                changed = copy.deepcopy(original); changed[section][key] = value
+                with self.assertRaises(ValueError):
+                    self.guarded_builder(self.bare_driver(), [[changed]])
+        for snapshots in ([], [original, original]):
+            with self.assertRaises(ValueError):
+                self.guarded_builder(self.bare_driver(), [snapshots])
+        for value in (1, True, None):
+            changed = copy.deepcopy(original); changed["RestartCount"] = value
+            with self.assertRaises(ValueError):
+                self.guarded_builder(self.bare_driver(), [[changed]])
+
     def test_compose_only_omits_builder_but_build_all_and_suite_switch_reject(self):
         raw = copy.deepcopy(self.raw)
         del raw["builder"]

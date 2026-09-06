@@ -2,3 +2,4 @@
 # pinned patch bytes; ordinary source whitespace checks remain enabled.
 linux/youki/seccomp-exec.patch whitespace=-blank-at-eol
 linux/youki/tenant-root.patch whitespace=-blank-at-eol
+linux/youki/tenant-cgroup.patch whitespace=-blank-at-eol

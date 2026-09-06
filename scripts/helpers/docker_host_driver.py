@@ -19,6 +19,7 @@ from __future__ import annotations
 import argparse
 import base64
 import dataclasses
+from datetime import datetime
 import hashlib
 import json
 import os
@@ -908,10 +909,33 @@ class Driver:
         builder = self.inputs.raw["builder"]
         inspected = self.command(["buildx", "inspect", builder["name"]])
         assert_builder_inspect(inspected.stdout, builder, self.inputs.scope["docker_context"])
-        item = self.json_command(["container", "inspect", builder["container_id"]])[0]
+        items = self.json_command(["container", "inspect", builder["container_id"]])
+        require(isinstance(items, list) and len(items) == 1, "exactly one builder container required")
+        item = items[0]
         require(item["Id"] == builder["container_id"] and item["Image"] == builder["image_id"] and
-                item["Name"] == "/buildx_buildkit_" + builder["node"] and item["State"]["Running"],
+                item["Name"] == "/buildx_buildkit_" + builder["node"] and item["State"]["Running"] is True,
                 "builder container content/identity mismatch")
+        require(item.get("Config", {}).get("Env") == [
+            "PATH=/usr/bin:/bin", "SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt",
+            "BUILDKIT_SETUP_CGROUPV2_ROOT=1"], "builder cgroup setup environment differs")
+        host = item.get("HostConfig", {})
+        require(host.get("CgroupnsMode") == "private" and host.get("Runtime") == "youki" and
+                host.get("Privileged") is True and host.get("Init") is True, "builder cgroup/runtime policy differs")
+        state = item["State"]
+        started = state.get("StartedAt")
+        require(type(state.get("Pid")) is int and state["Pid"] > 0 and
+                type(item.get("RestartCount")) is int and item["RestartCount"] == 0 and
+                state.get("Status") == "running" and state.get("Paused") is False and
+                state.get("Restarting") is False and state.get("Dead") is False and
+                isinstance(started, str) and re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z", started),
+                "builder process identity incomplete or not continuously running")
+        # The strict format above already admits only UTC and 1–9 fractional
+        # digits. Python 3.9 cannot parse nanoseconds; validate the calendar
+        # portion separately without changing the identity's original bytes.
+        require(datetime.fromisoformat(started[:19]).year > 1970, "invalid builder start time")
+        identity = (state["Pid"], started)
+        require(getattr(self, "_builder_process", identity) == identity, "builder process identity changed")
+        self._builder_process = identity
 
     def build(self, suffix: str, dockerfile: str, arguments: dict[str, str], *,
               extra: list[str] | None = None, expected: int | None = 0) -> tuple[Command, Path]:

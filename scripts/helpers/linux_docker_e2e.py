@@ -79,6 +79,7 @@ def preflight(args, require_host=True):
         info["buildkit"] = builder.preflight_archive(archive)
         info["inputs"][str(archive)] = startup.digest(archive)
         for path in (REPO / "scripts/helpers/linux_docker_buildkit_builder.py",
+                     REPO / "scripts/helpers/linux_docker_buildkit_cgroup.py",
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)

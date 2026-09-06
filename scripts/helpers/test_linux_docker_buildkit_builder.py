@@ -108,7 +108,8 @@ class Harness:
         b = self.b
         if args[:2] == ["image", "import"]:
             self.objects["image"] = {"Id": "sha256:" + "a" * 64, "Architecture": "arm64", "Os": "linux",
-                "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"]}}
+                "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"],
+                           "Env": list(builder.ENV)}}
             return ("sha256:" + "a" * 64 + "\n").encode(), b"", 0
         if args[:2] == ["volume", "create"]:
             self.objects["volume"] = {"Name": b.volume_name, "Driver": "local", "Scope": "local",
@@ -116,12 +117,15 @@ class Harness:
                 "Mountpoint": "/var/lib/docker/engine/volumes/" + b.volume_name + "/_data"}
         if args[:2] == ["container", "create"]:
             self.objects["container"] = {"Id": "b" * 64, "Name": "/" + b.container_name, "Image": b.image_id,
-                "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"], "Cmd": list(builder.FLAGS)},
+                "Config": {"Labels": {builder.LABEL: b.token}, "Entrypoint": ["/usr/bin/buildkitd"],
+                           "Cmd": list(builder.FLAGS), "Env": list(builder.ENV)},
                 "HostConfig": {"Runtime": "youki", "Privileged": True, "Init": True, "NetworkMode": "bridge",
-                    "Binds": None, "PortBindings": {}, "RestartPolicy": {"Name": "no"}},
+                    "Binds": None, "PortBindings": {}, "RestartPolicy": {"Name": "no"}, "CgroupnsMode": "private"},
                 "Mounts": [{"Type": "volume", "Name": b.volume_name, "Destination": "/var/lib/buildkit",
                     "Source": self.objects["volume"]["Mountpoint"], "RW": True}],
-                "State": {"Running": False, "Status": "created", "ExitCode": 0}, "RestartCount": 0}
+                "State": {"Running": False, "Status": "created", "ExitCode": 0,
+                          "Paused": False, "Restarting": False, "Dead": False,
+                          "Pid": 737, "StartedAt": "2026-09-06T00:00:01.123456789Z"}, "RestartCount": 0}
             return ("b" * 64 + "\n").encode(), b"", 0
         if args[:2] in (["container", "start"], ["container", "stop"]):
             running = args[1] == "start"
@@ -177,6 +181,9 @@ class LifecycleTests(unittest.TestCase):
             {"usr/bin/youki": {"sha256": "c" * 64, "mode": 0o755, "size": 1}}))
         self.payload.start()
         self.addCleanup(self.payload.stop)
+        self.cgroup = patch.object(builder.cgroup, "capture", return_value={"offline_test_only": True})
+        self.capture = self.cgroup.start()
+        self.addCleanup(self.cgroup.stop)
 
     def test_exact_precreated_builder_has_no_pull_default_or_runtime_fallback(self):
         mapping = self.b.prepare()
@@ -185,11 +192,18 @@ class LifecycleTests(unittest.TestCase):
         create_container = next(i for i, args in enumerate(commands) if args[:2] == ["container", "create"])
         register = next(i for i, args in enumerate(commands) if args[:2] == ["buildx", "create"])
         self.assertLess(create_container, register)
+        imported = next(args for args in commands if args[:2] == ["image", "import"])
+        self.assertIn("ENV BUILDKIT_SETUP_CGROUPV2_ROOT=1", imported)
+        self.assertEqual(commands[create_container][commands[create_container].index("--cgroupns") + 1], "private")
         proof = json.loads((self.harness.evidence / (self.b.token + "-image-input.json")).read_bytes())
         retained = self.harness.evidence / proof["rootfs_archive"]
         self.assertEqual(retained.read_bytes(), b"fixture rootfs")
         self.assertEqual(builder.startup.digest(retained), proof["rootfs_sha256"])
+        self.assertEqual(proof["image_env"], builder.ENV)
+        self.assertEqual(proof["cgroup_namespace"], "private")
         self.assertTrue(all(scope == self.descriptor for _, _, scope, _ in self.harness.calls))
+        self.capture.assert_called_once()
+        self.assertEqual(self.capture.call_args.args[1], self.descriptor)
         for args in commands:
             self.assertNotIn("--use", args)
             self.assertNotIn("prune", args)
@@ -205,6 +219,65 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.b.verify()
 
+    def test_cgroup_observation_failure_withholds_recipe_readiness(self):
+        self.capture.side_effect = ValueError("builder cgroup: root still contains processes")
+        with self.assertRaisesRegex(ValueError, "root still contains processes"):
+            self.b.prepare()
+        self.assertFalse(any(label == "builder-runtime-hashes" for _, label, *_ in self.harness.calls))
+
+    def test_bootstrap_failure_observed_externally_without_retry_or_cleanup(self):
+        self.harness.failure = "builder-bootstrap"
+        self.capture.side_effect = ValueError("external observation failed")
+        with self.assertRaisesRegex(ValueError, "injected mutation failure"):
+            self.b.prepare()
+        self.assertEqual(sum(label == "builder-bootstrap" for _, label, *_ in self.harness.calls), 1)
+        self.assertFalse(any(args[1:2] == ["rm"] for _, _, _, args in self.harness.calls))
+        self.assertEqual(json.loads((self.harness.evidence / (self.b.token + "-bootstrap-failure-cgroup.json")).read_bytes()),
+                         {"observation_failed": "external observation failed"})
+
+    def test_missing_conflicting_or_duplicate_setup_environment_rejected(self):
+        self.b.prepare()
+        for kind in ("image", "container"):
+            config = self.harness.objects[kind]["Config"]
+            for env in (None, builder.ENV[:-1], builder.ENV[:-1] + ["BUILDKIT_SETUP_CGROUPV2_ROOT=0"],
+                        builder.ENV + ["BUILDKIT_SETUP_CGROUPV2_ROOT=1"],
+                        builder.ENV + ["BUILDKIT_SETUP_CGROUPV2_ROOT=0"]):
+                with self.subTest(kind=kind, env=env):
+                    config["Env"] = env
+                    before = len(self.harness.calls)
+                    with self.assertRaisesRegex(ValueError, "configuration drift"):
+                        self.b.remove_owned()
+                    self.assertFalse(any(mutation for mutation, *_ in self.harness.calls[before:]))
+            config["Env"] = list(builder.ENV)
+
+    def test_nonprivate_cgroup_namespace_rejected_without_mutation(self):
+        self.b.prepare()
+        host = self.harness.objects["container"]["HostConfig"]
+        for namespace in (None, "", "host"):
+            host["CgroupnsMode"] = namespace
+            before = len(self.harness.calls)
+            with self.assertRaisesRegex(ValueError, "policy drift"):
+                self.b.remove_owned()
+            self.assertFalse(any(mutation for mutation, *_ in self.harness.calls[before:]))
+
+    def test_live_builder_incarnation_drift_rejected(self):
+        self.b.prepare()
+        state = self.harness.objects["container"]["State"]
+        original = dict(state)
+        for key, value in (("Pid", True), ("Pid", 0), ("Pid", 738), ("StartedAt", None),
+                           ("Paused", True), ("Restarting", True), ("Dead", True),
+                           ("StartedAt", "2026-99-06T99:99:99Z"),
+                           ("StartedAt", "0001-01-01T00:00:00Z"),
+                           ("StartedAt", "2026-09-06T00:00:02.123456789Z")):
+            with self.subTest(key=key, value=value):
+                state.update(original)
+                state[key] = value
+                with self.assertRaises(ValueError):
+                    self.b.verify(False)
+        state.update(original)
+        self.harness.objects["container"]["RestartCount"] = False
+        with self.assertRaisesRegex(ValueError, "lifecycle drift"):
+            self.b.remove_owned()
     def test_foreign_engine_or_cache_volume_fails_before_mutation(self):
         self.harness.engine_id = "foreign"
         with self.assertRaises(ValueError):

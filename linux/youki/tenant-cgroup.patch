@@ -1,0 +1,750 @@
+Locally authored vz filesystem-v2 tenant cgroup correction for pinned youki 0.7.0.
+Apply after seccomp-exec.patch, tenant-root.patch, runtime-log.patch, and
+executable-permissions.patch. Not an upstream-reviewed backport.
+Preserve configured-base attachment; only EBUSY permits a pinned strict init
+descendant. Explicit subgroups/systemd/v1/default-relative paths are unchanged.
+No group creation, controller changes, threaded conversion, or unrelated PID moves.
+
+--- a/crates/libcontainer/src/container/mod.rs
++++ b/crates/libcontainer/src/container/mod.rs
+@@ -20,6 +20,7 @@
+ mod mount_validation;
+ pub mod state;
+ pub mod tenant_builder;
++pub(crate) mod tenant_cgroup;
+ pub(crate) mod tenant_root;
+ pub use container::{CheckpointOptions, Container};
+ pub use container_checkpoint::CheckpointError;
+--- a/crates/libcontainer/src/container/tenant_builder.rs
++++ b/crates/libcontainer/src/container/tenant_builder.rs
+@@ -245,7 +245,7 @@
+         self.adapt_spec_for_tenant(&mut spec, &container)?;
+         // Pin one process directory, then acquire root and every selected
+         // namespace relative to it. Never reopen a numeric PID after this point.
+-        let tenant_root = super::tenant_root::TenantRoot::capture(
++        let mut tenant_root = super::tenant_root::TenantRoot::capture(
+             container
+                 .pid()
+                 .ok_or_else(|| LibcontainerError::Other("missing init pid".into()))?,
+@@ -253,6 +253,16 @@
+             self.base.preserve_fds,
+         )
+         .map_err(LibcontainerError::OtherIO)?;
++        let use_systemd = self.should_use_systemd(&container);
++        let user_ns_config = UserNamespaceConfig::new(&spec)?;
++        tenant_root
++            .pin_cgroup(
++                &spec,
++                self.sub_cgroup.is_some(),
++                use_systemd || user_ns_config.is_some(),
++                self.base.preserve_fds,
++            )
++            .map_err(LibcontainerError::OtherIO)?;
+         // validate terminal field against console socket presence before any side effects
+         self.base.check_terminal(&spec, self.detached)?;
+ 
+@@ -267,9 +277,6 @@
+         // get file descriptors of console socket
+         let csocketfd = self.setup_tty_socket(&container_dir)?;
+ 
+-        let use_systemd = self.should_use_systemd(&container);
+-        let user_ns_config = UserNamespaceConfig::new(&spec)?;
+-
+         let (read_end, write_end) =
+             pipe2(OFlag::O_CLOEXEC).map_err(LibcontainerError::OtherSyscall)?;
+ 
+--- a/crates/libcontainer/src/container/tenant_root.rs
++++ b/crates/libcontainer/src/container/tenant_root.rs
+@@ -14,6 +14,7 @@
+     proc: OwnedFd,
+     root: OwnedFd,
+     namespaces: Vec<OwnedFd>,
++    cgroup: Option<super::tenant_cgroup::TenantCgroup>,
+ }
+ 
+ fn owned(result: libc::c_int) -> io::Result<OwnedFd> {
+@@ -24,7 +25,7 @@
+     Ok(unsafe { OwnedFd::from_raw_fd(result) })
+ }
+ 
+-fn open_at(dir: RawFd, name: &CStr, flags: i32, floor: i32) -> io::Result<OwnedFd> {
++pub(super) fn open_at(dir: RawFd, name: &CStr, flags: i32, floor: i32) -> io::Result<OwnedFd> {
+     // SAFETY: name is NUL terminated; no O_CREAT, so no mode argument is needed.
+     let fd = owned(unsafe { libc::openat(dir, name.as_ptr(), flags | libc::O_CLOEXEC) })?;
+     // Always duplicate above stdio and caller-preserved descriptors. CLOEXEC is
+@@ -87,11 +88,43 @@
+             proc,
+             root,
+             namespaces: handles,
++            cgroup: None,
+         };
+         pinned.check_live_root()?;
+         Ok(pinned)
+     }
+ 
++    pub(crate) fn pin_cgroup(
++        &mut self,
++        spec: &Spec,
++        explicit_subgroup: bool,
++        systemd: bool,
++        preserve_fds: i32,
++    ) -> io::Result<()> {
++        let path = spec
++            .linux()
++            .as_ref()
++            .and_then(|linux| linux.cgroups_path().as_deref());
++        self.cgroup = super::tenant_cgroup::TenantCgroup::capture(
++            self.proc.as_raw_fd(),
++            path,
++            explicit_subgroup,
++            systemd,
++            preserve_fds,
++        )?;
++        Ok(())
++    }
++
++    pub(crate) fn attach_cgroup(&self, pid: Pid) -> io::Result<bool> {
++        let Some(cgroup) = &self.cgroup else {
++            return Ok(false);
++        };
++        self.check_live_root()?;
++        cgroup.attach(self.proc.as_raw_fd(), pid)?;
++        self.check_live_root()?;
++        Ok(true)
++    }
++
+     fn check_live_root(&self) -> io::Result<()> {
+         // Relative lookup through the held proc directory cannot resolve a
+         // reused numeric PID. A dead task has no root; a changed root is refused.
+--- a/crates/libcontainer/src/container/tenant_cgroup.rs
++++ b/crates/libcontainer/src/container/tenant_cgroup.rs
+@@ -0,0 +1,594 @@
++//! Locally authored cgroupfs-v2 exec correction. Keep the configured cgroup
++//! when it accepts the task. EBUSY alone permits following init into a pinned,
++//! strict descendant, without creating groups, enabling controllers, or moving
++//! any other process. Explicit subgroups, systemd, v1, and relative/default OCI
++//! paths retain their existing routing. Acquisition cannot authenticate a stale
++//! persisted numeric PID before TenantRoot pins its proc directory.
++use std::ffi::CString;
++use std::fs::File;
++use std::io::{self, Read};
++use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
++use std::path::{Path, PathBuf};
++
++use nix::unistd::Pid;
++
++use super::tenant_root::open_at;
++
++const LIMIT: u64 = 8192;
++const DIR: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW;
++
++pub(super) struct TenantCgroup {
++    root: OwnedFd,
++    base: OwnedFd,
++    leaf: OwnedFd,
++    base_procs: OwnedFd,
++    leaf_procs: OwnedFd,
++    base_path: PathBuf,
++    leaf_path: PathBuf,
++    membership: String,
++    floor: i32,
++}
++
++fn clean_path(value: &str) -> io::Result<PathBuf> {
++    if !value.starts_with('/')
++        || value.bytes().any(|c| c < 32 || c == 127)
++        || (value != "/"
++            && value[1..]
++                .split('/')
++                .any(|part| matches!(part, "" | "." | "..")))
++    {
++        return Err(io::Error::other("noncanonical unified cgroup path"));
++    }
++    Ok(PathBuf::from(value))
++}
++
++fn unified_membership(raw: &str) -> io::Result<String> {
++    if raw.len() > LIMIT as usize || raw.contains('\r') {
++        return Err(io::Error::other("invalid or oversized proc cgroup record"));
++    }
++    let mut unified = None;
++    for line in raw.lines() {
++        let mut fields = line.splitn(3, ':');
++        let hierarchy = fields.next();
++        let controllers = fields.next();
++        let path = fields
++            .next()
++            .ok_or_else(|| io::Error::other("malformed proc cgroup record"))?;
++        if hierarchy == Some("0") {
++            if controllers != Some("") || unified.is_some() {
++                return Err(io::Error::other("ambiguous unified cgroup record"));
++            }
++            clean_path(path)?;
++            unified = Some(path.to_owned());
++        }
++    }
++    unified.ok_or_else(|| io::Error::other("missing unified cgroup record"))
++}
++
++fn read_membership(proc: RawFd, floor: i32) -> io::Result<String> {
++    let fd = open_at(proc, c"cgroup", libc::O_RDONLY | libc::O_NOFOLLOW, floor)?;
++    let mut raw = String::new();
++    File::from(fd).take(LIMIT + 1).read_to_string(&mut raw)?;
++    unified_membership(&raw)
++}
++
++fn selected_base(
++    path: Option<&Path>,
++    explicit: bool,
++    systemd: bool,
++) -> io::Result<Option<PathBuf>> {
++    if explicit || systemd {
++        return Ok(None);
++    }
++    let Some(path) = path else { return Ok(None) };
++    if !path.is_absolute() || path == Path::new("/") {
++        return Ok(None);
++    }
++    clean_path(
++        path.to_str()
++            .ok_or_else(|| io::Error::other("non-UTF8 cgroup path"))?,
++    )
++    .map(Some)
++}
++
++fn descendant(base: &Path, member: &str) -> io::Result<Option<PathBuf>> {
++    let path = clean_path(member)?;
++    if !path.starts_with(base) {
++        return Err(io::Error::other(
++            "init cgroup is outside the original owned subtree",
++        ));
++    }
++    Ok((path != base).then_some(path))
++}
++
++fn walk(root: RawFd, path: &Path, floor: i32) -> io::Result<OwnedFd> {
++    let mut directory = open_at(root, c".", DIR, floor)?;
++    for part in path.components() {
++        if let std::path::Component::Normal(name) = part {
++            let name = CString::new(name.as_encoded_bytes())
++                .map_err(|_| io::Error::other("NUL in cgroup path"))?;
++            directory = open_beneath(directory.as_raw_fd(), &name, DIR, floor)?;
++        } else if !matches!(part, std::path::Component::RootDir) {
++            return Err(io::Error::other("noncanonical cgroup traversal"));
++        }
++    }
++    Ok(directory)
++}
++
++fn open_beneath(dir: RawFd, name: &std::ffi::CStr, flags: i32, floor: i32) -> io::Result<OwnedFd> {
++    #[repr(C)]
++    struct OpenHow {
++        flags: u64,
++        mode: u64,
++        resolve: u64,
++    }
++    let how = OpenHow {
++        flags: (flags | libc::O_CLOEXEC | libc::O_NOFOLLOW) as u64,
++        mode: 0,
++        // RESOLVE_NO_XDEV | NO_MAGICLINKS | NO_SYMLINKS | BENEATH.
++        // Unlike O_NOFOLLOW, NO_XDEV also rejects same-filesystem bind mounts.
++        resolve: 0x01 | 0x02 | 0x04 | 0x08,
++    };
++    // SAFETY: valid borrowed dir fd, NUL-terminated name and initialized Linux
++    // open_how ABI buffer. No create operation; successful result is a new fd.
++    let result = unsafe {
++        libc::syscall(
++            libc::SYS_openat2,
++            dir,
++            name.as_ptr(),
++            &how,
++            std::mem::size_of::<OpenHow>(),
++        )
++    };
++    if result < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let fd = unsafe { OwnedFd::from_raw_fd(result as RawFd) };
++    // SAFETY: fd is live and fcntl creates a distinct owned CLOEXEC descriptor.
++    let duplicate = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_DUPFD_CLOEXEC, floor) };
++    if duplicate < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(unsafe { OwnedFd::from_raw_fd(duplicate) })
++}
++
++fn identity(fd: RawFd) -> io::Result<(libc::dev_t, libc::ino_t)> {
++    let mut info = std::mem::MaybeUninit::<libc::stat>::uninit();
++    // SAFETY: borrowed live fd; successful fstat initializes the output.
++    if unsafe { libc::fstat(fd, info.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    let info = unsafe { info.assume_init() };
++    if info.st_nlink == 0 {
++        return Err(io::Error::other("cgroup was removed"));
++    }
++    Ok((info.st_dev, info.st_ino))
++}
++
++fn unified_fs(fd: RawFd) -> io::Result<bool> {
++    let mut info = std::mem::MaybeUninit::<libc::statfs>::uninit();
++    // SAFETY: borrowed live fd; successful fstatfs initializes the output.
++    if unsafe { libc::fstatfs(fd, info.as_mut_ptr()) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    Ok(unsafe { info.assume_init() }.f_type as u64 == libc::CGROUP2_SUPER_MAGIC as u64)
++}
++
++impl TenantCgroup {
++    pub(super) fn capture(
++        proc: RawFd,
++        path: Option<&Path>,
++        explicit: bool,
++        systemd: bool,
++        preserve_fds: i32,
++    ) -> io::Result<Option<Self>> {
++        let Some(base) = selected_base(path, explicit, systemd)? else {
++            return Ok(None);
++        };
++        let floor = preserve_fds
++            .checked_add(3)
++            .filter(|n| *n >= 3)
++            .ok_or_else(|| io::Error::other("invalid preserved fd count"))?;
++        // Mount crossings are needed to reach the cgroup mount, but forbidden
++        // for all traversal below this pinned and filesystem-verified root.
++        let mut root = open_at(libc::AT_FDCWD, c"/", DIR, floor)?;
++        for part in [c"sys", c"fs", c"cgroup"] {
++            root = open_at(root.as_raw_fd(), part, DIR, floor)?;
++        }
++        if !unified_fs(root.as_raw_fd())? {
++            return Ok(None);
++        }
++        let membership = read_membership(proc, floor)?;
++        let Some(leaf) = descendant(&base, &membership)? else {
++            return Ok(None);
++        };
++        let selected = Self::pin(root, base, leaf, membership, floor)?;
++        if !unified_fs(selected.base.as_raw_fd())? || !unified_fs(selected.leaf.as_raw_fd())? {
++            return Err(io::Error::other("selected cgroup is not cgroupfs v2"));
++        }
++        selected.verify(proc)?;
++        Ok(Some(selected))
++    }
++
++    fn pin(
++        root: OwnedFd,
++        base_path: PathBuf,
++        leaf_path: PathBuf,
++        membership: String,
++        floor: i32,
++    ) -> io::Result<Self> {
++        let base = walk(root.as_raw_fd(), &base_path, floor)?;
++        let leaf = walk(root.as_raw_fd(), &leaf_path, floor)?;
++        let base_procs = open_beneath(
++            base.as_raw_fd(),
++            c"cgroup.procs",
++            libc::O_WRONLY | libc::O_NOFOLLOW,
++            floor,
++        )?;
++        let leaf_procs = open_beneath(
++            leaf.as_raw_fd(),
++            c"cgroup.procs",
++            libc::O_WRONLY | libc::O_NOFOLLOW,
++            floor,
++        )?;
++        Ok(Self {
++            root,
++            base,
++            leaf,
++            base_procs,
++            leaf_procs,
++            base_path,
++            leaf_path,
++            membership,
++            floor,
++        })
++    }
++
++    fn verify(&self, proc: RawFd) -> io::Result<()> {
++        if read_membership(proc, self.floor)? != self.membership {
++            return Err(io::Error::other(
++                "init cgroup changed during exec admission",
++            ));
++        }
++        for (path, held) in [(&self.base_path, &self.base), (&self.leaf_path, &self.leaf)] {
++            let current = walk(self.root.as_raw_fd(), path, self.floor)?;
++            if identity(current.as_raw_fd())? != identity(held.as_raw_fd())? {
++                return Err(io::Error::other("selected cgroup identity changed"));
++            }
++        }
++        for (directory, held) in [
++            (&self.base, &self.base_procs),
++            (&self.leaf, &self.leaf_procs),
++        ] {
++            let current = open_beneath(
++                directory.as_raw_fd(),
++                c"cgroup.procs",
++                libc::O_WRONLY | libc::O_NOFOLLOW,
++                self.floor,
++            )?;
++            if identity(current.as_raw_fd())? != identity(held.as_raw_fd())? {
++                return Err(io::Error::other("selected cgroup.procs identity changed"));
++            }
++        }
++        Ok(())
++    }
++
++    pub(super) fn attach(&self, proc: RawFd, pid: Pid) -> io::Result<()> {
++        if pid.as_raw() <= 0 {
++            return Err(io::Error::other("invalid exec pid"));
++        }
++        self.attach_with(proc, |fd| {
++            let value = pid.as_raw().to_string();
++            // SAFETY: borrowed live cgroup.procs fd and initialized byte slice.
++            // Exactly one write: do not retry/continue a partial kernel request.
++            let written = unsafe { libc::write(fd, value.as_ptr().cast(), value.len()) };
++            if written < 0 {
++                return Err(io::Error::last_os_error());
++            }
++            if written as usize != value.len() {
++                return Err(io::Error::other("short cgroup.procs write"));
++            }
++            Ok(())
++        })
++    }
++
++    fn attach_with(
++        &self,
++        proc: RawFd,
++        mut write: impl FnMut(RawFd) -> io::Result<()>,
++    ) -> io::Result<()> {
++        self.verify(proc)?;
++        match write(self.base_procs.as_raw_fd()) {
++            Ok(()) => (),
++            Err(error) if error.raw_os_error() == Some(libc::EBUSY) => {
++                self.verify(proc)?;
++                write(self.leaf_procs.as_raw_fd())?;
++            }
++            Err(error) => return Err(error),
++        }
++        self.verify(proc)
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use std::fs;
++    use std::os::unix::fs::symlink;
++
++    // Real native descriptors and filesystem races, with a synthetic proc
++    // record. These unit fixtures do not claim kernel cgroup enforcement.
++    struct Fixture {
++        directory: tempfile::TempDir,
++        proc: OwnedFd,
++        selected: TenantCgroup,
++    }
++
++    fn fixture() -> Fixture {
++        let directory = tempfile::tempdir().unwrap();
++        fs::create_dir_all(directory.path().join("tree/owned/init")).unwrap();
++        fs::create_dir(directory.path().join("proc")).unwrap();
++        fs::write(directory.path().join("proc/cgroup"), "0::/owned/init\n").unwrap();
++        for path in ["tree/owned/cgroup.procs", "tree/owned/init/cgroup.procs"] {
++            fs::write(directory.path().join(path), "unchanged").unwrap();
++        }
++        let open = |path: &Path| {
++            let name = CString::new(path.as_os_str().as_encoded_bytes()).unwrap();
++            open_at(libc::AT_FDCWD, &name, DIR, 15).unwrap()
++        };
++        let root = open(&directory.path().join("tree"));
++        let proc = open(&directory.path().join("proc"));
++        let selected = TenantCgroup::pin(
++            root,
++            "/owned".into(),
++            "/owned/init".into(),
++            "/owned/init".into(),
++            15,
++        )
++        .unwrap();
++        Fixture {
++            directory,
++            proc,
++            selected,
++        }
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_parser_and_owned_subtree() {
++        assert_eq!(
++            unified_membership("2:cpu:/legacy\n0::/owned/init:colon\n").unwrap(),
++            "/owned/init:colon"
++        );
++        for bad in [
++            "",
++            "0::/owned\n0::/owned\n",
++            "0:cpu:/owned\n",
++            "0::owned\n",
++            "0::/owned/../other\n",
++            "0::/owned//init\n",
++            "0::/owned/.\n",
++            "0::/owned/\n",
++            "0::/owned\r\n",
++            "broken\n",
++            "0::/owned\0\n",
++        ] {
++            assert!(unified_membership(bad).is_err(), "accepted {bad:?}");
++        }
++        assert!(unified_membership(&format!("0::/{}", "a".repeat(8192))).is_err());
++        assert!(descendant(Path::new("/owned"), "/owned").unwrap().is_none());
++        assert_eq!(
++            descendant(Path::new("/owned"), "/owned/init").unwrap(),
++            Some("/owned/init".into())
++        );
++        for outside in ["/", "/owned-evil/init", "/other/init"] {
++            assert!(descendant(Path::new("/owned"), outside).is_err());
++        }
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_routing_preserves_explicit_and_nonfilesystem() {
++        // Explicit '/' and explicit relative subgroups both map to `true` at
++        // tenant_builder's Option::is_some boundary; neither is redirected.
++        for subgroup in [Some("/"), Some("child")] {
++            assert!(
++                TenantCgroup::capture(-1, Some(Path::new("/owned")), subgroup.is_some(), false, 0)
++                    .unwrap()
++                    .is_none()
++            );
++        }
++        assert!(
++            TenantCgroup::capture(-1, Some(Path::new("/owned")), false, true, 0)
++                .unwrap()
++                .is_none()
++        );
++        for path in [
++            None,
++            Some(Path::new(":youki:default")),
++            Some(Path::new("relative")),
++            Some(Path::new("/")),
++        ] {
++            assert!(
++                TenantCgroup::capture(-1, path, false, false, 0)
++                    .unwrap()
++                    .is_none()
++            );
++        }
++        let fixture = fixture();
++        assert!(!unified_fs(fixture.selected.root.as_raw_fd()).unwrap());
++        assert!(selected_base(Some(Path::new("/owned/../other")), false, false).is_err());
++        assert!(TenantCgroup::capture(-1, Some(Path::new("/owned")), false, false, -1).is_err());
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_base_success_and_only_ebusy_fallback() {
++        let fixture = fixture();
++        let base = fixture.selected.base_procs.as_raw_fd();
++        let leaf = fixture.selected.leaf_procs.as_raw_fd();
++        for error in [
++            None,
++            Some(libc::EBUSY),
++            Some(libc::EACCES),
++            Some(libc::EROFS),
++            Some(libc::EOPNOTSUPP),
++            Some(libc::ENOENT),
++            Some(libc::EINTR),
++        ] {
++            let mut calls = Vec::new();
++            let result = fixture
++                .selected
++                .attach_with(fixture.proc.as_raw_fd(), |fd| {
++                    calls.push(fd);
++                    if fd == base
++                        && let Some(error) = error
++                    {
++                        return Err(io::Error::from_raw_os_error(error));
++                    }
++                    Ok(())
++                });
++            assert_eq!(
++                calls,
++                if error == Some(libc::EBUSY) {
++                    vec![base, leaf]
++                } else {
++                    vec![base]
++                }
++            );
++            assert_eq!(
++                result.is_ok(),
++                error.is_none() || error == Some(libc::EBUSY)
++            );
++        }
++        let mut calls = Vec::new();
++        let error = fixture
++            .selected
++            .attach_with(fixture.proc.as_raw_fd(), |fd| {
++                calls.push(fd);
++                Err(io::Error::from_raw_os_error(if fd == base {
++                    libc::EBUSY
++                } else {
++                    libc::EPERM
++                }))
++            })
++            .unwrap_err();
++        assert_eq!(error.raw_os_error(), Some(libc::EPERM));
++        assert_eq!(calls, [base, leaf]);
++        assert!(
++            fixture
++                .selected
++                .attach(fixture.proc.as_raw_fd(), Pid::from_raw(0))
++                .is_err()
++        );
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_path_replacement_and_symlinks() {
++        for replace_base in [false, true] {
++            let fixture = fixture();
++            let target = fixture.directory.path().join(if replace_base {
++                "tree/owned"
++            } else {
++                "tree/owned/init"
++            });
++            let moved = fixture.directory.path().join("moved");
++            fs::rename(&target, &moved).unwrap();
++            fs::create_dir(&target).unwrap();
++            assert!(
++                fixture
++                    .selected
++                    .attach_with(fixture.proc.as_raw_fd(), |_| panic!(
++                        "must reject replacement before write"
++                    ))
++                    .is_err()
++            );
++            fs::remove_dir(&target).unwrap();
++            symlink(&moved, &target).unwrap();
++            assert!(fixture.selected.verify(fixture.proc.as_raw_fd()).is_err());
++        }
++        let fixture = fixture();
++        let file = fixture
++            .directory
++            .path()
++            .join("tree/owned/init/cgroup.procs");
++        fs::remove_file(&file).unwrap();
++        symlink("../cgroup.procs", &file).unwrap();
++        assert!(
++            open_at(
++                fixture.selected.leaf.as_raw_fd(),
++                c"cgroup.procs",
++                libc::O_WRONLY | libc::O_NOFOLLOW,
++                15
++            )
++            .is_err()
++        );
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_membership_change_and_dead_proc() {
++        let fixture = fixture();
++        let record = fixture.directory.path().join("proc/cgroup");
++        let mut calls = 0;
++        assert!(
++            fixture
++                .selected
++                .attach_with(fixture.proc.as_raw_fd(), |_| {
++                    calls += 1;
++                    fs::write(&record, "0::/owned/other\n").unwrap();
++                    Err(io::Error::from_raw_os_error(libc::EBUSY))
++                })
++                .is_err()
++        );
++        assert_eq!(calls, 1, "movement must prevent fallback");
++        fs::write(&record, "0::/owned/init\n").unwrap();
++        let mut calls = 0;
++        assert!(
++            fixture
++                .selected
++                .attach_with(fixture.proc.as_raw_fd(), |_| {
++                    calls += 1;
++                    fs::write(&record, "0::/owned/other\n").unwrap();
++                    Ok(())
++                })
++                .is_err()
++        );
++        assert_eq!(calls, 1, "post-write movement must fail closed");
++        fs::remove_file(&record).unwrap();
++        assert!(fixture.selected.verify(fixture.proc.as_raw_fd()).is_err());
++
++        let mut child = std::process::Command::new("/bin/busybox")
++            .args(["sleep", "60"])
++            .spawn()
++            .unwrap();
++        let path = CString::new(format!("/proc/{}", child.id())).unwrap();
++        let proc = open_at(libc::AT_FDCWD, &path, DIR, 15).unwrap();
++        // Reading an exited pinned proc directory cannot switch to a reused PID.
++        child.kill().unwrap();
++        child.wait().unwrap();
++        assert!(read_membership(proc.as_raw_fd(), 15).is_err());
++    }
++
++    #[test]
++    fn test_vz_tenant_cgroup_descriptors_preserved_and_closed() {
++        let fixture = fixture();
++        let descriptors = [
++            &fixture.selected.root,
++            &fixture.selected.base,
++            &fixture.selected.leaf,
++            &fixture.selected.base_procs,
++            &fixture.selected.leaf_procs,
++        ]
++        .map(AsRawFd::as_raw_fd);
++        for fd in descriptors {
++            assert!(fd >= 15);
++            // SAFETY: borrowed test-owned descriptors; fcntl only queries flags.
++            assert_ne!(
++                unsafe { libc::fcntl(fd, libc::F_GETFD) } & libc::FD_CLOEXEC,
++                0
++            );
++        }
++        drop(fixture);
++        for fd in descriptors {
++            // SAFETY: F_GETFD is a read-only invalid-descriptor probe.
++            assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFD) }, -1);
++        }
++    }
++}
+--- a/crates/libcontainer/src/process/container_intermediate_process.rs
++++ b/crates/libcontainer/src/process/container_intermediate_process.rs
+@@ -82,11 +82,27 @@
+     // In addition this needs to be done before we enter the cgroup namespace as
+     // the cgroup of the process will form the root of the cgroup hierarchy in
+     // the cgroup namespace.
+-    apply_cgroups(
+-        &cgroup_manager,
+-        linux.resources().as_ref(),
+-        matches!(args.container_type, ContainerType::InitContainer),
+-    )?;
++    // An implicit filesystem-v2 exec may follow a verified init descendant
++    // only when the original cgroup rejects attachment with EBUSY. This runs
++    // before namespace entry; proc cgroup paths are relative to that namespace.
++    let attached = if let Some(root) = &args.tenant_root {
++        let borrowed = root.borrow();
++        let pinned = borrowed.as_ref().ok_or_else(|| {
++            IntermediateProcessError::Cgroup("tenant root was already consumed".into())
++        })?;
++        pinned.attach_cgroup(current_pid).map_err(|error| {
++            IntermediateProcessError::Cgroup(format!("tenant cgroup attachment: {error}"))
++        })?
++    } else {
++        false
++    };
++    if !attached {
++        apply_cgroups(
++            &cgroup_manager,
++            linux.resources().as_ref(),
++            matches!(args.container_type, ContainerType::InitContainer),
++        )?;
++    }
+ 
+     // setting CPU affinity for tenant container after cgroup move
+     if matches!(args.container_type, ContainerType::TenantContainer { .. }) {
