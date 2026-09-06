@@ -155,6 +155,7 @@ def preflight(args, require_host=True):
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
+        from linux_docker_runtime_audit_evidence import required_source_paths as audit_source_paths
         selected = startup.canonical(getattr(args, "container_fixture", None) or
                                      str(REPO / "tests/fixtures/vz-0.4/docker-container-io"))
         fixture_contract(selected)
@@ -163,7 +164,7 @@ def preflight(args, require_host=True):
         info['inputs'][terminal['path']] = terminal['sha256']
         python = startup.canonical(sys.executable, links=True)
         info['inputs'][str(python)] = startup.digest(python)
-        for path in required_source_paths():
+        for path in [*required_source_paths(), *audit_source_paths()]:
             info['inputs'][str(path)] = startup.digest(path)
         for name in ("linux_docker_container_lifecycle.py", "linux_docker_container_state.py",
                      "linux_docker_container_commands.py", "linux_docker_container_fixture.py",
@@ -423,6 +424,32 @@ class ComposeHarness(startup.Harness):
         self.ssh_cache_requests = []
         self.ssh_cache_proofs = []
         self.ssh_cache_captures = []
+        self.runtime_audits = []
+
+    def enroll_runtime_audits(self, contexts):
+        """Fresh diagnostic sessions before this candidate's Docker mutations.
+
+        Ready/startup and future recovery invocations are outside this window.
+        Registration precedes enrollment so even a partial failure fences cleanup.
+        """
+        from linux_docker_runtime_audit_evidence import Session, required_source_paths
+        require(not self.runtime_audits and len(contexts) == 4,
+                'four fresh Machine audit sessions required')
+        require(len({row['owner']['machine_id'] for row in contexts}) == 4,
+                'runtime audit Machine owners must be distinct')
+        pins = {path: self.info['inputs'][path] for path in required_source_paths()}
+        pins[str(self.cli)] = self.staged_inputs[str(self.cli)]
+        for index, descriptor in enumerate(contexts):
+            session = Session(self, descriptor, self.evidence / ('runtime-audit-%d' % index),
+                              pins, session_id=uuid.uuid4().hex + uuid.uuid4().hex)
+            self.runtime_audits.append(session)
+            session.enroll()
+
+    def capture_runtime_audits(self):
+        """Finish quiescent audit replay after owned workload removal, before Stop."""
+        self.assert_certain()
+        require(len(self.runtime_audits) == 4, 'all four Machine audit sessions required')
+        return [session.capture() for session in self.runtime_audits]
 
     @staticmethod
     def builder_key(descriptor, role):
@@ -581,6 +608,11 @@ class ComposeHarness(startup.Harness):
                 "compose": {"reference": row["image_id"], "id": row["image_id"], "platform": "linux/arm64"}}
 
     def assert_certain(self):
+        # Final audit capture cannot be a prerequisite for Docker cleanup: those
+        # cleanup invocations themselves belong in the journal. Enrollment and
+        # every already-dispatched acquisition must nevertheless be certain.
+        for session in getattr(self, 'runtime_audits', []):
+            session.assert_enrolled_certain()
         require(all(getattr(self, "keep_proofs_verified", [])),
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
@@ -678,6 +710,8 @@ class ComposeHarness(startup.Harness):
                 require(raw == (self.info["public_ca"]["bundle_sha256"] +
                                "  /etc/vz/ca-certificates.crt\n").encode() and not stderr,
                         "actual Machine public CA bytes differ from selected immutable input")
+        if suite == 'lifecycle':
+            self.enroll_runtime_audits(contexts)
         sentinels = [self.sentinel(descriptor) for descriptor in contexts]
         self.monitor = SentinelMonitor(self, sentinels)
         observations = []
@@ -848,6 +882,8 @@ def run(info):
         try:
             require(harness.monitor is None or not harness.monitor.thread.is_alive(), "live monitor prevents cleanup")
             harness.remove_owned()
+            if info['suite'] == 'lifecycle':
+                result['runtime_audit_validation'] = harness.capture_runtime_audits()
             if info["suite"] == "ssh":
                 require(len(harness.ssh_cache_proofs) == 3, "three stopped SSH worker-cache proofs required")
                 result["ssh_stopped_cache_validation"] = harness.ssh_cache_proofs

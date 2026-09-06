@@ -546,9 +546,97 @@ SHA-256 `cbd58f6df0e4c877eca3fc60872f605acf883d486b7f3a1fc5bfbf7641c7d51e`.
 These are early-return and error-routing probes, not successful OCI payloads.
 
 No installed runtime was replaced by these native builds. Exact-Machine
-enrollment/retrieval, rebuilt backend verification, installed Docker invocation
+enrollment/retrieval, installed Docker invocation
 mapping and the aggregate release gate remain open. Fresh workload enrollment
 must precede all fixture/sentinel Docker mutations; persisted recovery additionally
 needs enrollment before daemon restore can invoke the runtime, explicit retained
 old-session disposition and a new-boot transition. Post-Ready enrollment alone
 cannot establish that recovery coverage.
+
+### Rebuilt Mac backend gate
+
+The new runtime passed the release-built Mac backend gate from source `296f6bcb`:
+`.artifacts/sandbox-vm-e2e/20260906T210423Z`. The original process exited zero;
+all seven selected lanes passed, with 50 selected tests: runtime 19, runtime
+crash/reopen 1, StateStore crash/reopen 1, runtimed 1, Machine registry 1, stack
+24 and BuildKit 3. There were no failed or ignored selected tests.
+
+Console `.artifacts/runtime-audit-backend-1.console.log` is 717,286 bytes,
+SHA-256 `c0f99658acb98a566ee6d59f51e9751d28e4d0cf1e755457694a281d49ebb96e`.
+Summary SHA-256:
+`b8749d920add876e989c08b9e362b11ac3e1d95aa297220b0864fe923dc49bf3`.
+The exact nine guest inputs were copied into the run's
+`retained-guest-bundles/` directory, totaling 85,692,154 bytes, with manifest
+SHA-256 `ee34ae422ae71b2e264d07cf5ae105a5f0e83ecfda48af8da89c8b12d47141ef`.
+Both profiles contain the native-verified `dcf891fa…5a20a84` runtime.
+Independent full-byte audit verifies all 11 JSON checksum sidecars and 4,072
+regular files totaling 69,584,261,153 logical bytes, including every byte of the
+64 GiB sparse cache. The in-memory inventory digest is
+`fdc7862ba791d0824a32275508c1ceff182e76cbd27f1463c2ee69251fb4700b`:
+sort regular-file relative POSIX paths, concatenate each file's SHA-256, two
+spaces, its relative path and LF, then hash those UTF-8 bytes. This includes the
+retained guest manifest and excludes directories and OCI symlinks; it is not
+an on-disk aggregate release manifest.
+
+This backend pass exercises the new runtime without diagnostic enrollment. It
+does not establish Machine-bound journal capture or installed host-Docker
+invocation mapping, and does not replace the required aggregate release gate.
+
+### Machine-bound capture implementation (physical verification pending)
+
+The DEV lifecycle harness now requires four fresh diagnostic enrollments before
+any sentinel or fixture Docker mutation. Sessions are registered before dispatch;
+even a normally returned nonzero enrollment remains uncertain and fences automatic
+cleanup. After the monitor is joined and owned Docker objects are removed, each
+Machine's journal is captured and independently replayed before public Stop.
+Capture failure also fences automatic Stop; it never resets or retries a journal.
+
+`scripts/helpers/linux_docker_runtime_audit_capture.py` uses fixed guest paths,
+fresh-directory/no-clobber enrollment with the enrollment marker written last,
+checked file synchronization, actual boot/runtime observations and protected-file
+metadata. Capture transfers at most 1 MiB of journal bytes per command, below the
+recorder's 4 MiB stream limit. Before/after snapshots and full content hashes must
+remain identical through all chunks; the existing parser validates the entire
+nonempty journal, up to 16 MiB, with no unmatched invocations.
+
+`scripts/helpers/linux_docker_runtime_audit_evidence.py` binds these source-selected
+commands to the original project, Environment, Machine, incarnation, staged CLI,
+runtime artifacts and authenticated startup selection. Independent replay reads
+original receipts only, checks the exact evidence inventory and proof readback,
+and cannot dispatch or write. The focused audit family passes 41 tests, including
+a 3,200-record, 1,600-invocation multi-chunk journal. The harness integration passes
+54 tests. These are host tests, not installed guest execution.
+The finalized broader host regression passes 749 tests in 91.794 seconds:
+`.artifacts/runtime-audit-capture-host-regression-2.log`, SHA-256
+`f7580543f45b7dfc70f5a5e6502f43fe57bd90ccc943e8f40a9802da92d75741`.
+The earlier sandboxed run remains failed: 746 tests with 12 errors during
+disposable SSH-agent startup; the final run used the local socket permissions
+required by those tests and includes three subsequently completed bridge tests.
+
+The BusyBox shell acquisition is diagnostic, not hostile-root containment:
+metadata/content checks detect ordinary concurrent change, but do not establish
+fd-relative protection against a malicious root path-swap/ABA attack. Workload
+quiescence is provided by the harness's owned cleanup boundary, not a journal
+lock. Up/startup, public Stop and persisted-recovery invocations remain outside
+this capture window. Docker-operation mapping and full historical process or
+namespace-reference absence remain uncertified.
+
+Native portability attempts are retained separately. Attempt 1 failed before
+container creation because the OrbStack multicall executable received the wrong
+argv0; attempt 2 found the exact builder image absent from the local cache.
+Attempt 3 fetched and verified the pinned image but timed out after 40 seconds
+during container creation, before enrollment or any youki invocation. Its host
+client was reaped, and separate exact-name inspection found no container at that
+observation; the original Engine mutation remains uncertain, not a verified
+rollback. No further create was dispatched.
+
+Attempt 3 evidence is `.artifacts/runtime-audit-capture-native-3`, 19 payloads,
+24,540 bytes, manifest SHA-256
+`71ed4671995e63dc75327a5ce0c83a2d4e75b01bbd32e48ee196fdb0a85f9f76`.
+Separate disposition evidence is `.artifacts/runtime-audit-capture-native-3-disposition`,
+six payloads, 4,306 bytes, manifest SHA-256
+`5ff4a92e6958920aaa1661195490b1035db0dcbfabe2e5a574c3db08a4b54046`.
+The exact name requiring future observation is
+`vz-audit-capture-736956287e494c92b38cd9847fdaff70`.
+Native portability and a fresh installed-Mac lifecycle candidate remain pending;
+none of these diagnostic attempts certifies runtime capture or Docker parity.

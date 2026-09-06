@@ -57,7 +57,8 @@ class AdmissionTests(unittest.TestCase):
                      'linux_docker_interactive_capture.py', 'linux_docker_interactive_evidence.py',
                      'linux_docker_container_tmux.py', 'linux_docker_interactive_tmux.py',
                      'linux_docker_buildkit_shutdown.py', 'linux_docker_image_input.py',
-                     'linux_docker_compose_evidence.py'):
+                     'linux_docker_compose_evidence.py', 'linux_docker_runtime_audit.py',
+                     'linux_docker_runtime_audit_capture.py', 'linux_docker_runtime_audit_evidence.py'):
             self.assertIn(str(gate.REPO/'scripts/helpers'/name), info['inputs'])
         for name in ('Dockerfile', 'README.md', 'contract.json', 'probe.py', 'test_probe.py'):
             self.assertIn(str(selected/name), info['inputs'])
@@ -310,7 +311,8 @@ class ResultScopeTests(unittest.TestCase):
             with self.subTest(changed=changed):
                 harness = types.SimpleNamespace(evidence=Path('/owned/evidence'), root=Path('/owned/root'),
                     staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
-                    remove_owned=Mock(), cleanup=Mock(return_value={}))
+                    remove_owned=Mock(), capture_runtime_audits=Mock(return_value=['four replayed sessions']),
+                    cleanup=Mock(return_value={}))
                 with patch.object(gate, 'ComposeHarness', return_value=harness), \
                         patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
                         patch.object(gate.startup, 'collect_runtime_receipts'), \
@@ -364,6 +366,107 @@ class ResultScopeTests(unittest.TestCase):
                         "owned_workload_objects_removed": True,
                         "retained_stopped_machine_disks_and_contexts": True,
                         "delete_certified": False})
+
+
+class RuntimeAuditIntegrationTests(unittest.TestCase):
+    def harness(self):
+        h = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        h.runtime_audits = []
+        h.cli, h.evidence = Path('/owned/bin/vz'), Path('/owned/evidence')
+        h.info = {'inputs': {'/source/audit.py': 'source-pin'}}
+        h.staged_inputs = {str(h.cli): 'cli-pin'}
+        return h
+
+    def test_registers_each_owner_before_fresh_enrollment_and_no_reenrollment(self):
+        h = self.harness()
+        contexts = [{'owner': {'machine_id': 'machine-%d' % i}} for i in range(4)]
+        sessions = []
+        def session(*args, **kwargs):
+            self.assertEqual(args[:3], (h, contexts[len(sessions)],
+                h.evidence / ('runtime-audit-%d' % len(sessions))))
+            self.assertEqual(args[3], {'/source/audit.py': 'source-pin', str(h.cli): 'cli-pin'})
+            self.assertRegex(kwargs['session_id'], '^[0-9a-f]{64}$')
+            item = Mock()
+            item.enroll.side_effect = lambda: self.assertIs(h.runtime_audits[-1], item)
+            sessions.append(item)
+            return item
+        with patch('linux_docker_runtime_audit_evidence.required_source_paths', return_value=['/source/audit.py']), \
+                patch('linux_docker_runtime_audit_evidence.Session', side_effect=session) as constructor:
+            h.enroll_runtime_audits(contexts)
+            self.assertEqual(h.runtime_audits, sessions)
+            for item in sessions:
+                item.enroll.assert_called_once_with()
+            with self.assertRaisesRegex(driver.Rejected, 'fresh'):
+                h.enroll_runtime_audits(contexts)
+            self.assertEqual(constructor.call_count, 4)
+
+    def test_partial_enrollment_is_retained_and_later_machines_are_not_dispatched(self):
+        h = self.harness()
+        contexts = [{'owner': {'machine_id': 'machine-%d' % i}} for i in range(4)]
+        first, failed = Mock(), Mock()
+        first.assert_enrolled_certain = Mock()
+        failed.assert_enrolled_certain = Mock()
+        failed.enroll.side_effect = ValueError('uncertain enrollment')
+        failed.assert_enrolled_certain.side_effect = ValueError('uncertain enrollment')
+        with patch('linux_docker_runtime_audit_evidence.required_source_paths', return_value=['/source/audit.py']), \
+                patch('linux_docker_runtime_audit_evidence.Session', side_effect=[first, failed]) as constructor:
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                h.enroll_runtime_audits(contexts)
+            self.assertEqual(constructor.call_count, 2)
+            self.assertEqual(h.runtime_audits, [first, failed])
+            with self.assertRaisesRegex(ValueError, 'uncertain'):
+                h.assert_certain()
+        first.assert_enrolled_certain.assert_called_once_with()
+
+    def test_capture_requires_certain_cleanup_and_all_four_sessions(self):
+        h = self.harness()
+        h.assert_certain = Mock()
+        with self.assertRaisesRegex(driver.Rejected, 'four'):
+            h.capture_runtime_audits()
+        h.runtime_audits = [Mock() for _ in range(4)]
+        for index, session in enumerate(h.runtime_audits):
+            session.capture.return_value = {'machine': index}
+        self.assertEqual(h.capture_runtime_audits(), [{'machine': i} for i in range(4)])
+        h.assert_certain.side_effect = ValueError('live monitor')
+        with self.assertRaisesRegex(ValueError, 'live monitor'):
+            h.capture_runtime_audits()
+        for session in h.runtime_audits:
+            session.capture.assert_called_once_with()
+
+    def test_final_capture_follows_owned_removal_and_failure_blocks_public_stop(self):
+        info = {'scope': gate.LIFECYCLE_SCOPE, 'suite': 'lifecycle', 'inputs': {},
+                'fixture': '/owned/base', 'fixture_sha256': 'hash',
+                'container_fixture': '/owned/container', 'container_fixture_sha256': 'hash'}
+        for failure in (False, True):
+            with self.subTest(failure=failure):
+                order = []
+                def capture():
+                    order.append('capture')
+                    if failure:
+                        raise ValueError('incomplete journal')
+                    return ['four independently replayed journals']
+                h = types.SimpleNamespace(evidence=Path('/owned/evidence'), root=Path('/owned/root'),
+                    staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
+                    remove_owned=Mock(side_effect=lambda: order.append('remove')),
+                    capture_runtime_audits=Mock(side_effect=capture),
+                    cleanup=Mock(side_effect=lambda: order.append('stop') or {}))
+                with patch.object(gate, 'ComposeHarness', return_value=h), \
+                        patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
+                        patch.object(gate.startup, 'collect_runtime_receipts'), \
+                        patch.object(gate.startup, 'checksum_evidence'), \
+                        patch.object(gate.driver, 'tree_digest', return_value='hash'), \
+                        patch('linux_docker_container_fixture.fixture_contract'), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    self.assertEqual(gate.run(info), int(failure))
+                result = json.loads(output.getvalue())
+                self.assertEqual(order, ['remove', 'capture'] + ([] if failure else ['stop']))
+                self.assertIs(result['docker_parity_certified'], False)
+                self.assertIs(result['aggregate_release_certified'], False)
+                if failure:
+                    h.cleanup.assert_not_called()
+                    self.assertIn('incomplete journal', result['cleanup_errors'][0])
+                else:
+                    self.assertEqual(result['runtime_audit_validation'], ['four independently replayed journals'])
 
 
 class PrePullTrustTests(unittest.TestCase):
@@ -473,6 +576,10 @@ class BuildDispatchTests(unittest.TestCase):
         harness.status = Mock()
         harness.command = Mock(return_value=(("a" * 64 + "  /etc/vz/ca-certificates.crt\n").encode(), b"", 0))
         harness.sentinel = Mock(side_effect=lambda descriptor: {"descriptor": descriptor})
+        harness.enroll_runtime_audits = Mock()
+        enrollment_order = Mock()
+        enrollment_order.attach_mock(harness.enroll_runtime_audits, 'enroll')
+        enrollment_order.attach_mock(harness.sentinel, 'sentinel')
         harness.prepare_image = Mock(return_value={"exact": "images"})
         harness.driver_inputs, harness.validate_driver = Mock(), Mock()
         monitor = Mock()
@@ -488,6 +595,12 @@ class BuildDispatchTests(unittest.TestCase):
                 patch.object(gate.driver, "Driver") as selected:
             result = harness.scenario()
         self.assertEqual(result["machine_slices"], observations)
+        if suite == 'lifecycle':
+            harness.enroll_runtime_audits.assert_called_once_with(contexts)
+            self.assertEqual(enrollment_order.mock_calls, [unittest.mock.call.enroll(contexts)] +
+                             [unittest.mock.call.sentinel(context) for context in contexts])
+        else:
+            harness.enroll_runtime_audits.assert_not_called()
         self.assertEqual(module.run_machine.call_args_list, [unittest.mock.call(
             harness, contexts[i], {"scope": "exact"}, {"proof": "exact"}, {"exact": "images"}, i) for i in range(3)])
         self.assertEqual(monitor.check_interval.call_args_list, [unittest.mock.call(
