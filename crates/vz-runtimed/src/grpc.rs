@@ -416,6 +416,13 @@ where
 {
     let socket_path = socket_path.as_ref();
 
+    #[cfg(target_os = "macos")]
+    let listener = tokio::net::UnixListener::from_std(
+        daemon
+            .control_socket
+            .publish_and_take_listener(socket_path)?,
+    )?;
+    #[cfg(not(target_os = "macos"))]
     let (listener, _socket_guard) = socket_ownership::bind(socket_path)?;
 
     let incoming = UnixListenerStream::new(listener);
@@ -523,6 +530,7 @@ where
     Ok(())
 }
 
+#[cfg(any(test, not(target_os = "macos")))]
 mod socket_ownership;
 #[cfg(test)]
 mod tests;

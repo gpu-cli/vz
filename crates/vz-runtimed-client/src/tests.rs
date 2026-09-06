@@ -1075,6 +1075,94 @@ fn autostart_never_removes_existing_socket_or_store_lock() {
     );
 }
 
+#[test]
+fn managed_delete_requires_both_prior_owner_discovery_and_existing_state() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = DaemonClientConfig {
+        socket_path: tmp.path().join("recovery.sock"),
+        state_store_path: Some(tmp.path().join("state.db")),
+        recover_existing_owner_only: true,
+        ..Default::default()
+    };
+    let owner = tmp.path().join("recovery.sock.owner.json");
+    assert!(validate_spawn_candidate(&config).is_err());
+    std::fs::write(&owner, "not-authority-only-a-discovery-candidate").expect("fixture owner");
+    assert!(validate_spawn_candidate(&config).is_err());
+    assert!(!config.state_store_path.as_ref().expect("path").exists());
+    std::fs::write(
+        config.state_store_path.as_ref().expect("path"),
+        "existing database decoy",
+    )
+    .expect("fixture database");
+    // This client-side check never parses or authorizes recovery. The actual
+    // daemon must independently reject these deliberately invalid contents.
+    assert!(validate_spawn_candidate(&config).is_ok());
+    assert_eq!(
+        std::fs::read_to_string(&owner).expect("retained"),
+        "not-authority-only-a-discovery-candidate"
+    );
+    assert_eq!(
+        std::fs::read_to_string(config.state_store_path.as_ref().expect("path")).expect("retained"),
+        "existing database decoy"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_delete_discovery_rejects_symlink_owner_and_database() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let config = DaemonClientConfig {
+        socket_path: tmp.path().join("recovery.sock"),
+        state_store_path: Some(tmp.path().join("state.db")),
+        recover_existing_owner_only: true,
+        ..Default::default()
+    };
+    let source = tmp.path().join("foreign");
+    std::fs::write(&source, "foreign bytes").expect("decoy");
+    std::os::unix::fs::symlink(&source, tmp.path().join("recovery.sock.owner.json"))
+        .expect("owner link");
+    std::os::unix::fs::symlink(&source, config.state_store_path.as_ref().expect("path"))
+        .expect("database link");
+    assert!(validate_spawn_candidate(&config).is_err());
+    assert_eq!(
+        std::fs::read_to_string(source).expect("retained"),
+        "foreign bytes"
+    );
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn stale_socket_candidate_is_never_removed_by_client_discovery() {
+    use std::os::unix::fs::MetadataExt;
+    let tmp = tempfile::Builder::new()
+        .prefix("vz-recover-")
+        .tempdir_in("/private/tmp")
+        .expect("tempdir");
+    let config = DaemonClientConfig {
+        socket_path: tmp.path().join("recovery.sock"),
+        ..Default::default()
+    };
+    let listener =
+        std::os::unix::net::UnixListener::bind(&config.socket_path).expect("owned fixture socket");
+    let inode = std::fs::symlink_metadata(&config.socket_path)
+        .expect("socket")
+        .ino();
+    drop(listener);
+    assert!(validate_spawn_candidate(&config).is_err());
+    std::fs::write(
+        tmp.path().join("recovery.sock.owner.json"),
+        "candidate only",
+    )
+    .expect("fixture owner");
+    assert!(validate_spawn_candidate(&config).is_ok());
+    assert_eq!(
+        std::fs::symlink_metadata(&config.socket_path)
+            .expect("retained socket")
+            .ino(),
+        inode
+    );
+}
+
 #[tokio::test]
 async fn heartbeat_lease_round_trip_and_signal_exec_missing_returns_not_found() {
     let tmp = tempfile::tempdir().expect("tempdir");

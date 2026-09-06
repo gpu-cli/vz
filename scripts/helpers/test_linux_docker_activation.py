@@ -129,6 +129,17 @@ class ActivationTests(unittest.TestCase):
         self.command["stdout_sha256"] = sha(raw)
         self.h.record.receipts = [self.command]
 
+    def capture_history(self, completions):
+        self.h.record.receipts = []
+        for index, completion in enumerate(completions, 1):
+            raw = json.dumps({"progress": {"completion": completion}}).encode() + b"\n"
+            self.write(self.h.evidence / f"{index:03}-public-up.stdout", raw)
+            command = copy.deepcopy(self.command)
+            command.update(index=index, stdout_sha256=sha(raw))
+            command["argv"][command["argv"].index("--request-id") + 1] = completion["admission"]["request_id"]
+            command["argv"][command["argv"].index("--idempotency-key") + 1] = completion["admission"]["idempotency_key"]
+            self.h.record.receipts.append(command)
+
     def proof(self):
         raw = json.dumps(self.receipt).encode()
         self.write(self.attempt / "receipt.json", raw)
@@ -180,6 +191,87 @@ class ActivationTests(unittest.TestCase):
                 else:
                     completion["operation"]["generation"] = 2
                 self.reject_activation(completion)
+
+    def test_reup_selects_current_generation_and_preserves_earlier_raw_capture(self):
+        historical = copy.deepcopy(self.completion)
+        # Earlier topology definitions/incarnations are not current authority.
+        for section in ("admission", "operation"):
+            historical[section]["definition_digest"] = "sha256:" + "1" * 64
+        new_uuid = "66666666-2222-4333-8444-555555555555"
+        self.incarnation.update(incarnation_id="inc_runtime_" + new_uuid, generation=2)
+        self.machine.update(incarnation_id=self.incarnation["incarnation_id"], incarnation_generation=2)
+        self.descriptor.update(incarnation_id=self.incarnation["incarnation_id"], incarnation_generation=2)
+        runtime = json.loads(self.identity["opaque_id"])
+        runtime["incarnation_id"] = new_uuid
+        self.identity["opaque_id"] = json.dumps(runtime, separators=(",", ":"))
+        current = copy.deepcopy(self.completion)
+        self.environment["lifecycle_generation"] = 3
+        current["operation"]["generation"] = 3
+        for section in ("admission", "operation"):
+            current[section]["request_id"] = "reup-request"
+            current[section]["idempotency_key"] = "reup-key"
+        for completions in ([historical, current], [current, historical]):
+            with self.subTest(current_first=completions[0] is current):
+                self.capture_history(completions)
+                before = {path: path.read_bytes() for path in self.h.evidence.glob("*-public-up.stdout")}
+                receipts = copy.deepcopy(self.h.record.receipts)
+                self.assertEqual(gate.public_activation(self.h, self.environment, self.machine), self.identity)
+                self.assertEqual(self.h.record.receipts, receipts)
+                self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_history_cannot_mask_corrupt_or_foreign_current_generation(self):
+        historical = copy.deepcopy(self.completion)
+        self.environment["lifecycle_generation"] = 3
+        current = copy.deepcopy(self.completion)
+        current["operation"]["generation"] = 3
+        mutations = [
+            lambda row: row["admission"].update(environment_id="env_foreign"),
+            lambda row: row["operation"].update(environment_id="env_foreign"),
+            lambda row: row["admission"].update(project_id="prj_foreign"),
+            lambda row: row["operation"].update(definition_digest="sha256:" + "2" * 64),
+            lambda row: row["operation"]["machine_steps"][0]["resulting_activation"]["runtime_identity"].update(opaque_id="foreign"),
+            lambda row: row["operation"]["machine_steps"][0].update(status="failed"),
+        ]
+        for mutate in mutations:
+            with self.subTest(mutate=mutate):
+                corrupt = copy.deepcopy(current)
+                mutate(corrupt)
+                # A second valid current record must not hide the corrupt one.
+                self.capture_history([historical, corrupt, current])
+                with self.assertRaises((driver.Rejected, KeyError, ValueError)):
+                    gate.public_activation(self.h, self.environment, self.machine)
+
+    def test_history_rejects_invalid_future_and_missing_or_duplicate_current(self):
+        self.environment["lifecycle_generation"] = 3
+        current = copy.deepcopy(self.completion)
+        current["operation"]["generation"] = 3
+        for generation in (None, False, True, 0, -1, "1", 1.0, 4, 2**64):
+            with self.subTest(generation=generation):
+                invalid = copy.deepcopy(self.completion)
+                invalid["operation"]["generation"] = generation
+                self.capture_history([invalid, current])
+                with self.assertRaises(driver.Rejected):
+                    gate.public_activation(self.h, self.environment, self.machine)
+        for completions in ([self.completion], [self.completion, current, current]):
+            with self.subTest(count=len(completions)):
+                self.capture_history(completions)
+                with self.assertRaises(driver.Rejected):
+                    gate.public_activation(self.h, self.environment, self.machine)
+
+    def test_historical_capture_tamper_and_invalid_current_status_generation_reject(self):
+        current = copy.deepcopy(self.completion)
+        current["operation"]["generation"] = 3
+        self.environment["lifecycle_generation"] = 3
+        self.capture_history([self.completion, current])
+        self.h.record.receipts[0]["stdout_sha256"] = "0" * 64
+        with self.assertRaises(driver.Rejected):
+            gate.public_activation(self.h, self.environment, self.machine)
+        self.capture_history([self.completion, current])
+        for generation in (None, False, True, 0, -1, "3", 3.0, 2**64):
+            with self.subTest(generation=generation):
+                self.environment["lifecycle_generation"] = generation
+                with self.assertRaises(driver.Rejected):
+                    gate.public_activation(self.h, self.environment, self.machine)
 
     def test_duplicate_terminal_and_machine_inventory_rejected(self):
         self.capture(self.completion, copies=2)

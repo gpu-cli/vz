@@ -91,10 +91,6 @@ async fn main() -> Result<()> {
         None => vz_runtimed::machine_target_resolver::MachineTargetCatalog::default(),
     };
 
-    // Write logs to a file next to the socket for `vz logs` support.
-    let log_file_path = cli.socket_path.with_extension("log");
-    init_tracing(Some(&log_file_path));
-
     let config = RuntimedConfig {
         state_store_path: cli.state_store_path,
         runtime_data_dir: cli.runtime_data_dir,
@@ -115,6 +111,21 @@ async fn main() -> Result<()> {
         RuntimeDaemon::start_with_checkpoint_retention_policy(config, checkpoint_retention_policy);
     let daemon = Arc::new(daemon.context("failed to start runtime daemon")?);
 
+    // Admission precedes all diagnostic writes. On macOS the descriptor was
+    // pinned by the same control owner as the state store and socket; neither
+    // logs nor PID files are permission to adopt a foreign path.
+    #[cfg(target_os = "macos")]
+    let log_file = daemon
+        .open_owned_log()
+        .context("open admitted daemon log")?;
+    #[cfg(not(target_os = "macos"))]
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(daemon.socket_path().with_extension("log"))
+        .context("open daemon log")?;
+    init_tracing(Some(log_file));
+
     let health = daemon.health();
     info!(
         daemon_id = %health.daemon_id,
@@ -129,7 +140,13 @@ async fn main() -> Result<()> {
 
     // Diagnostic process identity for the exact supervising owner. A PID file
     // is not authority for a client to replace a version-mismatched daemon.
+    #[cfg(target_os = "macos")]
+    daemon
+        .write_owned_pid()
+        .context("write admitted daemon PID")?;
+    #[cfg(not(target_os = "macos"))]
     let pid_path = socket_path.with_extension("pid");
+    #[cfg(not(target_os = "macos"))]
     std::fs::write(&pid_path, std::process::id().to_string())
         .context("failed to write daemon PID file")?;
 
@@ -138,33 +155,25 @@ async fn main() -> Result<()> {
         .context("runtime gRPC server failed")?;
 
     // Clean up PID file on graceful shutdown.
+    #[cfg(not(target_os = "macos"))]
     let _ = std::fs::remove_file(&pid_path);
 
     info!("runtime daemon shutting down");
     Ok(())
 }
 
-fn init_tracing(log_file: Option<&std::path::Path>) {
+fn init_tracing(log_file: Option<std::fs::File>) {
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    if let Some(path) = log_file {
-        if let Some(parent) = path.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if let Ok(file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_target(false)
-                .with_ansi(false)
-                .compact()
-                .with_writer(file)
-                .init();
-            return;
-        }
+    if let Some(file) = log_file {
+        tracing_subscriber::fmt()
+            .with_env_filter(env_filter)
+            .with_target(false)
+            .with_ansi(false)
+            .compact()
+            .with_writer(file)
+            .init();
+        return;
     }
 
     // Fallback: write to stderr (for interactive use / debugging).

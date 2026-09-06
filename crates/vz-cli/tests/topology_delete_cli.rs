@@ -296,7 +296,7 @@ fn delete_rejects_malformed_replay_ids_before_selection_or_daemon_access() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn delete_requires_existing_daemon_even_when_autostart_is_requested() {
+async fn delete_requires_prior_control_owner_before_managed_recovery() {
     let fixture = Fixture::new(true);
     let mut command = fixture.command();
     command

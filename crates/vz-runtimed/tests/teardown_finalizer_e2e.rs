@@ -1487,7 +1487,14 @@ async fn teardown_finalizer_sigkill_restart_replacement_refusal() {
         std::env::var(TEST_BINARY_SHA256_ENV).expect("test binary digest evidence");
     assert_eq!(build_profile, "release");
     assert_eq!(test_binary_sha256.len(), 64);
-    let tmp = tempfile::tempdir().expect("E2E tempdir");
+    // Control ownership records use canonical paths. The default macOS temp
+    // root gains /private when resolved, and installed-product/control plus
+    // its private staging name would exceed sockaddr_un's 103-byte payload.
+    // Keep this fixture-owned root short without weakening production bounds.
+    let tmp = tempfile::Builder::new()
+        .prefix("vz-teardown-")
+        .tempdir_in("/private/tmp")
+        .expect("short E2E tempdir");
     let root = tmp.path();
     let cfg = config(root);
     std::fs::create_dir_all(

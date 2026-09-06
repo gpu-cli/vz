@@ -13,7 +13,7 @@ use vz_runtime_contract::{EnvironmentId, MachineError};
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, environment_stop_error_detail};
 
-use super::runtime_daemon::{connect_existing_daemon_for_state_db, default_state_db_path};
+use super::runtime_daemon::{connect_delete_daemon_for_state_db, default_state_db_path};
 
 #[derive(Args, Debug)]
 pub struct DevDeleteArgs {
@@ -161,7 +161,7 @@ pub async fn cmd_dev_delete(
             "Delete replay identity: --request-id {request_id} --idempotency-key {idempotency_key}"
         );
     }
-    let mut client = connect_existing_daemon_for_state_db(&default_state_db_path())
+    let mut client = connect_delete_daemon_for_state_db(&default_state_db_path())
         .await
         .map_err(|error| local_error("daemon_unavailable", error.to_string()))?;
     let mut stream = client

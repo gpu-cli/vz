@@ -411,3 +411,45 @@ mixed-target topology, full Docker compatibility and aggregate release
 certification remain open. In particular, a stale control socket or missing
 live-session handle is still not authoritative permission to recover/delete a
 Machine.
+
+### Completed-owner daemon recovery implementation (2026-09-05, DEV)
+
+The macOS daemon now admits exact persistent control ownership before database
+migration and diagnostic writes. Persistent database and socket-path locks,
+native process birth observations, pinned file/directory identities and durable
+owner records replace the previous memory-only socket guard on this host.
+Public Up may recover that owner; Delete may start a replacement only for an
+existing database with prior owner discovery. Neither client removes sockets
+or signals an existing daemon. The five public verbs remain unchanged.
+
+See [control recovery and its limits](../../docs/daemon-control-recovery.md).
+Control recovery does not establish Machine quiescence: positive prior Stop
+authority and exact lifecycle ownership remain required. Incomplete preparation,
+interrupted closed-record publication, active/uncertain Machine recovery and
+the full `vz-ehz` acceptance matrix remain open. The installed physical candidate
+must pass independently; unit tests do not certify this capability.
+
+The fresh release-profile backend gate passed at
+`.artifacts/sandbox-vm-e2e/20260906T001521Z/summary.txt`: seven lanes and 50
+selected tests, zero selected failures or ignored tests. It includes all 17
+teardown interruption boundaries and 18 exact-child fixture socket cleanup
+receipts. That fixture cleanup is not production socket-recovery evidence.
+The installed daemon has no test features; the runtime inventory contains only
+youki 0.7.0. Unit/regression checks additionally passed 378 daemon tests (three
+existing backend-specific ignores), 57 client tests, strict production Clippy,
+workspace compilation and all 31 installed CLI checks.
+
+The backend raw manifest binds all 4,062 retained files, independently verified:
+`1f2cbcf60f8490836f979a76d82e60559b88760f69e6e00b53f590bf2a15a01b`.
+
+The separate [installed recovery candidates](../../scripts/helpers/installed_daemon_recovery_e2e.md)
+both failed and remain retained. Candidate 1 exposed a fixed historical
+activation-validator bug. Candidate 2 recovered the exact dead daemon, deleted
+the stopped primary and restarted the neighbor with preserved metadata, but
+Docker could not start its original container. Read-only disk inspection found
+an unjournaled filesystem with corrupted inode references. The existing Stop
+path powers off the VM without Docker/containerd/filesystem drain; `vz-u0u`
+tracks the required durability fix. Both candidates positively Stopped their
+remaining Machines and gracefully closed the replacement daemon, without
+repairing or deleting the retained neighbor data. These partial observations
+do not certify workload persistence, complete crash recovery or 0.4.
