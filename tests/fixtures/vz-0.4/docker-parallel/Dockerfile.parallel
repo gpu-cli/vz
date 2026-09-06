@@ -1,0 +1,9 @@
+ARG FIXTURE_BASE
+FROM ${FIXTURE_BASE} AS build
+ARG FIXTURE_BASE
+ARG FIXTURE_RUN
+ARG FIXTURE_SLOT
+COPY parallel.py /fixture/parallel.py
+RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /fixture/parallel.py
+FROM scratch AS output
+COPY --from=build /out/payload.txt /payload.txt

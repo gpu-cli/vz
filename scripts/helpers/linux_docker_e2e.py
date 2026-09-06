@@ -25,6 +25,7 @@ import linux_docker_image_input as image_input
 SCOPE = "DEV_INSTALLED_LINUX_COMPOSE_NOT_RELEASE_CERTIFICATION"
 BUILD_SCOPE = "DEV_INSTALLED_LINUX_BUILDX_NOT_RELEASE_CERTIFICATION"
 ARTIFACT_SCOPE = "DEV_INSTALLED_LINUX_BUILD_ARTIFACTS_NOT_RELEASE_CERTIFICATION"
+PARALLEL_SCOPE = "DEV_INSTALLED_LINUX_PARALLEL_BUILD_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -32,40 +33,42 @@ require = driver.require
 
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
-    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive")
+    names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
     parser.add_argument("--image-input", default=str(REPO / "tests/fixtures/vz-0.4/docker/python-image-input.json"))
     parser.add_argument("--run-id")
     parser.add_argument("--buildkit-archive")
+    parser.add_argument("--parallel-fixture")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build", "artifacts"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build", "artifacts", "parallel"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.parallel_fixture is None or args.suite == "parallel", "parallel-fixture requires the parallel suite")
     if args.run_id is None:
         args.run_id = args.suite + "-" + uuid.uuid4().hex[:24]
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
-    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts"}),
-            "--buildkit-archive is required only for the build and artifacts suites")
+    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel"}),
+            "--buildkit-archive is required only for Buildx suites")
     return args
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build", "artifacts"}, "full contract unavailable")
+    require(args.suite in {"compose", "build", "artifacts", "parallel"}, "full contract unavailable")
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
     pin = image_input.load(pin_path)
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
-    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE}
+    scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -76,7 +79,7 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
-    if args.suite in {"build", "artifacts"}:
+    if args.suite in {"build", "artifacts", "parallel"}:
         import linux_docker_buildkit_builder as builder
         archive = startup.canonical(args.buildkit_archive)
         info["buildkit"] = builder.preflight_archive(archive)
@@ -88,11 +91,23 @@ def preflight(args, require_host=True):
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)
-    if args.suite == "artifacts":
+    if args.suite in {"artifacts", "parallel"}:
         for name in ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                      "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py"):
             path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == "parallel":
+        from linux_docker_build_parallel import fixture_contract
+        selected = startup.canonical(getattr(args, "parallel_fixture", None) or
+                                     str(REPO / "tests/fixtures/vz-0.4/docker-parallel"))
+        fixture_contract(selected)
+        info.update(parallel_fixture=str(selected), parallel_fixture_sha256=driver.tree_digest(selected))
+        for name in ("linux_docker_build_parallel.py", "linux_docker_parallel_evidence.py", "linux_docker_parallel_health.py"):
+            path = REPO / "scripts/helpers" / name
+            info["inputs"][str(path)] = startup.digest(path)
+        for path in selected.rglob("*"):
+            if path.is_file():
+                info["inputs"][str(path)] = startup.digest(path)
     return info
 
 
@@ -550,8 +565,11 @@ class ComposeHarness(startup.Harness):
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
                 images = self.prepare_image(descriptor)
-                if suite == "artifacts":
-                    from linux_docker_build_artifacts import run_machine
+                if suite in {"artifacts", "parallel"}:
+                    if suite == "artifacts":
+                        from linux_docker_build_artifacts import run_machine
+                    else:
+                        from linux_docker_build_parallel import run_machine
                     begin = time.time_ns()
                     observation = run_machine(self, descriptor, scope, proof, images, index)
                     end = time.time_ns()
@@ -683,6 +701,9 @@ def run(info):
         for path, expected in (info["inputs"] | harness.staged_inputs).items():
             require(startup.digest(Path(path)) == expected, "selected input changed during physical run")
         require(driver.tree_digest(Path(info["fixture"])) == info["fixture_sha256"], "fixture changed during run")
+        if info["suite"] == "parallel":
+            require(driver.tree_digest(Path(info["parallel_fixture"])) == info["parallel_fixture_sha256"],
+                    "parallel fixture changed during run")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:

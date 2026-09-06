@@ -18,7 +18,7 @@ class AdmissionTests(unittest.TestCase):
         names = ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                  "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py")
         for suite, scope in (("compose", gate.SCOPE), ("build", gate.BUILD_SCOPE),
-                             ("artifacts", gate.ARTIFACT_SCOPE)):
+                             ("artifacts", gate.ARTIFACT_SCOPE), ("parallel", gate.PARALLEL_SCOPE)):
             with self.subTest(suite=suite):
                 args = types.SimpleNamespace(suite=suite, fixture="/owned/fixture", image_input="/owned/pin",
                                              buildkit_archive="/owned/buildkit.tar", run_id="owned-run")
@@ -32,7 +32,12 @@ class AdmissionTests(unittest.TestCase):
                     info = gate.preflight(args, require_host=False)
                 self.assertEqual(info["scope"], scope)
                 for name in names:
-                    self.assertEqual(str(gate.REPO / "scripts/helpers" / name) in info["inputs"], suite == "artifacts")
+                    self.assertEqual(str(gate.REPO / "scripts/helpers" / name) in info["inputs"], suite in {"artifacts", "parallel"})
+                self.assertEqual("parallel_fixture" in info, suite == "parallel")
+                if suite == "parallel":
+                    self.assertEqual(info["parallel_fixture"], str(gate.REPO / "tests/fixtures/vz-0.4/docker-parallel"))
+                    for name in ("linux_docker_build_parallel.py", "linux_docker_parallel_evidence.py", "linux_docker_parallel_health.py"):
+                        self.assertIn(str(gate.REPO / "scripts/helpers" / name), info["inputs"])
                 self.assertEqual("buildkit" in info, suite != "compose")
                 self.assertEqual(archive.call_count, int(suite != "compose"))
 
@@ -92,7 +97,7 @@ class AdmissionTests(unittest.TestCase):
         common = []
         for name in gate.startup.OPTIONS:
             common.extend(["--" + name, "/absolute/input"])
-        for suite in ("build", "artifacts"):
+        for suite in ("build", "artifacts", "parallel"):
             with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
                 gate.arguments(["--suite", suite, *common])
             args = gate.arguments(["--suite", suite, *common, "--buildkit-archive", "/owned/buildkit.tar"])
@@ -103,6 +108,11 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(driver.Rejected, "duplicate"):
             gate.arguments(["--suite", "build", *common, "--buildkit-archive", "/owned/buildkit.tar",
                             "--buildkit-archive=/other/buildkit.tar"])
+
+    def test_parallel_fixture_is_not_accepted_for_other_suites(self):
+        for suite in ("build", "compose", "artifacts"):
+            with self.assertRaisesRegex(driver.Rejected, "parallel-fixture"):
+                gate.arguments(["--suite", suite, "--parallel-fixture", "/owned/parallel"])
 
     def test_python_repo_aliases_are_exact(self):
         pin = {"reference": "docker.io/library/python@sha256:" + "a" * 64, "id": "sha256:" + "a" * 64,
@@ -259,8 +269,14 @@ class PrePullTrustTests(unittest.TestCase):
 
 class BuildDispatchTests(unittest.TestCase):
     def test_artifacts_branch_calls_only_artifact_orchestrator_and_monitors_every_machine(self):
+        self.check_owned_orchestrator("artifacts", "linux_docker_build_artifacts")
+
+    def test_parallel_branch_calls_only_parallel_orchestrator_and_monitors_every_machine(self):
+        self.check_owned_orchestrator("parallel", "linux_docker_build_parallel")
+
+    def check_owned_orchestrator(self, suite, module_name):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
-        harness.info = {"suite": "artifacts", "public_ca": {"bundle_sha256": "a" * 64}}
+        harness.info = {"suite": suite, "public_ca": {"bundle_sha256": "a" * 64}}
         harness.cli, harness.evidence = Path("/owned/bin/vz"), Path("/owned/evidence")
         contexts = [{"name": "context-" + str(i), "endpoint": "endpoint-" + str(i),
                      "engine_id": "engine-" + str(i)} for i in range(4)]
@@ -280,7 +296,7 @@ class BuildDispatchTests(unittest.TestCase):
         monitor.summary.return_value = {"samples": "observed"}
         observations = [{"operation": i} for i in range(3)]
         module = types.SimpleNamespace(run_machine=Mock(side_effect=observations))
-        with patch.dict("sys.modules", {"linux_docker_build_artifacts": module}), \
+        with patch.dict("sys.modules", {module_name: module}), \
                 patch.object(gate, "SentinelMonitor", return_value=monitor), \
                 patch.object(gate.startup, "exact_developer_topology"), \
                 patch.object(gate.startup, "document"), \
