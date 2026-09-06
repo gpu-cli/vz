@@ -2,7 +2,7 @@
 
 Both Linux profiles use the same ARM64-musl youki binary, built from the exact
 upstream 0.7.0 commit in `inputs.env`, with the explicitly identified local
-seccomp correction described below. This recipe selects
+corrections described below. This recipe selects
 `v2,cgroupsv2_devices,seccomp` explicitly. It does not enable systemd, v1, WASM,
 or another OCI runtime. Linux init does not use systemd.
 
@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1` suffix so it cannot be mistaken for vanilla upstream.
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1` suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
 Version 2 also corrects the parent-side seccomp listener setup: ordinary filters
@@ -51,6 +51,16 @@ identity, so this does **not** claim to authenticate stale state before the
 initial proc-directory acquisition. Root-entry ordering/failure/handle-lifetime
 regressions are required in artifact evidence; actual root isolation and custom
 seccomp syscall denial still require the physical host-Docker gate.
+
+`runtime-log.patch` is a third **locally authored vz patch**. It preserves
+containerd-compatible JSON `level` (lowercase), `msg`, and RFC3339 `time`, while
+retaining escaped structured fields without allowing them to override metadata.
+JSON file logging appends complete records across invocations; text formatting
+is unchanged. Five formatter/file regressions and a real compiled-runtime
+invalid-create failure are required candidate evidence. The independent
+[pinned-containerd decoder replay](runtime-log-decoder.md) checks the actual
+failure output on the host. This diagnostic fix does not certify successful
+BuildKit startup or Docker parity.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

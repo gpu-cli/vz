@@ -1,0 +1,305 @@
+Locally authored vz runtime-log compatibility correction for pinned youki 0.7.0.
+Apply AFTER seccomp-exec.patch and tenant-root.patch. Not an upstream-reviewed backport.
+Uses runc-compatible JSON level/msg/time, preserving typed event fields and escaping.
+JSON logs append complete records across invocations; text logging is unchanged.
+
+--- a/crates/youki/src/observability.rs
++++ b/crates/youki/src/observability.rs
+@@ -4,8 +4,10 @@
+ use std::str::FromStr;
+ 
+ use anyhow::{Context, Result, bail};
+-use tracing::Level;
++use tracing::{Event, Level, Subscriber};
++use tracing_subscriber::fmt::{FmtContext, FormatEvent, FormatFields, format::Writer};
+ use tracing_subscriber::prelude::*;
++use tracing_subscriber::registry::LookupSpan;
+ 
+ const LOG_FORMAT_TEXT: &str = "text";
+ const LOG_FORMAT_JSON: &str = "json";
+@@ -14,6 +16,55 @@
+     Json,
+ }
+ 
++/// The runc-compatible JSON contract read by containerd's getLastRuntimeError.
++/// Keep event fields nested: fields named level/msg/time must never replace
++/// authoritative metadata or introduce duplicate JSON keys. Delegate collection
++/// and escaping (including typed fields and current-span context) to tracing.
++struct RuntimeJson;
++
++impl<S, N> FormatEvent<S, N> for RuntimeJson
++where
++    S: Subscriber + for<'lookup> LookupSpan<'lookup>,
++    N: for<'writer> FormatFields<'writer> + 'static,
++{
++    fn format_event(
++        &self,
++        ctx: &FmtContext<'_, S, N>,
++        mut writer: Writer<'_>,
++        event: &Event<'_>,
++    ) -> std::fmt::Result {
++        let mut original = String::new();
++        tracing_subscriber::fmt::format()
++            .json()
++            .flatten_event(false)
++            .with_span_list(false)
++            .format_event(ctx, Writer::new(&mut original), event)?;
++        let mut record: serde_json::Map<String, serde_json::Value> =
++            serde_json::from_str(&original).map_err(|_| std::fmt::Error)?;
++        let time = record.remove("timestamp").ok_or(std::fmt::Error)?;
++        let fields = record.get("fields").ok_or(std::fmt::Error)?;
++        let message = match fields.get("message").and_then(serde_json::Value::as_str) {
++            Some(message) => message.to_owned(),
++            // Structured-only errors still need a diagnostic for containerd.
++            None => serde_json::to_string(fields).map_err(|_| std::fmt::Error)?,
++        };
++        record.insert("time".to_owned(), time);
++        record.insert(
++            "level".to_owned(),
++            event
++                .metadata()
++                .level()
++                .as_str()
++                .to_ascii_lowercase()
++                .into(),
++        );
++        record.insert("msg".to_owned(), message.into());
++        let mut encoded = serde_json::to_string(&record).map_err(|_| std::fmt::Error)?;
++        encoded.push('\n');
++        writer.write_str(&encoded)
++    }
++}
++
+ /// If in debug mode, default level is debug to get maximum logging
+ #[cfg(debug_assertions)]
+ const DEFAULT_LOG_LEVEL: &str = "debug";
+@@ -123,8 +174,7 @@
+                 .with(
+                     tracing_subscriber::fmt::layer()
+                         .json()
+-                        .flatten_event(true)
+-                        .with_span_list(false)
++                        .event_format(RuntimeJson)
+                         .with_writer(std::io::stderr),
+                 )
+                 .try_init()
+@@ -147,16 +197,14 @@
+             // Log file with JSON format
+             let file = OpenOptions::new()
+                 .create(true)
+-                .write(true)
+-                .truncate(false)
++                .append(true)
+                 .open(path)
+                 .with_context(|| "failed to open log file")?;
+             subscriber
+                 .with(
+                     tracing_subscriber::fmt::layer()
+                         .json()
+-                        .flatten_event(true)
+-                        .with_span_list(false)
++                        .event_format(RuntimeJson)
+                         .with_writer(file),
+                 )
+                 .try_init()
+@@ -174,8 +222,200 @@
+     use libcontainer::test_utils::TestCallbackError;
+ 
+     use super::*;
++
++    fn runtime_log_records(path: &Path) -> Vec<serde_json::Value> {
++        let raw = std::fs::read_to_string(path).expect("read actual runtime log");
++        assert!(raw.ends_with('\n'), "complete newline-terminated records");
++        raw.lines()
++            .map(|line| {
++                let value: serde_json::Value = serde_json::from_str(line).expect("JSON log record");
++                chrono::DateTime::parse_from_rfc3339(value["time"].as_str().expect("string time"))
++                    .expect("containerd-compatible RFC3339 time");
++                assert!(value["msg"].is_string());
++                value
++            })
++            .collect()
++    }
++
++    #[test]
++    fn test_vz_runtime_log_formatter_preserves_fields_and_escaping() {
++        let directory = tempfile::tempdir().expect("test directory");
++        let path = directory.path().join("runtime.json");
++        let file = std::fs::File::create(&path).expect("create test log");
++        let subscriber = tracing_subscriber::registry().with(
++            tracing_subscriber::fmt::layer()
++                .json()
++                .event_format(RuntimeJson)
++                .with_writer(file),
++        );
++        let message = "quoted \"error\"\\path\nsecond line\t雪\0";
++        tracing::subscriber::with_default(subscriber, || {
++            let span = tracing::info_span!("owned_span", machine = "fixture");
++            let _entered = span.enter();
++            tracing::trace!("trace record");
++            tracing::debug!("debug record");
++            tracing::info!("info record");
++            tracing::warn!("warn record");
++            tracing::error!(
++                level = "info",
++                msg = "not the diagnostic",
++                time = "not a timestamp",
++                attempts = 7_u64,
++                negative = -3_i64,
++                fraction = 1.5_f64,
++                active = true,
++                detail = ?vec!["one", "two"],
++                "{message}"
++            );
++            tracing::error!(errno = 2_i64);
++        });
++        let records = runtime_log_records(&path);
++        assert_eq!(records.len(), 6);
++        let levels: Vec<_> = records
++            .iter()
++            .map(|row| row["level"].as_str().unwrap())
++            .collect();
++        assert_eq!(levels, ["trace", "debug", "info", "warn", "error", "error"]);
++        let row = &records[4];
++        assert_eq!(row["msg"], message);
++        assert_eq!(row["fields"]["message"], message);
++        assert_eq!(row["fields"]["level"], "info");
++        assert_eq!(row["fields"]["msg"], "not the diagnostic");
++        assert_eq!(row["fields"]["time"], "not a timestamp");
++        assert_eq!(row["fields"]["attempts"], 7);
++        assert_eq!(row["fields"]["negative"], -3);
++        assert_eq!(row["fields"]["fraction"], 1.5);
++        assert_eq!(row["fields"]["active"], true);
++        assert_eq!(row["fields"]["detail"], "[\"one\", \"two\"]");
++        assert_eq!(row["span"]["name"], "owned_span");
++        assert_eq!(row["span"]["machine"], "fixture");
++        assert!(
++            row["target"]
++                .as_str()
++                .unwrap()
++                .ends_with("observability::tests")
++        );
++        assert_eq!(records[5]["msg"], "{\"errno\":2}");
++    }
+ 
+     #[test]
++    fn test_vz_runtime_log_file_captures_failure_chain() -> Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("runtime.json");
++        let missing = directory.path().join("absent-runtime-input");
++        let failure = std::fs::read(&missing)
++            .context("fixture create failure: missing runtime input")
++            .expect_err("input must not exist");
++        let expected = format!("error in executing command: {failure:?}");
++        libcontainer::test_utils::test_in_child_process(|| {
++            init(ObservabilityConfig {
++                log_file: Some(path.clone()),
++                log_format: Some(LOG_FORMAT_JSON.to_owned()),
++                log_level: Some("error".to_owned()),
++                ..Default::default()
++            })
++            .map_err(|err| TestCallbackError::Other(err.into()))?;
++            // Same formatting used by main() on the actual command-error path.
++            tracing::error!("error in executing command: {:?}", failure);
++            Ok(())
++        })?;
++        let records = runtime_log_records(&path);
++        assert_eq!(records.len(), 1);
++        assert_eq!(records[0]["level"], "error");
++        assert_eq!(records[0]["msg"], expected);
++        assert!(expected.contains("Caused by:"));
++        assert!(expected.contains("os error 2"));
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_runtime_log_create_validation_failure() -> Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("runtime.json");
++        libcontainer::test_utils::test_in_child_process(|| {
++            init(ObservabilityConfig {
++                log_file: Some(path.clone()),
++                log_format: Some(LOG_FORMAT_JSON.to_owned()),
++                log_level: Some("error".to_owned()),
++                ..Default::default()
++            })
++            .map_err(|err| TestCallbackError::Other(err.into()))?;
++            let args = liboci_cli::Create {
++                bundle: directory.path().to_path_buf(),
++                console_socket: None,
++                pid_file: None,
++                no_pivot: false,
++                no_new_keyring: false,
++                preserve_fds: 0,
++                container_id: ".".to_owned(),
++            };
++            // The real create handler rejects this ID before reading a spec
++            // or constructing any container namespaces/processes.
++            let failure =
++                crate::commands::create::create(args, directory.path().to_path_buf(), false)
++                    .expect_err("invalid ID must fail before container creation");
++            tracing::error!("error in executing command: {:?}", failure);
++            Ok(())
++        })?;
++        let records = runtime_log_records(&path);
++        assert_eq!(records.len(), 1);
++        assert_eq!(records[0]["level"], "error");
++        assert_eq!(
++            records[0]["msg"],
++            "error in executing command: container id can't be used to represent a file name (such as . or ..)"
++        );
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_runtime_log_file_reopen_appends_complete_records() -> Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("runtime.json");
++        let first = "first invocation error with a long tail: ".repeat(100);
++        for message in [first.as_str(), "short second error"] {
++            libcontainer::test_utils::test_in_child_process(|| {
++                init(ObservabilityConfig {
++                    log_file: Some(path.clone()),
++                    log_format: Some(LOG_FORMAT_JSON.to_owned()),
++                    log_level: Some("error".to_owned()),
++                    ..Default::default()
++                })
++                .map_err(|err| TestCallbackError::Other(err.into()))?;
++                tracing::error!("{message}");
++                Ok(())
++            })?;
++        }
++        let records = runtime_log_records(&path);
++        assert_eq!(records.len(), 2);
++        assert_eq!(records[0]["msg"], first);
++        assert_eq!(records[1]["msg"], "short second error");
++        assert!(records.iter().all(|row| row["level"] == "error"));
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_runtime_log_text_behavior_unchanged() -> Result<()> {
++        let directory = tempfile::tempdir()?;
++        let path = directory.path().join("runtime.txt");
++        libcontainer::test_utils::test_in_child_process(|| {
++            init(ObservabilityConfig {
++                log_file: Some(path.clone()),
++                log_format: Some(LOG_FORMAT_TEXT.to_owned()),
++                log_level: Some("error".to_owned()),
++                ..Default::default()
++            })
++            .map_err(|err| TestCallbackError::Other(err.into()))?;
++            tracing::error!("text runtime failure");
++            Ok(())
++        })?;
++        let raw = std::fs::read_to_string(path)?;
++        assert!(raw.contains("ERROR"));
++        assert!(raw.contains("text runtime failure"));
++        assert!(serde_json::from_str::<serde_json::Value>(&raw).is_err());
++        Ok(())
++    }
++
++    #[test]
+     fn test_detect_log_level() {
+         let test = vec![
+             ("error", tracing::Level::ERROR),

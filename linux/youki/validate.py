@@ -2,6 +2,8 @@
 """Validate a source-built youki candidate before reuse or atomic installation."""
 import hashlib
 import json
+import datetime
+import re
 from pathlib import Path
 import stat
 import struct
@@ -28,6 +30,14 @@ REQUIRED_ROOT_TESTS = (
     "test_vz_tenant_root_rejects_missing_process_and_invalid_fd_floor",
     "test_vz_tenant_root_refuses_exited_pinned_init",
 )
+REQUIRED_LOG_TESTS = (
+    "test_vz_runtime_log_formatter_preserves_fields_and_escaping",
+    "test_vz_runtime_log_file_captures_failure_chain",
+    "test_vz_runtime_log_create_validation_failure",
+    "test_vz_runtime_log_file_reopen_appends_complete_records",
+    "test_vz_runtime_log_text_behavior_unchanged",
+)
+RUNTIME_LOG_MESSAGE = "error in executing command: container id can't be used to represent a file name (such as . or ..)"
 
 
 def require(condition, message):
@@ -35,10 +45,10 @@ def require(condition, message):
         raise ValueError(message)
 
 
-def read_regular(path, limit=32 * 1024 * 1024):
+def read_regular(path, limit=32 * 1024 * 1024, allow_empty=False):
     info = path.lstat()
     require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1, f"not a single-link regular file: {path}")
-    require(0 < info.st_size <= limit, f"invalid file size: {path}")
+    require((allow_empty or info.st_size > 0) and info.st_size <= limit, f"invalid file size: {path}")
     return path.read_bytes()
 
 
@@ -62,7 +72,9 @@ def validate_elf(data):
 
 
 def validate(candidate, source):
-    names = {"youki", "features.json", "elf.txt", "version.txt", "inputs.env", "apk.sha256", "source-lock.sha256", "cargo-features.txt", "upstream-tests.txt", "seccomp-exec.patch", "seccomp-exec-tests.txt", "tenant-root.patch", "tenant-root-tests.txt"}
+    names = {"youki", "features.json", "elf.txt", "version.txt", "inputs.env", "apk.sha256", "source-lock.sha256", "cargo-features.txt", "upstream-tests.txt", "seccomp-exec.patch", "seccomp-exec-tests.txt", "tenant-root.patch", "tenant-root-tests.txt",
+             "runtime-log.patch", "runtime-log-tests.txt", "runtime-log.json", "runtime-log-stdout.txt",
+             "runtime-log-stderr.txt", "runtime-log-exit-status.txt"}
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -71,17 +83,19 @@ def validate(candidate, source):
         require(len(digest) == 64 and all(c in "0123456789abcdef" for c in digest), "invalid checksum")
         checksums[name] = digest
     require(set(checksums) == names, "incomplete youki evidence manifest")
-    contents = {name: read_regular(candidate / name) for name in names}
+    contents = {name: read_regular(candidate / name, allow_empty=name in {"runtime-log-stdout.txt", "runtime-log-stderr.txt"}) for name in names}
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
     require(inputs["YOUKI_FEATURES"] == "v2,cgroupsv2_devices,seccomp", "unexpected runtime feature selection")
     require(checksums["seccomp-exec.patch"] == inputs["YOUKI_PATCH_SHA256"], "pinned local seccomp patch mismatch")
     require(checksums["tenant-root.patch"] == inputs["YOUKI_ROOT_PATCH_SHA256"], "pinned local root patch mismatch")
+    require(checksums["runtime-log.patch"] == inputs["YOUKI_LOG_PATCH_SHA256"], "pinned local runtime log patch mismatch")
+    validate_runtime_log(contents)
     root_tests = contents["tenant-root-tests.txt"].decode()
     for test in REQUIRED_ROOT_TESTS:
         require(any(line.startswith("test ") and line.endswith("::" + test + " ... ok") for line in root_tests.splitlines()), f"missing passing local root regression: {test}")
@@ -101,9 +115,42 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_elf(contents["youki"])
     return checksums["youki"]
+
+
+def validate_runtime_log(contents):
+    tests = contents["runtime-log-tests.txt"].decode()
+    for test in REQUIRED_LOG_TESTS:
+        require(any(line.startswith("test ") and line.endswith("::" + test + " ... ok") for line in tests.splitlines()),
+                f"missing passing runtime log regression: {test}")
+    require("FAILED" not in tests and "test result: ok." in tests, "failed runtime log tests")
+    require(contents["runtime-log-exit-status.txt"] == b"1\n", "runtime failure probe did not exit exactly one")
+    require(contents["runtime-log-stdout.txt"] == b"", "runtime failure probe emitted unexpected stdout")
+    require(contents["runtime-log-stderr.txt"] == ("Error: " + RUNTIME_LOG_MESSAGE.removeprefix("error in executing command: ") + "\n").encode(),
+            "runtime failure probe emitted unexpected stderr")
+    raw = contents["runtime-log.json"]
+    require(len(raw) <= 65536 and raw.endswith(b"\n") and len(raw.splitlines()) == 1,
+            "runtime failure probe must contain one complete JSON record")
+    def unique(pairs):
+        row = {}
+        for key, value in pairs:
+            require(key not in row, "duplicate runtime log field")
+            row[key] = value
+        return row
+    row = json.loads(raw.decode("utf-8"), object_pairs_hook=unique)
+    require(isinstance(row, dict) and row.get("level") == "error" and row.get("msg") == RUNTIME_LOG_MESSAGE,
+            "runtime log does not preserve containerd-compatible error")
+    require(set(row) == {"level", "msg", "time", "target", "fields"}
+            and row["target"] == "youki" and row["fields"] == {"message": RUNTIME_LOG_MESSAGE}
+            and isinstance(row.get("time"), str),
+            "runtime log uses incompatible metadata")
+    require(re.fullmatch(r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})", row["time"]) is not None,
+            "runtime log time is not RFC3339")
+    timestamp = datetime.datetime.fromisoformat(row["time"].replace("Z", "+00:00"))
+    require(timestamp.tzinfo is not None, "runtime log time lacks timezone")
+    require(timestamp != datetime.datetime.min.replace(tzinfo=datetime.timezone.utc), "runtime log time is zero")
 
 
 if __name__ == "__main__":

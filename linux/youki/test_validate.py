@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import REQUIRED_LOCAL_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, validate, validate_elf
+from validate import REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -33,7 +33,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -43,6 +43,12 @@ class CandidateTests(unittest.TestCase):
             "seccomp-exec-tests.txt": ("\n".join("test fixture::" + name + " ... ok" for name in REQUIRED_LOCAL_TESTS) + "\ntest result: ok.\n").encode(),
             "tenant-root.patch": (self.source / "tenant-root.patch").read_bytes(),
             "tenant-root-tests.txt": ("\n".join("test fixture::" + name + " ... ok" for name in REQUIRED_ROOT_TESTS) + "\ntest result: ok.\n").encode(),
+            "runtime-log.patch": (self.source / "runtime-log.patch").read_bytes(),
+            "runtime-log-tests.txt": ("\n".join("test fixture::" + name + " ... ok" for name in REQUIRED_LOG_TESTS) + "\ntest result: ok.\n").encode(),
+            "runtime-log.json": (json.dumps({"level": "error", "msg": RUNTIME_LOG_MESSAGE, "time": "2026-09-06T00:00:00Z", "target": "youki", "fields": {"message": RUNTIME_LOG_MESSAGE}}) + "\n").encode(),
+            "runtime-log-stdout.txt": b"",
+            "runtime-log-stderr.txt": ("Error: " + RUNTIME_LOG_MESSAGE.removeprefix("error in executing command: ") + "\n").encode(),
+            "runtime-log-exit-status.txt": b"1\n",
         }
         self.publish()
 
@@ -141,8 +147,51 @@ class CandidateTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "stale build input"):
             validate(self.root, self.source)
 
+    def test_runtime_log_patch_and_each_formatter_regression_are_required(self):
+        original = self.files["runtime-log-tests.txt"]
+        for test in REQUIRED_LOG_TESTS:
+            self.files["runtime-log-tests.txt"] = original.replace((test + " ... ok").encode(), (test + " ... ignored").encode())
+            self.publish()
+            with self.subTest(test=test), self.assertRaisesRegex(ValueError, "missing passing runtime log regression"):
+                validate(self.root, self.source)
+        self.files["runtime-log-tests.txt"] = original
+        self.files["runtime-log.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_runtime_failure_must_be_real_complete_containerd_compatible_error(self):
+        original = self.files["runtime-log.json"]
+        good = json.loads(original)
+        bad_records = [good | {"level": "ERROR"}, good | {"level": "info"}, good | {"msg": "generic exit1"},
+                       good | {"time": "not a timestamp"}, good | {"time": "2026-09-06T00:00:00"},
+                       good | {"message": RUNTIME_LOG_MESSAGE}, good | {"timestamp": good["time"]},
+                       good | {"time": "2026-09-06 00:00:00Z"}, good | {"time": "0001-01-01T00:00:00Z"}, good | {"target": "other"},
+                       good | {"fields": {"message": "forged"}}, good | {"fields": {"message": RUNTIME_LOG_MESSAGE, "level": "error"}}]
+        for row in bad_records:
+            self.files["runtime-log.json"] = (json.dumps(row) + "\n").encode()
+            self.publish()
+            with self.subTest(row=row), self.assertRaises(ValueError):
+                validate(self.root, self.source)
+        for raw in (b"", original.rstrip(b"\n"), original + original, b"\xef\xbb\xbf" + original,
+                    b"\xfe\xff" + original.decode().encode("utf-16-be"),
+                    original.replace(b'"level": "error"', b'"level": "info", "level": "error"')):
+            self.files["runtime-log.json"] = raw
+            self.publish()
+            with self.subTest(raw=raw), self.assertRaises(ValueError):
+                validate(self.root, self.source)
+        self.files["runtime-log.json"] = original
+        for name, bad in (("runtime-log-exit-status.txt", b"0\n"), ("runtime-log-exit-status.txt", b"2\n"),
+                          ("runtime-log-stdout.txt", b"unexpected success\n"), ("runtime-log-stderr.txt", b"generic error\n")):
+            old = self.files[name]
+            self.files[name] = bad
+            self.publish()
+            with self.subTest(name=name, bad=bad), self.assertRaises(ValueError):
+                validate(self.root, self.source)
+            self.files[name] = old
+
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
