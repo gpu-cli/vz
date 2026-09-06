@@ -16,6 +16,7 @@ coverage_files=(
   "crates/vz-runtimed-client/src/machine_exec.rs"
   "crates/vz-runtimed-client/src/machine_exec_tests.rs"
   "crates/vz-runtimed-client/src/environment_up.rs"
+  "crates/vz-runtimed-client/src/environment_delete.rs"
   "crates/vz-cli/tests/topology_up_cli.rs"
   "crates/vz-cli/tests/topology_stop_cli.rs"
   "crates/vz-cli/tests/topology_exec_cli.rs"

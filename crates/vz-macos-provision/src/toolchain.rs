@@ -1,6 +1,6 @@
-//! Pinned Swift/SDK receipt embedded by the maintainer in a native image.
+//! Pinned Swift/SDK receipt embedded by local setup or maintainer preparation.
 //!
-//! The bootstrap patch authenticates the full initial installation. This small
+//! The prepared-image identity binds the full initial installation. This small
 //! receipt binds its input archive and the compiler/SDK anchors checked on boot;
 //! it is not an attestation of every mutable file in a running Machine.
 use anyhow::{Result, ensure};

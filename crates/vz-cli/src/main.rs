@@ -251,8 +251,8 @@ mod tests {
             .get_subcommands()
             .map(|child| child.get_name())
             .collect::<Vec<_>>();
-        // Transitional DEV assertion, not the five-verb release acceptance gate.
-        assert_eq!(names, ["up", "stop", "exec", "status", "help"]);
+        // Setup is a separate executable; the Environment CLI keeps five verbs.
+        assert_eq!(names, ["up", "stop", "delete", "exec", "status", "help"]);
         for child in command.get_subcommands() {
             assert!(!child.is_hide_set());
             assert_eq!(child.get_all_aliases().count(), 0);

@@ -1,4 +1,4 @@
-//! Guest toolchain preparation shared by setup and maintainer tooling.
+//! Guest toolchain preparation shared by setup and setup tooling.
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use sha2::{Digest, Sha256};
@@ -52,11 +52,8 @@ async fn execute(
             .await
     })
     .await
-    .context("maintainer command deadline")??;
-    ensure!(
-        output.exit_code == 0,
-        "maintainer command failed: {output:?}"
-    );
+    .context("setup command deadline")??;
+    ensure!(output.exit_code == 0, "setup command failed: {output:?}");
     Ok(output)
 }
 
@@ -90,7 +87,7 @@ async fn upload(
                 client.stdin_write(id, &buffer[..count]).await?;
                 sent += count as u64;
                 if sent % (128 * 1024 * 1024) == 0 {
-                    tracing::info!(sent, "maintainer input transfer");
+                    tracing::info!(sent, "setup input transfer");
                 }
             }
             client.stdin_close(id).await?;
@@ -100,12 +97,12 @@ async fn upload(
         let (_, output) = tokio::try_join!(send, receive)?;
         ensure!(
             output.exit_code == 0 && output.stderr.is_empty(),
-            "maintainer upload failed: {output:?}"
+            "setup upload failed: {output:?}"
         );
         Ok::<_, anyhow::Error>(())
     })
     .await
-    .context("maintainer upload deadline")?
+    .context("setup upload deadline")?
 }
 
 async fn preflight(
@@ -156,14 +153,14 @@ async fn preflight(
             Ok::<_, anyhow::Error>(stream.collect_checked().await?)
         })
         .await
-        .context("maintainer Swift fixture deadline")??;
+        .context("setup Swift fixture deadline")??;
         fs::write(
             output.join(format!("preflight-{name}.json")),
             serde_json::to_vec_pretty(&observed)?,
         )?;
         ensure!(
             observed.exit_code == 0,
-            "maintainer Swift {name} failed: {observed:?}"
+            "setup Swift {name} failed: {observed:?}"
         );
         if name == "test" {
             ensure!(
@@ -262,7 +259,7 @@ pub async fn run(args: Args) -> Result<()> {
     let result = async {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
         let mut client = loop {
-            ensure!(tokio::time::Instant::now() < deadline, "maintainer agent did not become ready");
+            ensure!(tokio::time::Instant::now() < deadline, "setup agent did not become ready");
             if let Ok(mut client) = GrpcAgentClient::connect_default(Arc::clone(&vm)).await {
                 if client.ping().await.is_ok() { break client; }
             }
@@ -347,7 +344,7 @@ pub async fn run(args: Args) -> Result<()> {
     result?;
     ensure!(
         matches!(stopped, Ok(Ok(()))),
-        "graceful maintainer shutdown failed"
+        "graceful setup shutdown failed"
     );
     Ok(())
 }

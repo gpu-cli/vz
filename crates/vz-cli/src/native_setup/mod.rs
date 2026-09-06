@@ -129,8 +129,10 @@ pub(super) fn hash_file(path: &Path) -> Result<(String, u64)> {
     Ok((format!("{:x}", hash.finalize()), size))
 }
 fn private(path: &Path) -> Result<()> {
-    if !path.exists() {
-        fs::DirBuilder::new().mode(0o700).create(path)?;
+    match fs::DirBuilder::new().mode(0o700).create(path) {
+        Ok(()) => (),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+        Err(error) => return Err(error.into()),
     }
     ensure!(
         path.canonicalize()? == path,
@@ -618,4 +620,49 @@ fn provision(disk: &Path) -> Result<()> {
     result?;
     detached?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn simultaneous_setup_directory_creation_is_safe_and_reusable() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let path = root.path().canonicalize()?.join("macos-local");
+        std::thread::scope(|scope| -> Result<()> {
+            let threads = (0..16)
+                .map(|_| scope.spawn(|| private(&path)))
+                .collect::<Vec<_>>();
+            for thread in threads {
+                thread
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("setup thread failed"))??;
+            }
+            Ok(())
+        })?;
+        assert_eq!(fs::metadata(path)?.mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn local_stamp_detects_replacement_and_rejects_links() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let bundle = root.path().canonicalize()?.join("bundle");
+        private(&bundle)?;
+        let digest = "a".repeat(64);
+        let path = bundle.join(&digest);
+        fs::write(&path, b"local image")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+        let before = LocalStamp::read(&bundle, &digest)?;
+        fs::remove_file(&path)?;
+        fs::write(&path, b"local image")?;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o400))?;
+        assert!(before != LocalStamp::read(&bundle, &digest)?);
+        let alias = bundle.join("b".repeat(64));
+        fs::hard_link(&path, &alias)?;
+        assert!(LocalStamp::read(&bundle, &digest).is_err());
+        assert!(LocalStamp::read(&bundle, "../outside").is_err());
+        Ok(())
+    }
 }

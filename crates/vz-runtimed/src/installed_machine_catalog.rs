@@ -74,7 +74,15 @@ async fn write_catalog(
         lock.metadata()?.is_file() && lock.metadata()?.nlink() == 1,
         "invalid catalog lock"
     );
-    fs2::FileExt::lock_exclusive(&lock)?;
+    loop {
+        match fs2::FileExt::try_lock_exclusive(&lock) {
+            Ok(()) => break,
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
     let mut catalog = if prefix.join("machine-target-catalog.json").exists() {
         MachineTargetCatalog::from_file(&prefix.join("machine-target-catalog.json"))?
     } else {

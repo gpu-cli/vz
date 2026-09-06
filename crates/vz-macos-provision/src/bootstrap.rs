@@ -1,4 +1,4 @@
-//! Exact macOS base/patch preparation, independent of catalog and VM lifecycle.
+//! Local macOS image and optional base/patch preparation, separate from VM lifecycle.
 //!
 //! [`BootstrapCache::prepare`] accepts a manifest pin from an authenticated catalog.
 //! Persist that pin in Environment state first: this layer never follows `latest`.

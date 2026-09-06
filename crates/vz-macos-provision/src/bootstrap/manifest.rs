@@ -41,7 +41,8 @@ pub struct Platform {
     pub auxiliary_storage_seed: Artifact,
 }
 
-/// Version 1 of the exact base + delta delivery contract.
+/// Versioned preparation contract: schema 1 uses exact base + delta; schema 2
+/// uses a complete locally provisioned image.
 ///
 /// Authenticate a pin for these exact JSON bytes using the release catalog,
 /// then persist that pin in Environment state before invoking preparation.
@@ -53,7 +54,7 @@ pub struct ReleaseManifest {
     /// only here; this flag never establishes release conformance.
     #[serde(default)]
     pub development: bool,
-    /// Format version; currently 1.
+    /// Format version: 1 for base + delta, 2 for a local prepared image.
     pub schema_version: u32,
     /// Exact macOS guest version, with major version at least 26.
     pub macos_version: String,
