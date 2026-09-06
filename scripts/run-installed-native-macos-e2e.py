@@ -37,6 +37,7 @@ def main():
                         help="require a pinned toolchain and build/test/run the Swift guest fixture")
     parser.add_argument("--require-clean", action="store_true", help="prove Xcode, CLT, and toolchain receipt are absent")
     parser.add_argument("--channel", default="latest", help="installed macOS template channel to resolve")
+    parser.add_argument("--exercise-capacity", action="store_true", help="on a two-macOS-VM host, prove rejected third start can be Stopped and Deleted")
     args = parser.parse_args()
     assert not (args.require_clean and args.require_swift)
     # The setup harness deliberately gives product processes a minimal PATH.
@@ -251,7 +252,7 @@ def main():
         with (evidence / "platform-audit.log").open("w") as log:
             audit = subprocess.Popen([
                 sys.executable, str(Path(__file__).parent / "helpers/native_macos_platform_audit.py"),
-                str(evidence)], stdout=log, stderr=log)
+                str(evidence), "--expected-machines", "3" if args.exercise_capacity else "2"], stdout=log, stderr=log)
     try:
         if args.expect_preparation_failure:
             cli("corrupt-up", "up", "--timeout", "30", timeout=45, expected=2)
@@ -317,6 +318,20 @@ def main():
         if args.require_clean:
             run("second-clean", [binary_dir / "vz", "exec", "--environment", "native-second", "--no-stdin", "--", "/bin/sh", "-c",
                  "set -eu; test ! -e /Applications/Xcode.app; test ! -e /Library/Developer/CommandLineTools; test ! -e /usr/local/share/vz/toolchain.json"])
+        if args.exercise_capacity:
+            run("capacity-up", [binary_dir / "vz", "up", "--environment", "native-capacity",
+                                "--timeout", "120"], timeout=150, expected=2)
+            rejection = json.loads((evidence / "capacity-up.stderr").read_text())["error"]
+            assert "maximum supported number of active" in rejection["message"], rejection
+            assert "original VM retained for Stop" in rejection["message"], rejection
+            run("capacity-stop", [binary_dir / "vz", "stop", "--environment", "native-capacity",
+                                  "--timeout", "120"], timeout=150)
+            run("capacity-delete", [binary_dir / "vz", "delete", "--environment", "native-capacity",
+                                    "--timeout", "120"], timeout=150)
+            for environment in ["native-e2e", "native-second"]:
+                run("capacity-survivor-" + environment,
+                    [binary_dir / "vz", "exec", "--environment", environment,
+                     "--no-stdin", "--", "/usr/bin/true"])
         if args.require_swift:
             # macOS can refuse writes inside Xcode even for guest root. Alter
             # the mutable receipt instead, and prove the write happened before
@@ -356,7 +371,8 @@ def main():
         summary.update(passed=False, error=str(error))
         (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
         print("FAILED: retaining original daemon; use layout.json for positive Stop/Delete.", flush=True)
-        time.sleep(3600)
+        # The daemon outlives this harness; report the failure immediately so
+        # a parent setup gate can retain its own failure receipt too.
         raise
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
     if audit is not None and audit.wait(timeout=15) != 0:

@@ -28,6 +28,26 @@ pub struct NativeMacosLease {
     _guard: OwnedRwLockReadGuard<()>,
 }
 
+/// A start failure retains the exact VM lease so the controller can admit Stop.
+#[derive(Debug, thiserror::Error)]
+pub enum NativeMacosBootError {
+    #[error(transparent)]
+    BeforeStart(#[from] Error),
+    #[error("native VM start failed: {error}")]
+    Start {
+        error: Error,
+        lease: NativeMacosLease,
+    },
+}
+
+impl std::fmt::Debug for NativeMacosLease {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("NativeMacosLease")
+            .field("identity", &self.boot.identity)
+            .finish_non_exhaustive()
+    }
+}
+
 impl NativeMacosRuntime {
     pub fn new(directory: PathBuf, cpus: u8, memory_mb: u64) -> Self {
         Self {
@@ -39,14 +59,14 @@ impl NativeMacosRuntime {
         }
     }
 
-    pub async fn boot(&self, name: &str) -> Result<NativeMacosLease, Error> {
+    pub async fn boot(&self, name: &str) -> Result<NativeMacosLease, NativeMacosBootError> {
         let guard = Arc::clone(&self.lifecycle).read_owned().await;
         let mut live = self.live.lock().await;
         if let Some(boot) = live.as_ref() {
             if boot.identity.stack_id != name
                 || *boot.vm.state_stream().borrow() != VmState::Running
             {
-                return Err(error("native boot is retained but not safely reusable"));
+                return Err(error("native boot is retained but not safely reusable").into());
             }
             return Ok(NativeMacosLease {
                 boot: Arc::clone(boot),
@@ -77,11 +97,18 @@ impl NativeMacosRuntime {
         });
         // Retain before dispatch: even a failed start is not absence evidence.
         *live = Some(Arc::clone(&boot));
-        boot.vm.start().await.map_err(error)?;
-        Ok(NativeMacosLease {
+        let result = boot.vm.start().await;
+        let lease = NativeMacosLease {
             boot,
             _guard: guard,
-        })
+        };
+        match result {
+            Ok(()) => Ok(lease),
+            Err(cause) => Err(NativeMacosBootError::Start {
+                error: error(cause),
+                lease,
+            }),
+        }
     }
 
     pub async fn stop_exact(&self, request: &StackRuntimeShutdownRequest) -> Result<(), Error> {
