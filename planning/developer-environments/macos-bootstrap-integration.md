@@ -126,3 +126,70 @@ reports 39 existing unwrap/expect diagnostics in the original provisioning tests
 those test bodies match main exactly. Evidence is retained at
 `.artifacts/macos26-bootstrap/foundation-verification/` in the bootstrap worktree.
 The full native and aggregate gates remain required before closing `vz-mzs.11.4`.
+
+## Installed-user validation findings (in progress)
+
+The foundation was landed before a successful installed native happy path; that
+was premature. Further runtime/backend changes must stay off main until the
+relevant installed user flow passes. The new source guidance records this as a
+merge gate, separately from keeping the release issue open.
+
+The first real attempts on the macOS 26.3.1(a) host found:
+
+- A fresh signed installed `vz up` requesting a native macOS Machine returns
+  `unsupported_operation`: the current Up adapter supports only Linux/ARM64.
+  `vz status` then reports `project_not_found`, confirming no topology admission.
+  The probe used an empty catalog to expose the missing native adapter; it does
+  not claim that a published macOS catalog entry exists.
+- The actual `VZMacOSInstaller` call for the downloaded 26.6.2 / 25G83 IPSW
+  fails with VZErrorDomain 10006, requiring a software update. The earlier
+  read-only hardware-model compatibility check was insufficient to qualify it.
+- The alternate 26.3.1 / 25D2128 restore input downloaded completely and matched
+  its Apple CDN digest and length (19,330,833,456 bytes). Actual installation
+  succeeded in 281 seconds on this host. This qualifies an installation input,
+  not a booted or certified release.
+
+The new `vz` example `prepare_macos_base` is a maintainer-only installer into a
+new, task-owned directory; it cannot replace an existing image. Sign it with the
+repository virtualization entitlement before running it on a macOS host. Failed
+candidate directories remain isolated evidence and must not become published
+bases. End users continue to require the exact prepared base/patch download path.
+
+The required Swift fixture now exists at
+`tests/fixtures/vz-0.4/native-macos-swift/`. Its executable rejects a physical Mac
+hardware model; host syntax/unit checks are not guest execution evidence.
+
+Retained attempt logs, signed-binary identities, CLI output, and restore-install
+results live under `.artifacts/macos26-bootstrap/native-e2e/` in this worktree.
+Native E2E remains **failing/incomplete** until real artifacts, installation/boot,
+agent readiness, Swift execution, and the installed lifecycle are proven.
+
+The clone gate must verify fresh platform identity as well as private disk bytes.
+Apple specifies that concurrent VMs use distinct
+[machine identifiers](https://developer.apple.com/documentation/virtualization/vzmacmachineidentifier)
+and that clones receive their own
+[platform state](https://developer.apple.com/documentation/virtualization/vzmacplatformconfiguration).
+A copied auxiliary seed still needs a boot proof with the newly allocated
+identifier; metadata equality or an APFS clone syscall alone does not prove it.
+
+Maintainer continuation uses `provision_bootstrap` on a new APFS copy of the
+stopped installed base, with the release loader and guest agent. Its root-only
+mount/ownership step belongs to artifact production, never consumer setup.
+The current run is waiting for macOS administrator authentication; the original
+base is preserved. The mount helper now allocates a separate private directory
+per attachment and removes only the empty directory after a successful detach.
+The existing unit suite passes with this change, which awaits real mounting
+verification before main integration.
+
+After provisioning, sign and run the `vz-cli` example `native_bootstrap_probe`
+with the patched disk, installed hardware model, auxiliary seed and a new private
+Machine directory. It creates a disk clone and fresh VM identifier, checks the
+loader and guest agent over vsock, reads the guest version/hardware model, and
+stops its owned VM. Its output explicitly marks this as prerequisite evidence,
+not installed consumer E2E. Do not publish a base/patch until this succeeds and
+the exact patch has been applied and booted independently.
+
+Current branch checks: provisioning nextest 47 passed, zero skipped; strict
+library/example Clippy and Rust formatting passed. The Swift fixture passes its
+host syntax/unit check and its executable correctly rejects this physical
+`Mac16,5` host. These checks do not close the native lifecycle gate.

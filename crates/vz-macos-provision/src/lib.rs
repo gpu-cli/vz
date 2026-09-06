@@ -854,7 +854,11 @@ pub struct AttachedDisk {
 impl AttachedDisk {
     /// Unmount and detach the disk image.
     pub fn detach(self) -> anyhow::Result<()> {
-        detach_disk_image(&self.device, &self.mount_point)
+        detach_disk_image(&self.device, &self.mount_point)?;
+        // Remove only the now-empty owned mount directory. Never recursively
+        // delete a mount point: a failed detach must retain the guest contents.
+        std::fs::remove_dir(&self.mount_point)?;
+        Ok(())
     }
 }
 
@@ -894,13 +898,30 @@ pub fn attach_and_mount(image_path: &Path) -> anyhow::Result<AttachedDisk> {
 
     debug!(device = %base_device, "disk image attached");
 
-    // Find the APFS data volume using diskutil
-    let data_volume = find_apfs_data_volume(&base_device)?;
+    // If discovery fails, do not leave an untracked attached image behind.
+    let data_volume = match find_apfs_data_volume(&base_device) {
+        Ok(volume) => volume,
+        Err(error) => {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", &base_device])
+                .output();
+            return Err(error);
+        }
+    };
     debug!(volume = %data_volume, "found APFS data volume");
 
-    // Mount the data volume
-    let mount_point = PathBuf::from("/tmp/vz-provision");
-    std::fs::create_dir_all(&mount_point)?;
+    // Each attachment owns a distinct private mount directory. Keep the path
+    // explicitly rather than a TempDir guard, whose recursive Drop could delete
+    // guest files if a detach failed while the volume was still mounted.
+    let mount_point = match tempfile::Builder::new().prefix("vz-provision-").tempdir() {
+        Ok(directory) => directory.keep(),
+        Err(error) => {
+            let _ = std::process::Command::new("hdiutil")
+                .args(["detach", &base_device])
+                .output();
+            return Err(error.into());
+        }
+    };
 
     let output = std::process::Command::new("diskutil")
         .args(["mount", "-mountPoint"])
@@ -913,6 +934,9 @@ pub fn attach_and_mount(image_path: &Path) -> anyhow::Result<AttachedDisk> {
         let _ = std::process::Command::new("hdiutil")
             .args(["detach", &base_device])
             .output();
+        // remove_dir is safe even if the mount unexpectedly remains: it cannot
+        // recursively remove the mounted filesystem.
+        let _ = std::fs::remove_dir(&mount_point);
         let stderr = String::from_utf8_lossy(&output.stderr);
         anyhow::bail!("diskutil mount failed: {}", stderr.trim());
     }

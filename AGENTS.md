@@ -88,6 +88,11 @@ clone already migrated, run `bd bootstrap`. Only the designated migrator runs
 `BD_ALLOW_REMOTE_MIGRATE=1 bd migrate && bd dolt push`; other clones then bootstrap.
 Keep `.beads/` permissions at `0700`.
 
+Runtime/backend changes must pass the relevant installed user-level end-to-end
+flow before landing on main. Unit tests, synthetic image exercises, and backend
+helpers alone do not authorize a main merge. Keep fixes on an isolated branch
+until that evidence exists, and record any unvalidated paths explicitly.
+
 For implementation sessions, review and commit the task's changes, integrate
 remote changes (normally `git pull --rebase`), push issue data and code, and verify
 the branch is up to date with origin. Preserve unrelated edits and stashes; use an
