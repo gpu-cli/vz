@@ -40,6 +40,48 @@ def bare():
 
 
 class SourcePlanTests(unittest.TestCase):
+    def failed_run(self, code, *, stderr=None, returned=None):
+        value = bare(); value.absent = Mock()
+        role, entrypoint = ('nonexec', '/fixture/not-executable') if code == 126 else ('missing', '/fixture/does-not-exist')
+        name = TOKEN+'-'+role
+        state = {'Id': CID, 'Name': '/'+name, 'Image': IMAGE,
+            'Config': {'Labels': {lane.LABEL: TOKEN}, 'Entrypoint': [entrypoint], 'Cmd': None},
+            'HostConfig': {'Runtime': 'youki', 'NetworkMode': 'none'},
+            'State': {'Running': False, 'Pid': 0}, 'Mounts': []}
+        result = SimpleNamespace(index=1, returncode=code if returned is None else returned, stdout=b'',
+                                 stderr=lane.failed_start_diagnostic(code, entrypoint) if stderr is None else stderr)
+        value.step = Mock(side_effect=[result, SimpleNamespace(stdout=json.dumps([state]).encode(), stderr=b'')])
+        return value, role, entrypoint
+
+    def test_failed126_and127_exact_diagnostics_are_acknowledged_after_ownership(self):
+        for code in (126,127):
+            entrypoint = '/fixture/not-executable' if code == 126 else '/fixture/does-not-exist'
+            value, role, entrypoint = self.failed_run(code, stderr=b'docker: runtime create failed: ' +
+                lane.failed_start_diagnostic(code, entrypoint) + b'\n\nDocker help trailer\n')
+            proof = value.run_case(role, [], code, entrypoint=entrypoint)
+            self.assertEqual(proof['exit'], code); self.assertEqual(proof['cid'], CID)
+            self.assertEqual(value.step.call_args_list[0].kwargs['expected'], code)
+            value.record.acknowledge_negative.assert_called_once()
+        self.assertIn(b"permission denied: executable '/fixture/not-executable' at path '\"/fixture/not-executable\"'",
+                      lane.failed_start_diagnostic(126, '/fixture/not-executable'))
+        self.assertIn(b"executable file not found: executable '/fixture/does-not-exist' not found in $PATH",
+                      lane.failed_start_diagnostic(127, '/fixture/does-not-exist'))
+
+    def test_failed126_and127_wrong_diagnostic_or_code_never_acknowledged(self):
+        for code, entrypoint in ((126,'/fixture/not-executable'),(127,'/fixture/does-not-exist')):
+            exact = lane.failed_start_diagnostic(code, entrypoint)
+            prefix = b'permission denied: ' if code==126 else b'executable file not found: '
+            for kind in ('old', 'path', 'case', 'code', 'duplicate'):
+                stderr = exact
+                if kind=='old': stderr=exact.replace(prefix,b'')
+                if kind=='path': stderr=exact.replace(entrypoint.encode(),b'/fixture/foreign')
+                if kind=='case': stderr=exact.replace(prefix,prefix[:1].upper()+prefix[1:])
+                if kind=='duplicate': stderr=exact+b'\n'+exact
+                value, role, _ = self.failed_run(code, stderr=stderr, returned=125 if kind=='code' else code)
+                with self.subTest(code=code,kind=kind),self.assertRaises(ValueError):
+                    value.run_case(role, [], code, entrypoint=entrypoint)
+                value.record.acknowledge_negative.assert_not_called()
+
     def test_tty_failure_observer_preserves_original_predicate_and_exit(self):
         import os
         import sys

@@ -61,6 +61,23 @@ def build_arguments(inputs, selected, tag):
             '--build-arg', 'FIXTURE_BASE=' + inputs['images']['base']['reference'], '--tag', tag, str(selected)]
 
 
+def failed_start_diagnostic(expected, entrypoint):
+    """Exact pinned youki validation diagnostic through Moby/Docker run.
+
+    These are pre-exec validation failures, not payload-produced exit codes.
+    The lowercase tokens are significant to Docker CLI's classifier.
+    """
+    require(type(expected) is int and (expected, entrypoint) in (
+        (126, '/fixture/not-executable'), (127, '/fixture/does-not-exist')),
+        'unsupported failed-command fixture')
+    if expected == 126:
+        diagnostic = (f"permission denied: executable '{entrypoint}' at path '\"{entrypoint}\"' "
+                      'does not have correct permissions')
+    else:
+        diagnostic = f"executable file not found: executable '{entrypoint}' not found in $PATH"
+    return diagnostic.encode()
+
+
 class Lifecycle(driver.Driver):
     def __init__(self, inputs, base_fixture, output, selected, *, tmux_path, terminal_pins):
         super().__init__(inputs, base_fixture, output)
@@ -287,8 +304,8 @@ class Lifecycle(driver.Driver):
                     item['State']['Running'] is False and type(item['State']['Pid']) is int and
                     item['State']['Pid'] == 0 and not item['Mounts'] and
                     not result.stdout and bool(result.stderr), 'failed-command ownership/state differs')
-            required = b'permission denied' if expected == 126 else b'no such file or directory'
-            require(entrypoint.encode() in result.stderr and required in result.stderr.lower(),
+            require(type(result.returncode) is int and result.returncode == expected and
+                    result.stderr.count(failed_start_diagnostic(expected, entrypoint)) == 1,
                     'missing/nonexecutable command diagnostic differs')
         if expected:
             self.record.acknowledge_negative(result, 'source-selected run command, exact owned state and exit' + str(expected))

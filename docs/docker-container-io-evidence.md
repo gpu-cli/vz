@@ -336,3 +336,25 @@ Independent source review also identified a distinct unresolved path:
 intermediate process transports that display string. Kernel authorization and
 interpreter/format failures therefore need additional transport tests and actual
 Docker coverage; this prefix correction does not establish those cases.
+
+Source `00effbb3` passed all 33 offline candidate-validator tests and the pinned
+native ARM64 build. All four executable-error regressions passed with no failed
+or ignored tests. The candidate runtime SHA-256 is
+`bc624392bf1733f3eb0339c397d86d8aa422ab34783fdc6da7eae7df5fde0970`;
+its 31-payload evidence manifest SHA-256 is
+`c6f3f1ccc5512ac7bb7482afc4ddf39bd2220b6cdd99739ec3cfa70c34442869`.
+The candidate is retained under
+`linux/.cache/youki-source/builds/6bb9da17c79065cd1fef4cd75650be782b55cc2c3f4c4839b89314678d23f666`;
+the complete native log is `.artifacts/youki-executable-errors-build-1.console.log`
+(SHA-256 `d7e54781595067211cfddb2f03b573d86613121fba04ff3737c9eacea61ea236`).
+These native results do not replace the rebuilt backend or installed-Mac gates.
+
+Independent native audit verifies the exact 31 payloads (6,870,832 bytes) and
+81 distinct selected passing tests: the prior 77 plus the four new regressions.
+The lifecycle harness now requires the exact lowercase, entrypoint-specific
+canonical diagnostic once, with the original required 126/127 exit and ownership
+checks. It no longer requires `no such file or directory` for a runtime whose
+missing-command contract is `executable file not found`; unrelated Docker wrapper
+and help formatting are not pinned. All 692 affected Docker/host/startup tests
+pass in `.artifacts/container-executable-errors-host-regression-1.log` (SHA-256
+`72c9e76d52269b07ecd1bfd8e6a5993b2d8f88573e81e7da67ae1c9ba260107c`).
