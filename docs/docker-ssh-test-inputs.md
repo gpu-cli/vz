@@ -96,10 +96,26 @@ removes it before invoking tar. The replacement extractor uses a bounded
 explicit `--keep-directory-symlink`, preserving and verifying the known
 directory aliases and loader/tool identities before and after extraction.
 All eight admitted archives fit the 16 MiB per-package limit (9,830,400 bytes
-total uncompressed). Source review and fixture tests cover the replacement;
-fresh installed-Mac verification remains required. See
+total uncompressed). Source review and fixture tests cover the replacement.
+The second installed-Mac candidate successfully built this image, started the
+server, checked its readiness, and matched its public host key. No SSH-forwarding
+recipe ran: a later configuration-identity check rejected Docker's start-time
+normalization described below. See
 [GNU tar's option semantics](https://www.gnu.org/software/tar/manual/html_node/Option-Summary.html)
 and the [matching dpkg source archive](https://deb.debian.org/debian/pool/main/d/dpkg/dpkg_1.21.23.tar.xz).
+
+Moby 29.7.2 defaults an omitted `HostConfig.OomKillDisable` to `false` at
+creation, then clears it to `null` at start on cgroup v2, where disabling the
+OOM killer is unsupported. This is the sole configuration difference recorded
+in candidate 2. The pinned source paths are `daemon/create.go`,
+`daemon/daemon_unix.go`, `daemon/start.go`, and `pkg/sysinfo/cgroup2_linux.go` at
+commit `6a43e3d5afddf4111da0f864bbc7cae5d7e95001` (see the
+[resource normalization source](https://github.com/moby/moby/blob/6a43e3d5afddf4111da0f864bbc7cae5d7e95001/daemon/daemon_unix.go)).
+The harness admits this transition only with the exact Engine and unsupported
+cgroup-v2 policy, a successful owned start, and otherwise unchanged
+configuration. It retains both snapshots and the raw policy/start evidence;
+subsequent configuration drift still fails. Candidate 2 remains failed. All four Machines were publicly
+stopped with clean-journal receipts; objects and stopped disks remain retained.
 
 The authenticated OpenSSH 9.2p1 source defines Linux's locked-password prefix as
 `!` (`configure.ac`); `platform.c` checks that prefix, and `auth.c` applies the

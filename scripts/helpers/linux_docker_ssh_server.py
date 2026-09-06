@@ -140,6 +140,8 @@ class Server:
         self.container_id = self.image_id = self.host = None
         self.started_identity = None
         self.container_configuration = self.image_configuration = None
+        self.created_configuration = None
+        self.inspected_status = self.start_acknowledgement = self.start_normalization = None
         self.bridge_configuration = None
         self.cleanup_authorized = self.prepared = self.closed = self.attempted = False
         self.failed = False
@@ -210,15 +212,71 @@ class Server:
         item = self.object('container', self.container_id)
         host = container_identity(item, cid=self.container_id, image=self.image_id, token=self.token, status=status)
         configuration = {key: item[key] for key in ('Config', 'HostConfig', 'Mounts')}
-        require(self.container_configuration in (None, configuration), 'SSH server full configuration changed')
-        self.container_configuration = copy.deepcopy(configuration)
+        normalization = None
+        if self.container_configuration is not None and json.dumps(self.container_configuration, sort_keys=True) != json.dumps(configuration, sort_keys=True):
+            normalization = self.start_configuration_transition(configuration, status)
         if status == 'running' or self.bridge_configuration is not None:
             self.bridge(item if status == 'running' else None)
         if status == 'running':
             identity = (item['State']['Pid'], item['State']['StartedAt'], host)
             require(self.started_identity in (None, identity), 'SSH server process or address changed')
             self.started_identity, self.host = identity, host
+        if normalization is not None:
+            self.document('server-start-normalization.json', normalization)
+            self.start_normalization = normalization
+        if self.created_configuration is None and status == 'created':
+            self.created_configuration = copy.deepcopy(configuration)
+        self.container_configuration = copy.deepcopy(configuration)
+        self.inspected_status = status
         return item
+
+    def start_configuration_transition(self, configuration, status):
+        """Admit only Moby 29.7.2's unsupported cgroup-v2 OOM start rewrite.
+
+        daemon/start.go revalidates the stored HostConfig; daemon_unix.go's
+        verifyPlatformContainerResources changes false to nil when SysInfo
+        reports OomKillDisable unsupported. Creation had defaulted nil to false.
+        This is not a general inspect normalization or a runtime policy waiver.
+        """
+        before = self.container_configuration
+        require(status == 'running' and self.inspected_status == 'created' and
+                self.started_identity is None and self.start_normalization is None and
+                self.created_configuration is not None and self.start_acknowledgement is not None,
+                'SSH server full configuration changed outside acknowledged first start')
+        require('OomKillDisable' in before['HostConfig'] and
+                before['HostConfig']['OomKillDisable'] is False and
+                'OomKillDisable' in configuration['HostConfig'] and
+                configuration['HostConfig']['OomKillDisable'] is None,
+                'SSH server OOM start transition differs')
+        expected = copy.deepcopy(before)
+        expected['HostConfig']['OomKillDisable'] = None
+        require(json.dumps(expected, sort_keys=True) == json.dumps(configuration, sort_keys=True),
+                'SSH server full configuration changed beyond OOM start transition')
+        result = self.command(['info', '--format', '{{json .}}'])
+        require(type(result.returncode) is int and result.returncode == 0 and
+                result.timed_out is False and not result.stderr, 'SSH start policy command failed')
+        policy = image_input.parse(result.stdout)
+        require(type(policy) is dict and policy.get('ID') == self.scope_snapshot['engine_id'] and
+                policy.get('ServerVersion') == '29.7.2' and policy.get('CgroupVersion') == '2' and
+                policy.get('OomKillDisable') is False, 'SSH start Engine OOM policy differs')
+        return {'schema_version': 1, 'scope': copy.deepcopy(self.scope_snapshot),
+                'container_id': self.container_id, 'image_id': self.image_id,
+                'transition': 'created-to-running-unsupported-oom-kill-disable',
+                'source_commit': '6a43e3d5afddf4111da0f864bbc7cae5d7e95001',
+                'start_acknowledgement': copy.deepcopy(self.start_acknowledgement),
+                'policy_command_index': result.index, 'policy_stdout_sha256': driver.sha256(result.stdout),
+                'policy': {key: policy[key] for key in ('ID', 'ServerVersion', 'CgroupVersion', 'OomKillDisable')},
+                'created_configuration': copy.deepcopy(self.created_configuration),
+                'running_configuration': copy.deepcopy(configuration)}
+
+    def acknowledge_start(self, result):
+        require(self.start_acknowledgement is None and type(result.returncode) is int and
+                result.returncode == 0 and result.timed_out is False and
+                type(result.index) is int and result.index > 0 and
+                result.stdout == (self.container_id + '\n').encode() and not result.stderr,
+                'SSH start acknowledgement differs')
+        self.start_acknowledgement = {'command_index': result.index, 'container_id': self.container_id,
+                                     'stdout_sha256': driver.sha256(result.stdout), 'exit_code': 0}
 
     def bridge(self, item=None):
         """Bind the server to Engine's exact bridge, not a host-published port.
@@ -286,8 +344,7 @@ class Server:
                 copied = self.command(['cp', str(source), self.container_id + ':' + DIRECTORY + name])
                 require(not copied.stdout and not copied.stderr, 'SSH private copy diagnostic rejected')
             started = self.command(['container', 'start', self.container_id])
-            require(started.stdout == (self.container_id + '\n').encode() and not started.stderr,
-                    'SSH start acknowledgement differs')
+            self.acknowledge_start(started)
             ready = self.command(['exec', self.container_id, 'python3', '-c', READY], timeout=15)
             require(ready.stdout == b'VZ_SSH_SERVER_READY\n' and not ready.stderr, 'SSH server readiness failed')
             public = self.command(['exec', self.container_id, '/usr/bin/ssh-keygen', '-y', '-f', DIRECTORY + 'host_key'])

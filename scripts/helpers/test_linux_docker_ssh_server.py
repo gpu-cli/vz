@@ -118,10 +118,12 @@ class ServerTests(unittest.TestCase):
         selected.agent_proof = {'fingerprints': {'host': 'SHA256:'+'a'*43, 'auth': 'SHA256:'+'b'*43}}
         selected.inputs_snapshot = {'builder': {'name': 'owned', 'container_id': 'd'*64, 'image_id': 'sha256:'+'f'*64},
                                     'images': {'base': {'reference': 'python@sha256:'+'a'*64}}}
-        selected.scope_snapshot, selected.context_digest = {'machine_id': 'mch_owned'}, 'a'*64
+        selected.scope_snapshot, selected.context_digest = {'machine_id': 'mch_owned', 'engine_id': 'engine-owned'}, 'a'*64
         selected.driver = SimpleNamespace(record=SimpleNamespace(receipts=[]), _engine_system_time=SINCE)
         selected.container_id = selected.image_id = selected.host = selected.started_identity = None
         selected.container_configuration = selected.image_configuration = None
+        selected.created_configuration = None
+        selected.inspected_status = selected.start_acknowledgement = selected.start_normalization = None
         selected.bridge_configuration = None
         selected.bridge = Mock()
         selected.attempted = selected.closed = selected.failed = selected.prepared = selected.cleanup_authorized = False
@@ -228,6 +230,130 @@ class ServerTests(unittest.TestCase):
         changed = item(); changed['State']['Pid'] += 1
         selected.object.return_value = changed
         with self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+
+    def transition_fixture(self):
+        selected = self.fake()
+        selected.image_id, selected.container_id = IMAGE, CID
+        created, running = item('created'), item('running')
+        created['HostConfig']['OomKillDisable'] = False
+        running['HostConfig']['OomKillDisable'] = None
+        selected.object = Mock(return_value=created)
+        server.Server.inspect(selected, 'created')
+        selected.acknowledge_start(SimpleNamespace(index=7, returncode=0, timed_out=False,
+                                  stdout=(CID+'\n').encode(), stderr=b''))
+        selected.object.return_value = running
+        policy = {'ID': 'engine-owned', 'ServerVersion': '29.7.2', 'CgroupVersion': '2', 'OomKillDisable': False}
+        selected.command = Mock(return_value=SimpleNamespace(index=12, returncode=0, timed_out=False,
+                                  stdout=json.dumps(policy).encode(), stderr=b''))
+        return selected, created, running, policy
+
+    def test_acknowledged_cgroup2_start_records_policy_and_freezes_observed_snapshot(self):
+        selected, created, running, policy = self.transition_fixture()
+        original = copy.deepcopy(created)
+        server.Server.inspect(selected, 'running')
+        self.assertEqual(created, original)
+        self.assertIs(selected.created_configuration['HostConfig']['OomKillDisable'], False)
+        self.assertIs(selected.container_configuration['HostConfig']['OomKillDisable'], None)
+        name, proof = selected.document.call_args.args
+        self.assertEqual(name, 'server-start-normalization.json')
+        self.assertEqual(proof['policy'], policy)
+        self.assertEqual(proof['policy_command_index'], 12)
+        self.assertEqual(proof['policy_stdout_sha256'], driver.sha256(selected.command.return_value.stdout))
+        self.assertEqual(proof['start_acknowledgement']['command_index'], 7)
+        self.assertEqual(proof['created_configuration'], {key: original[key] for key in ('Config', 'HostConfig', 'Mounts')})
+        server.Server.inspect(selected, 'running')
+        selected.command.assert_called_once_with(['info', '--format', '{{json .}}'])
+        selected.document.assert_called_once()
+        # Neither a reverse rewrite nor a second false-to-null rewrite is admitted.
+        running['HostConfig']['OomKillDisable'] = False
+        with self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+        self.assertIs(selected.container_configuration['HostConfig']['OomKillDisable'], None)
+
+    def test_start_transition_requires_exact_current_engine_and_unsupported_policy(self):
+        for key, value in [('ID', 'foreign'), ('ServerVersion', '29.7.1'), ('ServerVersion', 29),
+                           ('CgroupVersion', '1'), ('CgroupVersion', 2),
+                           ('OomKillDisable', True), ('OomKillDisable', 0), ('OomKillDisable', None)]:
+            selected, _, _, policy = self.transition_fixture()
+            policy[key] = value
+            selected.command.return_value.stdout = json.dumps(policy).encode()
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                server.Server.inspect(selected, 'running')
+            selected.document.assert_not_called()
+            self.assertIs(selected.container_configuration['HostConfig']['OomKillDisable'], False)
+            self.assertIsNone(selected.start_normalization)
+            self.assertIsNone(selected.started_identity)
+            self.assertEqual(selected.inspected_status, 'created')
+        for key in ('ID', 'ServerVersion', 'CgroupVersion', 'OomKillDisable'):
+            selected, _, _, policy = self.transition_fixture()
+            del policy[key]
+            selected.command.return_value.stdout = json.dumps(policy).encode()
+            with self.subTest(missing=key), self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+
+    def test_start_transition_rejects_missing_non_boolean_reverse_or_other_config_changes(self):
+        for change in ('before-missing', 'before-zero', 'before-true', 'before-null',
+                       'after-missing', 'after-zero', 'after-true', 'config', 'hostconfig', 'mounts'):
+            selected, _, running, _ = self.transition_fixture()
+            before = selected.container_configuration['HostConfig']
+            after = running['HostConfig']
+            if change == 'before-missing': del before['OomKillDisable']
+            elif change == 'before-zero': before['OomKillDisable'] = 0
+            elif change == 'before-true': before['OomKillDisable'] = True
+            elif change == 'before-null':
+                before['OomKillDisable'] = None
+                after['OomKillDisable'] = False
+            elif change == 'after-missing': del after['OomKillDisable']
+            elif change == 'after-zero': after['OomKillDisable'] = 0
+            elif change == 'after-true': after['OomKillDisable'] = True
+            elif change == 'config': running['Config']['Hostname'] = 'changed'
+            elif change == 'hostconfig': after['CapAdd'] = ['SYS_ADMIN']
+            elif change == 'mounts': running['Mounts'] = [{'Type': 'volume'}]
+            with self.subTest(change=change), self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+            selected.command.assert_not_called()
+
+    def test_start_transition_cannot_repeat_or_apply_during_running_or_without_start_ack(self):
+        for change in ('no-ack', 'repeated', 'running', 'already-started', 'no-created'):
+            selected, _, _, _ = self.transition_fixture()
+            if change == 'no-ack': selected.start_acknowledgement = None
+            elif change == 'repeated': selected.start_normalization = {'already': True}
+            elif change == 'running': selected.inspected_status = 'running'
+            elif change == 'already-started': selected.started_identity = (17, SINCE, '172.17.0.2')
+            elif change == 'no-created': selected.created_configuration = None
+            with self.subTest(change=change), self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+            selected.command.assert_not_called()
+
+    def test_other_configuration_boolean_integer_drift_is_not_normalized(self):
+        for transition in (False, True):
+            selected, _, running, _ = self.transition_fixture()
+            selected.container_configuration['Config']['ExampleBoolean'] = False
+            running['Config']['ExampleBoolean'] = 0
+            if not transition:
+                running['HostConfig']['OomKillDisable'] = False
+            with self.subTest(oom_transition=transition), self.assertRaises(ValueError):
+                server.Server.inspect(selected, 'running')
+            self.assertIs(selected.container_configuration['Config']['ExampleBoolean'], False)
+            self.assertIsNone(selected.start_normalization)
+            self.assertIsNone(selected.started_identity)
+            selected.command.assert_not_called()
+
+    def test_start_acknowledgement_requires_exact_positive_owned_complete_result(self):
+        for key, value in [('returncode', 1), ('returncode', False), ('timed_out', True),
+                           ('stdout', b'foreign\n'), ('stderr', b'warning\n'), ('index', 0), ('index', True)]:
+            selected = self.fake(); selected.container_id = CID
+            values = dict(index=7, returncode=0, timed_out=False, stdout=(CID+'\n').encode(), stderr=b'')
+            values[key] = value
+            with self.subTest(key=key), self.assertRaises(ValueError): selected.acknowledge_start(SimpleNamespace(**values))
+            self.assertIsNone(selected.start_acknowledgement)
+        selected, _, _, _ = self.transition_fixture()
+        with self.assertRaises(ValueError):
+            selected.acknowledge_start(SimpleNamespace(index=8, returncode=0, timed_out=False,
+                                      stdout=(CID+'\n').encode(), stderr=b''))
+
+    def test_start_policy_failed_or_incomplete_command_is_not_admitted(self):
+        for key, value in [('returncode', 1), ('returncode', False), ('timed_out', True), ('stderr', b'error')]:
+            selected, _, _, _ = self.transition_fixture()
+            setattr(selected.command.return_value, key, value)
+            with self.subTest(key=key), self.assertRaises(ValueError): server.Server.inspect(selected, 'running')
+            selected.document.assert_not_called()
 
     def test_guard_rejects_context_key_canary_before_engine_call(self):
         selected = self.fake()
