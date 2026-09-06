@@ -1,0 +1,65 @@
+{
+  "schema_version": 1,
+  "scope": "INSTALLED_LOCAL_MACOS_SETUP_IN_PROGRESS",
+  "source_commit": "015d85c1e3b6ef73b266e03e0a3a92c78c3f0e58",
+  "branch": "feat/macos26-bootstrap",
+  "passed": false,
+  "pending": "macOS administrator authentication for guest-disk provisioning",
+  "binary_sha256": {
+    "vz": "0fd0a7542beff2b4065625334c59c4028f85c8942ce3e3ee85e686c38c5ec7c5",
+    "vz-runtimed": "6fc6093f584c2ca34904f003d51a49d16ad79a86ddb548d572da78d81ebd8311",
+    "vz-macos-setup": "e067f621d2cabb54d9f4119526392f6025812f97a84d934f15b4b9f1499ff84b",
+    "vz-agent-loader": "6db9504152bf24f00a69d1b64ba9be994047d53edfb92d380d3ed4b65e4679f8",
+    "vz-guest-agent": "d7283c69d15276a6e18fad36205e6f583bde96d36df34a2a9d09d2bdb755e994"
+  },
+  "host": {
+    "os": "macos",
+    "architecture": "aarch64",
+    "os_version": "26.3.1"
+  },
+  "ipsw": {
+    "url": "https://updates.cdn-apple.com/2026WinterFCS/fullrestores/047-88313/2E098049-1731-4415-A206-546D09301973/UniversalMac_26.3.1_25D2128_Restore.ipsw",
+    "sha256": "4ff171ba3fa6db4758a2a7cedc8f24d44f4e3de8051a84400984872619abd6bc",
+    "size_bytes": 19330833456
+  },
+  "macos_version": "26.3.1",
+  "macos_build": "25D2128",
+  "checks": {
+    "default_apple_download_and_full_hash": true,
+    "missing_license_rejected": true,
+    "cancelled_packaging_removed_staging": true,
+    "fresh_ipsw_installation": true,
+    "installation_seconds": 293.879,
+    "library_and_integration_tests_passed": 566,
+    "existing_test_skips": 6,
+    "strict_production_clippy": true,
+    "installer_tests_passed": 11,
+    "installed_linux_hardened_lifecycle": true,
+    "linux_test_daemon_cleaned_up": true
+  },
+  "remaining": [
+    "administrator authentication",
+    "guest loader provisioning and boot",
+    "local Xcode installation and native Swift build/test/run",
+    "template registration and warm setup reuse",
+    "installed native lifecycle and clone isolation"
+  ],
+  "attempts": [
+    {
+      "path": ".artifacts/macos-local-setup-1/evidence",
+      "scope": "fresh default Apple download",
+      "result": "IPSW hash passed; framework rejected digest-only filename before installation"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/retry-evidence",
+      "scope": "fixed installed retry, verified download only retained; no prepared guest reused",
+      "result": "fresh installation passed; waiting for host authentication"
+    }
+  ],
+  "regression_evidence": ".artifacts/macos-local-setup-1/linux-regression",
+  "notes": [
+    "The IPSW filename issue was fixed by a private APFS clone named restore.ipsw.",
+    "An earlier full run reproduced the previously recorded legacy concurrent CreateSandbox idempotency flake; the final unfiltered affected suite passed.",
+    "No code has been merged into main; public native/aggregate release conformance is not claimed."
+  ]
+}

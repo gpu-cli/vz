@@ -1,6 +1,9 @@
 # Local macOS setup
 
-Status: DEV, implementation and fresh installed E2E in progress.
+Status: DEV. Implementation, 566 affected tests, strict production Clippy, and
+installed Linux regression pass. The real Apple download and fresh macOS install
+pass; native setup is waiting for host administrator authentication. See the
+[current evidence](macos-local-setup-evidence.json).
 Tracked by `vz-mzs.11.4.2`, on `feat/macos26-bootstrap`. Main remains reserved
 for other work; no runtime merge before installed-user verification.
 
@@ -64,3 +67,16 @@ acquisition; using `--ipsw` alone does not prove the default download path.
 Signing/notarization and binary packaging are added to the ordinary release
 workflow. A dedicated Mac can run this same setup/E2E recipe when available;
 no hosted runner or public Apple-image publication is assumed to exist.
+
+## Current physical run
+
+The first run fetched and hashed the entire pinned IPSW from Apple, then found
+that Virtualization.framework requires a `.ipsw` filename. Setup now makes a
+private APFS clone named `restore.ipsw` from the verified digest-named cache blob.
+The installed retry retained only that downloaded input and installed a new
+macOS disk in 293.879 seconds. It is currently waiting at the normal macOS
+administrator dialog. No local template or catalog entry has been registered.
+
+The unchanged installed retry continues through provisioning, Swift validation,
+warm setup, and the existing installed native lifecycle harness after host
+authentication. This pending step is not an E2E pass. Do not merge to main yet.
