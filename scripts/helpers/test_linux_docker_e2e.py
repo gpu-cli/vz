@@ -115,6 +115,44 @@ class AdmissionTests(unittest.TestCase):
                 gate.embedded_builder(bad, "private-machine")
 
 
+class ResultScopeTests(unittest.TestCase):
+    def test_cleanup_reports_retained_machine_disks_not_removed_builder_cache(self):
+        info = {"scope": gate.BUILD_SCOPE, "suite": "build", "inputs": {},
+                "fixture": "/owned/fixture", "fixture_sha256": "fixture-digest"}
+        cleanup = {"positive_stop_all": True, "daemon_graceful_shutdown_observed": True,
+                   "daily_default_unchanged": True, "isolated_default_unchanged": True}
+        for failed_removal in (False, True):
+            with self.subTest(failed_removal=failed_removal):
+                harness = types.SimpleNamespace(
+                    evidence=Path("/owned/evidence"), root=Path("/owned/root"),
+                    staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
+                    remove_owned=Mock(side_effect=RuntimeError("removal unproven") if failed_removal else None),
+                    cleanup=Mock(return_value=cleanup))
+                with patch.object(gate, "ComposeHarness", return_value=harness), \
+                        patch.object(gate.os, "umask"), \
+                        patch.object(gate.startup, "document"), \
+                        patch.object(gate.startup, "collect_runtime_receipts"), \
+                        patch.object(gate.startup, "checksum_evidence"), \
+                        patch.object(gate.driver, "tree_digest", return_value="fixture-digest"), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = gate.run(info)
+                result = json.loads(output.getvalue())
+                self.assertFalse(result["docker_parity_certified"])
+                self.assertFalse(result["aggregate_release_certified"])
+                if failed_removal:
+                    self.assertEqual(code, 1)
+                    harness.cleanup.assert_not_called()
+                    self.assertNotIn("cleanup", result)
+                else:
+                    self.assertEqual(code, 0)
+                    harness.remove_owned.assert_called_once_with()
+                    harness.cleanup.assert_called_once_with()
+                    self.assertEqual(result["cleanup"], cleanup | {
+                        "owned_workload_objects_removed": True,
+                        "retained_stopped_machine_disks_and_contexts": True,
+                        "delete_certified": False})
+
+
 class PrePullTrustTests(unittest.TestCase):
     def ca_harness(self, replies):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)

@@ -4,7 +4,8 @@
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
 Full --suite all is deliberately rejected before provisioning until the complete
-63-scenario contract is implemented. Retained stopped disks/cache are NOT Delete.
+63-scenario contract is implemented. Retained stopped Machine disks are NOT Delete.
+Owned BuildKit builder cache volumes are removed by successful workload cleanup.
 """
 from __future__ import annotations
 
@@ -650,7 +651,7 @@ def run(info):
             require(harness.monitor is None or not harness.monitor.thread.is_alive(), "live monitor prevents cleanup")
             harness.remove_owned()
             result["cleanup"] = harness.cleanup() | {"owned_workload_objects_removed": True,
-                "retained_stopped_machine_disks_contexts_and_buildkit_cache": True, "delete_certified": False}
+                "retained_stopped_machine_disks_and_contexts": True, "delete_certified": False}
         except BaseException as error:
             result["cleanup_errors"].append(f"{type(error).__name__}: {error}")
         try:
