@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -92,6 +92,23 @@ descriptor lifetime; they do not replace actual nested BuildKit and Docker exec
 verification on the Mac. The installed builder gate separately requires a
 private cgroup namespace, exact setup environment, and external read-only
 cgroup observations. This integration remains DEV until its physical gate passes.
+
+`run-keep.patch` is a sixth **locally authored vz patch**. Upstream parses
+foreground `run --keep` but unconditionally deletes state and cgroups after the
+payload exits. BuildKit 0.19 explicitly requests `--keep` and later performs a
+normal delete; its asynchronous cgroup cleanup can discard that deletion error.
+Successful RUN/export alone therefore did not establish correct cleanup.
+The correction persists stopped state without the reaped init PID and retains
+the cgroup/configuration for explicit deletion. A failed wait retains uncertain
+ownership and returns the error; a failed state save is also an error. The
+default foreground deletion/error ordering, detached behavior, and build/start
+failures are unchanged. Seven required native regressions cover state/config
+retention, exit codes, default cleanup, normal/forced explicit deletion, wait/save
+errors, invalid bundles, and real BusyBox children reaped by the foreground
+waiter. State-only deletion fixtures do not prove kernel cgroup removal.
+Actual retained cgroup ownership and the absence of the subsequent BuildKit
+missing-container cleanup error still require the rebuilt full Mac backend and
+fresh installed Docker gate; old failed candidates remain failed evidence.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

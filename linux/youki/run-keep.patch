@@ -1,0 +1,324 @@
+--- a/crates/youki/src/commands/run.rs
++++ b/crates/youki/src/commands/run.rs
+@@ -2,6 +2,7 @@
+ 
+ use anyhow::{Context, Result};
+ use libcontainer::container::builder::ContainerBuilder;
++use libcontainer::container::{Container, ContainerStatus};
+ use libcontainer::syscall::syscall::SyscallType;
+ use liboci_cli::Run;
+ use nix::sys::signal::{self, kill};
+@@ -41,12 +42,26 @@
+         "expects a container init pid in the container state"
+     );
+     let foreground_result = handle_foreground(container.pid().unwrap());
+-    // execute the destruction action after the container finishes running
+-    container.delete(true)?;
+-    // return result
+-    foreground_result
++    finish_foreground(&mut container, args.keep, foreground_result)
+ }
+ 
++// The foreground waiter has reaped init only on Ok. Keep transfers cleanup to
++// the caller (including cgroups and poststop hooks); a failed wait must not turn
++// uncertain process ownership into a fabricated stopped state or deletion.
++fn finish_foreground(container: &mut Container, keep: bool, result: Result<i32>) -> Result<i32> {
++    if !keep {
++        // Preserve the original default cleanup and error precedence exactly.
++        container.delete(true)?;
++        return result;
++    }
++    let exit_code = result?;
++    // The reaped PID can be reused. Persist its absence so future state/delete
++    // operations cannot mistake an unrelated process for the container init.
++    container.state.pid = None;
++    container.set_status(ContainerStatus::Stopped).save()?;
++    Ok(exit_code)
++}
++
+ // handle_foreground will match the `runc` behavior running the foreground mode.
+ // The youki main process will wait and reap the container init process. The
+ // youki main process also forwards most of the signals to the container init
+@@ -214,7 +229,282 @@
+                 };
+             }
+         };
++
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod keep_tests {
++    use std::fs;
++    use std::os::unix::process::CommandExt;
++    use std::path::Path;
++    use std::process::{Command, Stdio};
++    use std::time::{Duration, Instant};
++
++    use anyhow::{Result, anyhow};
++    use clap::Parser;
++    use libcontainer::container::State;
++    use liboci_cli::{Delete, Run};
++    use tempfile::{TempDir, tempdir};
++
++    use super::*;
++
++    const OWNER: &[u8] = b"exact-owned-resource-marker";
++    const CONFIG: &[u8] = br#"{"hooks":null,"cgroup_path":"/vz-keep-owned-fixture"}"#;
++
++    fn fixture(pid: Option<i32>) -> Result<(TempDir, Container)> {
++        let root = tempdir()?;
++        let state = root.path().join("kept");
++        fs::create_dir(&state)?;
++        fs::write(state.join("resource-owner"), OWNER)?;
++        let container = Container::new("kept", ContainerStatus::Running, pid, root.path(), &state)?;
++        container.save()?;
++        Ok((root, container))
++    }
++
++    #[test]
++    fn test_vz_run_keep_state_and_exit_codes() -> Result<()> {
++        for code in [0, 37, 15] {
++            let (_root, mut container) = fixture(Some(std::process::id() as i32))?;
++            fs::write(container.root.join("youki_config.json"), CONFIG)?;
++            assert_eq!(finish_foreground(&mut container, true, Ok(code))?, code);
++            let stored = State::load(&container.root)?;
++            assert_eq!(stored.status, ContainerStatus::Stopped);
++            assert_eq!(stored.pid, None);
++            let loaded = Container::load(container.root.clone())?;
++            assert_eq!(loaded.status(), ContainerStatus::Stopped);
++            assert_eq!(loaded.id(), "kept");
++            assert_eq!(fs::read(container.root.join("resource-owner"))?, OWNER);
++            assert_eq!(fs::read(container.root.join("youki_config.json"))?, CONFIG);
++            assert_eq!(
++                loaded.spec()?.cgroup_path,
++                Path::new("/vz-keep-owned-fixture")
++            );
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_run_keep_default_cleanup_and_error_order() -> Result<()> {
++        for code in [0, 37, 15] {
++            let (_root, mut container) = fixture(None)?;
++            assert_eq!(finish_foreground(&mut container, false, Ok(code))?, code);
++            assert!(!container.root.exists());
++        }
++        let (_root, mut container) = fixture(None)?;
++        let error =
++            finish_foreground(&mut container, false, Err(anyhow!("wait failed"))).unwrap_err();
++        assert_eq!(error.to_string(), "wait failed");
++        assert!(!container.root.exists());
++
++        // A state root replaced with a regular file makes actual delete fail.
++        // Cleanup failure must still take precedence over the waiter failure.
++        let (root, mut container) = fixture(None)?;
++        fs::rename(&container.root, root.path().join("preserved-state"))?;
++        fs::write(&container.root, OWNER)?;
++        let error =
++            finish_foreground(&mut container, false, Err(anyhow!("wait failed"))).unwrap_err();
++        assert_ne!(error.to_string(), "wait failed");
++        assert_eq!(fs::read(&container.root)?, OWNER);
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_run_keep_explicit_normal_and_force_delete() -> Result<()> {
++        // These state-only fixtures exercise the real CLI delete dispatcher;
++        // no kernel cgroup claim is made by a unit fixture without OCI config.
++        for force in [false, true] {
++            let (root, mut container) = fixture(None)?;
++            finish_foreground(&mut container, true, Ok(37))?;
++            crate::commands::delete::delete(
++                Delete {
++                    container_id: "kept".into(),
++                    force,
++                },
++                root.path().into(),
++            )?;
++            assert!(!container.root.exists());
++            assert!(
++                crate::commands::delete::delete(
++                    Delete {
++                        container_id: "kept".into(),
++                        force: false
++                    },
++                    root.path().into()
++                )
++                .is_err()
++            );
++            crate::commands::delete::delete(
++                Delete {
++                    container_id: "kept".into(),
++                    force: true,
++                },
++                root.path().into(),
++            )?;
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_run_keep_wait_error_retains_state() -> Result<()> {
++        let (_root, mut container) = fixture(Some(std::process::id() as i32))?;
++        fs::write(container.root.join("youki_config.json"), CONFIG)?;
++        let before = fs::read(container.root.join("state.json"))?;
++        let error = finish_foreground(
++            &mut container,
++            true,
++            Err(anyhow!("wait ownership uncertain")),
++        )
++        .unwrap_err();
++        assert_eq!(error.to_string(), "wait ownership uncertain");
++        assert_eq!(container.status(), ContainerStatus::Running);
++        assert_eq!(fs::read(container.root.join("state.json"))?, before);
++        assert_eq!(fs::read(container.root.join("youki_config.json"))?, CONFIG);
++        assert_eq!(fs::read(container.root.join("resource-owner"))?, OWNER);
++        Ok(())
++    }
+ 
++    #[test]
++    fn test_vz_run_keep_save_error_retains_ownership() -> Result<()> {
++        let (_root, mut container) = fixture(None)?;
++        fs::write(container.root.join("youki_config.json"), CONFIG)?;
++        let state = container.root.join("state.json");
++        fs::rename(&state, container.root.join("state-before.json"))?;
++        fs::create_dir(&state)?;
++        let before = fs::read(container.root.join("state-before.json"))?;
++        assert!(finish_foreground(&mut container, true, Ok(0)).is_err());
++        assert_eq!(fs::read(container.root.join("state-before.json"))?, before);
++        assert_eq!(fs::read(container.root.join("resource-owner"))?, OWNER);
++        assert_eq!(fs::read(container.root.join("youki_config.json"))?, CONFIG);
+         Ok(())
+     }
++
++    #[derive(Parser)]
++    struct RunArguments {
++        #[command(flatten)]
++        run: Run,
++    }
++
++    #[test]
++    fn test_vz_run_keep_invalid_run_has_no_state() -> Result<()> {
++        for keep in [false, true] {
++            let root = tempdir()?;
++            let state = root.path().join("state-root");
++            fs::create_dir(&state)?;
++            let missing = root.path().join("missing-bundle");
++            let mut argv = vec!["run", "--bundle", missing.to_str().unwrap()];
++            if keep {
++                argv.push("--keep");
++            }
++            argv.push("invalid-fixture");
++            let args = RunArguments::try_parse_from(argv)?.run;
++            assert_eq!(args.keep, keep);
++            assert!(run(args, state.clone(), false).is_err());
++            // The real init builder loads/validates the bundle before creating
++            // container state. Keep must not introduce a failed-run residue.
++            assert_eq!(fs::read_dir(&state)?.count(), 0);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_run_keep_reaped_payload_lifecycle() -> Result<()> {
++        const SELECTOR: &str =
++            "commands::run::keep_tests::test_vz_run_keep_reaped_payload_lifecycle";
++        const ENV: &str = "VZ_RUN_KEEP_CHILD";
++        if let Ok(case) = std::env::var(ENV) {
++            let (keep, code) = match case.as_str() {
++                "keep-zero" => (true, 0),
++                "keep-nonzero" => (true, 37),
++                "default-zero" => (false, 0),
++                "default-nonzero" => (false, 37),
++                _ => anyhow::bail!("unexpected isolated child case"),
++            };
++            // This isolated test process blocks SIGCHLD before spawning so an
++            // already-exited child cannot race past the actual foreground wait.
++            SigSet::all().thread_block()?;
++            let child = Command::new("/bin/busybox")
++                .args(["sh", "-c", &format!("exit {code}")])
++                .spawn()?;
++            let pid = Pid::from_raw(child.id() as i32);
++            let (root, mut container) = fixture(Some(pid.as_raw()))?;
++            let waited = handle_foreground(pid);
++            assert_eq!(finish_foreground(&mut container, keep, waited)?, code);
++            assert_eq!(waitpid(pid, None), Err(nix::errno::Errno::ECHILD));
++            if keep {
++                assert_eq!(
++                    Container::load(container.root.clone())?.status(),
++                    ContainerStatus::Stopped
++                );
++                assert_eq!(State::load(&container.root)?.pid, None);
++                crate::commands::delete::delete(
++                    Delete {
++                        container_id: "kept".into(),
++                        force: false,
++                    },
++                    root.path().into(),
++                )?;
++            }
++            assert!(!container.root.exists());
++            return Ok(());
++        }
++        for case in [
++            "keep-zero",
++            "keep-nonzero",
++            "default-zero",
++            "default-nonzero",
++        ] {
++            let mut command = Command::new(std::env::current_exe()?);
++            command
++                .args(["--exact", SELECTOR, "--test-threads=1"])
++                .env(ENV, case)
++                .stdin(Stdio::null())
++                .stdout(Stdio::piped())
++                .stderr(Stdio::piped());
++            // SAFETY: only async-signal-safe libc operations run between fork
++            // and exec. Block before exec so *all* test-harness threads inherit
++            // the mask; otherwise an unblocked harness thread can consume the
++            // process-directed SIGCHLD before the foreground waiter sees it.
++            unsafe {
++                command.pre_exec(|| {
++                    let mut set: nix::libc::sigset_t = std::mem::zeroed();
++                    if nix::libc::sigfillset(&mut set) != 0 {
++                        return Err(std::io::Error::last_os_error());
++                    }
++                    let code = nix::libc::pthread_sigmask(
++                        nix::libc::SIG_SETMASK,
++                        &set,
++                        std::ptr::null_mut(),
++                    );
++                    if code != 0 {
++                        return Err(std::io::Error::from_raw_os_error(code));
++                    }
++                    Ok(())
++                });
++            }
++            let mut child = command.spawn()?;
++            let deadline = Instant::now() + Duration::from_secs(10);
++            loop {
++                if child.try_wait()?.is_some() {
++                    break;
++                }
++                if Instant::now() >= deadline {
++                    child.kill()?;
++                    child.wait()?;
++                    anyhow::bail!("bounded foreground child timed out: {case}");
++                }
++                std::thread::sleep(Duration::from_millis(10));
++            }
++            let output = child.wait_with_output()?;
++            assert!(
++                output.status.success(),
++                "{case}: stdout={} stderr={}",
++                String::from_utf8_lossy(&output.stdout),
++                String::from_utf8_lossy(&output.stderr)
++            );
++            assert!(output.stderr.is_empty());
++        }
++        Ok(())
++    }
+ }
