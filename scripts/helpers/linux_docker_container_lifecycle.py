@@ -76,6 +76,7 @@ class Lifecycle(driver.Driver):
         self.engine_policy = None
         self.workload_complete = False
         self.follower = None
+        self.killer = self.kill_termination = None
         self.follow_proof = None
         self.register_follower = None
         self.term_generation = None
@@ -300,6 +301,55 @@ class Lifecycle(driver.Driver):
         require(value['ID'] == self.inputs.scope['engine_id'] and not command.stderr, 'foreign Engine clock')
         return timestamp(value['SystemTime'])
 
+    def sigkill(self):
+        # PID-namespace init ignores self-generated SIGKILL. Keep a normal
+        # Docker run attached and kill its authenticated CID from the host.
+        name = self.token + '-sigkill'
+        require('sigkill' not in self.containers, 'SIGKILL role already used')
+        self.absent(name)
+        row = {'name': name, 'command': ['service', self.token], 'interactive': False,
+               'health': False, 'cid': None, 'entrypoint': ENTRYPOINT}
+        self.containers['sigkill'] = row
+        return self.run_kill(row)
+
+    def run_kill(self, row):
+        from linux_docker_container_kill import run_kill
+        require(callable(self.register_follower), 'run observer ownership registry required')
+        def register(item):
+            require(self.killer is None, 'run observer already registered')
+            self.killer = item
+            self.register_follower(item)
+        return run_kill(self, row['name'], self.image_id, self.token,
+                        terminate=self.terminate_kill, register_observer=register)
+
+    def terminate_kill(self):
+        from linux_docker_container_state import same_generation, same_identity, stopped
+        require(self.kill_termination is None, 'SIGKILL already dispatched')
+        row = self.containers['sigkill']
+        require(row['cid'] is None, 'SIGKILL container already resolved')
+        self.guard()
+        resolved = self.step('resolve-live-sigkill', ['container', 'inspect', row['name']])
+        values = json.loads(resolved.stdout)
+        require(type(values) is list and len(values) == 1 and not resolved.stderr,
+                'ambiguous live SIGKILL container')
+        row['cid'] = driver.checked_text(values[0]['Id'], r'[0-9a-f]{64}', 'live SIGKILL container ID')
+        initial = self.inspect('sigkill', 'running')
+        self.guard()
+        same_generation(initial, self.inspect('sigkill', 'running'))
+        command = self.step('signal-run-kill', ['container', 'kill', '--signal', 'KILL', row['cid']])
+        require(command.stdout == (row['cid'] + '\n').encode() and not command.stderr,
+                'SIGKILL acknowledgement differs')
+        self.kill_termination = {'cid': row['cid'], 'command_index': command.index,
+            'started_unix_ns': self.record.receipts[command.index - 1]['started_unix_ns']}
+        waited = self.step('wait-run-kill137', ['container', 'wait', row['cid']])
+        require(waited.stdout == b'137\n' and not waited.stderr, 'SIGKILL wait did not return137')
+        final = self.inspect('sigkill', 'exited')
+        same_identity(initial, final)
+        require(final['State']['StartedAt'] == initial['State']['StartedAt'] and
+                final['RestartCount'] == initial['RestartCount'], 'SIGKILL exit belongs to another generation')
+        stopped(final, 137)
+        return self.kill_termination
+
     def term_guard(self, cid, token):
         from linux_docker_container_state import same_generation
         require(cid == self.containers['term']['cid'] and token == self.token, 'foreign TERM actor')
@@ -409,8 +459,7 @@ class Lifecycle(driver.Driver):
         exits.append(self.run_case('sigterm', ['service', self.token], 143,
             plan=io_plan([{'kind': 'close_stdin'}, {'kind': 'signal', 'name': 'SIGTERM',
                          'after': {'stream': 'stdout', 'marker': ready}}])))
-        exits.append(self.run_case('sigkill', ['-c', 'import os,signal;os.kill(os.getpid(),signal.SIGKILL)'],
-                                  137, entrypoint='python3'))
+        exits.append(self.sigkill())
         exits += [self.run_case('nonexec', [], 126, entrypoint='/fixture/not-executable'),
                   self.run_case('missing', [], 127, entrypoint='/fixture/does-not-exist')]
         self.step('stop-service', ['container', 'stop', '--timeout', '10', row['cid']])
@@ -440,6 +489,8 @@ class Lifecycle(driver.Driver):
                 all(not x['effects_uncertain'] for x in self.record.receipts), 'unresolved lifecycle workload')
         require(self.follower is not None and not self.follower.follow_thread.is_alive() and
                 all(not x['effects_uncertain'] for x in self.follower.record.receipts), 'unresolved follower')
+        require(self.killer is not None and not self.killer.follow_thread.is_alive() and
+                all(not x['effects_uncertain'] for x in self.killer.record.receipts), 'unresolved run observer')
         owner = self.terminal_owner
         require(self.tmux_proof is not None and owner is not None and
                 type(owner.pending) is list and not owner.pending and owner.server is not None and
@@ -526,6 +577,7 @@ class ReplayLifecycle(Lifecycle):
         self.io_observations = self.service_generation = self.engine_policy = None
         self.workload_complete = False
         self.follower = self.follow_proof = self.term_generation = self.term_started = None
+        self.killer = self.kill_termination = None
         self.events_since = self.baseline = None
         self._tmux_path = live._tmux_path
         self._terminal_pins = dict(live._terminal_pins)
@@ -618,6 +670,26 @@ class ReplayLifecycle(Lifecycle):
         self.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
         return self.tmux_proof
 
+    def run_kill(self, row):
+        from linux_docker_container_kill import replay_kill
+        # Exact root-side order of the separate observer adapter. Its own
+        # guard/run/guard ledger is independently replayed by replay_kill.
+        self.guard(); self.guard()
+        termination = self.terminate_kill()
+        self.guard()
+        output = self.output / 'kill-run'
+        proof = interactive.parse(driver.regular(output / 'kill-proof.json', 8 * 1024 * 1024))
+        result = replay_kill(output, self.inputs.raw, row['name'], self.image_id, self.token, proof,
+            environment=self.env | {'TMPDIR': str(output / 'private-tmp')}, termination=termination)
+        rows = [interactive.parse(driver.regular(output / ('command-%05d.json' % i), 8 * 1024 * 1024))
+                for i in range(1, 6)]
+        # replay_kill independently verifies the source-selected negative
+        # acknowledgement before this inert cleanup representation is created.
+        rows[2]['effects_uncertain'] = False
+        self.killer = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
+                                     record=SimpleNamespace(receipts=rows))
+        return result
+
 
 def command_indices(output):
     result = []
@@ -675,6 +747,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     require(before['workload'] == result and after['workload'] == result and after['cleanup'] == cleanup,
             'independent lifecycle replay differs')
     harness.driver_cleanup_verified[position] = True
-    require(len(follower_positions) == 1, 'exactly one owned follower required')
-    harness.driver_cleanup_verified[follower_positions[0]] = True
+    require(len(follower_positions) == 2, 'exactly two owned stream observers required')
+    for position in follower_positions:
+        harness.driver_cleanup_verified[position] = True
     return {'workload': result, 'cleanup': cleanup, 'independent_validation': after}

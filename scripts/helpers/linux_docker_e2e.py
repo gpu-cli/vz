@@ -165,6 +165,7 @@ def preflight(args, require_host=True):
         for name in ("linux_docker_container_lifecycle.py", "linux_docker_container_state.py",
                      "linux_docker_container_commands.py", "linux_docker_container_fixture.py",
                      "linux_docker_container_exec.py", "linux_docker_container_follow.py",
+                     "linux_docker_container_kill.py",
                      "linux_docker_interactive_capture.py", "linux_docker_interactive_evidence.py",
                      "linux_docker_container_tmux.py", "linux_docker_interactive_tmux.py",
                      "linux_docker_buildkit_shutdown.py"):

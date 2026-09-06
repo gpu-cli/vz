@@ -33,6 +33,7 @@ def bare():
     value.record = SimpleNamespace(receipts=[], acknowledge_negative=Mock())
     value.workload_complete = False
     value.follower = None
+    value.killer = value.kill_termination = None
     value.terminal_owner = None
     value.tmux_proof = None
     return value
@@ -187,6 +188,7 @@ class SourcePlanTests(unittest.TestCase):
             value = bare(); value.workload_complete = True
             value.follower = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
                                             record=SimpleNamespace(receipts=[]))
+            value.killer = value.follower
             value.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
             value.tmux_proof = {'inert_test': True}
             value.containers = {'service': {'name': TOKEN+'-service', 'cid': CID}}
@@ -204,6 +206,7 @@ class SourcePlanTests(unittest.TestCase):
             value = bare(); value.workload_complete = True
             value.follower = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
                                             record=SimpleNamespace(receipts=[]))
+            value.killer = value.follower
             value.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
             value.tmux_proof = {'inert_test': True}
             if kind == 'missing': value.terminal_owner = None
@@ -211,6 +214,75 @@ class SourcePlanTests(unittest.TestCase):
             if kind in ('live', 'signal', 'bool'):
                 value.terminal_owner.server.returncode = {'live': None, 'signal': -15, 'bool': False}[kind]
             if kind == 'proof': value.tmux_proof = None
+            value.step = Mock(side_effect=AssertionError('cleanup dispatched'))
+            with self.subTest(kind=kind), self.assertRaises(ValueError): value.cleanup()
+            value.step.assert_not_called()
+
+    def test_sigkill_uses_normal_service_and_registers_before_dispatch(self):
+        value = bare(); value.absent = Mock()
+        def run(row):
+            self.assertIs(value.containers['sigkill'], row)
+            self.assertIsNone(row['cid'])
+            self.assertEqual(row['command'], ['service', TOKEN])
+            self.assertEqual(row['entrypoint'], lane.ENTRYPOINT)
+            self.assertFalse(row['interactive'])
+            return {'inert_test': True}
+        value.run_kill = Mock(side_effect=run)
+        self.assertEqual(value.sigkill(), {'inert_test': True})
+        value.absent.assert_called_once_with(TOKEN+'-sigkill')
+        with self.assertRaises(ValueError): value.sigkill()
+
+    def test_external_sigkill_uses_exact_cid_and_source_kill_timestamp(self):
+        value = bare(); value.record.count = 0
+        value.containers = {'sigkill': {'name': TOKEN+'-sigkill', 'cid': None}}
+        initial = {'State': {'StartedAt': 'same-generation'}, 'RestartCount': 0}
+        final = {'State': {'StartedAt': 'same-generation'}, 'RestartCount': 0, 'inert_exit': 137}
+        value.inspect = Mock(side_effect=[initial, initial, final])
+        calls = []
+        def add():
+            value.record.count += 1
+            value.record.receipts.append({'started_unix_ns': value.record.count*100})
+        def guard(): add(); add()
+        def step(label, args):
+            add(); calls.append((label, args, value.record.count))
+            raw = json.dumps([{'Id': CID}]).encode() if label == 'resolve-live-sigkill' else (
+                (CID+'\n').encode() if label == 'signal-run-kill' else b'137\n')
+            return SimpleNamespace(index=value.record.count, stdout=raw, stderr=b'')
+        value.guard, value.step = guard, step
+        with patch('linux_docker_container_state.same_generation') as generation, \
+             patch('linux_docker_container_state.same_identity') as identity, \
+             patch('linux_docker_container_state.stopped') as stopped:
+            result = value.terminate_kill()
+        self.assertEqual(calls, [('resolve-live-sigkill', ['container', 'inspect', TOKEN+'-sigkill'], 3),
+            ('signal-run-kill', ['container', 'kill', '--signal', 'KILL', CID], 6),
+            ('wait-run-kill137', ['container', 'wait', CID], 7)])
+        self.assertEqual(result, {'cid': CID, 'command_index': 6, 'started_unix_ns': 600})
+        generation.assert_called_once_with(initial, initial)
+        identity.assert_called_once_with(initial, final)
+        stopped.assert_called_once_with(final, 137)
+        with self.assertRaises(ValueError): value.terminate_kill()
+        for changed in (final | {'State': {'StartedAt': 'later-generation'}}, final | {'RestartCount': 1}):
+            value.kill_termination = None; value.containers['sigkill']['cid'] = None
+            value.inspect = Mock(side_effect=[initial, initial, changed])
+            with patch('linux_docker_container_state.same_generation'), \
+                 patch('linux_docker_container_state.same_identity'), \
+                 patch('linux_docker_container_state.stopped') as stopped, self.assertRaises(ValueError):
+                value.terminate_kill()
+            stopped.assert_not_called()
+        value.kill_termination = None; value.containers['sigkill']['cid'] = None
+        value.inspect = Mock(side_effect=[initial, initial]); calls.clear()
+        with patch('linux_docker_container_state.same_generation', side_effect=ValueError('generation drift')), \
+             self.assertRaises(ValueError): value.terminate_kill()
+        self.assertEqual([row[0] for row in calls], ['resolve-live-sigkill'])
+
+    def test_cleanup_refuses_unresolved_kill_run_observer(self):
+        for kind in ('missing', 'live', 'uncertain'):
+            value = bare(); value.workload_complete = True
+            value.follower = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
+                                            record=SimpleNamespace(receipts=[]))
+            value.killer = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: kind == 'live'),
+                record=SimpleNamespace(receipts=[{'effects_uncertain': kind == 'uncertain'}]))
+            if kind == 'missing': value.killer = None
             value.step = Mock(side_effect=AssertionError('cleanup dispatched'))
             with self.subTest(kind=kind), self.assertRaises(ValueError): value.cleanup()
             value.step.assert_not_called()
@@ -380,6 +452,29 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(result['guard_last_command'], 10)
         self.assertEqual(selected.terminal_owner.server.returncode, 0)
         self.assertEqual(selected.verify_terminal_pins.call_count, 2)
+
+    def test_kill_run_replay_uses_retained_filename_and_external_termination(self):
+        selected = lane.ReplayLifecycle(self.live); selected.image_id = IMAGE
+        output = self.root/'kill-run'; output.mkdir()
+        proof = {'inert_delegation_test': True}
+        (output/'kill-proof.json').write_text(json.dumps(proof))
+        for i in range(1, 6):
+            (output/('command-%05d.json' % i)).write_text(json.dumps({'effects_uncertain': i == 3}))
+        events = []; selected.guard = lambda: events.append('guard')
+        termination = {'cid': CID, 'command_index': 8, 'started_unix_ns': 800}
+        selected.terminate_kill = lambda: events.append('kill') or termination
+        row = {'name': selected.token+'-sigkill'}
+        with patch('linux_docker_container_kill.replay_kill', return_value=proof) as replay, \
+             patch('linux_docker_container_kill.run_kill', side_effect=AssertionError('launch')), \
+             patch.object(driver.Driver, 'command', side_effect=AssertionError('dispatch')), \
+             patch.object(lane.startup, 'document', side_effect=AssertionError('write')):
+            self.assertEqual(selected.run_kill(row), proof)
+        self.assertEqual(events, ['guard', 'guard', 'kill', 'guard'])
+        self.assertEqual(replay.call_args.args, (output, self.live.inputs.raw, row['name'], IMAGE, selected.token, proof))
+        self.assertEqual(replay.call_args.kwargs, {'environment': {'TMPDIR': str(output/'private-tmp')},
+                                                 'termination': termination})
+        self.assertFalse(selected.killer.follow_thread.is_alive())
+        self.assertFalse(any(row['effects_uncertain'] for row in selected.killer.record.receipts))
 
     def test_replay_negative_ack_is_exact_and_does_not_rewrite_raw(self):
         args = ['exec', CID, 'true']; command = self.record(args, exit=37)

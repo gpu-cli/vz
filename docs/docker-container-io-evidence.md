@@ -236,3 +236,51 @@ Both schema modules then passed their documented offline
 `uv run --offline --with jsonschema==4.23.0` runner: 15 compatibility-contract
 tests and seven project-schema tests. This is 837 passing host tests across the
 two interpreter/dependency setups, not a green result for the earlier command.
+
+## Corrected-runtime candidate 3
+
+Source `0d06f8ab` ran with the newly retained guest bundles. Command 120 now
+passes the previously failing `docker run --interactive --tty` phase: the first
+guest record has 24×80 dimensions and three TTY streams, an actual Ctrl-C byte
+follows readiness, and the guest reports SIGINT/130. The owned client is reaped;
+its terminal attributes were already restored before any harness repair.
+
+The first Machine's actual Docker tmux exchange also independently replays:
+24 controls, canonical ready 24×80 → size 40×120 → done/37 records, pane exit 37,
+normal server exit/reap, and exact socket retirement without fallback. The raw
+tmux manifest is
+`e2ea872ca888d861e1040a6032b36e373da1f8342892ecd1da5e24b3411ece52`.
+
+The overall candidate remains **failed** at command 128: Python PID 1 sent
+itself SIGKILL but exited 0, while the harness expected 137. Pinned Linux
+6.12.85 source explains this behavior: `kernel/fork.c` marks namespace init
+`SIGNAL_UNKILLABLE`; `kernel/signal.c` ignores its default-handler signals unless
+the forced kernel/ancestor-namespace exception applies. Self-SIGKILL therefore
+does not establish the intended test. No runtime change is justified by this
+failure. The revised test must keep the Docker run client attached to the normal
+service while a separately guarded host command kills its exact container ID,
+then verify both client and container exit 137. A numeric fixture exit or killing
+the host client cannot substitute for that signal propagation.
+
+The original 3,099 payloads / 3,668,543 bytes are retained in
+`.artifacts/linux-docker-lifecycle-candidate-3`; manifest SHA-256
+`0a4783401999cd4b73ee4d1d0a4b4844d74d758f02b7282a4d5f2280ef801e8f`.
+Separate disposition confirms the exact failed container exited 0, four
+owner/incarnation-bound clean-journal Stops, graceful daemon retirement and
+unchanged defaults. Its 500 payloads / 579,091 bytes are under
+`.artifacts/linux-docker-lifecycle-candidate-3-disposition`; manifest SHA-256
+`95f9d9cd8b32ff1840591bd62f74639ca136675f4160fbebf40197193c19dec6`.
+Objects/disks and the failed result are preserved. First-Machine phase results
+do not establish the three-Machine workload, full process/runtime provenance,
+or the aggregate release gate.
+
+The revised observer now owns a separate five-command guard/run/guard ledger.
+It observes both canonical ready streams before the parent authenticates the
+running container generation and issues exact-CID KILL. Independent replay
+requires attached-client 137, the external KILL timestamp after live readiness,
+wait/inspect 137 from the same started generation, positive child/thread
+closure, and a source-bound negative-exit acknowledgement. The invalid self-kill
+fixture is removed from the workload; the frozen probe itself is unchanged.
+All 105 container-focused tests and 690 affected Docker/host/startup regressions
+pass; the latter output is `.artifacts/container-kill-host-regression-1.log`.
+Physical verification of this revised observer is still required.
