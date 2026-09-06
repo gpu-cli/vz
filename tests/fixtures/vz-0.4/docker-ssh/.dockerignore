@@ -1,0 +1,15 @@
+*
+!Dockerfile.ssh
+!Dockerfile.undeclared
+!Dockerfile.server
+!ssh_probe.py
+!server.py
+!sshd_config
+!packages.py
+!package-pins.json
+!packages/
+!packages/*.deb
+!packages/manifest.json
+!inputs/
+!inputs/request.json
+!inputs/known_hosts

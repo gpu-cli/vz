@@ -1,0 +1,374 @@
+{
+  "base": {
+    "config_digest": "sha256:a74ddf067736251b63204a4d7a26411cffa3da75600b4e67ad54c9c79f3f81cb",
+    "dpkg_deb": {
+      "path": "/usr/bin/dpkg-deb",
+      "sha256": "b85e5cbe3dbb1cb9af9319994fdedf00d3dfac6234191e8b2e5ba0e90f5fa197",
+      "size": 199120
+    },
+    "keyring": {
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "filename": "base-debian-archive-keyring.gpg",
+      "gid": 0,
+      "layer_digest": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "mode": 420,
+      "sha256": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
+      "size": 55918,
+      "tar_path": "usr/share/keyrings/debian-archive-keyring.gpg",
+      "uid": 0
+    },
+    "reference": "docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9",
+    "rootfs_diff_ids": [
+      "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256:811200da0061220a3e28b9142728f858e7618bade93ea61d53c34f3f2aa629d5",
+      "sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256:568932e4ff4c0815486f1de32df754ed0e9a43c713bed5be7e5c5abf65a068e0"
+    ]
+  },
+  "bounds": {
+    "control_tar_bytes_each": 1048576,
+    "data_tar_bytes_each": 16777216,
+    "data_tar_bytes_total": 16777216,
+    "deb_bytes_each": 1048576,
+    "deb_bytes_total": 2097152,
+    "keyring_bytes": 65536,
+    "packages": 8,
+    "packages_compressed_bytes": 16777216,
+    "release_bytes": 1048576
+  },
+  "packages": [
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 245760,
+      "depends": "libc6 (>= 2.34), libmd0 (>= 1.0.3-2)",
+      "filename": "libbsd0_0.11.7-2_arm64.deb",
+      "package": "libbsd0",
+      "repository_path": "pool/main/libb/libbsd/libbsd0_0.11.7-2_arm64.deb",
+      "sha256": "ef00f132ddd268ee67d756998723ee18543db27ab34930c0a9f1cff75cf55382",
+      "size": 115116,
+      "version": "0.11.7-2"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 92160,
+      "depends": "libc6 (>= 2.17)",
+      "filename": "libcbor0.8_0.8.0-2+b1_arm64.deb",
+      "package": "libcbor0.8",
+      "repository_path": "pool/main/libc/libcbor/libcbor0.8_0.8.0-2+b1_arm64.deb",
+      "sha256": "6a4b71cbcb9fe1aa289aea983c7af80bef53bc63b217e39e24fef31c7491325f",
+      "size": 26012,
+      "version": "0.8.0-2+b1"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 307200,
+      "depends": "libbsd0 (>= 0.1.3), libc6 (>= 2.33), libtinfo6 (>= 6)",
+      "filename": "libedit2_3.1-20221030-2_arm64.deb",
+      "package": "libedit2",
+      "repository_path": "pool/main/libe/libedit/libedit2_3.1-20221030-2_arm64.deb",
+      "sha256": "6ca1e355586ebfcfe8122b4d317fcaad4a9a10ca455c6a9bbd36f55bf4be85d3",
+      "size": 88140,
+      "version": "3.1-20221030-2"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 286720,
+      "depends": "libc6 (>= 2.36), libcbor0.8 (>= 0.8.0), libssl3 (>= 3.0.0), libudev1 (>= 183), zlib1g (>= 1:1.1.4)",
+      "filename": "libfido2-1_1.12.0-2+b1_arm64.deb",
+      "package": "libfido2-1",
+      "repository_path": "pool/main/libf/libfido2/libfido2-1_1.12.0-2+b1_arm64.deb",
+      "sha256": "fc5373ec91102e4dac0f1d8fca5943c230fe9abbf348362f8956cda556dd22fd",
+      "size": 72644,
+      "version": "1.12.0-2+b1"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 122880,
+      "depends": "libc6 (>= 2.33), libnsl2 (>= 1.0)",
+      "filename": "libwrap0_7.6.q-32_arm64.deb",
+      "package": "libwrap0",
+      "repository_path": "pool/main/t/tcp-wrappers/libwrap0_7.6.q-32_arm64.deb",
+      "sha256": "c5f02a234b481e7016d10188822b8d84420cc5978db19c0d253eb222452cffe7",
+      "size": 54652,
+      "version": "7.6.q-32"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 6522880,
+      "depends": "adduser, passwd, libc6 (>= 2.36), libedit2 (>= 2.11-20080614-0), libfido2-1 (>= 1.8.0), libgssapi-krb5-2 (>= 1.17), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), zlib1g (>= 1:1.1.4)",
+      "filename": "openssh-client_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-client",
+      "repository_path": "pool/main/o/openssh/openssh-client_9.2p1-2+deb12u10_arm64.deb",
+      "sha256": "72f7cb7eb432038a62cd89e0552b352a514e880fe3907e73dc50ca2ef6d088d7",
+      "size": 934580,
+      "version": "1:9.2p1-2+deb12u10"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 1976320,
+      "depends": "adduser, libpam-modules, libpam-runtime, lsb-base, openssh-client (= 1:9.2p1-2+deb12u10), openssh-sftp-server, procps, ucf, debconf (>= 0.5) | debconf-2.0, runit-helper (>= 2.14.0~), libaudit1 (>= 1:2.2.1), libc6 (>= 2.36), libcom-err2 (>= 1.43.9), libcrypt1 (>= 1:4.1.0), libgssapi-krb5-2 (>= 1.17), libkrb5-3 (>= 1.13~alpha1+dfsg), libpam0g (>= 0.99.7.1), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), libsystemd0, libwrap0 (>= 7.6-4~), zlib1g (>= 1:1.1.4)",
+      "filename": "openssh-server_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-server",
+      "repository_path": "pool/main/o/openssh/openssh-server_9.2p1-2+deb12u10_arm64.deb",
+      "sha256": "63ea95107e522de7a8da9a841f3b9442875f9d064087d6ef8e5b4d21291016a9",
+      "size": 412488,
+      "version": "1:9.2p1-2+deb12u10"
+    },
+    {
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "architecture": "arm64",
+      "data_tar_uncompressed_bytes": 276480,
+      "depends": "openssh-client (= 1:9.2p1-2+deb12u10), libc6 (>= 2.34)",
+      "filename": "openssh-sftp-server_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-sftp-server",
+      "repository_path": "pool/main/o/openssh/openssh-sftp-server_9.2p1-2+deb12u10_arm64.deb",
+      "sha256": "d2a4eb41629bbc929318cdccac043f2f5934c2e4c12f72d7f9c73b3668feab6f",
+      "size": 60252,
+      "version": "1:9.2p1-2+deb12u10"
+    }
+  ],
+  "packages_index": {
+    "filename": "bookworm-Packages.xz",
+    "release_path": "main/binary-arm64/Packages.xz",
+    "sha256": "2ddb1737692e8c45c53e8d57c0ce4cd21c78c5703b830c3226b1423566a06c00",
+    "size": 8689464,
+    "uncompressed_limit": 67108864
+  },
+  "release": {
+    "filename": "bookworm.InRelease",
+    "repository_path": "dists/bookworm/InRelease",
+    "required_primary_fingerprints": [
+      "B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8",
+      "04B54C3CDCA79751B16BC6B5225629DF75B188BD",
+      "4D64FEC119C2029067D6E791F8D2585B8783D481"
+    ],
+    "sha256": "77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa",
+    "size": 151075
+  },
+  "runtime": {
+    "base_dependency_versions": {
+      "adduser": "3.134",
+      "apt": "2.6.1",
+      "base-files": "12.4+deb12u15",
+      "base-passwd": "3.6.1",
+      "bash": "5.2.15-2+b13",
+      "bsdutils": "1:2.38.1-5+deb12u3",
+      "ca-certificates": "20250419~deb12u1",
+      "coreutils": "9.1-1",
+      "dash": "0.5.12-2",
+      "debconf": "1.5.82",
+      "debian-archive-keyring": "2023.3+deb12u2",
+      "debianutils": "5.7-0.5~deb12u1",
+      "diffutils": "1:3.8-4",
+      "dpkg": "1.21.23",
+      "e2fsprogs": "1.47.0-2+b2",
+      "findutils": "4.9.0-4",
+      "gcc-12-base": "12.2.0-14+deb12u1",
+      "gpgv": "2.2.40-1.1+deb12u2",
+      "grep": "3.8-5",
+      "gzip": "1.12-1",
+      "hostname": "3.23+nmu1",
+      "init-system-helpers": "1.65.2+deb12u1",
+      "libacl1": "2.3.1-3",
+      "libapt-pkg6.0": "2.6.1",
+      "libattr1": "1:2.5.1-4",
+      "libaudit-common": "1:3.0.9-1",
+      "libaudit1": "1:3.0.9-1",
+      "libblkid1": "2.38.1-5+deb12u3",
+      "libbz2-1.0": "1.0.8-5+b1",
+      "libc-bin": "2.36-9+deb12u14",
+      "libc6": "2.36-9+deb12u14",
+      "libcap-ng0": "0.8.3-1+b3",
+      "libcap2": "1:2.66-4+deb12u3+b1",
+      "libcom-err2": "1.47.0-2+b2",
+      "libcrypt1": "1:4.4.33-2",
+      "libdb5.3": "5.3.28+dfsg2-1",
+      "libdebconfclient0": "0.270",
+      "libext2fs2": "1.47.0-2+b2",
+      "libffi8": "3.4.4-1",
+      "libgcc-s1": "12.2.0-14+deb12u1",
+      "libgcrypt20": "1.10.1-3+deb12u1",
+      "libgdbm6": "1.23-3",
+      "libgmp10": "2:6.2.1+dfsg1-1.1",
+      "libgnutls30": "3.7.9-2+deb12u7",
+      "libgpg-error0": "1.46-1",
+      "libgssapi-krb5-2": "1.20.1-2+deb12u5",
+      "libhogweed6": "3.8.1-2",
+      "libidn2-0": "2.3.3-1+b1",
+      "libk5crypto3": "1.20.1-2+deb12u5",
+      "libkeyutils1": "1.6.3-2",
+      "libkrb5-3": "1.20.1-2+deb12u5",
+      "libkrb5support0": "1.20.1-2+deb12u5",
+      "liblz4-1": "1.9.4-1",
+      "liblzma5": "5.4.1-1+deb12u1",
+      "libmd0": "1.0.4-2",
+      "libmount1": "2.38.1-5+deb12u3",
+      "libncursesw6": "6.4-4",
+      "libnettle8": "3.8.1-2",
+      "libnsl2": "1.3.0-2",
+      "libp11-kit0": "0.24.1-2",
+      "libpam-modules": "1.5.2-6+deb12u2",
+      "libpam-modules-bin": "1.5.2-6+deb12u2",
+      "libpam-runtime": "1.5.2-6+deb12u2",
+      "libpam0g": "1.5.2-6+deb12u2",
+      "libpcre2-8-0": "10.42-1",
+      "libreadline8": "8.2-1.3",
+      "libseccomp2": "2.5.4-1+deb12u1",
+      "libselinux1": "3.4-1+b6",
+      "libsemanage-common": "3.4-1",
+      "libsemanage2": "3.4-1+b5",
+      "libsepol2": "3.4-2.1",
+      "libsmartcols1": "2.38.1-5+deb12u3",
+      "libsqlite3-0": "3.40.1-2+deb12u2",
+      "libss2": "1.47.0-2+b2",
+      "libssl3": "3.0.20-1~deb12u2",
+      "libstdc++6": "12.2.0-14+deb12u1",
+      "libsystemd0": "252.39-1~deb12u2",
+      "libtasn1-6": "4.19.0-2+deb12u1",
+      "libtinfo6": "6.4-4",
+      "libtirpc-common": "1.3.3+ds-1",
+      "libtirpc3": "1.3.3+ds-1",
+      "libudev1": "252.39-1~deb12u2",
+      "libunistring2": "1.0-2",
+      "libuuid1": "2.38.1-5+deb12u3",
+      "libxxhash0": "0.8.1-1",
+      "libzstd1": "1.5.4+dfsg2-5",
+      "login": "1:4.13+dfsg1-1+deb12u2",
+      "logsave": "1.47.0-2+b2",
+      "mawk": "1.3.4.20200120-3.1",
+      "mount": "2.38.1-5+deb12u3",
+      "ncurses-base": "6.4-4",
+      "ncurses-bin": "6.4-4",
+      "netbase": "6.4",
+      "openssl": "3.0.20-1~deb12u2",
+      "passwd": "1:4.13+dfsg1-1+deb12u2",
+      "perl-base": "5.36.0-7+deb12u3",
+      "readline-common": "8.2-1.3",
+      "sed": "4.9-1+deb12u1",
+      "sysvinit-utils": "3.06-4",
+      "tar": "1.34+dfsg-1.2+deb12u1",
+      "tzdata": "2026b-0+deb12u1",
+      "usr-is-merged": "37~deb12u1",
+      "util-linux": "2.38.1-5+deb12u3",
+      "util-linux-extra": "2.38.1-5+deb12u3",
+      "zlib1g": "1:1.2.13.dfsg-1"
+    },
+    "elf_closure_digest": "48708c8ad4e906d04a0d809f0c8d71378ee24411865e5b8d9f96a0c8d58ce536",
+    "elf_inspection_scope": "SONAME_reachability_not_kernel_execution_or_complete_ABI_validation",
+    "entrypoints": [
+      "/usr/bin/ssh",
+      "/usr/bin/ssh-keygen",
+      "/usr/sbin/sshd"
+    ],
+    "openssh_version": "1:9.2p1-2+deb12u10"
+  },
+  "schema_version": 1,
+  "scope": "authenticated_debian_runtime_overlay_not_dpkg_install",
+  "snapshot": {
+    "archive": "debian",
+    "base_url": "https://snapshot.debian.org/archive/debian/20260901T000000Z/",
+    "suite": "bookworm",
+    "timestamp": "20260901T000000Z"
+  },
+  "source_proofs": [
+    {
+      "filename": "base-evidence.json",
+      "sha256": "f849ebee5ac6251b1227803b4d1ede05334bf46262152a5ad96a7e2f375f7ca1",
+      "size": 3643
+    },
+    {
+      "filename": "base-var--lib--dpkg--status",
+      "sha256": "c592c612133cd614b9109f5b526d4deb35ef8733a68048a893b8184a66882cd4",
+      "size": 90464
+    },
+    {
+      "filename": "base-usr--lib--os-release",
+      "sha256": "59a77b5f2666d9c85c489bd1911a6eebbd91ef22fe48b90a3b75f1b21f3844d4",
+      "size": 267
+    },
+    {
+      "filename": "bookworm-signature.status",
+      "sha256": "cc63d83e1be92bae4e0f6c54a4ddc8ec9b727249ac5b25cc8e5329be18fd2a34",
+      "size": 1175
+    },
+    {
+      "filename": "bookworm-signature.stderr",
+      "sha256": "de0a06dfb559990bab7b35f18666b2f8e4bc8ad5c5f09f81f483e1799d6164c3",
+      "size": 684
+    },
+    {
+      "filename": "authenticated-closure-summary.json",
+      "sha256": "051ab5376377745aa6f0d33da059acd88630ceead63f19250fe1c5ff6fd109d8",
+      "size": 5161
+    },
+    {
+      "filename": "runtime-elf-proof.json",
+      "sha256": "48708c8ad4e906d04a0d809f0c8d71378ee24411865e5b8d9f96a0c8d58ce536",
+      "size": 28649
+    },
+    {
+      "filename": "bookworm-Sources.xz",
+      "sha256": "92d11a035571df011f06f28c61cb9825130ef1d92abb2f2e0525e8674dc44af8",
+      "size": 9491888
+    },
+    {
+      "filename": "openssh.source-stanza",
+      "sha256": "301b3eeaf52c6218d6dc5f56a411968e09dacc01bf6a9c1069f617ef2c864fd9",
+      "size": 2547
+    },
+    {
+      "filename": "openssh_9.2p1-2+deb12u10.dsc",
+      "sha256": "af8cfb3ce783604abd28183a52aa0bde8c6bc603cc35758035db48d1dac5f2e2",
+      "size": 3455
+    },
+    {
+      "filename": "openssh_9.2p1.orig.tar.gz",
+      "sha256": "3f66dbf1655fb45f50e1c56da62ab01218c228807b21338d634ebcdf9d71cf46",
+      "size": 1852380
+    },
+    {
+      "filename": "openssh_9.2p1-2+deb12u10.debian.tar.xz",
+      "sha256": "65cbc8353a4197d0e543dd5330ca9798663256ea54b91a9c7c49116e7ea342ea",
+      "size": 204884
+    }
+  ]
+}

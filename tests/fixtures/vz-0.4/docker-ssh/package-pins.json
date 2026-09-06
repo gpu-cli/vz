@@ -1,0 +1,70 @@
+{
+  "dpkg_deb_sha256": "b85e5cbe3dbb1cb9af9319994fdedf00d3dfac6234191e8b2e5ba0e90f5fa197",
+  "packages": [
+    {
+      "architecture": "arm64",
+      "filename": "libbsd0_0.11.7-2_arm64.deb",
+      "package": "libbsd0",
+      "sha256": "ef00f132ddd268ee67d756998723ee18543db27ab34930c0a9f1cff75cf55382",
+      "size": 115116,
+      "version": "0.11.7-2"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "libcbor0.8_0.8.0-2+b1_arm64.deb",
+      "package": "libcbor0.8",
+      "sha256": "6a4b71cbcb9fe1aa289aea983c7af80bef53bc63b217e39e24fef31c7491325f",
+      "size": 26012,
+      "version": "0.8.0-2+b1"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "libedit2_3.1-20221030-2_arm64.deb",
+      "package": "libedit2",
+      "sha256": "6ca1e355586ebfcfe8122b4d317fcaad4a9a10ca455c6a9bbd36f55bf4be85d3",
+      "size": 88140,
+      "version": "3.1-20221030-2"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "libfido2-1_1.12.0-2+b1_arm64.deb",
+      "package": "libfido2-1",
+      "sha256": "fc5373ec91102e4dac0f1d8fca5943c230fe9abbf348362f8956cda556dd22fd",
+      "size": 72644,
+      "version": "1.12.0-2+b1"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "libwrap0_7.6.q-32_arm64.deb",
+      "package": "libwrap0",
+      "sha256": "c5f02a234b481e7016d10188822b8d84420cc5978db19c0d253eb222452cffe7",
+      "size": 54652,
+      "version": "7.6.q-32"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "openssh-client_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-client",
+      "sha256": "72f7cb7eb432038a62cd89e0552b352a514e880fe3907e73dc50ca2ef6d088d7",
+      "size": 934580,
+      "version": "1:9.2p1-2+deb12u10"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "openssh-server_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-server",
+      "sha256": "63ea95107e522de7a8da9a841f3b9442875f9d064087d6ef8e5b4d21291016a9",
+      "size": 412488,
+      "version": "1:9.2p1-2+deb12u10"
+    },
+    {
+      "architecture": "arm64",
+      "filename": "openssh-sftp-server_9.2p1-2+deb12u10_arm64.deb",
+      "package": "openssh-sftp-server",
+      "sha256": "d2a4eb41629bbc929318cdccac043f2f5934c2e4c12f72d7f9c73b3668feab6f",
+      "size": 60252,
+      "version": "1:9.2p1-2+deb12u10"
+    }
+  ],
+  "schema_version": 1
+}

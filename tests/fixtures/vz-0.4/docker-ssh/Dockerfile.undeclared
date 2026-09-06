@@ -1,0 +1,9 @@
+ARG FIXTURE_BASE=docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9
+FROM ${FIXTURE_BASE} AS build
+COPY packages/ /fixture/packages/
+COPY packages.py package-pins.json ssh_probe.py /fixture/
+RUN --network=none python3 /fixture/packages.py
+COPY inputs/ /fixture/inputs/
+RUN python3 /fixture/ssh_probe.py undeclared
+FROM scratch AS output
+COPY --from=build /out/ssh.txt /ssh.txt

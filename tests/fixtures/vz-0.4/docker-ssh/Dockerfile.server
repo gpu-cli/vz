@@ -1,0 +1,10 @@
+ARG FIXTURE_BASE=docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9
+FROM ${FIXTURE_BASE}
+COPY packages/ /fixture/packages/
+COPY packages.py package-pins.json ssh_probe.py /fixture/
+RUN --network=none python3 /fixture/packages.py
+COPY server.py ssh_probe.py sshd_config /fixture/
+# Source-verified fresh dedicated accounts; existing accounts are never unlocked.
+# No apt, maintainer scripts, host-key generation, or private build arguments.
+RUN --network=none python3 /fixture/server.py prepare
+ENTRYPOINT ["python3", "-u", "/fixture/server.py", "serve"]

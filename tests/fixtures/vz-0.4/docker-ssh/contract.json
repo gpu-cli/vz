@@ -1,0 +1,21 @@
+{
+  "schema_version": 1,
+  "scope": "DEV_INSTALLED_BUILDKIT_SSH_NOT_RELEASE_CERTIFICATION",
+  "base_input": "registry_resolvable_pinned_python_linux_arm64_manifest",
+  "package_input": "authenticated_offline_debs_pinned_dpkg_deb_extract_no_maintainer_scripts",
+  "agent_id": "fixture",
+  "agent_target": "/run/vz-build-ssh-agent",
+  "server_port": 2222,
+  "server_user": "vzssh",
+  "response_prefix": "vz-ssh-response:",
+  "capture_bytes_per_stream": 8192,
+  "ssh_timeout_seconds": 15,
+  "operational_exit": 70,
+  "recipes": {
+    "declared": {"dockerfile": "Dockerfile.ssh", "agent_supplied": true, "known_host": "correct", "probe_exit": 0},
+    "undeclared": {"dockerfile": "Dockerfile.undeclared", "agent_supplied": true, "known_host": "correct", "probe_exit": 41},
+    "provider_omitted": {"dockerfile": "Dockerfile.ssh", "agent_supplied": false, "known_host": "correct", "probe_exit": null},
+    "wrong_host": {"dockerfile": "Dockerfile.ssh", "agent_supplied": true, "known_host": "wrong", "probe_exit": 42}
+  },
+  "output": {"path": "ssh.txt", "mode": 420, "uid": 0, "gid": 0, "format": "scratch_oci"}
+}
