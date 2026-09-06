@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1+vz-executable-errors-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -140,6 +140,26 @@ are mandatory candidate evidence; missing, ignored, duplicate or failed tests
 are rejected. These are bounded unit and PTY/ioctl checks, not a claim that a
 container payload or Docker workflow ran. The fresh installed Mac lifecycle
 gate and rebuilt backend still must pass; the old failed candidate is retained.
+
+`executable-errors.patch` is a ninth **locally authored vz patch**. It prefixes
+structural executable-validation errors with the canonical lowercase
+`permission denied` or `executable file not found` diagnostic, preserving the
+original command/path context. Docker CLI 29.4.0 uses these case-sensitive
+strings to classify failed starts as 126 or 127; the pinned Engine 29.7.2 also
+recognizes them. The validation predicates and kernel execution are unchanged.
+Four mandatory native tests exercise real DefaultExecutor validation for
+non-executable files/directories, missing absolute/PATH commands, unchanged
+allowed modes, and diagnostic context. Small source-mirrored consumer classifiers
+are regression controls, not execution of Go or Docker. Exact patch bytes and
+the complete four-test output are required in candidate evidence.
+
+This patch does not fix every kernel execution error: the existing
+`ExecutorError::Execution` display drops its inner execvp cause before transport
+to the caller. Credential/noexec denial, missing interpreters, and executable
+format failures need separate transport and physical-Docker coverage. Passing
+the frozen missing-command/non-executable-file fixture must not be reported as
+complete error-handling parity. The rebuilt backend and fresh installed Mac
+lifecycle gate remain required; previous failed candidates remain failed.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

@@ -1,0 +1,197 @@
+--- a/crates/libcontainer/src/workload/default.rs
++++ b/crates/libcontainer/src/workload/default.rs
+@@ -71,7 +71,7 @@
+                         "executable for container process not found in PATH",
+                     );
+                     Err(ExecutorValidationError::ArgValidationError(format!(
+-                        "executable '{}' not found in $PATH",
++                        "executable file not found: executable '{}' not found in $PATH",
+                         args[0]
+                     )))?;
+                 }
+@@ -85,7 +85,7 @@
+                             "executable does not have the correct permission set",
+                         );
+                         Err(ExecutorValidationError::ArgValidationError(format!(
+-                            "executable '{}' at path '{:?}' does not have correct permissions",
++                            "permission denied: executable '{}' at path '{:?}' does not have correct permissions",
+                             args[0], path
+                         )))?;
+                     }
+@@ -167,7 +167,176 @@
+         spec
+     }
+ 
++    // Diagnostic compatibility only. These deliberately small mirrors of the
++    // pinned consumers do not execute Go, Docker, a container or a payload:
++    // docker/cli v29.4.0 cli/command/container/run.go:306-329 (case-sensitive)
++    // moby/moby v29.7.2 daemon/errors.go:126-185 (case-insensitive).
++    fn vz_cli_start_status(message: &str) -> i32 {
++        if [
++            "executable file not found",
++            "no such file or directory",
++            "system cannot find the file specified",
++        ]
++        .iter()
++        .any(|needle| message.contains(*needle))
++        {
++            127
++        } else if message.contains("permission denied") || message.contains("is a directory") {
++            126
++        } else {
++            125
++        }
++    }
++
++    fn vz_moby_start_status(message: &str) -> i32 {
++        let message = message.to_lowercase();
++        if message.contains("permission denied") || message.contains("is a directory") {
++            126
++        } else if [
++            "not a directory",
++            "executable file not found",
++            "no such file or directory",
++            "system cannot find the file specified",
++            "failed to run runc create/exec call",
++        ]
++        .iter()
++        .any(|needle| message.contains(*needle))
++        {
++            127
++        } else {
++            128
++        }
++    }
++
++    fn vz_validation_message(command: String, search_path: &Path) -> String {
++        let spec = executable_permission_spec(command, search_path);
++        let error = DefaultExecutor {}.validate(&spec).unwrap_err();
++        match &error {
++            ExecutorValidationError::ArgValidationError(message) => {
++                assert_eq!(error.to_string(), *message);
++            }
++            _ => panic!("unexpected executor error variant"),
++        }
++        error.to_string()
++    }
++
+     #[test]
++    fn test_vz_executable_errors_denied_permissions() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("non-executable");
++        std::fs::write(&path, b"validation-only fixture").unwrap();
++        for mode in [0o600, 0o000] {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
++            let message =
++                vz_validation_message(path.to_string_lossy().into_owned(), directory.path());
++            assert_eq!(
++                message,
++                format!(
++                    "permission denied: executable '{}' at path '{:?}' does not have correct permissions",
++                    path.display(),
++                    path
++                )
++            );
++            assert_eq!(vz_cli_start_status(&message), 126);
++            assert_eq!(vz_moby_start_status(&message), 126);
++            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, mode);
++        }
++        let path = directory.path().join("executable-directory");
++        std::fs::create_dir(&path).unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
++        let message = vz_validation_message(path.to_string_lossy().into_owned(), directory.path());
++        assert!(message.starts_with("permission denied: "));
++        assert_eq!(vz_cli_start_status(&message), 126);
++        assert_eq!(vz_moby_start_status(&message), 126);
++        assert!(path.is_dir());
++        assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, 0o755);
++    }
++
++    #[test]
++    fn test_vz_executable_errors_missing_paths() {
++        let directory = tempfile::tempdir().unwrap();
++        let absolute = directory.path().join("missing-command");
++        for command in [
++            absolute.to_string_lossy().into_owned(),
++            "missing-command".to_owned(),
++        ] {
++            let message = vz_validation_message(command.clone(), directory.path());
++            assert_eq!(
++                message,
++                format!(
++                    "executable file not found: executable '{}' not found in $PATH",
++                    command
++                )
++            );
++            assert_eq!(vz_cli_start_status(&message), 127);
++            assert_eq!(vz_moby_start_status(&message), 127);
++        }
++        assert!(!absolute.exists());
++        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
++    }
++
++    #[test]
++    fn test_vz_executable_errors_allowed_modes_unchanged() {
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("allowed-command");
++        std::fs::write(&path, b"validation-only fixture").unwrap();
++        for mode in [0o700, 0o710, 0o010, 0o001, 0o755] {
++            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(mode)).unwrap();
++            for command in [
++                path.to_string_lossy().into_owned(),
++                "allowed-command".to_owned(),
++            ] {
++                let spec = executable_permission_spec(command, directory.path());
++                assert!(DefaultExecutor {}.validate(&spec).is_ok());
++            }
++            assert_eq!(path.metadata().unwrap().permissions().mode() & 0o777, mode);
++        }
++        assert_eq!(std::fs::read(&path).unwrap(), b"validation-only fixture");
++        // Validation still delegates real credentials, ACLs, noexec mounts,
++        // interpreter resolution and executable format to unchanged execvp.
++    }
++
++    #[test]
++    fn test_vz_executable_errors_classifier_controls_and_context() {
++        for (message, cli, moby) in [
++            ("generic runtime failure", 125, 128),
++            (
++                "executable 'old' does not have correct permissions",
++                125,
++                128,
++            ),
++            ("executable 'old' not found in $PATH", 125, 128),
++            ("Permission denied", 125, 126),
++            ("Executable file not found", 125, 127),
++            ("permission denied", 126, 126),
++            ("is a directory", 126, 126),
++            ("executable file not found", 127, 127),
++        ] {
++            assert_eq!(vz_cli_start_status(message), cli, "CLI: {message}");
++            assert_eq!(vz_moby_start_status(message), moby, "Moby: {message}");
++        }
++        let directory = tempfile::tempdir().unwrap();
++        let path = directory.path().join("retained-context");
++        std::fs::write(&path, b"validation-only fixture").unwrap();
++        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
++        let original = vz_validation_message(path.to_string_lossy().into_owned(), directory.path());
++        assert!(original.contains(&format!(
++            "executable '{}' at path '{:?}'",
++            path.display(),
++            path
++        )));
++        let wrapped = format!("OCI runtime create failed: error in executing command: {original}");
++        assert_eq!(vz_cli_start_status(&wrapped), 126);
++        assert_eq!(vz_moby_start_status(&wrapped), 126);
++        let mut spec = Spec::default();
++        spec.set_process(None);
++        let unrelated = DefaultExecutor {}.validate(&spec).unwrap_err().to_string();
++        assert_eq!(unrelated, "spec did not contain process");
++        assert_eq!(vz_cli_start_status(&unrelated), 125);
++        assert_eq!(vz_moby_start_status(&unrelated), 128);
++    }
++
++    #[test]
+     fn test_vz_executable_permissions_mode_matrix() {
+         let directory = tempfile::tempdir().expect("private fixture directory");
+         let path = directory.path().join("docker-init-fixture");

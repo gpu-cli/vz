@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, validate, validate_elf
+from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_ERROR_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -62,7 +62,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -90,6 +90,9 @@ class CandidateTests(unittest.TestCase):
             "foreground-wait-tests.txt": wait_tests(wait_probes()),
             "console-size.patch": (self.source / "console-size.patch").read_bytes(),
             "console-size-tests.txt": ("\n".join("test tty::tests::" + name + " ... ok" for name in REQUIRED_CONSOLE_TESTS)
+                + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
+            "executable-errors.patch": (self.source / "executable-errors.patch").read_bytes(),
+            "executable-errors-tests.txt": ("\n".join("test workload::default::tests::" + name + " ... ok" for name in REQUIRED_EXEC_ERROR_TESTS)
                 + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
         }
         self.publish()
@@ -267,7 +270,7 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
 
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
@@ -441,9 +444,64 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
         self.assertIn('tty::tests::test_vz_console_size_', recipe)
         self.assertIn('/inputs/console-size.patch /inputs/console-size-tests.txt /result/', recipe)
-        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt > evidence.sha256', recipe)
-        self.assertIn('foreground-wait.patch console-size.patch | shasum', build)
+        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256', recipe)
+        self.assertIn('foreground-wait.patch console-size.patch executable-errors.patch | shasum', build)
         self.assertIn('cp "$recipe_dir/console-size.patch" "$context/"', build)
+
+    def test_executable_errors_patch_and_each_native_regression_are_required(self):
+        original = self.files["executable-errors-tests.txt"]
+        for name in REQUIRED_EXEC_ERROR_TESTS:
+            for status in ("ignored", "FAILED"):
+                self.files["executable-errors-tests.txt"] = original.replace((name+" ... ok").encode(),
+                                                                            (name+" ... "+status).encode())
+                self.publish()
+                with self.subTest(name=name, status=status), self.assertRaisesRegex(ValueError, "executable error"):
+                    validate(self.root, self.source)
+        self.files["executable-errors-tests.txt"] = original
+        self.files["executable-errors.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_executable_errors_duplicate_incomplete_or_foreign_results_rejected(self):
+        original = self.files["executable-errors-tests.txt"]
+        for bad in (original + original.splitlines(keepends=True)[0],
+                    original + original.splitlines(keepends=True)[-1],
+                    original.replace(b"0 failed", b"1 failed"), original.replace(b"0 ignored", b"1 ignored"),
+                    original.replace(b"4 passed", b"0 passed"),
+                    original.replace(b"workload::default::tests::", b"foreign::"), b"test result: ok.\n"):
+            self.files["executable-errors-tests.txt"] = bad
+            self.publish()
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "executable error"):
+                validate(self.root, self.source)
+
+    def test_executable_errors_evidence_and_exact_commit_component_required(self):
+        original = self.files["version.txt"]
+        for replacement in (b"", b"+vz-executable-errors-v10", b"+vz-executable-errors-v1+unknown"):
+            self.files["version.txt"] = original.replace(b"+vz-executable-errors-v1", replacement)
+            self.publish()
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, "commit"):
+                validate(self.root, self.source)
+        self.files["version.txt"] = original
+        self.files.pop("executable-errors-tests.txt")
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "incomplete youki evidence manifest"):
+            validate(self.root, self.source)
+
+    def test_executable_errors_recipe_context_and_frozen_test_target(self):
+        recipe = (self.source / "Dockerfile").read_text()
+        build = (self.source / "build.sh").read_text()
+        self.assertIn('COPY executable-errors.patch /inputs/executable-errors.patch', recipe)
+        self.assertIn('patch --batch --forward --fuzz=0 -p1 -i /inputs/executable-errors.patch', recipe)
+        self.assertIn('"$YOUKI_EXEC_ERROR_PATCH_SHA256  /inputs/executable-errors.patch"', recipe)
+        self.assertIn('+$YOUKI_EXEC_ERROR_PATCH_ID', recipe)
+        self.assertIn('--skip test_vz_executable_errors_', recipe)
+        self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
+        self.assertIn('workload::default::tests::test_vz_executable_errors_', recipe)
+        self.assertIn('/inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/', recipe)
+        self.assertIn('console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256', recipe)
+        self.assertIn('console-size.patch executable-errors.patch | shasum', build)
+        self.assertIn('cp "$recipe_dir/executable-errors.patch" "$context/"', build)
 
     def test_advisory_lock_rejects_live_owner_then_releases(self):
         import fcntl

@@ -325,3 +325,14 @@ defaults. Its 500 payloads / 584,759 bytes are under
 `1ae859df6ef3a73bf464931f247f658a570fbdf699aa3ff641693818357bff84`.
 Both complete inventories/hashes were independently verified. Objects and disks
 remain retained; no failed result was retried or reclassified.
+
+The next source candidate adds the pinned `vz-executable-errors-v1` patch
+(SHA-256 `83b34be8acf1b730e62c0e0a05cd541320ab1af7ae6d4b286a4322f974cd07f5`).
+Only the two structural validation diagnostics change. Its four mandatory native
+regressions exercise the actual validator and narrowly mirrored pinned consumer
+classifiers, not Docker itself. Physical 126/127 acceptance remains pending.
+Independent source review also identified a distinct unresolved path:
+`ExecutorError::Execution` hides its boxed execvp cause when displayed, and the
+intermediate process transports that display string. Kernel authorization and
+interpreter/format failures therefore need additional transport tests and actual
+Docker coverage; this prefix correction does not establish those cases.

@@ -13,6 +13,7 @@ COPY tenant-cgroup.patch /inputs/tenant-cgroup.patch
 COPY run-keep.patch /inputs/run-keep.patch
 COPY foreground-wait.patch /inputs/foreground-wait.patch
 COPY console-size.patch /inputs/console-size.patch
+COPY executable-errors.patch /inputs/executable-errors.patch
 RUN . /inputs/inputs.env && \
     echo "$YOUKI_SOURCE_SHA256  /inputs/source.tar.gz" | sha256sum -c - && \
     mkdir /source && tar -xzf /inputs/source.tar.gz -C /source --strip-components=1 && \
@@ -37,6 +38,8 @@ RUN --network=none . /inputs/inputs.env && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/foreground-wait.patch && \
     echo "$YOUKI_CONSOLE_PATCH_SHA256  /inputs/console-size.patch" | sha256sum -c - && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/console-size.patch && \
+    echo "$YOUKI_EXEC_ERROR_PATCH_SHA256  /inputs/executable-errors.patch" | sha256sum -c - && \
+    patch --batch --forward --fuzz=0 -p1 -i /inputs/executable-errors.patch && \
     echo "$YOUKI_LOCK_SHA256  /source/Cargo.lock" | sha256sum -c -
 ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     LIBBPF_SYS_LIBRARY_PATH=/usr/lib PKG_CONFIG_ALL_STATIC=1 \
@@ -44,7 +47,7 @@ ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-Bstatic -C link-arg=-lzstd -C link-arg=-lgcc -C link-arg=-lc"
 RUN cargo +1.96.0 fetch --locked --target aarch64-unknown-linux-musl
 RUN --network=none . /inputs/inputs.env && \
-    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
+    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID+$YOUKI_EXEC_ERROR_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
       --target aarch64-unknown-linux-musl -p youki --bin youki \
       --no-default-features --features "$YOUKI_FEATURES"
 RUN --network=none cargo +1.96.0 test --frozen --release --locked \
@@ -68,7 +71,7 @@ RUN cat /inputs/upstream-tests.txt
 RUN --network=none cargo +1.96.0 test --frozen --release --locked \
       --target aarch64-unknown-linux-musl -p libcontainer --lib \
       --no-default-features --features v2,cgroupsv2_devices,libseccomp test_vz_ \
-      -- --test-threads=1 --skip test_vz_tenant_root_ --skip test_vz_executable_permissions_ --skip test_vz_tenant_cgroup_ --skip test_vz_console_size_ > /inputs/seccomp-exec-tests.txt 2>&1 || \
+      -- --test-threads=1 --skip test_vz_tenant_root_ --skip test_vz_executable_permissions_ --skip test_vz_tenant_cgroup_ --skip test_vz_console_size_ --skip test_vz_executable_errors_ > /inputs/seccomp-exec-tests.txt 2>&1 || \
       { cat /inputs/seccomp-exec-tests.txt; exit 1; }
 RUN cat /inputs/seccomp-exec-tests.txt
 RUN --network=none cargo +1.96.0 test --frozen --release --locked \
@@ -118,6 +121,13 @@ RUN --network=none cargo +1.96.0 test --frozen --release --locked \
       -- --test-threads=1 > /inputs/console-size-tests.txt 2>&1 || \
       { cat /inputs/console-size-tests.txt; exit 1; }
 RUN cat /inputs/console-size-tests.txt
+RUN --network=none cargo +1.96.0 test --frozen --release --locked \
+      --target aarch64-unknown-linux-musl -p libcontainer --lib \
+      --no-default-features --features v2,cgroupsv2_devices,libseccomp \
+      workload::default::tests::test_vz_executable_errors_ \
+      -- --test-threads=1 > /inputs/executable-errors-tests.txt 2>&1 || \
+      { cat /inputs/executable-errors-tests.txt; exit 1; }
+RUN cat /inputs/executable-errors-tests.txt
 RUN --network=none set -eux; . /inputs/inputs.env; \
     mkdir /result && cp target/aarch64-unknown-linux-musl/release/youki /result/youki && \
     readelf -h -l -d /result/youki > /result/elf.txt && cat /result/elf.txt && \
@@ -134,10 +144,11 @@ RUN --network=none set -eux; . /inputs/inputs.env; \
     cp /inputs/run-keep.patch /inputs/run-keep-tests.txt /result/ && \
     cp /inputs/foreground-wait.patch /inputs/foreground-wait-tests.txt /result/ && \
     cp /inputs/console-size.patch /inputs/console-size-tests.txt /result/ && \
+    cp /inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/ && \
     sha256sum Cargo.lock > /result/source-lock.sha256 && \
     cargo +1.96.0 tree --frozen --target aarch64-unknown-linux-musl -p youki \
       --no-default-features --features "$YOUKI_FEATURES" -e features > /result/cargo-features.txt && \
-    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt > evidence.sha256
+    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256
 RUN --network=none set -eu; \
     mkdir /inputs/runtime-log-root; \
     set +e; \
