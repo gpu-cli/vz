@@ -1,7 +1,7 @@
 # Docker image round-trip evidence
 
-Status: DEV image round-trip slice, not an installed Docker pass or release
-certification. The explicit `scripts/run-linux-docker-e2e.sh --suite images`
+Status: installed Linux-on-macOS DEV image round-trip slice passed; not full
+Docker or release certification. The explicit `scripts/run-linux-docker-e2e.sh --suite images`
 runner uses the installed release and guest-bundle/client inputs shared by the
 other Docker slices. It requires neither a BuildKit archive nor tmux. Tracked by
 `vz-mzs.7.1.8`; the complete Docker catalog and the
@@ -38,8 +38,8 @@ Pinned Moby 29.7.2's containerd image backend reports the manifest digest as
 image ID, independently of the config digest. Inspect uses familiar repository
 tags and synthesizes/deduplicates repository digests. Load acknowledgements also
 use familiar names. The archive naming and compatibility records follow its
-vendored containerd exporter. These source-derived expectations still require
-verification against the installed guest Engine.
+vendored containerd exporter. Installed candidate 1 below verifies these
+source-derived expectations against the guest Engine.
 
 The Machine adapter accepts the harness's authenticated
 descriptor/scope/runtime proof, pins its execution and replay helpers, and
@@ -62,8 +62,42 @@ including failure-at-each-Machine monitoring/cleanup fences. Log
 CLI admission verifies that `images` is explicit while `all` still refuses before
 provisioning; neither the new suite nor the unit results populate release passes.
 
-Remaining acceptance: run it across three fresh vz Linux Machines while observing four
-isolation sentinels. Require independent raw replay, owned object cleanup, four
-clean-journal public Stops and unchanged host Docker defaults. Registry
-login/pull/push are not covered by these four cases. Stopped disks are retained;
-this focused slice does not certify Delete or the complete 63-case gate.
+## Installed candidate 1
+
+Source `3d052b49` passes the fresh installed-Mac run in
+`.artifacts/linux-docker-images-candidate-1`, using the same signed CLI/release
+and retained guest bundles as lifecycle candidate 10. The supervised root
+process exits zero and is positively reaped. Each of three independent Machines
+passes 130 workload commands followed by explicit cleanup, for 153 commands per
+Machine. Both saved archives per Machine are 9,728 bytes and independently verify
+six regular members, two directories and the complete 35-byte public payload.
+All manifest/config/layer/payload digests survive removal and exact-byte reload.
+
+Independent cold replay reconstructs every workload prefix and complete cleanup
+with dispatch, process signals, Driver construction and file writes blocked.
+It binds original source/staged/runtime inputs, exact Machine scopes, command
+plans, raw streams, timing and retained results. The sealed evidence inventory
+is unchanged before and after replay: 6,050 payloads / 6,389,467 bytes.
+Manifest SHA-256:
+`109724df182a5840f222916304c9fe846b8f8089089167a89161673a4f68613d`;
+result SHA-256:
+`55664fc7c9fb4c2ed89fd43685a6162be4b527bd5e837c5bf33e013a07fc996e`.
+Cold replay log `.artifacts/linux-docker-images-candidate-1-independent-replay.log`,
+SHA-256 `5122faf10f1b05b75f4f749d637faad521f86106e58be24740ff37d8de9a1ec8`.
+
+Separate independent checks validate all 208 complete sentinel samples (52 per
+Machine, 832 successful raw commands), including neighboring samples during each
+active workload. All four public Stops bind the original owners, incarnations,
+operation and generation to clean, synced and unmounted Docker filesystems.
+Daemon PID 31192 retires normally; its PID file and all five sockets are absent.
+Host daily and isolated Docker defaults remain unchanged. Owned subject/decoy
+and sentinel objects are removed; stopped disks and contexts remain retained.
+No test retry, fallback, cleanup error or evidence mutation is reported.
+
+This meets `vz-mzs.7.1.8`'s narrow four-expectation acceptance. Registry
+login/pull/push, public-Stop/Up runtime-invocation coverage, Delete and the full
+63-case three-phase release run remain separate. Image metadata operations do
+not inherently invoke youki; this slice binds startup runtime inventory and
+does not claim a per-operation runtime journal. Registry work must additionally
+address real per-Machine client credential ownership (`vz-mzs.7.1.9`) and
+secret-safe input capture without weakening the public-input recorder.
