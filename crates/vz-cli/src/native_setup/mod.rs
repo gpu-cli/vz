@@ -36,14 +36,14 @@ pub struct Args {
     /// Installed vz prefix; defaults to the parent of this executable's bin directory.
     #[arg(long)]
     pub prefix: Option<PathBuf>,
-    /// Explicit local Xcode application; copied into the guest, never modified.
-    #[arg(long, default_value = "/Applications/Xcode.app")]
-    pub xcode: PathBuf,
+    /// Optional local Xcode application. Omit for macOS without developer tools.
+    #[arg(long)]
+    pub xcode: Option<PathBuf>,
     /// Optional existing IPSW; must match the built-in Apple version and SHA-256.
     #[arg(long)]
     pub ipsw: Option<PathBuf>,
     /// Accept the selected Xcode license inside the new VM.
-    #[arg(long)]
+    #[arg(long, requires = "xcode")]
     pub accept_xcode_license: bool,
     /// Emit structured phase and byte progress.
     #[arg(long)]
@@ -236,16 +236,29 @@ pub async fn run(args: Args) -> Result<()> {
     );
     let source = args
         .xcode
-        .canonicalize()
+        .as_ref()
+        .map(|p| p.canonicalize())
+        .transpose()
         .context("select an installed Xcode application with --xcode")?;
+    ensure!(
+        source.is_some() || !args.accept_xcode_license,
+        "--accept-xcode-license requires --xcode"
+    );
+    let toolchain_recipe = source
+        .as_ref()
+        .map(|source| -> Result<_> {
+            Ok(serde_json::json!({"source":source,
+            "xcode_info":hash_file(&source.join("Contents/Info.plist"))?.0,
+            "anchors":package::source_identity(source)?}))
+        })
+        .transpose()?;
     let loader = bin.join("vz-agent-loader");
     let agent = bin.join("vz-guest-agent");
     let ipsw_pin: Artifact = serde_json::from_str(include_str!(
         "../../../../config/macos-26.3.1-25D2128-ipsw.json"
     ))?;
     let recipe = serde_json::json!({"schema_version":1,"setup_binary":hash_file(&executable)?.0,
-        "ipsw":ipsw_pin,"xcode":source,"xcode_info":hash_file(&source.join("Contents/Info.plist"))?.0,
-        "toolchain_anchors":package::source_identity(&source)?,
+        "ipsw":ipsw_pin,"toolchain":toolchain_recipe,
         "loader":hash_file(&loader)?.0,"agent":hash_file(&agent)?.0});
     let recipe_sha256 = hash_bytes(&serde_json::to_vec(&recipe)?);
     let root = prefix.join("macos-local");
@@ -303,17 +316,22 @@ pub async fn run(args: Args) -> Result<()> {
         return Ok(());
     }
     ensure!(
-        args.accept_xcode_license,
+        source.is_none() || args.accept_xcode_license,
         "review the selected Xcode license and rerun with --accept-xcode-license to accept it inside the VM"
     );
     let stage = tempfile::Builder::new()
         .prefix("setup-")
         .permissions(fs::Permissions::from_mode(0o700))
         .tempdir_in(&root)?;
-    let payload = stage.path().join("payload");
-    private(&payload)?;
-    event(args.json, "Packaging local Xcode", 0, 0)?;
-    let toolchain_sha256 = package::package(&source, &payload)?;
+    let toolchain = if let Some(source) = &source {
+        let payload = stage.path().join("payload");
+        private(&payload)?;
+        event(args.json, "Packaging local Xcode", 0, 0)?;
+        let pin = package::package(source, &payload)?;
+        Some((payload, pin))
+    } else {
+        None
+    };
     check_cancelled()?;
     let downloads = ArtifactCache::new(root.join("downloads"))?;
     let mut last = std::time::Instant::now() - Duration::from_secs(1);
@@ -391,32 +409,38 @@ pub async fn run(args: Args) -> Result<()> {
     );
     check_cancelled()?;
     let fixture = stage.path().join("fixture");
-    for (relative, content) in [
-        (
-            "Package.swift",
-            include_str!("../../../../tests/fixtures/vz-0.4/native-macos-swift/Package.swift"),
-        ),
-        (
-            "Sources/NativeProbe/NativeProbe.swift",
-            include_str!(
-                "../../../../tests/fixtures/vz-0.4/native-macos-swift/Sources/NativeProbe/NativeProbe.swift"
+    if toolchain.is_some() {
+        for (relative, content) in [
+            (
+                "Package.swift",
+                include_str!("../../../../tests/fixtures/vz-0.4/native-macos-swift/Package.swift"),
             ),
-        ),
-        (
-            "Tests/NativeProbeTests/NativeProbeTests.swift",
-            include_str!(
-                "../../../../tests/fixtures/vz-0.4/native-macos-swift/Tests/NativeProbeTests/NativeProbeTests.swift"
+            (
+                "Sources/NativeProbe/NativeProbe.swift",
+                include_str!(
+                    "../../../../tests/fixtures/vz-0.4/native-macos-swift/Sources/NativeProbe/NativeProbe.swift"
+                ),
             ),
-        ),
-    ] {
-        let path = fixture.join(relative);
-        fs::create_dir_all(path.parent().context("fixture parent")?)?;
-        fs::write(path, content)?;
+            (
+                "Tests/NativeProbeTests/NativeProbeTests.swift",
+                include_str!(
+                    "../../../../tests/fixtures/vz-0.4/native-macos-swift/Tests/NativeProbeTests/NativeProbeTests.swift"
+                ),
+            ),
+        ] {
+            let path = fixture.join(relative);
+            fs::create_dir_all(path.parent().context("fixture parent")?)?;
+            fs::write(path, content)?;
+        }
     }
     let candidate = stage.path().join("candidate");
     event(
         args.json,
-        "Installing Xcode and validating native Swift build/test/run",
+        if toolchain.is_some() {
+            "Installing Xcode and validating native Swift build/test/run"
+        } else {
+            "Validating macOS without developer tools"
+        },
         0,
         0,
     )?;
@@ -425,11 +449,11 @@ pub async fn run(args: Args) -> Result<()> {
         hardware: installed.hardware_model_path,
         auxiliary: installed.auxiliary_storage_path,
         output: candidate.clone(),
-        payload,
-        toolchain_sha256: toolchain_sha256.clone(),
+        payload: toolchain.as_ref().map(|(payload, _)| payload.clone()),
+        toolchain_sha256: toolchain.as_ref().map(|(_, pin)| pin.clone()),
         reuse_installed_toolchain: false,
-        accept_xcode_license: true,
-        fixture: Some(fixture),
+        accept_xcode_license: args.accept_xcode_license,
+        fixture: toolchain.as_ref().map(|_| fixture),
         expected_os: Some(format!("{VERSION}/{BUILD}")),
     })
     .await?;
@@ -463,7 +487,10 @@ pub async fn run(args: Args) -> Result<()> {
             )?,
         },
         guest_agent_sha256: hash_file(&agent)?.0,
-        toolchain_sha256,
+        toolchain_sha256: toolchain
+            .as_ref()
+            .map(|(_, pin)| pin.clone())
+            .unwrap_or_default(),
     };
     manifest.validate()?;
     let bytes = serde_json::to_vec_pretty(&manifest)?;
@@ -489,16 +516,20 @@ pub async fn run(args: Args) -> Result<()> {
     );
     fs::rename(&bundle, &destination)?;
     // Retain exact preparation evidence next to the manifest, not mutable disks.
-    for name in [
-        "guest-os.json",
-        "verification.json",
-        "signature.json",
-        "preflight-build.json",
-        "preflight-test.json",
-        "preflight-run.json",
-        "shutdown.json",
-        "license-acceptance.json",
-    ] {
+    let mut evidence = vec!["guest-os.json", "dev-home.json", "shutdown.json"];
+    if toolchain.is_some() {
+        evidence.extend([
+            "verification.json",
+            "signature.json",
+            "preflight-build.json",
+            "preflight-test.json",
+            "preflight-run.json",
+            "license-acceptance.json",
+        ]);
+    } else {
+        evidence.push("clean.json");
+    }
+    for name in evidence {
         fs::copy(candidate.join(name), destination.join(name))?;
     }
     fs::write(
@@ -640,6 +671,23 @@ fn provision(disk: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn developer_tools_are_explicitly_optional() {
+        let clean = Args::try_parse_from(["vz-macos-setup"]).unwrap();
+        assert!(clean.xcode.is_none());
+        assert!(!clean.accept_xcode_license);
+        assert!(Args::try_parse_from(["vz-macos-setup", "--accept-xcode-license"]).is_err());
+        let xcode = Args::try_parse_from([
+            "vz-macos-setup",
+            "--xcode",
+            "/Applications/Xcode.app",
+            "--accept-xcode-license",
+        ])
+        .unwrap();
+        assert!(xcode.xcode.is_some());
+        assert!(xcode.accept_xcode_license);
+    }
 
     #[test]
     fn simultaneous_setup_directory_creation_is_safe_and_reusable() -> Result<()> {

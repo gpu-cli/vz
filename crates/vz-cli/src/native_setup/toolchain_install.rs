@@ -17,10 +17,10 @@ pub struct Args {
     pub auxiliary: PathBuf,
     #[arg(long)]
     pub output: PathBuf,
-    #[arg(long)]
-    pub payload: PathBuf,
-    #[arg(long)]
-    pub toolchain_sha256: String,
+    #[arg(long, requires = "toolchain_sha256")]
+    pub payload: Option<PathBuf>,
+    #[arg(long, requires = "payload")]
+    pub toolchain_sha256: Option<String>,
     /// Verify an already-installed matching receipt in a new private clone.
     #[arg(long)]
     pub reuse_installed_toolchain: bool,
@@ -200,34 +200,50 @@ pub async fn run(args: Args) -> Result<()> {
         args.output.is_absolute(),
         "absolute new output directory required"
     );
-    let payload = args.payload.canonicalize()?;
-    let manifest = ToolchainManifest::from_verified_bytes(
-        &fs::read(payload.join("toolchain.json"))?,
-        &args.toolchain_sha256,
-    )?;
-    let archive = payload.join("toolchain.tar.gz");
     ensure!(
-        fs::symlink_metadata(&archive)?.is_file(),
-        "archive must be a regular file"
+        args.payload.is_some() == args.toolchain_sha256.is_some(),
+        "toolchain payload and pin must be supplied together"
     );
-    let mut archive_file = fs::File::open(&archive)?;
     ensure!(
-        archive_file.metadata()?.len() == manifest.archive.size_bytes,
-        "archive size mismatch"
+        args.payload.is_some()
+            || (!args.reuse_installed_toolchain
+                && !args.accept_xcode_license
+                && args.fixture.is_none()),
+        "clean macOS preparation cannot accept a toolchain license or Swift fixture"
     );
-    let mut hash = Sha256::new();
-    let mut buffer = vec![0; 4 * 1024 * 1024];
-    loop {
-        let read = archive_file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+    let toolchain = if let (Some(payload), Some(pin)) = (&args.payload, &args.toolchain_sha256) {
+        let payload = payload.canonicalize()?;
+        let manifest = ToolchainManifest::from_verified_bytes(
+            &fs::read(payload.join("toolchain.json"))?,
+            pin,
+        )?;
+        let archive = payload.join("toolchain.tar.gz");
+        ensure!(
+            fs::symlink_metadata(&archive)?.is_file(),
+            "archive must be a regular file"
+        );
+        let mut archive_file = fs::File::open(&archive)?;
+        ensure!(
+            archive_file.metadata()?.len() == manifest.archive.size_bytes,
+            "archive size mismatch"
+        );
+        let mut hash = Sha256::new();
+        let mut buffer = vec![0; 4 * 1024 * 1024];
+        loop {
+            let read = archive_file.read(&mut buffer)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
         }
-        hash.update(&buffer[..read]);
-    }
-    ensure!(
-        format!("{:x}", hash.finalize()) == manifest.archive.sha256,
-        "archive digest mismatch"
-    );
+        ensure!(
+            format!("{:x}", hash.finalize()) == manifest.archive.sha256,
+            "archive digest mismatch"
+        );
+        Some((payload, manifest, archive))
+    } else {
+        None
+    };
     fs::DirBuilder::new().mode(0o700).create(&args.output)?;
     ensure!(
         std::process::Command::new("/bin/cp")
@@ -284,13 +300,14 @@ pub async fn run(args: Args) -> Result<()> {
         let home = client.exec_stream("/bin/sh".into(), vec!["-c".into(), "set -eu; test \"$HOME\" = /Users/dev; test -w \"$HOME\"; directory=$(mktemp -d \"$HOME/vz-home-check.XXXXXX\"); rmdir \"$directory\"".into()], vz_linux::ExecOptions { user: Some("dev".into()), working_dir: Some("/Users/dev".into()), ..Default::default() }).await?.collect_checked().await?;
         ensure!(home.exit_code == 0, "native dev home is not usable: {home:?}");
         fs::write(args.output.join("dev-home.json"), serde_json::to_vec_pretty(&home)?)?;
+        if let Some((payload, manifest, archive)) = &toolchain {
         if args.reuse_installed_toolchain {
             let receipt = execute(&mut client, "head -c 32769 /usr/local/share/vz/toolchain.json", 10).await?;
-            let installed = ToolchainManifest::from_verified_bytes(receipt.stdout.as_bytes(), &args.toolchain_sha256)?;
-            ensure!(installed == manifest, "existing toolchain receipt differs");
+            let installed = ToolchainManifest::from_verified_bytes(receipt.stdout.as_bytes(), args.toolchain_sha256.as_deref().context("toolchain pin missing")?)?;
+            ensure!(&installed == manifest, "existing toolchain receipt differs");
         } else {
         execute(&mut client, "mkdir -m 700 /private/var/tmp/vz-toolchain-inputs", 30).await?;
-        upload(&mut client, &archive, "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz").await?;
+        upload(&mut client, archive, "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.tar.gz").await?;
         upload(&mut client, &payload.join("toolchain.json"), "umask 077; cat > /private/var/tmp/vz-toolchain-inputs/toolchain.json").await?;
         // Use the native digest implementation for the multi-gigabyte archive.
         // This also avoids depending on Perl before Xcode has been installed.
@@ -322,6 +339,10 @@ pub async fn run(args: Args) -> Result<()> {
         ensure!(output.stdout == expected && output.stderr.is_empty(), "installed Swift identity differs from pinned receipt: {output:?}");
         if let Some(fixture) = &args.fixture {
             preflight(&mut client, fixture, &args.output).await?;
+        }
+        } else {
+            let clean = execute(&mut client, "set -eu; test \"$(/usr/bin/uname -s)\" = Darwin; test \"$(/usr/sbin/sysctl -n hw.model)\" = VirtualMac2,1; test ! -e /Applications/Xcode.app; test ! -e /Library/Developer/CommandLineTools; test ! -e /usr/local/share/vz/toolchain.json; printf 'clean-macos-validated\\n'", 30).await?;
+            fs::write(args.output.join("clean.json"), serde_json::to_vec_pretty(&clean)?)?;
         }
         Ok::<_, anyhow::Error>(())
     }.await;

@@ -173,8 +173,12 @@ topology contract is **DEV**.
 The 0.4 native macOS release gate requires at least one exact macOS 26+ guest
 version/build prepared locally from pinned Apple IPSW bytes. The explicit host
 setup operation installs macOS, requests administrator authorization to provision
-the new guest disk, installs an explicitly selected local toolchain, and validates
-native Swift build/test/run before registering an immutable local template.
+the new guest disk, and validates an immutable local template. By default it
+prepares macOS without Xcode or Command Line Tools. Opting in with `--xcode`
+installs the selected local application and validates native Swift build/test/run.
+The native release gate covers both clean and Xcode-equipped Machines; Xcode is
+not required for users who want a clean OS for testing. The `clean` and `xcode`
+catalog channels select separate templates when both are installed.
 Setup is once per host and recipe/toolchain pin. Ordinary Machine creation uses
 private APFS clones with fresh platform identities; Up/exec/Stop/Delete require
 no host sudo or manual guest repair. Repeating a completed setup reuses its

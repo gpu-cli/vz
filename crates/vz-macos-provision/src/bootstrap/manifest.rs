@@ -129,10 +129,6 @@ impl ReleaseManifest {
                         && image.size_bytes == self.prepared_image.size_bytes,
                     "local image differs from prepared identity"
                 );
-                ensure!(
-                    !self.toolchain_sha256.is_empty(),
-                    "local setup requires a validated toolchain"
-                );
             }
             _ => anyhow::bail!("manifest must select exactly one versioned preparation source"),
         }

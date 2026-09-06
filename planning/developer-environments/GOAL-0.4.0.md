@@ -145,9 +145,11 @@ required E2E scenario and retained evidence:
    with major version 26 or later and its Apple restore IPSW digest. A clean vz
    installation runs the supported local setup operation: obtain and verify the
    IPSW, install macOS locally, request scoped administrator authorization to
-   provision the new guest disk, install the selected local Xcode/toolchain,
+   provision the new guest disk, optionally install explicitly selected local Xcode,
    validate native guest execution, then atomically register a prepared template.
-   Record the locally produced image, platform, agent, toolchain and recipe pins.
+   Record the locally produced image, platform, agent, optional toolchain and recipe pins.
+   Also qualify the default clean-macOS setup without Xcode or Command Line Tools,
+   and independent `clean`/`xcode` selection when both templates are installed.
    Ordinary Up creates private clones with separate identities and starts the
    agent without further sudo, mounting, ownership repair or agent injection.
    Repeated setup and subsequent Machines reuse the template without installation

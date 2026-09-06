@@ -35,8 +35,14 @@ def main():
                         help="exercise a deliberately corrupt local fixture and public Delete")
     parser.add_argument("--require-swift", action="store_true",
                         help="require a pinned toolchain and build/test/run the Swift guest fixture")
+    parser.add_argument("--require-clean", action="store_true", help="prove Xcode, CLT, and toolchain receipt are absent")
+    parser.add_argument("--channel", default="latest", help="installed macOS template channel to resolve")
     args = parser.parse_args()
-    tmux = shutil.which("tmux")
+    assert not (args.require_clean and args.require_swift)
+    # The setup harness deliberately gives product processes a minimal PATH.
+    # Resolve this test-only dependency from standard Homebrew locations too.
+    tmux = shutil.which("tmux", path=os.pathsep.join([
+        os.environ.get("PATH", os.defpath), "/opt/homebrew/bin", "/usr/local/bin"]))
     if not tmux:
         parser.error("tmux is required for the interactive gate")
     evidence = args.evidence.resolve()
@@ -162,7 +168,7 @@ def main():
     if args.installed_prefix:
         catalog = json.loads((args.installed_prefix / "machine-target-catalog.json").read_text())
         assert any(entry["manifest"]["sha256"] == args.manifest and
-                   entry["installed_bundle"] == str(args.bundle.resolve()) and "latest" in entry["channels"]
+                   entry["installed_bundle"] == str(args.bundle.resolve()) and args.channel in entry["channels"]
                    for entry in catalog["macos"]), "setup did not register the selected local image"
     release = json.loads((args.bundle / args.manifest).read_text())
     if args.require_swift:
@@ -173,7 +179,7 @@ def main():
             "schema_version": 1, "machines": [{
                 "schema_version": 1, "name": "mac", "profile": "developer",
                 "target": {"os": "macos", "arch": "aarch64", "image": "vz-macos",
-                           "channel": "latest"},
+                           "channel": args.channel},
                 "resources": {"cpus": 4, "memory_mb": 8192},
                 "requested_capabilities": {"capabilities": ["posix_exec", "posix_pty"]},
             }],
@@ -274,6 +280,11 @@ def main():
         assert cli("env-cwd", "exec", "--env", "VZ_E2E=literal $HOME; value",
                    "--workdir", "/private/var/tmp", "--no-stdin", "--", "/bin/sh", "-c",
                    'printf "%s\\n" "$VZ_E2E"; pwd') == "literal $HOME; value\n/private/var/tmp\n"
+        if args.require_clean:
+            assert not release["toolchain_sha256"]
+            cli("clean-guest", "exec", "--no-stdin", "--", "/bin/sh", "-c",
+                "set -eu; test ! -e /Applications/Xcode.app; test ! -e /Library/Developer/CommandLineTools; test ! -e /usr/local/share/vz/toolchain.json")
+            summary["clean_without_developer_tools"] = True
         if args.require_swift:
             swift_build()
         terminal_test()
@@ -291,6 +302,9 @@ def main():
         cli("warm-up", "up", "--timeout", "120", timeout=150)
         assert cli("read-marker", "exec", "--no-stdin", "--", "/bin/cat",
                    "/private/var/tmp/vz-cli-marker") == "native-persistence"
+        if args.require_clean:
+            cli("clean-warm", "exec", "--no-stdin", "--", "/bin/sh", "-c",
+                "set -eu; test ! -e /Applications/Xcode.app; test ! -e /Library/Developer/CommandLineTools; test ! -e /usr/local/share/vz/toolchain.json")
         if args.require_swift:
             assert swift_identity("swift-warm") == summary["swift"]["identity"]
             summary["swift"]["persisted_probe"] = swift_probe("swift-persisted-run")
@@ -300,6 +314,9 @@ def main():
                                  "--no-stdin", "--", "/bin/sh", "-c",
                                  "test ! -e /private/var/tmp/vz-cli-marker && "
                                  "test ! -e /Users/dev/vz-swift-fixture"])
+        if args.require_clean:
+            run("second-clean", [binary_dir / "vz", "exec", "--environment", "native-second", "--no-stdin", "--", "/bin/sh", "-c",
+                 "set -eu; test ! -e /Applications/Xcode.app; test ! -e /Library/Developer/CommandLineTools; test ! -e /usr/local/share/vz/toolchain.json"])
         if args.require_swift:
             # macOS can refuse writes inside Xcode even for guest root. Alter
             # the mutable receipt instead, and prove the write happened before

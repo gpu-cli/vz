@@ -159,8 +159,14 @@ async fn write_catalog(
                 "local setup requires a local-image manifest"
             );
         }
+        let variant = if release.toolchain_sha256.is_empty() {
+            "clean"
+        } else {
+            "xcode"
+        };
         for entry in &mut catalog.macos {
             entry.channels.remove("latest");
+            entry.channels.remove(variant);
         }
         catalog
             .macos
@@ -176,7 +182,7 @@ async fn write_catalog(
                     size_bytes: bytes.len() as u64,
                 },
                 installed_bundle: Some(bundle.into()),
-                channels: BTreeSet::from(["latest".into()]),
+                channels: BTreeSet::from(["latest".into(), variant.into()]),
             });
     }
     catalog.validate()?;
@@ -391,6 +397,18 @@ mod tests {
         assert_eq!(catalog.macos.len(), 2);
         assert!(catalog.macos[0].channels.is_empty());
         assert!(catalog.macos[1].channels.contains("latest"));
+        updated.toolchain_sha256.clear();
+        let clean = blob(&serde_json::to_vec(&updated).unwrap());
+        register_local_catalog(&prefix, "0.4.0", (&bundle, &clean.sha256))
+            .await
+            .unwrap();
+        let catalog = MachineTargetCatalog::from_file(&path).unwrap();
+        assert_eq!(catalog.macos.len(), 3);
+        assert_eq!(catalog.macos[1].channels, BTreeSet::from(["xcode".into()]));
+        assert_eq!(
+            catalog.macos[2].channels,
+            BTreeSet::from(["latest".into(), "clean".into()])
+        );
         write_installed_catalog(&prefix, "0.4.1", &["developer".into()])
             .await
             .unwrap();

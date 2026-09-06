@@ -424,6 +424,8 @@ fn missing_toolchain_is_only_accepted_for_explicit_development() -> Result<()> {
 #[tokio::test]
 async fn local_image_needs_no_delta_and_warm_reuse_needs_no_source_disk() -> Result<()> {
     let mut f = Fixture::new()?;
+    f.manifest.development = true;
+    f.manifest.toolchain_sha256.clear();
     let bundle = f.root.join("local-inputs");
     private_directory(&bundle)?;
     f.manifest.schema_version = 2;
