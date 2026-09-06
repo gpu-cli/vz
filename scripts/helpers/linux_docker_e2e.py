@@ -154,6 +154,7 @@ def preflight(args, require_host=True):
             info["inputs"][str(path)] = startup.digest(path)
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
+        from linux_docker_container_process_evidence import required_source_paths
         selected = startup.canonical(getattr(args, "container_fixture", None) or
                                      str(REPO / "tests/fixtures/vz-0.4/docker-container-io"))
         fixture_contract(selected)
@@ -162,6 +163,8 @@ def preflight(args, require_host=True):
         info['inputs'][terminal['path']] = terminal['sha256']
         python = startup.canonical(sys.executable, links=True)
         info['inputs'][str(python)] = startup.digest(python)
+        for path in required_source_paths():
+            info['inputs'][str(path)] = startup.digest(path)
         for name in ("linux_docker_container_lifecycle.py", "linux_docker_container_state.py",
                      "linux_docker_container_commands.py", "linux_docker_container_fixture.py",
                      "linux_docker_container_exec.py", "linux_docker_container_follow.py",

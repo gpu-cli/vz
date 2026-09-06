@@ -104,6 +104,74 @@ class Lifecycle(driver.Driver):
         self.terminal_owner = None
         self._terminal_pins = dict(terminal_pins)
         self.tmux_proof = None
+        self.process_observer = None
+        self.process_live = {}
+        self.process_observations = []
+        self.process_boot_id = None
+
+    def observe_process(self, role, label, phase, expected):
+        """Bracket one external guest observation with exact Docker ownership.
+
+        Running snapshots bind a kernel birth identity; removal without such a
+        snapshot certifies only the owned cgroup's absence, never unseen tasks.
+        """
+        from linux_docker_container_state import same_generation, same_identity
+        require(self.process_observer is not None and phase in ('running', 'stopped', 'removed'),
+                'source-bound process observer required')
+        row = self.containers[role]
+        require(expected['Id'] == row['cid'], 'foreign process observation target')
+        first = self.record.count + 1
+        self.guard()
+        def absent(stage):
+            result = self.step('process-absent-' + stage + '-' + label,
+                ['container', 'ls', '--all', '--quiet', '--no-trunc', '--filter', 'id=' + row['cid']])
+            require(not result.stdout and not result.stderr, 'removed process target still exists')
+        if phase == 'removed':
+            absent('before')
+            before = expected
+        else:
+            before = self.inspect(role, 'running' if phase == 'running' else 'exited')
+            same_identity(expected, before)
+            if phase == 'running':
+                same_generation(expected, before)
+            else:
+                require(before['State']['StartedAt'] == expected['State']['StartedAt'],
+                        'stopped process observation changed generation')
+        previous = None if phase == 'running' else self.process_live.get(role)
+        require(phase != 'stopped' or previous is not None, 'stopped birth identity was never observed')
+        proof = self.process_observer.capture(before, phase=phase, previous=previous,
+            engine_policy=self.engine_policy, label=label, expected_boot_id=self.process_boot_id)
+        if phase == 'removed':
+            absent('after')
+        else:
+            after = self.inspect(role, 'running' if phase == 'running' else 'exited')
+            same_identity(before, after)
+            if phase == 'running':
+                same_generation(before, after)
+            else:
+                require(before['State'] == after['State'], 'stopped state changed during process observation')
+        self.guard()
+        rows = self.record.receipts[first - 1:]
+        require(self.record.count == first + 5 and len(rows) == 6, 'process guard interval missing')
+        previous_end = 0
+        for index, receipt in enumerate(rows, first):
+            start, elapsed = receipt.get('started_unix_ns'), receipt.get('elapsed_ns')
+            require(type(receipt.get('index')) is int and receipt['index'] == index and
+                    type(start) is int and type(elapsed) is int and start > 0 and elapsed >= 0 and
+                    previous_end <= start, 'process guard timestamps differ')
+            previous_end = start + elapsed
+        start, end = proof.get('started_unix_ns'), proof.get('finished_unix_ns')
+        require(type(start) is int and type(end) is int and
+                rows[2]['started_unix_ns'] + rows[2]['elapsed_ns'] <= start <= end <= rows[3]['started_unix_ns'],
+                'guest process observation escaped Docker generation guards')
+        boot = proof['observation']['boot_id']
+        require(self.process_boot_id in (None, boot), 'process observer crossed Machine boots')
+        self.process_boot_id = boot
+        if phase == 'running':
+            self.process_live[role] = proof
+        self.process_observations.append(proof | {'guard_first_command': first,
+            'guard_last_command': self.record.count, 'role': role})
+        return proof
 
     def step(self, label, args, *, expected=0, timeout=30, plan=None):
         # Append intent before the command; incomplete steps cannot disappear
@@ -242,7 +310,8 @@ class Lifecycle(driver.Driver):
                     ('StdinOnce', 'AttachStdin', 'AttachStdout', 'AttachStderr')),
                 'attach does not own one EOF-closing stdin attachment')
         self.step('start-attach', ['container', 'start', row['cid']])
-        self.inspect('attach', 'running')
+        attached = self.inspect('attach', 'running')
+        self.observe_process('attach', 'attach-running', 'running', attached)
         # PID1 waits for a public kickoff byte. Therefore no probe output can
         # race ahead of attach; this is not a retrospective `logs` substitute.
         plan = io_plan([{'kind': 'write', 'data': b'!'},
@@ -254,7 +323,9 @@ class Lifecycle(driver.Driver):
         proof = self.verify_interaction(result, args, plan, 37)
         semantic = fixture.validate_stream(result.stdout, result.stderr, 37, self.token)
         from linux_docker_container_state import stopped
-        stopped(self.inspect('attach', 'exited'), 37)
+        attached = self.inspect('attach', 'exited')
+        stopped(attached, 37)
+        self.observe_process('attach', 'attach-stopped', 'stopped', attached)
         self.record.acknowledge_negative(result, 'source-selected attach binary EOF and exact owned exit37')
         return {'capture': proof, 'semantic': semantic}
 
@@ -353,6 +424,7 @@ class Lifecycle(driver.Driver):
         initial = self.inspect('sigkill', 'running')
         self.guard()
         same_generation(initial, self.inspect('sigkill', 'running'))
+        self.observe_process('sigkill', 'sigkill-running', 'running', initial)
         command = self.step('signal-run-kill', ['container', 'kill', '--signal', 'KILL', row['cid']])
         require(command.stdout == (row['cid'] + '\n').encode() and not command.stderr,
                 'SIGKILL acknowledgement differs')
@@ -365,6 +437,7 @@ class Lifecycle(driver.Driver):
         require(final['State']['StartedAt'] == initial['State']['StartedAt'] and
                 final['RestartCount'] == initial['RestartCount'], 'SIGKILL exit belongs to another generation')
         stopped(final, 137)
+        self.observe_process('sigkill', 'sigkill-stopped', 'stopped', final)
         return self.kill_termination
 
     def term_guard(self, cid, token):
@@ -381,7 +454,9 @@ class Lifecycle(driver.Driver):
         require(result.stdout == (cid + '\n').encode() and not result.stderr, 'TERM acknowledgement differs')
         wait = self.step('wait143', ['container', 'wait', cid])
         require(wait.stdout == b'143\n' and not wait.stderr, 'TERM guest exit differs')
-        stopped(self.inspect('term', 'exited'), 143)
+        final = self.inspect('term', 'exited')
+        stopped(final, 143)
+        self.observe_process('term', 'term-stopped', 'stopped', final)
         self.term_started = self.record.receipts[result.index - 1]['started_unix_ns']
         return {'command_index': result.index, 'started_unix_ns': self.term_started}
 
@@ -390,6 +465,7 @@ class Lifecycle(driver.Driver):
         row = self.create('term', ['service', self.token])
         self.step('start-term', ['container', 'start', row['cid']])
         self.term_generation = self.inspect('term', 'running')
+        self.observe_process('term', 'term-running', 'running', self.term_generation)
         return self.follow_service(row)
 
     def follow_service(self, row):
@@ -460,6 +536,7 @@ class Lifecycle(driver.Driver):
         same_identity(row['created'], self.service_generation, start_policy=policy,
                       engine_id=self.inputs.scope['engine_id'], start_acknowledged=True)
         health = self.health()
+        self.observe_process('service', 'service-initial-running', 'running', self.service_generation)
         self.io_observations = run_exec_io(self, row['cid'], self.token, service_guard=self.service_guard)
         terminal = self.tmux()
         self.service_guard()
@@ -480,14 +557,19 @@ class Lifecycle(driver.Driver):
         exits += [self.run_case('nonexec', [], 126, entrypoint='/fixture/not-executable'),
                   self.run_case('missing', [], 127, entrypoint='/fixture/does-not-exist')]
         self.step('stop-service', ['container', 'stop', '--timeout', '10', row['cid']])
-        stopped(self.inspect('service', 'exited'), 143)
+        exited = self.inspect('service', 'exited')
+        stopped(exited, 143)
+        self.observe_process('service', 'service-initial-stopped', 'stopped', exited)
         self.step('restart-service', ['container', 'restart', '--timeout', '10', row['cid']])
         restarted = self.inspect('service', 'running')
         new_generation(self.service_generation, restarted)
         self.service_generation = restarted
+        self.observe_process('service', 'service-restarted-running', 'running', restarted)
         # A host 'container kill' is the signal cause; a fixture exit(137) is not.
         self.step('kill-service', ['container', 'kill', '--signal', 'KILL', row['cid']])
-        stopped(self.inspect('service', 'exited'), 137)
+        exited = self.inspect('service', 'exited')
+        stopped(exited, 137)
+        self.observe_process('service', 'service-restarted-stopped', 'stopped', exited)
         wait = self.create('wait', ['exit', '37'])
         self.step('start-wait', ['container', 'start', wait['cid']])
         waited = self.step('wait37', ['container', 'wait', wait['cid']])
@@ -497,7 +579,7 @@ class Lifecycle(driver.Driver):
         self.workload_complete = True
         return {'scope': 'DEV_CONTAINER_LIFECYCLE_WORKLOAD_NOT_RELEASE_CERTIFICATION',
                 'health': health, 'exec_io': self.io_observations, 'attach': attached, 'stdin': stdin, 'exits': exits,
-                'follow': followed, 'tmux': terminal,
+                'follow': followed, 'tmux': terminal, 'process_observations': list(self.process_observations),
                 'remaining_acceptance': ['full-process-runtime-inventory', 'aggregate-release-integration']}
 
     def cleanup(self):
@@ -525,6 +607,7 @@ class Lifecycle(driver.Driver):
             removed = self.step('remove-' + role, ['container', 'rm', row['cid']])
             require(removed.stdout == (row['cid'] + '\n').encode() and not removed.stderr, 'remove acknowledgement differs')
             self.absent(row['name'])
+            self.observe_process(role, 'removed-' + role, 'removed', item[0])
             if role == 'term':
                 until = self.engine_clock('events-clock-end')
                 result = self.step('events', ['events', '--since', engine_time(self.events_since), '--until', engine_time(until),
@@ -543,7 +626,8 @@ class Lifecycle(driver.Driver):
         self.absent(self.tag, 'image')
         self.guard()
         return {'events': events, 'containers_absent_and_unrelated_ids_unchanged': True,
-                'fixture_tag_absent': True, 'full_process_absence_certified': False}
+                'fixture_tag_absent': True, 'full_process_absence_certified': False,
+                'process_observations': list(self.process_observations)}
 
 
 def container_ids(raw):
@@ -599,6 +683,8 @@ class ReplayLifecycle(Lifecycle):
         self._tmux_path = live._tmux_path
         self._terminal_pins = dict(live._terminal_pins)
         self.terminal_owner = self.tmux_proof = None
+        self.process_observer = live.process_observer.replay() if live.process_observer is not None else None
+        self.process_live, self.process_observations, self.process_boot_id = {}, [], None
         self.record = ReplayRecord(self.output)
         self.expected_count = live.record.count
         require(json.loads(driver.regular(self.output / 'inputs.json')) == self.inputs.raw, 'foreign lifecycle inputs')
@@ -724,6 +810,8 @@ def replay(live, *, cleanup):
     require(workload == interactive.parse(driver.regular(live.output / 'workload.json', 8 * 1024 * 1024)),
             'replayed workload differs from retained result')
     removed = selected.cleanup() if cleanup else None
+    require(selected.process_observer is not None, 'process observer missing from lifecycle replay')
+    selected.process_observer.assert_complete()
     require(selected.record.count == live.record.count and selected.steps == live.steps and
             command_indices(live.output) == list(range(1, live.record.count + 1)) and
             all(not row['effects_uncertain'] for row in selected.record.receipts),
@@ -748,6 +836,14 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     harness.drivers.append(selected)
     harness.driver_cleanup_verified.append(False)
     position = len(harness.drivers) - 1
+    from linux_docker_container_process_evidence import Observer, required_source_paths
+    observer = Observer(harness, descriptor, selected.output / 'process-observer',
+                        {str(path): harness.info['inputs'][str(path)] for path in required_source_paths()} |
+                        {str(harness.cli): harness.staged_inputs[str(harness.cli)]})
+    selected.process_observer = observer
+    observer_position = len(harness.drivers)
+    harness.drivers.append(observer)
+    harness.driver_cleanup_verified.append(False)
     follower_positions = []
     def register(item):
         follower_positions.append(len(harness.drivers))
@@ -764,6 +860,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     require(before['workload'] == result and after['workload'] == result and after['cleanup'] == cleanup,
             'independent lifecycle replay differs')
     harness.driver_cleanup_verified[position] = True
+    harness.driver_cleanup_verified[observer_position] = True
     require(len(follower_positions) == 2, 'exactly two owned stream observers required')
     for position in follower_positions:
         harness.driver_cleanup_verified[position] = True

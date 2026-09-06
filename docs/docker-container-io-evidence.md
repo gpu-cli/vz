@@ -411,3 +411,36 @@ This is a passing DEV lifecycle slice, not full Docker or 0.4 certification.
 cgroup absence and actual Engine-youki invocation receipts still need complete
 evidence. The separate kernel-exec error transport gap above and aggregate
 release integration also remain open. Earlier failed candidates remain failed.
+
+## Process observations: next installed candidate
+
+The lifecycle source now adds read-only, exact-Machine public Exec observations
+around five long-lived container generations: the service before and after its
+restart, the waiting attach process, the externally killed process, and the
+followed-log TERM process. Each running snapshot binds guest boot ID, PID birth
+ticks, namespace PID mapping, namespace memberships and owned cgroup identity.
+Stopped observations reject the original birth (including a zombie), remaining
+private PID/mount namespace members, or any task in the owned cgroup subtree.
+Every owned container also gets a cgroup check after removal. Fast-exit cases
+without a prior running snapshot explicitly do not gain historical PID evidence.
+
+The probe admits only the observed pinned Engine's unified cgroupfs/default-parent
+configuration and checks actual membership under `/docker/<full-container-ID>`.
+Directory/process/stream bounds fail closed, including trailing-newline overflow
+and excessive directory depth. Shared user/cgroup namespace memberships are not
+private absence targets. Observations cover an interval, not an atomic kernel
+transaction or namespace-object/file-descriptor teardown.
+
+A separate ledger pins the public CLI, observer/parser sources, environment,
+project definition and Machine incarnation. Six source-selected Docker commands
+bracket each probe; replay checks its original timestamps between the two
+generation/absence checks. Raw frames remain checksummed while returned proofs
+use compact process-inventory hashes. The observer is registered before capture,
+and incomplete observations prevent normal cleanup. Unit/replay tests do not
+establish physical acceptance of this new probe; a fresh installed run is required.
+
+Historical OCI invocation evidence still needs an internal youki audit mechanism,
+not a substitute runtime wrapper or faster process polling. Containerd invokes
+youki for container create/start/kill/delete and detached exec admission, but it
+kills exec processes directly and removes their IO/pidfile without extra youki
+kill/delete invocations. Audit expectations must reflect those actual paths.

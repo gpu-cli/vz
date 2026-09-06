@@ -36,10 +36,104 @@ def bare():
     value.killer = value.kill_termination = None
     value.terminal_owner = None
     value.tmux_proof = None
+    value.observe_process = Mock(return_value={})
+    value.process_live, value.process_observations, value.process_boot_id = {}, [], None
+    value.process_observer = None
     return value
 
 
 class SourcePlanTests(unittest.TestCase):
+    def process_actor(self, *, proof_change=None, boot=None):
+        value = bare()
+        del value.observe_process
+        value.containers = {'service': {'cid': CID}}
+        value.engine_policy = {'CgroupDriver': 'cgroupfs', 'CgroupVersion': '2'}
+        value.process_boot_id = boot
+        value.record.count = 0
+        expected = {key: {} for key in ('Config', 'HostConfig')}
+        expected.update(Id=CID, Name='/service', Image=IMAGE, Created='created', Path='python3',
+                        Args=[], Mounts=[], RestartCount=0,
+                        State={'Status': 'running', 'Running': True, 'Pid': 42, 'StartedAt': 'start'})
+        def tick():
+            value.record.count += 1
+            value.record.receipts.append({'index': value.record.count,
+                'started_unix_ns': value.record.count * 100, 'elapsed_ns': 10})
+        def guard():
+            tick(); tick()
+        def inspect(role, status):
+            tick()
+            return json.loads(json.dumps(expected))
+        def capture(*args, **kwargs):
+            proof = {'started_unix_ns': value.record.count * 100 + 20,
+                     'finished_unix_ns': value.record.count * 100 + 90,
+                     'observation': {'boot_id': 'owned-boot'}}
+            return proof | (proof_change or {})
+        value.guard, value.inspect = guard, Mock(side_effect=inspect)
+        value.process_observer = SimpleNamespace(capture=Mock(side_effect=capture))
+        return value, expected
+
+    def test_process_observation_requires_external_generation_window_and_boot(self):
+        value, expected = self.process_actor()
+        proof = value.observe_process('service', 'service-running', 'running', expected)
+        self.assertEqual(value.record.count, 6)
+        self.assertEqual(value.process_boot_id, 'owned-boot')
+        self.assertEqual(value.process_live['service'], proof)
+        self.assertEqual(value.process_observations, [proof | {
+            'guard_first_command': 1, 'guard_last_command': 6, 'role': 'service'}])
+        arguments = value.process_observer.capture.call_args.kwargs
+        self.assertEqual(arguments, {'phase': 'running', 'previous': None,
+            'engine_policy': value.engine_policy, 'label': 'service-running', 'expected_boot_id': None})
+        for changed in ({'started_unix_ns': 309}, {'finished_unix_ns': 401},
+                        {'started_unix_ns': True}, {'finished_unix_ns': 319}):
+            value, expected = self.process_actor(proof_change=changed)
+            with self.subTest(changed=changed), self.assertRaises(ValueError):
+                value.observe_process('service', 'running', 'running', expected)
+            self.assertEqual(value.process_observations, [])
+        value, expected = self.process_actor(boot='different-boot')
+        with self.assertRaisesRegex(ValueError, 'Machine boots'):
+            value.observe_process('service', 'running', 'running', expected)
+
+    def test_process_observation_refuses_unsampled_stop_and_foreign_target(self):
+        value, expected = self.process_actor()
+        with self.assertRaisesRegex(ValueError, 'foreign process'):
+            value.observe_process('service', 'running', 'running', expected | {'Id': 'b'*64})
+        self.assertEqual(value.record.count, 0)
+        with self.assertRaisesRegex(ValueError, 'never observed'):
+            value.observe_process('service', 'stopped', 'stopped', expected)
+        value.process_observer.capture.assert_not_called()
+
+    def test_removed_process_probe_is_between_exact_cid_absence_checks(self):
+        value, expected = self.process_actor(boot='owned-boot')
+        expected['State'].update(Running=False, Pid=0, Status='exited')
+        calls = []
+        def step(label, args):
+            calls.append(args)
+            value.record.count += 1
+            value.record.receipts.append({'index': value.record.count,
+                'started_unix_ns': value.record.count * 100, 'elapsed_ns': 10})
+            return SimpleNamespace(stdout=b'', stderr=b'')
+        value.step = step
+        value.observe_process('service', 'removed-service', 'removed', expected)
+        command = ['container', 'ls', '--all', '--quiet', '--no-trunc', '--filter', 'id=' + CID]
+        self.assertEqual(calls, [command, command])
+        value.inspect.assert_not_called()
+        self.assertIsNone(value.process_observer.capture.call_args.kwargs['previous'])
+        self.assertEqual(value.process_observer.capture.call_args.kwargs['expected_boot_id'], 'owned-boot')
+        self.assertEqual(value.process_live, {})
+
+    def test_process_observation_rejects_generation_change_after_guest_probe(self):
+        value, expected = self.process_actor()
+        original = value.inspect.side_effect
+        def inspect(role, status):
+            result = original(role, status)
+            if value.inspect.call_count == 2:
+                result['State']['StartedAt'] = 'replacement-generation'
+            return result
+        value.inspect.side_effect = inspect
+        with self.assertRaisesRegex(ValueError, 'generation changed'):
+            value.observe_process('service', 'running', 'running', expected)
+        self.assertEqual(value.process_observations, [])
+
     def failed_run(self, code, *, stderr=None, returned=None):
         value = bare(); value.absent = Mock()
         role, entrypoint = ('nonexec', '/fixture/not-executable') if code == 126 else ('missing', '/fixture/does-not-exist')
@@ -442,6 +536,7 @@ class ReplayTests(unittest.TestCase):
         self.live = SimpleNamespace(inputs=SimpleNamespace(raw=data, scope=data['scope']), output=self.root,
                                     fixture=fixture.FIXTURE, selected=fixture.FIXTURE, env={},
                                     _tmux_path='/owned/tmux', _terminal_pins={},
+                                    process_observer=None,
                                     record=SimpleNamespace(count=0), steps=[])
         self.recorder = driver.Recorder(self.root, {}, [])
 
@@ -554,6 +649,7 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(check.call_args.kwargs['expected_exit'], 37)
 
     def test_final_replay_rejects_extra_or_uncertain_commands(self):
+        self.live.process_observer = SimpleNamespace(replay=lambda: SimpleNamespace(assert_complete=Mock()))
         workload = {'inert_test_program': True}
         (self.root/'workload.json').write_text(json.dumps(workload))
         def program(selected):
