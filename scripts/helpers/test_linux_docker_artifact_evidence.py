@@ -174,13 +174,103 @@ class ArtifactEvidenceTests(unittest.TestCase):
                             "writing config " + self.cache["config"]["digest"],
                             "writing cache image manifest " + self.cache["manifest"]["digest"]]
             else:
-                statuses = []
+                statuses = ["inferred cache manifest type: application/vnd.oci.image.manifest.v1+json"]
             batch.setdefault("statuses", []).extend({"id": status, "vertex": identity,
                 "started": SyntheticBuilder.stamp(start), "completed": SyntheticBuilder.stamp(end)} for status in statuses)
         return encoded(batch)
 
     def validate(self):
         return evidence.validate(self.directory, self.inputs, self.operation)
+
+    def materialization(self):
+        self.make("fresh-import-alpha")
+        batch = json.loads((self.directory / "command-00005.stderr").read_text())
+        rows = batch["vertexes"]
+        index = next(i for i, row in enumerate(rows) if row["name"] == evidence.PAYLOAD_OUTPUT)
+        terminal = rows[index]
+        initial = dict(terminal)
+        initial.pop("completed")
+        controllers = []
+        for start, end in ((4.1, 4.3), (4.5, 4.8)):
+            row = {"digest": terminal["digest"], "name": terminal["name"], "started": SyntheticBuilder.stamp(start)}
+            controllers.extend((row, dict(row, completed=SyntheticBuilder.stamp(end))))
+        rows[index:index + 1] = [initial, *controllers, terminal]
+        return batch, index
+
+    def test_importer_materialization_preserves_raw_proof(self):
+        batch, index = self.materialization()
+        raw = encoded(batch)
+        self.stream(5, "stderr", raw)
+        proof = self.validate()["progress"]
+        self.assertEqual(proof["progress_sha256"], hashlib.sha256(raw).hexdigest())
+        self.assertEqual(len(proof["importer_output_materialization"]), 2)
+        self.assertEqual(proof["importer_output_materialization"][0]["start_record"], index + 1)
+        self.assertEqual(proof["importer_output_materialization"][1]["completed_record"], index + 4)
+
+    def test_importer_controller_adversaries_resealed_reject(self):
+        mutations = ("name", "digest", "inputs", "cached-false", "cached-true", "error", "empty-error", "unknown",
+                     "unfinished", "orphan", "duplicate-start", "duplicate-end", "overlap", "changed-start",
+                     "before-lifetime", "after-lifetime", "reversed", "before-canonical", "postterminal",
+                     "past-engine", "future-engine", "canonical-uncached", "canonical-input-drift")
+        for mutation in mutations:
+            batch, index = self.materialization()
+            rows = batch["vertexes"]
+            start, done = rows[index + 1:index + 3]
+            if mutation == "name": start["name"] = "foreign output"
+            elif mutation == "digest": start["digest"] = "sha256:" + "f" * 64
+            elif mutation == "inputs": start["inputs"] = []
+            elif mutation.startswith("cached-"): start["cached"] = mutation == "cached-true"
+            elif mutation == "error": start["error"] = "failed"
+            elif mutation == "empty-error": start["error"] = ""
+            elif mutation == "unknown": start["foreign"] = True
+            elif mutation == "unfinished": rows.pop(index + 4)
+            elif mutation == "orphan": rows.pop(index + 1)
+            elif mutation == "duplicate-start": rows.insert(index + 2, copy.deepcopy(start))
+            elif mutation == "duplicate-end": rows.insert(index + 3, copy.deepcopy(done))
+            elif mutation == "overlap":
+                rows[index + 3]["started"] = rows[index + 4]["started"] = SyntheticBuilder.stamp(4.2)
+            elif mutation == "changed-start": done["started"] = SyntheticBuilder.stamp(4.15)
+            elif mutation == "before-lifetime": start["started"] = done["started"] = SyntheticBuilder.stamp(3.9)
+            elif mutation == "after-lifetime": done["completed"] = SyntheticBuilder.stamp(5.1)
+            elif mutation == "reversed": done["completed"] = SyntheticBuilder.stamp(4.0)
+            elif mutation == "before-canonical": rows[index:index + 3] = [start, done, rows[index]]
+            elif mutation == "postterminal": rows[index + 3:index + 6] = [rows[index + 5], *rows[index + 3:index + 5]]
+            elif mutation == "past-engine": start["started"] = done["started"] = SyntheticBuilder.stamp(-1)
+            elif mutation == "future-engine": done["completed"] = SyntheticBuilder.stamp(11)
+            elif mutation == "canonical-uncached": rows[index + 5]["cached"] = False
+            elif mutation == "canonical-input-drift": rows[index + 5]["inputs"] = ["sha256:" + "f" * 64]
+            self.stream(5, "stderr", encoded(batch))
+            with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid):
+                self.validate()
+
+    def test_materialization_projection_is_importer_only(self):
+        batch, _ = self.materialization()
+        self.make("fresh-cold-alpha")
+        self.stream(5, "stderr", encoded(batch))
+        with self.assertRaises(evidence.Invalid):
+            self.validate()
+
+    def test_import_manifest_status_adversaries_reject(self):
+        for mutation in ("type", "missing", "unfinished", "duplicate", "past", "future", "root-outside",
+                         "changed-start", "unknown", "counter"):
+            self.make("fresh-import-alpha")
+            batch = json.loads((self.directory / "command-00005.stderr").read_text())
+            row = next(row for row in batch["statuses"] if row["id"].startswith("inferred cache manifest type:"))
+            if mutation == "type": row["id"] = "inferred cache manifest type: application/vnd.oci.image.index.v1+json"
+            elif mutation == "missing": batch["statuses"].remove(row)
+            elif mutation == "unfinished": row.pop("completed")
+            elif mutation == "duplicate": batch["statuses"].append(copy.deepcopy(row))
+            elif mutation == "past": row["started"] = SyntheticBuilder.stamp(-1)
+            elif mutation == "future": row["completed"] = SyntheticBuilder.stamp(11)
+            elif mutation == "root-outside": row["started"] = SyntheticBuilder.stamp(0.4)
+            elif mutation == "changed-start":
+                initial = dict(row, started=SyntheticBuilder.stamp(0.6)); initial.pop("completed")
+                batch["statuses"].insert(0, initial)
+            elif mutation == "unknown": row["error"] = ""
+            elif mutation == "counter": row["current"] = True
+            self.stream(5, "stderr", encoded(batch))
+            with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid):
+                self.validate()
 
     def test_all_five_exact_operations(self):
         for op in evidence.OPERATIONS:

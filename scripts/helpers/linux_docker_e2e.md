@@ -112,6 +112,18 @@ and the before/after imported cache inventory. Normal cleanup is withheld until
 all five operations and role ownership checks pass. This lane's implementation
 and offline tests are not a physical pass; consult its retained candidate result.
 
+Artifact candidates 1 and 2 remain failed and preserved. Candidate 1 exposed an
+implicit fixture file-mode assumption; public outputs now explicitly use `0644`.
+Candidate 2 completed the source exports and fresh cold control, then rejected
+the importer's nested lazy-cache progress as graph drift. That importer emitted
+no worker-runtime invocations. This is diagnostic evidence, not an accepted cache
+hit. The replay now separately validates complete, nested lazy-materialization
+records and the exact imported-manifest status; the ordinary graph checks remain
+strict. A fresh candidate is still required.
+Their separate disposition records prove positive Stops without removing failed
+Docker objects or disks. Historical fixture bytes are retained separately under
+`.artifacts/docker-artifact-integration-2g6xLx/original-fixture`.
+
 Four additional containers are started once before workload execution. A
 separate recorder continuously checks their Engine identity, unchanged start
 time/ID, zero restarts and unique host-written marker. These are contemporaneous

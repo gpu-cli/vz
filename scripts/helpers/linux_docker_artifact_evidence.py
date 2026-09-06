@@ -28,6 +28,8 @@ OCI_OPTIONS = ",tar=false,oci-mediatypes=true,compression=gzip,force-compression
 CACHE_OPTIONS = ",mode=max,image-manifest=true,oci-mediatypes=true,compression=gzip,force-compression=true"
 OCI_EXPORT = "exporting to oci image format"
 CACHE_EXPORT = "exporting cache to client directory"
+PAYLOAD_OUTPUT = "[output 1/1] COPY --from=build /out/payload.txt /payload.txt"
+IMPORT_MANIFEST_STATUS = "inferred cache manifest type: application/vnd.oci.image.manifest.v1+json"
 
 
 def _absolute(value):
@@ -78,10 +80,64 @@ def export_steps(raw, image, cache):
                     "export substep did not complete exactly once")
 
 
+def importer_materialization(vertices):
+    """Separate pinned BuildKit lazy-cache controller lifetimes, not graph drift.
+
+    BuildKit v0.19.0 solver/jobs.go installs a progress Controller using the
+    operation's digest/name. cache/remote.go starts it while reading a lazy blob;
+    util/progress/controller/controller.go emits no Inputs or Cached fields and
+    resets its start after each completed lifetime. Only the imported cached
+    payload output is eligible here. The ordinary build graph is not relaxed.
+    """
+    output = [(index, row) for index, row in enumerate(vertices) if row["name"] == PAYLOAD_OUTPUT]
+    controllers = [(index, row) for index, row in output if "inputs" not in row]
+    if not controllers:
+        return vertices, []
+    canonical = [(index, row) for index, row in output if "inputs" in row]
+    require(canonical and len({row["digest"] for _, row in output}) == 1,
+            "foreign importer materialization identity")
+    terminal = _terminal([row for _, row in canonical])
+    require(terminal.get("cached") is True and all(row.get("cached") is True
+            for _, row in canonical if "started" in row), "materialization lacks canonical cached lifetime")
+    start = next(index for index, row in canonical if "started" in row)
+    end = canonical[-1][0]
+    lower, upper = progress_ns(terminal["started"]), progress_ns(terminal["completed"])
+    opened, proofs, previous = None, [], lower
+    for index, row in controllers:
+        require(start < index < end and set(row) in (
+            {"digest", "name", "started"}, {"digest", "name", "started", "completed"}),
+            "invalid or postterminal importer controller record")
+        began = progress_ns(row["started"])
+        require(lower <= began <= upper, "importer controller outside canonical lifetime")
+        if "completed" not in row:
+            require(opened is None and began >= previous, "overlapping importer controller lifetime")
+            opened = (index, row)
+        else:
+            require(opened is not None and opened[1]["started"] == row["started"],
+                    "unpaired importer controller completion")
+            completed = progress_ns(row["completed"])
+            require(began <= completed <= upper, "importer controller completion outside canonical lifetime")
+            proofs.append({"digest": row["digest"], "name": row["name"], "started": row["started"],
+                           "completed": row["completed"], "start_record": opened[0], "completed_record": index})
+            previous, opened = completed, None
+    require(opened is None, "unfinished importer controller lifetime")
+    excluded = {index for index, _ in controllers}
+    return [row for index, row in enumerate(vertices) if index not in excluded], proofs
+
+
 def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_import, lower, upper):
     """Separate exporter/importer grammar; existing payload graph stays strict."""
     vertices, logs = progress(raw)
     require(lower <= upper, "Engine clocks reversed")
+    # Check the full original stream before projecting any controller records.
+    for vertex in vertices:
+        require(not vertex.get("error"), "artifact solve contains an error")
+        for key in ("started", "completed"):
+            if key in vertex:
+                require(lower <= progress_ns(vertex[key]) <= upper, "artifact progress outside Engine clocks")
+    materialization = []
+    if cache_import and cached and not secret:
+        vertices, materialization = importer_materialization(vertices)
     grouped, names = {}, {}
     for v in vertices:
         require(not v.get("error"), "artifact solve contains an error")
@@ -128,18 +184,49 @@ def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_imp
                             "reversed artifact status lifetime")
                 if category == "statuses" and grouped[row["vertex"]][0]["name"] in extra:
                     name = grouped[row["vertex"]][0]["name"]
-                    patterns = (r"exporting layers|exporting (?:manifest|config|manifest list) sha256:[0-9a-f]{64}"
+                    patterns = (re.escape(IMPORT_MANIFEST_STATUS) if name in imports else
+                                r"exporting layers|exporting (?:manifest|config|manifest list) sha256:[0-9a-f]{64}"
                                 if name == OCI_EXPORT else
                                 r"preparing build cache for export|writing (?:layer|config|cache image manifest) sha256:[0-9a-f]{64}")
                     require(isinstance(row.get("id"), str) and re.fullmatch(patterns, row["id"]), "foreign export substep")
+    import_status = None
+    if imports:
+        # cache/remotecache/import.go:58 emits this OneOff immediately after
+        # DetectManifestBlobMediaType. This lane exports only OCI image manifests.
+        identity = names[imports[0]]
+        updates = [row for batch in batches for row in batch.get("statuses", []) if row.get("vertex") == identity]
+        require(updates and {row.get("id") for row in updates} == {IMPORT_MANIFEST_STATUS},
+                "missing or foreign imported cache manifest type")
+        terminal = terminals[imports[0]]
+        for row in updates:
+            require(set(row) <= {"id", "vertex", "current", "total", "timestamp", "started", "completed"},
+                    "unknown importer status field")
+            for key in ("current", "total"):
+                require(key not in row or type(row[key]) is int and row[key] >= 0, "invalid importer status counter")
+            for key in ("started", "completed", "timestamp"):
+                if key in row:
+                    require(progress_ns(terminal["started"]) <= progress_ns(row[key]) <= progress_ns(terminal["completed"]),
+                            "import status outside its root lifetime")
+        done = [row for row in updates if "completed" in row]
+        require(len(done) == 1 and updates[-1] is done[0] and "started" in done[0]
+                and len({row["started"] for row in updates if "started" in row}) == 1,
+                "import status did not complete exactly once")
+        import_status = dict(done[0])
     if not secret:
         # Explicitly remove only roots validated above. No unknown operation is
         # dropped, and the unmodified full stream remains hash-bound evidence.
         selected = []
+        record = 0
+        excluded = {proof[key] for proof in materialization for key in ("start_record", "completed_record")}
         for batch in batches:
             item = dict(batch)
             if "vertexes" in item:
-                item["vertexes"] = [v for v in item["vertexes"] if v["name"] not in extra]
+                kept = []
+                for vertex in item["vertexes"]:
+                    if record not in excluded and vertex["name"] not in extra:
+                        kept.append(vertex)
+                    record += 1
+                item["vertexes"] = kept
             selected.append(json.dumps(item, separators=(",", ":")).encode())
         graph = payload_graph(b"\n".join(selected) + b"\n", reference, cached)
         output_end = max(progress_ns(v["completed"]) for v in grouped[graph["ids"]["output"]] if "completed" in v)
@@ -182,6 +269,8 @@ def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_imp
         require(progress_ns(terminals[OCI_EXPORT]["completed"]) <= progress_ns(terminals[CACHE_EXPORT]["started"]),
                 "cache export precedes completed OCI export")
     return {"progress_sha256": sha(raw), "graph": graph, "export_roots": sorted(extra),
+            "importer_output_materialization": materialization,
+            "imported_manifest_status": import_status,
             "engine_before_ns": lower, "engine_after_ns": upper}
 
 
