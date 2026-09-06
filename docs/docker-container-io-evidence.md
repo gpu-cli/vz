@@ -636,7 +636,25 @@ Attempt 3 evidence is `.artifacts/runtime-audit-capture-native-3`, 19 payloads,
 Separate disposition evidence is `.artifacts/runtime-audit-capture-native-3-disposition`,
 six payloads, 4,306 bytes, manifest SHA-256
 `5ff4a92e6958920aaa1661195490b1035db0dcbfabe2e5a574c3db08a4b54046`.
-The exact name requiring future observation is
-`vz-audit-capture-736956287e494c92b38cd9847fdaff70`.
+At `2026-09-06T21:35:25.071328Z`, a later bounded read-only observation found
+delayed creation had completed for the exact owned name
+`vz-audit-capture-736956287e494c92b38cd9847fdaff70`, CID
+`d9fb10044346ef5a70291a07c8da15eea17f73b47c5605070f39f70fac19a406`.
+It was `created`, PID 0, never started, with the pinned image and ownership label.
+That observation is separately retained in
+`.artifacts/runtime-audit-capture-native-3-observation-2`, ten payloads,
+16,118 bytes, manifest SHA-256
+`f0bcff431f080822f1bc623f2563b01a4c4708182ef4723370396484893616e2`.
+The original timeout remains failed. A separate diagnostic continuation may use
+this now-resolved exact container; it must not dispatch another create or
+reinterpret the original timeout as a passing command.
 Native portability and a fresh installed-Mac lifecycle candidate remain pending;
 none of these diagnostic attempts certifies runtime capture or Docker parity.
+
+Source `2350aa83` starts fresh installed-Mac lifecycle candidate 7 with the nine
+retained guest inputs above. Evidence is
+`.artifacts/linux-docker-lifecycle-candidate-7`, console
+`.artifacts/linux-docker-lifecycle-candidate-7.console.log`, retained root
+`/private/tmp/vzdev-t0mvxp68`. The first Environment reached Ready; the second is
+provisioning. The run is live, not a physical pass. Continue observing its same
+process; an observation timeout is not authorization to restart it.
