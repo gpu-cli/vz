@@ -69,7 +69,8 @@ pub struct ReleaseManifest {
     pub platform: Platform,
     /// Agent content pin; readiness/handshake verification belongs to the adapter.
     pub guest_agent_sha256: String,
-    /// Native toolchain content pin; the installed native gate verifies execution.
+    /// SHA-256 of exact `toolchain::ToolchainManifest` receipt bytes embedded in
+    /// the image. Native readiness verifies the pinned compiler/SDK anchors.
     pub toolchain_sha256: String,
 }
 

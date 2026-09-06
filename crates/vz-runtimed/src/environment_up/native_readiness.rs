@@ -40,6 +40,43 @@ pub(super) async fn verify(
             "native version, hardware or guest-agent pin check failed: {probe:?}"
         )));
     }
+    if !pin.release().toolchain_sha256.is_empty() {
+        use vz_macos_provision::toolchain::{MAX_RECEIPT_BYTES, RECEIPT_PATH, ToolchainManifest};
+        let receipt = activation
+            .exec(
+                "/usr/bin/head".into(),
+                vec![
+                    "-c".into(),
+                    (MAX_RECEIPT_BYTES + 1).to_string(),
+                    RECEIPT_PATH.into(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| bad(e.to_string()))?;
+        if receipt.exit_code != 0 || !receipt.stderr.is_empty() {
+            return Err(bad("pinned native toolchain receipt is unavailable".into()));
+        }
+        let toolchain = ToolchainManifest::from_verified_bytes(
+            receipt.stdout.as_bytes(),
+            &pin.release().toolchain_sha256,
+        )
+        .map_err(|e| bad(e.to_string()))?;
+        let (script, expected) = toolchain.verification().map_err(|e| bad(e.to_string()))?;
+        let observed = activation
+            .exec(
+                "/bin/sh".into(),
+                vec!["-c".into(), script],
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| bad(e.to_string()))?;
+        if observed.exit_code != 0 || observed.stdout != expected || !observed.stderr.is_empty() {
+            return Err(bad(format!(
+                "native Swift/toolchain pin verification failed: {observed:?}"
+            )));
+        }
+    }
     let ticket = activation
         .execution_lease()
         .prepare_machine_exec_request()

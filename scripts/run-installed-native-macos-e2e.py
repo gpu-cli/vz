@@ -7,6 +7,7 @@ and positive cleanup through the recorded installation's public CLI.
 """
 import argparse
 import hashlib
+import io
 import json
 import os
 from pathlib import Path
@@ -14,6 +15,7 @@ import shlex
 import shutil
 import subprocess
 import sys
+import tarfile
 import tempfile
 import time
 import uuid
@@ -29,6 +31,8 @@ def main():
                         help="continue checks against an unchanged retained installation")
     parser.add_argument("--expect-preparation-failure", action="store_true",
                         help="exercise a deliberately corrupt local fixture and public Delete")
+    parser.add_argument("--require-swift", action="store_true",
+                        help="require a pinned toolchain and build/test/run the Swift guest fixture")
     args = parser.parse_args()
     tmux = shutil.which("tmux")
     if not tmux:
@@ -150,6 +154,8 @@ def main():
     else:
         assert args.manifest == retained["manifest"] and str(args.bundle.resolve()) == retained["bundle"]
     release = json.loads((args.bundle / args.manifest).read_text())
+    if args.require_swift:
+        assert release["toolchain_sha256"], "Swift gate requires a release-pinned toolchain"
     definition = {
         "schema_version": 1, "project_id": "prj_" + uuid.uuid4().hex,
         "name": "native-macos-user-e2e", "environment": {
@@ -175,6 +181,52 @@ def main():
             for name in ["vz", "vz-runtimed"]}), indent=2))
     summary = dict(scope="INSTALLED_NATIVE_DEV_LOCAL_BUNDLE", root=str(root),
                    aggregate_release_certified=False, results=results)
+
+    swift_directory = "/Users/dev/vz-swift-fixture"
+
+    def swift_identity(name):
+        receipt = cli(name + "-receipt", "exec", "--no-stdin", "--", "/bin/cat",
+                      "/usr/local/share/vz/toolchain.json")
+        assert hashlib.sha256(receipt.encode()).hexdigest() == release["toolchain_sha256"]
+        identity = json.loads(receipt)
+        observed = cli(name + "-version", "exec", "--user", "dev", "--no-stdin", "--",
+                       "/bin/sh", "-c", "/usr/bin/xcrun swift --version 2>&1; "
+                       "/usr/bin/xcrun --sdk macosx --show-sdk-version")
+        assert observed == identity["swift_version"] + "\n" + identity["sdk_version"] + "\n"
+        return identity
+
+    def swift_probe(name):
+        record = json.loads(cli(name, "exec", "--user", "dev", "--workdir", swift_directory,
+                               "--no-stdin", "--", "./.build/release/native-probe"))
+        assert record["protocol"] == "vz-native-macos-swift" and record["protocol_version"] == 1
+        assert record["os_version"] == release["macos_version"]
+        assert record["os_build"] == release["macos_build"]
+        assert record["hardware_model"] == "VirtualMac2,1" and record["pid"] > 1
+        return record
+
+    def swift_build():
+        identity = swift_identity("swift-cold")
+        fixture = Path(__file__).resolve().parents[1] / "tests/fixtures/vz-0.4/native-macos-swift"
+        sources = [fixture / "Package.swift", *sorted((fixture / "Sources").rglob("*.swift")),
+                   *sorted((fixture / "Tests").rglob("*.swift"))]
+        archive = io.BytesIO()
+        with tarfile.open(fileobj=archive, mode="w") as tar:
+            for source in sources:
+                tar.add(source, arcname=str(source.relative_to(fixture)), recursive=False)
+        cli("swift-fixture-directory", "exec", "--user", "dev", "--no-stdin", "--",
+            "/bin/mkdir", "-p", swift_directory)
+        cli("swift-fixture-transfer", "exec", "--user", "dev", "--workdir", swift_directory,
+            "--", "/usr/bin/tar", "-xf", "-", input=archive.getvalue())
+        for phase, arguments in [("build", ["build", "-c", "release"]), ("test", ["test"])]:
+            cli("swift-" + phase, "exec", "--user", "dev", "--workdir", swift_directory,
+                "--timeout", "600", "--no-stdin", "--", "/usr/bin/xcrun", "swift",
+                *arguments, timeout=630)
+        test_log = ((evidence / "swift-test.stdout").read_text() +
+                    (evidence / "swift-test.stderr").read_text())
+        assert "physicalMacCannotSatisfyGuestProbe" in test_log and "1 test passed" in test_log
+        summary["swift"] = dict(toolchain_sha256=release["toolchain_sha256"], identity=identity,
+                                source_sha256={str(p.relative_to(fixture)): hashlib.sha256(p.read_bytes()).hexdigest()
+                                               for p in sources}, probe=swift_probe("swift-run"))
     if retained:
         summary["continued_from"] = str(args.resume_layout.resolve())
     audit = None
@@ -211,6 +263,8 @@ def main():
         assert cli("env-cwd", "exec", "--env", "VZ_E2E=literal $HOME; value",
                    "--workdir", "/private/var/tmp", "--no-stdin", "--", "/bin/sh", "-c",
                    'printf "%s\\n" "$VZ_E2E"; pwd') == "literal $HOME; value\n/private/var/tmp\n"
+        if args.require_swift:
+            swift_build()
         terminal_test()
         cli("cancel", "exec", "--timeout", "2", "--no-stdin", "--", "/bin/sh", "-c",
             "trap '' TERM; sleep 120 & printf '%s %s' $$ $! > /private/var/tmp/vz-cancel-pids; wait",
@@ -226,11 +280,29 @@ def main():
         cli("warm-up", "up", "--timeout", "120", timeout=150)
         assert cli("read-marker", "exec", "--no-stdin", "--", "/bin/cat",
                    "/private/var/tmp/vz-cli-marker") == "native-persistence"
+        if args.require_swift:
+            assert swift_identity("swift-warm") == summary["swift"]["identity"]
+            summary["swift"]["persisted_probe"] = swift_probe("swift-persisted-run")
         run("second-up", [binary_dir / "vz", "up", "--environment", "native-second",
                           "--timeout", "120"], timeout=150)
         run("second-isolation", [binary_dir / "vz", "exec", "--environment", "native-second",
                                  "--no-stdin", "--", "/bin/sh", "-c",
-                                 "test ! -e /private/var/tmp/vz-cli-marker"])
+                                 "test ! -e /private/var/tmp/vz-cli-marker && "
+                                 "test ! -e /Users/dev/vz-swift-fixture"])
+        if args.require_swift:
+            # Deliberately alter a disposable Machine's SDK anchor, then prove
+            # the next boot refuses Ready while positive Delete still works.
+            sdk = summary["swift"]["identity"]["sdk_version"]
+            assert sdk and all(c in "0123456789." for c in sdk)
+            anchor = f"/Library/Developer/CommandLineTools/SDKs/MacOSX{sdk}.sdk/SDKSettings.json"
+            run("second-alter-sdk", [binary_dir / "vz", "exec", "--environment", "native-second",
+                                    "--no-stdin", "--", "/bin/sh", "-c",
+                                    "printf ' ' >> " + shlex.quote(anchor) + "; sync"])
+            run("second-stop", [binary_dir / "vz", "stop", "--environment", "native-second",
+                                "--timeout", "120"], timeout=150)
+            run("altered-sdk-up", [binary_dir / "vz", "up", "--environment", "native-second",
+                                   "--timeout", "120"], timeout=150, expected=2)
+            assert "native Swift/toolchain pin verification failed" in (evidence / "altered-sdk-up.stderr").read_text()
         run("second-delete", [binary_dir / "vz", "delete", "--environment", "native-second",
                               "--timeout", "120"], timeout=150)
         assert cli("first-survives", "exec", "--no-stdin", "--", "/bin/cat",

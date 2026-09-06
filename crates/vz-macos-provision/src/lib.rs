@@ -15,6 +15,7 @@ pub mod artifact_cache;
 #[cfg(unix)]
 pub mod bootstrap;
 pub mod image_delta;
+pub mod toolchain;
 
 /// Default binary name for the guest agent.
 const DEFAULT_AGENT_BINARY_NAME: &str = "vz-guest-agent";
