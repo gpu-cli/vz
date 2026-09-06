@@ -19,6 +19,28 @@ LABEL = 'dev.vz.container-io'
 ENTRYPOINT = ['python3', '-u', '/fixture/probe.py']
 ATTACH_START = ("import os,sys; assert os.read(0,1)==b'!'; "
                 "os.execv('/usr/local/bin/python3',['python3','-u','/fixture/probe.py','stream',sys.argv[1]])")
+# Observe only rejected predicates in the unchanged, digest-pinned probe.
+# No terminal repair, initial-size wait, exception suppression or successful
+# output substitution: its original predicate and exit status remain decisive.
+TTY_START = '''import importlib.util,os,sys
+spec=importlib.util.spec_from_file_location('vzio_probe','/fixture/probe.py')
+probe=importlib.util.module_from_spec(spec)
+spec.loader.exec_module(probe)
+owner=probe.token(sys.argv[1])
+original=probe.require
+def checked(value):
+    if not value:
+        frame=sys._getframe(1)
+        saved=frame.f_locals.get('saved')
+        probe.emit('tty_contract_failure',owner,stream=sys.stderr.buffer,
+            check=frame.f_code.co_name,line=frame.f_lineno,
+            isatty=[os.isatty(fd) for fd in (0,1,2)],
+            rows=frame.f_locals.get('rows'),cols=frame.f_locals.get('columns'),
+            lflag=saved[3] if saved is not None else None)
+    return original(value)
+probe.require=checked
+raise SystemExit(probe.main(['tty',owner]))
+'''
 require = driver.require
 
 
@@ -333,7 +355,8 @@ class Lifecycle(driver.Driver):
         exits = [self.run_case('exit' + str(code), ['exit', str(code)], code) for code in (0, 37)]
         from linux_docker_container_exec import operations
         tty_signal_plan = operations(row['cid'], self.token)[-1]['plan']
-        exits.append(self.run_case('sigint', ['tty', self.token], 130, plan=tty_signal_plan))
+        exits.append(self.run_case('sigint', ['-u', '-c', TTY_START, self.token], 130,
+                                   plan=tty_signal_plan, entrypoint='python3'))
         ready = fixture.encode({'schema_version': 1, 'type': 'service_ready', 'token': self.token,
             'pid': 1, 'health': 'starting', 'output': 'stdout'}) + b'\n'
         exits.append(self.run_case('sigterm', ['service', self.token], 143,

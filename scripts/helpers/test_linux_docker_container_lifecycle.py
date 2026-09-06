@@ -1,5 +1,6 @@
 """Inert source-program/replay checks; dispatch and process creation prohibited."""
 import json
+import importlib.util
 from pathlib import Path
 import tempfile
 from types import SimpleNamespace
@@ -36,6 +37,48 @@ def bare():
 
 
 class SourcePlanTests(unittest.TestCase):
+    def test_tty_failure_observer_preserves_original_predicate_and_exit(self):
+        import os
+        import sys
+        for failing in (False, True):
+            observed = []
+            def original(value):
+                if not value:
+                    raise ValueError('unchanged probe rejection')
+            probe = SimpleNamespace(token=lambda value: value, require=original,
+                                    emit=lambda *args, **kwargs: observed.append((args, kwargs)))
+            def size():
+                rows, columns = (0, 0) if failing else (24, 80)
+                probe.require(rows > 0 and columns > 0)
+            def main(args):
+                self.assertEqual(args, ['tty', TOKEN])
+                try:
+                    size()
+                    return 130
+                except ValueError:
+                    return 70
+            probe.main = main
+            spec = SimpleNamespace(loader=SimpleNamespace(exec_module=Mock()))
+            with patch.object(importlib.util, 'spec_from_file_location', return_value=spec) as load, \
+                 patch.object(importlib.util, 'module_from_spec', return_value=probe), \
+                 patch.object(sys, 'argv', ['-c', TOKEN]), patch.object(os, 'isatty', return_value=True), \
+                 self.assertRaises(SystemExit) as terminal:
+                exec(compile(lane.TTY_START, '<frozen-tty-observer>', 'exec'), {})
+            self.assertEqual(terminal.exception.code, 70 if failing else 130)
+            load.assert_called_once_with('vzio_probe', '/fixture/probe.py')
+            spec.loader.exec_module.assert_called_once_with(probe)
+            if failing:
+                self.assertEqual(len(observed), 1)
+                args, details = observed[0]
+                self.assertEqual(args, ('tty_contract_failure', TOKEN))
+                self.assertEqual(details['check'], 'size')
+                self.assertEqual((details['rows'], details['cols']), (0, 0))
+                self.assertEqual(details['isatty'], [True, True, True])
+                self.assertIsNone(details['lflag'])
+                self.assertIs(details['stream'], sys.stderr.buffer)
+            else:
+                self.assertEqual(observed, [])
+
     def test_fixture_build_and_token_bind_explicit_scope(self):
         data = inputs()
         argv = lane.build_arguments(data, Path('/owned/fixture'), 'owned:tag')
