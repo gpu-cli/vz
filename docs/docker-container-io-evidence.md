@@ -412,7 +412,7 @@ cgroup absence and actual Engine-youki invocation receipts still need complete
 evidence. The separate kernel-exec error transport gap above and aggregate
 release integration also remain open. Earlier failed candidates remain failed.
 
-## Process observations: next installed candidate
+## Process observation contract
 
 The lifecycle source now adds read-only, exact-Machine public Exec observations
 around five long-lived container generations: the service before and after its
@@ -436,11 +436,63 @@ project definition and Machine incarnation. Six source-selected Docker commands
 bracket each probe; replay checks its original timestamps between the two
 generation/absence checks. Raw frames remain checksummed while returned proofs
 use compact process-inventory hashes. The observer is registered before capture,
-and incomplete observations prevent normal cleanup. Unit/replay tests do not
-establish physical acceptance of this new probe; a fresh installed run is required.
+and incomplete observations prevent normal cleanup. Unit/replay tests alone do
+not establish physical acceptance; candidate 6 below provides installed evidence.
 
 Historical OCI invocation evidence still needs an internal youki audit mechanism,
 not a substitute runtime wrapper or faster process polling. Containerd invokes
 youki for container create/start/kill/delete and detached exec admission, but it
 kills exec processes directly and removes their IO/pidfile without extra youki
 kill/delete invocations. Audit expectations must reflect those actual paths.
+
+## Candidate 6: installed lifecycle with process observations passed
+
+Source `9dc6768b` completed a fresh installed local-Mac run against the unchanged
+release-built CLI, daemon and retained guest bundles used by candidate 5. The
+runtime bytes are unchanged, so the earlier native 81-test and backend 50-test
+results remain applicable. The changed host harness passed 729 regressions in
+32.485 seconds; log `.artifacts/container-process-host-regression-2.log` SHA-256:
+`03f3e448df5bb1f5cc091aa7ab337e9b0396f170f05d47765a4a2b8ceca3ee3f`.
+
+All three Machines passed the original lifecycle and interactive workload,
+including exits 0, 37, 130, 143, 137, 126 and 127. Each completed 354 main Docker
+commands, 179 source-selected steps and 22 separate process observations.
+Independent no-dispatch, no-write replay reconstructed every retained workload
+and cleanup result exactly: 1,062 main commands and 66 process observations
+across the three Machines. Each owned tmux pane returned 37, its server was
+reaped and its socket removed. There were no test retries or cleanup errors.
+
+Independent raw sampler replay confirms 15 running, 15 stopped and 36 removed
+observations. All 51 nonrunning samples found the owned cgroup absent; 27 also
+verified the previously recorded birth and private PID/mount namespace members
+absent. The other 24 explicitly provide cgroup-only evidence without historical
+birth claims. Captures took 0.349–0.537 seconds and retained 12,162,443 raw bytes.
+Each sampled 93–97 stable processes, including 84 kernel threads. No zombie or
+unavailable-namespace observations occurred, so the narrow zombie allowance is
+source/unit verified but not physically exercised by this candidate.
+
+Four raw public Stop receipts independently match the original Machine owners,
+incarnations and operations, with clean journals, synced/unmounted storage and
+reaped guest daemons. Host daemon PID 8295, its PID file and all five owned daemon
+and Docker sockets are absent. Daily and isolated Docker defaults are unchanged.
+All 2,848 raw sentinel commands independently validate as complete, certain and
+successful: 712 ordered samples, 178 per Machine across four Machines. Original
+Engine/context endpoint, container/image identity, start time, zero restart count
+and host-written marker remain stable, with no sentinel errors or retries. This
+establishes sampled continuity, not network-service conformance.
+
+Evidence is `.artifacts/linux-docker-lifecycle-candidate-6`. Independent full-byte
+integrity verification checks the exact 18,221 payloads totaling 34,841,321 bytes.
+Manifest SHA-256:
+`4ec6d7450f2f7e9c1aebbe447b7c066819beeb154dc36d9b4ab9022663e284c2`.
+Result SHA-256:
+`de331990f7c027420b28b903fb135b8cd061c30a29b984bbad623c80933ef1d6`.
+Console `.artifacts/linux-docker-lifecycle-candidate-6.console.log` SHA-256:
+`c2f96c914e92e1e6e264a1fb66c6396817c3655d68bf67054a0a54f8940f5a17`.
+
+This remains a DEV lifecycle slice, not full process absence, Docker parity or
+0.4 release certification. The observations establish bounded kernel-state
+checks, not historical births of unsampled fast processes, surviving namespace
+file-descriptor references or actual Engine-to-youki invocation history. The
+kernel-exec error transport gap and full aggregate release gate remain open.
+Stopped Machine disks and contexts are retained; this run does not certify Delete.
