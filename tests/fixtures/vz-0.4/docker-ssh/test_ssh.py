@@ -228,6 +228,43 @@ class Recipe(unittest.TestCase):
         with mock.patch.object(server.pwd, 'getpwnam', side_effect=KeyError), self.assertRaises(KeyError):
             server.accounts()
 
+    def test_server_image_declares_only_public_code_readable(self):
+        recipe = (ROOT / 'Dockerfile.server').read_text()
+        self.assertIn('COPY --chmod=0644 server.py ssh_probe.py sshd_config /fixture/\n', recipe)
+        self.assertEqual(recipe.count('--chmod'), 1)
+        self.assertNotIn('chmod -R', recipe)
+
+    def test_public_code_rejects_unreadable_writable_redirected_or_foreign_metadata(self):
+        metadata = {'/fixture': (stat.S_IFDIR | 0o755, 0, 0, 1),
+                    **{'/fixture/' + name: (stat.S_IFREG | 0o644, 0, 0, 1)
+                       for name in ('server.py', 'ssh_probe.py', 'sshd_config')}}
+        def inspect(path):
+            mode, uid, gid, links = metadata[str(path)]
+            return os.stat_result((mode, 1, 1, links, uid, gid, 10, 0, 0, 0))
+        with mock.patch.object(Path, 'lstat', inspect):
+            server.public_code()
+            for path in metadata:
+                original = metadata[path]
+                variants = [(original[0], 1, 0, 1), (original[0], 0, 1, 1),
+                            (stat.S_IFLNK | 0o777, 0, 0, 1)]
+                if path == '/fixture':
+                    variants.extend([(stat.S_IFDIR | 0o700, 0, 0, 1), (stat.S_IFDIR | 0o777, 0, 0, 1)])
+                else:
+                    variants.extend([(stat.S_IFREG | 0o600, 0, 0, 1), (stat.S_IFREG | 0o666, 0, 0, 1),
+                                     (stat.S_IFREG | 0o644, 0, 0, 2)])
+                for changed in variants:
+                    metadata[path] = changed
+                    with self.subTest(path=path, metadata=changed), self.assertRaises(ValueError):
+                        server.public_code()
+                metadata[path] = original
+
+    def test_public_code_admission_precedes_account_mutation(self):
+        with mock.patch.object(server.os, 'getuid', return_value=0), \
+             mock.patch.object(server, 'public_code', side_effect=ValueError), \
+             mock.patch.object(server, 'install_accounts') as install, self.assertRaises(ValueError):
+            server.prepare()
+        install.assert_not_called()
+
     def test_server_response_only_exact_public_token(self):
         with mock.patch.object(server, 'read_regular', return_value=probe.response(item())):
             self.assertEqual(server.public_response(), probe.response(item()))

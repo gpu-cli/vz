@@ -3,7 +3,7 @@ FROM ${FIXTURE_BASE}
 COPY packages/ /fixture/packages/
 COPY packages.py package-pins.json ssh_probe.py /fixture/
 RUN --network=none python3 /fixture/packages.py
-COPY server.py ssh_probe.py sshd_config /fixture/
+COPY --chmod=0644 server.py ssh_probe.py sshd_config /fixture/
 # Source-verified fresh dedicated accounts; existing accounts are never unlocked.
 # No apt, maintainer scripts, host-key generation, or private build arguments.
 RUN --network=none python3 /fixture/server.py prepare

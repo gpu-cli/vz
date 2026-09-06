@@ -117,6 +117,18 @@ configuration. It retains both snapshots and the raw policy/start evidence;
 subsequent configuration drift still fails. Candidate 2 remains failed. All four Machines were publicly
 stopped with clean-journal receipts; objects and stopped disks remain retained.
 
+Candidate 3 passed that normalization and independently replayed all three
+intended denials on its first Machine. Its declared-forwarding build reached
+the remote forced command, but Python could not read `/fixture/server.py`:
+the image had inherited the host staging file's `0600` mode. This is not a
+positive SSH build pass. The image now explicitly copies only public server
+modules and configuration with `0644` permissions, and preparation/startup
+validate root ownership, single-link regular files and the traversable `0755`
+parent. Host staging and runtime private-key permissions are unchanged.
+Candidate 3's four Machines were publicly stopped with clean-journal receipts;
+its failed evidence and stopped objects remain retained. Fresh positive and
+complete cache/cleanup verification are still required.
+
 The authenticated OpenSSH 9.2p1 source defines Linux's locked-password prefix as
 `!` (`configure.ac`); `platform.c` checks that prefix, and `auth.c` applies the
 check when PAM is disabled. Therefore a dedicated fixture account with shadow

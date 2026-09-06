@@ -18,7 +18,7 @@ import linux_docker_ssh_input as packages
 require = driver.require
 CASES = ("undeclared", "provider_omitted", "wrong_host", "declared")
 FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker-ssh"
-FIXTURE_SHA256 = "3a2e84a13a095effb535faeab2359a13aa0092d4bec7a7ce0e5a07a8f22169c1"
+FIXTURE_SHA256 = "3472d44f91ed99e3b4e32c7bbaaea2da528426889876849d25692b5e1444908a"
 FIXTURE_FILES = {"Dockerfile.server", "Dockerfile.ssh", "Dockerfile.undeclared", "README.md",
                  "contract.json", "package-pins.json", "packages.py", "server.py", "ssh_probe.py",
                  "sshd_config", "test_ssh.py", ".dockerignore"}

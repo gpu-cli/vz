@@ -22,6 +22,11 @@ reaping is unproven, its private spool is retained for Machine lifecycle cleanup
 `server.py`
 installs fresh dedicated `vzssh` (10001) and privilege-separation `sshd` (10002)
 accounts, rejecting any existing name/ID instead of repairing or unlocking it.
+The server image copies only its public Python modules and sshd configuration
+with explicit `0644` modes. Preparation and startup require those files to be
+single-link, root-owned regular files in root-owned `0755` `/fixture`; the
+unprivileged forced command can read them without changing host staging modes
+or runtime private-key permissions.
 The Linux OpenSSH build treats shadow `!` as locked; shadow `*` is not a usable
 password and is not that prefix. The fixture uses `*` with no expiry fields and
 also disables PAM/password/interactive authentication. Source evidence is the

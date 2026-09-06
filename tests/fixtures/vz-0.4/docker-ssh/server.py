@@ -67,8 +67,20 @@ def accounts():
     return login, separation
 
 
+def public_code(root=Path('/fixture')):
+    """Public forced-command source must be readable, but never user-writable."""
+    directory = root.lstat()
+    require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == directory.st_gid == 0 and
+            stat.S_IMODE(directory.st_mode) == 0o755)
+    for name in ('server.py', 'ssh_probe.py', 'sshd_config'):
+        info = (root / name).lstat()
+        require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1 and
+                info.st_uid == info.st_gid == 0 and stat.S_IMODE(info.st_mode) == 0o644)
+
+
 def prepare():
     require(os.getuid() == 0)
+    public_code()
     install_accounts()
     accounts()
     for name in ('/run/sshd', str(DIRECTORY), '/var/empty/vzssh'):
@@ -87,6 +99,7 @@ def public_response():
 
 def serve():
     require(os.getuid() == 0)
+    public_code()
     accounts()
     directory = DIRECTORY.lstat()
     require(stat.S_ISDIR(directory.st_mode) and directory.st_uid == 0 and
