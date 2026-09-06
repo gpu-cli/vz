@@ -33,9 +33,18 @@ The version/build and URL were read from Apple's
 [restore catalog](https://mesu.apple.com/assets/macos/com_apple_macOSIPSW/com_apple_macOSIPSW.xml).
 The digest/length came from the matching Apple CDN response headers; downloaded
 bytes must independently match them before use. This is a candidate input, not
-an ACTIVE capability or a certified macOS version. Host compatibility, loader
-bootstrap, Xcode/Swift toolchain and the installed physical gate still need proof.
-The local host inspected for this work is Apple silicon, macOS 26.3.1(a).
+an ACTIVE capability or a certified macOS version. The complete download matched
+that SHA-256, and its Restore.plist identifies 26.6.2 / 25G83 and VirtualMac2,1.
+A signed read-only Virtualization.framework probe on the local Apple-silicon
+macOS 26.3.1(a) host accepted the restore hardware model and reported minimums of
+2 CPUs and 4 GiB RAM. Installation, loader bootstrap, Xcode/Swift execution and
+the installed physical gate still need proof.
+
+The framework requires a `.ipsw` filename even for valid archive bytes. Native
+preparation must stage a verified cache blob under that suffix in its owned
+workspace. The probe used a task-owned hard link; it did not copy the 19.8 GB
+archive, mount a disk, install or boot a VM. Evidence is retained under
+`.artifacts/macos26-bootstrap/verification/` in this worktree.
 
 ## Base compatibility decision
 

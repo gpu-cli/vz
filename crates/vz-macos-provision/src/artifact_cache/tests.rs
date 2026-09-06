@@ -189,8 +189,11 @@ async fn dropped_download_future_discards_staging_and_releases_lock() -> Result<
     );
     let stalled_server = tokio::spawn(async move {
         let (mut stream, _) = listener.accept().await?;
-        let mut request = [0; 4096];
-        stream.read(&mut request).await?;
+        let mut method = [0; 4];
+        stream.read_exact(&mut method).await?;
+        if &method != b"GET " {
+            return Err(std::io::Error::other("expected GET request"));
+        }
         stream
             .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabc")
             .await?;
