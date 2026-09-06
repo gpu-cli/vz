@@ -1,0 +1,1123 @@
+--- a/crates/youki/src/main.rs
++++ b/crates/youki/src/main.rs
+@@ -4,6 +4,7 @@
+ mod commands;
+ mod observability;
+ mod rootpath;
++mod runtime_audit;
+ mod workload;
+ 
+ use anyhow::{Context, Result};
+@@ -60,6 +61,18 @@
+     Completion(commands::completion::Completion),
+ }
+ 
++// These explicit completion paths preserve OCI results even when diagnostic
++// recording fails. Drop cannot record direct process::exit or crash completion.
++fn exit_with_audit(audit: &mut runtime_audit::Audit, ok: bool, code: i32) -> ! {
++    audit.finish(ok, code);
++    std::process::exit(code)
++}
++
++fn return_with_audit(audit: &mut runtime_audit::Audit, result: Result<()>) -> Result<()> {
++    audit.finish(result.is_ok(), if result.is_ok() { 0 } else { 1 });
++    result
++}
++
+ /// This is the entry point in the container runtime. The binary is run by a high-level container runtime,
+ /// with various flags passed. This parses the flags, creates and manages appropriate resources.
+ fn main() -> Result<()> {
+@@ -76,77 +89,83 @@
+     pentacle::ensure_sealed().context("failed to seal /proc/self/exe")?;
+ 
+     let opts = Opts::parse();
+-    if opts.version {
+-        info::print_youki();
+-        return Ok(());
+-    }
++    let mut audit = runtime_audit::Audit::begin(&opts);
++    // Capture setup errors too, without changing their previous propagation.
++    // Malformed Clap input and the initial sealing re-exec precede typed audit.
++    let cmd_result = (|| -> Result<()> {
++        if opts.version {
++            info::print_youki();
++            return Ok(());
++        }
+ 
+-    let mut app = Opts::command();
+-    let syscall = create_syscall();
++        let mut app = Opts::command();
++        let syscall = create_syscall();
+ 
+-    observability::init(&opts).map_err(|err| {
+-        eprintln!("failed to initialize observability: {}", err);
+-        err
+-    })?;
++        observability::init(&opts).map_err(|err| {
++            eprintln!("failed to initialize observability: {}", err);
++            err
++        })?;
+ 
+-    tracing::debug!(
+-        "started by user {} with {:?}",
+-        syscall.get_euid(),
+-        std::env::args_os()
+-    );
++        tracing::debug!(
++            "started by user {} with {:?}",
++            syscall.get_euid(),
++            std::env::args_os()
++        );
+ 
+-    let root_path = rootpath::determine(opts.global.root, &*syscall)?;
+-    let systemd_cgroup = opts.global.systemd_cgroup;
++        let root_path = rootpath::determine(opts.global.root, &*syscall)?;
++        let systemd_cgroup = opts.global.systemd_cgroup;
+ 
+-    let cmd_result = match opts.subcmd {
+-        Some(YoukiSubCommand::Standard(cmd)) => match *cmd {
+-            StandardCmd::Create(create) => {
+-                commands::create::create(create, root_path, systemd_cgroup)
+-            }
+-            StandardCmd::Start(start) => commands::start::start(start, root_path),
+-            StandardCmd::Kill(kill) => commands::kill::kill(kill, root_path),
+-            StandardCmd::Delete(delete) => commands::delete::delete(delete, root_path),
+-            StandardCmd::State(state) => commands::state::state(state, root_path),
+-        },
+-        Some(YoukiSubCommand::Common(cmd)) => match *cmd {
+-            CommonCmd::Checkpointt(checkpoint) => {
+-                commands::checkpoint::checkpoint(checkpoint, root_path)
+-            }
+-            CommonCmd::Events(events) => commands::events::events(events, root_path),
+-            CommonCmd::Exec(exec) => match commands::exec::exec(exec, root_path) {
+-                Ok(exit_code) => std::process::exit(exit_code),
+-                Err(e) => {
+-                    tracing::error!("error in executing command: {:?}", e);
+-                    std::process::exit(-1);
++        let cmd_result = match opts.subcmd {
++            Some(YoukiSubCommand::Standard(cmd)) => match *cmd {
++                StandardCmd::Create(create) => {
++                    commands::create::create(create, root_path, systemd_cgroup)
+                 }
++                StandardCmd::Start(start) => commands::start::start(start, root_path),
++                StandardCmd::Kill(kill) => commands::kill::kill(kill, root_path),
++                StandardCmd::Delete(delete) => commands::delete::delete(delete, root_path),
++                StandardCmd::State(state) => commands::state::state(state, root_path),
+             },
+-            CommonCmd::Features(features) => commands::features::features(features),
+-            CommonCmd::List(list) => commands::list::list(list, root_path),
+-            CommonCmd::Pause(pause) => commands::pause::pause(pause, root_path),
+-            CommonCmd::Ps(ps) => commands::ps::ps(ps, root_path),
+-            CommonCmd::Resume(resume) => commands::resume::resume(resume, root_path),
+-            CommonCmd::Run(run) => match commands::run::run(run, root_path, systemd_cgroup) {
+-                Ok(exit_code) => std::process::exit(exit_code),
+-                Err(e) => {
+-                    tracing::error!("error in executing command: {:?}", e);
+-                    std::process::exit(-1);
++            Some(YoukiSubCommand::Common(cmd)) => match *cmd {
++                CommonCmd::Checkpointt(checkpoint) => {
++                    commands::checkpoint::checkpoint(checkpoint, root_path)
+                 }
++                CommonCmd::Events(events) => commands::events::events(events, root_path),
++                CommonCmd::Exec(exec) => match commands::exec::exec(exec, root_path) {
++                    Ok(exit_code) => exit_with_audit(&mut audit, true, exit_code),
++                    Err(e) => {
++                        tracing::error!("error in executing command: {:?}", e);
++                        exit_with_audit(&mut audit, false, -1);
++                    }
++                },
++                CommonCmd::Features(features) => commands::features::features(features),
++                CommonCmd::List(list) => commands::list::list(list, root_path),
++                CommonCmd::Pause(pause) => commands::pause::pause(pause, root_path),
++                CommonCmd::Ps(ps) => commands::ps::ps(ps, root_path),
++                CommonCmd::Resume(resume) => commands::resume::resume(resume, root_path),
++                CommonCmd::Run(run) => match commands::run::run(run, root_path, systemd_cgroup) {
++                    Ok(exit_code) => exit_with_audit(&mut audit, true, exit_code),
++                    Err(e) => {
++                        tracing::error!("error in executing command: {:?}", e);
++                        exit_with_audit(&mut audit, false, -1);
++                    }
++                },
++                CommonCmd::Spec(spec) => commands::spec_json::spec(spec, &*syscall),
++                CommonCmd::Update(update) => commands::update::update(update, root_path),
+             },
+-            CommonCmd::Spec(spec) => commands::spec_json::spec(spec, &*syscall),
+-            CommonCmd::Update(update) => commands::update::update(update, root_path),
+-        },
+ 
+-        Some(YoukiSubCommand::Info(info)) => commands::info::info(info),
+-        Some(YoukiSubCommand::Completion(completion)) => {
+-            commands::completion::completion(completion, &mut app)
+-        }
+-        None => app
+-            .print_help()
+-            .map_err(|e| anyhow::anyhow!("failed to print help: {e}")),
+-    };
++            Some(YoukiSubCommand::Info(info)) => commands::info::info(info),
++            Some(YoukiSubCommand::Completion(completion)) => {
++                commands::completion::completion(completion, &mut app)
++            }
++            None => app
++                .print_help()
++                .map_err(|e| anyhow::anyhow!("failed to print help: {e}")),
++        };
+ 
+-    if let Err(ref e) = cmd_result {
+-        tracing::error!("error in executing command: {:?}", e);
+-    }
+-    cmd_result
++        if let Err(ref e) = cmd_result {
++            tracing::error!("error in executing command: {:?}", e);
++        }
++        cmd_result
++    })();
++    return_with_audit(&mut audit, cmd_result)
+ }
+--- /dev/null
++++ b/crates/youki/src/runtime_audit.rs
+@@ -0,0 +1,945 @@
++//! Opt-in diagnostic audit, not an authorization or OCI success dependency.
++//! Enrollment/files are created only by an authenticated external controller.
++//! No audit FD survives begin/finish into dispatch, fork, hooks, or payload exec.
++//! Missing pairs, sticky incomplete status, or any invalid byte invalidate proof.
++use std::ffi::CString;
++use std::fs::File;
++use std::io::{self, Read, Seek, SeekFrom, Write};
++use std::os::fd::{AsRawFd, FromRawFd};
++use std::os::unix::fs::MetadataExt;
++use std::path::{Component, Path, PathBuf};
++use std::thread;
++use std::time::{Duration, Instant};
++
++use nix::libc;
++use serde::{Deserialize, Serialize};
++
++use crate::{Opts, YoukiSubCommand};
++use liboci_cli::{CommonCmd, StandardCmd};
++
++const ROOT: &str = "/var/lib/docker/runtime-audit";
++const LIMIT: u64 = 16 * 1024 * 1024;
++const RECORD_LIMIT: usize = 2048;
++const WARNING: &str = "youki: runtime audit incomplete";
++
++fn invalid() -> io::Error {
++    io::Error::from_raw_os_error(libc::EINVAL)
++}
++
++#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Enrollment {
++    schema_version: u8,
++    session_id: String,
++    boot_id: String,
++}
++
++#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
++#[serde(deny_unknown_fields)]
++struct Record {
++    schema_version: u8,
++    sequence: u64,
++    event: String,
++    session_id: String,
++    boot_id: String,
++    invocation_id: String,
++    operation: String,
++    container_id: Option<String>,
++    pid: u32,
++    starttime_ticks: u64,
++    monotonic_ns: u64,
++    wall_time_ns: u64,
++    outcome: Option<String>,
++    exit_code: Option<u8>,
++}
++
++#[derive(Clone)]
++struct Selection {
++    operation: &'static str,
++    container_id: Option<String>,
++}
++
++impl Selection {
++    fn from_opts(opts: &Opts) -> Self {
++        let (operation, cid) = if opts.version {
++            ("version", None)
++        } else {
++            match opts.subcmd.as_ref() {
++                Some(YoukiSubCommand::Standard(cmd)) => match cmd.as_ref() {
++                    StandardCmd::Create(c) => ("create", Some(&c.container_id)),
++                    StandardCmd::Start(c) => ("start", Some(&c.container_id)),
++                    StandardCmd::Kill(c) => ("kill", Some(&c.container_id)),
++                    StandardCmd::Delete(c) => ("delete", Some(&c.container_id)),
++                    StandardCmd::State(c) => ("state", Some(&c.container_id)),
++                },
++                Some(YoukiSubCommand::Common(cmd)) => match cmd.as_ref() {
++                    CommonCmd::Checkpointt(c) => ("checkpoint", Some(&c.container_id)),
++                    CommonCmd::Events(c) => ("events", Some(&c.container_id)),
++                    CommonCmd::Exec(c) => ("exec", Some(&c.container_id)),
++                    CommonCmd::Pause(c) => ("pause", Some(&c.container_id)),
++                    CommonCmd::Ps(c) => ("ps", Some(&c.container_id)),
++                    CommonCmd::Resume(c) => ("resume", Some(&c.container_id)),
++                    CommonCmd::Run(c) => ("run", Some(&c.container_id)),
++                    CommonCmd::Update(c) => ("update", Some(&c.container_id)),
++                    CommonCmd::Features(_) => ("features", None),
++                    CommonCmd::List(_) => ("list", None),
++                    CommonCmd::Spec(_) => ("spec", None),
++                },
++                Some(YoukiSubCommand::Info(_)) => ("info", None),
++                Some(YoukiSubCommand::Completion(_)) => ("completion", None),
++                None => ("help", None),
++            }
++        };
++        Self {
++            operation,
++            container_id: cid.cloned(),
++        }
++    }
++}
++
++#[derive(Clone, Copy, PartialEq)]
++struct Identity(u64, u64);
++
++fn identity(file: &File) -> io::Result<Identity> {
++    let meta = file.metadata()?;
++    Ok(Identity(meta.dev(), meta.ino()))
++}
++
++fn openat(directory: &File, name: &str, flags: i32) -> io::Result<File> {
++    let name = CString::new(name).map_err(|_| invalid())?;
++    // SAFETY: valid borrowed directory FD and NUL-terminated component; O_CREAT
++    // is never supplied. NONBLOCK ensures a substituted FIFO cannot hang open.
++    let fd = unsafe {
++        libc::openat(
++            directory.as_raw_fd(),
++            name.as_ptr(),
++            flags | libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK,
++        )
++    };
++    if fd < 0 {
++        return Err(io::Error::last_os_error());
++    }
++    // SAFETY: successful openat returned a new owned descriptor.
++    Ok(unsafe { File::from_raw_fd(fd) })
++}
++
++fn open_root(path: &Path) -> io::Result<Option<File>> {
++    if !path.is_absolute() {
++        return Err(invalid());
++    }
++    let mut directory = File::open("/")?;
++    for part in path.components() {
++        let Component::Normal(part) = part else {
++            if part == Component::RootDir {
++                continue;
++            }
++            return Err(invalid());
++        };
++        let next = match openat(
++            &directory,
++            part.to_str().ok_or_else(invalid)?,
++            libc::O_RDONLY | libc::O_DIRECTORY,
++        ) {
++            Ok(file) => file,
++            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
++            Err(error) => return Err(error),
++        };
++        let meta = next.metadata()?;
++        // Sticky root-owned ancestors also support isolated native /tmp tests:
++        // unprivileged peers cannot replace a root-owned child there.
++        if meta.uid() != 0 || (meta.mode() & 0o022 != 0 && meta.mode() & 0o1000 == 0) {
++            return Err(invalid());
++        }
++        directory = next;
++    }
++    if directory.metadata()?.mode() & 0o7777 != 0o700 {
++        return Err(invalid());
++    }
++    Ok(Some(directory))
++}
++
++fn regular(directory: &File, name: &str, flags: i32, maximum: u64) -> io::Result<File> {
++    let file = openat(directory, name, flags)?;
++    let meta = file.metadata()?;
++    if !meta.is_file()
++        || meta.uid() != 0
++        || meta.mode() & 0o7777 != 0o600
++        || meta.nlink() != 1
++        || meta.len() > maximum
++    {
++        return Err(invalid());
++    }
++    Ok(file)
++}
++
++fn bounded(file: &mut File, limit: usize) -> io::Result<Vec<u8>> {
++    let before = file.metadata()?;
++    let mut bytes = Vec::new();
++    (&mut *file)
++        .take(limit as u64 + 1)
++        .read_to_end(&mut bytes)?;
++    let after = file.metadata()?;
++    if bytes.len() > limit
++        || (
++            before.dev(),
++            before.ino(),
++            before.len(),
++            before.mtime(),
++            before.mtime_nsec(),
++            before.ctime(),
++            before.ctime_nsec(),
++        ) != (
++            after.dev(),
++            after.ino(),
++            after.len(),
++            after.mtime(),
++            after.mtime_nsec(),
++            after.ctime(),
++            after.ctime_nsec(),
++        )
++    {
++        return Err(invalid());
++    }
++    Ok(bytes)
++}
++
++fn boot_id() -> io::Result<String> {
++    let raw = bounded(&mut File::open("/proc/sys/kernel/random/boot_id")?, 37)?;
++    let value = std::str::from_utf8(&raw).map_err(|_| invalid())?;
++    let value = value.strip_suffix('\n').ok_or_else(invalid)?;
++    if value.len() != 36
++        || value.bytes().enumerate().any(|(i, b)| {
++            if [8, 13, 18, 23].contains(&i) {
++                b != b'-'
++            } else {
++                !b.is_ascii_hexdigit() || b.is_ascii_uppercase()
++            }
++        })
++        || value == "00000000-0000-0000-0000-000000000000"
++    {
++        return Err(invalid());
++    }
++    Ok(value.to_owned())
++}
++
++fn birth() -> io::Result<u64> {
++    let raw = bounded(&mut File::open("/proc/self/stat")?, 4096)?;
++    let text = std::str::from_utf8(&raw).map_err(|_| invalid())?;
++    let tail = text.rsplit_once(") ").ok_or_else(invalid)?.1;
++    let value = tail
++        .split_whitespace()
++        .nth(19)
++        .ok_or_else(invalid)?
++        .parse::<u64>()
++        .map_err(|_| invalid())?;
++    if value == 0 {
++        return Err(invalid());
++    }
++    Ok(value)
++}
++
++fn clock(kind: libc::clockid_t) -> io::Result<u64> {
++    let mut time = libc::timespec {
++        tv_sec: 0,
++        tv_nsec: 0,
++    };
++    // SAFETY: clock_gettime writes one valid stack timespec, no retained pointer.
++    if unsafe { libc::clock_gettime(kind, &mut time) } != 0 {
++        return Err(io::Error::last_os_error());
++    }
++    if time.tv_sec < 0 || !(0..1_000_000_000).contains(&time.tv_nsec) {
++        return Err(invalid());
++    }
++    (time.tv_sec as u64)
++        .checked_mul(1_000_000_000)
++        .and_then(|v| v.checked_add(time.tv_nsec as u64))
++        .filter(|v| *v > 0)
++        .ok_or_else(invalid)
++}
++
++fn lock(file: &File) -> io::Result<()> {
++    let deadline = Instant::now() + Duration::from_secs(2);
++    loop {
++        // SAFETY: flock acts only on this freshly opened, validated owned FD.
++        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
++            return Ok(());
++        }
++        let error = io::Error::last_os_error();
++        if error.raw_os_error() != Some(libc::EWOULDBLOCK) || Instant::now() >= deadline {
++            return Err(error);
++        }
++        thread::sleep(Duration::from_millis(10));
++    }
++}
++
++fn enrollment(directory: &File) -> io::Result<Option<Enrollment>> {
++    let mut file = match regular(directory, "enrollment.json", libc::O_RDONLY, 512) {
++        Ok(file) => file,
++        Err(error) if error.raw_os_error() == Some(libc::ENOENT) => return Ok(None),
++        Err(error) => return Err(error),
++    };
++    let value: Enrollment =
++        serde_json::from_slice(&bounded(&mut file, 512)?).map_err(|_| invalid())?;
++    if value.schema_version != 1
++        || value.session_id.len() != 64
++        || !value
++            .session_id
++            .bytes()
++            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
++        || value.boot_id != boot_id()?
++    {
++        return Err(invalid());
++    }
++    Ok(Some(value))
++}
++
++fn status(directory: &File) -> io::Result<()> {
++    let bytes = bounded(&mut regular(directory, "status", libc::O_RDONLY, 11)?, 11)?;
++    if bytes != b"complete\n" {
++        return Err(invalid());
++    }
++    Ok(())
++}
++
++fn last_record(file: &mut File, enrollment: &Enrollment) -> io::Result<Option<Record>> {
++    let size = file.metadata()?.len();
++    if size == 0 {
++        return Ok(None);
++    }
++    if size > LIMIT {
++        return Err(invalid());
++    }
++    let start = size.saturating_sub(RECORD_LIMIT as u64 + 1);
++    file.seek(SeekFrom::Start(start))?;
++    let bytes = bounded(file, RECORD_LIMIT + 1)?;
++    if bytes.last() != Some(&b'\n') {
++        return Err(invalid());
++    }
++    let body = &bytes[..bytes.len() - 1];
++    let offset = body.iter().rposition(|b| *b == b'\n').map_or(0, |i| i + 1);
++    if start > 0 && offset == 0 || body.len() - offset + 1 > RECORD_LIMIT {
++        return Err(invalid());
++    }
++    let row: Record = serde_json::from_slice(&body[offset..]).map_err(|_| invalid())?;
++    if row.schema_version != 1
++        || row.sequence == 0
++        || row.session_id != enrollment.session_id
++        || row.boot_id != enrollment.boot_id
++        || row.pid == 0
++        || row.starttime_ticks == 0
++        || row.monotonic_ns == 0
++        || row.wall_time_ns == 0
++        || !matches!(row.event.as_str(), "begin" | "result")
++        || (row.event == "begin" && (row.outcome.is_some() || row.exit_code.is_some()))
++        || (row.event == "result"
++            && (!matches!(row.outcome.as_deref(), Some("ok" | "error")) || row.exit_code.is_none()))
++    {
++        return Err(invalid());
++    }
++    Ok(Some(row))
++}
++
++struct Active {
++    enrollment: Enrollment,
++    root_identity: Identity,
++    log_identity: Identity,
++    begin: Record,
++}
++
++pub(crate) struct Audit {
++    root: PathBuf,
++    active: Option<Active>,
++}
++
++impl Audit {
++    pub(crate) fn begin(opts: &Opts) -> Self {
++        Self::begin_at(PathBuf::from(ROOT), Selection::from_opts(opts))
++    }
++
++    fn begin_at(root: PathBuf, selected: Selection) -> Self {
++        let mut audit = Self { root, active: None };
++        match audit.start(selected) {
++            Ok(active) => audit.active = active,
++            Err(_) => audit.failed(),
++        }
++        audit
++    }
++
++    fn start(&self, selected: Selection) -> io::Result<Option<Active>> {
++        let Some(directory) = open_root(&self.root)? else {
++            return Ok(None);
++        };
++        let Some(enrollment) = enrollment(&directory)? else {
++            return Ok(None);
++        };
++        if let Some(cid) = &selected.container_id {
++            if cid.is_empty()
++                || cid.len() > 128
++                || cid == "."
++                || cid == ".."
++                || !cid
++                    .bytes()
++                    .all(|b| b.is_ascii_alphanumeric() || b"_+.-".contains(&b))
++            {
++                return Err(invalid());
++            }
++        }
++        status(&directory)?;
++        let mut log = regular(
++            &directory,
++            "events.jsonl",
++            libc::O_RDWR | libc::O_APPEND,
++            LIMIT,
++        )?;
++        lock(&log)?;
++        let mut begin = Record {
++            schema_version: 1,
++            sequence: 0,
++            event: "begin".to_owned(),
++            session_id: enrollment.session_id.clone(),
++            boot_id: enrollment.boot_id.clone(),
++            invocation_id: String::new(),
++            operation: selected.operation.to_owned(),
++            container_id: selected.container_id,
++            pid: std::process::id(),
++            starttime_ticks: birth()?,
++            monotonic_ns: clock(libc::CLOCK_MONOTONIC)?,
++            wall_time_ns: clock(libc::CLOCK_REALTIME)?,
++            outcome: None,
++            exit_code: None,
++        };
++        begin.invocation_id = format!(
++            "{}:{}:{}",
++            begin.pid, begin.starttime_ticks, begin.monotonic_ns
++        );
++        self.append(&directory, &mut log, &enrollment, &mut begin)?;
++        Ok(Some(Active {
++            enrollment,
++            root_identity: identity(&directory)?,
++            log_identity: identity(&log)?,
++            begin,
++        }))
++    }
++
++    fn append(
++        &self,
++        directory: &File,
++        log: &mut File,
++        enrolled: &Enrollment,
++        row: &mut Record,
++    ) -> io::Result<()> {
++        if enrollment(directory)?.as_ref() != Some(enrolled) {
++            return Err(invalid());
++        }
++        status(directory)?;
++        let reopened_root = open_root(&self.root)?.ok_or_else(invalid)?;
++        let reopened = regular(
++            &reopened_root,
++            "events.jsonl",
++            libc::O_RDWR | libc::O_APPEND,
++            LIMIT,
++        )?;
++        if identity(&reopened_root)? != identity(directory)?
++            || identity(&reopened)? != identity(log)?
++        {
++            return Err(invalid());
++        }
++        let last = last_record(log, enrolled)?;
++        row.sequence = last
++            .as_ref()
++            .map_or(Some(1), |r| r.sequence.checked_add(1))
++            .ok_or_else(invalid)?;
++        if last
++            .as_ref()
++            .is_some_and(|r| r.monotonic_ns > row.monotonic_ns)
++        {
++            return Err(invalid());
++        }
++        let mut bytes = serde_json::to_vec(row).map_err(|_| invalid())?;
++        bytes.push(b'\n');
++        if bytes.len() > RECORD_LIMIT
++            || log
++                .metadata()?
++                .len()
++                .checked_add(bytes.len() as u64)
++                .is_none_or(|n| n > LIMIT)
++        {
++            return Err(invalid());
++        }
++        log.write_all(&bytes)?;
++        log.sync_all()?;
++        Ok(())
++    }
++
++    pub(crate) fn finish(&mut self, ok: bool, exit_code: i32) {
++        let Some(active) = self.active.take() else {
++            return;
++        };
++        if self.finish_active(active, ok, exit_code).is_err() {
++            self.failed();
++        }
++    }
++
++    fn finish_active(&self, active: Active, ok: bool, exit_code: i32) -> io::Result<()> {
++        let directory = open_root(&self.root)?.ok_or_else(invalid)?;
++        if identity(&directory)? != active.root_identity
++            || enrollment(&directory)?.as_ref() != Some(&active.enrollment)
++        {
++            return Err(invalid());
++        }
++        let mut log = regular(
++            &directory,
++            "events.jsonl",
++            libc::O_RDWR | libc::O_APPEND,
++            LIMIT,
++        )?;
++        if identity(&log)? != active.log_identity {
++            return Err(invalid());
++        }
++        lock(&log)?;
++        if birth()? != active.begin.starttime_ticks || std::process::id() != active.begin.pid {
++            return Err(invalid());
++        }
++        let mut row = active.begin;
++        row.event = "result".to_owned();
++        row.monotonic_ns = clock(libc::CLOCK_MONOTONIC)?;
++        row.wall_time_ns = clock(libc::CLOCK_REALTIME)?;
++        row.outcome = Some(if ok { "ok" } else { "error" }.to_owned());
++        row.exit_code = Some((exit_code & 255) as u8);
++        self.append(&directory, &mut log, &active.enrollment, &mut row)
++    }
++
++    fn failed(&self) {
++        // Never replace an OCI result or prevent kill/delete because evidence
++        // failed. No error/source/path/args are included in this fixed warning.
++        let _ = (|| -> io::Result<()> {
++            let Some(directory) = open_root(&self.root)? else {
++                return Ok(());
++            };
++            let mut file = regular(&directory, "status", libc::O_RDWR, 11)?;
++            lock(&file)?;
++            let bytes = bounded(&mut file, 11)?;
++            if bytes != b"complete\n" && bytes != b"incomplete\n" {
++                return Err(invalid());
++            }
++            file.seek(SeekFrom::Start(0))?;
++            file.write_all(b"incomplete\n")?;
++            file.sync_all()
++        })();
++        // Unlike eprintln!, a broken diagnostic stream must not panic and
++        // override the OCI operation/result we are merely observing.
++        let _ = writeln!(io::stderr().lock(), "{WARNING}");
++    }
++}
++
++#[cfg(test)]
++mod tests {
++    use super::*;
++    use clap::Parser;
++    use std::fs;
++    use std::os::unix::fs::{PermissionsExt, symlink};
++    use std::process::{Command, Stdio};
++    use std::sync::{Arc, Barrier};
++
++    fn setup() -> tempfile::TempDir {
++        assert_eq!(
++            unsafe { libc::geteuid() },
++            0,
++            "native audit fixture requires root"
++        );
++        let root = tempfile::tempdir().unwrap();
++        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700)).unwrap();
++        for (name, bytes) in [
++            (
++                "enrollment.json",
++                serde_json::to_vec(&Enrollment {
++                    schema_version: 1,
++                    session_id: "a".repeat(64),
++                    boot_id: boot_id().unwrap(),
++                })
++                .unwrap(),
++            ),
++            ("events.jsonl", Vec::new()),
++            ("status", b"complete\n".to_vec()),
++        ] {
++            fs::write(root.path().join(name), bytes).unwrap();
++            fs::set_permissions(root.path().join(name), fs::Permissions::from_mode(0o600)).unwrap();
++        }
++        root
++    }
++    fn select() -> Selection {
++        Selection {
++            operation: "exec",
++            container_id: Some("b".repeat(64)),
++        }
++    }
++    fn rows(root: &Path) -> Vec<Record> {
++        fs::read_to_string(root.join("events.jsonl"))
++            .unwrap()
++            .lines()
++            .map(|s| serde_json::from_str(s).unwrap())
++            .collect()
++    }
++    fn unchanged_status(root: &Path) {
++        assert_eq!(fs::read(root.join("status")).unwrap(), b"complete\n");
++    }
++    fn no_owned_fds(root: &Path) {
++        for entry in fs::read_dir("/proc/self/fd").unwrap() {
++            if let Ok(target) = fs::read_link(entry.unwrap().path()) {
++                assert!(!target.starts_with(root), "audit FD survived operation");
++            }
++        }
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_enrollment_disabled_and_identity() {
++        let missing = tempfile::tempdir().unwrap();
++        let mut disabled = Audit::begin_at(missing.path().join("not-created"), select());
++        disabled.finish(true, 37);
++        assert!(!missing.path().join("not-created").exists());
++        let root = setup();
++        let mut audit = Audit::begin_at(root.path().to_owned(), select());
++        assert!(audit.active.is_some());
++        no_owned_fds(root.path());
++        audit.finish(true, 37);
++        no_owned_fds(root.path());
++        let records = rows(root.path());
++        assert_eq!(records.len(), 2);
++        assert_eq!(records[0].pid, std::process::id());
++        assert_eq!(records[0].starttime_ticks, birth().unwrap());
++        assert_eq!(records[0].boot_id, boot_id().unwrap());
++        assert_eq!(
++            records[0].invocation_id,
++            format!(
++                "{}:{}:{}",
++                records[0].pid, records[0].starttime_ticks, records[0].monotonic_ns
++            )
++        );
++        assert_eq!(records[1].invocation_id, records[0].invocation_id);
++        assert_eq!(records[1].exit_code, Some(37));
++        assert_eq!(records[1].outcome.as_deref(), Some("ok"));
++        unchanged_status(root.path());
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_unsafe_paths_and_quota() {
++        for case in [
++            "symlink",
++            "hardlink",
++            "fifo",
++            "mode",
++            "quota",
++            "ancestor",
++            "owner",
++            "marker-symlink",
++            "status-hardlink",
++            "boot",
++        ] {
++            let root = setup();
++            let path = root.path().join("events.jsonl");
++            match case {
++                "symlink" => {
++                    fs::remove_file(&path).unwrap();
++                    symlink("status", &path).unwrap();
++                }
++                "hardlink" => fs::hard_link(&path, root.path().join("extra")).unwrap(),
++                "fifo" => {
++                    fs::remove_file(&path).unwrap();
++                    let c = CString::new(path.to_str().unwrap()).unwrap();
++                    assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
++                }
++                "mode" => fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap(),
++                "quota" => File::options()
++                    .write(true)
++                    .open(&path)
++                    .unwrap()
++                    .set_len(LIMIT + 1)
++                    .unwrap(),
++                "ancestor" => {
++                    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o777)).unwrap()
++                }
++                "owner" => {
++                    let c = CString::new(path.to_str().unwrap()).unwrap();
++                    // SAFETY: private native fixture path; test runs as root.
++                    assert_eq!(unsafe { libc::chown(c.as_ptr(), 10001, 10001) }, 0);
++                }
++                "marker-symlink" => {
++                    fs::remove_file(root.path().join("enrollment.json")).unwrap();
++                    symlink("status", root.path().join("enrollment.json")).unwrap();
++                }
++                "status-hardlink" => {
++                    fs::hard_link(root.path().join("status"), root.path().join("extra")).unwrap()
++                }
++                "boot" => {
++                    fs::write(
++                        root.path().join("enrollment.json"),
++                        serde_json::to_vec(&Enrollment {
++                            schema_version: 1,
++                            session_id: "a".repeat(64),
++                            boot_id: "00000000-0000-0000-0000-000000000000".to_owned(),
++                        })
++                        .unwrap(),
++                    )
++                    .unwrap();
++                }
++                _ => unreachable!(),
++            }
++            let mut audit = Audit::begin_at(root.path().to_owned(), select());
++            assert!(audit.active.is_none(), "{case}");
++            audit.finish(true, 0); // diagnostic failure never blocks operation completion
++            if !matches!(case, "ancestor" | "status-hardlink") {
++                assert_eq!(
++                    fs::read(root.path().join("status")).unwrap(),
++                    b"incomplete\n"
++                );
++            }
++        }
++        let root = setup();
++        let directory = open_root(root.path()).unwrap().unwrap();
++        let held = regular(&directory, "events.jsonl", libc::O_RDWR, LIMIT).unwrap();
++        lock(&held).unwrap();
++        let start = Instant::now();
++        let mut audit = Audit::begin_at(root.path().to_owned(), select());
++        assert!(audit.active.is_none());
++        assert!(start.elapsed() < Duration::from_secs(5));
++        assert!(crate::return_with_audit(&mut audit, Ok(())).is_ok());
++        assert_eq!(
++            fs::read(root.path().join("status")).unwrap(),
++            b"incomplete\n"
++        );
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_concurrent_pairs_and_sequences() {
++        let root = setup();
++        let barrier = Arc::new(Barrier::new(8));
++        let threads: Vec<_> = (0..8)
++            .map(|_| {
++                let path = root.path().to_owned();
++                let barrier = barrier.clone();
++                thread::spawn(move || {
++                    barrier.wait();
++                    let mut audit = Audit::begin_at(path, select());
++                    assert!(audit.active.is_some());
++                    audit.finish(true, 0);
++                })
++            })
++            .collect();
++        for t in threads {
++            t.join().unwrap();
++        }
++        let records = rows(root.path());
++        assert_eq!(records.len(), 16);
++        for (index, row) in records.iter().enumerate() {
++            assert_eq!(row.sequence, index as u64 + 1);
++        }
++        assert!(
++            records
++                .windows(2)
++                .all(|r| r[0].monotonic_ns <= r[1].monotonic_ns)
++        );
++        for begin in records.iter().filter(|r| r.event == "begin") {
++            assert_eq!(
++                records
++                    .iter()
++                    .filter(|r| r.invocation_id == begin.invocation_id)
++                    .count(),
++                2
++            );
++        }
++        unchanged_status(root.path());
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_incomplete_and_corrupt_tail() {
++        let root = setup();
++        let audit = Audit::begin_at(root.path().to_owned(), select());
++        drop(audit); // abrupt termination cannot synthesize a result via Drop
++        assert_eq!(rows(root.path()).len(), 1);
++        assert_eq!(rows(root.path())[0].event, "begin");
++        for bytes in [b"partial".as_slice(), b"{}\n", b"\n"] {
++            let root = setup();
++            fs::write(root.path().join("events.jsonl"), bytes).unwrap();
++            let audit = Audit::begin_at(root.path().to_owned(), select());
++            assert!(audit.active.is_none());
++            assert_eq!(
++                fs::read(root.path().join("status")).unwrap(),
++                b"incomplete\n"
++            );
++        }
++        let root = setup();
++        let mut audit = Audit::begin_at(root.path().to_owned(), select());
++        fs::write(root.path().join("status"), b"incomplete\n").unwrap();
++        audit.finish(true, 0);
++        assert_eq!(rows(root.path()).len(), 1);
++        assert_eq!(
++            fs::read(root.path().join("status")).unwrap(),
++            b"incomplete\n"
++        );
++        let root = setup();
++        let mut audit = Audit::begin_at(root.path().to_owned(), select());
++        audit.finish(true, 0);
++        let original = fs::read(root.path().join("events.jsonl")).unwrap();
++        fs::write(
++            root.path().join("enrollment.json"),
++            serde_json::to_vec(&Enrollment {
++                schema_version: 1,
++                session_id: "c".repeat(64),
++                boot_id: boot_id().unwrap(),
++            })
++            .unwrap(),
++        )
++        .unwrap();
++        let audit = Audit::begin_at(root.path().to_owned(), select());
++        assert!(audit.active.is_none());
++        assert_eq!(
++            fs::read(root.path().join("events.jsonl")).unwrap(),
++            original
++        );
++        assert_eq!(
++            fs::read(root.path().join("status")).unwrap(),
++            b"incomplete\n"
++        );
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_typed_operations_and_secret_exclusion() {
++        let cid = "b".repeat(64);
++        let secret = "private-payload-that-must-never-enter-audit";
++        let opts = Opts::try_parse_from([
++            "youki",
++            "exec",
++            "--env",
++            &format!("SECRET={secret}"),
++            &cid,
++            "/bin/echo",
++            secret,
++        ])
++        .unwrap();
++        let selected = Selection::from_opts(&opts);
++        assert_eq!(selected.operation, "exec");
++        assert_eq!(selected.container_id.as_deref(), Some(cid.as_str()));
++        let root = setup();
++        let mut audit = Audit::begin_at(root.path().to_owned(), selected);
++        audit.finish(false, -1);
++        let records = rows(root.path());
++        assert_eq!(records[1].exit_code, Some(255));
++        assert!(
++            !fs::read_to_string(root.path().join("events.jsonl"))
++                .unwrap()
++                .contains(secret)
++        );
++        for operation in [
++            "create",
++            "start",
++            "state",
++            "delete",
++            "pause",
++            "resume",
++            "events",
++            "ps",
++            "checkpoint",
++            "run",
++            "update",
++        ] {
++            let opts = Opts::try_parse_from(["youki", operation, &cid]).unwrap();
++            assert_eq!(Selection::from_opts(&opts).operation, operation);
++        }
++        for operation in ["features", "list", "spec", "info"] {
++            let opts = Opts::try_parse_from(["youki", operation]).unwrap();
++            assert!(Selection::from_opts(&opts).container_id.is_none());
++        }
++        let kill = Opts::try_parse_from(["youki", "kill", &cid, "TERM"]).unwrap();
++        assert_eq!(Selection::from_opts(&kill).operation, "kill");
++        let completion = Opts::try_parse_from(["youki", "completion", "--shell", "bash"]).unwrap();
++        assert_eq!(Selection::from_opts(&completion).operation, "completion");
++        assert_eq!(
++            Selection::from_opts(&Opts::try_parse_from(["youki"]).unwrap()).operation,
++            "help"
++        );
++        assert_eq!(
++            Selection::from_opts(&Opts::try_parse_from(["youki", "--version"]).unwrap()).operation,
++            "version"
++        );
++    }
++
++    #[test]
++    fn test_vz_runtime_audit_explicit_exit_and_error_routing() {
++        const CHILD: &str = "VZ_RUNTIME_AUDIT_NATIVE_CHILD";
++        const FAILURE: &str = "VZ_RUNTIME_AUDIT_NATIVE_FAILURE";
++        if let Some(path) = std::env::var_os(CHILD) {
++            // Only test builds accept a private fixture path; production has no
++            // environment-selected privileged audit sink.
++            let mut audit = Audit::begin_at(PathBuf::from(path), select());
++            assert_eq!(audit.active.is_none(), std::env::var_os(FAILURE).is_some());
++            crate::exit_with_audit(&mut audit, true, 37);
++        }
++        for failure in [false, true] {
++            let root = setup();
++            if failure {
++                File::options()
++                    .write(true)
++                    .open(root.path().join("events.jsonl"))
++                    .unwrap()
++                    .set_len(LIMIT + 1)
++                    .unwrap();
++            }
++            let mut command = Command::new(std::env::current_exe().unwrap());
++            command
++                .args([
++                    "--exact",
++                    "runtime_audit::tests::test_vz_runtime_audit_explicit_exit_and_error_routing",
++                    "--nocapture",
++                ])
++                .env(CHILD, root.path())
++                .env_remove(FAILURE)
++                .stdin(Stdio::null())
++                .stdout(Stdio::null());
++            if failure {
++                command.env(FAILURE, "1").stderr(Stdio::from(
++                    File::options().write(true).open("/dev/full").unwrap(),
++                ));
++            }
++            let mut child = command.spawn().unwrap();
++            let deadline = Instant::now() + Duration::from_secs(10);
++            let status = loop {
++                if let Some(status) = child.try_wait().unwrap() {
++                    break status;
++                }
++                if Instant::now() >= deadline {
++                    // Direct child was not reaped by try_wait; kill/reap only
++                    // that retained Child, never a guessed/reused process ID.
++                    child.kill().unwrap();
++                    child.wait().unwrap();
++                    panic!("native audit child deadline exceeded");
++                }
++                thread::sleep(Duration::from_millis(10));
++            };
++            assert_eq!(status.code(), Some(37));
++            if failure {
++                assert_eq!(
++                    fs::read(root.path().join("status")).unwrap(),
++                    b"incomplete\n"
++                );
++            } else {
++                assert_eq!(rows(root.path()).len(), 2);
++                assert_eq!(rows(root.path())[1].exit_code, Some(37));
++            }
++        }
++        let root = setup();
++        let mut audit = Audit::begin_at(root.path().to_owned(), select());
++        let error =
++            crate::return_with_audit(&mut audit, Err(anyhow::anyhow!("private error detail")))
++                .unwrap_err();
++        assert_eq!(error.to_string(), "private error detail");
++        assert_eq!(rows(root.path())[1].exit_code, Some(1));
++        assert!(
++            !fs::read_to_string(root.path().join("events.jsonl"))
++                .unwrap()
++                .contains("private error detail")
++        );
++        let source = include_str!("main.rs");
++        assert_eq!(source.matches("exit_with_audit(&mut audit,").count(), 4);
++        assert!(source.contains("return_with_audit(&mut audit, cmd_result)"));
++    }
++}

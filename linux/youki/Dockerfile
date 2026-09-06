@@ -14,6 +14,9 @@ COPY run-keep.patch /inputs/run-keep.patch
 COPY foreground-wait.patch /inputs/foreground-wait.patch
 COPY console-size.patch /inputs/console-size.patch
 COPY executable-errors.patch /inputs/executable-errors.patch
+COPY runtime-audit.patch /inputs/runtime-audit.patch
+COPY runtime-audit-parser.py /inputs/runtime-audit-parser.py
+COPY runtime-audit-probe.sh /inputs/runtime-audit-probe.sh
 RUN . /inputs/inputs.env && \
     echo "$YOUKI_SOURCE_SHA256  /inputs/source.tar.gz" | sha256sum -c - && \
     mkdir /source && tar -xzf /inputs/source.tar.gz -C /source --strip-components=1 && \
@@ -40,6 +43,8 @@ RUN --network=none . /inputs/inputs.env && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/console-size.patch && \
     echo "$YOUKI_EXEC_ERROR_PATCH_SHA256  /inputs/executable-errors.patch" | sha256sum -c - && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/executable-errors.patch && \
+    echo "$YOUKI_AUDIT_PATCH_SHA256  /inputs/runtime-audit.patch" | sha256sum -c - && \
+    patch --batch --forward --fuzz=0 -p1 -i /inputs/runtime-audit.patch && \
     echo "$YOUKI_LOCK_SHA256  /source/Cargo.lock" | sha256sum -c -
 ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     LIBBPF_SYS_LIBRARY_PATH=/usr/lib PKG_CONFIG_ALL_STATIC=1 \
@@ -47,7 +52,7 @@ ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-Bstatic -C link-arg=-lzstd -C link-arg=-lgcc -C link-arg=-lc"
 RUN cargo +1.96.0 fetch --locked --target aarch64-unknown-linux-musl
 RUN --network=none . /inputs/inputs.env && \
-    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID+$YOUKI_EXEC_ERROR_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
+    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID+$YOUKI_EXEC_ERROR_PATCH_ID+$YOUKI_AUDIT_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
       --target aarch64-unknown-linux-musl -p youki --bin youki \
       --no-default-features --features "$YOUKI_FEATURES"
 RUN --network=none cargo +1.96.0 test --frozen --release --locked \
@@ -128,6 +133,13 @@ RUN --network=none cargo +1.96.0 test --frozen --release --locked \
       -- --test-threads=1 > /inputs/executable-errors-tests.txt 2>&1 || \
       { cat /inputs/executable-errors-tests.txt; exit 1; }
 RUN cat /inputs/executable-errors-tests.txt
+RUN --network=none cargo +1.96.0 test --frozen --release --locked \
+      --target aarch64-unknown-linux-musl -p youki --bin youki \
+      --no-default-features --features v2,cgroupsv2_devices,seccomp \
+      runtime_audit::tests::test_vz_runtime_audit_ \
+      -- --test-threads=1 > /inputs/runtime-audit-tests.txt 2>&1 || \
+      { cat /inputs/runtime-audit-tests.txt; exit 1; }
+RUN cat /inputs/runtime-audit-tests.txt
 RUN --network=none set -eux; . /inputs/inputs.env; \
     mkdir /result && cp target/aarch64-unknown-linux-musl/release/youki /result/youki && \
     readelf -h -l -d /result/youki > /result/elf.txt && cat /result/elf.txt && \
@@ -145,10 +157,11 @@ RUN --network=none set -eux; . /inputs/inputs.env; \
     cp /inputs/foreground-wait.patch /inputs/foreground-wait-tests.txt /result/ && \
     cp /inputs/console-size.patch /inputs/console-size-tests.txt /result/ && \
     cp /inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/ && \
+    cp /inputs/runtime-audit.patch /inputs/runtime-audit-tests.txt /result/ && \
     sha256sum Cargo.lock > /result/source-lock.sha256 && \
     cargo +1.96.0 tree --frozen --target aarch64-unknown-linux-musl -p youki \
       --no-default-features --features "$YOUKI_FEATURES" -e features > /result/cargo-features.txt && \
-    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256
+    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256
 RUN --network=none set -eu; \
     mkdir /inputs/runtime-log-root; \
     set +e; \
@@ -161,5 +174,17 @@ RUN --network=none set -eu; \
     test -s /result/runtime-log.json; \
     cd /result; \
     sha256sum runtime-log.json runtime-log-stdout.txt runtime-log-stderr.txt runtime-log-exit-status.txt >> evidence.sha256
+RUN --network=none . /inputs/inputs.env && \
+    echo "$YOUKI_AUDIT_PARSER_SHA256  /inputs/runtime-audit-parser.py" | sha256sum -c - && \
+    echo "$YOUKI_AUDIT_PROBE_SHA256  /inputs/runtime-audit-probe.sh" | sha256sum -c - && \
+    cp /inputs/runtime-audit-parser.py /inputs/runtime-audit-probe.sh /result/ && \
+    /bin/sh /inputs/runtime-audit-probe.sh && \
+    cd /result && sha256sum runtime-audit-parser.py runtime-audit-probe.sh runtime-audit-boot-id.txt \
+      runtime-audit-metadata-before.txt runtime-audit-metadata-after.txt runtime-audit-enrollment.json \
+      runtime-audit-events.jsonl runtime-audit-status.txt \
+      runtime-audit-version.argv runtime-audit-version.stdout runtime-audit-version.stderr runtime-audit-version.exit-status.txt \
+      runtime-audit-create.argv runtime-audit-create.stdout runtime-audit-create.stderr runtime-audit-create.exit-status.txt \
+      runtime-audit-exec.argv runtime-audit-exec.stdout runtime-audit-exec.stderr runtime-audit-exec.exit-status.txt \
+      runtime-audit-run.argv runtime-audit-run.stdout runtime-audit-run.stderr runtime-audit-run.exit-status.txt >> evidence.sha256
 FROM scratch AS artifact
 COPY --from=builder /result/ /

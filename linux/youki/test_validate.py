@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_ERROR_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, validate, validate_elf
+from validate import AUDIT_NATIVE_CASES, AUDIT_NATIVE_CID, AUDIT_NATIVE_FILES, AUDIT_NATIVE_SESSION, EXEC_PROBE_PREFIX, REQUIRED_AUDIT_TESTS, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_ERROR_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, audit_native_argv, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -51,6 +51,40 @@ def wait_tests(rows):
             + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode()
 
 
+def audit_native_files(source, version):
+    boot = "12345678-1234-1234-1234-123456789abc"
+    records = []
+    for index, (case, outcome, code) in enumerate(AUDIT_NATIVE_CASES):
+        for event_index, event in enumerate(("begin", "result")):
+            records.append({"schema_version": 1, "sequence": index * 2 + event_index + 1, "event": event,
+                "session_id": AUDIT_NATIVE_SESSION, "boot_id": boot,
+                "invocation_id": f"{100 + index}:123:{1000 + index * 2}", "operation": case,
+                "container_id": None if case == "version" else AUDIT_NATIVE_CID,
+                "pid": 100 + index, "starttime_ticks": 123, "monotonic_ns": 1000 + index * 2 + event_index,
+                "wall_time_ns": 2000 + index * 2 + event_index,
+                "outcome": outcome if event == "result" else None,
+                "exit_code": code if event == "result" else None})
+    metadata = "".join("/var/lib/docker/runtime-audit" + suffix +
+        ("|0|0|700|2" if index == 0 else "|0|0|600|1") + f"|41|{100 + index}\n"
+        for index, suffix in enumerate(("", "/enrollment.json", "/events.jsonl", "/status"))).encode()
+    result = {"runtime-audit-parser.py": (source / "../../scripts/helpers/linux_docker_runtime_audit.py").read_bytes(),
+              "runtime-audit-probe.sh": (source / "runtime-audit-probe.sh").read_bytes(),
+              "runtime-audit-boot-id.txt": (boot + "\n").encode(),
+              "runtime-audit-metadata-before.txt": metadata, "runtime-audit-metadata-after.txt": metadata,
+              "runtime-audit-enrollment.json": json.dumps({"schema_version": 1, "session_id": AUDIT_NATIVE_SESSION,
+                                                           "boot_id": boot}).encode(),
+              "runtime-audit-events.jsonl": b"".join(json.dumps(record).encode() + b"\n" for record in records),
+              "runtime-audit-status.txt": b"complete\n"}
+    for case, _, code in AUDIT_NATIVE_CASES:
+        result["runtime-audit-" + case + ".argv"] = audit_native_argv(case)
+        result["runtime-audit-" + case + ".stdout"] = version if case == "version" else b""
+        result["runtime-audit-" + case + ".stderr"] = (
+            b"ERROR youki: error in executing command: oci spec error\nError: oci spec error\n\nCaused by:\n"
+            b"    0: io operation failed\n    1: No such file or directory (os error 2)\n" if case == "create" else b"")
+        result["runtime-audit-" + case + ".exit-status.txt"] = (str(code) + "\n").encode()
+    return result
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -62,7 +96,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -94,7 +128,12 @@ class CandidateTests(unittest.TestCase):
             "executable-errors.patch": (self.source / "executable-errors.patch").read_bytes(),
             "executable-errors-tests.txt": ("\n".join("test workload::default::tests::" + name + " ... ok" for name in REQUIRED_EXEC_ERROR_TESTS)
                 + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
+            "runtime-audit.patch": (self.source / "runtime-audit.patch").read_bytes(),
+            "runtime-audit-tests.txt": ("\n".join("test runtime_audit::tests::" + name + " ... ok" for name in REQUIRED_AUDIT_TESTS)
+                + "\ntest result: ok. " + str(len(REQUIRED_AUDIT_TESTS)) +
+                " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
         }
+        self.files.update(audit_native_files(self.source, self.files["version.txt"]))
         self.publish()
 
     def publish(self):
@@ -270,7 +309,7 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
 
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "runtime-audit-probe.sh", "../../scripts/helpers/linux_docker_runtime_audit.py")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
@@ -444,8 +483,8 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
         self.assertIn('tty::tests::test_vz_console_size_', recipe)
         self.assertIn('/inputs/console-size.patch /inputs/console-size-tests.txt /result/', recipe)
-        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256', recipe)
-        self.assertIn('foreground-wait.patch console-size.patch executable-errors.patch | shasum', build)
+        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
+        self.assertIn('foreground-wait.patch console-size.patch executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
         self.assertIn('cp "$recipe_dir/console-size.patch" "$context/"', build)
 
     def test_executable_errors_patch_and_each_native_regression_are_required(self):
@@ -499,9 +538,143 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
         self.assertIn('workload::default::tests::test_vz_executable_errors_', recipe)
         self.assertIn('/inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/', recipe)
-        self.assertIn('console-size-tests.txt executable-errors.patch executable-errors-tests.txt > evidence.sha256', recipe)
-        self.assertIn('console-size.patch executable-errors.patch | shasum', build)
+        self.assertIn('console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
+        self.assertIn('console-size.patch executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
         self.assertIn('cp "$recipe_dir/executable-errors.patch" "$context/"', build)
+
+    def test_runtime_audit_patch_and_each_native_regression_are_required(self):
+        original = self.files["runtime-audit-tests.txt"]
+        for name in REQUIRED_AUDIT_TESTS:
+            for status in ("ignored", "FAILED"):
+                self.files["runtime-audit-tests.txt"] = original.replace((name + " ... ok").encode(),
+                                                                         (name + " ... " + status).encode())
+                self.publish()
+                with self.subTest(name=name, status=status), self.assertRaisesRegex(ValueError, "runtime audit"):
+                    validate(self.root, self.source)
+        self.files["runtime-audit-tests.txt"] = original
+        self.files["runtime-audit.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_runtime_audit_duplicate_incomplete_foreign_and_failed_results_rejected(self):
+        original = self.files["runtime-audit-tests.txt"]
+        for bad in (original + original.splitlines(keepends=True)[0],
+                    original + original.splitlines(keepends=True)[-1],
+                    b"".join(original.splitlines(keepends=True)[1:]),
+                    original.replace(b"0 failed", b"1 failed"), original.replace(b"0 ignored", b"1 ignored"),
+                    original.replace((str(len(REQUIRED_AUDIT_TESTS)) + " passed").encode(), b"0 passed"),
+                    original.replace(b"runtime_audit::tests::", b"foreign::"), b"test result: ok.\n"):
+            self.files["runtime-audit-tests.txt"] = bad
+            self.publish()
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "runtime audit"):
+                validate(self.root, self.source)
+
+    def test_runtime_audit_evidence_and_exact_commit_component_required(self):
+        original = self.files["version.txt"]
+        for replacement in (b"", b"+vz-runtime-audit-v10", b"+vz-runtime-audit-v1+unknown"):
+            self.files["version.txt"] = original.replace(b"+vz-runtime-audit-v1", replacement)
+            self.publish()
+            with self.subTest(replacement=replacement), self.assertRaisesRegex(ValueError, "commit"):
+                validate(self.root, self.source)
+        self.files["version.txt"] = original
+        self.files.pop("runtime-audit-tests.txt")
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "incomplete youki evidence manifest"):
+            validate(self.root, self.source)
+
+    def test_runtime_audit_recipe_context_and_frozen_test_target(self):
+        recipe = (self.source / "Dockerfile").read_text()
+        build = (self.source / "build.sh").read_text()
+        self.assertIn('COPY runtime-audit.patch /inputs/runtime-audit.patch', recipe)
+        self.assertIn('patch --batch --forward --fuzz=0 -p1 -i /inputs/runtime-audit.patch', recipe)
+        self.assertIn('"$YOUKI_AUDIT_PATCH_SHA256  /inputs/runtime-audit.patch"', recipe)
+        self.assertIn('+$YOUKI_AUDIT_PATCH_ID', recipe)
+        commands = [line.replace('\\\n', ' ') for line in recipe.split('RUN ') if
+                    'runtime_audit::tests::test_vz_runtime_audit_' in line]
+        self.assertEqual(len(commands), 1)
+        selected = commands[0]
+        self.assertIn('--network=none cargo +1.96.0 test --frozen --release --locked', selected)
+        self.assertIn('--target aarch64-unknown-linux-musl -p youki --bin youki', selected)
+        self.assertIn('--no-default-features --features v2,cgroupsv2_devices,seccomp', selected)
+        self.assertIn('-- --test-threads=1 > /inputs/runtime-audit-tests.txt 2>&1', selected)
+        self.assertIn('{ cat /inputs/runtime-audit-tests.txt; exit 1; }', selected)
+        self.assertIn('/inputs/runtime-audit.patch /inputs/runtime-audit-tests.txt /result/', recipe)
+        self.assertIn('executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
+        self.assertIn('executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
+        self.assertIn('cp "$recipe_dir/runtime-audit.patch" "$context/"', build)
+
+    def test_native_runtime_audit_artifacts_and_source_selected_inputs_required(self):
+        for name in AUDIT_NATIVE_FILES:
+            original = self.files.pop(name)
+            self.publish()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "incomplete youki evidence manifest"):
+                validate(self.root, self.source)
+            self.files[name] = original
+        for name in ("runtime-audit-parser.py", "runtime-audit-probe.sh"):
+            original = self.files[name]; self.files[name] += b"foreign source\n"
+            self.publish()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "stale build input"):
+                validate(self.root, self.source)
+            self.files[name] = original
+
+    def test_native_runtime_audit_typed_outcomes_raw_argv_and_status_bound(self):
+        for case, _, _ in AUDIT_NATIVE_CASES:
+            for suffix, bad in ((".argv", b"/bin/true\0"), (".exit-status.txt", b"137\n"), (".stdout", b"foreign\n")):
+                name = "runtime-audit-" + case + suffix
+                original = self.files[name]; self.files[name] = bad
+                self.publish()
+                with self.subTest(name=name), self.assertRaisesRegex(ValueError, "runtime audit"):
+                    validate(self.root, self.source)
+                self.files[name] = original
+        original = self.files["runtime-audit-events.jsonl"]
+        for index, field, value in ((1, "exit_code", 37), (2, "operation", "start"),
+                                    (4, "container_id", "c" * 64), (7, "outcome", "ok")):
+            events = [json.loads(line) for line in original.splitlines()]
+            events[index][field] = value
+            self.files["runtime-audit-events.jsonl"] = b"".join(json.dumps(event).encode() + b"\n" for event in events)
+            self.publish()
+            with self.subTest(index=index, field=field), self.assertRaisesRegex(ValueError, "runtime audit"):
+                validate(self.root, self.source)
+        self.files["runtime-audit-events.jsonl"] = original
+
+    def test_native_runtime_audit_incomplete_session_boot_and_metadata_rejected(self):
+        changes = (("runtime-audit-status.txt", b"incomplete\n"),
+                   ("runtime-audit-boot-id.txt", b"22345678-1234-1234-1234-123456789abc\n"),
+                   ("runtime-audit-create.stderr", b"unrelated failure\n"),
+                   ("runtime-audit-version.stderr", b"audit diagnostic\n"))
+        for name, bad in changes:
+            original = self.files[name]; self.files[name] = bad
+            self.publish()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "runtime audit"):
+                validate(self.root, self.source)
+            self.files[name] = original
+        names = ("runtime-audit-metadata-before.txt", "runtime-audit-metadata-after.txt")
+        original = self.files[names[0]]
+        for old, new in ((b"|0|0|600|1", b"|0|0|666|1"), (b"|0|0|600|1", b"|0|0|600|2"),
+                         (b"|0|0|700|2", b"|1|0|700|2"), (b"|41|101", b"|41|100")):
+            for name in names:
+                self.files[name] = original.replace(old, new)
+            self.publish()
+            with self.subTest(old=old, new=new), self.assertRaisesRegex(ValueError, "runtime audit"):
+                validate(self.root, self.source)
+        for name in names:
+            self.files[name] = original
+
+    def test_native_runtime_audit_probe_recipe_is_bounded_and_source_pinned(self):
+        recipe, build, probe = [(self.source / name).read_text() for name in ("Dockerfile", "build.sh", "runtime-audit-probe.sh")]
+        self.assertIn('COPY runtime-audit-parser.py /inputs/runtime-audit-parser.py', recipe)
+        self.assertIn('COPY runtime-audit-probe.sh /inputs/runtime-audit-probe.sh', recipe)
+        self.assertIn('"$YOUKI_AUDIT_PARSER_SHA256  /inputs/runtime-audit-parser.py"', recipe)
+        self.assertIn('"$YOUKI_AUDIT_PROBE_SHA256  /inputs/runtime-audit-probe.sh"', recipe)
+        self.assertIn('/bin/sh /inputs/runtime-audit-probe.sh', recipe)
+        self.assertIn('cp "$recipe_dir/../../scripts/helpers/linux_docker_runtime_audit.py" "$context/runtime-audit-parser.py"', build)
+        self.assertIn('/bin/busybox timeout -s KILL 30 /result/youki', probe)
+        self.assertIn('cat /proc/sys/kernel/random/boot_id > /result/runtime-audit-boot-id.txt', probe)
+        for case, _, code in AUDIT_NATIVE_CASES:
+            self.assertIn('audit_run ' + case + ' ' + str(code) + ' ', probe)
+        for name in AUDIT_NATIVE_FILES:
+            self.assertIn(name, recipe)
 
     def test_advisory_lock_rejects_live_owner_then_releases(self):
         import fcntl

@@ -8,6 +8,7 @@ from pathlib import Path
 import stat
 import struct
 import sys
+import types
 
 REQUIRED_TESTS = (
     "test_channel_time_offset_request", "test_channel_time_offsets_ack",
@@ -65,6 +66,32 @@ REQUIRED_CONSOLE_TESTS = tuple("test_vz_console_size_" + name for name in (
 REQUIRED_EXEC_ERROR_TESTS = tuple("test_vz_executable_errors_" + name for name in (
     "denied_permissions", "missing_paths", "allowed_modes_unchanged", "classifier_controls_and_context",
 ))
+REQUIRED_AUDIT_TESTS = tuple("test_vz_runtime_audit_" + name for name in (
+    "enrollment_disabled_and_identity", "unsafe_paths_and_quota", "concurrent_pairs_and_sequences",
+    "incomplete_and_corrupt_tail", "typed_operations_and_secret_exclusion", "explicit_exit_and_error_routing",
+))
+AUDIT_NATIVE_CASES = (("version", "ok", 0), ("create", "error", 1),
+                      ("exec", "error", 255), ("run", "error", 255))
+AUDIT_NATIVE_SESSION = "a" * 64
+AUDIT_NATIVE_CID = "b" * 64
+AUDIT_NATIVE_FILES = (
+    "runtime-audit-parser.py", "runtime-audit-probe.sh", "runtime-audit-boot-id.txt",
+    "runtime-audit-metadata-before.txt", "runtime-audit-metadata-after.txt",
+    "runtime-audit-enrollment.json", "runtime-audit-events.jsonl", "runtime-audit-status.txt",
+) + tuple("runtime-audit-" + case + suffix for case, _, _ in AUDIT_NATIVE_CASES
+          for suffix in (".argv", ".stdout", ".stderr", ".exit-status.txt"))
+
+
+def audit_native_argv(case):
+    arguments = {
+        "version": ["--version"],
+        "create": ["create", "--bundle", "/inputs/runtime-audit-invalid-bundle", AUDIT_NATIVE_CID],
+        "exec": ["exec", "--env", "VZ_NATIVE_AUDIT_EXEC_CANARY=vz-native-audit-exec-env-canary-v1",
+                 AUDIT_NATIVE_CID, "/vz-native-audit-argv-canary-v1"],
+        "run": ["run", "--bundle", "/inputs/runtime-audit-invalid-bundle", AUDIT_NATIVE_CID],
+    }
+    return ("\0".join(["/bin/busybox", "timeout", "-s", "KILL", "30", "/result/youki", "--root",
+                       "/inputs/runtime-audit-root", *arguments[case]]) + "\0").encode()
 
 
 def require(condition, message):
@@ -105,7 +132,7 @@ def validate(candidate, source):
              "executable-permissions.patch", "executable-permissions-tests.txt",
              "tenant-cgroup.patch", "tenant-cgroup-tests.txt", "run-keep.patch", "run-keep-tests.txt",
              "foreground-wait.patch", "foreground-wait-tests.txt", "console-size.patch", "console-size-tests.txt",
-             "executable-errors.patch", "executable-errors-tests.txt"}
+             "executable-errors.patch", "executable-errors-tests.txt", "runtime-audit.patch", "runtime-audit-tests.txt"} | set(AUDIT_NATIVE_FILES)
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -114,12 +141,16 @@ def validate(candidate, source):
         require(len(digest) == 64 and all(c in "0123456789abcdef" for c in digest), "invalid checksum")
         checksums[name] = digest
     require(set(checksums) == names, "incomplete youki evidence manifest")
-    contents = {name: read_regular(candidate / name, allow_empty=name in {"runtime-log-stdout.txt", "runtime-log-stderr.txt"}) for name in names}
+    empty_allowed = {"runtime-log-stdout.txt", "runtime-log-stderr.txt"} | {
+        "runtime-audit-" + case + suffix for case, _, _ in AUDIT_NATIVE_CASES for suffix in (".stdout", ".stderr")}
+    contents = {name: read_regular(candidate / name, allow_empty=name in empty_allowed) for name in names}
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "runtime-audit-probe.sh"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
+    parser_path = source / "../../scripts/helpers/linux_docker_runtime_audit.py"
+    require(contents["runtime-audit-parser.py"] == read_regular(parser_path), "stale build input: runtime audit parser")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
     require(inputs["YOUKI_FEATURES"] == "v2,cgroupsv2_devices,seccomp", "unexpected runtime feature selection")
@@ -137,6 +168,10 @@ def validate(candidate, source):
     validate_console_size(contents["console-size-tests.txt"])
     require(checksums["executable-errors.patch"] == inputs["YOUKI_EXEC_ERROR_PATCH_SHA256"], "pinned local executable error patch mismatch")
     validate_executable_errors(contents["executable-errors-tests.txt"])
+    require(checksums["runtime-audit.patch"] == inputs["YOUKI_AUDIT_PATCH_SHA256"], "pinned local runtime audit patch mismatch")
+    validate_runtime_audit(contents["runtime-audit-tests.txt"])
+    require(checksums["runtime-audit-parser.py"] == inputs["YOUKI_AUDIT_PARSER_SHA256"], "pinned runtime audit parser mismatch")
+    require(checksums["runtime-audit-probe.sh"] == inputs["YOUKI_AUDIT_PROBE_SHA256"], "pinned runtime audit native probe mismatch")
     keep_tests = contents["run-keep-tests.txt"].decode()
     expected_keep = {"test commands::run::keep_tests::" + test + " ... ok" for test in REQUIRED_KEEP_TESTS}
     actual_keep = [line for line in keep_tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
@@ -173,9 +208,80 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    validate_runtime_audit_native(contents, parser_path)
     validate_elf(contents["youki"])
     return checksums["youki"]
+
+
+def validate_runtime_audit_native(contents, parser_path):
+    # Compile the exact trusted source bytes, not any ambient __pycache__. Both
+    # source equality and its explicit pin were checked before reaching here.
+    trusted_parser = read_regular(parser_path)
+    require(trusted_parser == contents["runtime-audit-parser.py"], "runtime audit parser changed during validation")
+    parser = types.ModuleType("vz_youki_audit_native_parser")
+    exec(compile(trusted_parser, str(parser_path), "exec"), parser.__dict__)
+    boot_raw = contents["runtime-audit-boot-id.txt"]
+    require(re.fullmatch(rb"[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\n", boot_raw),
+            "runtime audit independent boot capture malformed")
+    proof = parser.validate(contents["runtime-audit-events.jsonl"],
+        enrollment_raw=contents["runtime-audit-enrollment.json"], status_raw=contents["runtime-audit-status.txt"],
+        expected_session_id=AUDIT_NATIVE_SESSION, expected_boot_id=boot_raw.decode().strip())
+    require(proof["record_count"] == 8 and proof["invocation_count"] == 4, "runtime audit native invocation count")
+    require(contents["runtime-audit-metadata-before.txt"] == contents["runtime-audit-metadata-after.txt"],
+            "runtime audit protected file metadata changed")
+    metadata = contents["runtime-audit-metadata-before.txt"].decode("ascii").splitlines()
+    paths = ["/var/lib/docker/runtime-audit" + suffix for suffix in ("", "/enrollment.json", "/events.jsonl", "/status")]
+    require(len(metadata) == 4, "runtime audit protected metadata inventory")
+    identities = []
+    for index, (line, path) in enumerate(zip(metadata, paths)):
+        fields = line.split("|")
+        require(len(fields) == 7 and fields[:4] == [path, "0", "0", "700" if index == 0 else "600"] and
+                re.fullmatch(r"[1-9][0-9]*", fields[4]) and (index == 0 or fields[4] == "1") and
+                re.fullmatch(r"[0-9]+", fields[5]) and re.fullmatch(r"[1-9][0-9]*", fields[6]),
+                "runtime audit unsafe protected metadata")
+        identities.append((fields[5], fields[6]))
+    require(len(set(identities)) == 4 and len({device for device, _ in identities}) == 1,
+            "runtime audit protected files alias or change filesystem")
+    births = []
+    for index, (pair, (case, outcome, code)) in enumerate(zip(proof["invocations"], AUDIT_NATIVE_CASES)):
+        begin, result = pair["begin"], pair["result"]
+        require(begin["operation"] == case and begin["container_id"] == (None if case == "version" else AUDIT_NATIVE_CID)
+                and begin["sequence"] == index * 2 + 1 and result["sequence"] == index * 2 + 2 and
+                (result["outcome"], result["exit_code"]) == (outcome, code), "runtime audit native typed dispatch differs")
+        births.append((begin["pid"], begin["starttime_ticks"]))
+        require(contents["runtime-audit-" + case + ".argv"] == audit_native_argv(case), "runtime audit native argv differs")
+        require(contents["runtime-audit-" + case + ".exit-status.txt"] == (str(code) + "\n").encode(),
+                "runtime audit native host exit differs")
+        if case == "version":
+            require(contents["runtime-audit-version.stdout"] == contents["version.txt"] and
+                    contents["runtime-audit-version.stderr"] == b"", "runtime audit version early return differs")
+        else:
+            require(contents["runtime-audit-" + case + ".stdout"] == b"", "runtime audit failed native command emitted stdout")
+    require(len(set(births)) == 4, "runtime audit native commands reused process birth")
+    create_error = contents["runtime-audit-create.stderr"]
+    # Default text tracing may precede Rust main's error chain. Spec::load has
+    # no filename context, so do not invent a config.json path in its output.
+    require(len(create_error) <= 65536 and create_error.endswith(b"\n") and
+            create_error.splitlines().count(b"Error: oci spec error") == 1 and
+            b"No such file or directory (os error 2)" in create_error,
+            "runtime audit create did not reject invalid bundle")
+    for name in ("runtime-audit-events.jsonl", "runtime-audit-enrollment.json", "runtime-audit-status.txt"):
+        require(not any(marker in contents[name] for marker in (
+            b"VZ_NATIVE_AUDIT_ENV_CANARY", b"vz-native-audit-env-canary-v1", b"VZ_NATIVE_AUDIT_EXEC_CANARY",
+            b"vz-native-audit-exec-env-canary-v1", b"vz-native-audit-argv-canary-v1")), "runtime audit argv/environment canary leak")
+
+
+def validate_runtime_audit(raw):
+    tests = raw.decode("utf-8")
+    actual = [line for line in tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
+    expected = {"test runtime_audit::tests::" + name + " ... ok" for name in REQUIRED_AUDIT_TESTS}
+    summaries = [line for line in tests.splitlines() if line.startswith("test result:")]
+    require(len(actual) == len(expected) and set(actual) == expected and "FAILED" not in tests and
+            len(summaries) == 1 and re.fullmatch(
+                r"test result: ok\. " + str(len(REQUIRED_AUDIT_TESTS)) +
+                r" passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
+                summaries[0]), "missing or failed runtime audit regressions")
 
 
 def validate_executable_errors(raw):

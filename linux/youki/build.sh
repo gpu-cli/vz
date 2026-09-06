@@ -12,7 +12,7 @@ docker_context="${YOUKI_DOCKER_CONTEXT:-}"
 docker_command=(env -u BUILDX_BUILDER -u BUILDX_CONFIG -u DOCKER_HOST -u DOCKER_CONTEXT -u DOCKER_TLS_VERIFY -u DOCKER_CERT_PATH docker --context "$docker_context")
 cache_root="${YOUKI_CACHE_DIR:-$recipe_dir/../.cache/youki-source}"
 mkdir -p "$cache_root/downloads" "$cache_root/builds"
-recipe_digest="$(cd "$recipe_dir" && shasum -a 256 Dockerfile inputs.env apk.sha256 build.sh validate.py lock.py seccomp-exec.patch tenant-root.patch runtime-log.patch executable-permissions.patch tenant-cgroup.patch run-keep.patch foreground-wait.patch console-size.patch executable-errors.patch | shasum -a 256 | cut -d' ' -f1)"
+recipe_digest="$(cd "$recipe_dir" && shasum -a 256 Dockerfile inputs.env apk.sha256 build.sh validate.py lock.py seccomp-exec.patch tenant-root.patch runtime-log.patch executable-permissions.patch tenant-cgroup.patch run-keep.patch foreground-wait.patch console-size.patch executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum -a 256 | cut -d' ' -f1)"
 candidate="$cache_root/builds/$recipe_digest"
 
 fetch() {
@@ -63,6 +63,9 @@ if drivers != ["docker"] or endpoints != [sys.argv[1]]:
     cp "$recipe_dir/foreground-wait.patch" "$context/"
     cp "$recipe_dir/console-size.patch" "$context/"
     cp "$recipe_dir/executable-errors.patch" "$context/"
+    cp "$recipe_dir/runtime-audit.patch" "$context/"
+    cp "$recipe_dir/runtime-audit-probe.sh" "$context/"
+    cp "$recipe_dir/../../scripts/helpers/linux_docker_runtime_audit.py" "$context/runtime-audit-parser.py"
     cp "$cache_root/downloads/source-$YOUKI_COMMIT.tar.gz" "$context/source.tar.gz"
     while read -r _ filename; do cp "$cache_root/downloads/$filename" "$context/apks/"; done < "$recipe_dir/apk.sha256"
     output="$(mktemp -d "$cache_root/builds/.candidate.XXXXXX")"

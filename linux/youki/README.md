@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1+vz-executable-errors-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1+vz-executable-errors-v1+vz-runtime-audit-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -160,6 +160,39 @@ format failures need separate transport and physical-Docker coverage. Passing
 the frozen missing-command/non-executable-file fixture must not be reported as
 complete error-handling parity. The rebuilt backend and fresh installed Mac
 lifecycle gate remain required; previous failed candidates remain failed.
+
+`runtime-audit.patch` is a tenth **locally authored vz patch**, adding an opt-in
+diagnostic journal inside the actual runtime. It is not a replacement executable
+or a new public vz verb. An external, exact-Machine evidence controller must
+enroll a fresh protected session under `/var/lib/docker/runtime-audit`; normal
+unenrolled operation does not create audit files. Enrollment records the guest
+boot and random session, not Machine ownership. The host must independently bind
+those values to the original Machine owner and incarnation.
+
+Typed invocation begin/result records contain operation, container ID, runtime
+PID/birth, clocks and exit result. They never copy argv, environment, OCI specs
+or error text. Explicit run/exec exits are recorded before process exit, not by
+relying on a destructor. Audit descriptors are closed before OCI dispatch so
+they are not inherited by container forks. The journal has a fixed byte quota;
+audit failures invalidate evidence without changing OCI results or preventing
+kill/delete. A protected sticky incomplete status is never cleared by the runtime.
+There is no automatic history deletion, session reset or rotation.
+
+The native audit test log and exact patch bytes are mandatory candidate inputs.
+The source-pinned `runtime-audit-probe.sh` additionally exercises the compiled
+binary's version return, invalid-bundle create/run and missing-container exec
+paths. It retains exact arguments, separate output streams, statuses, protected
+file metadata and the resulting journal for independent host replay. These
+native CLI probes do not run a container payload or Docker workload.
+The separate host parser `scripts/helpers/linux_docker_runtime_audit.py` validates
+bounded original journal bytes, exact enrollment, contiguous sequence and paired
+process identities. Its tests are synthetic, not physical invocation evidence.
+A detached exec result of zero proves runtime admission, not payload completion;
+containerd can kill/remove exec tasks directly without invoking youki kill/delete.
+The parser does not certify protected-file acquisition, Machine binding, complete
+Docker-operation mapping or process absence. Exact-Machine enrollment/retrieval,
+reboot/session transition behavior and fresh installed-Mac/aggregate acceptance
+remain required before claiming runtime-invocation coverage.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,
