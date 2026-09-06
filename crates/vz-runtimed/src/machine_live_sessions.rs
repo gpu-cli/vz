@@ -46,6 +46,7 @@ pub struct MachineSessionStopReceipt {
     pub generation: u64,
     pub runtime_identity: StackRuntimeIdentity,
     pub endpoint: Option<MachineDockerEndpointShutdown>,
+    pub docker_shutdown: Option<vz_linux::DockerShutdownComplete>,
     pub outcome: StackRuntimeShutdownOutcome,
 }
 
@@ -1642,6 +1643,7 @@ fn rebind_completed_stop<S: EnvironmentStateStore>(
         generation: delete.generation,
         runtime_identity: old.runtime_identity,
         endpoint: old.endpoint,
+        docker_shutdown: None,
         outcome: StackRuntimeShutdownOutcome::AlreadyAbsent,
     })
 }
@@ -1773,30 +1775,32 @@ async fn stop_resources(
     // Any externally retained activation reader causes a bounded timeout;
     // timeout is uncertainty, not evidence of physical absence.
     drop(activation);
-    let outcome = entry
+    let (outcome, docker_shutdown) = entry
         .runtime()
         .inner()
-        .shutdown_shared_vm_exact(&StackRuntimeShutdownRequest {
+        .shutdown_shared_vm_with_receipt_exact(&StackRuntimeShutdownRequest {
             schema_version: STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
             operation_id: operation.operation_id.to_string(),
             expected: identity.clone(),
         })
         .await
         .map_err(|error| error.to_string())?;
-    if matches!(
-        outcome,
-        StackRuntimeShutdownOutcome::ReplacementPresent { .. }
-    ) {
-        return Err("original Runtime now contains a replacement incarnation; preserved".into());
+    if outcome != StackRuntimeShutdownOutcome::Stopped {
+        return Err("original live Runtime did not positively stop its exact incarnation; ownership retained".into());
     }
-    Ok(MachineSessionStopReceipt {
+    let receipt = MachineSessionStopReceipt {
         owner,
         operation_id: operation.operation_id.to_string(),
         generation: operation.generation,
         runtime_identity: identity,
         endpoint,
+        docker_shutdown,
         outcome,
-    })
+    };
+    entry
+        .persist_stop_receipt(&receipt)
+        .map_err(|error| error.to_string())?;
+    Ok(receipt)
 }
 
 async fn run_owned_stop(
@@ -1867,6 +1871,7 @@ mod tests {
             generation: 1,
             runtime_identity: StackRuntimeIdentity::new("vm-test").unwrap(),
             endpoint: None,
+            docker_shutdown: None,
             outcome: StackRuntimeShutdownOutcome::Stopped,
         }
     }
@@ -2070,6 +2075,7 @@ mod tests {
             generation: operation.generation,
             runtime_identity: identity,
             endpoint: None,
+            docker_shutdown: None,
             outcome: StackRuntimeShutdownOutcome::Stopped,
         };
         let (_, receiver) = watch::channel(Some(Arc::new(Ok(receipt))));
@@ -2310,6 +2316,7 @@ mod tests {
                 socket_removed: true,
                 ..Default::default()
             }),
+            docker_shutdown: None,
             outcome: StackRuntimeShutdownOutcome::Stopped,
         };
         let (sender, receiver) = watch::channel(Some(Arc::new(Ok(good.clone()))));
@@ -2361,6 +2368,7 @@ mod tests {
             generation: op.generation,
             runtime_identity: session.identity.clone(),
             endpoint: None,
+            docker_shutdown: None,
             outcome: StackRuntimeShutdownOutcome::AlreadyAbsent,
         };
         let (_, receiver) = watch::channel(Some(Arc::new(Ok(receipt))));

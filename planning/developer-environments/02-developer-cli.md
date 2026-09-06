@@ -453,3 +453,68 @@ tracks the required durability fix. Both candidates positively Stopped their
 remaining Machines and gracefully closed the replacement daemon, without
 repairing or deleting the retained neighbor data. These partial observations
 do not certify workload persistence, complete crash recovery or 0.4.
+
+### Journaled Docker Stop correction (2026-09-06, DEV)
+
+`vz-u0u` now implements pinned static journal-capable formatting, clean ext4
+admission, streaming guest daemon/filesystem closure, and exact private durable
+Stop receipts. Forwarding drains before daemon termination; positive closure
+precedes VM power-off and lifecycle acknowledgement. Unclean/legacy disks and
+incomplete bootstrap ownership remain preserved and refused, not silently
+reformatted or repaired. Automatic recovery of those cases is still unfinished.
+
+Two backend candidates exposed and drove integration fixes. The first,
+`20260906T010254Z`, lacked formatter tools inside the guest-agent chroot. The
+second, `20260906T013530Z`, passed runtime and generation/teardown lanes but
+failed Machine reopen because receipt publication changed the immutable
+artifact pin inventory. Tools and provenance now cross the rootfs boundary
+with integrity checks; lifecycle receipts live separately under
+`data/linux-lifecycle/stops`. Strict artifact inventory validation is unchanged.
+Both failed runs and their exact guest bundles are retained under
+`.artifacts/sandbox-vm-e2e/`; their raw manifests bind 48 and 86 files,
+respectively. Neither is a passing backend or installed persistence gate.
+
+Candidate `20260906T015039Z` then passed the physical registry test, but its
+evidence checker rejected the added Docker shutdown field. Its 90-file raw
+manifest and exact bundles are retained as another failed full run. The
+checker now requires correlated daemon and clean journaled-filesystem closure,
+distinct Developer filesystem identities, and no Docker proof for Hardened;
+75 registry/recovery/Delete validator tests pass. Read-only validation of saved
+evidence does not relabel the failed run or supply its unrun downstream lanes.
+
+The final source checks passed 382 daemon tests (three existing platform-specific
+ignores), 141 guest tests, 88 Linux client tests, workspace compilation and
+strict production host/Linux Clippy. The signed installed CLI candidate
+`.artifacts/topology-cli-installed-ijivI3/` passes all 31 control-plane and
+retired-command checks, with independently verified signatures and evidence.
+These checks do not replace fresh physical workload-persistence evidence, the
+complete host Docker/Compose/buildx matrix, or the aggregate release gate.
+
+Installed recovery candidate 3 now passes that scoped physical scenario:
+`.artifacts/installed-daemon-recovery-candidate-3/`. All four Machines completed
+positive Stop; the neighbor's two original containers restarted after exact
+daemon recovery with their original writable-layer and named-volume bytes.
+Six correlated filesystem closures and two exact Deletes completed with no
+test retries or cleanup errors. The primary was deleted without restart;
+active-Machine crash adoption and automatic unclean-disk recovery are not
+certified. See the [candidate evidence and limits](../../scripts/helpers/installed_daemon_recovery_e2e.md#passing-scoped-candidate-2026-09-06-dev).
+
+The fresh full local-Mac backend candidate
+`.artifacts/sandbox-vm-e2e/20260906T020915Z/summary.txt` also passes: seven
+lanes, 50 selected tests, zero selected failures or ignored tests. It includes
+the stricter registry evidence validation, stack lifecycle and BuildKit lanes.
+Its signed production daemon matches the installed recovery candidate's bytes.
+This closes neither the full 63-case host Docker matrix nor the aggregate 0.4
+gate; `vz-u0u` and `vz-ehz` retain their unfinished recovery requirements.
+
+The backend raw manifest includes both exact retained guest bundles and all
+4,071 evidence files. Its SHA256 is
+`d617d098bd34422d65778c13bcc96fd7a80cf0374876c5adc07c70f2580506a7`.
+
+Post-integration workspace compilation, formatting and strict production
+Clippy pass. `topology-cli-installed-gLq7X5` passes all 31 CLI checks. Because
+the rebuilt CLI changed bytes, fresh installed recovery candidate 4 repeats
+the physical scenario and passes with the integrated CLI and the backend's
+exact daemon/guest artifact bytes. Its 1,339-file manifest is
+`7c28eb6e4ad8cf9728779fbab46921fb4e6fc6b5802c7e6adbf57ea002c7419f`.
+These are separate DEV gates, not an aggregate 0.4 release certification.

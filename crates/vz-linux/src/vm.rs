@@ -690,6 +690,82 @@ impl LinuxVm {
         self.ensure_docker_ready_with_progress(|_| {}).await
     }
 
+    /// Fence this exact guest's Docker owner, reap its daemons, and positively
+    /// close its persistent filesystem. Stream loss is never shutdown proof.
+    pub async fn shutdown_docker(
+        &self,
+        request_id: String,
+    ) -> Result<vz_agent_proto::DockerShutdownComplete, LinuxError> {
+        self.shutdown_docker_with_progress(request_id, |_| {}).await
+    }
+
+    /// Shut down Docker while reporting its streamed progress to the caller.
+    pub async fn shutdown_docker_with_progress<F>(
+        &self,
+        request_id: String,
+        mut on_event: F,
+    ) -> Result<vz_agent_proto::DockerShutdownComplete, LinuxError>
+    where
+        F: FnMut(&vz_agent_proto::DockerShutdownEvent),
+    {
+        if request_id.is_empty() || request_id.len() > 256 {
+            return Err(LinuxError::Protocol(
+                "invalid Docker shutdown request ID".to_string(),
+            ));
+        }
+        self.ensure_grpc().await?;
+        let mut grpc = self.grpc.lock().await;
+        let client = grpc
+            .as_mut()
+            .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
+        let mut stream = client.shutdown_docker_stream(request_id.clone()).await?;
+        drop(grpc);
+        let mut complete = None;
+        while let Some(event) = stream.message().await? {
+            if event.request_id != request_id || complete.is_some() {
+                return Err(LinuxError::Protocol(
+                    "Docker shutdown stream ownership/order mismatch".to_string(),
+                ));
+            }
+            on_event(&event);
+            if let Some(receipt) = event.complete {
+                let started = receipt.supervisor_started;
+                let closure = receipt.filesystem_synced && receipt.filesystem_unmounted;
+                if receipt.request_id != request_id
+                    || receipt.data_device != "/dev/vda"
+                    || receipt.data_mount != "/var/lib/docker"
+                    || receipt.filesystem_synced != receipt.filesystem_unmounted
+                    || (started
+                        && (!receipt.dockerd_reaped
+                            || !receipt.containerd_reaped
+                            || !closure
+                            || receipt.never_started_unmounted))
+                    || (!started
+                        && (receipt.dockerd_reaped
+                            || receipt.containerd_reaped
+                            || !(closure ^ receipt.never_started_unmounted)))
+                    || receipt.filesystem_state != "clean"
+                    || !shutdown_filesystem_identity_valid(&receipt)
+                    || !["has_journal", "extent"].iter().all(|feature| {
+                        receipt
+                            .filesystem_features
+                            .iter()
+                            .any(|value| value == feature)
+                    })
+                {
+                    return Err(LinuxError::Protocol(
+                        "Docker shutdown omitted exact process/filesystem closure proof"
+                            .to_string(),
+                    ));
+                }
+                complete = Some(receipt);
+            }
+        }
+        complete.ok_or_else(|| {
+            LinuxError::Protocol("Docker shutdown stream ended without closure proof".to_string())
+        })
+    }
+
     /// Run a command on the guest with explicit execution options and return a streaming handle.
     pub async fn exec_stream_with_options(
         &self,
@@ -982,7 +1058,8 @@ impl LinuxVm {
     /// Run a command on the guest, collect output via streaming, with a timeout.
     ///
     /// Convenience wrapper: opens a stream, collects all events, applies timeout.
-    /// Equivalent to `exec_stream().collect()` with a timeout guard.
+    /// Uses checked collection: a spawn error, transport loss, or missing
+    /// terminal event is an error, never a synthesized process exit status.
     pub async fn exec_collect(
         &self,
         command: String,
@@ -991,7 +1068,7 @@ impl LinuxVm {
     ) -> Result<ExecOutput, LinuxError> {
         tokio::time::timeout(timeout, async {
             let stream: GrpcExecStream = self.exec_stream(command, args).await?;
-            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+            stream.collect_checked().await
         })
         .await
         .map_err(|_| {
@@ -1014,7 +1091,7 @@ impl LinuxVm {
             let stream: GrpcExecStream = self
                 .exec_stream_with_options(command, args, options)
                 .await?;
-            Ok::<ExecOutput, LinuxError>(stream.collect().await)
+            stream.collect_checked().await
         })
         .await
         .map_err(|_| {
@@ -1440,11 +1517,36 @@ impl LinuxVm {
     }
 }
 
+fn shutdown_filesystem_identity_valid(receipt: &vz_agent_proto::DockerShutdownComplete) -> bool {
+    uuid::Uuid::parse_str(&receipt.filesystem_uuid).is_ok_and(|value| !value.is_nil())
+        && !receipt
+            .filesystem_features
+            .iter()
+            .any(|feature| feature == "needs_recovery")
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
 
     use super::*;
+
+    #[test]
+    fn shutdown_filesystem_identity_rejects_nil_and_pending_journal_recovery() {
+        let mut receipt = vz_agent_proto::DockerShutdownComplete {
+            filesystem_uuid: "80145f4c-5bb6-4220-bb9a-a01c19c8e178".into(),
+            filesystem_features: vec!["has_journal".into(), "extent".into()],
+            ..Default::default()
+        };
+        assert!(shutdown_filesystem_identity_valid(&receipt));
+        receipt.filesystem_features.push("needs_recovery".into());
+        assert!(!shutdown_filesystem_identity_valid(&receipt));
+        receipt.filesystem_features.pop();
+        for invalid in ["", "not-a-uuid", "00000000-0000-0000-0000-000000000000"] {
+            receipt.filesystem_uuid = invalid.into();
+            assert!(!shutdown_filesystem_identity_valid(&receipt));
+        }
+    }
 
     fn sample_info() -> SystemInfoResponse {
         SystemInfoResponse {

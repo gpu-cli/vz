@@ -5,6 +5,7 @@ import json
 from pathlib import Path
 import tempfile
 import threading
+import types
 import unittest
 from unittest.mock import Mock, patch
 
@@ -64,6 +65,21 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(gate.arguments(args).suite, "compose")
         with self.assertRaisesRegex(driver.Rejected, "run ID"):
             gate.arguments(args + ["--run-id", "../../foreign"])
+
+    def test_build_requires_pinned_archive_and_compose_rejects_it(self):
+        common = []
+        for name in gate.startup.OPTIONS:
+            common.extend(["--" + name, "/absolute/input"])
+        with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
+            gate.arguments(["--suite", "build", *common])
+        args = gate.arguments(["--suite", "build", *common, "--buildkit-archive", "/owned/buildkit.tar"])
+        self.assertEqual(args.suite, "build")
+        self.assertEqual(args.buildkit_archive, "/owned/buildkit.tar")
+        with self.assertRaisesRegex(driver.Rejected, "buildkit-archive"):
+            gate.arguments(["--suite", "compose", *common, "--buildkit-archive", "/owned/buildkit.tar"])
+        with self.assertRaisesRegex(driver.Rejected, "duplicate"):
+            gate.arguments(["--suite", "build", *common, "--buildkit-archive", "/owned/buildkit.tar",
+                            "--buildkit-archive=/other/buildkit.tar"])
 
     def test_python_repo_aliases_are_exact(self):
         pin = {"reference": "docker.io/library/python@sha256:" + "a" * 64, "id": "sha256:" + "a" * 64,
@@ -179,6 +195,46 @@ class PrePullTrustTests(unittest.TestCase):
                 harness.exact_absent.assert_not_called()
                 self.assertEqual(harness.owned, [])
 
+
+class BuildDispatchTests(unittest.TestCase):
+    def test_builder_owner_is_retained_before_prepare_effects(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.info = {"suite": "build"}
+        harness.builders = []
+        descriptor = {"name": "private"}
+        builder = Mock()
+        def prepare():
+            self.assertEqual(harness.builders, [builder])
+            raise driver.Rejected("partial builder mutation")
+        builder.prepare.side_effect = prepare
+        module = types.SimpleNamespace(Builder=Mock(return_value=builder))
+        with patch.dict("sys.modules", {"linux_docker_buildkit_builder": module}), \
+                patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
+            with self.assertRaisesRegex(driver.Rejected, "partial builder"):
+                harness.driver_inputs(descriptor, {}, {}, {})
+        module.Builder.assert_called_once_with(harness, descriptor)
+        self.assertEqual(harness.builders, [builder])
+
+    def test_compose_never_provisions_build_builder(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.info = {"suite": "compose"}
+        harness.builders = []
+        with patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
+            self.assertEqual(harness.driver_inputs({}, {}, {}, {}), {"scope": "exact"})
+        self.assertEqual(harness.builders, [])
+
+    def test_replay_dispatch_uses_only_selected_suite_validator(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        build = types.SimpleNamespace(validate=Mock(return_value={"build": True}))
+        compose = types.SimpleNamespace(validate=Mock(return_value={"compose": True}))
+        with patch.dict("sys.modules", {"linux_docker_build_evidence": build,
+                                         "linux_docker_compose_evidence": compose}):
+            for suite in ("build", "compose"):
+                harness.info = {"suite": suite}
+                self.assertEqual(harness.validate_driver(Path("/owned"), {"exact": True}), {suite: True})
+        for module in (build, compose):
+            module.validate.assert_called_once_with(Path("/owned"), {"exact": True})
+
     def test_exact_engine_secure_policy_reaches_only_pinned_pull(self):
         policy = {"InsecureRegistryCIDRs": ["::1/128", "127.0.0.0/8"], "Mirrors": [],
                   "IndexConfigs": {"docker.io": {"Name": "docker.io", "Mirrors": [], "Secure": True, "Official": True}}}
@@ -260,7 +316,7 @@ class UncertaintyTests(unittest.TestCase):
                 h.owned = [{"descriptor": {"name": "exact-context"}, "token": "owned",
                             "tag": "owned:fixture", "image_id": "sha256:" + "a" * 64}]
                 h.mutate, h.exact_absent = Mock(), Mock()
-                with self.assertRaisesRegex(driver.Rejected, "Compose cleanup lacks successful independent replay"):
+                with self.assertRaisesRegex(driver.Rejected, "Docker fixture cleanup lacks successful independent replay"):
                     h.remove_owned()
                 h.docker.assert_not_called()
                 h.mutate.assert_not_called()
@@ -279,6 +335,31 @@ class UncertaintyTests(unittest.TestCase):
         h.docker.assert_called_once_with("owned-image-check", descriptor, ["image", "inspect", "owned:fixture"])
         h.mutate.assert_called_once_with("owned-image-remove", descriptor, ["image", "rm", "owned:fixture"])
         h.exact_absent.assert_called_once_with(descriptor, "image", "owned:fixture")
+
+    def test_builders_remove_in_reverse_order_only_after_replay_admission(self):
+        h = self.harness()
+        calls = []
+        h.builders = [Mock(remove_owned=Mock(side_effect=lambda: calls.append("first"))),
+                      Mock(remove_owned=Mock(side_effect=lambda: calls.append("second")))]
+        h.drivers = [Mock(record=Mock(receipts=[{"effects_uncertain": False}]))]
+        h.driver_cleanup_verified = [False]
+        with self.assertRaisesRegex(driver.Rejected, "independent replay"):
+            h.remove_owned()
+        self.assertEqual(calls, [])
+        h.driver_cleanup_verified = [True]
+        h.remove_owned()
+        self.assertEqual(calls, ["second", "first"])
+
+    def test_builder_cleanup_uncertainty_stops_later_owned_removal(self):
+        h = self.harness()
+        def uncertain():
+            h.effects_uncertain = True
+        first = Mock()
+        h.builders = [first, Mock(remove_owned=Mock(side_effect=uncertain))]
+        with self.assertRaisesRegex(driver.Rejected, "uncertain"):
+            h.remove_owned()
+        first.remove_owned.assert_not_called()
+        h.docker.assert_not_called()
 
     def test_liveness_requires_every_neighbor_during_exact_interval(self):
         monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)

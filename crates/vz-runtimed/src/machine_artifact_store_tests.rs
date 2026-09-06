@@ -390,6 +390,70 @@ async fn pin_reopens_from_private_bytes_after_catalog_source_is_removed() {
 }
 
 #[tokio::test]
+async fn persisted_stop_receipt_does_not_mutate_or_broaden_immutable_artifact_pin() {
+    let mut fixture = Fixture::new(MachineProfile::Developer).await;
+    let pinned = pin_machine_artifacts(fixture.store(), &fixture.target)
+        .await
+        .expect("published artifact pin");
+    let expected_configuration = pinned.configuration().clone();
+    let expected_pin = tree_snapshot(&fixture.pin_path());
+    let entry = fixture
+        .registry
+        .as_ref()
+        .expect("live registry")
+        .attach_runtime(fixture.store(), |_| Ok(()))
+        .expect("attach exact fixture runtime");
+    // Synthetic closure isolates the filesystem contract in this regression;
+    // only the separate installed backend gate establishes physical Stop.
+    let receipt = crate::machine_live_sessions::MachineSessionStopReceipt {
+        owner: fixture.owner.clone(),
+        operation_id: vz_runtime_contract::LifecycleOperationId::generate().to_string(),
+        generation: 1,
+        runtime_identity: vz_runtime_contract::StackRuntimeIdentity::new("artifact-reopen-stop")
+            .expect("fixture runtime identity"),
+        endpoint: None,
+        docker_shutdown: None,
+        outcome: vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped,
+    };
+    entry
+        .persist_stop_receipt(&receipt)
+        .expect("publish Stop through production receipt writer");
+    let receipt_path = fixture
+        .data_path()
+        .join("linux-lifecycle/stops")
+        .join(format!("{}.json", receipt.operation_id));
+    let receipt_bytes = serde_json::to_vec(&receipt).expect("serialized Stop receipt");
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+    assert_eq!(mode(&receipt_path), 0o600);
+    assert!(!fixture.pin_path().join("stops").exists());
+    assert_eq!(tree_snapshot(&fixture.pin_path()), expected_pin);
+    drop(entry);
+    drop(pinned);
+    fs::remove_dir_all(fixture.source()).expect("remove catalog source");
+
+    let reopened_store = fixture.reopen_store();
+    let reopened = load_machine_artifacts(reopened_store, fixture.host, &fixture.machine)
+        .await
+        .expect("reopen immutable private artifacts after persisted Stop");
+    assert_eq!(reopened.configuration(), &expected_configuration);
+    assert_eq!(tree_snapshot(&fixture.pin_path()), expected_pin);
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+    drop(reopened);
+
+    // A lifecycle-looking directory inside the pin is still unexpected. The
+    // fix must relocate mutable evidence, not weaken exact artifact inventory.
+    fs::create_dir(fixture.pin_path().join("stops")).expect("unexpected pin directory");
+    let rejected_snapshot = tree_snapshot(&fixture.pin_path());
+    assert!(
+        load_machine_artifacts(fixture.store(), fixture.host, &fixture.machine)
+            .await
+            .is_err()
+    );
+    assert_eq!(tree_snapshot(&fixture.pin_path()), rejected_snapshot);
+    assert_eq!(fs::read(&receipt_path).unwrap(), receipt_bytes);
+}
+
+#[tokio::test]
 async fn published_modes_are_exact_and_recovery_rejects_permission_drift_read_only() {
     for profile in [MachineProfile::Developer, MachineProfile::Hardened] {
         let fixture = Fixture::new(profile).await;

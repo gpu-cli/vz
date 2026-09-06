@@ -1,7 +1,7 @@
-# Installed local-Mac Compose slice (DEV)
+# Installed local-Mac Compose and Buildx slices (DEV)
 
-`scripts/run-linux-docker-e2e.sh` is the host entry point. Only `--suite compose`
-is implemented. `--suite all` rejects before client execution, state creation,
+`scripts/run-linux-docker-e2e.sh` is the host entry point. `--suite compose`
+and `--suite build` select distinct DEV slices. `--suite all` rejects before client execution, state creation,
 or VM provisioning; it never aliases the full 63-scenario contract to a subset.
 
 Pass absolute paths for every artifact/client and a fresh evidence directory:
@@ -53,6 +53,23 @@ matrix with paired destination controls, a host-written persistence sentinel,
 scale identities, blocked dependencies, failure propagation and owned cleanup.
 Missing history or observations fail; no test retries are performed.
 
+For Buildx, select `--suite build` and additionally pass
+`--buildkit-archive /absolute/vz-buildkit-v0.19.0-linux-arm64.tar`.
+The archive must match the checked-in runtime-free BuildKit pin, not a
+caller-selected checksum. Each selected Machine gets a separately owned
+`docker-container` builder, image and cache volume with the installed pinned
+youki runtime. Builder registration does not change the default builder or
+Docker context. The five recipes exercise multi-stage local output, repeated
+vertex cache reuse, build arguments, cold/warm cache mounts, and required-secret
+positive/negative behavior. Independent replay checks raw command evidence and
+retained export bytes before parent cleanup is admitted.
+
+The builder may fetch the exact pinned base image using HTTPS. Fixture RUN
+steps disable networking; this does not make the complete build offline.
+These recipes do not establish cache export/import, cross-Machine cache denial,
+parallel builds, SSH forwarding or secret absence from all image/cache blobs.
+Source integration and offline tests alone are not physical Buildx evidence.
+
 Four additional containers are started once before workload execution. A
 separate recorder continuously checks their Engine identity, unchanged start
 time/ID, zero restarts and unique host-written marker. These are contemporaneous
@@ -62,13 +79,38 @@ Cleanup removes only positively inspected owned workload objects and images,
 then obtains public Stop receipts and graceful daemon shutdown. Unknown command
 effects withhold cleanup; they are retained durably, including normal nonzero
 mutation failures. A monitor is positively reaped before removals begin. Outer
-cleanup also requires each Compose driver's successful cleanup and
+cleanup also requires each selected driver's successful cleanup and
 independent raw-evidence replay; certain command exits alone cannot certify
 that volumes or networks disappeared. Missing or failed replay retains resources.
-The owned installation, stopped Machine disks/contexts and BuildKit cache remain
+For the Buildx slice, exact owned builder/container/cache-volume removal precedes
+the shared image cleanup. The owned installation, stopped Machine disks/contexts
+and embedded Engine BuildKit cache remain
 for inspection. This is not Delete acceptance or a complete leak audit.
 
 No result certifies Docker parity or emits release-scenario PASS. Full fixture
 freezing, all63 scenarios, full OCI/cache/runtime audits, host binds/forwarding,
 recovery, native macOS, the five-verb Delete path, and the canonical three-phase
 aggregate with measured hardware sleep remain separate required work.
+
+## Buildx candidate 1: failed, retained
+
+`.artifacts/linux-docker-build-candidate-1` exercised the signed installed
+`topology-cli-installed-gLq7X5` artifacts on the local Mac. All four Developer
+Machines became ready, their sentinels started, and the first Machine pulled
+and executed the pinned Python input and built the preparatory image through
+its embedded builder. The separate BuildKit builder container then failed OCI
+create through pinned youki (command 080). None of the five-recipe Buildx slices
+ran. This is a failed candidate, not a passing compatibility demonstration.
+
+All 1,497 raw artifact hashes and 80 command receipts were independently
+verified. Its evidence manifest SHA256 is
+`65c2ea986b44e7fad09719d7b64b15f59a9c46cedda8853c9711ee50d5530b62`.
+The failed mutation remained uncertain and withheld Docker-object cleanup.
+
+A separate `.artifacts/linux-docker-build-candidate-1-disposition` captured
+bounded guest daemon logs through public Exec, positively stopped all four
+Machines, and gracefully closed the exact original daemon. Docker defaults
+were unchanged. The original failed evidence, Docker objects and stopped disks
+at `/private/tmp/vzdev-c4q2h8zh` remain preserved; no retry, disk repair, resource
+deletion or candidate promotion was performed. The generic OCI-create error
+still needs a concrete runtime diagnosis before the next candidate.

@@ -95,10 +95,64 @@ install_iptables_binary() {
   return 0
 }
 
+# The verified initramfs binds this canonical build-provenance JSON and both
+# static tools. Preserve that exact payload across the overlay/chroot boundary;
+# binaries outside the guest agent's root are not usable capabilities.
+verify_developer_e2fsprogs() {
+  e2_verify_root="$1"
+  for e2_path in "$e2_verify_root" "$e2_verify_root/sbin" "$e2_verify_root/etc"; do
+    [ -d "$e2_path" ] && [ ! -L "$e2_path" ] || return 1
+  done
+  e2_provenance="$e2_verify_root/etc/vz-e2fsprogs.json"
+  [ -f "$e2_provenance" ] && [ ! -L "$e2_provenance" ] || return 1
+  [ "$(/bin/busybox stat -c '%h' "$e2_provenance")" = 1 ] || return 1
+  for e2_name in mke2fs dumpe2fs; do
+    e2_path="$e2_verify_root/sbin/$e2_name"
+    [ -f "$e2_path" ] && [ ! -L "$e2_path" ] && [ -x "$e2_path" ] || return 1
+    [ "$(/bin/busybox stat -c '%h' "$e2_path")" = 1 ] || return 1
+    # Only the helper's canonical JSON binary fields are accepted. Multiple,
+    # missing, empty, malformed or redirected records cannot validate a tool.
+    e2_expected=$(/bin/busybox sed -n "s/^    \"$e2_name\": \"\([0-9a-f]*\)\"[,]\{0,1\}$/\1/p" "$e2_provenance") || return 1
+    [ "${#e2_expected}" = 64 ] || return 1
+    case "$e2_expected" in *[!0-9a-f]*) return 1 ;; esac
+    e2_observed=$(/bin/busybox sha256sum "$e2_path") || return 1
+    [ "${e2_observed%% *}" = "$e2_expected" ] || return 1
+  done
+}
+
+install_developer_e2fsprogs() {
+  e2_origin=/
+  e2_target_root="$1"
+  verify_developer_e2fsprogs "$e2_origin" || return 1
+  [ -d "$e2_target_root" ] && [ ! -L "$e2_target_root" ] || return 1
+  for e2_path in "$e2_target_root/sbin" "$e2_target_root/etc"; do
+    [ ! -L "$e2_path" ] || return 1
+    if [ -e "$e2_path" ]; then [ -d "$e2_path" ] || return 1; fi
+    /bin/busybox mkdir -p "$e2_path" || return 1
+  done
+  for e2_relative in sbin/mke2fs sbin/dumpe2fs etc/vz-e2fsprogs.json; do
+    e2_target="$e2_target_root/$e2_relative"
+    [ ! -L "$e2_target" ] || return 1
+    if [ -e "$e2_target" ]; then
+      [ -f "$e2_target" ] && [ "$(/bin/busybox stat -c '%h' "$e2_target")" = 1 ] || return 1
+      /bin/busybox cmp "$e2_origin/$e2_relative" "$e2_target" || return 1
+    else
+      /bin/busybox cp "$e2_origin/$e2_relative" "$e2_target" || return 1
+    fi
+  done
+  /bin/busybox chmod 755 "$e2_target_root/sbin/mke2fs" "$e2_target_root/sbin/dumpe2fs" || return 1
+  /bin/busybox chmod 444 "$e2_target_root/etc/vz-e2fsprogs.json" || return 1
+  verify_developer_e2fsprogs "$e2_target_root"
+}
+
 # Developer trust is a pinned public bundle in this verified initramfs, not
 # host trust or the build container's CA directory. Hardened has neither the
 # Developer xtables marker nor CA payload. Integrity failure is terminal.
 if [ -x /sbin/xtables-legacy-multi ]; then
+  if ! verify_developer_e2fsprogs /; then
+    echo "[vz-init] Developer ext4 tooling integrity failed"
+    exit 1
+  fi
   if [ ! -f /etc/vz/install-ca-trust.sh ] || [ -L /etc/vz/install-ca-trust.sh ]; then
     echo "[vz-init] missing or redirected Developer CA installer"
     exit 1
@@ -174,6 +228,10 @@ switch_root_into_overlay_rootfs() {
   mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin"
   cp /bin/busybox "$ROOTFS/bin/busybox" || return 1
   install_iptables_binary "$ROOTFS" || return 1
+  if [ -x /sbin/xtables-legacy-multi ] && ! install_developer_e2fsprogs "$ROOTFS"; then
+    echo "[vz-init] Developer overlay ext4 tooling installation failed"
+    exit 1
+  fi
   if [ -x /sbin/xtables-legacy-multi ] && ! install_developer_ca_trust "$ROOTFS"; then
     # Do not fall back to a different rootfs after rejecting unsafe trust paths.
     echo "[vz-init] Developer overlay CA trust installation failed"

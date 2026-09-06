@@ -300,6 +300,32 @@ pub struct MachineRuntimeEntry<R> {
 }
 
 impl<R> MachineRuntimeEntry<R> {
+    /// Durably bind a positive physical Stop result to this exact leased store.
+    /// Publication precedes the lifecycle acknowledgement. Existing evidence is
+    /// never replaced, including after an interrupted publication.
+    pub(crate) fn persist_stop_receipt(
+        &self,
+        receipt: &crate::machine_live_sessions::MachineSessionStopReceipt,
+    ) -> Result<(), MachineRuntimeRegistryError> {
+        self.validate_current()?;
+        if receipt.owner != *self.owner()
+            || receipt.generation == 0
+            || receipt.outcome != vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped
+        {
+            return Err(invalid("Stop receipt lacks exact positive Machine closure"));
+        }
+        receipt.runtime_identity.validate().map_err(invalid)?;
+        let operation = LifecycleOperationId::new(receipt.operation_id.clone()).map_err(invalid)?;
+        // Lifecycle evidence is mutable Machine-owned state, not part of the
+        // immutable linux-target artifact pin and its exact inventory.
+        let target = child_directory(self.lease.data_directory(), "linux-lifecycle", true)?;
+        let stops = child_directory(&target, "stops", true)?;
+        validate_stop_receipt_directories(self.lease.data_directory(), &target, &stops)?;
+        publish_delete_record(&stops, &format!("{operation}.json"), receipt)?;
+        validate_stop_receipt_directories(self.lease.data_directory(), &target, &stops)?;
+        self.validate_current()
+    }
+
     pub(crate) fn validate_current(&self) -> Result<(), MachineRuntimeRegistryError> {
         self.lease.validate_current()
     }
@@ -319,6 +345,21 @@ impl<R> MachineRuntimeEntry<R> {
     pub fn configuration_digest(&self) -> &str {
         self.lease.configuration_digest()
     }
+}
+
+fn validate_stop_receipt_directories(
+    data: &File,
+    target: &File,
+    stops: &File,
+) -> Result<(), MachineRuntimeRegistryError> {
+    let current_target = child_directory(data, "linux-lifecycle", false)?;
+    let current_stops = child_directory(&current_target, "stops", false)?;
+    if !same_file(target, &current_target)? || !same_file(stops, &current_stops)? {
+        return Err(invalid(
+            "Stop evidence directory was replaced; closure publication is uncertain",
+        ));
+    }
+    Ok(())
 }
 
 /// A daemon-owned registry, separate from the legacy global runtime manager.
@@ -1551,6 +1592,92 @@ mod tests {
         assert!(
             matches!(result, Err(MachineRuntimeRegistryError::Conflict(_))),
             "expected ownership conflict"
+        );
+    }
+
+    fn stop_receipt() -> crate::machine_live_sessions::MachineSessionStopReceipt {
+        crate::machine_live_sessions::MachineSessionStopReceipt {
+            owner: owner(),
+            operation_id: LifecycleOperationId::generate().to_string(),
+            generation: 1,
+            runtime_identity: vz_runtime_contract::StackRuntimeIdentity::new("vm-stop-proof")
+                .unwrap(),
+            endpoint: None,
+            docker_shutdown: None,
+            outcome: vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped,
+        }
+    }
+
+    #[test]
+    fn stop_receipt_is_exact_private_and_never_overwritten() {
+        let temp = TempDir::new().unwrap();
+        let registry = registry(temp.path());
+        let entry = admit(
+            &registry,
+            DIGEST_A,
+            MachineRuntimeAdmission::CreateOrOpen,
+            1,
+        )
+        .unwrap();
+        let receipt = stop_receipt();
+        entry.persist_stop_receipt(&receipt).unwrap();
+        let path = entry
+            .data_path()
+            .join("linux-lifecycle/stops")
+            .join(format!("{}.json", receipt.operation_id));
+        let original = fs::read(&path).unwrap();
+        assert_eq!(original, serde_json::to_vec(&receipt).unwrap());
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        assert!(entry.persist_stop_receipt(&receipt).is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[test]
+    fn stop_receipt_rejects_foreign_absent_and_symlinked_evidence() {
+        let temp = TempDir::new().unwrap();
+        let registry = registry(temp.path());
+        let entry = admit(
+            &registry,
+            DIGEST_A,
+            MachineRuntimeAdmission::CreateOrOpen,
+            1,
+        )
+        .unwrap();
+        let mut receipt = stop_receipt();
+        receipt.owner.machine_id = Some(MachineId::generate());
+        assert!(entry.persist_stop_receipt(&receipt).is_err());
+        receipt.owner = owner();
+        receipt.outcome = vz_runtime_contract::StackRuntimeShutdownOutcome::AlreadyAbsent;
+        assert!(entry.persist_stop_receipt(&receipt).is_err());
+        assert!(!entry.data_path().join("linux-lifecycle").exists());
+        receipt.outcome = vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped;
+        let decoy = TempDir::new().unwrap();
+        symlink(decoy.path(), entry.data_path().join("linux-lifecycle")).unwrap();
+        assert!(entry.persist_stop_receipt(&receipt).is_err());
+        assert_eq!(fs::read_dir(decoy.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn stop_receipt_directory_replacement_is_not_publication_proof() {
+        let temp = TempDir::new().unwrap();
+        let registry = registry(temp.path());
+        let lease = acquire(
+            &registry,
+            Some(DIGEST_A),
+            MachineRuntimeAdmission::CreateOrOpen,
+        )
+        .unwrap();
+        let target = child_directory(lease.data_directory(), "linux-lifecycle", true).unwrap();
+        let stops = child_directory(&target, "stops", true).unwrap();
+        validate_stop_receipt_directories(lease.data_directory(), &target, &stops).unwrap();
+        let path = lease.data_path().join("linux-lifecycle");
+        fs::rename(path.join("stops"), path.join("retained-stops")).unwrap();
+        child_directory(&target, "stops", true).unwrap();
+        assert!(
+            validate_stop_receipt_directories(lease.data_directory(), &target, &stops).is_err()
         );
     }
 

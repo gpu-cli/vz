@@ -390,8 +390,9 @@ def validate_live_sessions(value, machines):
             and value["public_stop"] is False, "live-session cleanup or unsupported claim")
     require(type(value["receipts"]) is list and len(value["receipts"]) == 3, "missing live-session receipts")
     operations = set()
+    filesystems = set()
     for name, receipt in zip(["developer_a", "developer_b", "hardened"], value["receipts"]):
-        keys(receipt, ["owner", "operation_id", "generation", "runtime_identity", "endpoint", "outcome"])
+        keys(receipt, ["owner", "operation_id", "generation", "runtime_identity", "endpoint", "outcome", "docker_shutdown"])
         require(receipt["owner"] == machines[name]["owner"]
                 and receipt["runtime_identity"] == machines[name]["first_identity"], "wrong live-session identity")
         require(receipt["outcome"] == "stopped", "live-session physical stop was not proven")
@@ -400,9 +401,13 @@ def validate_live_sessions(value, machines):
                 "wrong live-session Stop operation generation")
         operations.add(receipt["operation_id"])
         if name == "hardened":
-            require(receipt["endpoint"] is None, "Hardened session acquired an endpoint")
+            require(receipt["endpoint"] is None and receipt["docker_shutdown"] is None,
+                    "Hardened session acquired a Docker endpoint or shutdown authority")
         else:
             validate_endpoint_shutdown(receipt["endpoint"])
+            filesystem = validate_docker_shutdown(receipt["docker_shutdown"], receipt["operation_id"])
+            require(filesystem not in filesystems, "independent Developer Machines share filesystem identity")
+            filesystems.add(filesystem)
     require(len(operations) == 1, "session receipts belong to different Stop operations")
     commands = value["commands"]
     keys(commands, ["before_a", "before_b", "stopped_a", "surviving_b"])
@@ -434,6 +439,33 @@ def validate_live_sessions(value, machines):
     require(endpoints["a"] != endpoints["b"] and endpoints["a"].parent == endpoints["b"].parent,
             "session endpoints alias or escape one root")
     require(engines["before_a"] != engines["before_b"] == engines["surviving_b"], "sibling Engine replaced or aliased")
+
+
+def validate_docker_shutdown(receipt, operation_id):
+    """The started Developer guests must close their own journaled data disk.
+
+    A never-started receipt, daemon absence, clean-looking state without journal
+    closure, or another operation's completion cannot authorize physical Stop.
+    """
+    keys(receipt, ["request_id", "data_device", "data_mount", "supervisor_started", "dockerd_reaped",
+                   "containerd_reaped", "filesystem_synced", "filesystem_unmounted", "never_started_unmounted",
+                   "filesystem_uuid", "filesystem_features", "filesystem_state"])
+    require(receipt["request_id"] == operation_id and receipt["data_device"] == "/dev/vda" and
+            receipt["data_mount"] == "/var/lib/docker", "Docker closure request/device/mount differs")
+    require(all(receipt[field] is True for field in ["supervisor_started", "dockerd_reaped", "containerd_reaped",
+                                                    "filesystem_synced", "filesystem_unmounted"]) and
+            receipt["never_started_unmounted"] is False, "started Docker process/filesystem closure is unproven")
+    filesystem = receipt["filesystem_uuid"]
+    require(type(filesystem) is str and
+            re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", filesystem) and
+            filesystem != "00000000-0000-0000-0000-000000000000", "invalid closed Docker filesystem identity")
+    features = receipt["filesystem_features"]
+    require(type(features) is list and 2 <= len(features) <= 128 and
+            all(type(feature) is str and re.fullmatch(r"[a-z0-9_]+", feature) for feature in features) and
+            len(set(features)) == len(features) and {"has_journal", "extent"} <= set(features) and
+            "needs_recovery" not in features and receipt["filesystem_state"] == "clean",
+            "Docker filesystem lacks clean journaled ext4 closure")
+    return filesystem
 
 
 def validate_endpoint_shutdown(receipt):

@@ -18,7 +18,7 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 8;
+pub const AGENT_PROTOCOL_REVISION: u32 = 9;
 
 #[cfg(test)]
 mod tests {

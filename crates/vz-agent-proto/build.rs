@@ -22,6 +22,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     std::fs::create_dir_all(out_dir)?;
 
     tonic_build::configure()
+        .type_attribute(
+            "vz.agent.v1.DockerShutdownComplete",
+            "#[derive(serde::Serialize, serde::Deserialize)]\n#[serde(deny_unknown_fields)]",
+        )
         .build_server(true)
         .build_client(true)
         .out_dir(out_dir)

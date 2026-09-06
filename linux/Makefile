@@ -86,8 +86,13 @@ IPTABLES_READELF ?= readelf
 IPTABLES_CPPFLAGS ?= -idirafter /usr/include/$(shell $(IPTABLES_CC) -dumpmachine) -idirafter /usr/include
 endif
 
+E2FSPROGS_VERSION := 1.47.3
+E2FSPROGS_ARCHIVE := $(CACHE_DIR)/e2fsprogs-$(E2FSPROGS_VERSION).tar.xz
+E2FSPROGS_URL := https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/v$(E2FSPROGS_VERSION)/e2fsprogs-$(E2FSPROGS_VERSION).tar.xz
+E2FSPROGS_HELPER := $(ROOT_DIR)/e2fsprogs-build.py
+
 ifeq ($(KERNEL_PROFILE),developer)
-INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY) $(CA_TRUST_HELPER) \
+INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY) e2fsprogs $(CA_TRUST_HELPER) \
 	$(CA_TRUST_SOURCE)/inputs.json $(CA_TRUST_SOURCE)/cacert.pem \
 	$(CA_TRUST_SOURCE)/LICENSE $(CA_TRUST_SOURCE)/install.sh
 IPTABLES_VERSION_JSON := "$(IPTABLES_VERSION)"
@@ -214,6 +219,14 @@ $(YOUKI_BINARY): youki-verify | dirs
 
 youki: $(YOUKI_BINARY)
 
+$(E2FSPROGS_ARCHIVE): | dirs
+	curl -fL "$(E2FSPROGS_URL)" -o "$@"
+
+.PHONY: e2fsprogs
+e2fsprogs: $(E2FSPROGS_ARCHIVE) $(E2FSPROGS_HELPER) | dirs
+	@test "$(KERNEL_PROFILE)" = developer || { echo 'ext4 Docker tooling belongs only to Developer bundles' >&2; exit 1; }
+	python3 "$(E2FSPROGS_HELPER)" --archive "$(E2FSPROGS_ARCHIVE)" --out-dir "$(OUT_DIR)/e2fsprogs" --jobs "$(JOBS)"
+
 $(IPTABLES_ARCHIVE): | dirs
 	@echo "Downloading pinned iptables $(IPTABLES_VERSION) source"
 	curl -fL "$(IPTABLES_URL)" -o "$@"
@@ -311,6 +324,9 @@ $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) $(INITRAMFS_PROFILE_INPUTS) guest-agent $(
 
 ifeq ($(KERNEL_PROFILE),developer)
 	python3 "$(CA_TRUST_HELPER)" --source "$(CA_TRUST_SOURCE)" --install-root "$(INITRAMFS_ROOT)"
+	cp "$(OUT_DIR)/e2fsprogs/mke2fs" "$(INITRAMFS_ROOT)/sbin/mke2fs"
+	cp "$(OUT_DIR)/e2fsprogs/dumpe2fs" "$(INITRAMFS_ROOT)/sbin/dumpe2fs"
+	cp "$(OUT_DIR)/e2fsprogs/e2fsprogs.build.json" "$(INITRAMFS_ROOT)/etc/vz-e2fsprogs.json"
 	cp "$(IPTABLES_BINARY)" "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	chmod +x "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	for cmd in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \

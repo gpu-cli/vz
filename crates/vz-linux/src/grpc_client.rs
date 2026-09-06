@@ -565,6 +565,19 @@ impl GrpcAgentClient {
         Ok(response.into_inner())
     }
 
+    /// Stream ordered shutdown and persistent-filesystem closure for the exact
+    /// request. A missing terminal receipt is not permission to power-stop.
+    pub async fn shutdown_docker_stream(
+        &mut self,
+        request_id: String,
+    ) -> Result<tonic::Streaming<vz_agent_proto::DockerShutdownEvent>, LinuxError> {
+        Ok(self
+            .agent
+            .shutdown_docker(vz_agent_proto::DockerShutdownRequest { request_id })
+            .await?
+            .into_inner())
+    }
+
     /// Explicitly trigger lazy Docker facade supervision and stream startup progress.
     ///
     /// This hook is intentionally separate from all native OCI calls. The host
@@ -1253,6 +1266,37 @@ impl ExecStreamReadError {
     }
 }
 
+#[derive(Default)]
+struct CheckedExecCollection {
+    stdout: Vec<u8>,
+    stderr: Vec<u8>,
+}
+
+impl CheckedExecCollection {
+    fn accept(
+        &mut self,
+        event: Result<Option<vz::protocol::ExecEvent>, LinuxError>,
+    ) -> Result<Option<ExecOutput>, LinuxError> {
+        match event? {
+            Some(vz::protocol::ExecEvent::Stdout(data)) => self.stdout.extend(data),
+            Some(vz::protocol::ExecEvent::Stderr(data)) => self.stderr.extend(data),
+            Some(vz::protocol::ExecEvent::Exit(exit_code)) => {
+                return Ok(Some(ExecOutput {
+                    exit_code,
+                    stdout: String::from_utf8_lossy(&self.stdout).into_owned(),
+                    stderr: String::from_utf8_lossy(&self.stderr).into_owned(),
+                }));
+            }
+            None => {
+                return Err(LinuxError::Protocol(
+                    "exec stream ended without a guest-reported exit code".to_string(),
+                ));
+            }
+        }
+        Ok(None)
+    }
+}
+
 fn require_machine_ready(event: &vz_agent_proto::ExecEvent) -> Result<(), LinuxError> {
     if event.exec_id == 0
         || event.sequence != 1
@@ -1541,6 +1585,9 @@ impl GrpcExecStream {
     }
 
     /// Collect all remaining events into an [`ExecOutput`].
+    ///
+    /// This legacy adapter loses protocol/transport diagnostics. Runtime
+    /// decisions must use [`Self::collect_checked`] instead.
     pub async fn collect(mut self) -> ExecOutput {
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
@@ -1558,6 +1605,17 @@ impl GrpcExecStream {
             exit_code,
             stdout: String::from_utf8_lossy(&stdout).into_owned(),
             stderr: String::from_utf8_lossy(&stderr).into_owned(),
+        }
+    }
+
+    /// Collect a genuine guest terminal result without replacing spawn,
+    /// protocol, transport, or truncated-stream failures with exit code -1.
+    pub async fn collect_checked(mut self) -> Result<ExecOutput, LinuxError> {
+        let mut collected = CheckedExecCollection::default();
+        loop {
+            if let Some(output) = collected.accept(self.next_checked().await)? {
+                return Ok(output);
+            }
         }
     }
 }
@@ -2143,6 +2201,63 @@ mod tests {
         assert!(hook.contains("expected != command"));
         assert!(hook.contains("VZ_TEST_DROP_CONTAINER_EXEC_RESPONSE_DWELL_MS"));
         assert!(hook.find("expected != command") < hook.find("INJECTED.swap"));
+    }
+
+    #[test]
+    fn checked_collection_preserves_spawn_and_transport_errors_without_synthetic_exit() {
+        let mut collection = CheckedExecCollection::default();
+        let rejected = vz_agent_proto::ExecEvent {
+            event: Some(exec_event::Event::Error("exec rejected before spawn: failed to spawn process: No such file or directory (os error 2)".into())),
+            sequence: 1,
+            request_id: "req_1".into(),
+            exec_id: 0,
+        };
+        let decoded = decode_exec_stream_event(&mut 0, &mut Some("req_1".into()), None, rejected);
+        let error = collection.accept(decoded).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("No such file or directory (os error 2)")
+        );
+        let error = collection
+            .accept(Err(
+                tonic::Status::unavailable("exact transport reset").into()
+            ))
+            .unwrap_err();
+        assert!(error.to_string().contains("exact transport reset"));
+    }
+
+    #[test]
+    fn checked_collection_requires_exit_after_output_and_preserves_real_nonzero_status() {
+        use vz::protocol::ExecEvent;
+        let mut collection = CheckedExecCollection::default();
+        assert!(
+            collection
+                .accept(Ok(None))
+                .unwrap_err()
+                .to_string()
+                .contains("without a guest-reported exit")
+        );
+        assert!(
+            collection
+                .accept(Ok(Some(ExecEvent::Stdout(b"partial".to_vec()))))
+                .unwrap()
+                .is_none()
+        );
+        assert!(collection.accept(Ok(None)).is_err());
+        assert!(
+            collection
+                .accept(Ok(Some(ExecEvent::Stderr(b"stderr".to_vec()))))
+                .unwrap()
+                .is_none()
+        );
+        let result = collection
+            .accept(Ok(Some(ExecEvent::Exit(17))))
+            .unwrap()
+            .unwrap();
+        assert_eq!(result.exit_code, 17);
+        assert_eq!(result.stdout, "partial");
+        assert_eq!(result.stderr, "stderr");
     }
 
     #[test]

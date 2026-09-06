@@ -34,6 +34,7 @@ impl Drop for DockerForwardStream {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn start<S, T>(inbound: S, target: T) -> DockerForwardStream
 where
     S: Stream<Item = Result<DockerForwardFrame, Status>> + Send + Unpin + 'static,
@@ -45,6 +46,38 @@ where
             () = sender.closed() => return,
             result = relay(inbound, target, &sender) => result,
         };
+        if let Err(error) = result {
+            let _ = sender.send(Err(error)).await;
+        }
+    });
+    DockerForwardStream { receiver, task }
+}
+
+/// A Machine shutdown cancels each relay and waits for its ownership permit to
+/// drop before daemon shutdown. The cancellation cannot leave a borrowed half.
+pub(crate) fn start_owned<S>(
+    inbound: S,
+    target: (
+        tokio::net::UnixStream,
+        tokio::sync::OwnedRwLockReadGuard<()>,
+        tokio::sync::watch::Receiver<bool>,
+    ),
+) -> DockerForwardStream
+where
+    S: Stream<Item = Result<DockerForwardFrame, Status>> + Send + Unpin + 'static,
+{
+    let (stream, permit, mut shutdown) = target;
+    let (sender, receiver) = mpsc::channel(8);
+    let task = tokio::spawn(async move {
+        let result = tokio::select! {
+            () = sender.closed() => return,
+            _ = shutdown.wait_for(|value| *value) => return,
+            result = relay(inbound, stream, &sender) => result,
+        };
+        // relay owns both socket halves; once it returns they are gone. A
+        // non-reading response observer must not retain a data-plane permit
+        // while the final diagnostic waits behind its full response queue.
+        drop(permit);
         if let Err(error) = result {
             let _ = sender.send(Err(error)).await;
         }
@@ -138,6 +171,53 @@ mod tests {
 
     fn packet(frame: Frame) -> Result<DockerForwardFrame, Status> {
         Ok(DockerForwardFrame { frame: Some(frame) })
+    }
+
+    #[tokio::test]
+    async fn machine_shutdown_closes_forward_and_releases_ownership_permit() {
+        let (stream, mut target) = tokio::net::UnixStream::pair().unwrap();
+        let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+        let permit = std::sync::Arc::clone(&gate).read_owned().await;
+        let (shutdown, receiver) = tokio::sync::watch::channel(false);
+        let mut response = start_owned(tokio_stream::pending(), (stream, permit, receiver));
+        response.next().await.unwrap().unwrap();
+        assert!(gate.try_write().is_err());
+        shutdown.send_replace(true);
+        let _exclusive = tokio::time::timeout(Duration::from_secs(1), gate.write())
+            .await
+            .unwrap();
+        assert_eq!(target.read(&mut [0; 1]).await.unwrap(), 0);
+        assert!(response.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn full_error_queue_cannot_retain_forwarding_ownership() {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let (stream, mut target) = tokio::net::UnixStream::pair().unwrap();
+            let gate = std::sync::Arc::new(tokio::sync::RwLock::new(()));
+            let permit = std::sync::Arc::clone(&gate).read_owned().await;
+            let (_shutdown, receiver) = tokio::sync::watch::channel(false);
+            let (inbound, requests) = mpsc::channel(1);
+            let mut response =
+                start_owned(ReceiverStream::new(requests), (stream, permit, receiver));
+            response.next().await.unwrap().unwrap();
+            let writer = tokio::spawn(async move {
+                let _ = target.write_all(&vec![1; 2 * 1024 * 1024]).await;
+            });
+            while response.receiver.len() != 8 {
+                tokio::task::yield_now().await;
+            }
+            inbound
+                .send(Ok(DockerForwardFrame { frame: None }))
+                .await
+                .unwrap();
+            let _exclusive = gate.write().await;
+            assert_eq!(response.receiver.len(), 8);
+            drop(response);
+            writer.await.unwrap();
+        })
+        .await
+        .unwrap();
     }
 
     struct FailingTarget;

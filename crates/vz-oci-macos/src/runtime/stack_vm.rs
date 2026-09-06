@@ -32,7 +32,7 @@ impl GuestDiskPhase {
     pub(super) const fn timeout(self) -> Duration {
         match self {
             Self::Probe => Duration::from_secs(30),
-            // BusyBox mke2fs eagerly initializes metadata on the 64 GiB
+            // The pinned ext4 formatter eagerly initializes metadata on the 64 GiB
             // private disk. That write workload needs a separate bounded
             // budget from read-only blkid, especially under host I/O load.
             // The outer Up supervisor/fence retains unresolved boot uncertainty;
@@ -223,7 +223,7 @@ pub(super) fn classify_guest_disk_probe(
     allow_unformatted: bool,
 ) -> Result<GuestDiskProbe, String> {
     let output = stdout.trim();
-    if allow_unformatted && output.is_empty() && stderr.trim().is_empty() {
+    if allow_unformatted && exit_code == 0 && output.is_empty() && stderr.trim().is_empty() {
         return Ok(GuestDiskProbe::Unformatted);
     }
     if exit_code == 0
@@ -237,6 +237,146 @@ pub(super) fn classify_guest_disk_probe(
         "refusing to format an existing or unrecognized disk: exit_code={exit_code}, stdout={output:?}, stderr={:?}",
         stderr.trim()
     ))
+}
+
+/// Docker disks must be journaled ext4 and positively clean before admission.
+/// This reads metadata only: incompatible or damaged disks are never repaired,
+/// reformatted, or accepted merely because the ext4 driver can mount ext2.
+fn validate_docker_filesystem_header(header: &str) -> Result<(), String> {
+    let field = |name: &str| -> Result<&str, String> {
+        let mut values = header.lines().filter_map(|line| {
+            line.split_once(':')
+                .filter(|(key, _)| *key == name)
+                .map(|(_, value)| value.trim())
+        });
+        let value = values.next().ok_or_else(|| format!("missing {name}"))?;
+        if value.is_empty() || values.next().is_some() {
+            return Err(format!("empty or duplicate {name}"));
+        }
+        Ok(value)
+    };
+    let uuid = field("Filesystem UUID")?;
+    if uuid.len() != 36
+        || !uuid.chars().enumerate().all(|(index, value)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                value == '-'
+            } else {
+                value.is_ascii_hexdigit()
+            }
+        })
+        || uuid == "00000000-0000-0000-0000-000000000000"
+    {
+        return Err("missing or malformed filesystem UUID".to_string());
+    }
+    let features: Vec<_> = field("Filesystem features")?.split_whitespace().collect();
+    if !features.contains(&"has_journal") || !features.contains(&"extent") {
+        return Err("Docker data requires ext4 with has_journal and extent".to_string());
+    }
+    if features.contains(&"needs_recovery") || field("Filesystem state")? != "clean" {
+        return Err(
+            "Docker filesystem is not positively clean; automatic repair is forbidden".to_string(),
+        );
+    }
+    if header
+        .lines()
+        .any(|line| line.starts_with("FS Error count:"))
+        && field("FS Error count")? != "0"
+    {
+        return Err(
+            "Docker filesystem has recorded errors; automatic repair is forbidden".to_string(),
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod docker_filesystem_tests {
+    use super::{
+        classify_guest_disk_probe, require_complete_shared_vm_boot,
+        validate_docker_filesystem_header,
+    };
+
+    #[test]
+    fn incomplete_boot_is_owned_but_cannot_be_reused_or_power_stopped() {
+        assert!(require_complete_shared_vm_boot("exact-machine", true).is_ok());
+        let error = require_complete_shared_vm_boot("exact-machine", false).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("exact guest exec reconciliation")
+        );
+        assert!(error.to_string().contains("exact-machine"));
+    }
+
+    #[test]
+    fn bootstrap_publishes_ownership_before_start_and_never_power_stops_on_error() {
+        let source = include_str!("stack_vm.rs");
+        let boot = source
+            .rsplit_once("async fn boot_shared_vm_locked(")
+            .unwrap()
+            .1
+            .split_once("/// Create and start an OCI container")
+            .unwrap()
+            .0;
+        let published = boot.find("self.stack_vms.lock().await.insert(").unwrap();
+        let started = boot.find("vm.start().await?").unwrap();
+        assert!(published < started);
+        assert!(!boot.contains("vm.stop()"));
+        assert!(boot.contains("boot_complete: false"));
+        assert!(boot.contains("record.boot_complete = true"));
+    }
+
+    const CLEAN: &str = "Filesystem UUID: 8b0fa999-c711-4717-af6a-bddfeacdeeee\nFilesystem features: has_journal ext_attr dir_index filetype extent 64bit metadata_csum\nFilesystem state: clean\n";
+
+    #[test]
+    fn accepts_clean_journaled_ext4_header() {
+        assert!(validate_docker_filesystem_header(CLEAN).is_ok());
+        assert!(validate_docker_filesystem_header(&format!("{CLEAN}FS Error count: 0\n")).is_ok());
+    }
+
+    #[test]
+    fn rejects_legacy_dirty_or_corrupt_filesystems_without_repair() {
+        for header in [
+            CLEAN.replace("has_journal ", ""),
+            CLEAN.replace("extent ", ""),
+            CLEAN.replace("clean", "not clean"),
+            CLEAN.replace("clean", "clean with errors"),
+            CLEAN.replace("has_journal", "has_journal needs_recovery"),
+            format!("{CLEAN}FS Error count: 7\n"),
+        ] {
+            assert!(
+                validate_docker_filesystem_header(&header).is_err(),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_missing_duplicated_or_malformed_filesystem_proof() {
+        for header in [
+            String::new(),
+            CLEAN.replace("Filesystem UUID:", "Other UUID:"),
+            CLEAN.replace("8b0fa999-c711-4717-af6a-bddfeacdeeee", "<none>"),
+            CLEAN.replace(
+                "8b0fa999-c711-4717-af6a-bddfeacdeeee",
+                "00000000-0000-0000-0000-000000000000",
+            ),
+            format!("{CLEAN}Filesystem state: clean\n"),
+            format!("{CLEAN}Filesystem features: has_journal extent\n"),
+            format!("{CLEAN}FS Error count: 0\nFS Error count: 0\n"),
+        ] {
+            assert!(
+                validate_docker_filesystem_header(&header).is_err(),
+                "{header}"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_empty_probe_is_not_format_authority() {
+        assert!(classify_guest_disk_probe(2, "", "", true).is_err());
+        assert!(classify_guest_disk_probe(-1, "", "", true).is_err());
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -669,6 +809,9 @@ impl Runtime {
         stack_id: &str,
         operation: &str,
     ) -> Result<(), OciError> {
+        if let Some(record) = self.stack_vms.lock().await.get(stack_id) {
+            require_complete_shared_vm_boot(stack_id, record.boot_complete)?;
+        }
         let stack_container_ids = self
             .container_stack
             .lock()
@@ -938,6 +1081,15 @@ impl SharedVmLifecycleLease {
     }
 }
 
+fn require_complete_shared_vm_boot(stack_id: &str, complete: bool) -> Result<(), OciError> {
+    if !complete {
+        return Err(OciError::InvalidConfig(format!(
+            "shared VM '{stack_id}' has an incomplete owned bootstrap; exact guest exec reconciliation is required before reuse, filesystem closure, or power stop"
+        )));
+    }
+    Ok(())
+}
+
 fn diagnostic_file_component(value: &str) -> String {
     value
         .chars()
@@ -1026,6 +1178,7 @@ impl Runtime {
         device: &str,
         purpose: &str,
         allow_unformatted: bool,
+        docker_data: bool,
     ) -> Result<(), OciError> {
         let phase = GuestDiskPhase::Probe;
         let started = std::time::Instant::now();
@@ -1066,7 +1219,17 @@ impl Runtime {
             &inspection.stderr,
             allow_unformatted,
         ) {
-            Ok(GuestDiskProbe::ExtFilesystem) => return Ok(()),
+            Ok(GuestDiskProbe::ExtFilesystem) => {
+                if docker_data {
+                    if !inspection.stdout.contains("TYPE=\"ext4\"") {
+                        return Err(OciError::InvalidConfig(
+                            "Docker data requires journaled ext4; existing ext2/ext3 disks are preserved, never reformatted".to_string(),
+                        ));
+                    }
+                    Self::verify_guest_docker_filesystem(vm, device).await?;
+                }
+                return Ok(());
+            }
             Ok(GuestDiskProbe::Unformatted) => {}
             Err(reason) => {
                 return Err(guest_disk_phase_error(
@@ -1088,10 +1251,27 @@ impl Runtime {
             budget_seconds = phase.timeout().as_secs(),
             "guest disk phase started"
         );
+        let (formatter, arguments) = if docker_data {
+            (
+                "/sbin/mke2fs",
+                vec![
+                    "-t",
+                    "ext4",
+                    "-F",
+                    "-O",
+                    "has_journal,extent,64bit,metadata_csum",
+                    "-E",
+                    "lazy_itable_init=0,lazy_journal_init=0",
+                    device,
+                ],
+            )
+        } else {
+            ("/bin/busybox", vec!["mke2fs", "-F", device])
+        };
         let output = vm
             .exec_collect(
-                "/bin/busybox".to_string(),
-                vec!["mke2fs".to_string(), "-F".to_string(), device.to_string()],
+                formatter.to_string(),
+                arguments.into_iter().map(str::to_string).collect(),
                 phase.timeout(),
             )
             .await
@@ -1124,6 +1304,34 @@ impl Runtime {
                 ),
             ));
         }
+        if docker_data {
+            // Do not consume the host's exact format intent based on formatter
+            // exit alone. The actual on-disk journal and clean state are proof.
+            Self::verify_guest_docker_filesystem(vm, device).await?;
+        }
+        Ok(())
+    }
+
+    async fn verify_guest_docker_filesystem(vm: &LinuxVm, device: &str) -> Result<(), OciError> {
+        let header = vm
+            .exec_collect(
+                "/sbin/dumpe2fs".to_string(),
+                vec!["-h".to_string(), device.to_string()],
+                GuestDiskPhase::Probe.timeout(),
+            )
+            .await?;
+        if header.exit_code != 0 {
+            return Err(OciError::InvalidConfig(format!(
+                "Docker filesystem header probe failed for {device}: exit {}: {}{}",
+                header.exit_code, header.stdout, header.stderr
+            )));
+        }
+        validate_docker_filesystem_header(&header.stdout).map_err(|reason| {
+            OciError::InvalidConfig(format!(
+                "Docker filesystem admission refused for {device}: {reason}"
+            ))
+        })?;
+        tracing::info!(device, filesystem_header = %header.stdout, "journaled Docker filesystem admitted");
         Ok(())
     }
 
@@ -1222,6 +1430,7 @@ esac
         record: &super::StackVmRecord,
         operation: &str,
     ) -> Result<SharedVmDockerReadiness, OciError> {
+        require_complete_shared_vm_boot(&record.identity.stack_id, record.boot_complete)?;
         let verified_profile = require_docker_provisioned_developer_profile(
             record.verified_linux_profile,
             record.docker_provisioned,
@@ -1459,38 +1668,44 @@ esac
             vm_config.network = Some(NetworkConfig::None);
         }
 
-        let vm = LinuxVm::create(vm_config).await?;
+        let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
+            .map_err(OciError::InvalidConfig)?;
+        let vm = Arc::new(LinuxVm::create(vm_config).await?);
+        // Register ownership before the first start or guest-side effect. A
+        // failed/cancelled exec may still be formatting or mounting the disk;
+        // neither an RPC error nor a bootstrap shell trap proves it quiescent.
+        self.stack_vms.lock().await.insert(
+            stack_id.to_string(),
+            super::StackVmRecord {
+                identity: runtime_identity,
+                verified_linux_profile,
+                docker_provisioned: docker_provisioning.is_some(),
+                boot_complete: false,
+                docker_shutdown: Arc::new(Mutex::new(None)),
+                boot_ports: ports.clone(),
+                boot_resources: resources.clone(),
+                vm: Arc::clone(&vm),
+            },
+        );
         vm.start().await?;
 
-        if let Err(err) = vm.wait_for_agent(self.config.agent_ready_timeout).await {
-            let _ = vm.stop().await;
-            return Err(err.into());
-        }
+        vm.wait_for_agent(self.config.agent_ready_timeout).await?;
 
         if let Some((_, data_disk_path, disposition)) = &docker_provisioning {
-            if let Err(error) = Self::ensure_guest_ext4_disk(
+            Self::ensure_guest_ext4_disk(
                 &vm,
                 DOCKER_DATA_DEVICE,
                 "private Docker data",
                 *disposition == PrivateDiskDisposition::FormatAuthorized,
+                true,
             )
-            .await
-            {
-                let _ = vm.stop().await;
-                return Err(error);
-            }
-            if let Err(error) = complete_private_disk_format(
+            .await?;
+            complete_private_disk_format(
                 data_disk_path,
                 DOCKER_DATA_DISK_SIZE_BYTES,
                 *disposition,
-            ) {
-                let _ = vm.stop().await;
-                return Err(error);
-            }
-            if let Err(error) = Self::bootstrap_guest_docker_disk(&vm).await {
-                let _ = vm.stop().await;
-                return Err(error);
-            }
+            )?;
+            Self::bootstrap_guest_docker_disk(&vm).await?;
         }
 
         // Format and mount the persistent named-volume disk if attached.
@@ -1502,13 +1717,14 @@ esac
                 NAMED_VOLUME_DEVICE_WITHOUT_DOCKER
             };
 
-            if let Err(error) =
-                Self::ensure_guest_ext4_disk(&vm, volume_device, "persistent named-volume", true)
-                    .await
-            {
-                let _ = vm.stop().await;
-                return Err(error);
-            }
+            Self::ensure_guest_ext4_disk(
+                &vm,
+                volume_device,
+                "persistent named-volume",
+                true,
+                false,
+            )
+            .await?;
 
             // Mount the formatted disk.
             let mount_result = vm
@@ -1526,14 +1742,12 @@ esac
                 .await;
             match &mount_result {
                 Ok(output) if output.exit_code != 0 => {
-                    let _ = vm.stop().await;
                     return Err(OciError::InvalidConfig(format!(
                         "failed to mount persistent volume disk: {}{}",
                         output.stdout, output.stderr
                     )));
                 }
                 Err(err) => {
-                    let _ = vm.stop().await;
                     return Err(OciError::InvalidConfig(format!(
                         "failed to mount persistent volume disk: {err}"
                     )));
@@ -1543,8 +1757,6 @@ esac
                 }
             }
         }
-
-        let vm = Arc::new(vm);
 
         // Mount the setup-commits VirtioFS share inside the host VM so
         // create_container_in_stack can tar/untar setup state. Idempotent —
@@ -1577,13 +1789,7 @@ esac
         }
 
         // Set up port forwarding for all services' ports.
-        let port_forwarding = match start_port_forwarding(vm.inner_shared(), &ports).await {
-            Ok(pf) => pf,
-            Err(err) => {
-                let _ = vm.stop().await;
-                return Err(err);
-            }
-        };
+        let port_forwarding = start_port_forwarding(vm.inner_shared(), &ports).await?;
 
         if let Some(pf) = port_forwarding {
             self.stack_port_forwards
@@ -1592,19 +1798,13 @@ esac
                 .insert(stack_id.to_string(), pf);
         }
 
-        let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
-            .map_err(OciError::InvalidConfig)?;
-        self.stack_vms.lock().await.insert(
-            stack_id.to_string(),
-            super::StackVmRecord {
-                identity: runtime_identity,
-                verified_linux_profile,
-                docker_provisioned: docker_provisioning.is_some(),
-                boot_ports: ports,
-                boot_resources: resources,
-                vm,
-            },
-        );
+        let mut records = self.stack_vms.lock().await;
+        let record = records.get_mut(stack_id).ok_or_else(|| {
+            OciError::InvalidConfig(format!(
+                "shared VM ownership disappeared during bootstrap for '{stack_id}'"
+            ))
+        })?;
+        record.boot_complete = true;
 
         Ok(())
     }
@@ -1658,6 +1858,8 @@ esac
             None => stack_id.to_string(),
         };
         let stack_id = effective_stack_id.as_str();
+        self.ensure_stack_not_tearing_down(stack_id, "create a container in")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -2372,6 +2574,8 @@ esac
         transaction: &ContainerLifecycleTransaction,
     ) -> Result<(), OciError> {
         debug_assert_eq!(container_id, transaction.container_id());
+        self.ensure_stack_not_tearing_down(stack_id, "save setup state in")
+            .await?;
         let vm = self
             .stack_vms
             .lock()
@@ -2450,11 +2654,17 @@ esac
             .await
             .write_owned()
             .await;
-        self.shutdown_shared_vm_locked(stack_id).await
+        self.shutdown_shared_vm_locked(stack_id, stack_id)
+            .await
+            .map(|_| ())
     }
 
     /// Shut down a shared VM while the caller holds the stack lifecycle writer.
-    async fn shutdown_shared_vm_locked(&self, stack_id: &str) -> Result<(), OciError> {
+    async fn shutdown_shared_vm_locked(
+        &self,
+        stack_id: &str,
+        request_id: &str,
+    ) -> Result<Option<vz_linux::DockerShutdownComplete>, OciError> {
         let (stack_vms_count, stack_port_forwards_count) = {
             let vms = self.stack_vms.lock().await;
             let pfs = self.stack_port_forwards.lock().await;
@@ -2490,13 +2700,7 @@ esac
             }
         }
 
-        let Some(vm) = self
-            .stack_vms
-            .lock()
-            .await
-            .get(stack_id)
-            .map(|record| record.vm.clone())
-        else {
+        let Some(record) = self.stack_vms.lock().await.get(stack_id).cloned() else {
             // Bug B fix: in-memory state can be empty after a daemon
             // respawn (kill -9 / OS reboot mid-operation). In that case
             // the SQLite state-store may still claim the sandbox is
@@ -2519,8 +2723,10 @@ esac
             )
             .await;
             self.clear_stack_vm_stop_complete(stack_id);
-            return Ok(());
+            return Ok(None);
         };
+        require_complete_shared_vm_boot(stack_id, record.boot_complete)?;
+        let vm = Arc::clone(&record.vm);
 
         // Stop each container via OCI lifecycle, then tear down and verify its
         // generation-owned guest overlay before publishing host cleanup.
@@ -2624,6 +2830,33 @@ esac
             );
         }
 
+        // A Developer disk must be normally unmounted by its owning guest
+        // before VZ's hard power stop. Failure retains the VM and all ownership
+        // records; it is not permission to cut power or publish Stopped.
+        let docker_shutdown = if record.docker_provisioned {
+            let mut cached = record.docker_shutdown.lock().await;
+            if cached.is_none() {
+                *cached = Some(vm.shutdown_docker(request_id.to_string()).await?);
+            }
+            if cached
+                .as_ref()
+                .is_some_and(|receipt| receipt.request_id != request_id)
+            {
+                return Err(OciError::InvalidConfig(
+                    "Docker closure belongs to another shutdown operation; exact recovery required"
+                        .into(),
+                ));
+            }
+            cached.clone()
+        } else {
+            None
+        };
+        if !infrastructure_failures.is_empty() {
+            return Err(OciError::InvalidConfig(format!(
+                "shared VM shutdown retained stack '{stack_id}' after relay teardown failure: {}",
+                infrastructure_failures.join("; ")
+            )));
+        }
         if !self.stack_vm_stop_is_complete(stack_id) {
             match vm.stop().await {
                 Ok(()) => self.mark_stack_vm_stop_complete(stack_id),
@@ -2662,7 +2895,7 @@ esac
             stack_port_forwards_count_after,
             "[L4/stack-vm] shutdown_shared_vm complete"
         );
-        Ok(())
+        Ok(docker_shutdown)
     }
 
     /// Return the identity of the currently active shared-runtime boot.
@@ -2709,6 +2942,7 @@ esac
         let current = { self.stack_vms.lock().await.get(stack_id).cloned() };
         let record = match current {
             Some(record) => {
+                require_complete_shared_vm_boot(stack_id, record.boot_complete)?;
                 require_explicit_verified_profile(
                     Some(required_profile),
                     record.verified_linux_profile,
@@ -2778,6 +3012,23 @@ esac
         &self,
         request: &vz_runtime_contract::StackRuntimeShutdownRequest,
     ) -> Result<vz_runtime_contract::StackRuntimeShutdownOutcome, OciError> {
+        self.shutdown_shared_vm_with_receipt_exact(request)
+            .await
+            .map(|(outcome, _)| outcome)
+    }
+
+    /// Stop an exact boot and return its positive guest Docker disk closure.
+    /// An absent or replacement boot never manufactures a filesystem receipt.
+    pub async fn shutdown_shared_vm_with_receipt_exact(
+        &self,
+        request: &vz_runtime_contract::StackRuntimeShutdownRequest,
+    ) -> Result<
+        (
+            vz_runtime_contract::StackRuntimeShutdownOutcome,
+            Option<vz_linux::DockerShutdownComplete>,
+        ),
+        OciError,
+    > {
         request.validate().map_err(OciError::InvalidConfig)?;
         let expected = &request.expected;
         let stack_id = expected.stack_id.as_str();
@@ -2792,14 +3043,22 @@ esac
             expected,
         ) {
             vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped => {
-                self.shutdown_shared_vm_locked(stack_id).await?;
-                Ok(vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped)
+                let receipt = self
+                    .shutdown_shared_vm_locked(stack_id, &request.operation_id)
+                    .await?;
+                Ok((
+                    vz_runtime_contract::StackRuntimeShutdownOutcome::Stopped,
+                    receipt,
+                ))
             }
-            outcome => Ok(outcome),
+            outcome => Ok((outcome, None)),
         }
     }
 
-    /// Check whether a shared VM is running for the given stack.
+    /// Check whether a shared VM is owned for the given stack.
+    ///
+    /// This includes incomplete/failed bootstrap ownership and is not readiness
+    /// proof. Reuse and execution separately require a completed bootstrap.
     pub async fn has_shared_vm(&self, stack_id: &str) -> bool {
         self.stack_vms.lock().await.contains_key(stack_id)
     }

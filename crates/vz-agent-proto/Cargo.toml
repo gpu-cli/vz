@@ -8,6 +8,7 @@ repository.workspace = true
 description = "Protobuf/gRPC service definitions for the vz guest agent protocol."
 
 [dependencies]
+serde = { workspace = true }
 tonic = { workspace = true }
 prost = { workspace = true }
 

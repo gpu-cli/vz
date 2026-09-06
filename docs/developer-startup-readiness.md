@@ -71,10 +71,15 @@ fail-closed. See the [catalog recovery limitation](installed-machine-catalog.md)
 **Known durability defect (`vz-u0u`):** a later installed recovery candidate
 preserved Docker metadata across Stop/Up but could not restart its original
 container. Read-only inspection found corruption on the non-journaled Docker
-disk; the current Stop path powers off without Docker/filesystem drain. Do not
+disk; that candidate's Stop path powered off without Docker/filesystem drain. Do not
 treat successful Stop or Engine-ID persistence as proof of durable workload
 data. Both failed [recovery candidates](../scripts/helpers/installed_daemon_recovery_e2e.md)
-are retained; journaled formatting and positive durable shutdown remain required.
+are retained. A [DEV correction](docker-facade-artifacts.md#docker-persistence-correction-dev-vz-u0u)
+now implements journaled formatting and positive guest filesystem closure;
+the fresh installed recovery candidate 3 passes the four-Machine scenario,
+including original neighbor-container writable-layer and volume bytes after
+restart. Exact interrupted-operation recovery and the broader backend/release
+gates remain required before this defect can be considered fully resolved.
 
 The separate [installed startup harness](../scripts/helpers/installed_developer_startup.md)
 tests this path using signed staged product binaries and real local vz-managed
