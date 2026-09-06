@@ -358,3 +358,56 @@ missing-command contract is `executable file not found`; unrelated Docker wrappe
 and help formatting are not pinned. All 692 affected Docker/host/startup tests
 pass in `.artifacts/container-executable-errors-host-regression-1.log` (SHA-256
 `72c9e76d52269b07ecd1bfd8e6a5993b2d8f88573e81e7da67ae1c9ba260107c`).
+
+The rebuilt release-profile backend gate passed all 50 selected tests across
+seven lanes under `.artifacts/sandbox-vm-e2e/20260906T192121Z`; none failed or
+were ignored among the selected tests. Summary SHA-256:
+`435e09017d69d6ebf7242fb449975cede8d543654090d9eec605e6861bf70032`.
+Console `.artifacts/executable-errors-backend-1.console.log` SHA-256:
+`81921bbbc5e4a1ab3e9c003c5186bab4556636aa503a41f8335a3cac95e01eb1`.
+Its nine retained guest inputs total 85,560,956 bytes, with manifest SHA-256
+`f5220ec93ee0eed8c6612d1bcda1588737ba928e4bf1bf19345d68e106f2c335`.
+Both profiles contain the new runtime; these backend results do not establish
+installed lifecycle or aggregate release acceptance.
+
+## Candidate 5: installed three-Machine lifecycle workload passed
+
+Source `d432b3f1`, using the new runtime and retained backend bundles above,
+completed the installed local-Mac lifecycle slice with no test retries or cleanup
+errors. Each of three Machines completed its 222-command main ledger, separate
+stream observers and owned tmux session. Required exits 0, 37, 130, 143, 137,
+126 and 127 all passed. On each Machine, commands 145 and 148 are the real host
+Docker non-executable and missing-command results; the new exact canonical
+diagnostics, original rejection predicates and frozen fixture are preserved.
+
+The workload also covers health transitions, binary stdin/stdout/stderr and EOF,
+exec user/cwd/root/namespace checks, initial/resized TTY dimensions, attach,
+stop/restart/kill/wait, followed logs and create/start/die/destroy events.
+Each tmux pane reports 37, its server is reaped, and its owned socket is removed.
+Successful workload cleanup removes the owned containers and image tags while
+preserving unrelated IDs. The run reports four positive public Stops, graceful
+daemon shutdown and unchanged daily/isolated Docker defaults. Stopped Machine
+disks and contexts remain retained; this is not Delete certification.
+
+Evidence is `.artifacts/linux-docker-lifecycle-candidate-5`; manifest SHA-256
+`f79520c8ee3af436526bc4fdd24ca9ea7de798533b8b13ad7dc15f7ff19beb2f`.
+Independent integrity verification checks the exact 12,214 payloads totaling
+14,170,691 bytes. Four raw clean-journal Stop receipts match the original
+Machine owners and incarnations; host daemon PID 84369 is confirmed absent.
+Result SHA-256:
+`05abb34de632b397fda767d78aca53211f9423cf6f6a2dffd796ffd0f28999fc`.
+Console `.artifacts/linux-docker-lifecycle-candidate-5.console.log` SHA-256:
+`aebcf936f22ed5ffd2417e28f95809378cb6e9c75b8dda29a96d2d35104da1cc`.
+
+An independent no-dispatch replay matches all three retained workload/cleanup
+results exactly: 222 main commands and 135 source-selected steps per Machine
+(666 main commands total),
+including raw stream hashes, negative acknowledgements, tmux, external KILL and
+followed logs. The replay disables process dispatch and evidence writes; it does
+not reuse a live Machine or rerun a test.
+
+This is a passing DEV lifecycle slice, not full Docker or 0.4 certification.
+`full_process_absence_certified` remains false: guest process birth/namespace/
+cgroup absence and actual Engine-youki invocation receipts still need complete
+evidence. The separate kernel-exec error transport gap above and aggregate
+release integration also remain open. Earlier failed candidates remain failed.
