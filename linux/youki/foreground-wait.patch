@@ -1,0 +1,264 @@
+--- a/crates/youki/src/commands/run.rs
++++ b/crates/youki/src/commands/run.rs
+@@ -76,39 +76,30 @@
+         .thread_block()
+         .with_context(|| "failed to call pthread_sigmask")?;
+     loop {
++        // Init may have exited before signals were blocked. Its SIGCHLD can
++        // already be discarded while its waitable status remains. Always reap
++        // before sleeping; a later exit queues SIGCHLD under the blocked mask.
++        loop {
++            match waitpid(None, Some(WaitPidFlag::WNOHANG))? {
++                WaitStatus::Exited(pid, status) => {
++                    if pid.eq(&init_pid) {
++                        return Ok(status);
++                    }
++                }
++                WaitStatus::Signaled(pid, signal, _) => {
++                    if pid.eq(&init_pid) {
++                        return Ok(signal as i32);
++                    }
++                }
++                WaitStatus::StillAlive => break,
++                _ => {}
++            }
++        }
+         match signal_set
+             .wait()
+             .with_context(|| "failed to call sigwait")?
+         {
+-            signal::SIGCHLD => {
+-                // Reap all child until either container init process exits or
+-                // no more child to be reaped. Once the container init process
+-                // exits we can then return.
+-                tracing::trace!("reaping child processes");
+-                loop {
+-                    match waitpid(None, Some(WaitPidFlag::WNOHANG))? {
+-                        WaitStatus::Exited(pid, status) => {
+-                            if pid.eq(&init_pid) {
+-                                return Ok(status);
+-                            }
+-
+-                            // Else, some random child process exited, ignoring...
+-                        }
+-                        WaitStatus::Signaled(pid, signal, _) => {
+-                            if pid.eq(&init_pid) {
+-                                return Ok(signal as i32);
+-                            }
+-
+-                            // Else, some random child process exited, ignoring...
+-                        }
+-                        WaitStatus::StillAlive => {
+-                            // No more child to reap.
+-                            break;
+-                        }
+-                        _ => {}
+-                    }
+-                }
+-            }
++            signal::SIGCHLD => continue,
+             signal::SIGURG => {
+                 // In `runc`, SIGURG is used by go runtime and should not be forwarded to
+                 // the container process. Here, we just ignore the signal.
+@@ -230,8 +221,201 @@
+             }
+         };
+ 
++        Ok(())
++    }
++}
++
++#[cfg(test)]
++mod foreground_wait_tests {
++    use std::os::unix::process::CommandExt;
++    use std::process::{Command, Stdio};
++    use std::time::{Duration, Instant};
++
++    use nix::sys::signal::{SigHandler, Signal};
++    use nix::sys::wait::{Id, waitid};
++
++    use super::*;
++
++    const ENV: &str = "VZ_FOREGROUND_WAIT_CHILD";
++    const PREFIX: &str = "VZ_FOREGROUND_WAIT_PROBE=";
++
++    fn probe(case: &str, name: &str, code: i32) -> Result<()> {
++        if let Ok(selected) = std::env::var(ENV) {
++            anyhow::ensure!(selected == case, "unexpected isolated waiter case");
++            // Other harness threads inherited a blocked mask before exec. Only
++            // this test thread can receive (and discard) the early SIGCHLD.
++            // SAFETY: this is a dedicated test process, never a concurrent suite.
++            unsafe { signal::signal(Signal::SIGCHLD, SigHandler::SigDfl)? };
++            let mut chld = SigSet::empty();
++            chld.add(Signal::SIGCHLD);
++            chld.thread_unblock()?;
++            let parent_pid = nix::unistd::getpid().as_raw();
++            let spawn = |script: &str| -> Result<std::process::Child> {
++                let mut command = Command::new("/bin/busybox");
++                command.args(["sh", "-c", script]).stdin(Stdio::null());
++                // SAFETY: only async-signal-safe libc calls before exec. The
++                // owned payload must not survive a timed-out probe parent.
++                unsafe {
++                    command.pre_exec(move || {
++                        let mut empty: nix::libc::sigset_t = std::mem::zeroed();
++                        if nix::libc::sigemptyset(&mut empty) != 0 {
++                            return Err(std::io::Error::last_os_error());
++                        }
++                        let error = nix::libc::pthread_sigmask(
++                            nix::libc::SIG_SETMASK,
++                            &empty,
++                            std::ptr::null_mut(),
++                        );
++                        if error != 0 {
++                            return Err(std::io::Error::from_raw_os_error(error));
++                        }
++                        if nix::libc::prctl(nix::libc::PR_SET_PDEATHSIG, nix::libc::SIGKILL) != 0
++                            || nix::libc::getppid() != parent_pid
++                        {
++                            return Err(std::io::Error::from_raw_os_error(nix::libc::ECHILD));
++                        }
++                        Ok(())
++                    });
++                }
++                Ok(command.spawn()?)
++            };
++            // An unrelated exited child precedes init in the parent's wait
++            // queue. Its exit must not become the selected init result.
++            let unrelated = spawn("exit 9")?;
++            let unrelated_pid = Pid::from_raw(unrelated.id() as i32);
++            let observe = |pid| waitid(Id::Pid(pid), WaitPidFlag::WEXITED | WaitPidFlag::WNOWAIT);
++            assert_eq!(
++                observe(unrelated_pid)?,
++                WaitStatus::Exited(unrelated_pid, 9)
++            );
++            let forwarded = case == "forwarded";
++            let child = spawn(match case {
++                "zero" => "exit 0",
++                "nonzero" => "exit 37",
++                "signaled" => "kill -TERM $$",
++                "forwarded" => "exec /bin/busybox sleep 60",
++                _ => anyhow::bail!("unknown waiter case"),
++            })?;
++            let pid = Pid::from_raw(child.id() as i32);
++            if !forwarded {
++                let expected = if case == "signaled" {
++                    WaitStatus::Signaled(pid, Signal::SIGTERM, false)
++                } else {
++                    WaitStatus::Exited(pid, code)
++                };
++                assert_eq!(observe(pid)?, expected);
++            }
++            // Blocking now closes the assertion-to-wait race. The completed
++            // cases must have no wakeup queued even though init is waitable.
++            SigSet::all().thread_block()?;
++            let mut pending = std::mem::MaybeUninit::<nix::libc::sigset_t>::uninit();
++            // SAFETY: sigpending initializes this valid output buffer on zero.
++            let pending_chld = unsafe {
++                anyhow::ensure!(
++                    nix::libc::sigpending(pending.as_mut_ptr()) == 0,
++                    "sigpending failed"
++                );
++                nix::libc::sigismember(pending.as_ptr(), nix::libc::SIGCHLD)
++            };
++            assert_eq!(pending_chld, 0, "early SIGCHLD was not discarded");
++            if forwarded {
++                signal::kill(nix::unistd::getpid(), Signal::SIGTERM)?;
++            }
++            assert_eq!(handle_foreground(pid)?, code);
++            assert_eq!(waitpid(pid, None), Err(nix::errno::Errno::ECHILD));
++            assert_eq!(waitpid(unrelated_pid, None), Err(nix::errno::Errno::ECHILD));
++            // Once no child remains, the production drain reports ECHILD
++            // rather than blocking forever waiting for an impossible signal.
++            assert!(handle_foreground(pid).is_err());
++            println!(
++                "\n{PREFIX}{}",
++                serde_json::json!({
++                    "schema_version": 1, "case": case, "exit_code": code,
++                    "already_waitable": !forwarded, "pending_sigchld": false,
++                    "reaped": true, "unrelated_reaped": true, "forwarded_sigterm": forwarded,
++                })
++            );
++            return Ok(());
++        }
++        let selector = format!("commands::run::foreground_wait_tests::{name}");
++        let mut command = Command::new(std::env::current_exe()?);
++        command
++            .args(["--exact", &selector, "--test-threads=1", "--nocapture"])
++            .env(ENV, case)
++            .stdin(Stdio::null())
++            .stdout(Stdio::piped())
++            .stderr(Stdio::piped());
++        // SAFETY: only async-signal-safe libc functions before exec. All test
++        // harness threads inherit this mask, so none can steal a later wakeup.
++        unsafe {
++            command.pre_exec(|| {
++                let mut set: nix::libc::sigset_t = std::mem::zeroed();
++                if nix::libc::sigfillset(&mut set) != 0 {
++                    return Err(std::io::Error::last_os_error());
++                }
++                let error =
++                    nix::libc::pthread_sigmask(nix::libc::SIG_SETMASK, &set, std::ptr::null_mut());
++                if error != 0 {
++                    return Err(std::io::Error::from_raw_os_error(error));
++                }
++                Ok(())
++            });
++        }
++        let mut child = command.spawn()?;
++        let deadline = Instant::now() + Duration::from_secs(10);
++        while child.try_wait()?.is_none() {
++            if Instant::now() >= deadline {
++                child.kill()?;
++                child.wait()?;
++                anyhow::bail!("already-exited foreground probe timed out: {case}");
++            }
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        let output = child.wait_with_output()?;
++        anyhow::ensure!(
++            output.status.success() && output.stderr.is_empty(),
++            "{case}: stdout={} stderr={}",
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        );
++        let stdout = String::from_utf8(output.stdout)?;
++        let rows: Vec<_> = stdout
++            .lines()
++            .filter(|line| line.starts_with(PREFIX))
++            .collect();
++        anyhow::ensure!(rows.len() == 1, "missing or duplicate actual waiter proof");
++        println!("\n{}", rows[0]);
+         Ok(())
+     }
++
++    #[test]
++    fn test_vz_foreground_wait_already_exited_zero() -> Result<()> {
++        probe("zero", "test_vz_foreground_wait_already_exited_zero", 0)
++    }
++    #[test]
++    fn test_vz_foreground_wait_already_exited_nonzero() -> Result<()> {
++        probe(
++            "nonzero",
++            "test_vz_foreground_wait_already_exited_nonzero",
++            37,
++        )
++    }
++    #[test]
++    fn test_vz_foreground_wait_already_signaled() -> Result<()> {
++        probe(
++            "signaled",
++            "test_vz_foreground_wait_already_signaled",
++            Signal::SIGTERM as i32,
++        )
++    }
++    #[test]
++    fn test_vz_foreground_wait_forwards_pending_signal() -> Result<()> {
++        probe(
++            "forwarded",
++            "test_vz_foreground_wait_forwards_pending_signal",
++            Signal::SIGTERM as i32,
++        )
++    }
+ }
+ 
+ #[cfg(test)]

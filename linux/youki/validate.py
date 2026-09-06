@@ -55,6 +55,10 @@ REQUIRED_KEEP_TESTS = tuple("test_vz_run_keep_" + name for name in (
     "wait_error_retains_state", "save_error_retains_ownership", "invalid_run_has_no_state",
     "reaped_payload_lifecycle",
 ))
+REQUIRED_WAIT_TESTS = tuple("test_vz_foreground_wait_" + name for name in (
+    "already_exited_nonzero", "already_exited_zero", "already_signaled", "forwards_pending_signal",
+))
+WAIT_PROBE_PREFIX = "VZ_FOREGROUND_WAIT_PROBE="
 
 
 def require(condition, message):
@@ -93,7 +97,8 @@ def validate(candidate, source):
              "runtime-log.patch", "runtime-log-tests.txt", "runtime-log.json", "runtime-log-stdout.txt",
              "runtime-log-stderr.txt", "runtime-log-exit-status.txt",
              "executable-permissions.patch", "executable-permissions-tests.txt",
-             "tenant-cgroup.patch", "tenant-cgroup-tests.txt", "run-keep.patch", "run-keep-tests.txt"}
+             "tenant-cgroup.patch", "tenant-cgroup-tests.txt", "run-keep.patch", "run-keep-tests.txt",
+             "foreground-wait.patch", "foreground-wait-tests.txt"}
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -106,7 +111,7 @@ def validate(candidate, source):
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
@@ -119,6 +124,8 @@ def validate(candidate, source):
     validate_executable_permissions(contents)
     require(checksums["tenant-cgroup.patch"] == inputs["YOUKI_CGROUP_PATCH_SHA256"], "pinned local tenant cgroup patch mismatch")
     require(checksums["run-keep.patch"] == inputs["YOUKI_KEEP_PATCH_SHA256"], "pinned local run keep patch mismatch")
+    require(checksums["foreground-wait.patch"] == inputs["YOUKI_WAIT_PATCH_SHA256"], "pinned local foreground wait patch mismatch")
+    validate_foreground_wait(contents["foreground-wait-tests.txt"])
     keep_tests = contents["run-keep-tests.txt"].decode()
     expected_keep = {"test commands::run::keep_tests::" + test + " ... ok" for test in REQUIRED_KEEP_TESTS}
     actual_keep = [line for line in keep_tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
@@ -155,9 +162,38 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_elf(contents["youki"])
     return checksums["youki"]
+
+
+def validate_foreground_wait(raw):
+    tests = raw.decode("utf-8")
+    actual = [line for line in tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
+    require(len(actual) == 4 and all(
+        len(re.findall(r"(?m)^test commands::run::foreground_wait_tests::" + name + r" \.\.\. (?:ok$|$)", tests)) == 1
+        for name in REQUIRED_WAIT_TESTS), "missing or duplicate foreground wait regressions")
+    summaries = [line for line in tests.splitlines() if line.startswith("test result:")]
+    require("FAILED" not in tests and len(summaries) == 1 and re.fullmatch(
+        r"test result: ok\. 4 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
+        summaries[0]), "failed foreground wait regressions")
+    def unique(pairs):
+        row = {}
+        for key, value in pairs:
+            require(key not in row, "duplicate foreground wait proof field")
+            row[key] = value
+        return row
+    rows = [json.loads(line[len(WAIT_PROBE_PREFIX):], object_pairs_hook=unique)
+            for line in tests.splitlines() if line.startswith(WAIT_PROBE_PREFIX)]
+    require(len(rows) == 4, "missing or duplicate foreground wait proofs")
+    for row, case, code in zip(rows, ("nonzero", "zero", "signaled", "forwarded"), (37, 0, 15, 15)):
+        require(type(row) is dict and set(row) == {"schema_version", "case", "exit_code", "already_waitable",
+                "pending_sigchld", "reaped", "unrelated_reaped", "forwarded_sigterm"}, "wrong foreground wait proof schema")
+        require(type(row["schema_version"]) is int and row["schema_version"] == 1 and
+                type(row["exit_code"]) is int and row["exit_code"] == code and row["case"] == case and
+                row["already_waitable"] is (case != "forwarded") and row["pending_sigchld"] is False and
+                row["reaped"] is True and row["unrelated_reaped"] is True and
+                row["forwarded_sigterm"] is (case == "forwarded"), "wrong actual foreground wait proof")
 
 
 def validate_executable_permissions(contents):

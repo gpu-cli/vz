@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, RUNTIME_LOG_MESSAGE, validate, validate_elf
+from validate import EXEC_PROBE_PREFIX, REQUIRED_CGROUP_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -38,6 +38,19 @@ def executable_tests(rows):
             + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 261 filtered out;\n").encode()
 
 
+def wait_probes():
+    return [{"schema_version": 1, "case": case, "exit_code": code, "already_waitable": case != "forwarded",
+             "pending_sigchld": False, "reaped": True, "unrelated_reaped": True,
+             "forwarded_sigterm": case == "forwarded"}
+            for case, code in (("nonzero", 37), ("zero", 0), ("signaled", 15), ("forwarded", 15))]
+
+
+def wait_tests(rows):
+    return ("\n".join("test commands::run::foreground_wait_tests::" + name + " ... ok" for name in REQUIRED_WAIT_TESTS)
+            + "\n" + "\n".join(WAIT_PROBE_PREFIX + json.dumps(row) for row in rows)
+            + "\ntest result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode()
+
+
 class CandidateTests(unittest.TestCase):
     def setUp(self):
         self.temporary = tempfile.TemporaryDirectory()
@@ -49,7 +62,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -73,6 +86,8 @@ class CandidateTests(unittest.TestCase):
             "run-keep.patch": (self.source / "run-keep.patch").read_bytes(),
             "run-keep-tests.txt": ("\n".join("test commands::run::keep_tests::" + name + " ... ok" for name in REQUIRED_KEEP_TESTS)
                                     + "\ntest result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
+            "foreground-wait.patch": (self.source / "foreground-wait.patch").read_bytes(),
+            "foreground-wait-tests.txt": wait_tests(wait_probes()),
         }
         self.publish()
 
@@ -249,7 +264,7 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
 
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
@@ -327,6 +342,50 @@ class CandidateTests(unittest.TestCase):
             self.publish()
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "run keep regressions"):
                 validate(self.root, self.source)
+
+    def test_foreground_wait_patch_and_exact_regressions_required(self):
+        original = self.files["foreground-wait-tests.txt"]
+        for name in REQUIRED_WAIT_TESTS:
+            self.files["foreground-wait-tests.txt"] = original.replace((name + " ... ok").encode(), (name + " ... ignored").encode())
+            self.publish()
+            with self.subTest(name=name), self.assertRaisesRegex(ValueError, "foreground wait"):
+                validate(self.root, self.source)
+        self.files["foreground-wait-tests.txt"] = original
+        self.files["foreground-wait.patch"] += b"foreign patch\n"
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "stale build input"):
+            validate(self.root, self.source)
+
+    def test_foreground_wait_proofs_require_actual_exits_no_wakeup_and_reaping(self):
+        for index in range(4):
+            for key, value in (("schema_version", True), ("case", "wrong"), ("exit_code", 99),
+                               ("already_waitable", index == 3), ("pending_sigchld", True),
+                               ("reaped", False), ("unrelated_reaped", False),
+                               ("forwarded_sigterm", index != 3), ("extra", 1)):
+                rows = wait_probes()
+                rows[index][key] = value
+                self.files["foreground-wait-tests.txt"] = wait_tests(rows)
+                self.publish()
+                with self.subTest(index=index, key=key), self.assertRaisesRegex(ValueError, "foreground wait"):
+                    validate(self.root, self.source)
+
+    def test_foreground_wait_missing_duplicate_and_failed_evidence_rejected(self):
+        original = self.files["foreground-wait-tests.txt"]
+        for bad in (wait_tests([]), wait_tests(wait_probes() * 2), wait_tests(list(reversed(wait_probes()))),
+                    original.replace(b'"schema_version": 1', b'"schema_version": 0, "schema_version": 1'),
+                    original + original.splitlines(keepends=True)[0],
+                    original + original.splitlines(keepends=True)[-1],
+                    original.replace(b"0 failed", b"1 failed"), original.replace(b"0 ignored", b"1 ignored"),
+                    original.replace(b"4 passed", b"0 passed"), original.replace(b"... ok", b"... FAILED")):
+            self.files["foreground-wait-tests.txt"] = bad
+            self.publish()
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "foreground wait"):
+                validate(self.root, self.source)
+
+    def test_foreground_wait_actual_nocapture_format_is_accepted(self):
+        self.files["foreground-wait-tests.txt"] = wait_tests(wait_probes()).replace(b" ... ok\n", b" ... \n\nok\n")
+        self.publish()
+        validate(self.root, self.source)
 
     def test_advisory_lock_rejects_live_owner_then_releases(self):
         import fcntl

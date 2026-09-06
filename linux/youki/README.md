@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -109,6 +109,26 @@ waiter. State-only deletion fixtures do not prove kernel cgroup removal.
 Actual retained cgroup ownership and the absence of the subsequent BuildKit
 missing-container cleanup error still require the rebuilt full Mac backend and
 fresh installed Docker gate; old failed candidates remain failed evidence.
+
+`foreground-wait.patch` is a seventh **locally authored vz patch**. The default
+probe in installed candidate 7 left an exit-37 zombie while its exact parent
+runtime slept in ARM64 `rt_sigtimedwait` (syscall 137). Stock foreground run
+starts the payload before blocking SIGCHLD, then waits for a notification before
+checking waitable children. An early notification can already have been discarded.
+The correction drains nonblocking child statuses after the existing signal block
+and before every signal wait. An already-exited init is reaped immediately; a
+later exit queues its notification under the blocked mask. Signal forwarding,
+existing exit-code mapping, wait errors, detached execution, and keep/default
+cleanup selection are unchanged. No child-inherited signal mask is changed.
+Four native regressions use actual BusyBox children: already-exited 0 and 37,
+already-signaled SIGTERM, and a live-child SIGTERM forwarding control. WNOWAIT
+observes exited children without reaping, and missing pending SIGCHLD is required
+before entering the real waiter. An unrelated child is also drained. Isolated
+test processes retain four JSON proof records, enforce owned timeouts, and use
+parent-death signals to avoid leaving a live payload after test failure.
+The existing seven keep tests alone preblock SIGCHLD before spawning and did not
+cover this production ordering race. Source/native evidence does not replace
+the unchanged fast-payload installed probe and full backend verification.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,
