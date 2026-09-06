@@ -2,9 +2,10 @@
 
 Tracks `vz-mzs.11.4.1`, under `vz-mzs.11.4`. Work remains on
 `feat/macos26-bootstrap`; the main worktree is reserved for the other agent.
-**The installed Swift gate is not yet complete.** The complete Xcode candidate
-is installed in a stopped maintainer image, but Xcode requires explicit acceptance
-of its license before its tools will run. No new candidate is release-qualified.
+The operator authorized Xcode license acceptance in the maintainer VM, and
+maintainer Swift build/test/run passed. The first fresh installed run also passed
+Swift and persistence, but its negative restart exposed a lifecycle acknowledgement
+bug. The runtime fix is under fresh installed validation; this task remains open.
 
 ## Current candidate and evidence
 
@@ -19,13 +20,19 @@ bundle does not certify its GUI, debugger, simulators or other targets.
 | Exact toolchain receipt | `4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c` |
 | Complete archive, 4,442,355,108 bytes | `c8a3d1a14f255462e0d0f75f3dee305e7785650980456661f663a28d89c45619` |
 | Pristine 80 GiB base | `f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858` |
+| Block patch, 3,940,620,548 bytes | `3226f357ce4eac9d4f5bc89be0fd51de9821d7b01c8a4fb007374b4ab9f1da40` |
+| Prepared 80 GiB image | `21818773a98bd4287120ac4a80934a0469464806666ead459017685872a49f7e` |
+| Installed DEV manifest | `5595d334981bfc7a1de6c9d974ca05ba6dbe778f0765846170943e56de130c56` |
 
 Raw artifacts live under `.artifacts/macos26-bootstrap/native-e2e/`:
 `swift-toolchain-xcode-1/` contains the archive and pinned JSON;
-`swift-image-xcode-1/` contains the installed image, private platform state,
-home-write and install receipts, and a graceful shutdown receipt. Its final
-verification exited 69 with Xcode's license requirement; `provisioned` is false.
-Do not produce a qualifying patch from that failed verification alone.
+`swift-image-xcode-1/` records the initial license-blocked installation.
+`swift-image-xcode-2/` records the authorized continuation: exact toolchain identity,
+ordinary release build (3.06 seconds), Swift Testing (5.75-second build and one
+passing test), and execution reporting `VirtualMac2,1`, macOS 26.3.1 / 25D2128.
+The fixture directory was removed and shutdown reports `provisioned: true`,
+`stopped: true`, `forced: false`. These are maintainer timings, not consumer
+first-use or cached-boot measurements.
 
 The previous CLT-only candidate (Swift 6.2.1, SDK 26.1) reached installed Ready
 in **716.159 seconds**, but failed ordinary user execution because `/Users/dev`
@@ -42,6 +49,27 @@ provides context for the observed framework/directory mismatch. The candidate
 was deleted through its original installed daemon, that daemon was stopped, and
 its disposable cache was reclaimed. Logs remain in `installed-swift-candidate-2/`.
 The final gate must use ordinary commands with the complete Xcode candidate.
+
+The first Xcode consumer (`installed-xcode-candidate-1`) reached Ready in 728.553
+seconds, built in 10.675 seconds, tested in 7.052 seconds and restarted in 27.499
+seconds. Its initial SDK fault injection was denied by macOS; the harness now
+uses an authenticated receipt mutation with readback and immediate shell failure.
+A continuation also needed explicit Environment selection for status once both
+Environments existed.
+
+The corrected corruption check then exposed a runtime failure: a failed restart
+acknowledgement incorrectly supplied the previous incarnation as its result.
+The state contract rejected that acknowledgement and retained the operation
+fence, masking the toolchain mismatch and blocking Delete of that Environment.
+Up now supplies a resulting incarnation only with successful activation evidence;
+the previous incarnation remains the expected fence. The unaffected Environment
+was positively deleted; the failed daemon was terminated and its disposable
+images retired. That run is not qualification evidence.
+
+The fix passes 1,605 runtime/contract/state tests (31 existing skipped tests),
+strict production Clippy, and installed Linux Hardened lifecycle/persistence
+(`linux-swift-regression-1`). The rebuilt `installed-release-xcode-2` is running
+from a fresh empty cache in `installed-xcode-candidate-2`.
 
 ## Receipt and installation contract
 
@@ -101,7 +129,9 @@ above in another new clone. It requires the installed receipt to match exactly.
 The separate `--accept-xcode-license` switch runs `xcodebuild -license accept`
 **inside the maintainer VM** and must only be supplied after the operator has
 reviewed and explicitly approved that agreement. It is off by default; no
-license acceptance occurred in the recorded candidate. The exact local terms
+automatic license acceptance occurs without that switch. The operator explicitly
+authorized its use for `swift-image-xcode-2`; the guest command returned zero
+and its receipt is retained. The exact local terms
 are `/Applications/Xcode.app/Contents/Resources/en.lproj/License.pdf`.
 
 After identity, fixture and graceful-shutdown receipts pass, generate a delta
@@ -122,6 +152,11 @@ python3 scripts/run-installed-native-macos-e2e.py \
 This imports/applies the exact pair, transfers only project source through public
 `vz exec`, builds/tests/runs inside VirtualMac, verifies persistence after Stop/Up,
 and checks separate Machines and Delete. It deliberately changes the second
-Machine's SDK anchor and requires the next Up to reject it before Delete.
+Machine's toolchain receipt, reads back a different digest, and requires the next
+Up to reject it before Delete. SDK anchors are measured on successful Up; the
+negative test does not claim an SDK-file mutation. macOS refused the initial
+SDK write inside Xcode, and a trailing `sync` masked that shell error. The harness
+now uses `set -eu` plus readback for the receipt mutation. This correction changes
+only host test logic; the consumer image and installed binaries stay unchanged.
 Public artifact publication, authenticated channel delivery, native networking,
 workspace integration and aggregate 0.4 conformance remain parent-issue work.

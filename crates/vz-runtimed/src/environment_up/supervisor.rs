@@ -326,10 +326,11 @@ impl RuntimeDaemon {
                             initial_state: step.initial_state,
                             target_state: step.target_state,
                             expected_incarnation: step.expected_incarnation.clone(),
+                            // A failed readiness check has no resulting activation.
+                            // Retain the old incarnation only as the expected fence.
                             resulting_incarnation: activation
                                 .as_ref()
-                                .map(|activation| activation.incarnation.clone())
-                                .or(step.expected_incarnation),
+                                .map(|activation| activation.incarnation.clone()),
                             resulting_activation: activation,
                             result,
                         },

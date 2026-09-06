@@ -247,7 +247,7 @@ def main():
             (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
             return
         cli("continued-up" if retained else "cold-up", "up", timeout=3700)
-        status = run("ready-status", [binary_dir / "vz", "--json", "status"])
+        status = run("ready-status", [binary_dir / "vz", "--json", "status", "--environment", "native-e2e"])
         assert "macos_native" in status and "ready" in status
         output = cli("native-version", "exec", "--no-stdin", "--", "/bin/sh", "-c",
                      "/usr/bin/sw_vers -productVersion; /usr/bin/sw_vers -buildVersion; "
@@ -277,7 +277,7 @@ def main():
         cli("write-marker", "exec", "--no-stdin", "--", "/bin/sh", "-c",
             "printf native-persistence > /private/var/tmp/vz-cli-marker; /bin/sync")
         cli("stop", "stop", "--timeout", "120", timeout=150)
-        run("stopped-status", [binary_dir / "vz", "--json", "status"])
+        run("stopped-status", [binary_dir / "vz", "--json", "status", "--environment", "native-e2e"])
         cli("warm-up", "up", "--timeout", "120", timeout=150)
         assert cli("read-marker", "exec", "--no-stdin", "--", "/bin/cat",
                    "/private/var/tmp/vz-cli-marker") == "native-persistence"
@@ -291,21 +291,23 @@ def main():
                                  "test ! -e /private/var/tmp/vz-cli-marker && "
                                  "test ! -e /Users/dev/vz-swift-fixture"])
         if args.require_swift:
-            # Deliberately alter a disposable Machine's SDK anchor, then prove
-            # the next boot refuses Ready while positive Delete still works.
-            sdk = summary["swift"]["identity"]["sdk_version"]
-            assert sdk and all(c in "0123456789." for c in sdk)
-            developer = "/Applications/Xcode.app/Contents/Developer" if summary["swift"]["identity"].get("layout") == "xcode" else "/Library/Developer/CommandLineTools"
-            sdk_prefix = "Platforms/MacOSX.platform/Developer/SDKs" if summary["swift"]["identity"].get("layout") == "xcode" else "SDKs"
-            anchor = f"{developer}/{sdk_prefix}/MacOSX{sdk}.sdk/SDKSettings.json"
-            run("second-alter-sdk", [binary_dir / "vz", "exec", "--environment", "native-second",
-                                    "--no-stdin", "--", "/bin/sh", "-c",
-                                    "printf ' ' >> " + shlex.quote(anchor) + "; sync"])
+            # macOS can refuse writes inside Xcode even for guest root. Alter
+            # the mutable receipt instead, and prove the write happened before
+            # relying on the next Up as a negative readiness check.
+            receipt_path = "/usr/local/share/vz/toolchain.json"
+            run("second-alter-toolchain-receipt", [
+                binary_dir / "vz", "exec", "--environment", "native-second",
+                "--no-stdin", "--", "/bin/sh", "-c",
+                "set -eu; printf ' ' >> " + shlex.quote(receipt_path) + "; /bin/sync"])
+            altered = run("second-altered-toolchain-receipt", [
+                binary_dir / "vz", "exec", "--environment", "native-second",
+                "--no-stdin", "--", "/bin/cat", receipt_path])
+            assert hashlib.sha256(altered.encode()).hexdigest() != release["toolchain_sha256"]
             run("second-stop", [binary_dir / "vz", "stop", "--environment", "native-second",
                                 "--timeout", "120"], timeout=150)
-            run("altered-sdk-up", [binary_dir / "vz", "up", "--environment", "native-second",
-                                   "--timeout", "120"], timeout=150, expected=2)
-            assert "native Swift/toolchain pin verification failed" in (evidence / "altered-sdk-up.stderr").read_text()
+            run("altered-toolchain-up", [binary_dir / "vz", "up", "--environment", "native-second",
+                                         "--timeout", "120"], timeout=150, expected=2)
+            assert "native toolchain receipt SHA-256 mismatch" in (evidence / "altered-toolchain-up.stderr").read_text()
         run("second-delete", [binary_dir / "vz", "delete", "--environment", "native-second",
                               "--timeout", "120"], timeout=150)
         assert cli("first-survives", "exec", "--no-stdin", "--", "/bin/cat",
