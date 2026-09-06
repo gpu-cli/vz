@@ -271,6 +271,38 @@ def context_descriptor(environment, machine, config):
     return descriptor
 
 
+def machine_config_path(runtime, owner):
+    """Derive from immutable owners, never from a descriptor-supplied path."""
+    kind, logical = "other:machine_runtime_store", "runtime"
+    raw = b"vz.resource-name.v1\x00"
+    for field in (owner["project_id"], owner["environment_id"], owner["machine_id"], kind, logical):
+        encoded = field.encode("ascii")
+        raw += len(encoded).to_bytes(8, "little") + encoded
+    readable = re.sub(r"-+", "-", re.sub(r"[^A-Za-z0-9_.]", "-", kind + "-" + logical)).strip("-")[:26]
+    key = "vzr1-" + readable + "-" + hashlib.sha256(raw).hexdigest()[:32]
+    return Path(runtime) / "topology-machines" / key / "data/docker-client"
+
+
+def managed_context_descriptor(environment, machine, runtime):
+    owner = {"project_id": environment["project_id"], "environment_id": environment["environment_id"],
+             "machine_id": machine["machine_id"]}
+    config = machine_config_path(runtime, owner)
+    descriptor = context_descriptor(environment, machine, config)
+    require(config.resolve(strict=True) == config, "redirected Machine client configuration")
+    metadata = config.lstat()
+    require(stat.S_ISDIR(metadata.st_mode) and stat.S_IMODE(metadata.st_mode) == 0o700 and
+            metadata.st_uid == os.geteuid(), "Machine client configuration is not private")
+    store_owner = json.loads(read_private_regular(config.parent.parent / "owner.json", LIMIT))
+    claim = json.loads(read_private_regular(config / "vz-owner.json", LIMIT))
+    require(store_owner["owner"] == owner and claim["schema_version"] == 1 and claim["owner"] == owner and
+            claim["directory"] == {"device": metadata.st_dev, "inode": metadata.st_ino} and
+            re.fullmatch(r"lop_[0-9a-f]{32}", claim["nonce"]) is not None,
+            "Machine client configuration ownership differs")
+    require((config.lstat().st_dev, config.lstat().st_ino) == (metadata.st_dev, metadata.st_ino),
+            "Machine client configuration changed during admission")
+    return descriptor
+
+
 def exact_developer_topology(primary, neighbor):
     require(len(primary["machines"]) == 2 and len(neighbor["machines"]) == 2, "exact two-plus-two Developer topology required")
     require(primary["project_id"] == neighbor["project_id"] and primary["environment_id"] != neighbor["environment_id"],
@@ -359,7 +391,8 @@ class Harness:
         if descriptor is None:
             require(args in (["--version"], ["compose", "version"], ["buildx", "version"]), "context-free Engine operation forbidden")
         name = descriptor["name"] if descriptor else "default"
-        return self.command(label, ["docker", "--config", self.config, "--context", name, *args],
+        config = descriptor["config_dir"] if descriptor else self.config
+        return self.command(label, ["docker", "--config", config, "--context", name, *args],
                             executable=self.info["clients"]["docker"]["canonical"], **kwargs)
 
     def project(self, name, profile, count):
@@ -426,7 +459,7 @@ class Harness:
     def inspect(self, environment):
         descriptors = []
         for machine in environment["machines"]:
-            descriptor = context_descriptor(environment, machine, self.config)
+            descriptor = managed_context_descriptor(environment, machine, self.runtime)
             endpoint = Path(descriptor["endpoint"][7:])
             require(endpoint.is_relative_to(self.runtime) and stat.S_ISSOCK(endpoint.lstat().st_mode), "foreign/missing Machine socket")
             raw, _, _ = self.docker("context-inspect", descriptor, ["context", "inspect", descriptor["name"]])
@@ -583,7 +616,7 @@ class Harness:
         exact_developer_topology(primary, sibling)
         sibling_contexts = self.inspect(sibling)
         all_contexts = primary_contexts + sibling_contexts
-        for field in ("name", "endpoint", "engine_id"):
+        for field in ("name", "endpoint", "config_dir", "engine_id"):
             require(len({item[field] for item in all_contexts}) == len(all_contexts), "Machines share " + field)
         workloads = [self.workload(descriptor) for descriptor in primary_contexts]
         self.stop(project, primary["environment_id"])
@@ -609,10 +642,22 @@ class Harness:
         return {"primary_before": primary, "primary_after": restarted, "neighbor": sibling, "hardened": restricted, "host_workloads": workloads}
 
 
+def is_private_client_path(path, root):
+    """Client credentials/plugin state are never public runtime receipts."""
+    return any(part == "docker-client" or part.startswith(".docker-client.pending-")
+               for part in path.relative_to(root).parts)
+
+
 def collect_runtime_receipts(harness):
     from docker_host_driver import contains_canary, regular
     retained = private(harness.evidence / "runtime-receipts")
     for path in harness.runtime.rglob("*"):
+        # Client storage now lives under the runtime store. Its mutable auths
+        # and plugin state are private inputs, not publishable runtime receipts.
+        # Do not even read/hash them into evidence; public descriptors and
+        # separate ownership admission already bind the selected connection.
+        if is_private_client_path(path, harness.runtime):
+            continue
         if path.suffix not in (".log", ".json", ".stdout", ".stderr"):
             continue
         require(not path.is_symlink() and path.is_file() and path.stat().st_size <= 32 * 1024 * 1024, "unbounded/redirected runtime receipt")

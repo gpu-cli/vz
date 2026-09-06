@@ -211,7 +211,7 @@ class Capture:
                 'foreign_agent_or_docker_environment')
         self.client = copy.deepcopy(h.info['clients']['docker'])
         self.executable = Path(self.client['canonical'])
-        self.config = Path(h.config)
+        self.config = Path(self.owner['descriptor']['config_dir'])
         self.private = _Root(private_root)
         try:
             self.evidence = _Root(evidence_root)

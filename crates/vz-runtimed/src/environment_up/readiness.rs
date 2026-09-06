@@ -92,7 +92,8 @@ impl ReadinessEvidenceProvider for MeasuredLinuxReadiness<'_> {
                     "exact Developer Machine has no retained Docker endpoint",
                 )
             })?;
-            let client = HostDockerClient::discover().map_err(backend_error)?;
+            let client = HostDockerClient::discover_for_machine(Arc::clone(self.pin.store()))
+                .map_err(backend_error)?;
             let inventory = VerifiedMachineRuntimeInventory::measure(
                 activation,
                 &incarnation,

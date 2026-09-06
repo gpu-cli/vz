@@ -95,8 +95,10 @@ def bounded_receipt_paths(root, limit=4096):
             for entry in entries:
                 observed += 1
                 require(observed <= limit, "unexpected runtime store receipt inventory")
-                require(not entry.is_symlink(), "redirected runtime evidence")
                 path = Path(entry.path)
+                if startup.is_private_client_path(path, root):
+                    continue
+                require(not entry.is_symlink(), "redirected runtime evidence")
                 if entry.is_dir(follow_symlinks=False):
                     pending.append(path)
                 yield path
@@ -189,7 +191,7 @@ class NeighborMonitor:
         self.thread = threading.Thread(target=self.loop, name="vz-delete-neighbor-liveness", daemon=False)
 
     def command(self, descriptor, args):
-        return self.record.run("neighbor", ["docker", "--config", str(self.harness.config), "--context", descriptor["name"], *args],
+        return self.record.run("neighbor", ["docker", "--config", descriptor["config_dir"], "--context", descriptor["name"], *args],
             executable=self.harness.info["clients"]["docker"]["canonical"], cwd=self.harness.root, timeout=20)
 
     def loop(self):
@@ -268,7 +270,7 @@ class DeleteHarness(startup.Harness):
         bindings = []
         capture_root = startup.private(self.evidence / ("before-" + environment["environment_id"]))
         for machine in environment["machines"]:
-            descriptor = startup.context_descriptor(environment, machine, self.config)
+            descriptor = startup.managed_context_descriptor(environment, machine, self.runtime)
             owner = descriptor["owner"]
             key = resource_name(owner, "other:machine_runtime_store", "runtime")
             store = self.runtime / "topology-machines" / key
@@ -339,8 +341,8 @@ class DeleteHarness(startup.Harness):
                     ownership(owner, "incarnation", machine["incarnation_id"]), ownership(owner, "docker_context", descriptor["name"])]
             bindings.append({"machine": machine, "owner": owner, "descriptor": descriptor, "incarnation": activation["incarnation"],
                 "runtime_identity": runtime, "manifest": manifest, "store_path": str(store), "store_identity": store_identity,
-                "data_identity": data_identity, "context_path": str(self.config / "contexts/meta" / context_key),
-                "tls_path": str(self.config / "contexts/tls" / context_key), "ownership": rows})
+                "data_identity": data_identity, "context_path": str(Path(descriptor["config_dir"]) / "contexts/meta" / context_key),
+                "tls_path": str(Path(descriptor["config_dir"]) / "contexts/tls" / context_key), "ownership": rows})
         startup.document(self.evidence / (environment["environment_id"] + "-physical-bindings.json"), bindings)
         return bindings
 

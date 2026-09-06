@@ -611,8 +611,12 @@ class Driver:
         require(config != Path(os.environ.get("HOME", "")) / ".docker", "user Docker config rejected")
         data = regular(config / "config.json")
         parsed = json.loads(data)
-        require(set(parsed) <= {"currentContext", "cliPluginsExtraDirs"},
+        require(type(parsed) is dict and set(parsed) <= {"currentContext", "cliPluginsExtraDirs", "auths", "credHelpers"},
                 "credentials, proxies, helpers and unknown client settings rejected")
+        if "auths" in parsed or "credHelpers" in parsed:
+            require(type(parsed.get("auths")) is dict and parsed["auths"] == {} and
+                    parsed.get("credHelpers") == {"vz-managed-file-store.invalid": ""},
+                    "only the exact empty managed file-store guard is admitted")
         clients = self.inputs.raw["clients"]
         directories = sorted({str(Path(clients[name]["path"]).parent) for name in ("compose", "buildx")})
         installed = config / "cli-plugins"

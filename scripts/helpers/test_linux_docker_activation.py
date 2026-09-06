@@ -7,6 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest.mock import patch
 
 import docker_host_driver as driver
 import linux_docker_e2e as gate
@@ -29,13 +30,20 @@ class ActivationTests(unittest.TestCase):
             directory.mkdir(parents=True)
             directory.chmod(0o700)
         self.owner = {"project_id": "prj_test", "environment_id": "env_test", "machine_id": "mch_test"}
+        self.machine_config = gate.startup.machine_config_path(self.h.runtime, self.owner)
+        self.machine_config.mkdir(parents=True, mode=0o700)
+        self.machine_config.chmod(0o700)
+        metadata = self.machine_config.stat()
+        self.write(self.machine_config.parent.parent / 'owner.json', json.dumps({'owner': self.owner}).encode())
+        self.write(self.machine_config / 'vz-owner.json', json.dumps({'schema_version': 1, 'owner': self.owner,
+            'directory': {'device': metadata.st_dev, 'inode': metadata.st_ino}, 'nonce': 'lop_' + 'a' * 32}).encode())
         self.incarnation = {"schema_version": 1, "machine_id": "mch_test", "incarnation_id":
                             "inc_runtime_11111111-2222-4333-8444-555555555555", "generation": 1, "created_at": 100}
         self.identity = {"schema_version": 1, "opaque_id": json.dumps({"schema_version": 1,
                          "stack_id": "vzr1-other-runtime_vm-vm-" + "a" * 32,
                          "incarnation_id": "11111111-2222-4333-8444-555555555555"}, separators=(",", ":"))}
         self.descriptor = {"schema_version": 1, "owner": self.owner, "name": "vzr1-private-test",
-                           "endpoint": "unix://" + str(self.root / "machine.sock"), "config_dir": str(self.h.config),
+                           "endpoint": "unix://" + str(self.root / "machine.sock"), "config_dir": str(self.machine_config),
                            "engine_id": "11111111-aaaa-4bbb-8ccc-222222222222", "incarnation_id": self.incarnation["incarnation_id"],
                            "incarnation_generation": 1}
         self.capabilities = {"capabilities": ["posix_exec", "docker_engine", "compose", "buildx"]}
@@ -159,6 +167,25 @@ class ActivationTests(unittest.TestCase):
         self.assertEqual(proof["receipt_sha256"], sha((self.attempt / "receipt.json").read_bytes()))
         binding = json.loads((self.h.evidence / "mch_test-runtime-binding.json").read_bytes())
         self.assertEqual(binding["runtime_identity_material"], self.identity)
+
+    def test_private_client_receipt_names_are_never_read_as_runtime_proofs(self):
+        canary = b'public-private-credential-canary-not-json'
+        for selected in (self.machine_config, self.machine_config.with_name('.docker-client.pending-owned')):
+            nested = selected / 'private-plugin'
+            nested.mkdir(parents=True)
+            self.write(nested / 'receipt.json', canary)
+        reader = gate.startup.read_private_regular
+        def read(path, limit):
+            # The exact public ownership claim is intentionally admitted before
+            # proof discovery; arbitrary private client receipts are not.
+            if path.is_relative_to(self.h.runtime) and gate.startup.is_private_client_path(path, self.h.runtime):
+                self.assertEqual(path, self.machine_config / 'vz-owner.json')
+            return reader(path, limit)
+        with patch.object(gate.startup, 'read_private_regular', side_effect=read):
+            scope, proof = gate.authenticated_proof(self.h, self.environment, self.machine)
+        self.assertEqual(proof['receipt_sha256'], sha((self.attempt / 'receipt.json').read_bytes()))
+        binding = (self.h.evidence / 'mch_test-runtime-binding.json').read_bytes()
+        self.assertNotIn(canary, binding)
 
     def test_capture_tamper_nonzero_uncertain_and_incomplete_rejected(self):
         for field, changed in (("stdout_sha256", "0" * 64), ("exit_code", 1),

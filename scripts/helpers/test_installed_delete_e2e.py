@@ -4,8 +4,9 @@ import contextlib
 import json
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import installed_delete_e2e as driver
 
@@ -48,6 +49,46 @@ def encode(rows):
 
 
 class DeleteDriverTests(unittest.TestCase):
+    def test_receipt_inventory_prunes_private_client_trees_before_descent_or_read(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            private_roots = [root / 'data' / name for name in ('docker-client', '.docker-client.pending-owned')]
+            for selected in private_roots:
+                (selected / 'nested').mkdir(parents=True)
+                (selected / 'nested/config.json').write_bytes(b'public-private-credential-canary')
+            ordinary = root / 'receipt.json'
+            ordinary.write_bytes(b'{"public":"receipt"}\n')
+            ordinary.chmod(0o600)
+            original_scan = driver.os.scandir
+            def scan(path):
+                self.assertFalse(driver.startup.is_private_client_path(Path(path), root), 'descended into private client')
+                return original_scan(path)
+            with patch.object(driver.os, 'scandir', side_effect=scan):
+                paths = list(driver.bounded_receipt_paths(root))
+            self.assertEqual(set(paths), {root / 'data', ordinary})
+            reader = driver.startup.read_private_regular
+            def read(path, limit):
+                self.assertFalse(driver.startup.is_private_client_path(path, root), 'read private client bytes')
+                return reader(path, limit)
+            with patch.object(driver.startup, 'read_private_regular', side_effect=read) as observed:
+                copied = [driver.startup.read_private_regular(path, 1024) for path in paths if path.is_file()]
+            self.assertEqual(copied, [ordinary.read_bytes()])
+            observed.assert_called_once_with(ordinary, 1024)
+
+    def test_neighbor_monitor_uses_exact_descriptor_config_and_rejects_missing(self):
+        monitor = object.__new__(driver.NeighborMonitor)
+        monitor.harness = SimpleNamespace(config=Path('/bootstrap'), root=Path('/owned'),
+            info={'clients': {'docker': {'canonical': '/owned/docker'}}})
+        monitor.record = SimpleNamespace(run=Mock())
+        descriptor = {'name': 'neighbor', 'config_dir': '/owned/neighbor/docker-client'}
+        monitor.command(descriptor, ['info'])
+        self.assertEqual(monitor.record.run.call_args.args[1],
+                         ['docker', '--config', descriptor['config_dir'], '--context', 'neighbor', 'info'])
+        monitor.record.run.reset_mock()
+        with self.assertRaises(KeyError):
+            monitor.command({'name': 'neighbor'}, ['info'])
+        monitor.record.run.assert_not_called()
+
     def test_receipt_inventory_stops_before_consuming_or_processing_unbounded_source(self):
         consumed = []
         class Entry:

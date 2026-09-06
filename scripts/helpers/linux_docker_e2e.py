@@ -345,21 +345,25 @@ def public_activation(harness, environment, machine):
 
 
 def input_mapping(harness, scope, proof, images):
+    owner = {key: scope[key] for key in ("project_id", "environment_id", "machine_id")}
+    config = startup.machine_config_path(harness.runtime, owner)
     clients = {"docker": {"path": harness.info["clients"]["docker"]["canonical"],
                            "sha256": harness.info["clients"]["docker"]["sha256"]}}
     for name in ("compose", "buildx"):
         path = harness.config / "cli-plugins" / ("docker-" + name)
         clients[name] = {"path": str(path), "sha256": startup.digest(path)}
     return {"schema_version": 1, "run_id": harness.info["run_id"], "release_sha256": harness.info["clients"]["vz"]["sha256"],
-            "fixture_sha256": harness.info["fixture_sha256"], "scope": scope, "docker_config": str(harness.config),
+            "fixture_sha256": harness.info["fixture_sha256"], "scope": scope, "docker_config": str(config),
             "clients": clients, "images": images, "runtime_evidence": proof}
 
 
 def authenticated_proof(harness, environment, machine):
     """Bind normal-Up receipts to the public status and selected installed bytes."""
-    descriptor = startup.context_descriptor(environment, machine, harness.config)
+    descriptor = startup.managed_context_descriptor(environment, machine, harness.runtime)
     matches = []
     for path in harness.runtime.rglob("receipt.json"):
+        if startup.is_private_client_path(path, harness.runtime):
+            continue
         data = startup.read_private_regular(path, startup.LIMIT)
         row = json.loads(data)
         if row.get("owner") == descriptor["owner"] and row.get("incarnation", {}).get("incarnation_id") == machine["incarnation_id"]:
@@ -804,7 +808,7 @@ class SentinelMonitor:
     def command(self, descriptor, args):
         if self.finished.is_set():
             raise MonitorStopped()
-        return self.record.run("sentinel", ["docker", "--config", str(self.harness.config), "--context", descriptor["name"], *args],
+        return self.record.run("sentinel", ["docker", "--config", descriptor["config_dir"], "--context", descriptor["name"], *args],
                                executable=self.harness.info["clients"]["docker"]["canonical"], cwd=self.harness.root, timeout=8)
 
     def sample(self, row):

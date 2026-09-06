@@ -21,6 +21,10 @@ pub mod machine_artifact_store;
 #[cfg(target_os = "macos")]
 pub mod machine_backend;
 #[cfg(target_os = "macos")]
+mod machine_docker_config;
+#[cfg(target_os = "macos")]
+mod machine_docker_config_policy;
+#[cfg(target_os = "macos")]
 pub mod machine_docker_context;
 #[cfg(target_os = "macos")]
 pub mod machine_docker_endpoint;

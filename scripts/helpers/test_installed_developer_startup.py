@@ -264,6 +264,109 @@ class InstalledStartupTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             harness.docker("wrong", None, ["info"])
 
+    def managed_fixture(self):
+        environment = {'state': 'ready', 'project_id': 'prj_one', 'environment_id': 'env_one'}
+        owner = dict(project_id='prj_one', environment_id='env_one', machine_id='mch_one')
+        config = driver.machine_config_path(self.root, owner)
+        config.mkdir(parents=True, mode=0o700)
+        config.chmod(0o700)
+        metadata = config.stat()
+        driver.document(config.parent.parent / 'owner.json', {'owner': owner})
+        (config.parent.parent / 'owner.json').chmod(0o600)
+        claim = {'schema_version': 1, 'owner': owner,
+                 'directory': {'device': metadata.st_dev, 'inode': metadata.st_ino}, 'nonce': 'lop_' + 'a' * 32}
+        driver.document(config / 'vz-owner.json', claim)
+        (config / 'vz-owner.json').chmod(0o600)
+        descriptor = {'schema_version': 1, 'owner': owner, 'name': 'owned', 'endpoint': 'unix:///owned.sock',
+                      'config_dir': str(config), 'incarnation_id': 'inc_one', 'incarnation_generation': 2}
+        machine = {'state': 'ready', 'machine_id': 'mch_one', 'incarnation_id': 'inc_one', 'incarnation_generation': 2,
+                   'negotiated_capabilities': {'capabilities': ['docker_engine', 'compose', 'buildx']},
+                   'docker_context': descriptor}
+        return environment, machine, config, claim
+
+    def test_machine_config_derivation_binds_all_owners_and_not_incarnation(self):
+        owner = dict(project_id='prj_one', environment_id='env_one', machine_id='mch_one')
+        path = driver.machine_config_path('/owned/runtime', owner)
+        self.assertEqual(str(path), '/owned/runtime/topology-machines/'
+            'vzr1-other-machine_runtime_stor-15ba30d0036ca1f5a607c827baa784c6/data/docker-client')
+        for key in owner:
+            self.assertNotEqual(path, driver.machine_config_path('/owned/runtime', dict(owner, **{key: 'other'})))
+
+    def test_managed_descriptor_accepts_only_derived_private_owned_directory(self):
+        environment, machine, config, claim = self.managed_fixture()
+        self.assertEqual(driver.managed_context_descriptor(environment, machine, self.root), machine['docker_context'])
+        for key, value in (('config_dir', str(self.root / 'bootstrap')), ('config_dir', str(config) + '-sibling')):
+            changed = copy.deepcopy(machine)
+            changed['docker_context'][key] = value
+            with self.assertRaises(ValueError):
+                driver.managed_context_descriptor(environment, changed, self.root)
+        config.chmod(0o755)
+        with self.assertRaises(ValueError):
+            driver.managed_context_descriptor(environment, machine, self.root)
+        config.chmod(0o700)
+        target = config.with_name('retained-config')
+        config.rename(target)
+        config.symlink_to(target, target_is_directory=True)
+        with self.assertRaises(ValueError):
+            driver.managed_context_descriptor(environment, machine, self.root)
+
+    def test_managed_descriptor_rejects_foreign_claim_or_store_identity(self):
+        environment, machine, config, claim = self.managed_fixture()
+        for field, value in (('schema_version', 2), ('owner', dict(claim['owner'], machine_id='sibling')),
+                             ('directory', {'device': claim['directory']['device'], 'inode': 0}), ('nonce', 'foreign')):
+            (config / 'vz-owner.json').write_text(json.dumps(dict(claim, **{field: value})))
+            with self.subTest(field=field), self.assertRaises(ValueError):
+                driver.managed_context_descriptor(environment, machine, self.root)
+        (config / 'vz-owner.json').write_text(json.dumps(claim))
+        (config.parent.parent / 'owner.json').write_text(json.dumps({'owner': dict(claim['owner'], environment_id='foreign')}))
+        with self.assertRaises(ValueError):
+            driver.managed_context_descriptor(environment, machine, self.root)
+
+    def test_runtime_collection_never_reads_or_publishes_managed_client_subtrees(self):
+        import docker_host_driver as host
+        runtime, evidence = self.root / 'runtime', self.root / 'evidence'
+        runtime.mkdir()
+        evidence.mkdir()
+        canary = b'public-test-credential-must-not-enter-evidence'
+        for directory in ('docker-client', '.docker-client.pending-owned'):
+            selected = runtime / 'topology-machines/owned/data' / directory / 'nested'
+            selected.mkdir(parents=True)
+            for name in ('config.json', 'plugin.log', 'data.stderr'):
+                (selected / name).write_bytes(canary)
+        ordinary = runtime / 'ordinary/receipt.json'
+        ordinary.parent.mkdir()
+        ordinary.write_bytes(b'{"public":"receipt"}\n')
+        regular = host.regular
+        def guarded(path, limit):
+            self.assertFalse(any(part == 'docker-client' or part.startswith('.docker-client.pending-')
+                                 for part in Path(path).relative_to(runtime).parts), 'private client bytes read')
+            return regular(path, limit)
+        harness = type('HarnessFixture', (), {'runtime': runtime, 'evidence': evidence,
+                                              'sensitive_canaries': [canary]})()
+        with patch.object(host, 'regular', side_effect=guarded) as read:
+            driver.collect_runtime_receipts(harness)
+        read.assert_called_once_with(ordinary, 32 * 1024 * 1024)
+        files = [path for path in evidence.rglob('*') if path.is_file()]
+        self.assertEqual(files, [evidence / 'runtime-receipts/ordinary/receipt.json'])
+        self.assertEqual(files[0].read_bytes(), ordinary.read_bytes())
+        self.assertNotIn(canary, b''.join(path.read_bytes() for path in files))
+
+    def test_scoped_docker_uses_descriptor_config_without_bootstrap_fallback(self):
+        harness = object.__new__(driver.Harness)
+        harness.config = self.root / 'bootstrap'
+        harness.info = {'clients': {'docker': {'canonical': '/owned/docker'}}}
+        harness.command = MagicMock()
+        descriptor = {'name': 'owned', 'config_dir': str(self.root / 'machine')}
+        harness.docker('info', descriptor, ['info'])
+        self.assertEqual(harness.command.call_args.args[1],
+                         ['docker', '--config', descriptor['config_dir'], '--context', 'owned', 'info'])
+        harness.command.reset_mock()
+        with self.assertRaises(KeyError):
+            harness.docker('info', {'name': 'owned'}, ['info'])
+        harness.command.assert_not_called()
+        harness.docker('version', None, ['--version'])
+        self.assertEqual(harness.command.call_args.args[1][2], harness.config)
+
     def test_isolation_preserves_home_without_catalog_or_daemon_override(self):
         args = self.args()
         info = driver.preflight(args, require_host=False)

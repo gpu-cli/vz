@@ -209,7 +209,7 @@ class Health:
     def start(self):
         require(self.prepared and self.thread is None, 'health observer must be prepared and single-use')
         self.verify_inputs()
-        argv = ['docker', '--config', str(self.harness.config), '--context', self.descriptor['name'],
+        argv = ['docker', '--config', self.descriptor['config_dir'], '--context', self.descriptor['name'],
                 'exec', self.container_id, 'python3', '-u', '-c', self.source, 'probe', self.token,
                 json.dumps(TIMING, sort_keys=True, separators=(',', ':'))]
         self.observer_input = {'schema_version': 1, 'descriptor': self.descriptor, 'argv': argv,

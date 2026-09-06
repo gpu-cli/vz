@@ -41,6 +41,22 @@ pub struct ManagedMachineDockerContext {
 }
 
 impl ManagedMachineDockerContext {
+    /// Older DEV contexts lived in a shared client config. Never reinterpret
+    /// their credentials as Machine-owned, or publish private state beside a
+    /// conflicting claim. Stop and exact legacy context Delete remain usable.
+    pub(crate) fn require_private_config_compatible(
+        store: &MachineRuntimeStoreLease,
+    ) -> Result<()> {
+        if let Some(claim) = read_claim(store)? {
+            ensure!(
+                claim.owner == *store.owner()
+                    && Path::new(&claim.config_dir) == crate::machine_docker_config::path(store),
+                "legacy shared Docker configuration requires explicit migration; credentials were not copied; Stop/Delete remain available with the original Docker configuration"
+            );
+        }
+        Ok(())
+    }
+
     pub fn name(&self) -> &str {
         &self.claim.name
     }

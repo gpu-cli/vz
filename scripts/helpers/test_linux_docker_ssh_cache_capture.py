@@ -165,6 +165,7 @@ class CaptureTests(unittest.TestCase):
         config = self.root / 'docker'; config.mkdir(mode=0o700)
         (config/'config.json').write_text('{}\n')
         descriptor = {'owner': {'project_id': 'prj', 'environment_id': 'env', 'machine_id': 'mch'},
+                      'config_dir': str(config),
                       'name': 'exact-context', 'endpoint': 'unix:///private/socket', 'engine_id': 'exact-engine'}
         volume = {'Name': 'exact-volume', 'Driver': 'local', 'Scope': 'local',
                   'Labels': {capture.buildkit.LABEL: 'token'}, 'Options': None,
@@ -172,7 +173,7 @@ class CaptureTests(unittest.TestCase):
         builder = SimpleNamespace(descriptor=descriptor, mapping={'container_id': 'a'*64, 'image_id': 'sha256:'+'b'*64},
             role='source', token='token', identity_sha256='c'*64, container_name='exact-container',
             volume_name='exact-volume', volume=volume, ownership={'role': 'source'}, tag='exact:builder', registered=False,
-            harness=SimpleNamespace(evidence=evidence, config=config, env={'PATH': '/usr/bin:/bin'},
+            harness=SimpleNamespace(evidence=evidence, config=self.root / 'bootstrap', env={'PATH': '/usr/bin:/bin'},
                 info={'clients': {'docker': {'canonical': sys.executable, 'sha256': 'f'*64}}}))
         selected = capture.Capture(builder, (b'private-canary',), self.root/'private', evidence/'capture')
         selected.local_guard = Mock(side_effect=lambda: (selected.private.check(), selected.evidence.check()))
@@ -218,6 +219,9 @@ class CaptureTests(unittest.TestCase):
         self.assertTrue(result['capture']['archive_published'])
         self.assertFalse(result['builder_restarted'])
         self.assertEqual(dispatch.call_args.args[0][-3:], ['cp', 'a'*64+':/var/lib/buildkit/.', '-'])
+        self.assertEqual(dispatch.call_args.args[0][0:5],
+                         ['docker', '--config', selected.owner['descriptor']['config_dir'], '--context', 'exact-context'])
+        self.assertNotEqual(selected.config, selected.builder.harness.config)
         self.assertTrue((selected.evidence.path/'capture.result.json').is_file())
         with self.assertRaises(capture.CaptureError): selected.run(stopped, proof)
 

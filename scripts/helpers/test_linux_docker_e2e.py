@@ -16,6 +16,37 @@ import linux_docker_e2e as gate
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_input_mapping_derives_machine_config_but_retains_pinned_bootstrap_plugins(self):
+        harness = types.SimpleNamespace(runtime=Path('/owned/runtime'), config=Path('/owned/bootstrap'),
+            info={'run_id': 'owned-test', 'fixture_sha256': 'f' * 64,
+                  'clients': {'docker': {'canonical': '/owned/docker', 'sha256': 'd' * 64},
+                              'vz': {'sha256': 'a' * 64}}})
+        scope = {'project_id': 'prj_one', 'environment_id': 'env_one', 'machine_id': 'mch_one'}
+        with patch.object(gate.startup, 'digest', return_value='c' * 64):
+            value = gate.input_mapping(harness, scope, {'proof': 'exact'}, {'images': 'exact'})
+        self.assertEqual(value['docker_config'], str(gate.startup.machine_config_path(harness.runtime, scope)))
+        self.assertNotEqual(value['docker_config'], str(harness.config))
+        for name in ('compose', 'buildx'):
+            self.assertEqual(value['clients'][name]['path'], str(harness.config / 'cli-plugins' / ('docker-' + name)))
+        with patch.object(gate.startup, 'digest', return_value='c' * 64):
+            sibling = gate.input_mapping(harness, dict(scope, machine_id='mch_other'), {}, {})
+        self.assertNotEqual(value['docker_config'], sibling['docker_config'])
+
+    def test_sentinel_monitor_has_no_shared_config_fallback(self):
+        monitor = object.__new__(gate.SentinelMonitor)
+        monitor.finished = threading.Event()
+        monitor.harness = types.SimpleNamespace(config=Path('/bootstrap'), root=Path('/owned'),
+            info={'clients': {'docker': {'canonical': '/owned/docker'}}})
+        monitor.record = types.SimpleNamespace(run=Mock())
+        descriptor = {'name': 'machine', 'config_dir': '/owned/machine/docker-client'}
+        monitor.command(descriptor, ['info'])
+        self.assertEqual(monitor.record.run.call_args.args[1],
+                         ['docker', '--config', descriptor['config_dir'], '--context', 'machine', 'info'])
+        monitor.record.run.reset_mock()
+        with self.assertRaises(KeyError):
+            monitor.command({'name': 'machine'}, ['info'])
+        monitor.record.run.assert_not_called()
+
     def test_images_admission_has_no_builder_or_foreign_fixture_options(self):
         common = [part for name in gate.startup.OPTIONS for part in ('--' + name, '/owned/value')]
         args = gate.arguments(['--suite', 'images', *common])
@@ -566,7 +597,7 @@ class PrePullTrustTests(unittest.TestCase):
         environments = [{"environment_id": "environment-" + str(index), "machines": [
             {"machine_id": f"machine-{index}-{sibling}", "name": "worker-" + str(sibling)}
             for sibling in range(2)]} for index in range(2)]
-        contexts = [{field: field + "-" + str(index) for field in ("name", "endpoint", "engine_id")}
+        contexts = [{field: field + "-" + str(index) for field in ("name", "endpoint", "engine_id", "config_dir")}
                     for index in range(4)]
         harness.project = Mock(return_value=project)
         harness.up = Mock(side_effect=environments)
@@ -665,7 +696,7 @@ class BuildDispatchTests(unittest.TestCase):
         harness.effects_uncertain = False
         harness.cli, harness.evidence = Path("/owned/bin/vz"), Path("/owned/evidence")
         contexts = [{"name": "context-" + str(i), "endpoint": "endpoint-" + str(i),
-                     "engine_id": "engine-" + str(i)} for i in range(4)]
+                     "engine_id": "engine-" + str(i), "config_dir": "/owned/machine-config-" + str(i)} for i in range(4)]
         environments = [{"environment_id": "env-" + str(i), "machines": [
             {"machine_id": "machine-" + str(2*i+j), "name": "worker-" + str(j),
              "docker_context": contexts[2*i+j]} for j in range(2)]} for i in range(2)]

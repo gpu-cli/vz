@@ -636,6 +636,99 @@ fn exact_claim_is_durable_and_never_overwritten() -> Result<()> {
 }
 
 #[test]
+fn legacy_context_refuses_private_config_without_creating_or_rewriting_state() -> Result<()> {
+    let (_root, store) = fixture()?;
+    let expected = claim(&store)?;
+    publish_claim(&store, &expected)?;
+    let claim_path = store.data_path().join(CLAIM);
+    let before = std::fs::read(&claim_path)?;
+    let private_path = crate::machine_docker_config::path(&store);
+    assert!(!private_path.exists());
+    let error = ManagedMachineDockerContext::require_private_config_compatible(&store)
+        .expect_err("legacy shared claim must require explicit migration");
+    assert!(error.to_string().contains("explicit migration"));
+    // Exercise the production ordering too: executable admission may read the
+    // trusted binary, but legacy refusal precedes private-config publication.
+    assert!(
+        HostDockerClient::for_machine(Path::new("/usr/bin/true"), &[], Arc::clone(&store)).is_err()
+    );
+    assert!(!private_path.exists());
+    assert_eq!(std::fs::read(&claim_path)?, before);
+    assert_eq!(read_claim(&store)?, Some(expected));
+    assert!(std::fs::read_dir(store.data_path())?.all(|entry| {
+        entry.is_ok_and(|entry| {
+            !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".docker-client.pending-")
+        })
+    }));
+    Ok(())
+}
+
+#[test]
+fn exact_private_context_claim_is_compatible_without_creating_configuration() -> Result<()> {
+    let (_root, store) = fixture()?;
+    // Claim-free admission remains read-only and permits the separate creator.
+    ManagedMachineDockerContext::require_private_config_compatible(&store)?;
+    let private_path = crate::machine_docker_config::path(&store);
+    assert!(!private_path.exists());
+    let mut expected = claim(&store)?;
+    expected.config_dir = private_path.to_str().context("UTF-8 fixture path")?.into();
+    publish_claim(&store, &expected)?;
+    let claim_path = store.data_path().join(CLAIM);
+    let before = std::fs::read(&claim_path)?;
+    ManagedMachineDockerContext::require_private_config_compatible(&store)?;
+    assert_eq!(std::fs::read(&claim_path)?, before);
+    assert!(
+        !private_path.exists(),
+        "compatibility check must not create config"
+    );
+    assert_eq!(read_claim(&store)?, Some(expected));
+    Ok(())
+}
+
+#[test]
+fn machine_client_reopen_preserves_atomic_auth_update_and_rejects_plugin_drift() -> Result<()> {
+    let (root, store) = fixture()?;
+    let plugin_a = root.path().join("plugins-a");
+    let plugin_b = root.path().join("plugins-b");
+    std::fs::create_dir(&plugin_a)?;
+    std::fs::create_dir(&plugin_b)?;
+    let plugins = vec![plugin_a.canonicalize()?];
+    let client =
+        HostDockerClient::for_machine(Path::new("/usr/bin/true"), &plugins, Arc::clone(&store))?;
+    let path = crate::machine_docker_config::path(&store);
+    assert_eq!(client.config_dir(), path);
+    let config_path = path.join("config.json");
+    let owner_path = path.join("vz-owner.json");
+    let owner_before = std::fs::read(&owner_path)?;
+    let mut value: Value = serde_json::from_slice(&std::fs::read(&config_path)?)?;
+    value["auths"] = json!({"registry.example.invalid": {"auth": "opaque-private-test-auth"}});
+    let replacement = serde_json::to_vec_pretty(&value)?;
+    // Docker's Save replaces the config atomically; ownership must be bound to
+    // the stable directory/claim, not the old mutable credential-file inode.
+    let mut temporary = tempfile::NamedTempFile::new_in(&path)?;
+    temporary.write_all(&replacement)?;
+    temporary.as_file().sync_all()?;
+    temporary.persist(&config_path)?;
+    let reopened =
+        HostDockerClient::for_machine(Path::new("/usr/bin/true"), &plugins, Arc::clone(&store))?;
+    assert_eq!(reopened.config_dir(), path);
+    assert_eq!(std::fs::read(&config_path)?, replacement);
+    assert_eq!(std::fs::read(&owner_path)?, owner_before);
+    let changed = HostDockerClient::for_machine(
+        Path::new("/usr/bin/true"),
+        &[plugin_b.canonicalize()?],
+        Arc::clone(&store),
+    );
+    assert!(changed.is_err());
+    assert_eq!(std::fs::read(&config_path)?, replacement);
+    assert_eq!(std::fs::read(&owner_path)?, owner_before);
+    Ok(())
+}
+
+#[test]
 fn malformed_and_linked_claims_are_not_repaired() -> Result<()> {
     let (root, store) = fixture()?;
     let path = store.data_path().join(CLAIM);
@@ -859,6 +952,80 @@ async fn actual_host_contexts_are_stable_owned_and_preserve_default() -> Result<
     println!(
         "{}",
         json!({"phase":"offline_result","owned_claim_stable":true,"owned_context_deleted":true,"foreign_context_unchanged":true,"default_config_exact_bytes":String::from_utf8_lossy(default_bytes),"engine_connections":0,"vm_started":false,"readiness_or_parity_certified":false})
+    );
+    Ok(())
+}
+
+#[tokio::test]
+#[ignore = "requires explicit actual host Docker client; Machine-private offline context operations only"]
+async fn actual_host_private_configs_keep_context_and_credentials_separate() -> Result<()> {
+    let executable =
+        std::env::var_os("VZ_TEST_HOST_DOCKER").context("explicit host Docker client required")?;
+    ensure!(Path::new(&executable) == Path::new("/usr/local/bin/docker"));
+    let (first_root, first_store) = fixture()?;
+    let (second_root, second_store) = fixture()?;
+    let first =
+        HostDockerClient::for_machine(Path::new(&executable), &[], Arc::clone(&first_store))?;
+    let second =
+        HostDockerClient::for_machine(Path::new(&executable), &[], Arc::clone(&second_store))?;
+    ensure!(first.config_dir() != second.config_dir());
+    let first_socket = first_root.path().join("unused.sock");
+    let second_socket = second_root.path().join("unused.sock");
+    let listeners = [
+        std::os::unix::net::UnixListener::bind(&first_socket)?,
+        std::os::unix::net::UnixListener::bind(&second_socket)?,
+    ];
+    for listener in &listeners {
+        listener.set_nonblocking(true)?;
+    }
+    let first_context =
+        ManagedMachineDockerContext::ensure(&first, Arc::clone(&first_store), &first_socket)
+            .await?;
+    let second_context =
+        ManagedMachineDockerContext::ensure(&second, Arc::clone(&second_store), &second_socket)
+            .await?;
+    first_context.verify(&first).await?;
+    second_context.verify(&second).await?;
+    let peer = first
+        .run(
+            None,
+            &[
+                "context".into(),
+                "inspect".into(),
+                second_context.name().into(),
+            ],
+            None,
+            Duration::from_secs(10),
+        )
+        .await?;
+    ensure!(
+        !peer.status.success(),
+        "private config resolved another Machine context"
+    );
+    let first_before = std::fs::read(first.config_dir().join("config.json"))?;
+    let second_before = std::fs::read(second.config_dir().join("config.json"))?;
+    let reopened =
+        HostDockerClient::for_machine(Path::new(&executable), &[], Arc::clone(&first_store))?;
+    first_context.verify(&reopened).await?;
+    ManagedMachineDockerContext::prepare_existing_delete(
+        Arc::clone(&first_store),
+        None,
+        first.config_dir(),
+        &first_socket,
+    )?
+    .context("private context claim missing")?
+    .remove_exact(&delete_operation(&first_store))?;
+    second_context.verify(&second).await?;
+    ensure!(std::fs::read(first.config_dir().join("config.json"))? == first_before);
+    ensure!(std::fs::read(second.config_dir().join("config.json"))? == second_before);
+    for listener in &listeners {
+        ensure!(
+            matches!(listener.accept(), Err(error) if error.kind() == std::io::ErrorKind::WouldBlock),
+            "offline context operation contacted an Engine endpoint"
+        );
+    }
+    println!(
+        "Machine-private native context creation/reopen/isolation/removal PASS; no Engine contact or registry authentication claimed"
     );
     Ok(())
 }

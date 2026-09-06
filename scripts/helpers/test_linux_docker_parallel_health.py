@@ -117,6 +117,7 @@ class LifecycleTests(unittest.TestCase):
         for path in fixture.iterdir():
             path.chmod(0o600)
         descriptor = {'name': 'owned-context', 'engine_id': 'owned-engine', 'endpoint': 'unix:///owned',
+                      'config_dir': str(root / 'machine-config'),
                       'owner': {'machine_id': 'owned-machine'}}
         image = 'sha256:' + 'a' * 64
         row = {'descriptor': descriptor, 'token': TOKEN, 'tag': TOKEN + ':fixture', 'image_id': image}
@@ -152,6 +153,9 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(selected.thread.is_alive())
         selected.record.run.assert_called_once()
         self.assertEqual(selected.record.run.call_args.args[0], 'http-health')
+        self.assertEqual(selected.record.run.call_args.args[1][0:5],
+                         ['docker', '--config', selected.descriptor['config_dir'], '--context', 'owned-context'])
+        self.assertNotEqual(selected.descriptor['config_dir'], str(h.config))
         self.assertEqual(proof['container_id'], selected.container_id)
         self.assertEqual(h.docker.call_count, 1)
         with self.assertRaises(ValueError):

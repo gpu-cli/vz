@@ -28,7 +28,9 @@ The physical sequence is:
    into `linux/developer` and `linux/container`; generate the installed catalog
    through the daemon's offline installer entry point.
 2. Copy pinned Compose/buildx executable bytes under their proper applet names
-   in an isolated Docker config. Preserve `HOME` unchanged. Clear inherited
+   in an isolated plugin-discovery config. Normal Up creates a separate private
+   client configuration in each Machine's owned store, referencing those plugin
+   directories without copying ambient credentials or helper settings. Preserve `HOME` unchanged. Clear inherited
    Docker routing, proxy, Cargo-daemon, SSH-agent and catalog overrides. Only
    explicit runtime/state/socket and host-client/config isolation overrides
    enter the product invocation.
@@ -38,10 +40,12 @@ The physical sequence is:
 4. Create primary and neighbor named Environments from the same unmodified
    two-Machine project definition: **four concurrent Developer Machines**,
    each with 4 GiB RAM. Require successful Up, ready status, all three negotiated
-   capabilities, exact owned context descriptors and distinct Engine IDs.
+   capabilities, exact owned context descriptors, four distinct owner-derived
+   client configuration directories and distinct Engine IDs.
    Require exactly two Machines in each Environment, the same Project ID,
    distinct Environment IDs and four distinct Developer Machine IDs.
-5. Independently drive the unmodified host clients through those contexts:
+5. Independently drive the unmodified host clients with each descriptor's exact
+   `--config` and `--context` pair:
    immutable rootfs import, container run/exec, Compose single-service exec,
    Buildx `FROM scratch`/`COPY` build, then copy and compare the actual image's
    public payload. No mutable base image, plugin bootstrap, or daemon fallback.
@@ -87,3 +91,8 @@ Offline prerequisite checks (do not execute Docker or VMs):
 /usr/bin/python3 -m unittest discover -s scripts/helpers -p test_installed_developer_startup.py -v
 scripts/run-installed-developer-startup-e2e.sh --help
 ```
+
+Per-Machine credential storage is tracked by `vz-mzs.7.1.9`; the implementation
+and source-backed file-store policy are described in
+[`../../docs/docker-client-credentials.md`](../../docs/docker-client-credentials.md).
+Earlier shared-config candidate passes do not certify this new behavior.

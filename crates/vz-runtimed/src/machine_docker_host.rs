@@ -10,19 +10,35 @@ use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Command;
 
-use crate::machine_runtime_registry::open_trusted_registry_root;
+use crate::machine_docker_config::ManagedMachineDockerConfig;
+use crate::machine_docker_config_policy;
+use crate::machine_runtime_registry::{MachineRuntimeStoreLease, open_trusted_registry_root};
 
 const OUTPUT_LIMIT: u64 = 4 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HostDockerClient {
     executable: PathBuf,
     executable_sha256: String,
     config_dir: PathBuf,
+    managed_config: Option<Arc<ManagedMachineDockerConfig>>,
+    plugin_directories: Vec<PathBuf>,
+}
+
+impl std::fmt::Debug for HostDockerClient {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("HostDockerClient")
+            .field("executable", &self.executable)
+            .field("executable_sha256", &self.executable_sha256)
+            .field("config_dir", &self.config_dir)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -51,13 +67,20 @@ impl HostDockerClient {
     /// Resolve the normal host installation, never another Docker daemon.
     /// An explicit client/config override is authoritative and never falls back.
     pub fn discover() -> Result<Self> {
-        let executable = if let Some(explicit) = std::env::var_os("VZ_DOCKER_CLIENT") {
+        Self::new(
+            &Self::discover_executable()?,
+            &Self::discovery_config_dir()?,
+        )
+    }
+
+    fn discover_executable() -> Result<PathBuf> {
+        if let Some(explicit) = std::env::var_os("VZ_DOCKER_CLIENT") {
             let path = PathBuf::from(explicit);
             ensure!(
                 path.is_absolute(),
                 "VZ_DOCKER_CLIENT must be an absolute executable path"
             );
-            path
+            Ok(path)
         } else {
             let search =
                 std::env::var_os("PATH").context("host Docker client is not configured")?;
@@ -65,14 +88,63 @@ impl HostDockerClient {
                 .filter(|directory| directory.is_absolute())
                 .map(|directory| directory.join("docker"))
                 .find(|path| path.is_file())
-                .context("install a supported host Docker client or set VZ_DOCKER_CLIENT")?
-        };
-        let config = std::env::var_os("VZ_DOCKER_CONFIG")
+                .context("install a supported host Docker client or set VZ_DOCKER_CLIENT")
+        }
+    }
+
+    fn discovery_config_dir() -> Result<PathBuf> {
+        std::env::var_os("VZ_DOCKER_CONFIG")
             .or_else(|| std::env::var_os("DOCKER_CONFIG"))
             .map(PathBuf::from)
             .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker")))
-            .context("host Docker configuration directory is not configured")?;
-        Self::new(&executable, &config)
+            .context("host Docker configuration directory is not configured")
+    }
+
+    /// Discover executable plugins separately from credential storage. No
+    /// ambient config.json, auths, helper setting or current context is copied.
+    pub(crate) fn discover_for_machine(store: Arc<MachineRuntimeStoreLease>) -> Result<Self> {
+        let executable = Self::discover_executable()?;
+        let source = Self::discovery_config_dir()?;
+        ensure!(
+            source.is_absolute(),
+            "Docker plugin source must be absolute"
+        );
+        let plugins = source.join("cli-plugins");
+        let directories = match std::fs::symlink_metadata(&plugins) {
+            Ok(_) => {
+                // Source plugins may use the native installation's trusted
+                // executable ancestry, but never become Machine-owned data.
+                let canonical = std::fs::canonicalize(&plugins)?;
+                open_executable_parent(&canonical)?;
+                vec![canonical]
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+            Err(error) => return Err(error.into()),
+        };
+        Self::for_machine(&executable, &directories, store)
+    }
+
+    pub(crate) fn for_machine(
+        executable: &Path,
+        plugin_directories: &[PathBuf],
+        store: Arc<MachineRuntimeStoreLease>,
+    ) -> Result<Self> {
+        // Authenticate the executable before publishing any Machine state.
+        let executable = std::fs::canonicalize(executable)?;
+        executable_digest(&executable)?;
+        for directory in plugin_directories {
+            open_executable_parent(directory)?;
+        }
+        crate::machine_docker_context::ManagedMachineDockerContext::require_private_config_compatible(
+            &store,
+        )?;
+        let initial = machine_docker_config_policy::initial_config(plugin_directories)?;
+        let managed = Arc::new(ManagedMachineDockerConfig::ensure(store, &initial)?);
+        machine_docker_config_policy::validate_config(&managed.read_config()?, plugin_directories)?;
+        let mut client = Self::new(&executable, managed.path())?;
+        client.managed_config = Some(managed);
+        client.plugin_directories = plugin_directories.to_vec();
+        Ok(client)
     }
 
     pub fn new(executable: &Path, config_dir: &Path) -> Result<Self> {
@@ -110,6 +182,8 @@ impl HostDockerClient {
             executable,
             executable_sha256,
             config_dir: config_dir.into(),
+            managed_config: None,
+            plugin_directories: Vec::new(),
         })
     }
 
@@ -165,6 +239,12 @@ impl HostDockerClient {
             "host Docker executable changed"
         );
         validate_config(&self.config_dir)?;
+        if let Some(managed) = &self.managed_config {
+            machine_docker_config_policy::validate_config(
+                &managed.read_config()?,
+                &self.plugin_directories,
+            )?;
+        }
         let mut command = Command::new(&self.executable);
         command.as_std_mut().arg0("docker").process_group(0);
         command

@@ -19,6 +19,7 @@ use vz_runtime_contract::{
 
 use crate::RuntimeDaemon;
 use crate::environment_runtime_controller::EnvironmentControllerLease;
+use crate::machine_docker_config::ManagedMachineDockerConfig;
 use crate::machine_docker_context::{
     ManagedMachineDockerContext, PreparedMachineDockerContextDelete,
 };
@@ -168,15 +169,6 @@ impl RuntimeDaemon {
                 .validate_against_environment(&environment)
                 .map_err(|e| conflict(&input, e))?;
         }
-        let config_dir = if environment
-            .machines
-            .iter()
-            .any(|m| m.target.os == OperatingSystem::Linux)
-        {
-            docker_config_dir(&input)?
-        } else {
-            PathBuf::new()
-        };
         let mut prepared = Vec::new();
         for machine in &environment.machines {
             let owner = ResourceOwner {
@@ -211,6 +203,16 @@ impl RuntimeDaemon {
                 let socket =
                     MachineDockerEndpoint::socket_path_for(&self.config.runtime_data_dir, &owner)
                         .map_err(|e| conflict(&input, e))?;
+                // Private configuration is authorized by the retained Machine
+                // store, never by an ambient path or the public descriptor.
+                // Only old DEV claims retain the original shared-config path
+                // admission; their host credentials are never owned/deleted.
+                let config_dir = match ManagedMachineDockerConfig::open_existing(Arc::clone(lease))
+                    .map_err(|e| conflict(&input, e))?
+                {
+                    Some(config) => config.path().to_path_buf(),
+                    None => docker_config_dir(&input)?,
+                };
                 ManagedMachineDockerContext::prepare_existing_delete(
                     Arc::clone(lease),
                     machine.docker_context.as_ref(),

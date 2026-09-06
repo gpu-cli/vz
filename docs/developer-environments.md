@@ -149,7 +149,11 @@ context. A multi-Machine Environment therefore has multiple independent Docker
 engines and contexts; it never collapses them onto one shared daemon.
 
 Host `docker`, `docker compose`, and `docker buildx` select an exact
-`(environment_id, machine_id)` through the context returned by `vz status`.
+`(environment_id, machine_id)` through both the configuration directory and
+context returned by `vz status`: `docker --config <config_dir> --context <name>`.
+Each Machine owns its client credentials as well as its Engine. A context name
+alone does not select a credential scope. Ambient host credentials and native
+keychain/helper defaults must not be inherited by another Machine.
 vz never changes Docker's global default context and never falls back to Docker
 Desktop, a system daemon, another Machine, or another Environment. There is no
 global `~/.vz/docker.sock` and no Environment-wide `DOCKER_HOST` selector.
