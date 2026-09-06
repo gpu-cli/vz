@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import sys
 import time
 from types import SimpleNamespace
 
@@ -61,7 +62,7 @@ def build_arguments(inputs, selected, tag):
 
 
 class Lifecycle(driver.Driver):
-    def __init__(self, inputs, base_fixture, output, selected):
+    def __init__(self, inputs, base_fixture, output, selected, *, tmux_path, terminal_pins):
         super().__init__(inputs, base_fixture, output)
         self.selected = selected
         fixture.fixture_contract(selected)
@@ -81,6 +82,10 @@ class Lifecycle(driver.Driver):
         self.term_started = None
         self.events_since = None
         self.baseline = None
+        self._tmux_path = tmux_path
+        self.terminal_owner = None
+        self._terminal_pins = dict(terminal_pins)
+        self.tmux_proof = None
 
     def step(self, label, args, *, expected=0, timeout=30, plan=None):
         # Append intent before the command; incomplete steps cannot disappear
@@ -171,6 +176,47 @@ class Lifecycle(driver.Driver):
         return interactive.validate_recorded(self.output, result.index, argv=argv,
             executable=self.inputs.raw['clients']['docker']['path'], env=self.env,
             expected_exit=expected, expected_plan=plan)
+
+    def tmux(self):
+        from linux_docker_container_tmux import run_tmux
+        self.verify_terminal_pins()
+        first = self.record.count + 1
+        def register(owner):
+            require(self.terminal_owner is None, 'terminal owner already registered')
+            self.terminal_owner = owner
+        proof = run_tmux(self, self.containers['service']['cid'], self.token,
+            tmux_path=self._tmux_path, service_guard=self.service_guard, register_owner=register)
+        self.tmux_proof = self.tmux_window(first, proof)
+        self.verify_terminal_pins()
+        return self.tmux_proof
+
+    def verify_terminal_pins(self):
+        import linux_docker_container_tmux as terminal
+        paths = (Path(self._tmux_path), Path(sys.executable).resolve(strict=True),
+                 Path(terminal.__file__).resolve(), Path(terminal.core.__file__).resolve(),
+                 Path(terminal.core.capture.__file__).resolve())
+        require(self._terminal_pins == {str(p): driver.sha256(driver.regular(p, 64 * 1024 * 1024))
+                                       for p in paths}, 'terminal inputs differ from original admission')
+
+    def tmux_window(self, first, proof):
+        # The separate server ledger cannot select its own service-generation
+        # window. Both source-selected guards contribute five main commands:
+        # explicit Machine guard, service_guard's Machine guard, then inspect.
+        require(type(first) is int and first > 0 and self.record.count == first + 9 and
+                len(self.record.receipts) == self.record.count, 'terminal guard interval missing')
+        rows = self.record.receipts[first - 1:]
+        previous_end = 0
+        for index, row in enumerate(rows, first):
+            start, elapsed = row.get('started_unix_ns'), row.get('elapsed_ns')
+            require(type(row.get('index')) is int and row['index'] == index and
+                    type(start) is int and start > 0 and type(elapsed) is int and elapsed >= 0 and
+                    previous_end <= start, 'terminal guard timestamps differ')
+            previous_end = start + elapsed
+        start, end = proof.get('started_unix_ns'), proof.get('finished_unix_ns')
+        require(type(start) is int and type(end) is int and
+                rows[4]['started_unix_ns'] + rows[4]['elapsed_ns'] <= start <= end <=
+                rows[5]['started_unix_ns'], 'terminal execution escaped service-generation guards')
+        return proof | {'guard_first_command': first, 'guard_last_command': self.record.count}
 
     def attach(self):
         row = self.create('attach', ['-u', '-c', ATTACH_START, self.token], interactive_input=True, entrypoint='python3')
@@ -348,6 +394,7 @@ class Lifecycle(driver.Driver):
                       engine_id=self.inputs.scope['engine_id'], start_acknowledged=True)
         health = self.health()
         self.io_observations = run_exec_io(self, row['cid'], self.token, service_guard=self.service_guard)
+        terminal = self.tmux()
         self.service_guard()
         attached = self.attach()
         stdin = self.run_case('stdin', ['stream', self.token], 37,
@@ -384,7 +431,7 @@ class Lifecycle(driver.Driver):
         self.workload_complete = True
         return {'scope': 'DEV_CONTAINER_LIFECYCLE_WORKLOAD_NOT_RELEASE_CERTIFICATION',
                 'health': health, 'exec_io': self.io_observations, 'attach': attached, 'stdin': stdin, 'exits': exits,
-                'follow': followed,
+                'follow': followed, 'tmux': terminal,
                 'remaining_acceptance': ['full-process-runtime-inventory', 'aggregate-release-integration']}
 
     def cleanup(self):
@@ -393,6 +440,11 @@ class Lifecycle(driver.Driver):
                 all(not x['effects_uncertain'] for x in self.record.receipts), 'unresolved lifecycle workload')
         require(self.follower is not None and not self.follower.follow_thread.is_alive() and
                 all(not x['effects_uncertain'] for x in self.follower.record.receipts), 'unresolved follower')
+        owner = self.terminal_owner
+        require(self.tmux_proof is not None and owner is not None and
+                type(owner.pending) is list and not owner.pending and owner.server is not None and
+                type(owner.server.returncode) is int and owner.server.returncode == 0,
+                'unresolved terminal owner')
         events = None
         for role, row in reversed(list(self.containers.items())):
             raw = self.step('cleanup-inspect-' + role, ['container', 'inspect', row['cid']])
@@ -475,6 +527,9 @@ class ReplayLifecycle(Lifecycle):
         self.workload_complete = False
         self.follower = self.follow_proof = self.term_generation = self.term_started = None
         self.events_since = self.baseline = None
+        self._tmux_path = live._tmux_path
+        self._terminal_pins = dict(live._terminal_pins)
+        self.terminal_owner = self.tmux_proof = None
         self.record = ReplayRecord(self.output)
         self.expected_count = live.record.count
         require(json.loads(driver.regular(self.output / 'inputs.json')) == self.inputs.raw, 'foreign lifecycle inputs')
@@ -544,6 +599,25 @@ class ReplayLifecycle(Lifecycle):
                                             *(r['receipt'] for r in last['commands'])]))
         return self.follow_proof
 
+    def tmux(self):
+        from linux_docker_container_tmux import replay_tmux
+        self.verify_terminal_pins()
+        first = self.record.count + 1
+        cid = self.containers['service']['cid']
+        self.guard(); self.service_guard(cid, self.token)
+        root = self.output / 'tmux'
+        proof = replay_tmux(root, self.inputs.raw, cid, self.token,
+                            environment=self.env, tmux_path=self._tmux_path)
+        require(proof == interactive.parse(driver.regular(root / 'proof.json')),
+                'retained terminal proof differs from raw replay')
+        self.guard(); self.service_guard(cid, self.token)
+        self.tmux_proof = self.tmux_window(first, proof)
+        # This inert owner represents only the positively validated raw server
+        # disposition. Replay never polls, signals, launches or deletes.
+        self.verify_terminal_pins()
+        self.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
+        return self.tmux_proof
+
 
 def command_indices(output):
     result = []
@@ -571,12 +645,17 @@ def replay(live, *, cleanup):
 
 def run_machine(harness, descriptor, scope, proof, images, index):
     from linux_docker_e2e import input_mapping
+    import linux_docker_container_tmux as terminal
     inputs = input_mapping(harness, scope, proof, images)
     admitted = driver.Inputs(inputs, suite='compose')
     admitted.verify_runtime_evidence()
+    terminal_paths = (harness.info['tmux']['path'], str(Path(sys.executable).resolve(strict=True)),
+                      str(Path(terminal.__file__).resolve()), str(Path(terminal.core.__file__).resolve()),
+                      str(Path(terminal.core.capture.__file__).resolve()))
     selected = Lifecycle(admitted, Path(harness.info['fixture']),
                          harness.evidence / ('container-machine-' + str(index)),
-                         Path(harness.info['container_fixture']))
+                         Path(harness.info['container_fixture']), tmux_path=harness.info['tmux']['path'],
+                         terminal_pins={p: harness.info['inputs'][p] for p in terminal_paths})
     harness.drivers.append(selected)
     harness.driver_cleanup_verified.append(False)
     position = len(harness.drivers) - 1

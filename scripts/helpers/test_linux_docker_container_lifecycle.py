@@ -33,6 +33,8 @@ def bare():
     value.record = SimpleNamespace(receipts=[], acknowledge_negative=Mock())
     value.workload_complete = False
     value.follower = None
+    value.terminal_owner = None
+    value.tmux_proof = None
     return value
 
 
@@ -185,6 +187,8 @@ class SourcePlanTests(unittest.TestCase):
             value = bare(); value.workload_complete = True
             value.follower = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
                                             record=SimpleNamespace(receipts=[]))
+            value.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
+            value.tmux_proof = {'inert_test': True}
             value.containers = {'service': {'name': TOKEN+'-service', 'cid': CID}}
             item = {'Id': CID, 'Name': '/'+TOKEN+'-service', 'Image': IMAGE,
                     'Config': {'Labels': {lane.LABEL: TOKEN}}, 'State': {'Running': False, 'Pid': 0}}
@@ -194,6 +198,53 @@ class SourcePlanTests(unittest.TestCase):
                 value.cleanup()
             self.assertEqual(value.step.call_count, 1)
             self.assertEqual(value.step.call_args.args[1], ['container', 'inspect', CID])
+
+    def test_cleanup_refuses_missing_or_unresolved_terminal_before_dispatch(self):
+        for kind in ('missing', 'pending', 'live', 'signal', 'bool', 'proof'):
+            value = bare(); value.workload_complete = True
+            value.follower = SimpleNamespace(follow_thread=SimpleNamespace(is_alive=lambda: False),
+                                            record=SimpleNamespace(receipts=[]))
+            value.terminal_owner = SimpleNamespace(pending=[], server=SimpleNamespace(returncode=0))
+            value.tmux_proof = {'inert_test': True}
+            if kind == 'missing': value.terminal_owner = None
+            if kind == 'pending': value.terminal_owner.pending = [object()]
+            if kind in ('live', 'signal', 'bool'):
+                value.terminal_owner.server.returncode = {'live': None, 'signal': -15, 'bool': False}[kind]
+            if kind == 'proof': value.tmux_proof = None
+            value.step = Mock(side_effect=AssertionError('cleanup dispatched'))
+            with self.subTest(kind=kind), self.assertRaises(ValueError): value.cleanup()
+            value.step.assert_not_called()
+
+    def test_tmux_external_window_rejects_self_selected_clock_and_missing_guards(self):
+        value = bare(); value.record.count = 10
+        rows = [{'index': i, 'started_unix_ns': i*100, 'elapsed_ns': 10} for i in range(1, 11)]
+        value.record.receipts = rows
+        proof = {'started_unix_ns': 510, 'finished_unix_ns': 600}
+        self.assertEqual(value.tmux_window(1, proof), proof | {'guard_first_command': 1, 'guard_last_command': 10})
+        for key, changed in [('started_unix_ns', 509), ('finished_unix_ns', 601),
+                             ('started_unix_ns', 601), ('started_unix_ns', True)]:
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                value.tmux_window(1, proof | {key: changed})
+        for key, changed in [('index', True), ('started_unix_ns', 499), ('elapsed_ns', -1)]:
+            value.record.receipts = [dict(row) for row in rows]
+            value.record.receipts[5][key] = changed
+            with self.subTest(key=key), self.assertRaises(ValueError): value.tmux_window(1, proof)
+        value.record.receipts = rows[:-1]
+        with self.assertRaises(ValueError): value.tmux_window(1, proof)
+
+    def test_tmux_owner_retained_before_adapter_failure(self):
+        value = bare(); value.record.count = 0; value._tmux_path = '/owned/tmux'
+        value.verify_terminal_pins = Mock(); value.containers = {'service': {'cid': CID}}
+        owner = SimpleNamespace(pending=[object()], server=object())
+        def run(item, cid, token, **kwargs):
+            self.assertIs(item, value); self.assertEqual((cid, token), (CID, TOKEN))
+            self.assertEqual(kwargs['tmux_path'], '/owned/tmux')
+            kwargs['register_owner'](owner)
+            raise ValueError('owned terminal failed')
+        with patch('linux_docker_container_tmux.run_tmux', side_effect=run), self.assertRaises(ValueError):
+            value.tmux()
+        self.assertIs(value.terminal_owner, owner)
+        self.assertIsNone(value.tmux_proof)
 
     def test_container_inventory_and_engine_time_bounds(self):
         self.assertEqual(lane.container_ids((CID+'\n'+'b'*64+'\n').encode()), [CID, 'b'*64])
@@ -276,6 +327,7 @@ class ReplayTests(unittest.TestCase):
         data = inputs(); (self.root/'inputs.json').write_text(json.dumps(data))
         self.live = SimpleNamespace(inputs=SimpleNamespace(raw=data, scope=data['scope']), output=self.root,
                                     fixture=fixture.FIXTURE, selected=fixture.FIXTURE, env={},
+                                    _tmux_path='/owned/tmux', _terminal_pins={},
                                     record=SimpleNamespace(count=0), steps=[])
         self.recorder = driver.Recorder(self.root, {}, [])
 
@@ -300,6 +352,34 @@ class ReplayTests(unittest.TestCase):
             selected = lane.ReplayLifecycle(self.live)
             with self.assertRaises(ValueError):
                 selected.step(label, args)
+
+    def test_terminal_replay_consumes_guards_without_launch_or_write(self):
+        selected = lane.ReplayLifecycle(self.live)
+        selected.containers = {'service': {'cid': CID}}
+        selected.verify_terminal_pins = Mock()
+        events = []
+        def guard_rows(count, label):
+            events.append(label)
+            for _ in range(count):
+                selected.record.count += 1
+                i = selected.record.count
+                selected.record.receipts.append({'index': i, 'started_unix_ns': i*100, 'elapsed_ns': 10})
+        selected.guard = lambda: guard_rows(2, 'machine')
+        selected.service_guard = lambda cid, token: guard_rows(3, 'service')
+        proof = {'started_unix_ns': 510, 'finished_unix_ns': 600}
+        (self.root/'tmux').mkdir(); (self.root/'tmux/proof.json').write_text(json.dumps(proof))
+        def raw(*args, **kwargs):
+            events.append('replay'); self.assertEqual(args, (self.root/'tmux', self.live.inputs.raw, CID, selected.token))
+            self.assertEqual(kwargs, {'environment': {}, 'tmux_path': '/owned/tmux'})
+            return proof
+        with patch('linux_docker_container_tmux.replay_tmux', side_effect=raw), \
+             patch('linux_docker_container_tmux.run_tmux', side_effect=AssertionError('launch')), \
+             patch.object(lane.startup, 'document', side_effect=AssertionError('write')):
+            result = selected.tmux()
+        self.assertEqual(events, ['machine', 'service', 'replay', 'machine', 'service'])
+        self.assertEqual(result['guard_last_command'], 10)
+        self.assertEqual(selected.terminal_owner.server.returncode, 0)
+        self.assertEqual(selected.verify_terminal_pins.call_count, 2)
 
     def test_replay_negative_ack_is_exact_and_does_not_rewrite_raw(self):
         args = ['exec', CID, 'true']; command = self.record(args, exit=37)

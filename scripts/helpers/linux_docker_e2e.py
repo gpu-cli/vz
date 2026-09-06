@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import stat
 import sys
 import threading
 import time
@@ -36,7 +37,7 @@ require = driver.require
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
-             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture")
+             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
@@ -54,9 +55,12 @@ def arguments(argv):
     parser.add_argument("--ssh-packages")
     parser.add_argument("--ssh-gpgv")
     parser.add_argument("--container-fixture")
+    parser.add_argument("--tmux")
     args = parser.parse_args(argv)
     require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
     require(args.container_fixture is None or args.suite == "lifecycle", "container-fixture requires the lifecycle suite")
+    require((args.tmux is not None) == (args.suite == "lifecycle"),
+            "--tmux is required only for the lifecycle suite")
     require(args.parallel_fixture is None or args.suite == "parallel", "parallel-fixture requires the parallel suite")
     require(args.suite == "ssh" or all(getattr(args, name) is None for name in ("ssh_fixture", "ssh_packages", "ssh_gpgv")),
             "SSH options require the ssh suite")
@@ -73,6 +77,9 @@ def arguments(argv):
 
 def preflight(args, require_host=True):
     require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full contract unavailable")
+    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
+            "--tmux is required only for the lifecycle suite")
+    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
@@ -151,16 +158,37 @@ def preflight(args, require_host=True):
                                      str(REPO / "tests/fixtures/vz-0.4/docker-container-io"))
         fixture_contract(selected)
         info.update(container_fixture=str(selected), container_fixture_sha256=driver.tree_digest(selected))
+        info['tmux'] = terminal
+        info['inputs'][terminal['path']] = terminal['sha256']
+        python = startup.canonical(sys.executable, links=True)
+        info['inputs'][str(python)] = startup.digest(python)
         for name in ("linux_docker_container_lifecycle.py", "linux_docker_container_state.py",
                      "linux_docker_container_commands.py", "linux_docker_container_fixture.py",
                      "linux_docker_container_exec.py", "linux_docker_container_follow.py",
                      "linux_docker_interactive_capture.py", "linux_docker_interactive_evidence.py",
+                     "linux_docker_container_tmux.py", "linux_docker_interactive_tmux.py",
                      "linux_docker_buildkit_shutdown.py"):
             path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
         for path in selected.iterdir():
             info["inputs"][str(path)] = startup.digest(path)
     return info
+
+
+def tmux_input(value):
+    """Pin an explicitly selected executable without running it or searching PATH."""
+    path = startup.canonical(value)
+    before = path.lstat()
+    require(stat.S_ISREG(before.st_mode) and before.st_nlink == 1 and
+            0 < before.st_size <= 64 * 1024 * 1024 and os.access(path, os.X_OK),
+            'tmux requires a bounded single-link regular executable')
+    digest = startup.digest(path)
+    after = path.lstat()
+    signature = lambda row: (row.st_dev, row.st_ino, row.st_mode, row.st_nlink, row.st_uid,
+                             row.st_size, row.st_mtime_ns, row.st_ctime_ns)
+    require(signature(before) == signature(after) and path == path.resolve(strict=True),
+            'tmux executable changed during admission')
+    return {'path': str(path), 'sha256': digest}
 
 
 def public_ca_input(path):
@@ -558,6 +586,14 @@ class ComposeHarness(startup.Harness):
         for selected in self.drivers:
             follower = getattr(selected, "follow_thread", None)
             require(follower is None or not follower.is_alive(), "live log follower prevents cleanup")
+            owner = getattr(selected, 'terminal_owner', None)
+            if owner is not None:
+                require(type(getattr(owner, 'pending', None)) is list and not owner.pending,
+                        'pending tmux control process prevents cleanup')
+                require(hasattr(owner, 'server'), 'unknown tmux server ownership prevents cleanup')
+                server = owner.server
+                require(server is None or (type(server.returncode) is int and server.returncode == 0),
+                        'tmux server lacks normal exit; prevents cleanup')
         require(all(not getattr(record, "pending_interactions", []) for record in recorders),
                 "pending interactive process prevents cleanup")
         require(not self.effects_uncertain and all(not any(x["effects_uncertain"] for x in r.receipts) for r in recorders),

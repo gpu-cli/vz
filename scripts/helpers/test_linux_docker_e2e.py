@@ -3,6 +3,7 @@ import contextlib
 import copy
 import io
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -17,6 +18,7 @@ import linux_docker_e2e as gate
 class AdmissionTests(unittest.TestCase):
     def test_lifecycle_admission_requires_no_external_builder_and_scopes_fixture_option(self):
         common = [part for name in gate.startup.OPTIONS for part in ('--'+name, '/owned/value')]
+        common += ['--tmux', '/owned/tmux']
         args = gate.arguments(['--suite', 'lifecycle', *common])
         self.assertIsNone(args.buildkit_archive)
         self.assertIsNone(args.container_fixture)
@@ -32,9 +34,10 @@ class AdmissionTests(unittest.TestCase):
 
     def test_lifecycle_preflight_freezes_transitive_helpers_and_both_fixtures(self):
         args = types.SimpleNamespace(suite='lifecycle', fixture='/owned/base', image_input='/owned/pin',
-            buildkit_archive=None, run_id='lifecycle-owned')
+            buildkit_archive=None, run_id='lifecycle-owned', tmux='/owned/tmux')
         with patch.object(gate.startup, 'preflight', return_value={'inputs': {}}), \
-                patch.object(gate.startup, 'canonical', side_effect=Path), \
+                patch.object(gate.startup, 'canonical', side_effect=lambda value, **kwargs: Path(value)), \
+                patch.object(gate, 'tmux_input', return_value={'path': '/owned/tmux', 'sha256': 'tmux-hash'}), \
                 patch.object(gate.startup, 'digest', side_effect=lambda path: str(path)), \
                 patch.object(gate.image_input, 'load', return_value={}), \
                 patch.object(gate, 'public_ca_input', return_value={}), \
@@ -52,16 +55,21 @@ class AdmissionTests(unittest.TestCase):
                      'linux_docker_container_commands.py', 'linux_docker_container_fixture.py',
                      'linux_docker_container_exec.py', 'linux_docker_container_follow.py',
                      'linux_docker_interactive_capture.py', 'linux_docker_interactive_evidence.py',
+                     'linux_docker_container_tmux.py', 'linux_docker_interactive_tmux.py',
                      'linux_docker_buildkit_shutdown.py', 'linux_docker_image_input.py',
                      'linux_docker_compose_evidence.py'):
             self.assertIn(str(gate.REPO/'scripts/helpers'/name), info['inputs'])
         for name in ('Dockerfile', 'README.md', 'contract.json', 'probe.py', 'test_probe.py'):
             self.assertIn(str(selected/name), info['inputs'])
+        self.assertEqual(info['tmux'], {'path': '/owned/tmux', 'sha256': 'tmux-hash'})
+        self.assertEqual(info['inputs']['/owned/tmux'], 'tmux-hash')
+        self.assertIn(str(Path(gate.sys.executable)), info['inputs'])
 
     def test_lifecycle_fixture_rejection_prevents_runtime_dispatch(self):
         args = types.SimpleNamespace(suite='lifecycle', fixture='/owned/base', image_input='/owned/pin',
-            buildkit_archive=None, run_id='lifecycle-owned', container_fixture='/foreign/fixture')
+            buildkit_archive=None, run_id='lifecycle-owned', container_fixture='/foreign/fixture', tmux='/owned/tmux')
         with patch.object(gate.startup, 'preflight', return_value={'inputs': {}}), \
+                patch.object(gate, 'tmux_input', return_value={'path': '/owned/tmux', 'sha256': 'tmux-hash'}), \
                 patch.object(gate.startup, 'canonical', side_effect=Path), \
                 patch.object(gate.startup, 'digest', return_value='hash'), \
                 patch.object(gate.image_input, 'load', return_value={}), \
@@ -71,6 +79,50 @@ class AdmissionTests(unittest.TestCase):
                 patch.object(gate, 'run') as run:
             with self.assertRaisesRegex(ValueError, 'fixture rejected'): gate.preflight(args, require_host=False)
             run.assert_not_called()
+
+    def test_tmux_required_explicitly_only_for_lifecycle_before_preflight(self):
+        with self.assertRaisesRegex(ValueError, '--tmux'):
+            gate.arguments(['--suite', 'lifecycle'])
+        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh'):
+            with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, '--tmux'):
+                gate.arguments(['--suite', suite, '--tmux', '/owned/tmux'])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            gate.arguments(['--suite', 'lifecycle', '--tmux=a', '--tmux=b'])
+        with patch.object(gate.startup, 'preflight') as startup:
+            for suite, tmux in (('lifecycle', None), ('compose', '/owned/tmux'), ('all', '/owned/tmux')):
+                with self.subTest(suite=suite), self.assertRaises(ValueError):
+                    gate.preflight(types.SimpleNamespace(suite=suite, tmux=tmux), require_host=False)
+            startup.assert_not_called()
+
+    def test_tmux_input_is_canonical_regular_executable_and_stable(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary).resolve()
+            tool = root/'tmux'; tool.write_bytes(b'public inert executable fixture'); tool.chmod(0o700)
+            self.assertEqual(gate.tmux_input(str(tool)), {'path': str(tool), 'sha256': driver.sha256(tool.read_bytes())})
+            alias = root/'alias'; alias.symlink_to(tool)
+            for path in (alias, root, Path('tmux')):
+                with self.subTest(path=path), self.assertRaises(ValueError):
+                    gate.tmux_input(str(path))
+            tool.chmod(0o600)
+            with self.assertRaises(ValueError): gate.tmux_input(str(tool))
+            tool.chmod(0o700)
+            linked = root/'linked'; os.link(tool, linked)
+            with self.assertRaises(ValueError): gate.tmux_input(str(tool))
+            linked.unlink()
+            fifo = root/'fifo'; os.mkfifo(fifo)
+            with self.assertRaises(ValueError): gate.tmux_input(str(fifo))
+            original = gate.startup.digest
+            def mutate(path):
+                value = original(path); path.chmod(0o500); return value
+            with patch.object(gate.startup, 'digest', side_effect=mutate), self.assertRaisesRegex(ValueError, 'changed'):
+                gate.tmux_input(str(tool))
+
+    def test_bad_tmux_stops_before_startup_preflight(self):
+        with patch.object(gate, 'tmux_input', side_effect=ValueError('bad tmux')), \
+             patch.object(gate.startup, 'preflight') as startup:
+            with self.assertRaisesRegex(ValueError, 'bad tmux'):
+                gate.preflight(types.SimpleNamespace(suite='lifecycle', tmux='/bad/tmux'), require_host=False)
+            startup.assert_not_called()
 
     def test_artifact_helpers_are_hashed_only_for_explicit_artifacts_suite(self):
         names = ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
@@ -571,6 +623,30 @@ class BuildDispatchTests(unittest.TestCase):
 
 
 class UncertaintyTests(unittest.TestCase):
+    def test_pending_or_unreaped_tmux_owner_blocks_cleanup_without_polling(self):
+        for pending, code in (([object()], 0), ([], None), ([], 1), ([], -15), ([], False)):
+            h = self.harness()
+            server = Mock(returncode=code)
+            owner = types.SimpleNamespace(pending=pending, server=server)
+            h.drivers = [types.SimpleNamespace(terminal_owner=owner,
+                record=types.SimpleNamespace(receipts=[], pending_interactions=[]))]
+            h.driver_cleanup_verified = [True]
+            with self.subTest(code=code), self.assertRaisesRegex(ValueError, 'tmux'):
+                h.remove_owned()
+            h.docker.assert_not_called()
+            server.poll.assert_not_called(); server.wait.assert_not_called(); server.terminate.assert_not_called()
+
+    def test_normal_retired_tmux_owner_does_not_bypass_driver_cleanup_flags(self):
+        for server in (None, types.SimpleNamespace(returncode=0)):
+            h = self.harness()
+            h.drivers = [types.SimpleNamespace(terminal_owner=types.SimpleNamespace(pending=[], server=server),
+                record=types.SimpleNamespace(receipts=[], pending_interactions=[]))]
+            h.driver_cleanup_verified = [True]
+            h.assert_certain()
+            h.driver_cleanup_verified = [False]
+            with self.assertRaisesRegex(ValueError, 'cleanup lacks'):
+                h.assert_certain()
+
     def test_live_follower_and_pending_capture_prevent_cleanup_despite_verified_flags(self):
         for live, pending in ((True, []), (False, [object()])):
             h = self.harness()
@@ -635,7 +711,7 @@ class UncertaintyTests(unittest.TestCase):
 
     def test_driver_uncertainty_prevents_cleanup(self):
         h = self.harness()
-        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": True}], pending_interactions=[]))]
+        h.drivers = [Mock(follow_thread=None, terminal_owner=None, record=Mock(receipts=[{"effects_uncertain": True}], pending_interactions=[]))]
         h.driver_cleanup_verified = [True]
         with self.assertRaisesRegex(driver.Rejected, "uncertain"):
             h.remove_owned()
@@ -646,7 +722,7 @@ class UncertaintyTests(unittest.TestCase):
                              (2, [True]), (2, [True, False]), (2, [False, True])):
             with self.subTest(drivers=count, verified=flags):
                 h = self.harness()
-                h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(count)]
+                h.drivers = [Mock(follow_thread=None, terminal_owner=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(count)]
                 h.driver_cleanup_verified = flags
                 # An owned object ensures the test catches any cleanup dispatch,
                 # not merely successful return from an empty ownership loop.
@@ -661,7 +737,7 @@ class UncertaintyTests(unittest.TestCase):
 
     def test_all_driver_cleanup_proofs_allow_exact_owned_parent_removal(self):
         h = self.harness()
-        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(2)]
+        h.drivers = [Mock(follow_thread=None, terminal_owner=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[])) for _ in range(2)]
         h.driver_cleanup_verified = [True, True]
         descriptor = {"name": "exact-context"}
         image_id = "sha256:" + "a" * 64
@@ -678,7 +754,7 @@ class UncertaintyTests(unittest.TestCase):
         calls = []
         h.builders = [Mock(remove_owned=Mock(side_effect=lambda: calls.append("first"))),
                       Mock(remove_owned=Mock(side_effect=lambda: calls.append("second")))]
-        h.drivers = [Mock(follow_thread=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[]))]
+        h.drivers = [Mock(follow_thread=None, terminal_owner=None, record=Mock(receipts=[{"effects_uncertain": False}], pending_interactions=[]))]
         h.driver_cleanup_verified = [False]
         with self.assertRaisesRegex(driver.Rejected, "independent replay"):
             h.remove_owned()

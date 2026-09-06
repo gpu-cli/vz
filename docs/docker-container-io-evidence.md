@@ -3,7 +3,8 @@
 Tracked by `vz-mzs.7.1.6`. This is test infrastructure for the 16
 `docker.container.*` scenarios, not a completed Docker compatibility lane.
 The installed lifecycle dispatcher is available as the explicit DEV
-`run-linux-docker-e2e.sh --suite lifecycle` slice; its physical Docker acceptance
+`run-linux-docker-e2e.sh --suite lifecycle --tmux /absolute/canonical/tmux` slice
+(alongside its required installed-client and guest-bundle options); its physical Docker acceptance
 remains unfinished. `--suite all` still rejects before provisioning.
 
 ## Implemented capture boundary
@@ -79,6 +80,17 @@ and must observe the exact ready prefixes before the source-selected TERM
 command begins. Attach uses a public kickoff byte to prevent output racing ahead
 of attachment, and explicitly requests stdin attachment for Docker's
 `StdinOnce` EOF behavior.
+
+The Docker-backed tmux adapter now launches the exact Machine-context Docker
+`exec --interactive --tty` invocation inside an owned foreground tmux server.
+It reuses the local smoke's terminal interactions, but launches the frozen probe
+inside the authenticated service container, not host Python. Original admission
+pins bind tmux, Python, Docker and the helper sources. Independent raw replay
+requires the ready/resize/done records, pane exit 37, normal server exit/reap,
+socket retirement and no fallback. Ten source-selected Machine/service guard
+commands bracket the separate terminal ledger; unresolved children prevent
+cleanup. The terminal-testing skill informed these interaction and exit-state
+checks. This integration still needs its physical Docker run.
 
 The physical run must still establish these assertions. Numeric fixture exits
 alone cannot prove signal handling. Require three tested Machines, four continuous sentinels,
@@ -166,3 +178,61 @@ guest dimensions, terminal flags, and `isatty` values at entry, then implement
 and verify the runtime correction with rebuilt guest artifacts and the backend
 gate. Do not add a wait or relax the frozen probe merely to obtain a passing
 candidate.
+
+## Diagnostic candidate 2 and runtime correction
+
+Source `4eec3f3e` adds a failure-only observer around the unchanged probe. It
+records the rejected predicate's function/line and public terminal observations,
+then preserves the original rejection and exit code. It introduces no waits,
+terminal repair, accepted fallback, or additional successful output. All 80
+container-focused tests passed before the fresh installed-Mac run.
+
+Candidate 2, using the same old guest bundles, failed at command 110 with an
+explicit `check: size`, line 82, `rows: 0`, `cols: 0`, and
+`isatty: [true, true, true]` record. This confirms the probe actually encountered
+zero initial kernel PTY dimensions, rather than merely suggesting it from the
+runtime source. The original probe still returned 70. Evidence under
+`.artifacts/linux-docker-lifecycle-candidate-2` contains 2,953 payloads /
+3,510,053 bytes; manifest SHA-256
+`893c9ba637f674b0ac2ea354fcee13e2a8efae0b90eb745878b4682c3f8a93c4`.
+
+Its separately verified exact-owner disposition again stopped all four Machines
+with clean-journal receipts, observed graceful daemon shutdown, and preserved
+Docker defaults, objects, disks, and the failed outcome. The 500 payloads /
+580,109 bytes in `.artifacts/linux-docker-lifecycle-candidate-2-disposition`
+have manifest SHA-256
+`a3cba437a063f93a270760beb52564bf990345deea7c78f35588f89e8ae746a8`.
+
+Runtime correction `1f3c01ea` introduces the pinned, locally authored
+[`console-size.patch`](../linux/youki/console-size.patch). It passes the selected
+OCI process dimensions into PTY allocation before descriptor handoff for both
+init and exec. Checked conversion rejects overflow; omitted and explicit zero
+values retain their semantics. Four required native tests cover real PTY size
+readback, edge cases, and spec/call-site routing. The build validator requires
+their complete output and exact patch/runtime identity. All 29 offline validator
+tests and 751 affected host-harness tests passed. The native ARM64-musl build
+passed its required regression groups, including all four console-size tests
+with real PTY readback and no ignored tests in that group. Independent artifact
+validation returned runtime SHA-256
+`b811a418031fbe2c8d84acc92a2d9c3e1191701478efe471ddfb0dbbc4421d20`.
+The candidate is retained under
+`linux/.cache/youki-source/builds/89b46f93c7751cfe866be4272302e01a523dd48b81b9d8de0c5542365255039d`;
+its evidence manifest SHA-256 is
+`ef9e12147095ea08e91e3ba78a3a8188ed64c0090bc72d90225a1b75348664e6`.
+The rebuilt backend gate passed all 50 parent tests in seven selected suites in
+`.artifacts/sandbox-vm-e2e/20260906T180936Z`; the console log is
+`.artifacts/console-size-backend-1.console.log`. Nine copied guest inputs are
+preserved in its `retained-guest-bundles` directory with manifest SHA-256
+`1676ee80650b38b5415e82da5eba46c42e7bf91c629eeffd2ff35c8a0ea13289`.
+A fresh installed Docker lifecycle pass remains required. Neither failed
+candidate is retried or reclassified as acceptance.
+
+The subsequent Docker tmux integration passed 92 focused container tests.
+Broader host discovery completed 815 tests successfully in 198.239 seconds;
+two additional schema modules failed import because system Python lacks
+`jsonschema`, so that invocation exited unsuccessfully. Its complete output is
+`.artifacts/container-tmux-host-regression-1.log`.
+Both schema modules then passed their documented offline
+`uv run --offline --with jsonschema==4.23.0` runner: 15 compatibility-contract
+tests and seven project-schema tests. This is 837 passing host tests across the
+two interpreter/dependency setups, not a green result for the earlier command.
