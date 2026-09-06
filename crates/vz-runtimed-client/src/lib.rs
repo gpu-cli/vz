@@ -99,6 +99,10 @@ pub struct DaemonClientConfig {
     pub daemon_binary: Option<PathBuf>,
     /// Whether to spawn daemon if not currently reachable.
     pub auto_spawn: bool,
+    /// Permit managed startup only when a prior control-owner record and state
+    /// database exist. These are discovery prerequisites, never reclaim authority;
+    /// the daemon independently validates exact ownership under its fences.
+    pub recover_existing_owner_only: bool,
     /// Max wall-clock time for connection lifecycle completion.
     pub startup_timeout: Duration,
     /// Per-attempt socket connection timeout.
@@ -128,6 +132,7 @@ impl Default for DaemonClientConfig {
             socket_path: PathBuf::from(".vz-runtime/runtimed.sock"),
             daemon_binary: None,
             auto_spawn: true,
+            recover_existing_owner_only: false,
             startup_timeout: Duration::from_secs(6),
             connect_timeout: Duration::from_millis(400),
             request_timeout: Duration::from_millis(800),
@@ -309,14 +314,7 @@ impl DaemonClient {
     }
 
     fn spawn_daemon(config: &DaemonClientConfig) -> Result<()> {
-        match std::fs::symlink_metadata(&config.socket_path) {
-            Ok(_) => return Err(DaemonClientError::Unavailable {
-                socket_path: config.socket_path.clone(),
-                reason: "existing daemon socket/path cannot be replaced by autostart; inspect the original daemon and reconcile it explicitly".into(),
-            }),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-            Err(error) => return Err(error.into()),
-        }
+        validate_spawn_candidate(config)?;
         let binary = resolve_daemon_binary(config)?;
         if !binary.exists() {
             return Err(DaemonClientError::BinaryNotFound { path: binary });
@@ -324,23 +322,9 @@ impl DaemonClient {
 
         let catalog = installed_catalog::resolve(config, &binary)?;
 
-        if let Some(parent) = config.socket_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        if let Some(state_store_path) = &config.state_store_path
-            && let Some(parent) = state_store_path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            std::fs::create_dir_all(parent)?;
-        }
-        if let Some(runtime_data_dir) = &config.runtime_data_dir {
-            std::fs::create_dir_all(runtime_data_dir)?;
-        }
-
-        // Daemon writes its own log file via tracing (next to the socket),
-        // so we can discard spawned process stdio.
+        // Only the daemon may create startup directories, validate ownership,
+        // or recover a stale socket. Failed connection is not that authority.
+        // Daemon writes its admitted log descriptor, so spawned stdio is private.
         let mut command = Command::new(&binary);
         if let Some(catalog) = catalog {
             command.arg("--machine-target-catalog").arg(catalog);
@@ -371,6 +355,51 @@ impl DaemonClient {
             })?;
         Ok(())
     }
+}
+
+fn validate_spawn_candidate(config: &DaemonClientConfig) -> Result<()> {
+    let unavailable = |reason: &str| DaemonClientError::Unavailable {
+        socket_path: config.socket_path.clone(),
+        reason: reason.into(),
+    };
+    let mut owner_path = config.socket_path.as_os_str().to_owned();
+    owner_path.push(".owner.json");
+    let owner_path = PathBuf::from(owner_path);
+    let regular = |path: &Path| std::fs::symlink_metadata(path).is_ok_and(|value| value.is_file());
+    if config.recover_existing_owner_only
+        && (!regular(&owner_path)
+            || config
+                .state_store_path
+                .as_deref()
+                .is_none_or(|path| !regular(path)))
+    {
+        return Err(unavailable(
+            "managed Delete recovery requires an existing state database and prior control-owner record; no new state created",
+        ));
+    }
+    match std::fs::symlink_metadata(&config.socket_path) {
+        Ok(metadata) => {
+            #[cfg(target_os = "macos")]
+            {
+                use std::os::unix::fs::FileTypeExt;
+                if !metadata.file_type().is_socket() || !regular(&owner_path) {
+                    return Err(unavailable(
+                        "existing daemon path has no recoverable control-owner candidate; no replacement attempted",
+                    ));
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = metadata;
+                return Err(unavailable(
+                    "existing daemon socket/path cannot be replaced on this host backend",
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 async fn handshake_via_capabilities(

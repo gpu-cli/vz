@@ -61,10 +61,20 @@ Subsequent Up must preserve the context's owner, name, endpoint and config
 directory while binding new activation evidence to the new incarnation. Native
 macOS and Hardened Machines do not acquire implicit Docker capabilities.
 
-This Stop/Up behavior assumes the original daemon remains alive. Supported
-daemon-crash recovery is still missing: a stale control socket blocks autostart,
-and a new daemon cannot adopt previously active Machines without authoritative
-backend reconciliation. See the [catalog recovery limitation](installed-machine-catalog.md).
+The original installed Stop/Up evidence below kept the daemon alive. The new
+[completed-owner control recovery path](daemon-control-recovery.md) permits
+managed Up/Delete after exact daemon ownership validation on macOS; a stale
+socket alone is never authority. Previously active Machines still require
+authoritative backend reconciliation, and incomplete startup records remain
+fail-closed. See the [catalog recovery limitation](installed-machine-catalog.md).
+
+**Known durability defect (`vz-u0u`):** a later installed recovery candidate
+preserved Docker metadata across Stop/Up but could not restart its original
+container. Read-only inspection found corruption on the non-journaled Docker
+disk; the current Stop path powers off without Docker/filesystem drain. Do not
+treat successful Stop or Engine-ID persistence as proof of durable workload
+data. Both failed [recovery candidates](../scripts/helpers/installed_daemon_recovery_e2e.md)
+are retained; journaled formatting and positive durable shutdown remain required.
 
 The separate [installed startup harness](../scripts/helpers/installed_developer_startup.md)
 tests this path using signed staged product binaries and real local vz-managed

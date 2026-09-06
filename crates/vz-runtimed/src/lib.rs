@@ -3,6 +3,8 @@
 mod btrfs_health;
 pub mod btrfs_portability;
 #[cfg(target_os = "macos")]
+mod control_socket;
+#[cfg(target_os = "macos")]
 pub mod environment_delete;
 #[cfg(target_os = "macos")]
 pub mod environment_runtime_controller;
@@ -39,12 +41,11 @@ pub mod machine_runtime_registry;
 #[cfg(target_os = "macos")]
 pub mod machine_target_resolver;
 mod placement_scheduler;
+mod startup_lock;
 #[cfg(any(test, feature = "test-backend"))]
 mod test_backend;
 
 use std::collections::HashMap;
-use std::fs::OpenOptions;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +62,7 @@ use vz_stack::{Receipt, StackError, StackEvent, StateStore, StateStorePragmas};
 pub(crate) use execution_sessions::{ExecutionSessionRegistry, ExecutionSessionRegistryError};
 pub use grpc::{RuntimedServerError, serve_runtime_uds_with_shutdown};
 use placement_scheduler::{BackendPlacementCandidate, PlacementScheduler, PlacementSnapshot};
+use startup_lock::StartupLock;
 
 // StateStore migrates every opened database to its current schema before returning it. Keep the
 // daemon ceiling coupled to that contract so a freshly created store is always accepted.
@@ -208,7 +210,11 @@ pub struct RuntimeDaemon {
     daemon_id: String,
     daemon_version: String,
     started_at_unix_secs: u64,
-    startup_lock: StartupLock,
+    startup_lock: Arc<StartupLock>,
+    // Drop after runtime/session fields; this guard retains both startup
+    // fences through exact socket/diagnostic cleanup.
+    #[cfg(target_os = "macos")]
+    control_socket: control_socket::ControlSocket,
 }
 
 impl RuntimeDaemon {
@@ -350,7 +356,17 @@ impl RuntimeDaemon {
             });
         }
 
-        let startup_lock = StartupLock::acquire(startup_lock_path(&config.state_store_path))?;
+        let startup_lock = Arc::new(StartupLock::acquire(startup_lock_path(
+            &config.state_store_path,
+        ))?);
+        #[cfg(target_os = "macos")]
+        let control_socket =
+            control_socket::ControlSocket::acquire(&config, Arc::clone(&startup_lock)).map_err(
+                |source| RuntimedError::ControlSocketAdmission {
+                    path: config.socket_path.clone(),
+                    source,
+                },
+            )?;
         let mut prevalidation_pragmas = StateStorePragmas::daemon_defaults();
         prevalidation_pragmas.journal_mode_wal = false;
         let state_store =
@@ -359,6 +375,13 @@ impl RuntimeDaemon {
                     path: config.state_store_path.clone(),
                     source,
                 })?;
+        #[cfg(target_os = "macos")]
+        control_socket.verify_state_store().map_err(|source| {
+            RuntimedError::ControlSocketAdmission {
+                path: config.socket_path.clone(),
+                source,
+            }
+        })?;
         let schema_version =
             state_store
                 .schema_version()
@@ -449,6 +472,9 @@ impl RuntimeDaemon {
                 source,
             })?;
         let started_at_unix_secs = current_unix_secs();
+        #[cfg(target_os = "macos")]
+        let daemon_id = control_socket.daemon_id().to_owned();
+        #[cfg(not(target_os = "macos"))]
         let daemon_id = format!("runtimed-{}-{started_at_unix_secs}", std::process::id());
         let daemon_version = env!("CARGO_PKG_VERSION").to_string();
         let journal_mode = state_store
@@ -506,6 +532,8 @@ impl RuntimeDaemon {
             daemon_version,
             started_at_unix_secs,
             startup_lock,
+            #[cfg(target_os = "macos")]
+            control_socket,
         })
     }
 
@@ -542,6 +570,19 @@ impl RuntimeDaemon {
     /// Startup lock path for single-writer guard.
     pub fn startup_lock_path(&self) -> &Path {
         self.startup_lock.path()
+    }
+
+    /// Open only the log file admitted under this daemon's exact control owner.
+    #[cfg(target_os = "macos")]
+    pub fn open_owned_log(&self) -> std::io::Result<std::fs::File> {
+        self.control_socket.open_log()
+    }
+
+    /// Write the diagnostic PID through the admitted file descriptor. This
+    /// diagnostic never grants a client process or socket recovery authority.
+    #[cfg(target_os = "macos")]
+    pub fn write_owned_pid(&self) -> std::io::Result<()> {
+        self.control_socket.write_pid()
     }
 
     /// Return the backend capability matrix.
@@ -1322,59 +1363,16 @@ fn placement_internal_machine_error(error: StackError, request_id: &str) -> Mach
     )
 }
 
-#[derive(Debug)]
-struct StartupLock {
-    path: PathBuf,
-    _file: std::fs::File,
-}
-
-impl StartupLock {
-    fn acquire(path: PathBuf) -> Result<Self, RuntimedError> {
-        let file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|source| RuntimedError::AcquireStartupLock {
-                path: path.clone(),
-                source,
-            })?;
-        if let Err(source) = fs2::FileExt::try_lock_exclusive(&file) {
-            return Err(match source.kind() {
-                std::io::ErrorKind::WouldBlock => {
-                    RuntimedError::StartupLockAlreadyHeld { path: path.clone() }
-                }
-                _ => RuntimedError::AcquireStartupLock {
-                    path: path.clone(),
-                    source,
-                },
-            });
-        }
-
-        let mut owner_file = &file;
-        let _ = owner_file.set_len(0);
-        let _ = writeln!(&mut owner_file, "pid={}", std::process::id());
-        let _ = owner_file.flush();
-
-        Ok(Self { path, _file: file })
-    }
-
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-impl Drop for StartupLock {
-    fn drop(&mut self) {
-        let _ = fs2::FileExt::unlock(&self._file);
-        let _ = std::fs::remove_file(&self.path);
-    }
-}
-
 /// Daemon startup failures.
 #[derive(Debug, Error)]
 pub enum RuntimedError {
+    #[cfg(target_os = "macos")]
+    #[error("control socket ownership admission failed at {path}: {source}")]
+    ControlSocketAdmission {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[cfg(target_os = "macos")]
     #[error("failed to initialize Machine target resolver: {source}")]
     InitializeMachineTargetResolver {
@@ -2157,6 +2155,62 @@ mod tests {
 
         let second = RuntimeDaemon::start(cfg);
         assert!(second.is_ok(), "lock should be released after daemon drop");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn foreign_control_socket_rejects_start_before_database_or_diagnostic_mutation() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        std::fs::create_dir_all(cfg.state_store_path.parent().expect("state parent"))
+            .expect("state parent");
+        std::fs::create_dir_all(&cfg.runtime_data_dir).expect("runtime parent");
+        let _foreign = UnixListener::bind(&cfg.socket_path).expect("foreign listener");
+        let socket_before = cfg.socket_path.symlink_metadata().expect("socket metadata");
+        let log = cfg.socket_path.with_extension("log");
+        let pid = cfg.socket_path.with_extension("pid");
+        std::fs::write(&cfg.state_store_path, b"foreign database sentinel")
+            .expect("database sentinel");
+        std::fs::write(&log, b"foreign log sentinel").expect("log sentinel");
+        std::fs::write(&pid, b"foreign pid sentinel").expect("pid sentinel");
+
+        assert!(matches!(
+            RuntimeDaemon::start(cfg.clone()),
+            Err(RuntimedError::ControlSocketAdmission { .. })
+        ));
+        assert_eq!(
+            std::fs::read(&cfg.state_store_path).expect("database"),
+            b"foreign database sentinel"
+        );
+        assert_eq!(std::fs::read(log).expect("log"), b"foreign log sentinel");
+        assert_eq!(std::fs::read(pid).expect("pid"), b"foreign pid sentinel");
+        let socket_after = cfg.socket_path.symlink_metadata().expect("retained socket");
+        assert_eq!(
+            (socket_before.dev(), socket_before.ino()),
+            (socket_after.dev(), socket_after.ino())
+        );
+        assert!(!cfg.state_store_path.with_extension("db-wal").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn independent_databases_cannot_share_a_control_socket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = startup_validation_config(tmp.path());
+        let _first = RuntimeDaemon::start(cfg.clone()).expect("first daemon");
+        let mut other = cfg;
+        other.state_store_path = tmp.path().join("other.db");
+        assert!(matches!(
+            RuntimeDaemon::start(other.clone()),
+            Err(RuntimedError::ControlSocketAdmission { .. })
+        ));
+        assert!(
+            !other.state_store_path.exists(),
+            "contender must not create a database"
+        );
     }
 
     #[test]

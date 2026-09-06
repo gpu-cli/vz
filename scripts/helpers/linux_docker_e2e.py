@@ -139,6 +139,9 @@ def embedded_builder(raw, context):
 
 
 def public_activation(harness, environment, machine):
+    current_generation = environment["lifecycle_generation"]
+    require(type(current_generation) is int and 0 < current_generation < 2**64,
+            "invalid current Environment lifecycle generation")
     matches = []
     for command in harness.record.receipts:
         if command["label"] != "public-up":
@@ -152,7 +155,8 @@ def public_activation(harness, environment, machine):
             if completion is None:
                 continue
             admission, operation = completion["admission"], completion["operation"]
-            if admission["environment_id"] != environment["environment_id"]:
+            if (admission["environment_id"] != environment["environment_id"] and
+                    operation["environment_id"] != environment["environment_id"]):
                 continue
             argv = command["argv"]
             request = argv[argv.index("--request-id") + 1]
@@ -163,8 +167,17 @@ def public_activation(harness, environment, machine):
                         ("project_id", environment["project_id"]), ("environment_id", environment["environment_id"]),
                         ("request_id", request), ("idempotency_key", idempotency))) and
                     admission["request_hash"] == operation["request_hash"] and
-                    admission["definition_digest"] == operation["definition_digest"] == environment["definition_digest"] and
-                    operation["generation"] == environment["lifecycle_generation"] and
+                    admission["definition_digest"] == operation["definition_digest"],
+                    "Up operation does not authenticate exact request/owner")
+            generation = operation["generation"]
+            require(type(generation) is int and 0 < generation <= current_generation,
+                    "invalid or future Up lifecycle generation")
+            if generation < current_generation:
+                # Re-Up retains the previous completed Up commands and their
+                # original incarnations. Authenticate their capture and owner,
+                # but do not mistake historical activation for current status.
+                continue
+            require(operation["definition_digest"] == environment["definition_digest"] and
                     len(admission["machine_ids"]) == len(operation["machine_steps"]) == len(environment["machines"]) and
                     set(admission["machine_ids"]) == {step["machine_id"] for step in operation["machine_steps"]} ==
                     {m["machine_id"] for m in environment["machines"]},

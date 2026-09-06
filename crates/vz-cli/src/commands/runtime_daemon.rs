@@ -161,6 +161,28 @@ pub async fn connect_up_daemon_for_state_db(state_db: &Path) -> anyhow::Result<D
         .context("connect managed Up daemon")
 }
 
+/// Delete can recover an existing managed control owner, but cannot bootstrap
+/// a new database. Socket/process authority is validated by the daemon, never
+/// inferred by the CLI from path presence or a failed connection.
+pub async fn connect_delete_daemon_for_state_db(state_db: &Path) -> anyhow::Result<DaemonClient> {
+    if parse_env_control_plane_transport()? != ControlPlaneTransport::DaemonGrpc {
+        bail!("Developer Environment Delete requires daemon-grpc transport; no HTTP fallback");
+    }
+    let mut config = daemon_client_config_with_overrides(
+        state_db,
+        parse_env_daemon_socket_override(),
+        parse_env_runtime_data_dir_override(),
+        true,
+    );
+    config.recover_existing_owner_only = true;
+    config.machine_target_catalog =
+        parse_machine_target_catalog(std::env::var_os(MACHINE_TARGET_CATALOG_ENV))?;
+    config.discover_installed_machine_target_catalog = true;
+    DaemonClient::connect_with_config(config)
+        .await
+        .context("connect existing managed Delete owner")
+}
+
 /// Connect to an already-running daemon without creating runtime state.
 ///
 /// Read-only Developer Environment commands use this path so observing status

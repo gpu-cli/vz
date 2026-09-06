@@ -57,6 +57,8 @@ pub mod install;
 #[cfg(target_os = "macos")]
 pub mod machine_identifier;
 #[cfg(target_os = "macos")]
+pub mod process_identity;
+#[cfg(target_os = "macos")]
 pub mod virtio_fs;
 #[cfg(target_os = "macos")]
 pub mod vm;
