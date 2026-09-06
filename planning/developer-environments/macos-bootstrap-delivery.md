@@ -106,12 +106,19 @@ These are development artifact tools, not public lifecycle verbs. They do not
 boot a Machine, install a loader, authenticate/sign a release manifest, publish
 a patch, or satisfy the native release gate.
 
+`vz-macos-provision::bootstrap` now composes these APIs into a pinned release
+manifest, serialized one-time template preparation, acknowledged cancellation,
+atomic completion receipts, fast local template reuse, and private APFS disk
+clones. Platform resources remain immutable seeds; VM identity and boot belong
+to the native adapter. See [the integration handoff](macos-bootstrap-integration.md)
+for the exact API, trust boundary, cache layout, runnable example and next work.
+
 ## Next integration and acceptance
 
 Prepare the exact candidate base on this host and create its real loader-bearing
 patch. Publish the authenticated pair and immutable release manifest. Bind all
-artifacts and platform resources to the native target catalog and Machine ownership. Add the operation-owned
-prepared-template cache, streamed Up progress, clone-based creation, and native
+artifacts and platform resources to the native target catalog and Machine ownership. Connect the operation-owned
+prepared-template cache and clone API to streamed Up progress and native
 exec/lifecycle adapters. Automate the proven maintainer recipe in a release
 workflow. Finish with a clean consumer download/bootstrap and the pinned Swift
 fixture, mixed-target paths, Stop/Up, Delete, and the canonical installed native

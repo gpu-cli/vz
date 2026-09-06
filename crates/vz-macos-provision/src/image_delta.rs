@@ -216,6 +216,13 @@ pub fn create(
     Ok(info)
 }
 
+/// Inspect a delta header before allocating its output. This validates header
+/// bounds only; the caller must authenticate the patch and [`apply`] verifies
+/// its records and actual base/output bytes.
+pub fn inspect(patch: &Path) -> Result<DeltaInfo> {
+    read_header(&mut open_input(patch)?)
+}
+
 /// Apply an authenticated patch to its exact base without mounting or elevation.
 /// Cancellation, malformed records and hash failures discard the staging image.
 /// Does not create or reuse a Machine's platform identity or auxiliary storage.

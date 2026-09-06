@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, info, warn};
 
 pub mod artifact_cache;
+#[cfg(unix)]
+pub mod bootstrap;
 pub mod image_delta;
 
 /// Default binary name for the guest agent.

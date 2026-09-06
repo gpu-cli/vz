@@ -96,44 +96,7 @@ impl ArtifactCache {
     /// have no symlink ancestry; create its parent before calling this method.
     /// This does not select or alter a Machine or an Environment.
     pub fn new(root: PathBuf) -> Result<Self> {
-        ensure!(root.is_absolute(), "artifact cache path must be absolute");
-        for ancestor in root.ancestors() {
-            match fs::symlink_metadata(ancestor) {
-                Ok(m) => ensure!(
-                    m.is_dir() && !m.file_type().is_symlink(),
-                    "artifact cache ancestry must be directories without symlinks"
-                ),
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound && ancestor == root => {}
-                Err(e) => return Err(e).context("inspect artifact cache ancestry"),
-            }
-        }
-        let mut builder = fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            builder.mode(0o700);
-        }
-        match builder.create(&root) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(e) => return Err(e).context("create private artifact cache"),
-        }
-        let metadata = fs::symlink_metadata(&root)?;
-        ensure!(
-            metadata.is_dir() && !metadata.file_type().is_symlink(),
-            "artifact cache must be a directory"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::{MetadataExt, PermissionsExt};
-            // SAFETY: geteuid only returns the caller's effective user identity.
-            #[allow(unsafe_code)]
-            let uid = unsafe { libc::geteuid() };
-            ensure!(
-                metadata.uid() == uid && metadata.permissions().mode() & 0o077 == 0,
-                "artifact cache must be caller-owned and private"
-            );
-        }
+        private_directory(&root)?;
         let client = reqwest::Client::builder()
             .https_only(true)
             .connect_timeout(Duration::from_secs(30))
@@ -167,30 +130,7 @@ impl ArtifactCache {
             total: artifact.size_bytes,
         };
         let lock_path = self.root.join(format!("{}.lock", artifact.sha256));
-        let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
-        }
-        let lock = options
-            .open(lock_path)
-            .context("open persistent artifact preparation lock")?;
-        ensure!(
-            lock.metadata()?.is_file(),
-            "artifact lock must be a regular file"
-        );
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::MetadataExt;
-            ensure!(
-                lock.metadata()?.nlink() == 1,
-                "artifact lock must not be hard-linked"
-            );
-        }
+        let lock = preparation_lock(&lock_path)?;
         loop {
             match lock.try_lock_exclusive() {
                 Ok(()) => break,
@@ -296,6 +236,83 @@ impl ArtifactCache {
         drop(lock);
         Ok(path)
     }
+}
+
+// Shared by the prepared-template cache; these checks never repair permissions.
+pub(crate) fn private_directory(root: &std::path::Path) -> Result<()> {
+    ensure!(root.is_absolute(), "artifact cache path must be absolute");
+    ensure!(
+        !root
+            .components()
+            .any(|c| matches!(c, std::path::Component::ParentDir)),
+        "artifact cache path must not contain parent traversal"
+    );
+    for ancestor in root.ancestors() {
+        match fs::symlink_metadata(ancestor) {
+            Ok(m) => ensure!(
+                m.is_dir() && !m.file_type().is_symlink(),
+                "artifact cache ancestry must be directories without symlinks"
+            ),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound && ancestor == root => {}
+            Err(e) => return Err(e).context("inspect artifact cache ancestry"),
+        }
+    }
+    let mut builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    match builder.create(root) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => return Err(e).context("create private artifact cache"),
+    }
+    let metadata = fs::symlink_metadata(root)?;
+    ensure!(
+        metadata.is_dir() && !metadata.file_type().is_symlink(),
+        "artifact cache must be a directory"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        // SAFETY: geteuid only returns the caller's effective user identity.
+        #[allow(unsafe_code)]
+        let uid = unsafe { libc::geteuid() };
+        ensure!(
+            metadata.uid() == uid && metadata.permissions().mode() & 0o077 == 0,
+            "artifact cache must be caller-owned and private"
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn preparation_lock(lock_path: &std::path::Path) -> Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let lock = options
+        .open(lock_path)
+        .context("open persistent artifact preparation lock")?;
+    ensure!(
+        lock.metadata()?.is_file(),
+        "artifact lock must be a regular file"
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        ensure!(
+            lock.metadata()?.nlink() == 1,
+            "artifact lock must not be hard-linked"
+        );
+    }
+    Ok(lock)
 }
 
 #[cfg(test)]
