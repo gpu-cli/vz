@@ -887,14 +887,9 @@ pub fn attach_and_mount(image_path: &Path) -> anyhow::Result<AttachedDisk> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    // Parse the first line to get the base device (e.g., "/dev/disk4")
-    let base_device = stdout
-        .lines()
-        .next()
-        .and_then(|line| line.split_whitespace().next())
-        .ok_or_else(|| anyhow::anyhow!("failed to parse hdiutil output"))?
-        .trim_start_matches("/dev/")
-        .to_string();
+    // hdiutil does not promise device order: an APFS container or partition can
+    // precede the whole disk. Select the partition scheme explicitly.
+    let base_device = attached_base_device(&stdout)?;
 
     debug!(device = %base_device, "disk image attached");
 
@@ -966,6 +961,46 @@ pub fn attach_and_mount(image_path: &Path) -> anyhow::Result<AttachedDisk> {
         mount_point,
         _data_volume: data_volume,
     })
+}
+
+fn attached_base_device(output: &str) -> anyhow::Result<String> {
+    let mut disks = output.lines().filter_map(|line| {
+        let mut fields = line.split_whitespace();
+        let device = fields.next()?.strip_prefix("/dev/disk")?;
+        let kind = fields.next()?;
+        (kind == "GUID_partition_scheme"
+            && !device.is_empty()
+            && device.bytes().all(|byte| byte.is_ascii_digit()))
+        .then(|| format!("disk{device}"))
+    });
+    let disk = disks
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("hdiutil returned no GUID whole disk"))?;
+    anyhow::ensure!(
+        disks.next().is_none(),
+        "hdiutil returned ambiguous whole disks"
+    );
+    Ok(disk)
+}
+
+#[cfg(test)]
+mod attachment_tests {
+    use super::attached_base_device;
+
+    #[test]
+    fn selects_whole_disk_after_containers_and_partitions() -> anyhow::Result<()> {
+        let output = "/dev/disk10 Apple_APFS\n/dev/disk9s1 Apple_APFS_ISC\n/dev/disk9 GUID_partition_scheme\n/dev/disk12s5 Apple_APFS\n";
+        assert_eq!(attached_base_device(output)?, "disk9");
+        assert!(attached_base_device("/dev/disk9s1 GUID_partition_scheme").is_err());
+        assert!(attached_base_device("/dev/disk10 Apple_APFS").is_err());
+        assert!(
+            attached_base_device(
+                "/dev/disk9 GUID_partition_scheme\n/dev/disk8 GUID_partition_scheme"
+            )
+            .is_err()
+        );
+        Ok(())
+    }
 }
 
 /// Find the APFS Data volume on an attached disk.

@@ -175,8 +175,10 @@ identifier; metadata equality or an APFS clone syscall alone does not prove it.
 Maintainer continuation uses `provision_bootstrap` on a new APFS copy of the
 stopped installed base, with the release loader and guest agent. Its root-only
 mount/ownership step belongs to artifact production, never consumer setup.
-The current run is waiting for macOS administrator authentication; the original
-base is preserved. The mount helper now allocates a separate private directory
+The first authenticated run failed during Data-volume discovery: hdiutil returned
+a container before the whole disk. The helper now selects the unique GUID whole
+disk explicitly, with an ordering regression test. Its retry is waiting for macOS
+administrator authentication; the original base is preserved. The mount helper now allocates a separate private directory
 per attachment and removes only the empty directory after a successful detach.
 The existing unit suite passes with this change, which awaits real mounting
 verification before main integration.
@@ -189,7 +191,7 @@ stops its owned VM. Its output explicitly marks this as prerequisite evidence,
 not installed consumer E2E. Do not publish a base/patch until this succeeds and
 the exact patch has been applied and booted independently.
 
-Current branch checks: provisioning nextest 47 passed, zero skipped; strict
+Current branch checks: provisioning nextest 48 passed, zero skipped; strict
 library/example Clippy and Rust formatting passed. The Swift fixture passes its
 host syntax/unit check and its executable correctly rejects this physical
 `Mac16,5` host. These checks do not close the native lifecycle gate.
