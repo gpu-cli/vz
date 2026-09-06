@@ -59,6 +59,9 @@ REQUIRED_WAIT_TESTS = tuple("test_vz_foreground_wait_" + name for name in (
     "already_exited_nonzero", "already_exited_zero", "already_signaled", "forwards_pending_signal",
 ))
 WAIT_PROBE_PREFIX = "VZ_FOREGROUND_WAIT_PROBE="
+REQUIRED_CONSOLE_TESTS = tuple("test_vz_console_size_" + name for name in (
+    "real_pty_dimensions", "none_and_zero_semantics", "overflow_rejected", "spec_and_callsite_routing",
+))
 
 
 def require(condition, message):
@@ -98,7 +101,7 @@ def validate(candidate, source):
              "runtime-log-stderr.txt", "runtime-log-exit-status.txt",
              "executable-permissions.patch", "executable-permissions-tests.txt",
              "tenant-cgroup.patch", "tenant-cgroup-tests.txt", "run-keep.patch", "run-keep-tests.txt",
-             "foreground-wait.patch", "foreground-wait-tests.txt"}
+             "foreground-wait.patch", "foreground-wait-tests.txt", "console-size.patch", "console-size-tests.txt"}
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -111,7 +114,7 @@ def validate(candidate, source):
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     inputs = dict(line.split("=", 1) for line in contents["inputs.env"].decode().splitlines() if line and not line.startswith("#"))
     require(contents["source-lock.sha256"].decode().split()[0] == inputs["YOUKI_LOCK_SHA256"], "source Cargo.lock changed")
@@ -126,6 +129,8 @@ def validate(candidate, source):
     require(checksums["run-keep.patch"] == inputs["YOUKI_KEEP_PATCH_SHA256"], "pinned local run keep patch mismatch")
     require(checksums["foreground-wait.patch"] == inputs["YOUKI_WAIT_PATCH_SHA256"], "pinned local foreground wait patch mismatch")
     validate_foreground_wait(contents["foreground-wait-tests.txt"])
+    require(checksums["console-size.patch"] == inputs["YOUKI_CONSOLE_PATCH_SHA256"], "pinned local console size patch mismatch")
+    validate_console_size(contents["console-size-tests.txt"])
     keep_tests = contents["run-keep-tests.txt"].decode()
     expected_keep = {"test commands::run::keep_tests::" + test + " ... ok" for test in REQUIRED_KEEP_TESTS}
     actual_keep = [line for line in keep_tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
@@ -162,9 +167,20 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_elf(contents["youki"])
     return checksums["youki"]
+
+
+def validate_console_size(raw):
+    tests = raw.decode("utf-8")
+    actual = [line for line in tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
+    expected = {"test tty::tests::" + name + " ... ok" for name in REQUIRED_CONSOLE_TESTS}
+    summaries = [line for line in tests.splitlines() if line.startswith("test result:")]
+    require(len(actual) == len(expected) and set(actual) == expected and "FAILED" not in tests and
+            len(summaries) == 1 and re.fullmatch(
+                r"test result: ok\. 4 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
+                summaries[0]), "missing or failed console size regressions")
 
 
 def validate_foreground_wait(raw):

@@ -1,0 +1,201 @@
+--- a/crates/libcontainer/src/tty.rs
++++ b/crates/libcontainer/src/tty.rs
+@@ -79,6 +79,8 @@
+     CreateConsoleSocketFd { source: nix::Error },
+     #[error("could not create pseudo terminal")]
+     CreatePseudoTerminal { source: nix::Error },
++    #[error("OCI console size exceeds terminal dimensions: {height} rows, {width} columns")]
++    InvalidConsoleSize { height: u64, width: u64 },
+     #[error("failed to send pty master")]
+     SendPtyMaster { source: nix::Error },
+     #[error("could not close console socket")]
+@@ -283,11 +285,17 @@
+ /// exists within the container's namespace, which is required for CRIU checkpoint.
+ ///
+ /// See: https://github.com/opencontainers/runc/blob/v1.4.0/libcontainer/rootfs_linux.go
+-pub fn setup_console(syscall: &dyn Syscall, console_fd: RawFd, mount: bool) -> Result<()> {
++pub fn setup_console(
++    syscall: &dyn Syscall,
++    console_fd: RawFd,
++    mount: bool,
++    console_size: Option<&oci_spec::runtime::Box>,
++) -> Result<()> {
+     // Create PTY pair from /dev/pts/ptmx
+     // After pivot_root, /dev/pts points to the container's devpts
+-    let openpty_result = nix::pty::openpty(None, None)
+-        .map_err(|err| TTYError::CreatePseudoTerminal { source: err })?;
++    // Apply the OCI initial dimensions before sending the master or starting
++    // the payload. A later client resize cannot replace this initialization.
++    let openpty_result = open_console_pty(console_size)?;
+ 
+     let master = &openpty_result.master;
+     let slave = &openpty_result.slave;
+@@ -321,6 +329,37 @@
+     close(console_fd).map_err(|err| TTYError::CloseConsoleSocket { source: err })?;
+ 
+     Ok(())
++}
++
++fn console_winsize(
++    console_size: Option<&oci_spec::runtime::Box>,
++) -> Result<Option<nix::pty::Winsize>> {
++    console_size
++        .map(|size| {
++            let height = u64::from(size.height());
++            let width = u64::from(size.width());
++            let ws_row = u16::try_from(height)
++                .map_err(|_| TTYError::InvalidConsoleSize { height, width })?;
++            let ws_col =
++                u16::try_from(width).map_err(|_| TTYError::InvalidConsoleSize { height, width })?;
++            Ok(nix::pty::Winsize {
++                ws_row,
++                ws_col,
++                ws_xpixel: 0,
++                ws_ypixel: 0,
++            })
++        })
++        .transpose()
++}
++
++fn open_console_pty(
++    console_size: Option<&oci_spec::runtime::Box>,
++) -> Result<nix::pty::OpenptyResult> {
++    // None preserves openpty's default; explicit zero dimensions are not
++    // replaced with invented defaults. Overflow fails before allocating a PTY.
++    let size = console_winsize(console_size)?;
++    nix::pty::openpty(size.as_ref(), None)
++        .map_err(|source| TTYError::CreatePseudoTerminal { source })
+ }
+ 
+ /// Mount PTY slave on /dev/console.
+@@ -408,6 +447,104 @@
+ 
+     const CONSOLE_SOCKET: &str = "console-socket";
+ 
++    fn vz_console_size(height: u64, width: u64) -> oci_spec::runtime::Box {
++        serde_json::from_value(serde_json::json!({"height": height, "width": width})).unwrap()
++    }
++
++    fn vz_observed_size(fd: &OwnedFd) -> (u16, u16) {
++        let mut size = nix::pty::Winsize {
++            ws_row: 0,
++            ws_col: 0,
++            ws_xpixel: 0,
++            ws_ypixel: 0,
++        };
++        // SAFETY: fd remains owned and open; size is writable, correctly
++        // aligned storage for the TIOCGWINSZ result throughout this ioctl.
++        let result = unsafe { libc::ioctl(fd.as_raw_fd(), libc::TIOCGWINSZ, &mut size) };
++        assert_eq!(
++            result,
++            0,
++            "TIOCGWINSZ failed: {}",
++            std::io::Error::last_os_error()
++        );
++        assert_eq!((size.ws_xpixel, size.ws_ypixel), (0, 0));
++        (size.ws_row, size.ws_col)
++    }
++
++    #[test]
++    fn test_vz_console_size_real_pty_dimensions() -> Result<()> {
++        for (height, width) in [(24, 80), (40, 120), (65535, 65535)] {
++            let requested = vz_console_size(height, width);
++            let pair = open_console_pty(Some(&requested))?;
++            let expected = (u16::try_from(height)?, u16::try_from(width)?);
++            assert_eq!(vz_observed_size(&pair.master), expected);
++            assert_eq!(vz_observed_size(&pair.slave), expected);
++            // Both OwnedFds are dropped here; no payload or stdio mutation.
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_console_size_none_and_zero_semantics() -> Result<()> {
++        assert!(console_winsize(None)?.is_none());
++        let control = nix::pty::openpty(None, None)?;
++        let omitted = open_console_pty(None)?;
++        assert_eq!(
++            vz_observed_size(&omitted.master),
++            vz_observed_size(&control.master)
++        );
++        assert_eq!(
++            vz_observed_size(&omitted.slave),
++            vz_observed_size(&control.slave)
++        );
++        for (height, width) in [(0, 0), (0, 80), (24, 0)] {
++            let requested = vz_console_size(height, width);
++            assert!(console_winsize(Some(&requested))?.is_some());
++            let pair = open_console_pty(Some(&requested))?;
++            let expected = (u16::try_from(height)?, u16::try_from(width)?);
++            assert_eq!(vz_observed_size(&pair.master), expected);
++            assert_eq!(vz_observed_size(&pair.slave), expected);
++        }
++        Ok(())
++    }
++
++    #[test]
++    fn test_vz_console_size_overflow_rejected() {
++        for (height, width) in [(65536, 80), (24, 65536), (u32::MAX as u64, u32::MAX as u64)] {
++            let requested = vz_console_size(height, width);
++            assert!(matches!(open_console_pty(Some(&requested)),
++                Err(TTYError::InvalidConsoleSize { height: h, width: w }) if h == height && w == width));
++        }
++    }
++
++    #[test]
++    fn test_vz_console_size_spec_and_callsite_routing() -> Result<()> {
++        let mut init = oci_spec::runtime::Spec::default();
++        let mut process = oci_spec::runtime::Process::default();
++        process.set_terminal(Some(true));
++        process.set_console_size(Some(vz_console_size(24, 80)));
++        init.set_process(Some(process.clone()));
++        // Full init config.json and exec process.json carry the same OCI
++        // process member into the common PTY constructor.
++        let init: oci_spec::runtime::Spec = serde_json::from_slice(&serde_json::to_vec(&init)?)?;
++        let exec: oci_spec::runtime::Process =
++            serde_json::from_slice(&serde_json::to_vec(&process)?)?;
++        for selected in [init.process().as_ref().unwrap(), &exec] {
++            let pair = open_console_pty(selected.console_size().as_ref())?;
++            assert_eq!(vz_observed_size(&pair.slave), (24, 80));
++        }
++        // Explicit static routing coverage, not a claimed container launch:
++        // the one shared init/tenant call forwards the selected process size;
++        // the existing type distinction controls only /dev/console mounting.
++        let callsite = include_str!("process/init/process.rs");
++        assert_eq!(callsite.matches("tty::setup_console(").count(), 1);
++        assert!(callsite.contains("ctx.process.console_size().as_ref(),"));
++        assert!(callsite.contains(
++            "let mount_console = matches!(args.container_type, ContainerType::InitContainer);"
++        ));
++        Ok(())
++    }
++
+     #[test]
+     #[serial]
+     fn test_setup_console_socket() -> Result<()> {
+@@ -470,7 +607,7 @@
+         // mount=false because mounting /dev/console requires an actual container
+         // environment with proper namespace setup (pivot_root completed).
+         let syscall = create_syscall();
+-        let status = setup_console(syscall.as_ref(), fd.into_raw_fd(), false);
++        let status = setup_console(syscall.as_ref(), fd.into_raw_fd(), false, None);
+ 
+         // restore the original std* before doing final assert
+         dup2(old_stdin, StdIO::Stdin.into())?;
+--- a/crates/libcontainer/src/process/init/process.rs
++++ b/crates/libcontainer/src/process/init/process.rs
+@@ -154,7 +154,13 @@
+     // See: https://github.com/opencontainers/runc/blob/v1.4.0/libcontainer/setns_init_linux.go
+     if let Some(csocketfd) = args.console_socket {
+         let mount_console = matches!(args.container_type, ContainerType::InitContainer);
+-        tty::setup_console(ctx.syscall.as_ref(), csocketfd, mount_console).map_err(|err| {
++        tty::setup_console(
++            ctx.syscall.as_ref(),
++            csocketfd,
++            mount_console,
++            ctx.process.console_size().as_ref(),
++        )
++        .map_err(|err| {
+             tracing::error!(?err, "failed to set up tty");
+             InitProcessError::Tty(err)
+         })?;

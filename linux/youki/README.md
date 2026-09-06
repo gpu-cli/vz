@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -129,6 +129,17 @@ parent-death signals to avoid leaving a live payload after test failure.
 The existing seven keep tests alone preblock SIGCHLD before spawning and did not
 cover this production ordering race. Source/native evidence does not replace
 the unchanged fast-payload installed probe and full backend verification.
+
+`console-size.patch` is an eighth **locally authored vz patch**. The runtime
+must honor OCI `process.consoleSize` when allocating a terminal, before handing
+the console to its caller. A later Docker resize does not replace that initial
+size contract. Four dedicated native regressions require real PTY dimension
+readback, omitted/zero semantics, overflow rejection, and spec/callsite routing.
+The complete `console-size-tests.txt` output, exact patch bytes and patch pin
+are mandatory candidate evidence; missing, ignored, duplicate or failed tests
+are rejected. These are bounded unit and PTY/ioctl checks, not a claim that a
+container payload or Docker workflow ran. The fresh installed Mac lifecycle
+gate and rebuilt backend still must pass; the old failed candidate is retained.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

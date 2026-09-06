@@ -3,3 +3,4 @@
 linux/youki/seccomp-exec.patch whitespace=-blank-at-eol
 linux/youki/tenant-root.patch whitespace=-blank-at-eol
 linux/youki/tenant-cgroup.patch whitespace=-blank-at-eol
+linux/youki/console-size.patch whitespace=-blank-at-eol
