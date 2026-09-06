@@ -29,6 +29,7 @@ ARTIFACT_SCOPE = "DEV_INSTALLED_LINUX_BUILD_ARTIFACTS_NOT_RELEASE_CERTIFICATION"
 PARALLEL_SCOPE = "DEV_INSTALLED_LINUX_PARALLEL_BUILD_NOT_RELEASE_CERTIFICATION"
 SSH_SCOPE = "DEV_INSTALLED_LINUX_SSH_BUILD_NOT_RELEASE_CERTIFICATION"
 LIFECYCLE_SCOPE = "DEV_INSTALLED_LINUX_CONTAINER_LIFECYCLE_NOT_RELEASE_CERTIFICATION"
+IMAGES_SCOPE = "DEV_INSTALLED_LINUX_IMAGE_ROUNDTRIP_NOT_RELEASE_CERTIFICATION"
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -43,7 +44,7 @@ def arguments(argv):
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "all"))
+    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -57,7 +58,7 @@ def arguments(argv):
     parser.add_argument("--container-fixture")
     parser.add_argument("--tmux")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
     require(args.container_fixture is None or args.suite == "lifecycle", "container-fixture requires the lifecycle suite")
     require((args.tmux is not None) == (args.suite == "lifecycle"),
             "--tmux is required only for the lifecycle suite")
@@ -76,7 +77,11 @@ def arguments(argv):
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle"}, "full contract unavailable")
+    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images"}, "full contract unavailable")
+    if args.suite == 'images':
+        require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
+                'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
+                'image suite rejects builder, foreign fixture and terminal options')
     require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
             "--tmux is required only for the lifecycle suite")
     terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
@@ -87,7 +92,7 @@ def preflight(args, require_host=True):
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
-              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE}
+              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -152,6 +157,10 @@ def preflight(args, require_host=True):
         info["inputs"][str(ssh_input.PIN)] = startup.digest(ssh_input.PIN)
         for path in selected.iterdir():
             info["inputs"][str(path)] = startup.digest(path)
+    if args.suite == 'images':
+        from linux_docker_image_machine import required_source_paths
+        for path in required_source_paths():
+            info['inputs'][str(path)] = startup.digest(Path(path))
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
@@ -721,14 +730,23 @@ class ComposeHarness(startup.Harness):
                 self.monitor.check()
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
-                images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh", "lifecycle"}:
+                if suite == 'images':
+                    # Driver schema compatibility only: this recipe uses tiny
+                    # source-selected archives, not the Python/Compose image.
+                    # Never pull/build/execute those admission-only image pins.
+                    base = {key: self.info['python_image'][key] for key in ('reference', 'id', 'platform')}
+                    images = {'base': dict(base), 'compose': dict(base)}
+                else:
+                    images = self.prepare_image(descriptor)
+                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
                     elif suite == "parallel":
                         from linux_docker_build_parallel import run_machine
                     elif suite == "ssh":
                         from linux_docker_build_ssh import run_machine
+                    elif suite == 'images':
+                        from linux_docker_image_machine import run_machine
                     else:
                         from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()

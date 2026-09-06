@@ -16,6 +16,54 @@ import linux_docker_e2e as gate
 
 
 class AdmissionTests(unittest.TestCase):
+    def test_images_admission_has_no_builder_or_foreign_fixture_options(self):
+        common = [part for name in gate.startup.OPTIONS for part in ('--' + name, '/owned/value')]
+        args = gate.arguments(['--suite', 'images', *common])
+        self.assertEqual(args.suite, 'images')
+        self.assertTrue(args.run_id.startswith('images-'))
+        for option in ('buildkit-archive', 'parallel-fixture', 'ssh-fixture', 'ssh-packages',
+                       'ssh-gpgv', 'container-fixture', 'tmux'):
+            self.assertIsNone(getattr(args, option.replace('-', '_')))
+            with self.subTest(option=option), self.assertRaises(ValueError):
+                gate.arguments(['--suite', 'images', *common, '--' + option, '/foreign/input'])
+        with self.assertRaisesRegex(ValueError, 'duplicate'):
+            gate.arguments(['--suite', 'images', '--suite=images'])
+
+    def test_images_preflight_pins_exact_source_closure_without_builder_or_terminal(self):
+        from linux_docker_image_machine import required_source_paths
+        args = types.SimpleNamespace(suite='images', fixture='/owned/base', image_input='/owned/pin',
+            run_id='images-owned')
+        with patch.object(gate.startup, 'preflight', return_value={'inputs': {}}), \
+                patch.object(gate.startup, 'canonical', side_effect=Path), \
+                patch.object(gate.startup, 'digest', side_effect=lambda path: 'hash:' + str(path)), \
+                patch.object(gate.image_input, 'load', return_value={'immutable': 'image-pin'}), \
+                patch.object(gate, 'public_ca_input', return_value={}), \
+                patch.object(gate.driver, 'tree_digest', return_value='fixture-hash'), \
+                patch.object(gate, 'tmux_input') as terminal, \
+                patch('linux_docker_buildkit_builder.preflight_archive') as builder:
+            info = gate.preflight(args, require_host=False)
+        self.assertEqual(info['scope'], gate.IMAGES_SCOPE)
+        self.assertEqual(info['suite'], 'images')
+        self.assertEqual(info['python_image'], {'immutable': 'image-pin'})
+        self.assertEqual(info['fixture_sha256'], 'fixture-hash')
+        for name in required_source_paths():
+            self.assertEqual(info['inputs'][name], 'hash:' + name)
+        for name in ('buildkit', 'container_fixture', 'parallel_fixture', 'ssh_fixture', 'tmux'):
+            self.assertNotIn(name, info)
+        for name in ('linux_docker_runtime_audit.py', 'linux_docker_container_lifecycle.py',
+                     'linux_docker_buildkit_builder.py', 'linux_docker_interactive_tmux.py'):
+            self.assertNotIn(str(gate.REPO / 'scripts/helpers' / name), info['inputs'])
+        terminal.assert_not_called()
+        builder.assert_not_called()
+
+    def test_images_preflight_rejects_foreign_options_even_without_argument_parser(self):
+        for option in ('buildkit_archive', 'parallel_fixture', 'ssh_fixture', 'ssh_packages',
+                       'ssh_gpgv', 'container_fixture', 'tmux'):
+            with self.subTest(option=option), patch.object(gate.startup, 'preflight') as startup:
+                with self.assertRaisesRegex(ValueError, 'image suite rejects'):
+                    gate.preflight(types.SimpleNamespace(suite='images', **{option: '/foreign/input'}), require_host=False)
+                startup.assert_not_called()
+
     def test_lifecycle_admission_requires_no_external_builder_and_scopes_fixture_option(self):
         common = [part for name in gate.startup.OPTIONS for part in ('--'+name, '/owned/value')]
         common += ['--tmux', '/owned/tmux']
@@ -26,7 +74,7 @@ class AdmissionTests(unittest.TestCase):
         self.assertEqual(selected.container_fixture, '/owned/container')
         with self.assertRaisesRegex(ValueError, 'Buildx suites'):
             gate.arguments(['--suite', 'lifecycle', *common, '--buildkit-archive', '/owned/archive'])
-        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh'):
+        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh', 'images'):
             with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, 'container-fixture'):
                 gate.arguments(['--suite', suite, '--container-fixture', '/owned/container'])
         with self.assertRaisesRegex(ValueError, 'duplicate'):
@@ -84,7 +132,7 @@ class AdmissionTests(unittest.TestCase):
     def test_tmux_required_explicitly_only_for_lifecycle_before_preflight(self):
         with self.assertRaisesRegex(ValueError, '--tmux'):
             gate.arguments(['--suite', 'lifecycle'])
-        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh'):
+        for suite in ('compose', 'build', 'artifacts', 'parallel', 'ssh', 'images'):
             with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, '--tmux'):
                 gate.arguments(['--suite', suite, '--tmux', '/owned/tmux'])
         with self.assertRaisesRegex(ValueError, 'duplicate'):
@@ -303,6 +351,45 @@ class AdmissionTests(unittest.TestCase):
 
 
 class ResultScopeTests(unittest.TestCase):
+    def test_images_result_stays_dev_and_retains_normal_cleanup_fence_without_runtime_audit(self):
+        info = {'scope': gate.IMAGES_SCOPE, 'suite': 'images', 'inputs': {'/owned/image-helper.py': 'source-hash'},
+                'fixture': '/owned/base', 'fixture_sha256': 'base-hash'}
+        for failed in (False, True):
+            with self.subTest(failed=failed):
+                harness = types.SimpleNamespace(evidence=Path('/owned/evidence'), root=Path('/owned/root'),
+                    staged_inputs={}, monitor=None, stage=Mock(),
+                    scenario=Mock(side_effect=ValueError('image replay failed') if failed else None, return_value={}),
+                    remove_owned=Mock(side_effect=ValueError('cleanup proof unresolved') if failed else None),
+                    cleanup=Mock(return_value={'positive_stop_all': True, 'daily_default_unchanged': True}),
+                    capture_runtime_audits=Mock())
+                with patch.object(gate, 'ComposeHarness', return_value=harness), \
+                        patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
+                        patch.object(gate.startup, 'collect_runtime_receipts'), \
+                        patch.object(gate.startup, 'checksum_evidence'), \
+                        patch.object(gate.startup, 'digest', return_value='source-hash') as digest, \
+                        patch.object(gate.driver, 'tree_digest', return_value='base-hash'), \
+                        contextlib.redirect_stdout(io.StringIO()) as output:
+                    code = gate.run(info)
+                result = json.loads(output.getvalue())
+                self.assertEqual(code, int(failed))
+                self.assertEqual(result['scope'], gate.IMAGES_SCOPE)
+                self.assertEqual(result['outcome'], 'failed' if failed else 'passed_dev_installed_images_slice')
+                self.assertFalse(result['docker_parity_certified'])
+                self.assertFalse(result['aggregate_release_certified'])
+                self.assertEqual(result['release_scenarios_passed'], [])
+                self.assertEqual(result['test_case_retries'], 0)
+                harness.capture_runtime_audits.assert_not_called()
+                if failed:
+                    harness.cleanup.assert_not_called()
+                    self.assertIn('image replay failed', result['error'])
+                    self.assertIn('cleanup proof unresolved', result['cleanup_errors'][0])
+                else:
+                    digest.assert_called_once_with(Path('/owned/image-helper.py'))
+                    harness.cleanup.assert_called_once_with()
+                    self.assertTrue(result['cleanup']['positive_stop_all'])
+                    self.assertTrue(result['cleanup']['daily_default_unchanged'])
+                    self.assertFalse(result['cleanup']['delete_certified'])
+
     def test_lifecycle_end_rehash_cannot_promote_changed_fixture_or_full_contract(self):
         info = {'scope': gate.LIFECYCLE_SCOPE, 'suite': 'lifecycle', 'inputs': {},
                 'fixture': '/owned/base', 'fixture_sha256': 'base-hash',
@@ -551,6 +638,14 @@ class PrePullTrustTests(unittest.TestCase):
 
 
 class BuildDispatchTests(unittest.TestCase):
+    def test_images_branch_skips_preparation_driver_run_and_runtime_audits(self):
+        self.check_owned_orchestrator('images', 'linux_docker_image_machine')
+
+    def test_images_failure_stops_monitor_preserves_cleanup_fence_and_never_dispatches_later_machine(self):
+        for index in (0, 1, 2):
+            with self.subTest(index=index):
+                self.check_owned_orchestrator('images', 'linux_docker_image_machine', fail_at=index)
+
     def test_lifecycle_branch_calls_only_lifecycle_and_monitors_every_machine(self):
         self.check_owned_orchestrator('lifecycle', 'linux_docker_container_lifecycle')
 
@@ -560,9 +655,14 @@ class BuildDispatchTests(unittest.TestCase):
     def test_parallel_branch_calls_only_parallel_orchestrator_and_monitors_every_machine(self):
         self.check_owned_orchestrator("parallel", "linux_docker_build_parallel")
 
-    def check_owned_orchestrator(self, suite, module_name):
+    def check_owned_orchestrator(self, suite, module_name, fail_at=None):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
-        harness.info = {"suite": suite, "public_ca": {"bundle_sha256": "a" * 64}}
+        image_pin = {'reference': 'python@sha256:' + 'b' * 64, 'id': 'sha256:' + 'c' * 64,
+                     'platform': 'linux/arm64', 'extra_registry_metadata': 'not passed as image identity'}
+        harness.info = {"suite": suite, "public_ca": {"bundle_sha256": "a" * 64}, 'python_image': image_pin}
+        harness.drivers, harness.driver_cleanup_verified = [], []
+        harness.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
+        harness.effects_uncertain = False
         harness.cli, harness.evidence = Path("/owned/bin/vz"), Path("/owned/evidence")
         contexts = [{"name": "context-" + str(i), "endpoint": "endpoint-" + str(i),
                      "engine_id": "engine-" + str(i)} for i in range(4)]
@@ -581,11 +681,24 @@ class BuildDispatchTests(unittest.TestCase):
         enrollment_order.attach_mock(harness.enroll_runtime_audits, 'enroll')
         enrollment_order.attach_mock(harness.sentinel, 'sentinel')
         harness.prepare_image = Mock(return_value={"exact": "images"})
+        harness.prepare_builder = Mock()
+        harness.docker, harness.mutate = Mock(), Mock()
         harness.driver_inputs, harness.validate_driver = Mock(), Mock()
         monitor = Mock()
+        monitor.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
+        monitor.thread.is_alive.return_value = False
         monitor.summary.return_value = {"samples": "observed"}
         observations = [{"operation": i} for i in range(3)]
-        module = types.SimpleNamespace(run_machine=Mock(side_effect=observations))
+        def selected_machine(*args):
+            index = args[-1]
+            if suite == 'images':
+                harness.drivers.append(types.SimpleNamespace(record=types.SimpleNamespace(
+                    receipts=[{'effects_uncertain': False}], pending_interactions=[])))
+                harness.driver_cleanup_verified.append(index != fail_at)
+            if index == fail_at:
+                raise ValueError('image Machine replay failed')
+            return observations[index]
+        module = types.SimpleNamespace(run_machine=Mock(side_effect=selected_machine))
         with patch.dict("sys.modules", {module_name: module}), \
                 patch.object(gate, "SentinelMonitor", return_value=monitor), \
                 patch.object(gate.startup, "exact_developer_topology"), \
@@ -593,24 +706,44 @@ class BuildDispatchTests(unittest.TestCase):
                 patch.object(gate, "authenticated_proof", return_value=({"scope": "exact"}, {"proof": "exact"})), \
                 patch.object(gate.time, "time_ns", side_effect=range(10, 16)), \
                 patch.object(gate.driver, "Driver") as selected:
-            result = harness.scenario()
-        self.assertEqual(result["machine_slices"], observations)
+            if fail_at is None:
+                result = harness.scenario()
+            else:
+                with self.assertRaisesRegex(ValueError, 'image Machine replay failed'):
+                    harness.scenario()
+        if fail_at is None:
+            self.assertEqual(result["machine_slices"], observations)
+        else:
+            self.assertEqual(harness.driver_cleanup_verified, [True] * fail_at + [False])
+            with self.assertRaisesRegex(ValueError, 'cleanup lacks successful independent replay'):
+                harness.remove_owned()
+            harness.docker.assert_not_called()
+            harness.mutate.assert_not_called()
         if suite == 'lifecycle':
             harness.enroll_runtime_audits.assert_called_once_with(contexts)
             self.assertEqual(enrollment_order.mock_calls, [unittest.mock.call.enroll(contexts)] +
                              [unittest.mock.call.sentinel(context) for context in contexts])
         else:
             harness.enroll_runtime_audits.assert_not_called()
+        if suite == 'images':
+            base = {key: image_pin[key] for key in ('reference', 'id', 'platform')}
+            expected_images = {'base': base, 'compose': base}
+            harness.prepare_image.assert_not_called()
+            harness.prepare_builder.assert_not_called()
+        else:
+            expected_images = {'exact': 'images'}
+        self.assertEqual(harness.sentinel.call_args_list, [unittest.mock.call(context) for context in contexts])
         self.assertEqual(module.run_machine.call_args_list, [unittest.mock.call(
-            harness, contexts[i], {"scope": "exact"}, {"proof": "exact"}, {"exact": "images"}, i) for i in range(3)])
+            harness, contexts[i], {"scope": "exact"}, {"proof": "exact"}, expected_images, i)
+            for i in range(3 if fail_at is None else fail_at + 1)])
         self.assertEqual(monitor.check_interval.call_args_list, [unittest.mock.call(
-            10+2*i, 11+2*i, contexts[i]["name"]) for i in range(3)])
+            10+2*i, 11+2*i, contexts[i]["name"]) for i in range(3 if fail_at is None else fail_at)])
         monitor.start.assert_called_once_with()
         monitor.stop.assert_called_once_with()
         harness.driver_inputs.assert_not_called()
         harness.validate_driver.assert_not_called()
         selected.assert_not_called()
-        self.assertEqual(harness.status.call_count, 2)
+        self.assertEqual(harness.status.call_count, 2 if fail_at is None else 0)
 
     def test_builder_owner_is_retained_before_prepare_effects(self):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)

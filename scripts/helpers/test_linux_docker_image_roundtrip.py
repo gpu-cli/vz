@@ -71,7 +71,7 @@ class Fake:
             if self.fail == 'wrong-image' and self.load_count == 1:
                 row['Architecture'] = 'amd64'
             stdout = ('Loaded image: ' + lane.fixture.familiar_reference(reference) + '\n').encode()
-        elif args[:2] == ['image', 'tag']:
+        elif args[:1] == ['tag']:
             source, alias = [lane.fixture.familiar_reference(ref) for ref in args[-2:]]
             row = next(value for value in self.images.values() if source in value['RepoTags'])
             row['RepoTags'] = sorted(row['RepoTags'] + [alias])
@@ -144,7 +144,7 @@ class RoundTripTests(unittest.TestCase):
         self.assertEqual(len(loads), 3)
         self.assertEqual(loads[-1], saves[0])
         for index, (args, _, _) in fake.commands.items():
-            if args[:2] in (['image', 'load'], ['image', 'tag'], ['image', 'rm']):
+            if args[:1] == ['tag'] or args[:2] in (['image', 'load'], ['image', 'rm']):
                 self.assertIn(index - 2, fake.guards)
                 self.assertIn(index + 1, fake.guards)
 

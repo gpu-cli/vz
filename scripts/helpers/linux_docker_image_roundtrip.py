@@ -287,7 +287,7 @@ class _Program:
         self.expected_inventory({'subject': [self.refs['source']]})
         self.load('decoy', self.refs['decoy'], fixture.archive('decoy', self.refs['decoy']))
         before_tag = self.expected_inventory({'subject': [self.refs['source']], 'decoy': [self.refs['decoy']]})
-        tagged = self.mutate(['image', 'tag', self.refs['source'], self.refs['alias']])
+        tagged = self.mutate(['tag', self.refs['source'], self.refs['alias']])
         require(not tagged.stdout, 'tag emitted unexpected output')
         self.expected_inventory({'subject': [self.refs['source'], self.refs['alias']], 'decoy': [self.refs['decoy']]})
         self.saved, self.first_save = self.save(self.refs['alias'])
