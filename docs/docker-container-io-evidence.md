@@ -835,3 +835,56 @@ including the image-helper foundation tests then present. Log:
 `.artifacts/container-queued-winch-host-1.log`, SHA-256
 `27fd0bca8612707810ea862e97d0c1166c845ddf8faae08bf654cf71bdbcbf39`.
 These host tests do not certify installed Docker behavior.
+
+### Candidate 10: installed lifecycle slice passes
+
+`.artifacts/linux-docker-lifecycle-candidate-10` completes with
+`passed_dev_installed_lifecycle_slice`, no workload error and no cleanup errors.
+The supervised root process exits zero and is positively reaped. This uses the
+reviewed `50bb5a30` launch source and unchanged installed release/guest artifacts;
+later image-foundation files are unused by this run.
+
+All three workload Machines pass the fixed lifecycle program, including direct
+TTY resize/acknowledgement/query/exit and SIGINT, plus real tmux interaction.
+The direct resize captures prove restored client termios and owned child reaping.
+Cold replay with dispatch and filesystem-write entry points blocked independently
+reconstructs each complete workload and cleanup: respectively 354, 348 and 354
+main commands; 179, 177 and 179 source-selected steps; and 22 process captures per
+Machine. All replayed workload/cleanup objects match retained raw evidence.
+The reusable inert replay is `.artifacts/candidate10-independent-replay.py`.
+
+The run observes four sentinels (634 samples, no errors or test retries), removes
+its owned workload objects, captures all four enrolled runtime journals, and
+reports four positive public Stops, graceful daemon retirement and unchanged
+daily/isolated Docker defaults. Stopped disks and contexts remain retained;
+Delete is not certified.
+
+Manifest SHA-256:
+`5678b82215c95f0a4a2c378e4ea9c406c7fa3d86587c1be458e1f8f9322827e6`;
+result SHA-256:
+`b3b104f3b5eeb538119595d77fcdc07741ee965dd02e743de58f0b124f2086b5`.
+
+Independent final verification checks the exact inventory of 17,083 payloads /
+36,016,629 bytes. All four complete enrollment→snapshot→chunk→final capture
+programs replay against raw bytes: respectively 530, 549, 531 and 323 paired
+runtime invocations (3,866 journal records total). Every capture is tied to its
+distinct enrolled Machine owner, incarnation, boot, session and pinned runtime.
+The four public-Stop receipts have matching operation/generation/owner bindings
+and clean, distinct filesystem journals. All five sockets and the daemon PID
+file are absent; recorded daemon PID 94264 retires normally. These final captures
+precede public Stop and do not extend journal coverage past that boundary.
+
+Independent sentinel replay validates all 634 complete samples directly from
+context, Engine, container-inspect and host-written-marker receipts, preserving
+exact container/image/label/start identity and zero restarts. The cooperatively
+stopped final partial sample retains three completed commands but is not counted
+as another complete sample. All 2,539 sentinel commands returned zero with
+complete, certain receipts; no evidence was changed during the audit.
+
+This is still a focused DEV slice. The final journals explicitly do not certify
+Docker-operation causality, full historical process/namespace-FD absence,
+normal-Up startup invocations or public-Stop invocations. Their post-Ready
+enrollment also does not establish pre-daemon persisted-recovery coverage.
+Those proof gaps, actual kernel-exec error transport, the remaining Docker
+catalog and the full three-phase 0.4 aggregate remain open. Candidates 8 and 9
+remain failed; their preserved evidence is not reclassified by this new run.
