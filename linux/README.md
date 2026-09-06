@@ -18,7 +18,12 @@ Developer Environments; it is not a separate peer product.
 
 Full Docker compatibility is roadmap work. The Developer guest now includes a
 pinned, statically linked iptables legacy frontend for Docker bridge/NAT setup;
-the hardened Container guest intentionally does not. When complete, Docker will
+its kernel must build in the IPv4 raw table used by Docker's bridge direct-access
+filtering. Kernel builds and cache checks validate the effective configuration,
+and the local-Mac backend gate exercises an exact raw PREROUTING rule and its
+removal. This does not establish IPv6 or full Docker parity.
+The hardened Container guest intentionally does not acquire this Developer
+requirement or the frontend. When complete, Docker will
 be an implicit, private capability of each Developer-profile Linux Machine, never a
 global daemon or a capability of native macOS/Windows targets. Both Linux
 profiles use the pinned youki runtime; runc fallback is not supported.
@@ -139,11 +144,12 @@ additional validation:
 - `vz_linux::ensure_kernel_profile(KernelProfile::Container)`
 - `vz_linux::ensure_kernel_bundle(KernelBundleOptions { profile: Some(...), required_capabilities: ..., ..Default::default() })`
 
-OCI runtime callers can set `RuntimeConfig::linux_profile`. The transitional
-0.3 CLI still exposes backend profile flags and `vz vm`; these are not the 0.4
-public interface and must be removed, not retained as hidden aliases. The 0.4
-ProjectDefinition carries each Machine's explicit Developer/Hardened profile,
-and the five lifecycle commands operate on that topology.
+OCI runtime callers can set `RuntimeConfig::linux_profile`. The current 0.4
+development CLI exposes only `up`, `exec`, `status`, `stop`, and `delete`;
+`vz vm` and the legacy backend command families are rejected, not hidden aliases.
+The ProjectDefinition carries each Machine's explicit Developer/Hardened profile,
+and those five lifecycle commands operate on the topology. This CLI shape does
+not imply that the full 0.4 release gate has passed.
 
 ## Benchmark boot latency
 

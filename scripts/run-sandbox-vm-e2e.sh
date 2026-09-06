@@ -3381,6 +3381,12 @@ run_and_log() {
             echo "private guest Docker readiness evidence is missing or invalid" >&2
             return 115
         fi
+        if ! python3 "$SCRIPT_DIR/helpers/docker_raw_table_evidence.py" \
+            "$DOCKER_READINESS_EVIDENCE" \
+            --iptables-version "$(jq -er '.iptables' "$REPO_ROOT/linux/out/version.json")"; then
+            echo "Developer legacy raw-table evidence is missing or invalid" >&2
+            return 115
+        fi
         shasum -a 256 "$DOCKER_READINESS_EVIDENCE" > "$DOCKER_READINESS_SHA256"
         DOCKER_READINESS_VALIDATED=true
     fi

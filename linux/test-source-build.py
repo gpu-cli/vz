@@ -182,7 +182,8 @@ class SourceBuildTests(unittest.TestCase):
         archive, checksum = self.archive()
         self.prepare(archive, checksum)
         artifact, config, effective, recipe = [self.root / name for name in ("vmlinux", "fragment", ".config", "recipe")]
-        for path, content in [(artifact, b"image"), (config, b"CONFIG_SAMPLE=y\n"), (effective, b"effective config"), (recipe, b"recipe")]:
+        for path, content in [(artifact, b"image"), (config, b"CONFIG_SAMPLE=y\nCONFIG_IP_NF_RAW=y\n"),
+                              (effective, b"CONFIG_SAMPLE=y\nCONFIG_IP_NF_RAW=y\n"), (recipe, b"recipe")]:
             path.write_bytes(content)
             path.chmod(0o644)
         return argparse.Namespace(
@@ -190,6 +191,85 @@ class SourceBuildTests(unittest.TestCase):
             source_manifest=str(self.root / "source.source.json"), recipe=[str(recipe)],
             compiler="gcc", sha256=checksum, kind="kernel", arch="arm64", cross_compile="", base_config="defconfig",
         )
+
+    def test_developer_effective_config_requires_exactly_one_builtin_ipv4_raw_table(self):
+        args = self.artifact_args()
+        BUILD.validate_effective_config(args, "CONFIG_IP_NF_RAW=y\n")
+        for config in ("", "# CONFIG_IP_NF_RAW is not set\n", "CONFIG_IP_NF_RAW=n\n",
+                       "CONFIG_IP_NF_RAW=m\n", "CONFIG_IP_NF_RAW=y\nCONFIG_IP_NF_RAW=y\n",
+                       "CONFIG_IP_NF_RAW=y\nCONFIG_IP_NF_RAW=m\n",
+                       "CONFIG_IP_NF_RAW=y\n# CONFIG_IP_NF_RAW is not set\n",
+                       "CONFIG_IP_NF_RAW = y\n", "CONFIG_IP_NF_RAW=y # not generated config\n",
+                       "CONFIG_IP_NF_RAW_OTHER=y\n"):
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "CONFIG_IP_NF_RAW=y"):
+                BUILD.validate_effective_config(args, config)
+
+    def test_invalid_effective_config_cannot_overwrite_recorded_provenance(self):
+        args = self.artifact_args()
+        BUILD.record_artifact(args)
+        evidence = Path(str(args.artifact) + ".build.json")
+        before = evidence.read_bytes(), evidence.stat().st_ino
+        Path(args.effective_config).write_text("CONFIG_IP_NF_RAW=m\n")
+        with self.assertRaisesRegex(ValueError, "CONFIG_IP_NF_RAW=y"):
+            BUILD.record_artifact(args)
+        self.assertEqual((evidence.read_bytes(), evidence.stat().st_ino), before)
+
+    def test_self_consistently_rehashed_bad_cached_config_is_rejected(self):
+        args = self.artifact_args()
+        BUILD.record_artifact(args)
+        evidence = Path(str(args.artifact) + ".build.json")
+        valid = json.loads(evidence.read_bytes())
+        for config in ("", "# CONFIG_IP_NF_RAW is not set\n", "CONFIG_IP_NF_RAW=n\n",
+                       "CONFIG_IP_NF_RAW=m\n", "CONFIG_IP_NF_RAW=y\nCONFIG_IP_NF_RAW=y\n"):
+            invalid = valid | {"effective_config": config,
+                               "effective_config_sha256": BUILD.hashlib.sha256(config.encode()).hexdigest()}
+            evidence.write_bytes(BUILD.encoded(invalid))
+            before = evidence.read_bytes()
+            with self.subTest(config=config), self.assertRaisesRegex(ValueError, "CONFIG_IP_NF_RAW=y"):
+                BUILD.verify_artifact(args)
+            self.assertEqual(evidence.read_bytes(), before)
+
+    def test_raw_requirement_does_not_change_hardened_or_busybox_policy(self):
+        args = self.artifact_args()
+        Path(args.effective_config).write_text("CONFIG_SAMPLE=y\n")
+        for kind, profile in (("kernel", "container"), ("busybox", "developer"), ("busybox", "container")):
+            args.kind, args.profile = kind, profile
+            args.config = str(self.root / "fragment") if kind == "kernel" else None
+            Path(args.artifact).chmod(0o644 if kind == "kernel" else 0o755)
+            with self.subTest(kind=kind, profile=profile):
+                BUILD.record_artifact(args)
+                BUILD.verify_artifact(args)
+                recorded = json.loads(Path(str(args.artifact) + ".build.json").read_bytes())
+                self.assertEqual(recorded["effective_config"], "CONFIG_SAMPLE=y\n")
+
+    def test_olddefconfig_dropping_raw_refuses_before_compilation_and_preserves_old_pair(self):
+        args = self.artifact_args()
+        BUILD.record_artifact(args)
+        evidence = Path(str(args.artifact) + ".build.json")
+        before = Path(args.artifact).read_bytes(), evidence.read_bytes()
+        args.source, args.build_dir = str(self.root / "source"), str(self.root / "build")
+        args.archive, args.jobs = str(self.root / "source.tar"), 1
+        build = Path(args.build_dir)
+        build.mkdir()
+        # Invalidate the cache without altering its existing image/provenance.
+        Path(args.config).write_text("CONFIG_SAMPLE=y\nCONFIG_IP_NF_RAW=y\n# new fragment\n")
+        commands = []
+
+        def make(command, **unused_kwargs):
+            commands.append(command)
+            self.assertNotIn("Image", command, "must refuse before kernel compilation")
+            (build / ".config").write_text(
+                "# CONFIG_IP_NF_RAW is not set\n" if command[-1] == "olddefconfig"
+                else "CONFIG_IP_NF_RAW=y\n")
+
+        with mock.patch.object(BUILD, "require_case_sensitive"), mock.patch.object(BUILD.subprocess, "run", side_effect=make):
+            with mock.patch.object(BUILD, "publish_artifact") as publish:
+                with self.assertRaisesRegex(ValueError, "CONFIG_IP_NF_RAW=y"):
+                    BUILD.build_artifact(args)
+                publish.assert_not_called()
+        self.assertEqual(len(commands), 3)
+        self.assertEqual(commands[-1][-1], "olddefconfig")
+        self.assertEqual((Path(args.artifact).read_bytes(), evidence.read_bytes()), before)
 
     def test_artifact_provenance_roundtrip_and_input_drift_refusal(self):
         args = self.artifact_args()
@@ -252,7 +332,7 @@ class SourceBuildTests(unittest.TestCase):
         before = Path(args.artifact).read_bytes()
 
         def make(*unused_args, **unused_kwargs):
-            (build / ".config").write_bytes(b"CONFIG_SAMPLE=y\n")
+            (build / ".config").write_bytes(b"CONFIG_SAMPLE=y\nCONFIG_IP_NF_RAW=y\n")
             image = build / "arch/arm64/boot/Image"
             image.parent.mkdir(parents=True, exist_ok=True)
             image.write_bytes(b"newly built image")

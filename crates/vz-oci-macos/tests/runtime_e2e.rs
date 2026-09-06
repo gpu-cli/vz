@@ -227,7 +227,8 @@ fn ready_generation_evidence(ready: &ContainerReadyGeneration) -> serde_json::Va
 }
 
 /// Prove lazy Docker activation against one exact, vz-managed Developer Linux
-/// shared VM. This intentionally stops at the guest socket boundary: a host
+/// shared VM, including the legacy raw-table rule required by Docker bridge
+/// endpoints. This intentionally stops at the guest socket boundary: a host
 /// Docker proxy/context is a separate product layer.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires Apple Silicon + Developer Linux artifacts + Docker facade artifacts"]
@@ -256,6 +257,101 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
         .await
         .unwrap()
         .unwrap_or_else(|| panic!("shared VM identity"));
+
+    // Probe before activating Docker so no daemon can concurrently change the
+    // table snapshot. The unique interface token owns exactly one rule; the
+    // documentation-only destination is never contacted by this test.
+    let probe_digest = format!(
+        "{:x}",
+        Sha256::digest(temp.path().as_os_str().as_encoded_bytes())
+    );
+    let raw_rule_interface = format!("vzraw{}", &probe_digest[..10]);
+    let raw_table_result = runtime
+        .exec_in_shared_vm(
+            stack_id,
+            "/bin/sh".to_string(),
+            vec![
+                "-c".to_string(),
+                r#"
+set -eu
+owned_interface=$1
+version=$(/sbin/iptables --version)
+printf 'iptables_version=%s\n' "$version"
+case "$version" in
+  'iptables v'*' (legacy)') ;;
+  *) echo 'expected pinned legacy iptables' >&2; exit 1 ;;
+esac
+raw_rule() {
+  /sbin/iptables --wait 2 -t raw "$1" PREROUTING -d 192.0.2.1 ! -i "$owned_interface" -j DROP
+}
+before=$(/sbin/iptables --wait 2 -t raw -S)
+printf 'raw_before_begin\n%s\nraw_before_end\n' "$before"
+if raw_rule -C; then
+  echo 'owned raw probe rule already exists; refusing to modify it' >&2
+  exit 1
+else
+  test "$?" -eq 1
+fi
+rollback() {
+  status=$?
+  trap - EXIT HUP INT TERM
+  # Absence was proven before arming cleanup. Even an interrupted add may
+  # have installed this exact rule; never flush a chain or remove other rules.
+  if raw_rule -C; then
+    raw_rule -D || status=1
+  else
+    test "$?" -eq 1 || status=1
+  fi
+  after=$(/sbin/iptables --wait 2 -t raw -S) || status=1
+  printf 'raw_rollback_begin\n%s\nraw_rollback_end\n' "$after"
+  test "$before" = "$after" || status=1
+  exit "$status"
+}
+trap rollback EXIT
+trap 'exit 1' HUP INT TERM
+raw_rule -A
+raw_rule -C
+printf 'raw_rule_added_and_checked=%s\n' "$owned_interface"
+raw_rule -D
+if raw_rule -C; then
+  echo 'owned raw probe rule remains after deletion' >&2
+  exit 1
+else
+  test "$?" -eq 1
+fi
+after=$(/sbin/iptables --wait 2 -t raw -S)
+printf 'raw_after_begin\n%s\nraw_after_end\n' "$after"
+test "$before" = "$after"
+trap - EXIT HUP INT TERM
+printf 'developer-legacy-raw-prerouting-preserved\n'
+"#
+                .to_string(),
+                "vz-raw-table-probe".to_string(),
+                raw_rule_interface.clone(),
+            ],
+            Duration::from_secs(30),
+        )
+        .await;
+    write_test_stderr(format_args!(
+        "VZ_DEVELOPER_RAW_TABLE_PROBE: interface={raw_rule_interface} result={raw_table_result:?}"
+    ));
+    let raw_table_probe = match raw_table_result {
+        Ok(output)
+            if output.exit_code == 0
+                && output.stdout.lines().last()
+                    == Some("developer-legacy-raw-prerouting-preserved") =>
+        {
+            output
+        }
+        failure => {
+            let shutdown = runtime.shutdown_shared_vm(stack_id).await;
+            let preserved = temp.keep();
+            panic!(
+                "Developer raw-table regression failed: {failure:?}; shutdown: {shutdown:?}; preserved fixture: {}",
+                preserved.display()
+            );
+        }
+    };
 
     let stale = vz_runtime_contract::StackRuntimeIdentity::new(stack_id).unwrap();
     let stale_error = runtime
@@ -391,6 +487,11 @@ async fn developer_shared_vm_docker_readiness_is_generation_fenced_and_engine_ba
                 "old_identity_refused_after_reboot": true,
                 "persistent_machine_state_survived_reboot": true,
                 "bootstrap_preserved_daemon_config": true,
+                "legacy_raw_prerouting": {
+                    "interface_token": raw_rule_interface,
+                    "add_check_delete_and_table_preservation_proven": true,
+                    "probe": raw_table_probe,
+                },
                 "host_socket_or_context": null,
             }))
             .unwrap(),

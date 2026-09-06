@@ -111,6 +111,13 @@ images. Cached artifacts are accepted only after checking this evidence against
 the current inputs. `TRUST_EXISTING_KERNEL_IMAGE=1` now requires valid matching
 provenance; it cannot bless an old image by timestamp or existence alone.
 
+Developer kernel builds also require exactly one effective
+`CONFIG_IP_NF_RAW=y` setting after `olddefconfig`, before compilation, and during
+record/cache validation. Missing, disabled, modular, or conflicting values are
+rejected even if their provenance hashes are internally consistent. This is the
+IPv4 legacy raw table required by Docker bridge filtering; it does not add a
+Hardened/BusyBox requirement or an IPv6 compatibility claim.
+
 Direct `make all`/`make kernel` remain available on a case-sensitive native Linux
 build filesystem. They deliberately refuse a case-insensitive Mac checkout.
 Use the Docker wrappers on the Mac; do not delete `linux/src` or touch output
@@ -118,7 +125,9 @@ timestamps to bypass the check.
 
 ## Verification status
 
-The offline tests run with:
+The offline tests require Python 3.11 or newer (`hashlib.file_digest`); the
+older `/usr/bin/python3` bundled with some macOS versions is insufficient.
+Run with:
 
 ```bash
 PYTHONDONTWRITEBYTECODE=1 python3 linux/test-source-build.py
@@ -130,7 +139,8 @@ inventory, and cache-proof drift. Small extraction tests mock only the storage
 probe so they can run on the case-insensitive Mac; this is not evidence that a
 Linux build or case-preserving extraction passed.
 
-Issue `vz-5in.1` remains open until fresh builds of **both** profiles produce the
-case-preservation/provenance evidence and pass the complete local-vz Linux
-backend gate. Old kernel boot results, source inventory alone, and offline tests
-cannot close it or certify a 0.4 release.
+Issue `vz-5in.1` closed after fresh builds of **both** profiles produced the
+case-preservation/provenance evidence and passed the complete local-vz Linux
+backend gate. Its Beads record retains the build identities and physical run.
+Subsequent runtime changes still require their applicable backend gate; source
+inventory or offline tests alone cannot certify Docker compatibility or 0.4.

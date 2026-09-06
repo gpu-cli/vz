@@ -229,6 +229,22 @@ def build_environment(source_date_epoch):
     return environment
 
 
+def validate_effective_config(args, config):
+    """Require Developer IPv4 raw tables built in, without widening other profiles.
+
+    A fragment request is insufficient: olddefconfig can drop an option whose
+    dependencies are not satisfied. Modules are not shipped as a substitute.
+    This is an internal build invariant, not a new public kernel capability.
+    """
+    if args.kind != "kernel" or args.profile != "developer":
+        return
+    declarations = [line.strip() for line in config.splitlines()
+                    if re.match(r"^(?:CONFIG_IP_NF_RAW(?:\s*=|$)|#\s*CONFIG_IP_NF_RAW\s+is not set(?:\s|$))",
+                                line.strip())]
+    if declarations != ["CONFIG_IP_NF_RAW=y"]:
+        raise ValueError("Developer kernel effective config requires exactly one CONFIG_IP_NF_RAW=y (built-in IPv4 raw table)")
+
+
 def record_artifact(args):
     artifact = Path(args.artifact)
     if artifact.is_symlink() or not artifact.is_file() or artifact.stat().st_size == 0:
@@ -236,6 +252,8 @@ def record_artifact(args):
     source = json.loads(read_regular(args.source_manifest))
     if source.get("case_sensitive_storage") is not True or source.get("schema_version") != 1:
         raise ValueError("missing verified source provenance")
+    effective_config = read_regular(args.effective_config)
+    validate_effective_config(args, effective_config.decode("utf-8"))
     result = {
         "schema_version": 1,
         "profile": args.profile,
@@ -244,8 +262,8 @@ def record_artifact(args):
         "artifact_mode": stat.S_IMODE(artifact.stat().st_mode),
         "source": source,
         "config_fragment_sha256": digest(args.config) if args.config else None,
-        "effective_config_sha256": digest(args.effective_config),
-        "effective_config": read_regular(args.effective_config).decode("utf-8"),
+        "effective_config_sha256": hashlib.sha256(effective_config).hexdigest(),
+        "effective_config": effective_config.decode("utf-8"),
         "recipe_inputs": recipe_identity(args.recipe),
         "build_parameters": build_parameters(args),
         "builder_id": os.environ.get("VZ_LINUX_BUILDER_ID") or f"native:{platform.system()}:{platform.machine()}",
@@ -283,6 +301,7 @@ def verify_artifact(args):
         or result.get("compiler") != compiler_identity(args.cross_compile + "gcc")
     ):
         raise ValueError("cached build provenance does not match current pinned inputs and artifact")
+    validate_effective_config(args, result["effective_config"])
 
 
 def build_artifact(args):
@@ -308,6 +327,7 @@ def build_artifact(args):
             subprocess.run([str(source / "scripts/kconfig/merge_config.sh"), "-m", "-O", str(build),
                             str(effective), args.config], cwd=build, env=environment, check=True)
             subprocess.run(make + ["olddefconfig"], env=environment, check=True)
+            validate_effective_config(args, read_regular(effective).decode("utf-8"))
             target, binary = "Image", build / "arch/arm64/boot/Image"
         else:
             config = effective.read_text().replace("# CONFIG_STATIC is not set", "CONFIG_STATIC=y")
