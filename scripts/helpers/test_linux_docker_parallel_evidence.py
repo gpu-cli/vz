@@ -177,16 +177,63 @@ class ParallelEvidenceTests(unittest.TestCase):
             batch["vertexes"][role_index:role_index + 1] = [first, second]
             self.raw.stream(5, "stderr", encode(batch))
             self.validate()
-            for mutation in ("unfinished", "duplicate", "overlap", "abandoned", "reset"):
+            for mutation in ("unfinished", "changed-duplicate", "overlap", "abandoned", "reset"):
                 changed = copy.deepcopy(batch)
                 a, b = changed["vertexes"][role_index:role_index + 2]
                 if mutation == "unfinished": b.pop("completed")
-                elif mutation == "duplicate": changed["vertexes"].insert(role_index + 1, copy.deepcopy(a))
+                elif mutation == "changed-duplicate": changed["vertexes"].insert(role_index + 1, dict(a, cached=True))
                 elif mutation == "overlap": b["started"] = SyntheticBuilder.stamp(1.1)
                 elif mutation == "abandoned": a.pop("completed")
                 else: changed["vertexes"].append({"digest": b["digest"], "name": b["name"], "inputs": []})
                 self.raw.stream(5, "stderr", encode(changed))
                 with self.subTest(role=role_index, mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+
+    def test_exact_current_source_terminal_retransmission_preserves_raw_rows(self):
+        for role_index in (0, 1):
+            self.make(0)
+            batch = self.batch(0)
+            original = batch["vertexes"][role_index]
+            first = dict(original, completed=SyntheticBuilder.stamp(1.2))
+            second = dict(original, started=SyntheticBuilder.stamp(1.3))
+            batch["vertexes"][role_index:role_index + 1] = [first, copy.deepcopy(first), second, copy.deepcopy(second)]
+            raw = encode(batch)
+            self.raw.stream(5, "stderr", raw)
+            proof = self.validate()
+            self.assertEqual(proof["progress_sha256"], hashlib.sha256(raw).hexdigest())
+            if role_index == 1:
+                self.assertEqual(proof["copy_graph"]["local_context"], [first, first, second, second])
+            # The same current snapshot may cross a batch boundary, but its
+            # complete object must remain identical in the source's stream.
+            batch["vertexes"].pop(role_index + 3)
+            raw = encode(batch) + encode({"vertexes": [copy.deepcopy(second)]})
+            self.raw.stream(5, "stderr", raw)
+            self.assertEqual(self.validate()["progress_sha256"], hashlib.sha256(raw).hexdigest())
+
+    def test_source_terminal_retransmission_drift_stale_and_reopen_rejected(self):
+        for role_index in (0, 1):
+            for mutation in ("completed", "started", "cache", "error", "inputs", "stale", "reopen"):
+                self.make(0)
+                batch = self.batch(0)
+                original = batch["vertexes"][role_index]
+                first = dict(original, completed=SyntheticBuilder.stamp(1.2))
+                second = dict(original, started=SyntheticBuilder.stamp(1.3))
+                repeated = copy.deepcopy(second)
+                if mutation == "completed": repeated["completed"] = SyntheticBuilder.stamp(1.9)
+                elif mutation == "started": repeated["started"] = SyntheticBuilder.stamp(1.4)
+                elif mutation == "cache": repeated["cached"] = True
+                elif mutation == "error": repeated["error"] = "context canceled"
+                elif mutation == "inputs": repeated["inputs"] = ["sha256:" + "f" * 64]
+                elif mutation == "stale": repeated = copy.deepcopy(first)
+                else: repeated.pop("completed")
+                batch["vertexes"][role_index:role_index + 1] = [first, second, repeated]
+                self.raw.stream(5, "stderr", encode(batch))
+                with self.subTest(role=role_index, mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+        for role_index in (2, 3, 4, 5):
+            self.make(0)
+            batch = self.batch(0)
+            batch["vertexes"].insert(role_index + 1, copy.deepcopy(batch["vertexes"][role_index]))
+            self.raw.stream(5, "stderr", encode(batch))
+            with self.subTest(operation=role_index), self.assertRaises(evidence.Invalid): self.validate()
 
     def merged_batch(self, slot):
         batch = self.batch(slot)

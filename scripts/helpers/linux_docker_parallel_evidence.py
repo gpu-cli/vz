@@ -158,7 +158,7 @@ def parallel_progress(raw, reference, operation, guest_lower, guest_upper, host_
         done = [row for row in rows if "completed" in row]
         require(done, "parallel graph role unfinished")
         if role in ("base", "context"):
-            current, finished, previous_end = None, False, None
+            current, finished, previous_end, terminal_row = None, False, None, None
             for row in rows:
                 if "started" not in row:
                     require(current is None, "parallel source reset after execution")
@@ -168,9 +168,18 @@ def parallel_progress(raw, reference, operation, guest_lower, guest_upper, host_
                     require(current is None or finished, "parallel source lifetime abandoned")
                     require(previous_end is None or previous_end <= started, "parallel source lifetimes overlap")
                     current, finished = started, False
-                require(not finished, "parallel source updated after terminal")
+                if finished:
+                    # BuildKit v0.19.0 (3637d1b15a13fc3cdd0c16fcf3be0845ae68f53d),
+                    # solver/jobs.go:581-586: connectProgressFromState replays
+                    # MultiWriter history, then writes the current snapshot
+                    # with a fresh progress ID. Admit only an identical repeat
+                    # of this source's current terminal, never a prior lifetime
+                    # or changed/reopened terminal. Keep every original row.
+                    require(row == terminal_row, "parallel source updated after terminal")
+                    continue
                 if "completed" in row:
                     previous_end, finished = progress_ns(row["completed"]), True
+                    terminal_row = row
             require(finished, "parallel source final lifetime unfinished")
         if role not in ("base", "context"):
             require(len(done) == 1 and rows[-1] is done[0] and len({row["started"] for row in rows if "started" in row}) == 1,
