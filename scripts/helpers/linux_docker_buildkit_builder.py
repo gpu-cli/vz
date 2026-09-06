@@ -15,11 +15,13 @@ import re
 import stat
 import struct
 import tarfile
+import time
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
 import linux_docker_image_input as image_input
 import linux_docker_buildkit_cgroup as cgroup
+import linux_docker_buildkit_shutdown as shutdown
 
 REPO = Path(__file__).resolve().parents[2]
 CONTRACT = REPO / "config/buildkit-artifact-v0.19.0.json"
@@ -213,6 +215,7 @@ class Builder:
         require(info["ID"] == self.descriptor["engine_id"] and info["OSType"] == "linux" and
                 info["Architecture"] in ("aarch64", "arm64") and info["DefaultRuntime"] == "youki" and
                 info["Runtimes"]["youki"]["path"] == "/mnt/linux-bin/youki", "builder Engine/context/runtime mismatch")
+        return info
 
     def inspect_owned(self, running=True):
         self.engine_guard()
@@ -245,6 +248,7 @@ class Builder:
             require(type(state.get("Pid")) is int and state["Pid"] > 0 and
                     state.get("Status") == "running" and state.get("Paused") is False and
                     state.get("Restarting") is False and state.get("Dead") is False and
+                    state.get("OOMKilled") is False and state.get("Error") == "" and
                     isinstance(state.get("StartedAt"), str) and
                     re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,9})?Z",
                                  state["StartedAt"]), "missing live builder process identity")
@@ -367,16 +371,36 @@ class Builder:
             return
         self.harness.assert_certain()
         require(self.prepared and self.registered, "partially provisioned builder retained for explicit reconciliation")
+        contract_raw = read(CONTRACT, 64 * 1024)
+        require(sha(contract_raw) == self.harness.info["buildkit"]["contract_sha256"], "BuildKit shutdown source pin changed")
+        shutdown.source_contract(image_input.parse(contract_raw))
         self.inspect_owned()
         self.command("unregister", ["buildx", "rm", "--keep-daemon", "--keep-state", self.name], mutate=True)
         self.registered = False
         raw, _, _ = self.command("unregistered", ["buildx", "ls", "--format", "{{.Name}}"])
         require(self.name not in [line.strip().rstrip("*") for line in raw.decode().splitlines()], "builder registration remains")
-        self.inspect_owned()
-        self.command("container-stop", ["container", "stop", "--time", "30", self.container_id], mutate=True, timeout=60)
+        since = self.engine_guard()["SystemTime"]
+        shutdown.timestamp(since)
+        before = self.inspect_owned()
+        started = time.monotonic_ns()
+        self.command("container-stop", ["container", "stop", "--signal", "SIGTERM", "--time", "30", self.container_id],
+                     mutate=True, timeout=60)
+        stop_elapsed_ns = time.monotonic_ns() - started
         item = self.inspect_owned(running=False)
-        require(item["State"]["Status"] == "exited" and item["State"]["ExitCode"] == 0,
-                "builder did not gracefully exit; cleanup withheld")
+        until = self.engine_guard()["SystemTime"]
+        require(0 < shutdown.timestamp(until) - shutdown.timestamp(since) <= 60 * 10**9,
+                "invalid or unbounded Engine stop window")
+        event_raw, event_error, _ = self.command("stop-events", ["events", "--since", since, "--until", until,
+            "--filter", "type=container", "--filter", "container=" + self.container_id,
+            "--format", shutdown.EVENT_FORMAT], timeout=10)
+        require(event_error == b"", "unexpected stop-event error stream")
+        log_stdout, log_stderr, _ = self.command("stop-logs", ["logs", "--timestamps", "--since", since,
+            "--until", until, self.container_id], timeout=10)
+        stop_proof = shutdown.validate(before, item, since, until, stop_elapsed_ns,
+                                       event_raw, log_stdout, log_stderr, self.token)
+        stop_proof.update(owner=self.descriptor["owner"], context=self.descriptor["name"],
+                          engine_id=self.descriptor["engine_id"], contract_sha256=sha(contract_raw))
+        startup.document(self.harness.evidence / (self.token + "-normal-stop.json"), stop_proof)
         self.command("container-remove", ["container", "rm", self.container_id], mutate=True)
         self.absent("container", self.container_name)
         raw, _, _ = self.command("container-id-absent", ["container", "ls", "--all", "--quiet", "--no-trunc", "--filter", "id=" + self.container_id])
@@ -394,4 +418,5 @@ class Builder:
         startup.document(self.harness.evidence / (self.token + "-cleanup.json"),
                          {"builder": self.mapping, "cache_volume": self.volume, "owner": self.descriptor["owner"],
                           "buildx_registration_absent": True,
+                          "normal_stop": stop_proof,
                           "exact_owned_builder_container_volume_image_removed": True})

@@ -10,6 +10,7 @@ import unittest
 from unittest.mock import patch
 
 import linux_docker_buildkit_builder as builder
+from test_linux_docker_buildkit_shutdown import ACTUAL_LOG, SINCE, START, UNTIL, records, encode
 
 
 def elf(kind=1, machine=183):
@@ -88,13 +89,18 @@ class Harness:
     def __init__(self, root):
         self.root, self.evidence = root, root / "evidence"
         self.evidence.mkdir()
-        self.info = {"run_id": "builder-fixture", "buildkit": {"archive": "fixture"}}
+        self.info = {"run_id": "builder-fixture", "buildkit": {"archive": "fixture",
+                     "contract_sha256": builder.sha(builder.CONTRACT.read_bytes())}}
         self.calls, self.objects, self.lines = [], {}, []
         self.b = None
         self.running = self.registered = self.uncertain = False
         self.keep_registration = False
         self.failure = self.forbidden = None
         self.engine_id = "engine-exact"
+        self.stopped = False
+        self.stop_state = {}
+        self.stop_events = None
+        self.stop_logs = (b"", ACTUAL_LOG)
 
     def assert_certain(self):
         if self.uncertain:
@@ -124,17 +130,24 @@ class Harness:
                 "Mounts": [{"Type": "volume", "Name": b.volume_name, "Destination": "/var/lib/buildkit",
                     "Source": self.objects["volume"]["Mountpoint"], "RW": True}],
                 "State": {"Running": False, "Status": "created", "ExitCode": 0,
-                          "Paused": False, "Restarting": False, "Dead": False,
-                          "Pid": 737, "StartedAt": "2026-09-06T00:00:01.123456789Z"}, "RestartCount": 0}
+                          "Paused": False, "Restarting": False, "Dead": False, "OOMKilled": False, "Error": "",
+                          "Pid": 737, "StartedAt": START}, "RestartCount": 0}
             return ("b" * 64 + "\n").encode(), b"", 0
         if args[:2] in (["container", "start"], ["container", "stop"]):
             running = args[1] == "start"
             self.objects["container"]["State"].update(Running=running, Status="running" if running else "exited")
+            if not running:
+                self.stopped = True
+                self.objects["container"]["State"].update(Pid=0, ExitCode=1,
+                    FinishedAt="2026-09-06T07:18:56.282503111Z")
+                self.objects["container"]["State"].update(self.stop_state)
         if args[:2] == ["buildx", "create"]:
             self.registered = True
         if args[:2] == ["buildx", "rm"]:
             self.registered = self.keep_registration
         if len(args) > 1 and args[1] == "rm":
+            if args[0] == "container":
+                assert (self.evidence / (b.token + "-normal-stop.json")).is_file()
             self.objects.pop(args[0], None)
         if args[:2] == ["buildx", "inspect"]:
             return self.inspect_text(), b"", 0
@@ -147,7 +160,8 @@ class Harness:
         self.calls.append((False, label, copy.deepcopy(descriptor), list(args)))
         if args[0] == "info":
             value = {"ID": self.engine_id, "OSType": "linux", "Architecture": "aarch64", "DefaultRuntime": "youki",
-                     "Runtimes": {"youki": {"path": "/mnt/linux-bin/youki"}}}
+                     "Runtimes": {"youki": {"path": "/mnt/linux-bin/youki"}},
+                     "SystemTime": UNTIL if self.stopped else SINCE}
             return json.dumps(value).encode(), b"", 0
         if args[:2] == ["buildx", "ls"]:
             return (self.b.name.encode() if self.registered else b""), b"", 0
@@ -165,6 +179,12 @@ class Harness:
             return b"ID:\tworker-exact\nLabels:\n\torg.mobyproject.buildkit.worker.executor:\toci\n", b"", 0
         if label == "builder-youki-invocations":
             return "\n".join(self.lines).encode(), b"", 0
+        if label == "builder-stop-events":
+            raw = self.stop_events if self.stop_events is not None else encode(
+                records(self.b.container_id, self.b.container_name, self.b.image_id, self.b.token))
+            return raw, b"", 0
+        if label == "builder-stop-logs":
+            return *self.stop_logs, 0
         raise AssertionError((label, args))
 
 
@@ -266,6 +286,7 @@ class LifecycleTests(unittest.TestCase):
         original = dict(state)
         for key, value in (("Pid", True), ("Pid", 0), ("Pid", 738), ("StartedAt", None),
                            ("Paused", True), ("Restarting", True), ("Dead", True),
+                           ("OOMKilled", True), ("Error", "unexpected runtime error"),
                            ("StartedAt", "2026-99-06T99:99:99Z"),
                            ("StartedAt", "0001-01-01T00:00:00Z"),
                            ("StartedAt", "2026-09-06T00:00:02.123456789Z")):
@@ -330,6 +351,70 @@ class LifecycleTests(unittest.TestCase):
         self.assertFalse(self.harness.registered)
         proof = json.loads((self.harness.evidence / (self.b.token + "-cleanup.json")).read_bytes())
         self.assertTrue(proof["buildx_registration_absent"])
+        self.assertEqual(proof["normal_stop"]["exit_code"], 1)
+        self.assertEqual(proof["normal_stop"]["owner"], self.descriptor["owner"])
+        self.assertIn(["container", "stop", "--signal", "SIGTERM", "--time", "30", self.b.container_id], mutations)
+        reads = [args for mutation, _, _, args in self.harness.calls if not mutation]
+        self.assertIn(["events", "--since", SINCE, "--until", UNTIL, "--filter", "type=container",
+                       "--filter", "container=" + self.b.container_id, "--format", builder.shutdown.EVENT_FORMAT], reads)
+        self.assertIn(["logs", "--timestamps", "--since", SINCE, "--until", UNTIL, self.b.container_id], reads)
+
+    def test_missing_stop_logs_withholds_all_object_deletion(self):
+        self.b.prepare()
+        self.harness.stop_logs = (b"", b"")
+        with self.assertRaisesRegex(ValueError, "shutdown log"):
+            self.b.remove_owned()
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+        self.assertFalse((self.harness.evidence / (self.b.token + "-normal-stop.json")).exists())
+
+    def test_missing_stop_events_withholds_all_object_deletion(self):
+        self.b.prepare()
+        self.harness.stop_events = b""
+        with self.assertRaisesRegex(ValueError, "event stream"):
+            self.b.remove_owned()
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+
+    def test_oom_after_stop_withholds_all_object_deletion(self):
+        self.b.prepare()
+        self.harness.stop_state = {"OOMKilled": True}
+        with self.assertRaisesRegex(ValueError, "abnormal builder state"):
+            self.b.remove_owned()
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+
+    def test_unexpected_exit_zero_is_not_a_fallback_success(self):
+        self.b.prepare()
+        self.harness.stop_state = {"ExitCode": 0}
+        with self.assertRaisesRegex(ValueError, "unexpected stopped daemon status"):
+            self.b.remove_owned()
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+
+    def test_sigkill_event_withholds_all_object_deletion(self):
+        self.b.prepare()
+        events = records(self.b.container_id, self.b.container_name, self.b.image_id, self.b.token)
+        events[0]["attributes"]["signal"] = "9"
+        self.harness.stop_events = encode(events)
+        with self.assertRaisesRegex(ValueError, "exactly one SIGTERM"):
+            self.b.remove_owned()
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+
+    def test_uncertain_stop_has_no_observer_retry_or_object_deletion(self):
+        self.b.prepare()
+        self.harness.failure = "builder-container-stop"
+        with self.assertRaisesRegex(ValueError, "injected mutation failure"):
+            self.b.remove_owned()
+        count = len(self.harness.calls)
+        with self.assertRaisesRegex(ValueError, "uncertain host effect"):
+            self.b.remove_owned()
+        self.assertEqual(len(self.harness.calls), count)
+        self.assertEqual(set(self.harness.objects), {"container", "volume", "image"})
+
+    def test_stop_contract_change_withholds_even_unregister(self):
+        self.b.prepare()
+        self.harness.info["buildkit"]["contract_sha256"] = "f" * 64
+        count = len(self.harness.calls)
+        with self.assertRaisesRegex(ValueError, "source pin changed"):
+            self.b.remove_owned()
+        self.assertEqual(len(self.harness.calls), count)
 
     def test_remaining_registration_withholds_container_volume_image_deletion(self):
         self.b.prepare()

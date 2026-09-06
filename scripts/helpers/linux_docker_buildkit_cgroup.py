@@ -106,7 +106,8 @@ def canonical_path(value):
 
 
 def controllers(value):
-    require(value == "\n" or re.fullmatch(r"[a-z][a-z0-9_]*(?: [a-z][a-z0-9_]*)*\n", value),
+    # cgroup_print_ss_mask emits no bytes (not a newline) for an empty mask.
+    require(value == "" or re.fullmatch(r"[a-z][a-z0-9_]*(?: [a-z][a-z0-9_]*)*\n", value),
             "malformed controller set")
     values = value.strip().split()
     require(len(set(values)) == len(values), "duplicate controller")

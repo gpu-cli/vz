@@ -24,7 +24,7 @@ def fixture():
                   before_process_root="42:600\n", before_root_inode="29:700\n", before_init_inode="29:701\n",
                   root_fs="63677270\n", init_fs="63677270\n", root_type="domain\n", init_type="domain\n",
                   root_controllers="cpu io memory pids\n", root_subtree="cpu io memory pids\n",
-                  init_controllers="cpu io memory pids\n", init_subtree="\n", init_procs=f"{PID}\n322\n")
+                  init_controllers="cpu io memory pids\n", init_subtree="", init_procs=f"{PID}\n322\n")
     for name in ("stat", "membership", "namespace", "mountinfo", "process_root", "root_inode", "init_inode"):
         values["after_" + name] = values["before_" + name]
     return values
@@ -90,6 +90,29 @@ class CgroupTests(unittest.TestCase):
         self.assertEqual(proof["init_pids"], [PID, 322])
         self.assertEqual(proof["process"]["starttime_ticks"], 98765)
         self.assertEqual(proof["root_pids"], [])
+
+    def test_empty_controller_mask_uses_zero_byte_raw_probe_field(self):
+        raw = pack(fixture())
+        self.assertIn(b"\ninit_subtree=\n", raw)
+        self.assertEqual(cgroup.unpack(raw)["init_subtree"], "")
+        self.assertEqual(cgroup.controllers(""), [])
+        self.assertEqual(cgroup.validate(raw, PID)["enabled_controllers"], ["cpu", "io", "memory", "pids"])
+        for value in ("\n", "\n\n", " ", " \n", "\t", "\t\n", "\r\n"):
+            with self.subTest(value=repr(value)):
+                self.assert_bad(init_subtree=value)
+
+    def test_empty_root_controller_sets_still_rejected(self):
+        self.assert_bad(root_controllers="", root_subtree="", init_controllers="")
+        self.assert_bad(root_controllers="")
+        self.assert_bad(root_subtree="")
+        self.assert_bad(init_controllers="")
+
+    def test_nonempty_controller_set_spelling_and_uniqueness_remain_strict(self):
+        self.assertEqual(cgroup.controllers("cpu io memory pids\n"), ["cpu", "io", "memory", "pids"])
+        for value in ("cpu", " cpu\n", "cpu \n", "cpu  pids\n", "cpu\tpids\n", "cpu\npids\n",
+                      "cpu\r\n", "CPU\n", "cpu pids pids\n"):
+            with self.subTest(value=repr(value)), self.assertRaises(ValueError):
+                cgroup.controllers(value)
 
     def test_process_counters_may_change_but_birth_identity_cannot(self):
         values = fixture()
