@@ -47,7 +47,7 @@ directory() {
   test ! -L "$1" && test -d "$1" || fail
   test "$("$bb" stat -c '%u' "$1")" = 0 || fail
   mode=$("$bb" stat -c '%a' "$1")
-  case "$mode" in 700|755|750|555) ;; *) fail ;; esac
+  case "$mode" in 700|755|750|555|500) ;; *) fail ;; esac
 }
 parents() {
   test "$("$bb" id -u)" = 0 || fail

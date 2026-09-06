@@ -87,6 +87,23 @@ class CaptureTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 capture.chunk_script(SESSION, RUNTIME, index, size, sha)
 
+    def test_root_owned_readonly_parent_does_not_relax_journal_root_mode(self):
+        # Installed virtiofs artifact directories are root-owned 0500. They
+        # need traversal/read access, not write access; the audit sink itself
+        # still requires its exact private 0700 contract.
+        script = capture.enrollment_script(SESSION, RUNTIME)
+        self.assertIn('case "$mode" in 700|755|750|555|500)', script)
+        self.assertIn('test "$("$bb" stat -c \'%u\' "$1")" = 0 || fail', script)
+        self.assertIn('test "$("$bb" stat -c \'%a\' "$root")" = 700 || fail', script)
+        rows = snapshot_raw().split(b'\n')
+        for mode in (0o40500, 0o40555, 0o40755, 0o40750, 0o40777):
+            fields = rows[5].split(b'|')
+            fields[0] = ('%x' % mode).encode()
+            changed = list(rows)
+            changed[5] = b'|'.join(fields)
+            with self.subTest(mode=oct(mode)), self.assertRaises(ValueError):
+                parse(b'\n'.join(changed), enrolled=True)
+
     def test_snapshot_framing_and_base64_rejects_trailing_duplicate_and_noncanonical(self):
         raw = snapshot_raw()
         for changed in (raw[:-1], raw + b'\n', raw + raw, raw.replace(b'END\n', b'OTHER\n'), b'x' * 8193,

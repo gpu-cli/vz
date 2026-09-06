@@ -648,13 +648,63 @@ That observation is separately retained in
 The original timeout remains failed. A separate diagnostic continuation may use
 this now-resolved exact container; it must not dispatch another create or
 reinterpret the original timeout as a passing command.
-Native portability and a fresh installed-Mac lifecycle candidate remain pending;
-none of these diagnostic attempts certifies runtime capture or Docker parity.
+None of these initial diagnostic attempts certifies runtime capture or Docker
+parity. The separate continuation below subsequently verifies native portability.
 
 Source `2350aa83` starts fresh installed-Mac lifecycle candidate 7 with the nine
 retained guest inputs above. Evidence is
 `.artifacts/linux-docker-lifecycle-candidate-7`, console
 `.artifacts/linux-docker-lifecycle-candidate-7.console.log`, retained root
-`/private/tmp/vzdev-t0mvxp68`. The first Environment reached Ready; the second is
-provisioning. The run is live, not a physical pass. Continue observing its same
-process; an observation timeout is not authorization to restart it.
+`/private/tmp/vzdev-t0mvxp68`. Both Environments reached Ready, but the original
+process terminated with exit 1 at the first enrollment, before any sentinel or
+Docker workload fixture. No test case was retried. Original failed manifest:
+`fc09ac1bac6b453cd70f09ae169b6b2ee4bbbe649a1d065fc20fa4b4894ff0e9`;
+result SHA-256:
+`a2228dad6f8765d96c322a0b5efdc660402559e04e9242f26e19865d86be8dbd`.
+
+### Native portability passed; installed read-only-directory mismatch diagnosed
+
+`.artifacts/runtime-audit-capture-native-3-continuation-2` uses the resolved exact
+container above, without another create. An earlier continuation's guard rejected
+only a reordered Docker mount array before Start; that guard failure is retained.
+The final continuation compares the exact mount inventory by destination, rejecting
+duplicates, and passes with actual guest BusyBox and the pinned runtime. One fresh
+enrollment and one real `youki --version` call produce a complete two-record pair;
+snapshot/chunk/final replay and denied reenrollment with unchanged history pass.
+Normal Stop returns zero, and the exact owned container is removed. Independent
+verification checks 69 payloads totaling 119,813 bytes, manifest SHA-256
+`d216e14b9b45ffc4ef62c4ac4ce472e9e022217cea82770feb48dc2e6b33cc65`.
+Journal SHA-256:
+`a1e4ccf1b6ea9d8bb6233fd9366f7b55c77f74ec65e1ff014a9f006334851207`.
+This is native acquisition portability, not an OCI payload or vz Machine pass.
+
+Candidate 7's separate authenticated public-Exec diagnostic identifies the actual
+Machine difference: `/mnt/linux-bin` is a root-owned `0500` virtiofs directory,
+but the capture helper's directory-mode list omitted `0500`. All audit paths
+are absent, so the rejection preceded enrollment creation. Protected journal
+ancestors are root-owned and correct; there is no evidence justifying a UID
+exception or changing initramfs ownership. The observed guest mount flags are
+`rw`; host-side `VZSharedDirectory(read_only=true)` enforces the artifact share's
+read-only setting, rather than a guest `ro` mount flag.
+
+Disposition `.artifacts/linux-docker-lifecycle-candidate-7-disposition` verifies
+all four exact-owner public Stops, four clean distinct filesystem journals,
+graceful daemon exit, absent PID file/five sockets and unchanged Docker defaults.
+Original failure evidence and stopped disks are preserved; no enrollment repair,
+Docker-object removal or Delete was performed. Independent inventory: 513 payloads,
+557,439 bytes, manifest SHA-256
+`aca4500ccc18bd18bb0586e37c7afa3dd9b84a865ba4abad62b71568e7de8767`.
+Raw filesystem diagnostic SHA-256:
+`81a30adfce61de84912d7ea019f02ef15007e172fabe2761058eb1e06454c84e`.
+
+The capture-only correction admits root-owned `0500` ancestors while preserving
+the audit sink's exact `0700` requirement and every file's `0600` requirement.
+The expanded focused audit family passes 42 tests in 3.297 seconds, including
+rejection of a `0500` journal root. Log
+`.artifacts/runtime-audit-capture-mode500-1.log`, SHA-256
+`988bfe7e98f3e411c35ca7947731244798c5f6027a04b2e07024d1d628da36dd`.
+The final broad host regression passes 750 tests in 193.446 seconds:
+`.artifacts/runtime-audit-capture-host-regression-3.log`, SHA-256
+`8badb487fa739a7b589d34eb0777294b0f126bfb4068485d8e4d4ae6d59f3682`.
+Runtime/guest artifacts are unchanged; fresh installed-Mac verification remains
+required before this corrected acquisition path can pass.
