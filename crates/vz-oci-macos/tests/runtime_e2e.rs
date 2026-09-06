@@ -4313,11 +4313,12 @@ async fn cgroup_cpu_max_enforcement() {
     }
     init_tracing();
     let tmp = tempfile::tempdir().unwrap();
+    let fixture = install_cgroup_probe_image(tmp.path()).await;
     let rt = test_runtime(tmp.path());
 
     let create_result = rt
         .create_container(
-            "alpine:3.20",
+            &fixture.reference,
             RunConfig {
                 cmd: vec!["/bin/busybox".into(), "sleep".into(), "300".into()],
                 execution_mode: ExecutionMode::OciRuntime,
@@ -4879,7 +4880,26 @@ fn install_exec_defaults_image(data_dir: &Path) -> ExecDefaultsImageFixture {
         }
     }))
     .unwrap();
-    let config_digest = sha256_digest(&config);
+    register_local_exec_fixture(
+        data_dir,
+        EXEC_DEFAULTS_IMAGE,
+        false,
+        &layer,
+        &config,
+        busybox_digest,
+    )
+}
+
+fn register_local_exec_fixture(
+    data_dir: &Path,
+    image_name: &str,
+    digest_qualified: bool,
+    layer: &[u8],
+    config: &[u8],
+    busybox_digest: String,
+) -> ExecDefaultsImageFixture {
+    let layer_digest = sha256_digest(layer);
+    let config_digest = sha256_digest(config);
     let manifest = serde_json::to_vec(&json!({
         "config": {
             "digest": &config_digest,
@@ -4900,29 +4920,296 @@ fn install_exec_defaults_image(data_dir: &Path) -> ExecDefaultsImageFixture {
     let store = ImageStore::new(data_dir.to_path_buf());
     store.ensure_layout().unwrap();
     store
-        .write_layer_blob(&layer_digest, EXEC_DEFAULTS_LAYER_MEDIA_TYPE, &layer)
+        .write_layer_blob(&layer_digest, EXEC_DEFAULTS_LAYER_MEDIA_TYPE, layer)
         .unwrap();
     store
         .write_manifest_json(&manifest_digest, &manifest)
         .unwrap();
-    store.write_config_json(&manifest_digest, &config).unwrap();
-    let canonical_reference = Reference::from_str(EXEC_DEFAULTS_IMAGE).unwrap().whole();
+    store.write_config_json(&manifest_digest, config).unwrap();
+    let reference = if digest_qualified {
+        format!("{image_name}@{manifest_digest}")
+    } else {
+        image_name.to_string()
+    };
+    let canonical_reference = Reference::from_str(&reference).unwrap().whole();
     store
         .write_reference(&canonical_reference, &manifest_digest)
         .unwrap();
-    if canonical_reference != EXEC_DEFAULTS_IMAGE {
-        store
-            .write_reference(EXEC_DEFAULTS_IMAGE, &manifest_digest)
-            .unwrap();
+    if canonical_reference != reference {
+        store.write_reference(&reference, &manifest_digest).unwrap();
     }
+    assert_eq!(
+        store.read_manifest_json(&manifest_digest).unwrap(),
+        manifest
+    );
+    assert_eq!(store.read_config_json(&manifest_digest).unwrap(), config);
+    assert!(store.has_layer_blob(&layer_digest));
 
     ExecDefaultsImageFixture {
-        reference: EXEC_DEFAULTS_IMAGE.to_string(),
+        reference,
         manifest_digest,
         config_digest,
         layer_digest,
         busybox_digest,
     }
+}
+
+/// Authenticate the exact offline layer and source proof before registering it.
+fn verify_cgroup_fixture_input(
+    layer: &[u8],
+    source_proof: &[u8],
+    metadata: &vz_linux::DeveloperProbeMetadata,
+) {
+    use std::io::Read as _;
+
+    assert!(layer.len() as u64 <= vz_linux::MAX_DEVELOPER_PROBE_BYTES);
+    assert!(source_proof.len() <= 4 * 1024 * 1024);
+    metadata.validate().unwrap();
+    assert_eq!(sha256_digest(layer), format!("sha256:{}", metadata.sha256));
+    assert_eq!(
+        sha256_digest(source_proof),
+        format!("sha256:{}", metadata.build_provenance_sha256)
+    );
+    let proof: serde_json::Value = serde_json::from_slice(source_proof).unwrap();
+    assert_eq!(proof["schema_version"], 1);
+    assert_eq!(proof["build_parameters"]["kind"], "busybox");
+    assert_eq!(proof["build_parameters"]["arch"], "arm64");
+    assert_eq!(proof["artifact_sha256"], metadata.busybox_sha256);
+    assert_eq!(
+        proof["source"]["archive_sha256"],
+        metadata.source_archive_sha256
+    );
+    assert_eq!(
+        proof["source"]["source_tree_sha256"],
+        metadata.source_inventory_sha256
+    );
+    assert_eq!(proof["source"]["case_sensitive_storage"], true);
+    assert_eq!(
+        proof["source"]["archive_root"],
+        format!("busybox-{}", metadata.busybox_version)
+    );
+    let mut archive = tar::Archive::new(Cursor::new(layer));
+    let mut busybox_count = 0;
+    let mut shell_count = 0;
+    for entry in archive.entries().unwrap() {
+        let mut entry = entry.unwrap();
+        match entry.path().unwrap().as_ref() {
+            path if path == Path::new("bin/busybox") => {
+                assert!(entry.header().entry_type().is_file());
+                assert_eq!(entry.header().mode().unwrap(), 0o755);
+                let mut bytes = Vec::new();
+                entry.read_to_end(&mut bytes).unwrap();
+                assert_eq!(
+                    sha256_digest(&bytes),
+                    format!("sha256:{}", metadata.busybox_sha256)
+                );
+                busybox_count += 1;
+            }
+            path if path == Path::new("bin/sh") => {
+                assert!(entry.header().entry_type().is_symlink());
+                assert_eq!(
+                    entry.link_name().unwrap().as_deref(),
+                    Some(Path::new("busybox"))
+                );
+                shell_count += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!((busybox_count, shell_count), (1, 1));
+}
+
+fn read_cgroup_fixture_file(path: &Path, limit: u64) -> Vec<u8> {
+    use std::io::Read as _;
+    use std::os::unix::fs::MetadataExt as _;
+
+    let before = std::fs::symlink_metadata(path).unwrap();
+    assert!(before.is_file() && before.nlink() == 1 && before.len() <= limit);
+    let file = std::fs::File::open(path).unwrap();
+    let opened = file.metadata().unwrap();
+    assert_eq!((before.dev(), before.ino()), (opened.dev(), opened.ino()));
+    let mut bytes = Vec::new();
+    file.take(limit + 1).read_to_end(&mut bytes).unwrap();
+    assert!(bytes.len() as u64 <= limit);
+    let after = std::fs::symlink_metadata(path).unwrap();
+    assert_eq!(
+        (
+            before.dev(),
+            before.ino(),
+            before.len(),
+            before.mtime(),
+            before.mtime_nsec()
+        ),
+        (
+            after.dev(),
+            after.ino(),
+            after.len(),
+            after.mtime(),
+            after.mtime_nsec()
+        ),
+    );
+    bytes
+}
+
+async fn install_cgroup_probe_image(data_dir: &Path) -> ExecDefaultsImageFixture {
+    let bundle_dir =
+        std::path::PathBuf::from(std::env::var_os("VZ_LINUX_DEVELOPER_BUNDLE_DIR").unwrap());
+    let bundle = vz_linux::verify_kernel_bundle_read_only(&bundle_dir, KernelProfile::Developer)
+        .await
+        .unwrap();
+    let probe = bundle
+        .developer_probe
+        .as_ref()
+        .unwrap_or_else(|| panic!("authenticated Developer probe required"));
+    // The read-only verifier already bounds and authenticates this archive.
+    // Recheck the bytes actually registered, rather than trusting a prior read.
+    let layer = read_cgroup_fixture_file(&probe.archive, vz_linux::MAX_DEVELOPER_PROBE_BYTES);
+    let source_proof =
+        read_cgroup_fixture_file(&bundle_dir.join("busybox.build.json"), 4 * 1024 * 1024);
+    verify_cgroup_fixture_input(&layer, &source_proof, &probe.metadata);
+    let config = serde_json::to_vec(&json!({
+        "architecture": "arm64", "os": "linux",
+        "config": {"Cmd": ["/bin/busybox", "sleep", "300"], "User": "0:0", "WorkingDir": "/",
+                   "Env": ["PATH=/bin", "TERM=xterm"]},
+        "rootfs": {"diff_ids": [sha256_digest(&layer)], "type": "layers"}
+    }))
+    .unwrap();
+    let fixture = register_local_exec_fixture(
+        data_dir,
+        "localhost/vz-e2e-cgroup",
+        true,
+        &layer,
+        &config,
+        format!("sha256:{}", probe.metadata.busybox_sha256),
+    );
+    write_test_stderr(format_args!(
+        "cgroup CPU/PID offline OCI fixture evidence: reference={} manifest={} config={} layer={} busybox={} bundle={} source_proof={} source_archive={} source_inventory={}",
+        fixture.reference,
+        fixture.manifest_digest,
+        fixture.config_digest,
+        fixture.layer_digest,
+        fixture.busybox_digest,
+        bundle.artifact_identity.digest,
+        probe.metadata.build_provenance_sha256,
+        probe.metadata.source_archive_sha256,
+        probe.metadata.source_inventory_sha256,
+    ));
+    fixture
+}
+
+fn cgroup_offline_test_inputs() -> (Vec<u8>, Vec<u8>, vz_linux::DeveloperProbeMetadata) {
+    let busybox = b"offline fixture payload, never executed";
+    let mut archive = TarBuilder::new(Vec::new());
+    append_exec_defaults_tar_entry(
+        &mut archive,
+        "bin/busybox",
+        EntryType::Regular,
+        0o755,
+        busybox,
+    );
+    let mut shell = Header::new_gnu();
+    shell.set_entry_type(EntryType::Symlink);
+    shell.set_mode(0o777);
+    shell.set_size(0);
+    shell.set_link_name("busybox").unwrap();
+    shell.set_cksum();
+    archive
+        .append_data(&mut shell, "bin/sh", Cursor::new([]))
+        .unwrap();
+    let layer = archive.into_inner().unwrap();
+    let hash = |bytes: &[u8]| {
+        sha256_digest(bytes)
+            .trim_start_matches("sha256:")
+            .to_string()
+    };
+    let source = serde_json::to_vec(&json!({
+        "schema_version": 1, "artifact_sha256": hash(busybox),
+        "build_parameters": {"kind": "busybox", "arch": "arm64"},
+        "source": {"archive_root": "busybox-1.37.0", "archive_sha256": "a".repeat(64),
+                   "source_tree_sha256": "b".repeat(64), "case_sensitive_storage": true}
+    }))
+    .unwrap();
+    let metadata = vz_linux::DeveloperProbeMetadata {
+        schema_version: 1,
+        archive: vz_linux::DEVELOPER_PROBE_ARCHIVE.into(),
+        sha256: hash(&layer),
+        busybox_sha256: hash(busybox),
+        busybox_version: "1.37.0".into(),
+        source_archive_sha256: "a".repeat(64),
+        source_inventory_sha256: "b".repeat(64),
+        build_provenance_sha256: hash(&source),
+        marker_sha256: hash(vz_linux::DEVELOPER_PROBE_MARKER),
+    };
+    (layer, source, metadata)
+}
+
+#[test]
+fn cgroup_offline_fixture_authentication_rejects_tampering() {
+    let (layer, source, metadata) = cgroup_offline_test_inputs();
+    verify_cgroup_fixture_input(&layer, &source, &metadata);
+    for case in 0..5 {
+        let mut changed = metadata.clone();
+        match case {
+            0 => changed.sha256 = "c".repeat(64),
+            1 => changed.build_provenance_sha256 = "c".repeat(64),
+            2 => changed.busybox_sha256 = "c".repeat(64),
+            3 => changed.source_archive_sha256 = "c".repeat(64),
+            _ => changed.source_inventory_sha256 = "c".repeat(64),
+        }
+        assert!(
+            std::panic::catch_unwind(|| verify_cgroup_fixture_input(&layer, &source, &changed))
+                .is_err()
+        );
+    }
+}
+
+#[test]
+fn cgroup_offline_fixture_registers_complete_digest_reference() {
+    let (layer, _, metadata) = cgroup_offline_test_inputs();
+    let tmp = tempfile::tempdir().unwrap();
+    let config = serde_json::to_vec(&json!({
+        "architecture": "arm64", "os": "linux", "config": {"User": "0:0", "WorkingDir": "/"},
+        "rootfs": {"diff_ids": [sha256_digest(&layer)], "type": "layers"}
+    }))
+    .unwrap();
+    let fixture = register_local_exec_fixture(
+        tmp.path(),
+        "localhost/vz-e2e-cgroup",
+        true,
+        &layer,
+        &config,
+        format!("sha256:{}", metadata.busybox_sha256),
+    );
+    assert_eq!(
+        fixture.reference,
+        format!("localhost/vz-e2e-cgroup@{}", fixture.manifest_digest)
+    );
+    let store = ImageStore::new(tmp.path().to_path_buf());
+    assert_eq!(
+        store.read_reference(&fixture.reference).unwrap(),
+        fixture.manifest_digest
+    );
+    assert_eq!(
+        sha256_digest(&store.read_manifest_json(&fixture.manifest_digest).unwrap()),
+        fixture.manifest_digest
+    );
+    assert_eq!(
+        store.read_config_json(&fixture.manifest_digest).unwrap(),
+        config
+    );
+    assert!(store.has_layer_blob(&fixture.layer_digest));
+    let parsed = parse_image_config_summary_from_store(&store, &fixture.manifest_digest).unwrap();
+    assert_eq!(parsed.user.as_deref(), Some("0:0"));
+    assert_eq!(parsed.working_dir.as_deref(), Some("/"));
+    let defaults = register_local_exec_fixture(
+        tmp.path(),
+        EXEC_DEFAULTS_IMAGE,
+        false,
+        &layer,
+        &config,
+        fixture.busybox_digest,
+    );
+    assert_eq!(defaults.reference, EXEC_DEFAULTS_IMAGE);
 }
 
 async fn exec_via_defaults_adapter(

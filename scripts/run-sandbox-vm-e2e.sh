@@ -3348,10 +3348,12 @@ run_and_log() {
         return 99
     fi
 
+    # --ignored selects all 19 VM tests; the in-memory shutdown test and two
+    # authenticated offline cgroup-fixture tests are deliberately filtered out.
     if [[ $status -eq 0 && "$PROFILE" == "release" \
         && "$suite" == "runtime" && "$label" == "runtime" ]] \
         && ! grep -Fqx \
-            "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished" \
+            "test result: ok. 19 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished" \
             <(sed -E 's/; finished in .*/; finished/' "$log_file"); then
         echo "complete runtime suite did not report exactly 19/19 real-VM tests with zero ignored failures" >&2
         return 100

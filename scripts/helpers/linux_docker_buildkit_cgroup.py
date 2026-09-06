@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import json
+from pathlib import Path
 import re
 
+import installed_developer_startup as startup
 
 LIMIT = 131072
 STREAM_LIMIT = 4 * 1024 * 1024
@@ -172,6 +175,58 @@ def validate(raw, pid):
             "root_pids": [], "init_pids": init_pids, "stdout_sha256": hashlib.sha256(raw).hexdigest()}
 
 
+def project_binding(harness, descriptor):
+    """Resolve only the retained, exact owned project; never infer a CLI cwd."""
+    def unique(pairs):
+        result = {}
+        for key, value in pairs:
+            require(key not in result, "duplicate project/topology field")
+            result[key] = value
+        return result
+
+    def document(path):
+        raw = startup.read_private_regular(path, startup.LIMIT)
+        value = json.loads(raw, object_pairs_hook=unique)
+        require(isinstance(value, dict), "project/topology object required")
+        return value, hashlib.sha256(raw).hexdigest()
+
+    try:
+        root = startup.canonical(str(harness.root))
+        evidence = startup.canonical(str(harness.evidence))
+        topology, topology_sha = document(evidence / "topology.json")
+        require(set(topology) == {"project", "primary", "neighbor"}, "unexpected retained topology fields")
+        require(isinstance(topology["project"], str), "missing retained project path")
+        project = startup.canonical(topology["project"])
+        require(project.is_dir() and project.parent == root, "project is not an exact owned fixture child")
+        definition, definition_sha = document(project / "vz.json")
+        owner = descriptor["owner"]
+        require(type(definition.get("schema_version")) is int and definition["schema_version"] == 1 and
+                definition.get("project_id") == owner["project_id"],
+                "project definition owner differs")
+        environments = [topology[key] for key in ("primary", "neighbor")]
+        require(all(isinstance(env, dict) and env.get("project_id") == owner["project_id"] for env in environments),
+                "retained topology project owner differs")
+        selected = [env for env in environments if env.get("environment_id") == owner["environment_id"]]
+        require(len(selected) == 1 and selected[0].get("state") == "ready", "exact retained Ready Environment required")
+        machines = selected[0].get("machines")
+        require(isinstance(machines, list) and all(isinstance(machine, dict) for machine in machines),
+                "retained Machine inventory required")
+        selected = [machine for machine in machines if machine.get("machine_id") == owner["machine_id"]]
+        require(len(selected) == 1 and selected[0].get("state") == "ready" and
+                selected[0].get("docker_context") == descriptor and
+                isinstance(descriptor.get("incarnation_id"), str) and descriptor["incarnation_id"] and
+                selected[0].get("incarnation_id") == descriptor.get("incarnation_id") and
+                type(descriptor.get("incarnation_generation")) is int and
+                type(selected[0].get("incarnation_generation")) is int and
+                selected[0]["incarnation_generation"] > 0 and
+                selected[0]["incarnation_generation"] == descriptor.get("incarnation_generation"),
+                "retained Machine/context/incarnation differs")
+        return {"project_path": str(project), "project_definition_sha256": definition_sha,
+                "retained_topology_sha256": topology_sha}
+    except (OSError, KeyError, TypeError, UnicodeError) as error:
+        raise ValueError("builder cgroup: unavailable or malformed owned project binding") from error
+
+
 def capture(harness, descriptor, inspected, label="builder-cgroup"):
     """Sample once; caller rechecks exact container ownership after this returns."""
     require(isinstance(inspected, dict) and isinstance(inspected.get("Id"), str) and
@@ -184,13 +239,15 @@ def capture(harness, descriptor, inspected, label="builder-cgroup"):
     script = probe_script(pid)
     require(isinstance(descriptor, dict) and isinstance(descriptor.get("owner"), dict), "missing Machine owner")
     owner = descriptor["owner"]
-    for key in ("environment_id", "machine_id"):
+    for key in ("project_id", "environment_id", "machine_id"):
         require(isinstance(owner.get(key), str) and re.fullmatch(r"[A-Za-z0-9_-]{1,128}", owner[key]),
                 "invalid explicit Machine owner")
+    binding = project_binding(harness, descriptor)
     raw, stderr, code = harness.command(label, [harness.cli, "exec", "--environment", owner["environment_id"],
         "--machine", owner["machine_id"], "--no-stdin", "--timeout", "30", "--", "/bin/busybox", "sh", "-c", script],
-        timeout=40, success=False)
+        cwd=Path(binding["project_path"]), timeout=40, success=False)
     require(type(code) is int and code == 0 and stderr == b"", "public Exec failed; raw diagnostic retained")
+    require(project_binding(harness, descriptor) == binding, "owned project binding changed during observation")
     proof = validate(raw, pid)
-    proof.update(container_id=inspected["Id"], owner=dict(owner), command_label=label)
+    proof.update(container_id=inspected["Id"], owner=dict(owner), command_label=label, **binding)
     return proof

@@ -1,6 +1,10 @@
 """Offline rejection tests; these do not constitute physical cgroup evidence."""
 import base64
+import copy
+import json
+from pathlib import Path
 import subprocess
+import tempfile
 import unittest
 
 import linux_docker_buildkit_cgroup as cgroup
@@ -37,6 +41,42 @@ def inspected():
 
 
 class CgroupTests(unittest.TestCase):
+    def capture_fixture(self):
+        temporary = tempfile.TemporaryDirectory(prefix="vz-cgroup-owned-project-")
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name).resolve()
+        project, evidence = root / "build", root / "evidence"
+        project.mkdir(mode=0o700); evidence.mkdir(mode=0o700)
+        descriptor = {"owner": {"project_id": "project-exact", "environment_id": "env-exact",
+                                 "machine_id": "machine-exact"},
+                      "incarnation_id": "incarnation-exact", "incarnation_generation": 1}
+        definition = {"schema_version": 1, "project_id": "project-exact"}
+        topology = {"project": str(project),
+                    "primary": {"project_id": "project-exact", "environment_id": "env-exact", "state": "ready",
+                                "machines": [{"machine_id": "machine-exact", "state": "ready",
+                                              "incarnation_id": "incarnation-exact", "incarnation_generation": 1,
+                                              "docker_context": copy.deepcopy(descriptor)}]},
+                    "neighbor": {"project_id": "project-exact", "environment_id": "env-other", "state": "ready",
+                                 "machines": []}}
+        for path, value in ((project / "vz.json", definition), (evidence / "topology.json", topology)):
+            path.write_text(json.dumps(value)); path.chmod(0o600)
+
+        class Harness:
+            cli = "/private/owned/bin/vz"
+
+            def __init__(self):
+                self.root, self.evidence = root, evidence
+                self.calls = []
+                self.output = (pack(fixture()), b"", 0)
+                self.after_dispatch = lambda: None
+
+            def command(self, label, argv, **kwargs):
+                self.calls.append((label, argv, kwargs))
+                self.after_dispatch()
+                return self.output
+
+        return Harness(), descriptor, project
+
     def assert_bad(self, **changes):
         values = fixture()
         values.update(changes)
@@ -131,24 +171,15 @@ class CgroupTests(unittest.TestCase):
         self.assertEqual((parsed.returncode, parsed.stdout, parsed.stderr), (0, b"", b""))
 
     def test_capture_records_explicit_public_exec_and_retains_diagnostic(self):
-        class Harness:
-            cli = "/private/owned/bin/vz"
-
-            def __init__(self):
-                self.calls = []
-                self.output = (pack(fixture()), b"", 0)
-
-            def command(self, label, argv, **kwargs):
-                self.calls.append((label, argv, kwargs))
-                return self.output
-
-        harness = Harness()
-        descriptor = {"owner": {"environment_id": "env-exact", "machine_id": "machine-exact"}}
+        harness, descriptor, project = self.capture_fixture()
         proof = cgroup.capture(harness, descriptor, inspected())
         self.assertEqual(proof["container_id"], "a" * 64)
         argv = harness.calls[0][1]
         self.assertEqual(argv[:6], [harness.cli, "exec", "--environment", "env-exact", "--machine", "machine-exact"])
         self.assertFalse(harness.calls[0][2]["success"])
+        self.assertEqual(harness.calls[0][2]["cwd"], project)
+        self.assertEqual(proof["project_path"], str(project))
+        self.assertEqual(proof["project_definition_sha256"], cgroup.hashlib.sha256((project / "vz.json").read_bytes()).hexdigest())
         for output in ((b"partial", b"read failed", 1), (pack(fixture()), b"warning", 0), (b"bad", b"", 0)):
             harness.output = output
             with self.assertRaises(ValueError):
@@ -159,6 +190,73 @@ class CgroupTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 cgroup.capture(harness, descriptor, record)
         self.assertEqual(len(harness.calls), 4)
+
+    def test_project_or_machine_owner_mismatch_rejected_before_dispatch(self):
+        changes = [lambda t: t["primary"].update(project_id="foreign"),
+                   lambda t: t["neighbor"].update(project_id="foreign"),
+                   lambda t: t["primary"].update(environment_id="foreign"),
+                   lambda t: t["primary"].update(state="stopped"),
+                   lambda t: t["primary"]["machines"][0].update(machine_id="foreign"),
+                   lambda t: t["primary"]["machines"][0].update(incarnation_id="stale"),
+                   lambda t: t["primary"]["machines"][0].update(incarnation_generation=2),
+                   lambda t: t["primary"]["machines"][0]["docker_context"].update(name="foreign"),
+                   lambda t: t["primary"]["machines"].append(copy.deepcopy(t["primary"]["machines"][0]))]
+        for change in changes:
+            harness, descriptor, _ = self.capture_fixture()
+            path = harness.evidence / "topology.json"; topology = json.loads(path.read_bytes())
+            change(topology); path.write_text(json.dumps(topology))
+            with self.assertRaises(ValueError):
+                cgroup.capture(harness, descriptor, inspected())
+            self.assertEqual(harness.calls, [])
+        harness, descriptor, project = self.capture_fixture()
+        (project / "vz.json").write_text('{"schema_version":1,"project_id":"foreign"}')
+        with self.assertRaisesRegex(ValueError, "definition owner"):
+            cgroup.capture(harness, descriptor, inspected())
+        self.assertEqual(harness.calls, [])
+        for value in (True, "1", None, 2):
+            harness, descriptor, project = self.capture_fixture()
+            (project / "vz.json").write_text(json.dumps({"schema_version": value, "project_id": "project-exact"}))
+            with self.assertRaisesRegex(ValueError, "definition owner"):
+                cgroup.capture(harness, descriptor, inspected())
+            self.assertEqual(harness.calls, [])
+
+    def test_missing_duplicate_or_symlink_project_evidence_rejected(self):
+        for filename in ("topology.json", "vz.json"):
+            for change in ("missing", "symlink", "duplicate"):
+                with self.subTest(filename=filename, change=change):
+                    harness, descriptor, project = self.capture_fixture()
+                    path = (harness.evidence if filename == "topology.json" else project) / filename
+                    original = path.read_text()
+                    if change == "duplicate":
+                        path.write_text(original[:-1] + ',"project_id":"foreign","project_id":"project-exact"}')
+                    else:
+                        path.unlink()
+                        if change == "symlink":
+                            target = path.with_suffix(".original"); target.write_text(original); target.chmod(0o600)
+                            path.symlink_to(target)
+                    with self.assertRaises(ValueError):
+                        cgroup.capture(harness, descriptor, inspected())
+                    self.assertEqual(harness.calls, [])
+
+    def test_foreign_relative_or_symlink_project_path_rejected(self):
+        for kind in ("relative", "outside", "root", "symlink", "dotdot"):
+            with self.subTest(kind=kind):
+                harness, descriptor, project = self.capture_fixture()
+                link = harness.root / "alias"; link.symlink_to(project, target_is_directory=True)
+                paths = {"relative": "build", "outside": str(harness.root.parent), "root": str(harness.root),
+                         "symlink": str(link), "dotdot": str(project) + "/../build"}
+                path = harness.evidence / "topology.json"; topology = json.loads(path.read_bytes())
+                topology["project"] = paths[kind]; path.write_text(json.dumps(topology))
+                with self.assertRaises(ValueError):
+                    cgroup.capture(harness, descriptor, inspected())
+                self.assertEqual(harness.calls, [])
+
+    def test_project_change_during_observation_rejects_proof_without_retry(self):
+        harness, descriptor, project = self.capture_fixture()
+        harness.after_dispatch = lambda: (project / "vz.json").write_text('{"schema_version":1,"project_id":"foreign"}')
+        with self.assertRaises(ValueError):
+            cgroup.capture(harness, descriptor, inspected())
+        self.assertEqual(len(harness.calls), 1)
 
 
 if __name__ == "__main__":
