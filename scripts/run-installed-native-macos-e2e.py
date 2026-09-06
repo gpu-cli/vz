@@ -13,6 +13,7 @@ from pathlib import Path
 import shlex
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
 import uuid
@@ -24,6 +25,8 @@ def main():
     parser.add_argument("--bundle", type=Path, required=True)
     parser.add_argument("--manifest", required=True)
     parser.add_argument("--evidence", type=Path, required=True)
+    parser.add_argument("--resume-layout", type=Path,
+                        help="continue checks against an unchanged retained installation")
     parser.add_argument("--expect-preparation-failure", action="store_true",
                         help="exercise a deliberately corrupt local fixture and public Delete")
     args = parser.parse_args()
@@ -32,13 +35,14 @@ def main():
         parser.error("tmux is required for the interactive gate")
     evidence = args.evidence.resolve()
     evidence.mkdir(mode=0o700)
-    root = Path(tempfile.mkdtemp(prefix="vzmac-cli-", dir="/private/tmp"))
+    retained = json.loads(args.resume_layout.read_text()) if args.resume_layout else None
+    root = Path(retained["root"]) if retained else Path(tempfile.mkdtemp(prefix="vzmac-cli-", dir="/private/tmp"))
     binary_dir = root / "install/bin"
-    binary_dir.mkdir(parents=True, mode=0o700)
+    binary_dir.mkdir(parents=True, mode=0o700, exist_ok=retained is not None)
     runtime = root / "r"
-    runtime.mkdir(mode=0o700)
+    runtime.mkdir(mode=0o700, exist_ok=retained is not None)
     project = root / "project"
-    project.mkdir(mode=0o700)
+    project.mkdir(mode=0o700, exist_ok=retained is not None)
     env = {
         "PATH": f"{binary_dir}:/usr/bin:/bin:/usr/sbin:/sbin",
         "LC_ALL": "C", "NO_COLOR": "1", "HOME": os.environ["HOME"],
@@ -107,8 +111,13 @@ def main():
             send("test -t 0 && test -t 1 && printf '%s%s\\n' terminal- ready")
             wait_for("terminal-ready")
             control("resize-window", "-t", "native:0", "-x", "100", "-y", "35")
-            send("stty size")
-            wait_for("35 100")
+            # The public CLI polls local dimensions every 250 ms. Observe the
+            # guest's eventual size instead of racing that control round trip.
+            deadline = time.monotonic() + 10
+            while "35 100" not in frame():
+                assert time.monotonic() < deadline, "guest terminal did not resize"
+                send("stty size")
+                time.sleep(0.3)
             send("sleep 120")
             time.sleep(0.5)
             control("send-keys", "-t", "native:0.0", "C-c")
@@ -126,14 +135,20 @@ def main():
 
     for name in ["vz", "vz-runtimed"]:
         destination = binary_dir / name
-        destination.write_bytes((args.release_dir / name).read_bytes())
-        destination.chmod(0o700)
+        if retained:
+            assert hashlib.sha256(destination.read_bytes()).hexdigest() == retained["binary_sha256"][name]
+        else:
+            destination.write_bytes((args.release_dir / name).read_bytes())
+            destination.chmod(0o700)
         run(name + "-signature", ["/usr/bin/codesign", "--verify", "--strict",
                                  destination], cwd=root)
-    run("catalog", [binary_dir / "vz-runtimed", "--write-installed-machine-target-catalog",
+    if not retained:
+        run("catalog", [binary_dir / "vz-runtimed", "--write-installed-machine-target-catalog",
                     root / "install", "--installed-release-version", "0.4.0-dev",
                     "--installed-native-bundle", args.bundle.resolve(),
-                    "--installed-native-manifest-sha256", args.manifest], cwd=root)
+                        "--installed-native-manifest-sha256", args.manifest], cwd=root)
+    else:
+        assert args.manifest == retained["manifest"] and str(args.bundle.resolve()) == retained["bundle"]
     release = json.loads((args.bundle / args.manifest).read_text())
     definition = {
         "schema_version": 1, "project_id": "prj_" + uuid.uuid4().hex,
@@ -147,8 +162,12 @@ def main():
             }],
         },
     }
-    (project / "vz.json").write_text(json.dumps(definition, indent=2) + "\n")
-    run("git-init", ["/usr/bin/git", "init", "--quiet"])
+    if retained:
+        definition = retained["definition"]
+        assert json.loads((project / "vz.json").read_text()) == definition
+    else:
+        (project / "vz.json").write_text(json.dumps(definition, indent=2) + "\n")
+        run("git-init", ["/usr/bin/git", "init", "--quiet"])
     (evidence / "layout.json").write_text(json.dumps(dict(
         root=str(root), definition=definition, environment=env, manifest=args.manifest,
         bundle=str(args.bundle.resolve()), euid=os.geteuid(), binary_sha256={
@@ -156,6 +175,14 @@ def main():
             for name in ["vz", "vz-runtimed"]}), indent=2))
     summary = dict(scope="INSTALLED_NATIVE_DEV_LOCAL_BUNDLE", root=str(root),
                    aggregate_release_certified=False, results=results)
+    if retained:
+        summary["continued_from"] = str(args.resume_layout.resolve())
+    audit = None
+    if not args.expect_preparation_failure:
+        with (evidence / "platform-audit.log").open("w") as log:
+            audit = subprocess.Popen([
+                sys.executable, str(Path(__file__).parent / "helpers/native_macos_platform_audit.py"),
+                str(evidence)], stdout=log, stderr=log)
     try:
         if args.expect_preparation_failure:
             cli("corrupt-up", "up", "--timeout", "30", timeout=45, expected=2)
@@ -166,7 +193,7 @@ def main():
             summary.update(passed=True, scope="INSTALLED_NATIVE_CORRUPT_INPUT_DELETE")
             (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
             return
-        cli("cold-up", "up", timeout=3700)
+        cli("continued-up" if retained else "cold-up", "up", timeout=3700)
         status = run("ready-status", [binary_dir / "vz", "--json", "status"])
         assert "macos_native" in status and "ready" in status
         output = cli("native-version", "exec", "--no-stdin", "--", "/bin/sh", "-c",
@@ -187,7 +214,8 @@ def main():
         terminal_test()
         cli("cancel", "exec", "--timeout", "2", "--no-stdin", "--", "/bin/sh", "-c",
             "trap '' TERM; sleep 120 & printf '%s %s' $$ $! > /private/var/tmp/vz-cancel-pids; wait",
-            expected=4, timeout=30)
+            expected=137, timeout=30)
+        assert "execution deadline expired" in (evidence / "cancel.stderr").read_text()
         cli("cancel-reaped", "exec", "--no-stdin", "--", "/bin/sh", "-c",
             "set -eu; for pid in $(cat /private/var/tmp/vz-cancel-pids); do "
             "if kill -0 $pid 2>/dev/null; then exit 1; fi; done")
@@ -218,6 +246,10 @@ def main():
         time.sleep(3600)
         raise
     (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
+    if audit is not None and audit.wait(timeout=15) != 0:
+        summary.update(passed=False, error="platform audit failed; see platform-audit.log")
+        (evidence / "summary.json").write_text(json.dumps(summary, indent=2))
+        raise AssertionError(summary["error"])
     print(json.dumps(summary), flush=True)
 
 

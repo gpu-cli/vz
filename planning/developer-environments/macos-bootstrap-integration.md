@@ -161,8 +161,9 @@ hardware model; host syntax/unit checks are not guest execution evidence.
 
 Retained attempt logs, signed-binary identities, CLI output, and restore-install
 results live under `.artifacts/macos26-bootstrap/native-e2e/` in this worktree.
-Native E2E remains **failing/incomplete** until real artifacts, installation/boot,
-agent readiness, Swift execution, and the installed lifecycle are proven.
+The aggregate native release gate remains **incomplete** until published artifacts,
+Swift execution and aggregate topology behavior are proven. The DEV installed
+lifecycle result below supersedes this initial adapter failure.
 
 The clone gate must verify fresh platform identity as well as private disk bytes.
 Apple specifies that concurrent VMs use distinct
@@ -332,5 +333,29 @@ The updated host passes 1,491 guest/runtime/state tests, strict affected Clippy,
 11 installer checks, installed corrupt-input rejection/never-started Delete
 (`installed-corrupt-input-2`), and installed Linux Hardened lifecycle/persistence
 regression (`linux-regression-3`). The native cold gate is `installed-candidate-6`.
-No successful native installed lifecycle or main-merge claim is made by this
-in-progress note. The release issue remains open.
+The installed DEV gate subsequently **passed**, with receipts summarized in
+[macos-native-dev-evidence.json](macos-native-dev-evidence.json). Fresh first-use
+Up imported the exact base and matching patch, verified the full output and
+reached Ready in **717.05 seconds**. Cached Stop/Up reached Ready in **8.90 seconds**;
+a second Environment cloned the cached template and reached Ready in **13.67
+seconds**. Graceful Stop took **5.86 seconds** and running Delete **5.89 seconds**.
+These are local measurements on Mac16,5 / macOS 26.3.1(a), not network-download
+timings or a performance guarantee.
+
+The cold receipt is `installed-candidate-6/cold-up.json`. Terminal/lifecycle
+checks completed in `installed-candidate-6-continuation-2`, against the same
+unchanged installed binaries, original daemon and patched image. Two harness
+assertions were corrected: wait for the CLI's existing 250 ms resize poll, and
+expect the positively reaped cancellation exit code (137) with its deadline
+diagnostic. No consumer guest provisioning or binary replacement occurred.
+The final gate proves stdin/output/exit status, user/env/cwd, tmux input/resize/
+Ctrl-C, cancellation with command/child reaping, persisted restart state,
+distinct private platform identities, clone isolation and both public Deletes.
+
+This is a usable local-bundle **DEV** path. Authenticated public publication,
+guest Swift/toolchain execution, networking/workspace integration, and mixed-target
+aggregate conformance remain open; `vz-mzs.11.4` is not release-complete.
+An additional negative test found the shared pre-existing cleanup gap for an Up
+rejected before any runtime reservation (such as a nonexistent catalog pin).
+That distinct case is tracked in `vz-1fv`; the installed corrupt-bytes case after
+reservation passes Delete in this change.

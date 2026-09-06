@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "scope": "INSTALLED_NATIVE_MACOS_DEV_LOCAL_BUNDLE",
+  "passed": true,
+  "aggregate_release_certified": false,
+  "recorded_at": "2026-09-06T04:55:16.065981+00:00",
+  "implementation_commit": "995a7daa",
+  "host": {
+    "os": "macOS",
+    "version": "26.3.1(a)",
+    "build": "25D771280a",
+    "hardware": "Mac16,5"
+  },
+  "guest": {
+    "version": "26.3.1",
+    "build": "25D2128",
+    "hardware": "VirtualMac2,1"
+  },
+  "manifest_sha256": "3ecc5ad65c762da36170f81d18cff3a61b3f7e2658f2394715fe740743d709cf",
+  "binary_sha256": {
+    "vz": "ba22f42358fbfee4b9e01ef766e72a65dc71e176272584796932446dc527d56e",
+    "vz-runtimed": "9e58223757aac2abb8e4cb11fdb589b104e997cc608192dbed14f511cd141bd6"
+  },
+  "timings_seconds": {
+    "cancel": 4.125314040924422,
+    "stop": 5.863819209043868,
+    "warm-up": 8.899493457982317,
+    "second-up": 13.672304041916505,
+    "second-delete": 5.735496999928728,
+    "delete": 5.886704291100614,
+    "cold-up": 717.0533665829571
+  },
+  "checks": [
+    "exact base and patch import/application with full output SHA-256 verification",
+    "installed Ready and exact guest agent hash",
+    "stdin/stdout/stderr, exit status, dev user, environment and working directory",
+    "tmux PTY input, resize to 35x100, Ctrl-C and exit 17",
+    "TERM-ignoring command and child positively reaped after deadline; exit 137",
+    "graceful Stop and persisted marker after Up",
+    "two private platform identities, stable through restart",
+    "second Environment lacks first marker; deleting it preserves first",
+    "both native Machines positively deleted",
+    "installed corrupt input rejected and never-started Machine deleted",
+    "installed Linux Hardened lifecycle and persistence regression"
+  ],
+  "evidence_paths": {
+    "cold": ".artifacts/macos26-bootstrap/native-e2e/installed-candidate-6",
+    "continued": ".artifacts/macos26-bootstrap/native-e2e/installed-candidate-6-continuation-2",
+    "negative": ".artifacts/macos26-bootstrap/native-e2e/installed-corrupt-input-2",
+    "linux": ".artifacts/macos26-bootstrap/native-e2e/linux-regression-3"
+  },
+  "harness_corrections": [
+    "Wait for the existing 250 ms CLI resize poll before asserting guest terminal dimensions.",
+    "Assert the existing CLI cancellation contract: reaped guest exit 137 and deadline diagnostic."
+  ],
+  "continuation": "All native consumer operations used the same installed binaries, original daemon and independently patched image; only host test assertions changed.",
+  "remaining_release_gates": [
+    "published authenticated base/patch/catalog",
+    "guest Swift/toolchain execution",
+    "native networking/workspace integration and mixed-target aggregate conformance",
+    "escaped-session execution supervision parity"
+  ]
+}
