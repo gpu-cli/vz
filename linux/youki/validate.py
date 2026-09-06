@@ -274,6 +274,12 @@ def validate_runtime_audit_native(contents, parser_path):
 
 def validate_runtime_audit(raw):
     tests = raw.decode("utf-8")
+    # Production warnings write directly to stderr rather than libtest's
+    # capture buffer. Native rejection controls therefore interleave this one
+    # exact static line between a test's " ... " and its final "ok". Normalize
+    # only those warning lines; retain/hash the original artifact unchanged.
+    tests = re.sub(r"(?m)(?:(?<=\.\.\. )|^)youki: runtime audit incomplete\n", "", tests)
+    require("youki:" not in tests, "unknown or malformed runtime audit native warning")
     actual = [line for line in tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
     expected = {"test runtime_audit::tests::" + name + " ... ok" for name in REQUIRED_AUDIT_TESTS}
     summaries = [line for line in tests.splitlines() if line.startswith("test result:")]

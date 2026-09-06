@@ -496,3 +496,26 @@ checks, not historical births of unsampled fast processes, surviving namespace
 file-descriptor references or actual Engine-to-youki invocation history. The
 kernel-exec error transport gap and full aggregate release gate remain open.
 Stopped Machine disks and contexts are retained; this run does not certify Delete.
+
+## Runtime invocation journal: native verification in progress
+
+Source `29886b79` adds an opt-in internal youki journal, a strict independent host
+parser and source-pinned native CLI probes; see
+[`../linux/youki/README.md`](../linux/youki/README.md). The final host Docker-helper
+regression passes 718 tests in 34.912 seconds, and the offline candidate validator
+passes 41 in 3.541 seconds. Their retained logs are
+`.artifacts/runtime-audit-host-regression-1.log` (SHA-256
+`8cbe6444b8edc4523939af54adb7684370053823498bb6dc85e56e4971ad861f`) and
+`.artifacts/runtime-audit-candidate-validator-1.log` (SHA-256
+`a7ddc898e7c0843764a641b7ab02810213f27c4f215d8e11960b3637037dee5f`).
+
+Native build attempt 1 compiled the release binary, but failed the typed-command
+audit test: pinned upstream `CommonCmd::Checkpointt` exposes `checkpointt`, not
+`checkpoint`. Five audit groups passed; this attempt is not a passing candidate.
+The complete failure log remains `.artifacts/youki-runtime-audit-build-1.console.log`
+(SHA-256 `3b9e14f3ba5cc2ef664ffe6b62a078dab9d5d6ff0db800d59234b9f22c15f79f`).
+The fixture correction must exercise the actual pinned spelling while retaining
+the journal's typed `checkpoint` operation, without claiming that the upstream
+public spelling was fixed. No installed runtime was replaced. Exact-Machine
+enrollment/retrieval, rebuilt backend verification, installed Docker invocation
+mapping and the aggregate release gate remain open.

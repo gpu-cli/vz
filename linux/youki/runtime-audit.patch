@@ -175,7 +175,7 @@
  }
 --- /dev/null
 +++ b/crates/youki/src/runtime_audit.rs
-@@ -0,0 +1,945 @@
+@@ -0,0 +1,941 @@
 +//! Opt-in diagnostic audit, not an authorization or OCI success dependency.
 +//! Enrollment/files are created only by an authenticated external controller.
 +//! No audit FD survives begin/finish into dispatch, fork, hooks, or payload exec.
@@ -1008,21 +1008,17 @@
 +                .contains(secret)
 +        );
 +        for operation in [
-+            "create",
-+            "start",
-+            "state",
-+            "delete",
-+            "pause",
-+            "resume",
-+            "events",
-+            "ps",
-+            "checkpoint",
-+            "run",
++            "create", "start", "state", "delete", "pause", "resume", "events", "ps", "run",
 +            "update",
 +        ] {
 +            let opts = Opts::try_parse_from(["youki", operation, &cid]).unwrap();
 +            assert_eq!(Selection::from_opts(&opts).operation, operation);
 +        }
++        // Upstream exposes the misspelled CommonCmd::Checkpointt as its CLI
++        // spelling. Audit records the semantic operation, not a CLI repair.
++        let checkpoint = Opts::try_parse_from(["youki", "checkpointt", &cid]).unwrap();
++        assert_eq!(Selection::from_opts(&checkpoint).operation, "checkpoint");
++        assert!(Opts::try_parse_from(["youki", "checkpoint", &cid]).is_err());
 +        for operation in ["features", "list", "spec", "info"] {
 +            let opts = Opts::try_parse_from(["youki", operation]).unwrap();
 +            assert!(Selection::from_opts(&opts).container_id.is_none());

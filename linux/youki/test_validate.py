@@ -570,6 +570,37 @@ class CandidateTests(unittest.TestCase):
             with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "runtime audit"):
                 validate(self.root, self.source)
 
+    def test_runtime_audit_observed_interleaved_static_warnings_are_accepted(self):
+        original = self.files["runtime-audit-tests.txt"]
+        warning = b"youki: runtime audit incomplete\n"
+        observed = original
+        for name, count in (("incomplete_and_corrupt_tail", 5), ("unsafe_paths_and_quota", 11)):
+            marker = ("test_vz_runtime_audit_" + name + " ... ").encode()
+            observed = observed.replace(marker + b"ok\n", marker + warning * count + b"ok\n")
+        self.assertIn(b'const WARNING: &str = "youki: runtime audit incomplete";', self.files["runtime-audit.patch"])
+        self.files["runtime-audit-tests.txt"] = observed
+        self.publish()
+        validate(self.root, self.source)
+        self.assertEqual((self.root / "runtime-audit-tests.txt").read_bytes(), observed)
+
+    def test_runtime_audit_warning_normalization_cannot_hide_bad_results(self):
+        original = self.files["runtime-audit-tests.txt"]
+        warning = b"youki: runtime audit incomplete\n"
+        marker = ("test_vz_runtime_audit_incomplete_and_corrupt_tail ... ").encode()
+        observed = original.replace(marker + b"ok\n", marker + warning * 5 + b"ok\n")
+        for bad in (observed.replace(warning, b"youki: runtime audit unexpected\n", 1),
+                    observed + b"youki: runtime audit unexpected\n",
+                    observed.replace(warning, b"youki: runtime audit incomplete extra\n", 1),
+                    observed.replace(warning, b"youki: runtime audit incomplete\r\n", 1),
+                    observed.replace(marker + warning * 5 + b"ok\n", marker + warning * 5 + b"FAILED\n"),
+                    observed.replace(b"runtime_audit::tests::", b"foreign::", 1),
+                    observed + observed.splitlines(keepends=True)[0],
+                    observed + observed.splitlines(keepends=True)[-1]):
+            self.files["runtime-audit-tests.txt"] = bad
+            self.publish()
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, "runtime audit"):
+                validate(self.root, self.source)
+
     def test_runtime_audit_evidence_and_exact_commit_component_required(self):
         original = self.files["version.txt"]
         for replacement in (b"", b"+vz-runtime-audit-v10", b"+vz-runtime-audit-v1+unknown"):
