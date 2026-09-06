@@ -114,3 +114,26 @@ were unchanged. The original failed evidence, Docker objects and stopped disks
 at `/private/tmp/vzdev-c4q2h8zh` remain preserved; no retry, disk repair, resource
 deletion or candidate promotion was performed. The generic OCI-create error
 still needs a concrete runtime diagnosis before the next candidate.
+
+## Buildx candidate 2: actionable failure, retained
+
+`.artifacts/linux-docker-build-candidate-2` uses the logging-corrected youki
+runtime after the complete selected Mac backend gate passed. Both public Ups
+and all four startup probes passed. The first preparatory image build also
+passed, but command 080 again failed before the five-recipe slice. Containerd
+now preserves the actual error: `/sbin/docker-init` does not have correct
+permissions. All 1,509 raw files were independently verified; manifest SHA256:
+`6612082e3bd313e68a37f87e5e34d53a37402131f6add9f11021792974ca998e`.
+
+The separate public-Exec/Stop disposition confirms the exact pinned guest
+`docker-init` is a root-owned regular executable with mode `0700`. Pinned
+youki's preflight incorrectly checks only the other-execute bit (`0o001`),
+rejecting this owner-executable file before kernel execution. The correction
+is tracked as `vz-pa9`; private artifact modes, `--init`, privileged builder
+settings, and youki-only execution must remain unchanged.
+
+All four Machines were positively stopped and the original daemon gracefully
+closed. Failed Docker objects and disks at `/private/tmp/vzdev-1vxano0n` remain
+preserved. Disposition manifest SHA256:
+`981c504b72105698bbf86c30aa177b443d01ab7b22df4e2f19ff2cd4104c3401`.
+This proves actionable runtime diagnostics, not a passing Buildx slice.

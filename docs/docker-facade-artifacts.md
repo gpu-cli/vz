@@ -2,8 +2,8 @@
 
 Status: **DEV**, macOS host × Developer Linux Machine — private Machine runtime
 admission, artifact pinning, persistent disks and guest supervision have focused
-local-VM evidence. The host endpoint transport is implemented; actual host
-container execution and full Docker compatibility are not yet certified.
+local-VM evidence. Host container execution and installed Compose have focused
+evidence; full Docker compatibility is not yet certified.
 
 Docker compatibility is an implicit capability of each Linux Developer Machine.
 Reconciliation provisions or verifies its requirements; the Machine's private
@@ -107,6 +107,41 @@ after a daemon crash remain unfinished. Same-UID host processes and directory
 ACL configuration remain trusted; there is no new cross-user authorization claim.
 
 ## Pending integration and evidence
+
+### Actionable OCI runtime diagnostics (DEV, `vz-az4`)
+
+Installed Buildx candidate 1 failed while starting its exact owned privileged
+BuildKit container, before the five-recipe workload slice. The pinned youki
+JSON logger used uppercase levels and `message`/`timestamp`; containerd's
+runtime-error decoder expects lowercase `error` and `msg`/`time`. Its generic
+exit-status error therefore did not identify the underlying create failure.
+
+The [pinned runtime recipe](../linux/youki/README.md) now carries a separate
+local logging patch and real compiled-runtime invalid-create probe, with an
+[independent decoder replay](../linux/youki/runtime-log-decoder.md). JSON file
+reopens append complete records. The patch does not change privileged/init
+behavior, container isolation, or the youki-only runtime policy. Fresh physical
+backend and installed Buildx evidence are required; logging tests alone do not
+establish successful BuildKit startup. Candidate 1 and its positive public-Stop
+disposition remain retained, with its stopped Machine disks untouched.
+
+The actual compiled invalid-create log passes the pinned-containerd decoder
+replay in `.artifacts/youki-runtime-log-4mD6SG/actual-decoder-replay.json`.
+Both rebuilt profiles carry youki SHA256
+`73cf3e46d15af4781bcd078bcc26504dc808cd0235910f795dfc05868cacb3df`.
+The complete selected backend gate
+`.artifacts/sandbox-vm-e2e/20260906T033136Z/` passes seven lanes and 50 tests,
+with zero failures or ignored tests. Independent replay verifies all 4,071
+retained files; its manifest SHA256 is
+`27b8f76d75a78e8b2450958b05d26c7714f534d5442fb090a75c21e636191248`.
+This is backend and diagnostic evidence, not installed Buildx slice acceptance.
+
+[Installed candidate 2](../scripts/helpers/linux_docker_e2e.md#buildx-candidate-2-actionable-failure-retained)
+now preserves the exact init-executable permission failure. Guest stat/hash
+confirms the private pinned `docker-init` is mode `0700`; youki incorrectly
+requires its other-execute bit. The runtime predicate correction is tracked
+as `vz-pa9`, without loosening host artifact permissions or removing `--init`.
+The failed candidate and its positively stopped disks remain preserved.
 
 ### Docker persistence correction (DEV, `vz-u0u`)
 
