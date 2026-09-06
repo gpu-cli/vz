@@ -168,7 +168,15 @@ impl RuntimeDaemon {
                 .validate_against_environment(&environment)
                 .map_err(|e| conflict(&input, e))?;
         }
-        let config_dir = docker_config_dir(&input)?;
+        let config_dir = if environment
+            .machines
+            .iter()
+            .any(|m| m.target.os == OperatingSystem::Linux)
+        {
+            docker_config_dir(&input)?
+        } else {
+            PathBuf::new()
+        };
         let mut prepared = Vec::new();
         for machine in &environment.machines {
             let owner = ResourceOwner {
@@ -177,7 +185,7 @@ impl RuntimeDaemon {
                 machine_id: Some(machine.machine_id.clone()),
             };
             let reservation =
-                MachineRuntimeRegistry::<vz_oci_macos::MacosRuntimeBackend>::reservation(&owner)
+                MachineRuntimeRegistry::<crate::machine_backend::MachineBackendRuntime>::reservation(&owner)
                     .map_err(|e| conflict(&input, e))?;
             self.with_state_store(|store| store.require_owned_resource(&reservation))
                 .map_err(|e| e.to_machine_error(&input.metadata))?;
@@ -196,7 +204,10 @@ impl RuntimeDaemon {
                     ));
                 }
             }
-            let context = if let Some(lease) = store.lease() {
+            let context = if let Some(lease) = store
+                .lease()
+                .filter(|_| machine.target.os == OperatingSystem::Linux)
+            {
                 let socket =
                     MachineDockerEndpoint::socket_path_for(&self.config.runtime_data_dir, &owner)
                         .map_err(|e| conflict(&input, e))?;
@@ -610,13 +621,14 @@ fn validate_supported(
         || !environment.networks.is_empty()
         || !environment.endpoints.is_empty()
         || environment.machines.iter().any(|m| {
-            m.target.os != OperatingSystem::Linux || m.target.arch != Architecture::Aarch64
+            !matches!(m.target.os, OperatingSystem::Linux | OperatingSystem::Macos)
+                || m.target.arch != Architecture::Aarch64
         })
     {
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Delete currently supports registered Linux/ARM64 Machines; native and additional topology resource adapters are pending",
+            "Delete supports registered Linux/native macOS ARM64 Machines; additional topology resource adapters remain unsupported",
         ));
     }
     let mut expected = Vec::<OwnershipRecord>::new();
@@ -634,12 +646,16 @@ fn validate_supported(
             machine_id: Some(machine.machine_id.clone()),
         });
         expected.push(
-            MachineRuntimeRegistry::<vz_oci_macos::MacosRuntimeBackend>::reservation(&owner)
-                .map_err(|e| conflict(input, e))?,
+            MachineRuntimeRegistry::<crate::machine_backend::MachineBackendRuntime>::reservation(
+                &owner,
+            )
+            .map_err(|e| conflict(input, e))?,
         );
         expected.push(
-            MachineRuntimeEntry::<vz_oci_macos::MacosRuntimeBackend>::vm_reservation(&owner)
-                .map_err(|e| conflict(input, e))?,
+            MachineRuntimeEntry::<crate::machine_backend::MachineBackendRuntime>::vm_reservation(
+                &owner,
+            )
+            .map_err(|e| conflict(input, e))?,
         );
         if let Some(incarnation) = &machine.incarnation {
             expected.push(OwnershipRecord {

@@ -115,6 +115,7 @@ async fn target(source: &Path) -> ResolvedLinuxMachineTarget {
             arch: Architecture::Aarch64,
         },
         MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry],
         },

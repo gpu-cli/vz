@@ -344,8 +344,17 @@ async fn stop_accounts_for_exact_failed_up_non_dispatch_without_reconstructing_a
         environment_id: admission.environment_id.clone(),
         machine_id: Some(admission.machine_ids[0].clone()),
     };
-    let records=[crate::machine_runtime_registry::MachineRuntimeRegistry::<vz_oci_macos::MacosRuntimeBackend>::reservation(&owner).unwrap(),
-        crate::machine_runtime_registry::MachineRuntimeEntry::<vz_oci_macos::MacosRuntimeBackend>::vm_reservation(&owner).unwrap()];
+    let records =
+        [
+            crate::machine_runtime_registry::MachineRuntimeRegistry::<
+                vz_oci_macos::MacosRuntimeBackend,
+            >::reservation(&owner)
+            .unwrap(),
+            crate::machine_runtime_registry::MachineRuntimeEntry::<
+                crate::machine_backend::MachineBackendRuntime,
+            >::vm_reservation(&owner)
+            .unwrap(),
+        ];
     daemon
         .with_state_store(|store| {
             for record in &records {

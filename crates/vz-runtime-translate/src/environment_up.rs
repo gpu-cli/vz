@@ -83,6 +83,13 @@ pub fn environment_up_progress_to_proto(
         schema_version: value.schema_version,
         sequence: value.sequence,
         admission: Some(admission_to_proto(&value.admission)),
+        preparation: value.preparation.as_ref().map(|p| {
+            runtime_v2::EnvironmentPreparationProgress {
+                label: p.label.clone(),
+                completed: p.completed,
+                total: p.total,
+            }
+        }),
         phase: value.phase.clone(),
         operation: value
             .operation
@@ -186,11 +193,28 @@ pub fn environment_up_progress_from_proto(
         };
         validation.validate()?;
     }
+    let preparation = value
+        .preparation
+        .as_ref()
+        .map(|p| {
+            let progress = vz_runtime_contract::EnvironmentPreparationProgress {
+                label: p.label.clone(),
+                completed: p.completed,
+                total: p.total,
+            };
+            progress.validate()?;
+            if value.phase != "preparing" {
+                return Err("preparation progress outside preparation phase".to_string());
+            }
+            Ok(progress)
+        })
+        .transpose()?;
     Ok(EnvironmentUpProgress {
         schema_version: 1,
         sequence: value.sequence,
         admission,
         phase: value.phase.clone(),
+        preparation,
         operation,
         completion,
     })

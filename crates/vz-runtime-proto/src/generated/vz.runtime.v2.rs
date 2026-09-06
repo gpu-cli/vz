@@ -706,6 +706,15 @@ pub struct EnvironmentUpCompletion {
     pub completed_at: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EnvironmentPreparationProgress {
+    #[prost(string, tag = "1")]
+    pub label: ::prost::alloc::string::String,
+    #[prost(uint64, tag = "2")]
+    pub completed: u64,
+    #[prost(uint64, tag = "3")]
+    pub total: u64,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
 pub struct UpEnvironmentEvent {
     #[prost(uint32, tag = "1")]
     pub schema_version: u32,
@@ -719,6 +728,8 @@ pub struct UpEnvironmentEvent {
     pub operation: ::core::option::Option<EnvironmentLifecycleOperation>,
     #[prost(message, optional, tag = "6")]
     pub completion: ::core::option::Option<EnvironmentUpCompletion>,
+    #[prost(message, optional, tag = "7")]
+    pub preparation: ::core::option::Option<EnvironmentPreparationProgress>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct StopEnvironmentRequest {

@@ -135,7 +135,7 @@ impl Fixture {
                     .unwrap(),
                 );
                 environment.ownership.push(
-                    MachineRuntimeEntry::<vz_oci_macos::MacosRuntimeBackend>::vm_reservation(
+                    MachineRuntimeEntry::<crate::machine_backend::MachineBackendRuntime>::vm_reservation(
                         &owner,
                     )
                     .unwrap(),

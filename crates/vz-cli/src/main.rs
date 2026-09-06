@@ -51,21 +51,20 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
-    /// Create/reconcile the selected Environment (Linux-on-macOS DEV adapter).
+    /// Create/reconcile the selected Environment (Linux and native macOS on Apple silicon; DEV).
     ///
-    /// Developer boots retain private Engine endpoints but are not Ready until
-    /// complete Docker/Compose/buildx readiness evidence is available.
+    /// Linux Developer readiness requires Docker/Compose/buildx. Native macOS
+    /// prepares a pinned image once and measures native exec/PTY readiness.
     Up(commands::dev_up::DevUpArgs),
     /// Stop the selected Developer Environment, preserving identities and state.
     Stop(commands::dev_stop::DevStopArgs),
 
-    /// Delete the selected Environment and its owned resources (Linux-on-macOS DEV adapter).
+    /// Delete the selected Environment and its owned resources (Linux and native macOS on Apple silicon; DEV).
     Delete(commands::dev_delete::DevDeleteArgs),
 
-    /// Execute in one selected Ready Machine (Linux-on-macOS DEV adapter).
+    /// Execute in one selected Ready Machine (Linux and native macOS on Apple silicon; DEV).
     ///
-    /// Automatic startup/reconciliation and native-target execution are not yet
-    /// available. Unknown runtime ownership fails closed; no legacy Run fallback.
+    /// Run Up first. Unknown runtime ownership fails closed.
     Exec(commands::dev_exec::DevExecArgs),
 
     /// Show the project's persisted Developer Environment topology.

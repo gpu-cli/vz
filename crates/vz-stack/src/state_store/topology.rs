@@ -5227,3 +5227,62 @@ impl StateStore {
         })
     }
 }
+
+impl StateStore {
+    /// Revalidate recovery of a first-generation Delete which can have no prior
+    /// VM dispatch: the sole lifecycle journal is this exact Delete, and every
+    /// Machine began Creating without an incarnation. Hold the controller fence.
+    pub fn require_never_started_delete_fence(
+        &self,
+        expected: &EnvironmentInstance,
+        operation: &EnvironmentLifecycleOperation,
+    ) -> Result<(), StackError> {
+        let conflict = || StackError::Machine {
+            code: vz_runtime_contract::MachineErrorCode::StateConflict,
+            message: "Delete lacks exact never-started admission authority".into(),
+        };
+        let transaction = self.conn.unchecked_transaction()?;
+        let actual = self
+            .load_project_state(expected.project_id.as_str())?
+            .ok_or_else(conflict)?
+            .environments
+            .into_iter()
+            .find(|e| e.environment_id == expected.environment_id)
+            .ok_or_else(conflict)?;
+        if actual != *expected
+            || expected.legacy_migration.is_some()
+            || operation.kind != EnvironmentLifecycleKind::Delete
+            || operation.generation != 1
+            || expected.lifecycle_generation != 1
+            || expected.active_operation_id.as_ref() != Some(&operation.operation_id)
+            || self
+                .load_environment_lifecycle(operation.operation_id.as_str())?
+                .as_ref()
+                != Some(operation)
+            || operation.machine_steps.iter().any(|s| {
+                s.initial_state != MachineState::Creating || s.expected_incarnation.is_some()
+            })
+            || expected.machines.iter().any(|m| {
+                m.backend.is_some()
+                    || m.incarnation.is_some()
+                    || m.runtime_identity.is_some()
+                    || m.legacy_sandbox_id.is_some()
+            })
+        {
+            return Err(conflict());
+        }
+        operation
+            .validate_against_environment(expected)
+            .map_err(|_| conflict())?;
+        let count: u64 = self.conn.query_row(
+            "SELECT COUNT(*) FROM environment_lifecycle_operations WHERE environment_id = ?1",
+            params![expected.environment_id.as_str()],
+            |r| r.get(0),
+        )?;
+        if count != 1 {
+            return Err(conflict());
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+}

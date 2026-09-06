@@ -10,10 +10,10 @@ use std::future::Future;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{OwnedMutexGuard, watch};
-use vz_oci_macos::MacosRuntimeBackend;
 use vz_runtime_contract::{
     EnvironmentLifecycleKind, EnvironmentLifecycleOperation, MachineId, ResourceOwner,
     STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION, StackRuntimeIdentity,
@@ -99,6 +99,9 @@ enum DeleteAdmissionAuthority {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum DeleteAbsenceAuthority {
+    /// Captured under the durable generation-zero admission fence, or recovered
+    /// from the exact first-generation Delete and absence of any prior journal.
+    NeverStartedAdmission,
     PositiveStop {
         operation: EnvironmentLifecycleOperation,
     },
@@ -383,6 +386,25 @@ impl MachineLiveSessions {
                         _fence: lease.retained_guard(),
                     }));
                 }
+                if prior.generation == 1
+                    && step.initial_state == vz_runtime_contract::MachineState::Creating
+                {
+                    state
+                        .access(|store| {
+                            store.require_never_started_delete_fence(environment, prior)
+                        })
+                        .map_err(error)?;
+                    return Ok(Some(MachineDeleteAbsentAdmission {
+                        environment: environment.clone(),
+                        machine_id: machine_id.clone(),
+                        authority: DeleteAdmissionAuthority::Absent(Box::new(
+                            DeleteAbsenceAuthority::NeverStartedAdmission,
+                        )),
+                        current_delete: Some(prior.clone()),
+                        controller: Arc::clone(lease.controller_identity()),
+                        _fence: lease.retained_guard(),
+                    }));
+                }
                 if step.initial_state != vz_runtime_contract::MachineState::Stopped {
                     let proof = state
                         .access(|store| {
@@ -434,7 +456,12 @@ impl MachineLiveSessions {
                 }));
             }
         }
-        let authority = if machine.state == vz_runtime_contract::MachineState::Stopped {
+        let authority = if environment.lifecycle_generation == 0 {
+            state
+                .access(|store| store.require_environment_admission_fence(environment))
+                .map_err(error)?;
+            DeleteAbsenceAuthority::NeverStartedAdmission
+        } else if machine.state == vz_runtime_contract::MachineState::Stopped {
             let prior =
                 prior.ok_or_else(|| error("Stopped Machine has no positive Stop journal"))?;
             require_positive_stop(environment, machine_id, &prior)?;
@@ -1456,6 +1483,23 @@ fn validate_quiescence_evidence(
             }
         }
         DeleteQuiescenceAuthority::Absent { authority } => match authority {
+            DeleteAbsenceAuthority::NeverStartedAdmission => {
+                let current = environment
+                    .machines
+                    .iter()
+                    .find(|row| &row.machine_id == machine)
+                    .ok_or_else(|| error("Delete Machine absent"))?;
+                if operation.generation != 1
+                    || step.initial_state != vz_runtime_contract::MachineState::Creating
+                    || step.expected_incarnation.is_some()
+                    || environment.legacy_migration.is_some()
+                    || current.incarnation.is_some()
+                    || current.runtime_identity.is_some()
+                    || current.backend.is_some()
+                {
+                    return Err(error("Delete never-started authority changed"));
+                }
+            }
             DeleteAbsenceAuthority::PositiveStop { operation: prior } => {
                 let prior_step = prior
                     .machine_steps
@@ -1777,7 +1821,6 @@ async fn stop_resources(
     drop(activation);
     let (outcome, docker_shutdown) = entry
         .runtime()
-        .inner()
         .shutdown_shared_vm_with_receipt_exact(&StackRuntimeShutdownRequest {
             schema_version: STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
             operation_id: operation.operation_id.to_string(),
@@ -1982,6 +2025,19 @@ mod tests {
         EnvironmentLifecycleOperation,
         ResourceOwner,
     ) {
+        recovery_fixture_with_initial(up, false)
+    }
+
+    fn recovery_fixture_with_initial(
+        up: bool,
+        never_started: bool,
+    ) -> (
+        tempfile::TempDir,
+        vz_stack::StateStore,
+        MachineRuntimeRegistry<MacosRuntimeBackend>,
+        EnvironmentLifecycleOperation,
+        ResourceOwner,
+    ) {
         use std::os::unix::fs::PermissionsExt;
         let root = tempfile::Builder::new()
             .prefix("vz-del-retry-")
@@ -1995,7 +2051,7 @@ mod tests {
                 "target":{"os":"linux","arch":"aarch64","image":"fixture"}}]}
         })).unwrap();
         let mut environment = definition.instantiate_environment("test", 1).unwrap();
-        if !up {
+        if !up && !never_started {
             environment.state = EnvironmentState::Failed;
             environment.machines[0].state = MachineState::Failed;
         }
@@ -2044,6 +2100,50 @@ mod tests {
             )
             .unwrap();
         (root, store, registry, operation, owner)
+    }
+
+    #[tokio::test]
+    async fn first_delete_recovers_never_started_admission_after_daemon_restart() {
+        let (root, state, registry, delete, owner) = recovery_fixture_with_initial(false, true);
+        drop(state);
+        let state = vz_stack::StateStore::open(&root.path().join("state.db")).unwrap();
+        let sessions = MachineLiveSessions::default();
+        let controller =
+            crate::environment_runtime_controller::EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&owner.project_id, &owner.environment_id)
+            .await
+            .unwrap();
+        let machine = owner.machine_id.as_ref().unwrap();
+        let current = load_delete_environment(&state, &owner).unwrap();
+        let admission = sessions
+            .prepare_delete_absence(&lease, &state, &current, machine)
+            .unwrap()
+            .unwrap();
+        let claim = registry
+            .preflight_delete(
+                &owner,
+                &MachineRuntimeRegistry::<MacosRuntimeBackend>::reservation(&owner).unwrap(),
+            )
+            .unwrap();
+        let token = sessions
+            .retire_for_delete(&lease, &state, &delete, machine, &claim, Some(admission))
+            .unwrap();
+        assert_eq!(
+            token.evidence()["authority"]["authority"]["kind"],
+            "never_started_admission"
+        );
+        assert!(token.runtime_entry_address().is_none());
+        let mut forged = current.clone();
+        forged.lifecycle_generation = 0;
+        assert!(state.require_environment_admission_fence(&forged).is_err());
+        let mut forged_delete = delete.clone();
+        forged_delete.generation = 2;
+        assert!(
+            state
+                .require_never_started_delete_fence(&current, &forged_delete)
+                .is_err()
+        );
     }
 
     #[tokio::test]

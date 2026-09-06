@@ -15,9 +15,9 @@ pub struct DevUpArgs {
     /// Existing Environment ID/name, or a new project-unique name.
     #[arg(long, value_name = "NAME_OR_ID")]
     pub environment: Option<String>,
-    /// Deadline for observation and new effects; in-flight effects remain owned.
-    #[arg(long,default_value_t=300,value_parser=clap::value_parser!(u64).range(1..=600))]
-    pub timeout: u64,
+    /// Deadline in seconds. Defaults to 3600 for macOS image preparation, 300 for Linux.
+    #[arg(long,value_parser=clap::value_parser!(u64).range(1..=3600))]
+    pub timeout: Option<u64>,
     /// Exact request ID for response-loss replay, paired with --idempotency-key.
     #[arg(long, requires = "idempotency_key")]
     pub request_id: Option<String>,
@@ -157,10 +157,30 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
             process_environment_id,
             workspace_key: Some(workspace.workspace_key),
             path_hint: Some(cwd.to_string_lossy().into_owned()),
-            timeout_millis: args.timeout * 1000,
+            timeout_millis: args.timeout.unwrap_or_else(|| {
+                if discovered
+                    .definition
+                    .environment
+                    .machines
+                    .iter()
+                    .any(|m| m.target.os == vz_runtime_contract::OperatingSystem::Macos)
+                {
+                    3600
+                } else {
+                    300
+                }
+            }) * 1000,
         })
         .await
         .map_err(client_error)?;
+    let preparation_bar = indicatif::ProgressBar::hidden();
+    if !json_output {
+        preparation_bar.set_draw_target(indicatif::ProgressDrawTarget::stderr());
+        preparation_bar.set_style(
+            indicatif::ProgressStyle::with_template("{msg} [{bar:30}] {percent}%")
+                .map_err(|e| local_error("progress_failed", e.to_string()))?,
+        );
+    }
     let mut terminal = None;
     while let Some(event) = stream.next_event().await.map_err(client_error)? {
         if json_output {
@@ -168,7 +188,22 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
                 "{}",
                 json!({"schema_version":1,"record_type":"operation_progress","progress":event})
             );
+        } else if let Some(progress) = &event.preparation {
+            if preparation_bar.is_finished() {
+                preparation_bar.reset();
+            }
+            preparation_bar.set_message(progress.label.clone());
+            preparation_bar.set_length(progress.total);
+            preparation_bar.set_position(progress.completed);
+            if preparation_bar.is_hidden() {
+                println!(
+                    "{}: {:.0}%",
+                    progress.label,
+                    100.0 * progress.completed as f64 / progress.total as f64
+                );
+            }
         } else if event.completion.is_none() {
+            preparation_bar.finish_and_clear();
             println!(
                 "Environment {}: {}",
                 event.admission.environment_id, event.phase
@@ -178,6 +213,7 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
             terminal = Some(completion);
         }
     }
+    preparation_bar.finish_and_clear();
     let completion = terminal.ok_or_else(|| {
         local_error(
             "invalid_daemon_response",

@@ -12,13 +12,14 @@ use anyhow::{Context, Result, ensure};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 /// An exact artifact selected from trusted, versioned release inputs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Artifact {
-    /// HTTPS download URL; no embedded credentials or fragment are accepted.
+    /// HTTPS URL, or `bundle:<sha256>` for an explicitly installed artifact.
+    /// Bundle locators never resolve to host paths or make network requests.
     pub url: String,
     /// Lowercase hexadecimal SHA-256 of the complete downloaded bytes.
     pub sha256: String,
@@ -45,6 +46,9 @@ impl Artifact {
             self.size_bytes > 0,
             "artifact requires an exact nonzero length"
         );
+        if self.url == format!("bundle:{}", self.sha256) {
+            return Ok(());
+        }
         let url = reqwest::Url::parse(&self.url).context("invalid artifact URL")?;
         ensure!(
             url.scheme() == "https"
@@ -63,6 +67,8 @@ impl Artifact {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Phase {
+    /// Verify and import bytes from an explicitly installed bundle.
+    Importing,
     /// Another caller is preparing this exact artifact.
     Waiting,
     /// Check a previously completed artifact before using it.
@@ -122,6 +128,34 @@ impl ArtifactCache {
     async fn ensure_validated(
         &self,
         artifact: &Artifact,
+        progress: impl FnMut(Progress) -> Result<()>,
+    ) -> Result<PathBuf> {
+        self.ensure_source(artifact, None, progress).await
+    }
+
+    /// Import a trusted installation input, verifying its exact content pin.
+    /// The caller supplies the path; bundle locators cannot select host files.
+    pub async fn ensure_installed(
+        &self,
+        artifact: &Artifact,
+        source: &std::path::Path,
+        progress: impl FnMut(Progress) -> Result<()>,
+    ) -> Result<PathBuf> {
+        artifact.validate()?;
+        ensure!(
+            source.is_absolute()
+                && !source
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir)),
+            "installed artifact path must be absolute without traversal"
+        );
+        self.ensure_source(artifact, Some(source), progress).await
+    }
+
+    async fn ensure_source(
+        &self,
+        artifact: &Artifact,
+        source: Option<&std::path::Path>,
         mut progress: impl FnMut(Progress) -> Result<()>,
     ) -> Result<PathBuf> {
         let notify = |phase, completed| Progress {
@@ -185,6 +219,65 @@ impl ArtifactCache {
                 );
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                if let Some(source) = source {
+                    let mut options = OpenOptions::new();
+                    options.read(true);
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+                    }
+                    let input = options.open(source)?;
+                    ensure!(
+                        input.metadata()?.is_file()
+                            && input.metadata()?.len() == artifact.size_bytes,
+                        "installed artifact type or length mismatch"
+                    );
+                    let mut input = tokio::fs::File::from_std(input);
+                    let staged = tempfile::NamedTempFile::new_in(&self.root)?;
+                    let mut output = tokio::fs::File::from_std(staged.reopen()?);
+                    let mut hash = Sha256::new();
+                    let mut buffer = vec![0; 4 * 1024 * 1024];
+                    let mut done = 0u64;
+                    progress(notify(Phase::Importing, 0))?;
+                    loop {
+                        let count = input.read(&mut buffer).await?;
+                        if count == 0 {
+                            break;
+                        }
+                        done += count as u64;
+                        ensure!(
+                            done <= artifact.size_bytes,
+                            "installed artifact exceeded pin"
+                        );
+                        hash.update(&buffer[..count]);
+                        if buffer[..count].iter().all(|b| *b == 0) {
+                            output
+                                .seek(std::io::SeekFrom::Current(count as i64))
+                                .await?;
+                        } else {
+                            output.write_all(&buffer[..count]).await?;
+                        }
+                        progress(notify(Phase::Importing, done))?;
+                    }
+                    ensure!(
+                        done == artifact.size_bytes
+                            && format!("{:x}", hash.finalize()) == artifact.sha256,
+                        "installed artifact digest mismatch"
+                    );
+                    output.set_len(done).await?;
+                    output.flush().await?;
+                    output.sync_all().await?;
+                    drop(output);
+                    staged.persist_noclobber(&path).map_err(|e| e.error)?;
+                    File::open(&self.root)?.sync_all()?;
+                    progress(notify(Phase::Available, done))?;
+                    return Ok(path);
+                }
+                ensure!(
+                    !artifact.url.starts_with("bundle:"),
+                    "bundle artifact is not installed in this cache"
+                );
                 progress(notify(Phase::Downloading, 0))?;
                 let staged = tempfile::NamedTempFile::new_in(&self.root)?;
                 let mut output = tokio::fs::File::from_std(staged.reopen()?);

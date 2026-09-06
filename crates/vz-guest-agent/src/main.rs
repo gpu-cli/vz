@@ -12,6 +12,8 @@ mod docker;
 mod docker_forward;
 mod grpc_server;
 mod listener;
+#[cfg(target_os = "macos")]
+mod native_machine_exec;
 #[cfg(target_os = "linux")]
 pub(crate) mod network;
 #[cfg(any(target_os = "linux", test))]
@@ -73,6 +75,13 @@ struct Args {
 }
 
 fn main() -> anyhow::Result<()> {
+    #[cfg(target_os = "macos")]
+    {
+        let args = std::env::args_os().skip(1).collect::<Vec<_>>();
+        if native_machine_exec::is_request(&args) {
+            return native_machine_exec::run(args);
+        }
+    }
     if invoked_as_buildkit_runtime_shim(std::env::args_os().next().as_deref()) {
         return exec_buildkit_runtime(std::env::args_os().skip(1).collect());
     }

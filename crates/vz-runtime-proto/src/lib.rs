@@ -112,6 +112,7 @@ mod tests {
             created_at: 7,
         };
         let event = UpEnvironmentEvent {
+            preparation: None,
             schema_version: 1,
             sequence: 9,
             admission: Some(admission.clone()),
@@ -1158,6 +1159,7 @@ mod tests {
                     ("phase", 4),
                     ("operation", 5),
                     ("completion", 6),
+                    ("preparation", 7),
                 ],
             ),
             (

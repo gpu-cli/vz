@@ -155,6 +155,7 @@ async fn write_bundle_and_resolve(source: &Path) -> (ResolvedLinuxMachineTarget,
     let resolver = MachineTargetResolver::new(
         host(),
         MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry],
         },

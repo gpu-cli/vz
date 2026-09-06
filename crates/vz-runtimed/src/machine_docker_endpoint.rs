@@ -109,7 +109,7 @@ impl MachineDockerEndpoint {
         activation: Arc<MachineRuntimeActivation>,
         socket_path: &Path,
     ) -> Result<Self, MachineDockerEndpointError> {
-        if activation.verified_profile() != KernelProfile::Developer {
+        if activation.verified_profile() != Some(KernelProfile::Developer) {
             return Err(MachineDockerEndpointError::Conflict(
                 "only Developer Linux Machines have Docker endpoints".into(),
             ));

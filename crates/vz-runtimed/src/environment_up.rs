@@ -10,6 +10,7 @@ use tokio::sync::{OwnedMutexGuard, watch};
 use vz_runtime_contract::*;
 use vz_stack::StackError;
 
+mod native_readiness;
 mod readiness;
 mod supervisor;
 #[cfg(test)]
@@ -42,6 +43,17 @@ struct UpRun {
 }
 
 impl UpRun {
+    fn preparing(&self, preparation: EnvironmentPreparationProgress) {
+        self.progress.send_modify(|event| {
+            if event.completion.is_some() {
+                return;
+            }
+            event.sequence += 1;
+            event.phase = "preparing".into();
+            event.preparation = Some(preparation);
+        });
+    }
+
     fn publish(
         &self,
         phase: &str,
@@ -54,6 +66,7 @@ impl UpRun {
             }
             event.sequence += 1;
             event.phase = phase.into();
+            event.preparation = None;
             event.operation = operation;
             event.completion = completion;
         });
@@ -150,6 +163,7 @@ impl RuntimeDaemon {
             .with_state_store(|store| store.load_environment_up_completion(key))
             .map_err(|error| error.to_machine_error(&metadata))?;
         let initial = EnvironmentUpProgress {
+            preparation: None,
             schema_version: 1,
             sequence: 0,
             admission: admission.clone(),
@@ -255,13 +269,15 @@ fn validate_supported(
         ));
     }
     for machine in &spec.machines {
-        if machine.target.os != OperatingSystem::Linux
-            || machine.target.arch != Architecture::Aarch64
+        if !matches!(
+            machine.target.os,
+            OperatingSystem::Linux | OperatingSystem::Macos
+        ) || machine.target.arch != Architecture::Aarch64
         {
             return Err(failure(
                 metadata,
                 MachineErrorCode::UnsupportedOperation,
-                "this Up effect adapter supports Linux/ARM64 on macOS only; no host/native substitution",
+                "this Up adapter supports Linux and native macOS ARM64 on Apple silicon only",
             ));
         }
     }

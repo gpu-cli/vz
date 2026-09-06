@@ -45,6 +45,7 @@ impl Fixture {
         let hardware = b"test hardware model";
         let auxiliary = b"test auxiliary seed";
         let manifest = ReleaseManifest {
+            development: false,
             schema_version: 1,
             macos_version: "26.6.2".into(),
             macos_build: "25G83".into(),
@@ -382,5 +383,43 @@ fn cache_root_rejects_parent_traversal_before_creation() -> Result<()> {
     let root = directory.path().canonicalize()?;
     assert!(BootstrapCache::new(root.join("unused/../cache")).is_err());
     assert!(!root.join("cache").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn installed_bundle_verifies_then_reuses_template_without_source_blobs() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.manifest.development = true;
+    f.manifest.toolchain_sha256.clear();
+    for a in [
+        &mut f.manifest.base,
+        &mut f.manifest.patch,
+        &mut f.manifest.platform.hardware_model,
+        &mut f.manifest.platform.auxiliary_storage_seed,
+    ] {
+        a.url = format!("bundle:{}", a.sha256);
+    }
+    f.save_manifest()?;
+    f.pin.url = format!("bundle:{}", f.pin.sha256);
+    let bundle = f.root.join("bundle");
+    fs::rename(f.root.join("cache/downloads"), &bundle)?;
+    let cache = BootstrapCache::new(f.root.join("consumer"))?;
+    let prepared = cache.prepare_installed(&f.pin, &bundle, |_| Ok(())).await?;
+    assert_eq!(prepared.manifest(), &f.manifest);
+    fs::remove_dir_all(&bundle)?;
+    let warm = cache.prepare_installed(&f.pin, &bundle, |_| Ok(())).await?;
+    assert_eq!(prepared.manifest_sha256(), warm.manifest_sha256());
+    Ok(())
+}
+
+#[test]
+fn missing_toolchain_is_only_accepted_for_explicit_development() -> Result<()> {
+    let mut f = Fixture::new()?;
+    f.manifest.toolchain_sha256.clear();
+    assert!(f.manifest.validate().is_err());
+    f.manifest.development = true;
+    f.manifest.validate()?;
+    f.manifest.toolchain_sha256 = "unverified".into();
+    assert!(f.manifest.validate().is_err());
     Ok(())
 }

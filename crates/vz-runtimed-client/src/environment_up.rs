@@ -29,6 +29,7 @@ mod tests {
             created_at: 1,
         };
         let event = EnvironmentUpProgress {
+            preparation: None,
             schema_version: 1,
             sequence: 0,
             admission,
@@ -265,5 +266,53 @@ impl DaemonClient {
                 terminal: false,
             },
         })
+    }
+}
+
+#[cfg(test)]
+mod preparation_tests {
+    #![allow(clippy::unwrap_used)]
+    use vz_runtime_contract::*;
+
+    #[test]
+    fn preparation_progress_roundtrips_with_bounded_fields() {
+        let admission = EnvironmentUpAdmission {
+            schema_version: 1,
+            project_id: ProjectId::generate(),
+            environment_id: EnvironmentId::generate(),
+            machine_ids: vec![MachineId::generate()],
+            definition_digest: format!("sha256:{}", "a".repeat(64)),
+            request_id: "request".into(),
+            idempotency_key: "key".into(),
+            request_hash: format!("sha256:{}", "b".repeat(64)),
+            workspace_key: None,
+            created_at: 1,
+        };
+        let event = EnvironmentUpProgress {
+            schema_version: 1,
+            sequence: 1,
+            admission,
+            phase: "preparing".into(),
+            operation: None,
+            completion: None,
+            preparation: Some(EnvironmentPreparationProgress {
+                label: "Preparing macOS image".into(),
+                completed: 5,
+                total: 10,
+            }),
+        };
+        let mut wire = vz_runtime_translate::environment_up_progress_to_proto(&event);
+        assert_eq!(
+            vz_runtime_translate::environment_up_progress_from_proto(&wire).unwrap(),
+            event
+        );
+        wire.preparation.as_mut().unwrap().completed = 11;
+        assert!(vz_runtime_translate::environment_up_progress_from_proto(&wire).is_err());
+        wire.preparation.as_mut().unwrap().completed = 5;
+        wire.phase = "starting".into();
+        assert!(vz_runtime_translate::environment_up_progress_from_proto(&wire).is_err());
+        wire.phase = "preparing".into();
+        wire.preparation.as_mut().unwrap().label = "injected\nline".into();
+        assert!(vz_runtime_translate::environment_up_progress_from_proto(&wire).is_err());
     }
 }

@@ -1,8 +1,8 @@
 use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
 use super::*;
+use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use crate::machine_docker_endpoint::MachineDockerEndpoint;
 use crate::machine_runtime_registry::MachineRuntimeEntry;
-use vz_oci_macos::MacosRuntimeBackend;
 
 impl RuntimeDaemon {
     pub(super) async fn supervise_up(
@@ -150,7 +150,9 @@ impl RuntimeDaemon {
             .map_err(|error| backend_error(error.to_string()))?;
         // Validate every eventual socket pathname before pinning or booting.
         for machine in &environment.machines {
-            if machine.profile == MachineProfile::Developer {
+            if machine.target.os == OperatingSystem::Linux
+                && machine.profile == MachineProfile::Developer
+            {
                 MachineDockerEndpoint::socket_path_for(
                     &self.config.runtime_data_dir,
                     &ResourceOwner {
@@ -163,8 +165,18 @@ impl RuntimeDaemon {
             }
         }
         run.publish("preparing", None, None);
+        let run_progress = Arc::clone(&run);
         let prepared = match self
-            .prepare_environment_machine_runtimes(lease, &environment)
+            .prepare_environment_machine_runtimes_with_progress(lease, &environment, {
+                let mut last = tokio::time::Instant::now() - Duration::from_secs(1);
+                move |progress| {
+                    if last.elapsed() >= Duration::from_millis(100) {
+                        run_progress.preparing(native_progress(&progress));
+                        last = tokio::time::Instant::now();
+                    }
+                    Ok(())
+                }
+            })
             .await
         {
             Ok(prepared) => prepared,
@@ -245,13 +257,14 @@ impl RuntimeDaemon {
                 self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                 let entry=prepared.attach_machine(&self.state_store,&self.machine_runtime_registry,&operation,&step.machine_id)
                     .map_err(|error|backend_error(error.to_string()))?;
-                let pin=prepared.pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id))
-                    .ok_or_else(||backend_error("prepared Machine pin missing".into()))?;
+                let pin=prepared.pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id));
+                let native_pin=prepared.native_pins().iter().find(|pin|pin.store().owner().machine_id.as_ref()==Some(&step.machine_id));
+                if pin.is_none() && native_pin.is_none() {return Err(backend_error("prepared Machine pin missing".into()));}
                 let activation=if let Some(activation)=existing.get(&step.machine_id) {
                     if !Arc::ptr_eq(activation.entry(),&entry) { return Err(backend_error("Up attachment changed original Runtime object".into())); }
                     Arc::clone(activation)
                 } else {
-                    let resources=&pin.configuration().resources;
+                    let (cpus,memory_mb)=if let Some(pin)=native_pin {(pin.configuration().cpus,pin.configuration().memory_mb)} else {let pin=pin.ok_or_else(||backend_error("missing Linux pin".into()))?;(pin.configuration().resources.cpus,pin.configuration().resources.memory_mb)};
                     let reservation=MachineRuntimeEntry::<MacosRuntimeBackend>::vm_reservation(entry.owner()).map_err(|error|backend_error(error.to_string()))?;
                     if let Some(observer)=&self.environment_up_observer {
                         observer.before_dispatch(&EnvironmentUpBootBoundary {admission:run.admission.clone(),operation:operation.clone(),machine_id:step.machine_id.clone(),owner:entry.owner().clone()}).await;
@@ -262,7 +275,7 @@ impl RuntimeDaemon {
                     self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                     self.with_state_store(|store|store.consume_machine_boot_non_dispatch(&operation,&step.machine_id)).map_err(state_error)?;
                     let activation=match entry.boot_or_inspect_machine(&reservation,vec![],StackResourceHint {
-                        cpus:Some(resources.cpus),memory_mb:Some(resources.memory_mb),..Default::default()
+                        cpus:Some(cpus),memory_mb:Some(memory_mb),..Default::default()
                     }).await { Ok(activation)=>Arc::new(activation),Err(error)=>{uncertain=true;return Err(backend_error(format!("Machine boot failed; original Runtime and fence retained, absence unproven: {error}")));} };
                     run.uncertain.lock().map_err(|error|backend_error(error.to_string()))?.push(Arc::clone(&activation));
                     if let Err(error)=self.machine_live_sessions.register(prepared.lease(),Arc::clone(&activation),&mut None) {
@@ -273,7 +286,7 @@ impl RuntimeDaemon {
                     run.uncertain.lock().map_err(|error|backend_error(error.to_string()))?.clear();
                     activation
                 };
-                if machine.profile==MachineProfile::Developer && self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
+                if machine.target.os==OperatingSystem::Linux && machine.profile==MachineProfile::Developer && self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
                     .map_err(|error|backend_error(error.to_string()))?.is_none() {
                     let path=MachineDockerEndpoint::socket_path_for(&self.config.runtime_data_dir,activation.owner()).map_err(|error|backend_error(error.to_string()))?;
                     let mut endpoint=Some(MachineDockerEndpoint::start(Arc::clone(&activation),&path).await.map_err(|error|backend_error(error.to_string()))?);
@@ -288,6 +301,8 @@ impl RuntimeDaemon {
                 }};
                 let docker_endpoint=self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
                     .map_err(|error|backend_error(error.to_string()))?;
+                if let Some(pin)=native_pin { return super::readiness::await_readiness(super::native_readiness::verify(&activation,pin,machine,incarnation,deadline,&metadata),deadline,&metadata).await; }
+                let pin=pin.ok_or_else(||backend_error("missing Linux pin".into()))?;
                 let readiness=MeasuredLinuxReadiness {pin,docker_endpoint:docker_endpoint.as_deref(),deadline};
                 super::readiness::await_readiness(readiness.verify(&activation,machine,incarnation,&metadata),deadline,&metadata).await
             }.await;
@@ -401,4 +416,34 @@ fn load_environment(
                 .into_iter()
                 .find(|environment| environment.environment_id == admission.environment_id)
         }))
+}
+
+fn native_progress(
+    progress: &vz_macos_provision::bootstrap::Progress,
+) -> EnvironmentPreparationProgress {
+    use vz_macos_provision::bootstrap::Progress;
+    let (label, completed, total) = match progress {
+        Progress::Artifact { progress, .. } => {
+            use vz_macos_provision::artifact_cache::Phase;
+            let label = match progress.phase {
+                Phase::Importing => "Copying macOS image files",
+                Phase::Downloading => "Downloading macOS image files",
+                Phase::VerifyingCache => "Verifying macOS image files",
+                Phase::Waiting => "Waiting for macOS image files",
+                Phase::Available => "macOS image files ready",
+            };
+            (label, progress.completed, progress.total)
+        }
+        Progress::PreparingImage { progress } => {
+            ("Preparing macOS image", progress.completed, progress.total)
+        }
+        Progress::TemplateReady { reused: true } => ("Using prepared macOS image", 1, 1),
+        Progress::TemplateReady { reused: false } => ("macOS image prepared", 1, 1),
+        _ => ("Preparing macOS image", 0, 1),
+    };
+    EnvironmentPreparationProgress {
+        label: label.into(),
+        completed,
+        total: total.max(1),
+    }
 }

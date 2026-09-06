@@ -392,6 +392,9 @@ struct MachineRuntimeRegistryState<R> {
 }
 
 impl<R> MachineRuntimeRegistry<R> {
+    pub(crate) fn native_bootstrap_cache_path(&self) -> PathBuf {
+        self.root.join("native-bootstrap")
+    }
     pub fn new(root: PathBuf) -> Result<Self, MachineRuntimeRegistryError> {
         let root = absolute_path_without_parent_traversal(&root)?;
         Ok(Self {

@@ -114,6 +114,43 @@ impl BootstrapCache {
     pub async fn prepare(
         &self,
         manifest_pin: &Artifact,
+        progress: impl FnMut(Progress) -> Result<()>,
+    ) -> Result<PreparedTemplate> {
+        self.prepare_source(manifest_pin, None, progress).await
+    }
+
+    /// Prepare from an explicitly trusted installation bundle. Each input is
+    /// named by its SHA-256 within this directory and independently verified.
+    /// Existing completed templates need only their small manifest and receipt.
+    pub async fn prepare_installed(
+        &self,
+        manifest_pin: &Artifact,
+        bundle: &std::path::Path,
+        progress: impl FnMut(Progress) -> Result<()>,
+    ) -> Result<PreparedTemplate> {
+        self.prepare_source(manifest_pin, Some(bundle), progress)
+            .await
+    }
+
+    async fn acquire(
+        &self,
+        pin: &Artifact,
+        bundle: Option<&std::path::Path>,
+        progress: impl FnMut(artifact_cache::Progress) -> Result<()>,
+    ) -> Result<PathBuf> {
+        if let Some(bundle) = bundle {
+            self.downloads
+                .ensure_installed(pin, &bundle.join(&pin.sha256), progress)
+                .await
+        } else {
+            self.downloads.ensure(pin, progress).await
+        }
+    }
+
+    async fn prepare_source(
+        &self,
+        manifest_pin: &Artifact,
+        bundle: Option<&std::path::Path>,
         mut progress: impl FnMut(Progress) -> Result<()>,
     ) -> Result<PreparedTemplate> {
         manifest_pin.validate()?;
@@ -122,8 +159,7 @@ impl BootstrapCache {
             "manifest exceeds size limit"
         );
         let manifest_path = self
-            .downloads
-            .ensure(manifest_pin, |p| {
+            .acquire(manifest_pin, bundle, |p| {
                 progress(Progress::Artifact {
                     component: Component::Manifest,
                     progress: p,
@@ -173,14 +209,13 @@ impl BootstrapCache {
             ),
         ] {
             inputs.push(
-                self.downloads
-                    .ensure(artifact, |p| {
-                        progress(Progress::Artifact {
-                            component,
-                            progress: p,
-                        })
+                self.acquire(artifact, bundle, |p| {
+                    progress(Progress::Artifact {
+                        component,
+                        progress: p,
                     })
-                    .await?,
+                })
+                .await?,
             );
         }
         let [base, patch, hardware, auxiliary]: [PathBuf; 4] = inputs

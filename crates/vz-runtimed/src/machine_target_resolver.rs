@@ -32,6 +32,8 @@ const LINUX_BUNDLE_DIGEST_DOMAIN: &[u8] = b"vz.linux.kernel-bundle.v1\0";
 pub struct MachineTargetCatalog {
     pub schema_version: u32,
     pub linux: Vec<LinuxTargetCatalogEntry>,
+    #[serde(default)]
+    pub macos: Vec<NativeMacosCatalogEntry>,
 }
 
 impl Default for MachineTargetCatalog {
@@ -39,6 +41,7 @@ impl Default for MachineTargetCatalog {
         Self {
             schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
             linux: Vec::new(),
+            macos: Vec::new(),
         }
     }
 }
@@ -55,6 +58,26 @@ pub struct LinuxTargetCatalogEntry {
     pub digest: String,
     #[serde(default)]
     pub channels: BTreeSet<String>,
+}
+
+/// Exact native macOS release selected by the trusted installation catalog.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct NativeMacosCatalogEntry {
+    pub image: String,
+    pub version: String,
+    pub manifest: vz_macos_provision::artifact_cache::Artifact,
+    #[serde(default)]
+    pub installed_bundle: Option<PathBuf>,
+    #[serde(default)]
+    pub channels: BTreeSet<String>,
+}
+
+#[derive(Debug)]
+pub struct ResolvedNativeMacosTarget {
+    pub configuration: crate::native_macos::artifacts::NativeConfiguration,
+    pub configuration_digest: String,
+    pub installed_bundle: Option<PathBuf>,
 }
 
 #[derive(Debug, Error)]
@@ -130,7 +153,9 @@ impl MachineTargetCatalog {
     }
 
     pub fn validate(&self) -> Result<(), TargetResolutionError> {
-        if self.schema_version != MACHINE_TARGET_CATALOG_SCHEMA_VERSION || self.linux.len() > 1024 {
+        if self.schema_version != MACHINE_TARGET_CATALOG_SCHEMA_VERSION
+            || self.linux.len() + self.macos.len() > 1024
+        {
             return Err(TargetResolutionError::InvalidCatalog(
                 "unsupported schema or oversized entry set".into(),
             ));
@@ -160,6 +185,31 @@ impl MachineTargetCatalog {
                         "a channel selects multiple releases of one profile".into(),
                     ));
                 }
+            }
+        }
+        let mut native_versions = BTreeSet::new();
+        let mut native_channels = BTreeSet::new();
+        for entry in &self.macos {
+            entry
+                .manifest
+                .validate()
+                .map_err(|e| TargetResolutionError::InvalidCatalog(e.to_string()))?;
+            if entry.image != "vz-macos"
+                || !label(&entry.version)
+                || entry
+                    .installed_bundle
+                    .as_ref()
+                    .is_some_and(|p| !absolute_without_traversal(p))
+                || entry.channels.iter().any(|c| !label(c))
+                || !native_versions.insert(entry.version.clone())
+                || entry
+                    .channels
+                    .iter()
+                    .any(|c| !native_channels.insert(c.clone()))
+            {
+                return Err(TargetResolutionError::InvalidCatalog(
+                    "invalid or duplicate native macOS catalog selection".into(),
+                ));
             }
         }
         Ok(())
@@ -334,6 +384,7 @@ impl ResolvedLinuxMachineTarget {
 pub struct ResolvedProjectTargets {
     pub definition_digest: String,
     pub machines: BTreeMap<String, ResolvedLinuxMachineTarget>,
+    pub native: BTreeMap<String, ResolvedNativeMacosTarget>,
 }
 
 #[derive(Debug, Clone)]
@@ -368,10 +419,18 @@ impl MachineTargetResolver {
             .validate()
             .map_err(|error| TargetResolutionError::InvalidDefinition(error.to_string()))?;
         // Pure selection for all siblings precedes even the first artifact read.
+        let native = definition
+            .environment
+            .machines
+            .iter()
+            .filter(|m| m.target.os == OperatingSystem::Macos)
+            .map(|m| self.select_native(m).map(|r| (m.name.clone(), r)))
+            .collect::<Result<BTreeMap<_, _>, _>>()?;
         let selected = definition
             .environment
             .machines
             .iter()
+            .filter(|machine| machine.target.os != OperatingSystem::Macos)
             .map(|machine| self.select(machine).map(|entry| (machine, entry)))
             .collect::<Result<Vec<_>, _>>()?;
         let mut machines = BTreeMap::new();
@@ -384,6 +443,102 @@ impl MachineTargetResolver {
                 .digest()
                 .map_err(|error| TargetResolutionError::InvalidDefinition(error.to_string()))?,
             machines,
+            native,
+        })
+    }
+
+    fn select_native(
+        &self,
+        machine: &MachineSpec,
+    ) -> Result<ResolvedNativeMacosTarget, TargetResolutionError> {
+        let invalid = |reason: &str| TargetResolutionError::UnsupportedTarget {
+            machine: machine.name.clone(),
+            reason: reason.into(),
+        };
+        if self.host.os != OperatingSystem::Macos
+            || self.host.arch != Architecture::Aarch64
+            || machine.target.arch != Architecture::Aarch64
+            || machine.profile != MachineProfile::Developer
+        {
+            return Err(invalid(
+                "native DEV requires Developer macOS/ARM64 on Apple silicon",
+            ));
+        }
+        let supported = vz_runtime_contract::CapabilitySet::new([
+            MachineCapability::PosixExec,
+            MachineCapability::PosixPty,
+        ]);
+        if !machine
+            .requested_capabilities
+            .unaccounted_by(&supported)
+            .is_empty()
+        {
+            return Err(invalid("native DEV currently supports POSIX exec/PTY only"));
+        }
+        let digest = machine.target.digest.as_deref();
+        if digest.is_some_and(|d| !canonical_digest(d)) {
+            return Err(TargetResolutionError::UnpinnedTarget {
+                machine: machine.name.clone(),
+            });
+        }
+        let entries = self
+            .catalog
+            .macos
+            .iter()
+            .filter(|e| {
+                e.image == machine.target.image
+                    && digest.is_none_or(|d| format!("sha256:{}", e.manifest.sha256) == d)
+                    && machine
+                        .target
+                        .version
+                        .as_ref()
+                        .is_none_or(|v| v == &e.version)
+                    && machine
+                        .target
+                        .channel
+                        .as_ref()
+                        .is_none_or(|c| e.channels.contains(c))
+            })
+            .collect::<Vec<_>>();
+        let entry = match entries.as_slice() {
+            [entry] => *entry,
+            [] => {
+                return Err(TargetResolutionError::TargetNotFound {
+                    machine: machine.name.clone(),
+                });
+            }
+            _ => {
+                return Err(TargetResolutionError::AmbiguousTarget {
+                    machine: machine.name.clone(),
+                });
+            }
+        };
+        let cpus = machine.resources.cpus.unwrap_or(4);
+        let memory_mb = machine.resources.memory_mb.unwrap_or(8192);
+        if cpus == 0
+            || memory_mb < 4096
+            || memory_mb.checked_mul(1024 * 1024).is_none()
+            || machine.resources.disk_bytes.is_some()
+        {
+            return Err(invalid(
+                "invalid native compute resources or unsupported disk sizing",
+            ));
+        }
+        let configuration = crate::native_macos::artifacts::NativeConfiguration {
+            schema_version: 1,
+            host: self.host,
+            machine: machine.clone(),
+            manifest: entry.manifest.clone(),
+            cpus,
+            memory_mb,
+        };
+        let configuration_digest = configuration
+            .digest()
+            .map_err(|e| invalid(&e.to_string()))?;
+        Ok(ResolvedNativeMacosTarget {
+            configuration,
+            configuration_digest,
+            installed_bundle: entry.installed_bundle.clone(),
         })
     }
 
@@ -681,6 +836,7 @@ mod tests {
         MachineTargetResolver::new(
             host(),
             MachineTargetCatalog {
+                macos: Vec::new(),
                 schema_version: 1,
                 linux: entries,
             },
@@ -708,6 +864,52 @@ mod tests {
             &mut expected_machine,
         );
         (name, configuration, expected_host, expected_machine)
+    }
+
+    #[tokio::test]
+    async fn native_channel_resolves_exact_pin_and_rejects_wrong_digest_or_capability() {
+        let definition: ProjectDefinition = serde_json::from_value(json!({"schema_version":1,"project_id":"prj_native","name":"native","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"mac","profile":"developer","target":{"os":"macos","arch":"aarch64","image":"vz-macos","channel":"latest"}}]}})).unwrap();
+        let digest = "a".repeat(64);
+        let catalog = MachineTargetCatalog {
+            macos: vec![NativeMacosCatalogEntry {
+                image: "vz-macos".into(),
+                version: "26.3.1".into(),
+                manifest: vz_macos_provision::artifact_cache::Artifact {
+                    url: format!("bundle:{digest}"),
+                    sha256: digest.clone(),
+                    size_bytes: 100,
+                },
+                installed_bundle: Some("/private/explicit-bundle".into()),
+                channels: BTreeSet::from(["latest".into()]),
+            }],
+            ..Default::default()
+        };
+        let resolver = MachineTargetResolver::new(host(), catalog).unwrap();
+        let plan = resolver.resolve_project(&definition).await.unwrap();
+        assert!(plan.machines.is_empty());
+        assert_eq!(plan.native["mac"].configuration.manifest.sha256, digest);
+        for capability in [
+            MachineCapability::DockerEngine,
+            MachineCapability::Files,
+            MachineCapability::Ports,
+        ] {
+            let mut invalid = definition.clone();
+            invalid.environment.machines[0].requested_capabilities =
+                CapabilitySet::new([capability]);
+            assert!(resolver.resolve_project(&invalid).await.is_err());
+        }
+        let mut invalid = definition.clone();
+        invalid.environment.machines[0].target.digest = Some(format!("sha256:{}", "b".repeat(64)));
+        assert!(resolver.resolve_project(&invalid).await.is_err());
+        let changed = MachineTargetResolver::new(
+            HostSpec {
+                os: OperatingSystem::Linux,
+                arch: Architecture::Aarch64,
+            },
+            resolver.catalog.clone(),
+        )
+        .unwrap();
+        assert!(changed.resolve_project(&definition).await.is_err());
     }
 
     #[tokio::test]
@@ -814,6 +1016,7 @@ mod tests {
                                 arch: host_arch,
                             },
                             MachineTargetCatalog {
+                                macos: Vec::new(),
                                 schema_version: 1,
                                 linux: vec![entry.clone()],
                             },
@@ -1124,6 +1327,7 @@ mod tests {
         let root = temp.path().canonicalize().unwrap();
         let entry = bundle(&root.join("bundle"), MachineProfile::Developer).await;
         let catalog = MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry.clone()],
         };
@@ -1131,6 +1335,7 @@ mod tests {
         fs::write(&file, serde_json::to_vec(&catalog).unwrap()).unwrap();
         assert_eq!(MachineTargetCatalog::from_file(&file).unwrap(), catalog);
         let duplicate = MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 1,
             linux: vec![entry.clone(), entry.clone()],
         };
@@ -1138,6 +1343,7 @@ mod tests {
         let mut other = entry;
         other.version = "other-version".into();
         let channels = MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 1,
             linux: vec![catalog.linux[0].clone(), other],
         };

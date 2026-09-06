@@ -37,7 +37,11 @@ struct Cli {
 
     /// Offline installer operation: verify selected profile bundles and atomically write the catalog.
     #[cfg(target_os = "macos")]
-    #[arg(long, requires_all = ["installed_release_version", "installed_linux_profile"], conflicts_with = "machine_target_catalog")]
+    #[arg(
+        long,
+        requires = "installed_release_version",
+        conflicts_with = "machine_target_catalog"
+    )]
     write_installed_machine_target_catalog: Option<PathBuf>,
     #[cfg(target_os = "macos")]
     #[arg(long, requires = "write_installed_machine_target_catalog")]
@@ -45,6 +49,14 @@ struct Cli {
     #[cfg(target_os = "macos")]
     #[arg(long, requires = "write_installed_machine_target_catalog", value_parser = ["developer", "container"])]
     installed_linux_profile: Vec<String>,
+
+    /// Explicit DEV content-addressed native bundle and trusted manifest pin.
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires_all = ["write_installed_machine_target_catalog", "installed_native_manifest_sha256"])]
+    installed_native_bundle: Option<PathBuf>,
+    #[cfg(target_os = "macos")]
+    #[arg(long, requires = "installed_native_bundle")]
+    installed_native_manifest_sha256: Option<String>,
 
     /// Maximum retained untagged checkpoints in daemon GC loop.
     #[arg(long, default_value_t = 128)]
@@ -66,10 +78,13 @@ async fn main() -> Result<()> {
             .context("installed release version required")?;
         let path = tokio::time::timeout(
             std::time::Duration::from_secs(120),
-            vz_runtimed::installed_machine_catalog::write_installed_catalog(
+            vz_runtimed::installed_machine_catalog::write_installed_catalog_with_native(
                 prefix,
                 version,
                 &cli.installed_linux_profile,
+                cli.installed_native_bundle
+                    .as_deref()
+                    .zip(cli.installed_native_manifest_sha256.as_deref()),
             ),
         )
         .await

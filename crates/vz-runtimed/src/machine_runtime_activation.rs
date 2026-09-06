@@ -4,13 +4,13 @@
 //! Topology controller tasks retain this composite across readiness and evidence
 //! publication, even if their owning daemon registry is dropped concurrently.
 
+use crate::machine_backend::{MachineBackendRuntime as MacosRuntimeBackend, MachineExecutionLease};
 use std::sync::Arc;
 use std::time::Duration;
 
 use thiserror::Error;
 use vz_oci_macos::{
-    KernelProfile, MacosOciError as OciError, MacosRuntimeBackend, PortMapping,
-    SharedVmDockerReadiness, SharedVmLifecycleLease,
+    KernelProfile, MacosOciError as OciError, PortMapping, SharedVmDockerReadiness,
 };
 use vz_runtime_contract::{
     ExecOutput, OwnedResourceKind, OwnershipRecord, ResourceOwner, StackResourceHint,
@@ -38,12 +38,18 @@ pub enum MachineRuntimeActivationError {
 #[must_use = "retain the activation through readiness and evidence publication"]
 pub struct MachineRuntimeActivation {
     // Release the VM lifecycle fence before dropping the owning runtime store.
-    lease: SharedVmLifecycleLease,
+    lease: MachineExecutionLease,
     entry: Arc<MachineRuntimeEntry<MacosRuntimeBackend>>,
 }
 
 impl MachineRuntimeActivation {
-    pub(crate) fn execution_lease(&self) -> &SharedVmLifecycleLease {
+    pub(crate) fn native_lease(&self) -> Option<&crate::native_macos::runtime::NativeMacosLease> {
+        match &self.lease {
+            MachineExecutionLease::Native(lease) => Some(lease),
+            _ => None,
+        }
+    }
+    pub(crate) fn execution_lease(&self) -> &MachineExecutionLease {
         &self.lease
     }
     pub(crate) fn entry(&self) -> &Arc<MachineRuntimeEntry<MacosRuntimeBackend>> {
@@ -58,20 +64,33 @@ impl MachineRuntimeActivation {
         self.lease.runtime_identity()
     }
 
-    pub fn verified_profile(&self) -> KernelProfile {
-        self.lease.verified_profile()
+    pub fn verified_profile(&self) -> Option<KernelProfile> {
+        match &self.lease {
+            MachineExecutionLease::Linux(l) => Some(l.verified_profile()),
+            MachineExecutionLease::Native(_) => None,
+        }
     }
 
     /// Guest-local readiness only; no host socket/context or capabilities are
     /// created or inferred by this operation.
     pub async fn ensure_docker_ready(&self) -> Result<SharedVmDockerReadiness, OciError> {
-        self.lease.ensure_docker_ready().await
+        match &self.lease {
+            MachineExecutionLease::Linux(l) => l.ensure_docker_ready().await,
+            MachineExecutionLease::Native(_) => {
+                Err(OciError::InvalidConfig("native macOS has no Docker".into()))
+            }
+        }
     }
 
     /// Exact-boot Docker transport. An endpoint supervisor must retain this
     /// activation for every live stream, then drain clients before stopping VM.
     pub async fn open_docker_stream(&self) -> Result<vz_linux::GrpcDockerStream, OciError> {
-        self.lease.open_docker_stream().await
+        match &self.lease {
+            MachineExecutionLease::Linux(l) => l.open_docker_stream().await,
+            MachineExecutionLease::Native(_) => {
+                Err(OciError::InvalidConfig("native macOS has no Docker".into()))
+            }
+        }
     }
 
     /// Execute in the exact leased guest without recursively acquiring a
@@ -82,7 +101,21 @@ impl MachineRuntimeActivation {
         args: Vec<String>,
         timeout: Duration,
     ) -> Result<ExecOutput, OciError> {
-        let output = self.lease.exec(command, args, timeout).await?;
+        let output = match &self.lease {
+            MachineExecutionLease::Linux(l) => l.exec(command, args, timeout).await?,
+            MachineExecutionLease::Native(l) => tokio::time::timeout(timeout, async {
+                Ok::<_, OciError>(
+                    l.client()
+                        .await?
+                        .exec_stream(command, args, Default::default())
+                        .await?
+                        .collect()
+                        .await,
+                )
+            })
+            .await
+            .map_err(|_| OciError::InvalidConfig("native probe timed out".into()))??,
+        };
         Ok(ExecOutput {
             exit_code: output.exit_code,
             stdout: output.stdout,
@@ -133,11 +166,17 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
             .into());
         }
         let entry = Arc::clone(self);
-        let lease = entry
-            .runtime()
-            .inner()
-            .boot_or_inspect_shared_vm(&reservation.resource_id, ports, resources)
-            .await?;
+        let lease = match entry.runtime() {
+            MacosRuntimeBackend::Linux(runtime) => MachineExecutionLease::Linux(
+                runtime
+                    .inner()
+                    .boot_or_inspect_shared_vm(&reservation.resource_id, ports, resources)
+                    .await?,
+            ),
+            MacosRuntimeBackend::Native(runtime) => {
+                MachineExecutionLease::Native(runtime.boot(&reservation.resource_id).await?)
+            }
+        };
         Ok(MachineRuntimeActivation { lease, entry })
     }
 }
@@ -237,7 +276,8 @@ mod tests {
         assert!(
             !entry
                 .runtime()
-                .inner()
+                .linux()
+                .expect("Linux runtime")
                 .has_shared_vm(&expected.resource_id)
                 .await
         );

@@ -20,14 +20,25 @@ pub async fn write_installed_catalog(
     version: &str,
     profiles: &[String],
 ) -> Result<PathBuf> {
+    write_installed_catalog_with_native(prefix, version, profiles, None).await
+}
+
+/// Publish a DEV native bundle alongside the explicitly installed Linux profiles.
+/// The manifest digest is operator supplied; project definitions cannot select paths.
+pub async fn write_installed_catalog_with_native(
+    prefix: &Path,
+    version: &str,
+    profiles: &[String],
+    native: Option<(&Path, &str)>,
+) -> Result<PathBuf> {
     ensure!(
         prefix.is_absolute() && prefix.canonicalize()? == prefix,
         "installation prefix must be canonical and absolute"
     );
     trusted_metadata(prefix, true)?;
     ensure!(
-        !profiles.is_empty() && profiles.len() <= 2,
-        "one or two explicitly installed Linux profiles required"
+        (!profiles.is_empty() || native.is_some()) && profiles.len() <= 2,
+        "explicitly installed Linux profiles or a native bundle required"
     );
     let mut seen = BTreeSet::new();
     let mut catalog = MachineTargetCatalog::default();
@@ -56,6 +67,61 @@ pub async fn write_installed_catalog(
             digest: verified.artifact_identity.digest,
             channels: BTreeSet::new(),
         });
+    }
+    if let Some((bundle, digest)) = native {
+        use sha2::{Digest, Sha256};
+        use vz_macos_provision::{artifact_cache::Artifact, bootstrap::ReleaseManifest};
+        ensure!(
+            digest.len() == 64
+                && digest
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b)),
+            "expected native manifest SHA-256"
+        );
+        ensure!(
+            bundle.is_absolute() && bundle.canonicalize()? == bundle,
+            "native bundle must be canonical and absolute"
+        );
+        trusted_metadata(bundle, true)?;
+        let source = bundle.join(digest);
+        trusted_metadata(&source, false)?;
+        let bytes = crate::native_macos::artifacts::read_regular(&source, 64 * 1024)?;
+        ensure!(
+            format!("{:x}", Sha256::digest(&bytes)) == digest,
+            "native manifest checksum mismatch"
+        );
+        let release: ReleaseManifest = serde_json::from_slice(&bytes)?;
+        release.validate()?;
+        ensure!(
+            release.development,
+            "installed native bundles are explicitly DEV until release qualification"
+        );
+        for artifact in [
+            &release.base,
+            &release.patch,
+            &release.platform.hardware_model,
+            &release.platform.auxiliary_storage_seed,
+        ] {
+            let source = bundle.join(&artifact.sha256);
+            trusted_metadata(&source, false)?;
+            ensure!(
+                std::fs::metadata(&source)?.len() == artifact.size_bytes,
+                "installed native input size mismatch"
+            );
+        }
+        catalog
+            .macos
+            .push(crate::machine_target_resolver::NativeMacosCatalogEntry {
+                image: "vz-macos".into(),
+                version: release.macos_version,
+                manifest: Artifact {
+                    url: format!("bundle:{digest}"),
+                    sha256: digest.into(),
+                    size_bytes: bytes.len() as u64,
+                },
+                installed_bundle: Some(bundle.into()),
+                channels: BTreeSet::from(["latest".into()]),
+            });
     }
     catalog.validate()?;
     let destination = prefix.join("machine-target-catalog.json");

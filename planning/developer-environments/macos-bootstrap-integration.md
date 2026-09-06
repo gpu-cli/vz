@@ -243,3 +243,94 @@ booted writable copies. Nothing is published or certified as a consumer release.
 Remaining gates are authenticated publication/catalog selection, native installed
 five-verb integration, pinned guest Swift/toolchain execution, graceful shutdown,
 and mixed-target conformance. All further changes remain on the feature branch.
+
+### Installed native adapter in development
+
+The feature branch now connects native macOS to the shared Up/Exec/Status/Stop/
+Delete controller, runtime registry, exact boot leases, execution supervision and
+owner-scoped cleanup. The DEV adapter currently admits macOS/ARM64 Developer
+Machines with POSIX exec/PTY on Apple-silicon macOS. Network attachments, workspace
+projection, Docker, toolchain qualification and public artifact publication remain
+outside this adapter's measured scope.
+
+A trusted installation catalog can select `vz-macos` by exact version or a
+`latest` channel. Selection persists the immutable manifest pin in the Machine's
+configuration; recovery loads that pin without resolving the channel again.
+Each Machine gets a private APFS disk clone, auxiliary state and new VZ machine
+identifier. Native Stop requests guest shutdown and requires a positive framework
+Stopped state before shared lifecycle cleanup may release ownership.
+
+For local DEV delivery, a maintainer/operator supplies a directory of artifacts
+whose filenames are their SHA-256 digests, including the exact manifest JSON.
+The manifest declares `development: true`; an empty toolchain hash is accepted
+only for this explicitly unqualified input. `bundle:<sha256>` locators never
+resolve host paths: only the trusted installed catalog supplies the bundle root.
+The installer verifies the manifest pin and bounded source metadata; first Up
+verifies all actual artifact bytes, applies the exact matching patch, verifies
+output, publishes the immutable template and boots a private clone. A warm hit
+uses validated template receipts without downloading or rehashing the full disk.
+
+The installer accepts `VZ_NATIVE_BUNDLE` and `VZ_NATIVE_MANIFEST_SHA256`, together
+with its existing Linux profile selection. Its internal offline catalog writer
+also accepts `--installed-native-bundle` and
+`--installed-native-manifest-sha256`; these are installation inputs, not new
+public `vz` lifecycle commands. Public HTTPS publication can use the same native
+catalog entry and preparation pipeline without an installed bundle.
+
+An ordinary project selects the installed pointer:
+
+```json
+{
+  "schema_version": 1,
+  "project_id": "prj_native_example",
+  "name": "native-example",
+  "environment": {
+    "schema_version": 1,
+    "machines": [{
+      "schema_version": 1,
+      "name": "mac",
+      "profile": "developer",
+      "target": {"os": "macos", "arch": "aarch64", "image": "vz-macos", "channel": "latest"}
+    }]
+  }
+}
+```
+
+`vz up --environment dev` performs preparation automatically. Native Up defaults
+to a one-hour first-use deadline; cached boot does not repeat preparation.
+Preparation is a bounded structured field on the existing Up stream, separate
+from its lifecycle phase, rendered as terminal progress. `vz exec -- /usr/bin/sw_vers`, `vz status`, `vz stop` and `vz delete` use the same Environment selection.
+
+Installed physical verification is in progress under
+`.artifacts/macos26-bootstrap/native-e2e/installed-candidate-*`. Early attempts
+caught and fixed the preparation-progress protocol mismatch and first-use
+10-minute deadline. The original guest agent rejected supervised Machine exec
+on Darwin, so the final candidate includes a native supervisor with authenticated
+execve readiness, PTY support and cancellation of the retained command group.
+Deliberately detached sessions remain owned by the Machine; this DEV adapter does
+not claim Linux subreaper/escaped-descendant conformance or advertise Signals.
+
+The updated 26.3.1 / 25D2128 local bundle manifest pin is
+`3ecc5ad65c762da36170f81d18cff3a61b3f7e2658f2394715fe740743d709cf`.
+Its 165,932,984-byte patch has SHA-256
+`d4579623cc7169d921322d2df1719a42787aecd0b1b9d764246f97d94cd1cea3`;
+the reconstructed 80 GiB image must hash to
+`a462c28a1d3bdffaa7b062492056bf553a3e1a88e54e92b178399dee737da163`.
+The agent is pinned to
+`76a5c8d93762f126e79e19d968a702fca0825fffe991602f21e858c76fdee3a3`.
+The stopped maintainer clone passed pipe/PTY execution, cancellation/reconcile
+and graceful shutdown before patch creation (`agent-update-candidate-3`).
+
+The reusable installed gate is `scripts/run-installed-native-macos-e2e.py`:
+provide signed binaries via `--release-dir`, the exact content-addressed
+`--bundle`, trusted `--manifest` SHA-256 and a new `--evidence` directory.
+It uses a fresh private installation/project, the public five verbs, tmux
+input/resize/interrupt checks, bounded cancellation, restart persistence and
+two-Environment clone/Delete isolation. No consumer VM is manually provisioned.
+
+The updated host passes 1,491 guest/runtime/state tests, strict affected Clippy,
+11 installer checks, installed corrupt-input rejection/never-started Delete
+(`installed-corrupt-input-2`), and installed Linux Hardened lifecycle/persistence
+regression (`linux-regression-3`). The native cold gate is `installed-candidate-6`.
+No successful native installed lifecycle or main-merge claim is made by this
+in-progress note. The release issue remains open.

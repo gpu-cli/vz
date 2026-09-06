@@ -8,6 +8,8 @@
 #   VZ_VERSION     — Install a specific version (e.g., "0.2.0"). Default: latest.
 #   VZ_INSTALL_DIR — Installation directory. Default: ~/.vz
 #   VZ_NO_LINUX    — Set to "1" to skip Linux kernel/initramfs download.
+#   VZ_NATIVE_BUNDLE — Optional canonical DEV macOS bundle directory.
+#   VZ_NATIVE_MANIFEST_SHA256 — Trusted manifest pin required with VZ_NATIVE_BUNDLE.
 #   VZ_LINUX_PROFILE — Linux profile to install: all, developer, or container. Default: all.
 
 set -euo pipefail
@@ -169,6 +171,13 @@ install_linux_artifacts() {
             ;;
     esac
 
+ }
+
+install_machine_catalog() {
+    local version="$1"
+    if [ "${#INSTALLED_LINUX_PROFILES[@]}" = 0 ] && [ -z "${VZ_NATIVE_BUNDLE:-}" ]; then
+        return
+    fi
     # Only profiles downloaded by this transaction are catalogued. In particular,
     # an unavailable optional profile must not adopt an older directory on disk.
     local catalog_args=()
@@ -176,6 +185,11 @@ install_linux_artifacts() {
     for installed_profile in "${INSTALLED_LINUX_PROFILES[@]}"; do
         catalog_args+=(--installed-linux-profile "$installed_profile")
     done
+    if [ -n "${VZ_NATIVE_BUNDLE:-}" ]; then
+        : "${VZ_NATIVE_MANIFEST_SHA256:?VZ_NATIVE_MANIFEST_SHA256 is required for a DEV native bundle}"
+        catalog_args+=(--installed-native-bundle "$VZ_NATIVE_BUNDLE"
+            --installed-native-manifest-sha256 "$VZ_NATIVE_MANIFEST_SHA256")
+    fi
     local canonical_prefix
     canonical_prefix="$(cd "$INSTALL_DIR" && pwd -P)"
     "$BIN_DIR/vz-runtimed" --write-installed-machine-target-catalog "$canonical_prefix" \
@@ -347,6 +361,7 @@ main() {
 
     install_binaries "$version"
     install_linux_artifacts "$version"
+    install_machine_catalog "$version"
     setup_path
 
     echo "$version" > "$VERSION_FILE"

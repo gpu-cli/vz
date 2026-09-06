@@ -343,13 +343,15 @@ impl RuntimeDaemon {
             }));
             return Ok(receiver);
         }
-        if machine.target.os != OperatingSystem::Linux
-            || machine.target.arch != Architecture::Aarch64
+        if !matches!(
+            machine.target.os,
+            OperatingSystem::Linux | OperatingSystem::Macos
+        ) || machine.target.arch != Architecture::Aarch64
         {
             return Err(failure(
                 &input,
                 MachineErrorCode::UnsupportedOperation,
-                "supervised Machine Exec currently supports owned Linux-on-Apple-silicon sessions only; no native or host fallback",
+                "supervised Machine Exec supports owned Linux and native macOS ARM64 sessions only",
             ));
         }
         if machine.state != MachineState::Ready || environment.active_operation_id.is_some() {

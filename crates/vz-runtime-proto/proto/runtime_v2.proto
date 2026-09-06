@@ -604,6 +604,12 @@ message EnvironmentUpCompletion {
   uint64 completed_at = 5;
 }
 
+message EnvironmentPreparationProgress {
+  string label = 1;
+  uint64 completed = 2;
+  uint64 total = 3;
+}
+
 message UpEnvironmentEvent {
   uint32 schema_version = 1;
   uint64 sequence = 2;
@@ -611,6 +617,7 @@ message UpEnvironmentEvent {
   string phase = 4;
   optional EnvironmentLifecycleOperation operation = 5;
   optional EnvironmentUpCompletion completion = 6;
+  optional EnvironmentPreparationProgress preparation = 7;
 }
 
 message StopEnvironmentRequest {

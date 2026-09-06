@@ -31,6 +31,7 @@ async fn main() -> Result<()> {
         if let Some(bar) = &bar {
             bar.set_message(match p.phase {
                 Phase::Waiting => "Waiting",
+                Phase::Importing => "Importing installed macOS",
                 Phase::Downloading => "Downloading macOS",
                 Phase::VerifyingCache => "Verifying cached macOS",
                 Phase::Available => "Available",

@@ -10,9 +10,10 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
+use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use thiserror::Error;
 use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
-use vz_oci_macos::{MacosRuntimeBackend, Runtime, RuntimeConfig};
+use vz_oci_macos::{Runtime, RuntimeConfig};
 use vz_runtime_contract::{
     EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
     EnvironmentState, MachineErrorCode, MachineId, OwnershipRecord, ProjectId, ProjectState,
@@ -38,6 +39,8 @@ pub enum EnvironmentRuntimeControllerError {
     Registry(#[from] MachineRuntimeRegistryError),
     #[error(transparent)]
     Artifacts(#[from] MachineArtifactStoreError),
+    #[error("native macOS preparation: {0}")]
+    Native(#[from] anyhow::Error),
     #[error(transparent)]
     Resolution(#[from] TargetResolutionError),
 }
@@ -196,6 +199,20 @@ impl EnvironmentControllerLease {
         expected: &EnvironmentInstance,
         now: u64,
     ) -> Result<PreparedEnvironmentMachines, EnvironmentRuntimeControllerError> {
+        self.prepare_with_progress(state, registry, resolver, expected, now, |_| Ok(()))
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn prepare_with_progress<S: EnvironmentStateStore>(
+        self,
+        state: &S,
+        registry: &MachineRuntimeRegistry<MacosRuntimeBackend>,
+        resolver: &MachineTargetResolver,
+        expected: &EnvironmentInstance,
+        now: u64,
+        mut progress: impl FnMut(vz_macos_provision::bootstrap::Progress) -> anyhow::Result<()>,
+    ) -> Result<PreparedEnvironmentMachines, EnvironmentRuntimeControllerError> {
         if self.project_id != expected.project_id || self.environment_id != expected.environment_id
         {
             return Err(conflict("controller lease belongs to another Environment").into());
@@ -299,21 +316,29 @@ impl EnvironmentControllerLease {
             let target = resolved
                 .as_ref()
                 .and_then(|targets| targets.machines.get(&machine.name));
-            if fresh && target.is_none() {
+            let native = resolved
+                .as_ref()
+                .and_then(|targets| targets.native.get(&machine.name));
+            if fresh && target.is_none() && native.is_none() {
                 return Err(conflict("resolved sibling is missing").into());
             }
-            stores.push(registry.acquire_store(
-                owner,
-                &pair[0],
-                target.map(|target| target.configuration_digest()),
-                if fresh {
-                    MachineRuntimeAdmission::CreateOrOpen
-                } else {
-                    MachineRuntimeAdmission::ExistingOnly
-                },
-            )?);
+            stores.push(
+                registry.acquire_store(
+                    owner,
+                    &pair[0],
+                    target
+                        .map(|target| target.configuration_digest())
+                        .or_else(|| native.map(|target| target.configuration_digest.as_str())),
+                    if fresh {
+                        MachineRuntimeAdmission::CreateOrOpen
+                    } else {
+                        MachineRuntimeAdmission::ExistingOnly
+                    },
+                )?,
+            );
         }
         let mut pins = Vec::new();
+        let mut native_pins = Vec::new();
         for (store, machine) in stores.iter().zip(&admitted.machines) {
             state.access(|store| {
                 load_exact(store, &admitted)?;
@@ -322,6 +347,32 @@ impl EnvironmentControllerLease {
                 }
                 Ok(())
             })?;
+            if machine.target.os == vz_runtime_contract::OperatingSystem::Macos {
+                let native = if let Some(target) = resolved
+                    .as_ref()
+                    .and_then(|targets| targets.native.get(&machine.name))
+                {
+                    crate::native_macos::artifacts::prepare(
+                        Arc::clone(store),
+                        target.configuration.clone(),
+                        target.installed_bundle.as_deref(),
+                        registry.native_bootstrap_cache_path(),
+                        &mut progress,
+                    )
+                    .await?
+                } else {
+                    let spec = project
+                        .definition
+                        .environment
+                        .machines
+                        .iter()
+                        .find(|s| s.name == machine.name)
+                        .ok_or_else(|| conflict("missing native Machine specification"))?;
+                    crate::native_macos::artifacts::load(Arc::clone(store), resolver.host(), spec)?
+                };
+                native_pins.push(native);
+                continue;
+            }
             let pin = if let Some(target) = resolved
                 .as_ref()
                 .and_then(|targets| targets.machines.get(&machine.name))
@@ -357,6 +408,7 @@ impl EnvironmentControllerLease {
         Ok(PreparedEnvironmentMachines {
             environment: admitted,
             pins,
+            native_pins,
             _lease: self,
         })
     }
@@ -368,10 +420,14 @@ impl EnvironmentControllerLease {
 pub struct PreparedEnvironmentMachines {
     environment: EnvironmentInstance,
     pins: Vec<PinnedMachineArtifacts>,
+    native_pins: Vec<crate::native_macos::artifacts::NativePin>,
     _lease: EnvironmentControllerLease,
 }
 
 impl PreparedEnvironmentMachines {
+    pub fn native_pins(&self) -> &[crate::native_macos::artifacts::NativePin] {
+        &self.native_pins
+    }
     pub(crate) fn lease(&self) -> &EnvironmentControllerLease {
         &self._lease
     }
@@ -415,17 +471,24 @@ impl PreparedEnvironmentMachines {
             )
             .into());
         }
-        let pin = self
+        let linux_pin = self
             .pins
             .iter()
-            .find(|pin| pin.store().owner().machine_id.as_ref() == Some(machine_id))
+            .find(|pin| pin.store().owner().machine_id.as_ref() == Some(machine_id));
+        let native_pin = self
+            .native_pins
+            .iter()
+            .find(|pin| pin.store().owner().machine_id.as_ref() == Some(machine_id));
+        let owner_store = linux_pin
+            .map(|p| p.store())
+            .or_else(|| native_pin.map(|p| p.store()))
             .ok_or_else(|| conflict("Machine is not part of prepared admission"))?;
         let step = operation
             .machine_steps
             .iter()
             .find(|step| &step.machine_id == machine_id)
             .ok_or_else(|| conflict("Machine is not part of the Up operation"))?;
-        let records = reservations(pin.store().owner())?;
+        let records = reservations(owner_store.owner())?;
         state.access(|store| {
             store.require_current_machine_lifecycle_fence(operation, step, &records)
         })?;
@@ -434,6 +497,21 @@ impl PreparedEnvironmentMachines {
         for sibling in &self.pins {
             sibling.validate_current()?;
         }
+        for sibling in &self.native_pins {
+            sibling.validate_current()?;
+        }
+        if let Some(pin) = native_pin {
+            let config = pin.configuration();
+            let runtime = crate::native_macos::runtime::NativeMacosRuntime::new(
+                pin.directory(),
+                config.cpus,
+                config.memory_mb,
+            );
+            return Ok(registry.attach_runtime(Arc::clone(pin.store()), |_| {
+                Ok(MacosRuntimeBackend::Native(Arc::new(runtime)))
+            })?);
+        }
+        let pin = linux_pin.ok_or_else(|| conflict("missing Linux pin"))?;
         let bundle = pin.runtime_bundle();
         let profile = pin.configuration().kernel_profile;
         let memory_mb = pin.configuration().resources.memory_mb;

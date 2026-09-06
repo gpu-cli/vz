@@ -3974,6 +3974,7 @@ dependencies = [
  "vz-agent-proto",
  "vz-linux",
  "vz-linux-native",
+ "vz-macos-provision",
  "vz-oci-macos",
  "vz-runtime-contract",
  "vz-runtime-proto",

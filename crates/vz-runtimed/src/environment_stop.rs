@@ -197,13 +197,13 @@ impl RuntimeDaemon {
                 };
                 let records = [
                     crate::machine_runtime_registry::MachineRuntimeRegistry::<
-                        vz_oci_macos::MacosRuntimeBackend,
+                        crate::machine_backend::MachineBackendRuntime,
                     >::reservation(&owner)
                     .map_err(|error| {
                         failure(&input, MachineErrorCode::StateConflict, error.to_string())
                     })?,
                     crate::machine_runtime_registry::MachineRuntimeEntry::<
-                        vz_oci_macos::MacosRuntimeBackend,
+                        crate::machine_backend::MachineBackendRuntime,
                     >::vm_reservation(&owner)
                     .map_err(|error| {
                         failure(&input, MachineErrorCode::StateConflict, error.to_string())
@@ -540,8 +540,10 @@ fn validate_supported_topology(
         && environment.networks.is_empty()
         && environment.endpoints.is_empty()
         && environment.machines.iter().all(|machine| {
-            machine.target.os == OperatingSystem::Linux
-                && machine.target.arch == Architecture::Aarch64
+            matches!(
+                machine.target.os,
+                OperatingSystem::Linux | OperatingSystem::Macos
+            ) && machine.target.arch == Architecture::Aarch64
         })
         && environment
             .ownership
@@ -560,7 +562,7 @@ fn validate_supported_topology(
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Stop adapter supports up to 128 owned Linux/ARM64 Machines and their registered Docker endpoints; native, legacy, and additional live topology resource handlers are not yet implemented",
+            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines and registered Linux Docker endpoints; additional topology resources remain unsupported",
         ));
     }
     Ok(())

@@ -49,6 +49,10 @@ pub struct Platform {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ReleaseManifest {
+    /// Explicit unqualified DEV inputs. A missing toolchain pin is permitted
+    /// only here; this flag never establishes release conformance.
+    #[serde(default)]
+    pub development: bool,
     /// Format version; currently 1.
     pub schema_version: u32,
     /// Exact macOS guest version, with major version at least 26.
@@ -99,7 +103,22 @@ impl ReleaseManifest {
         self.platform.hardware_model.validate()?;
         self.platform.auxiliary_storage_seed.validate()?;
         digest(&self.guest_agent_sha256)?;
-        digest(&self.toolchain_sha256)?;
+        if !self.development || !self.toolchain_sha256.is_empty() {
+            digest(&self.toolchain_sha256)?;
+        }
+        if !self.development {
+            ensure!(
+                [
+                    &self.base,
+                    &self.patch,
+                    &self.platform.hardware_model,
+                    &self.platform.auxiliary_storage_seed
+                ]
+                .iter()
+                .all(|a| a.url.starts_with("https://")),
+                "qualified release artifacts require HTTPS locations"
+            );
+        }
         Ok(())
     }
 }

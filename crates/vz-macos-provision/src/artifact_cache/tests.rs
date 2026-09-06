@@ -229,3 +229,49 @@ async fn dropped_download_future_discards_staging_and_releases_lock() -> Result<
     assert_eq!(fs::read(result?)?, b"abcdefgh");
     Ok(())
 }
+
+#[tokio::test]
+async fn installed_import_rejects_corruption_and_cancellation_before_publication() -> Result<()> {
+    let directory = tempfile::tempdir()?;
+    let root = directory.path().canonicalize()?;
+    let cache = ArtifactCache::new(root.join("cache"))?;
+    let bytes = vec![7_u8; 8 * 1024 * 1024];
+    let hash = format!("{:x}", Sha256::digest(&bytes));
+    let pin = Artifact {
+        url: format!("bundle:{hash}"),
+        sha256: hash.clone(),
+        size_bytes: bytes.len() as u64,
+    };
+    let source = root.join("input");
+    fs::write(&source, vec![8_u8; bytes.len()])?;
+    assert!(
+        cache
+            .ensure_installed(&pin, &source, |_| Ok(()))
+            .await
+            .is_err()
+    );
+    assert!(!root.join("cache").join(&hash).exists());
+    fs::write(&source, &bytes)?;
+    assert!(
+        cache
+            .ensure_installed(&pin, &source, |p| {
+                ensure!(
+                    p.phase != Phase::Importing || p.completed == 0,
+                    "cancel import"
+                );
+                Ok(())
+            })
+            .await
+            .is_err()
+    );
+    assert!(!root.join("cache").join(&hash).exists());
+    assert!(cache.ensure(&pin, |_| Ok(())).await.is_err());
+    let path = cache.ensure_installed(&pin, &source, |_| Ok(())).await?;
+    assert_eq!(fs::read(&path)?, bytes);
+    fs::remove_file(&source)?;
+    assert_eq!(
+        cache.ensure_installed(&pin, &source, |_| Ok(())).await?,
+        path
+    );
+    Ok(())
+}

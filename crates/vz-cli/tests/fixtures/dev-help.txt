@@ -3,10 +3,10 @@ vz — reproducible, parallel Developer Environments
 Usage: vz [OPTIONS] [COMMAND]
 
 Commands:
-  up      Create/reconcile the selected Environment (Linux-on-macOS DEV adapter)
+  up      Create/reconcile the selected Environment (Linux and native macOS on Apple silicon; DEV)
   stop    Stop the selected Developer Environment, preserving identities and state
-  delete  Delete the selected Environment and its owned resources (Linux-on-macOS DEV adapter)
-  exec    Execute in one selected Ready Machine (Linux-on-macOS DEV adapter)
+  delete  Delete the selected Environment and its owned resources (Linux and native macOS on Apple silicon; DEV)
+  exec    Execute in one selected Ready Machine (Linux and native macOS on Apple silicon; DEV)
   status  Show the project's persisted Developer Environment topology
   help    Print this message or the help of the given subcommand(s)
 

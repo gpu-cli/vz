@@ -19,6 +19,8 @@ pub mod installed_machine_catalog;
 #[cfg(target_os = "macos")]
 pub mod machine_artifact_store;
 #[cfg(target_os = "macos")]
+pub mod machine_backend;
+#[cfg(target_os = "macos")]
 pub mod machine_docker_context;
 #[cfg(target_os = "macos")]
 pub mod machine_docker_endpoint;
@@ -40,6 +42,8 @@ pub mod machine_runtime_activation;
 pub mod machine_runtime_registry;
 #[cfg(target_os = "macos")]
 pub mod machine_target_resolver;
+#[cfg(target_os = "macos")]
+pub mod native_macos;
 mod placement_scheduler;
 mod startup_lock;
 #[cfg(any(test, feature = "test-backend"))]
@@ -140,7 +144,7 @@ type PlatformBackend = vz_oci_macos::MacosRuntimeBackend;
 // Topology Linux-on-macOS always owns the real backend, including host unit
 // builds. Legacy test-manager selection must not manufacture Machine readiness.
 #[cfg(target_os = "macos")]
-type TopologyBackend = vz_oci_macos::MacosRuntimeBackend;
+type TopologyBackend = machine_backend::MachineBackendRuntime;
 #[cfg(all(unix, not(target_os = "macos")))]
 type TopologyBackend = PlatformBackend;
 
@@ -712,15 +716,30 @@ impl RuntimeDaemon {
         environment_runtime_controller::PreparedEnvironmentMachines,
         environment_runtime_controller::EnvironmentRuntimeControllerError,
     > {
+        self.prepare_environment_machine_runtimes_with_progress(lease, expected, |_| Ok(()))
+            .await
+    }
+
+    #[cfg(target_os = "macos")]
+    pub async fn prepare_environment_machine_runtimes_with_progress(
+        &self,
+        lease: environment_runtime_controller::EnvironmentControllerLease,
+        expected: &vz_runtime_contract::EnvironmentInstance,
+        progress: impl FnMut(vz_macos_provision::bootstrap::Progress) -> anyhow::Result<()>,
+    ) -> Result<
+        environment_runtime_controller::PreparedEnvironmentMachines,
+        environment_runtime_controller::EnvironmentRuntimeControllerError,
+    > {
         self.environment_runtime_controller
             .require_own_lease(&lease)?;
         lease
-            .prepare(
+            .prepare_with_progress(
                 &self.state_store,
                 &self.machine_runtime_registry,
                 &self.machine_target_resolver,
                 expected,
                 current_unix_secs(),
+                progress,
             )
             .await
     }
@@ -1639,6 +1658,7 @@ mod tests {
         let root = temp.path().join("not-created");
         let config = startup_validation_config(&root);
         let catalog = machine_target_resolver::MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: 0,
             linux: Vec::new(),
         };
@@ -1675,6 +1695,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let digest = format!("sha256:{}", "b".repeat(64));
         let catalog = machine_target_resolver::MachineTargetCatalog {
+            macos: Vec::new(),
             schema_version: machine_target_resolver::MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
             linux: vec![machine_target_resolver::LinuxTargetCatalogEntry {
                 image: machine_target_resolver::LINUX_APPLIANCE_IMAGE.to_string(),

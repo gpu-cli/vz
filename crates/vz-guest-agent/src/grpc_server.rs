@@ -514,7 +514,12 @@ fn request_pending_child_force_cancel(pid: Option<u32>) {
         let _ = unsafe { libc::kill(pid as libc::pid_t, libc::SIGRTMIN()) };
     }
 
-    #[cfg(not(target_os = "linux"))]
+    #[cfg(target_os = "macos")]
+    if let Some(pid) = pid {
+        // SAFETY: the pending child remains unreaped and pins this identity.
+        let _ = unsafe { libc::kill(pid as i32, crate::native_machine_exec::CANCEL_SIGNAL) };
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let _ = pid;
 }
 
@@ -1545,7 +1550,40 @@ fn prepare_agent_exec(
                 "Machine and container execution targets are mutually exclusive",
             ));
         }
-        #[cfg(any(target_os = "linux", test))]
+        #[cfg(target_os = "macos")]
+        {
+            if req
+                .env
+                .iter()
+                .any(|(k, v)| k.is_empty() || k.contains(['=', '\0']) || v.contains('\0'))
+            {
+                return Err(Status::invalid_argument("invalid native exec environment"));
+            }
+            let (command, args) = crate::native_machine_exec::prepare(
+                &req.command,
+                &req.args,
+                &req.working_dir,
+                &req.user,
+                ready_handshake.ok_or_else(|| {
+                    Status::invalid_argument("native exec requires authenticated readiness")
+                })?,
+            )
+            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            return Ok(PreparedAgentExec {
+                command,
+                args,
+                spawn_working_dir: Some("/".into()),
+                spawn_user: None,
+                spawn_environment: req
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+                clear_environment: false,
+                container_targeted: false,
+            });
+        }
+        #[cfg(any(target_os = "linux", all(test, not(target_os = "macos"))))]
         {
             if req.env.iter().any(|(key, value)| {
                 key.is_empty() || key.contains(['=', '\0']) || value.contains('\0')
@@ -1579,9 +1617,9 @@ fn prepare_agent_exec(
                 container_targeted: false,
             });
         }
-        #[cfg(not(any(target_os = "linux", test)))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos", test)))]
         return Err(Status::unimplemented(
-            "supervised Machine execution requires a Linux guest",
+            "supervised Machine execution requires a supported POSIX guest",
         ));
     }
     if let Some(target) = &req.container_target {
@@ -1715,11 +1753,26 @@ impl AgentServiceImpl {
                 ));
             }
         };
+        #[cfg(target_os = "macos")]
+        let ready_listener = if req.supervised_machine {
+            Some(
+                crate::native_machine_exec::ReadyListener::bind()
+                    .map_err(|e| Status::internal(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let ready_endpoint = ready_listener
+            .as_ref()
+            .map(|l| l.endpoint())
+            .transpose()
+            .map_err(|e| Status::internal(e.to_string()))?;
         let launch = match prepare_agent_exec(
             &req,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             ready_endpoint,
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             None,
         ) {
             Ok(launch) => launch,
@@ -1853,6 +1906,17 @@ impl AgentServiceImpl {
         } else {
             (None, capture_signal_identity(spawned_pid))
         };
+        #[cfg(target_os = "macos")]
+        if let Some(listener) = ready_listener {
+            if let Err(error) = listener.wait_machine(spawned_pid).await {
+                return reject_pending_pipe(
+                    pending_child,
+                    &request_id,
+                    Status::failed_precondition(error.to_string()),
+                )
+                .await;
+            }
+        }
         #[cfg(not(target_os = "linux"))]
         let process_identity = ProcessIdentity::from_pid(spawned_pid);
 
@@ -1867,7 +1931,7 @@ impl AgentServiceImpl {
         #[cfg(target_os = "linux")]
         let initial_sequence = u64::from(ready_generation.is_some() || req.supervised_machine);
         #[cfg(not(target_os = "linux"))]
-        let initial_sequence = 0;
+        let initial_sequence = u64::from(req.supervised_machine);
 
         let process_table = self.state.process_table.clone();
         {
@@ -1904,6 +1968,17 @@ impl AgentServiceImpl {
                 }))
                 .await;
         } else if req.supervised_machine {
+            let _ = tx
+                .send(Ok(ExecEvent {
+                    event: Some(exec_event::Event::MachineReady(MachineExecReady {})),
+                    sequence: 1,
+                    request_id: request_id.clone(),
+                    exec_id,
+                }))
+                .await;
+        }
+        #[cfg(target_os = "macos")]
+        if req.supervised_machine {
             let _ = tx
                 .send(Ok(ExecEvent {
                     event: Some(exec_event::Event::MachineReady(MachineExecReady {})),
@@ -2098,11 +2173,26 @@ impl AgentServiceImpl {
                 ));
             }
         };
+        #[cfg(target_os = "macos")]
+        let ready_listener = if req.supervised_machine {
+            Some(
+                crate::native_machine_exec::ReadyListener::bind()
+                    .map_err(|e| Status::internal(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        #[cfg(target_os = "macos")]
+        let ready_endpoint = ready_listener
+            .as_ref()
+            .map(|l| l.endpoint())
+            .transpose()
+            .map_err(|e| Status::internal(e.to_string()))?;
         let launch = match prepare_agent_exec(
             &req,
-            #[cfg(target_os = "linux")]
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
             ready_endpoint,
-            #[cfg(not(target_os = "linux"))]
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
             None,
         ) {
             Ok(launch) => launch,
@@ -2306,6 +2396,17 @@ impl AgentServiceImpl {
         } else {
             (None, capture_signal_identity(spawned_pid))
         };
+        #[cfg(target_os = "macos")]
+        if let Some(listener) = ready_listener {
+            if let Err(error) = listener.wait_machine(spawned_pid).await {
+                return reject_pending_pty(
+                    pending_child,
+                    &request_id,
+                    Status::failed_precondition(error.to_string()),
+                )
+                .await;
+            }
+        }
         #[cfg(not(target_os = "linux"))]
         let process_identity = ProcessIdentity::from_pid(spawned_pid);
 
@@ -2329,7 +2430,11 @@ impl AgentServiceImpl {
             },
         );
         #[cfg(not(target_os = "linux"))]
-        let first_event = exec_event::Event::Stdout(Vec::new());
+        let first_event = if req.supervised_machine {
+            exec_event::Event::MachineReady(MachineExecReady {})
+        } else {
+            exec_event::Event::Stdout(Vec::new())
+        };
 
         // Get reader (cloned handle) and writer from the master.
         let mut reader = match pair.master.try_clone_reader() {
@@ -2667,7 +2772,7 @@ impl agent_service_server::AgentService for AgentServiceImpl {
                 "Machine and container execution targets are mutually exclusive".to_string(),
             ));
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         if req.supervised_machine {
             return Ok(definite_exec_rejection(
                 &request_id,
@@ -4481,7 +4586,10 @@ mod tests {
             assert!(!launch.container_targeted);
             assert!(launch.spawn_user.is_none());
             let args = launch.args.iter().map(OsString::from).collect::<Vec<_>>();
+            #[cfg(not(target_os = "macos"))]
             assert!(crate::container_exec::machine::is_request(&args));
+            #[cfg(target_os = "macos")]
+            assert!(crate::native_machine_exec::is_request(&args));
             assert!(!crate::container_exec::is_trampoline_request(&args));
             assert!(prepare_agent_exec(&req, None).is_err());
             req.container_target = Some(ContainerExecTarget {

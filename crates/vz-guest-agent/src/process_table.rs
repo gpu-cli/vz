@@ -409,14 +409,24 @@ impl ProcessIdentity {
         }
     }
 
-    /// Ask the Linux trampoline to atomically kill the supervised process
-    /// group. The reserved real-time signal is never exposed as public exec
-    /// control and is delivered through the retained pidfd.
+    /// Ask the supervisor to kill its retained command process group. Linux
+    /// delivers its reserved real-time signal through a pidfd; Darwin retains
+    /// the unreaped supervisor and reserves SIGUSR2 for this internal control.
     pub fn force_cancel(&self) -> std::io::Result<()> {
         #[cfg(target_os = "linux")]
         return self.signal(libc::SIGRTMIN());
 
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(target_os = "macos")]
+        {
+            // SAFETY: table retains the unreaped supervisor while delivering
+            // cancellation; the supervisor pins and cleans its command group.
+            if unsafe { libc::kill(self.pid, crate::native_machine_exec::CANCEL_SIGNAL) } == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
         return self.signal(libc::SIGKILL);
     }
 }
@@ -685,6 +695,18 @@ impl ProcessTable {
         self.controls.get(&exec_id).map(|control| {
             #[cfg(target_os = "linux")]
             let signal = routed_signal(signal, control.supervised_group, libc::SIGRTMIN());
+            #[cfg(target_os = "macos")]
+            if control.supervised_group {
+                if signal == libc::SIGKILL {
+                    return control.identity.force_cancel();
+                }
+                if signal == crate::native_machine_exec::CANCEL_SIGNAL {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "SIGUSR2 is reserved for native exec cancellation",
+                    ));
+                }
+            }
             control.identity.signal(signal)
         })
     }

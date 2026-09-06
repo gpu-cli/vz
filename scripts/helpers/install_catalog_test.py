@@ -164,6 +164,7 @@ install_linux_profile_artifacts() {
 }
 copy_linux_profile_to_legacy_default() { :; }
 install_linux_artifacts 0.4.0-test
+install_machine_catalog 0.4.0-test
 '''
             result = subprocess.run(["/bin/bash", "-c", source + stub], env=env,
                                     capture_output=True, text=True, timeout=10)

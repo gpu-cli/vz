@@ -30,7 +30,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow, ensure};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use vz_oci_macos::{KernelProfile, MacosRuntimeBackend, Runtime, SharedVmDockerReadiness};
+use vz_oci_macos::{KernelProfile, Runtime, SharedVmDockerReadiness};
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
     EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, HostSpec, LifecycleStepResult,
@@ -43,6 +43,7 @@ use vz_runtime_contract::{
 };
 use vz_runtimed::environment_runtime_controller::EnvironmentRuntimeController;
 use vz_runtimed::machine_artifact_store::{PinnedMachineArtifacts, pin_machine_artifacts};
+use vz_runtimed::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use vz_runtimed::machine_docker_endpoint::MachineDockerEndpoint;
 use vz_runtimed::machine_live_sessions::MachineLiveSessions;
 use vz_runtimed::machine_runtime_activation::MachineRuntimeActivation;
@@ -268,6 +269,7 @@ fn target_catalog(
         channels: BTreeSet::from(["local-physical-e2e".to_string()]),
     };
     MachineTargetCatalog {
+        macos: Vec::new(),
         schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
         linux: vec![
             entry(
@@ -714,7 +716,7 @@ async fn boot(
         .await?;
     ensure!(activation.owner() == &fixture.owner);
     ensure!(activation.runtime_identity().stack_id == fixture.stack_id());
-    ensure!(activation.verified_profile() == fixture.profile);
+    ensure!(activation.verified_profile() == Some(fixture.profile));
     Ok(activation)
 }
 
@@ -1455,7 +1457,11 @@ fn install_docker_probe(
     entry: &MachineRuntimeEntry<MacosRuntimeBackend>,
     source: &Path,
 ) -> Result<PathBuf> {
-    let rootfs = entry.runtime().inner().rootfs_store_dir();
+    let rootfs = entry
+        .runtime()
+        .linux()
+        .expect("Linux runtime")
+        .rootfs_store_dir();
     fs::create_dir_all(&rootfs)?;
     let target = rootfs.join("vz-machine-registry-docker-probe");
     let mut source_file = File::open(source)?;
@@ -1506,8 +1512,16 @@ fn storage_evidence(
         identities.push((metadata.dev(), metadata.ino()));
         root_identities.push(host_identity(&root)?);
         for child in [
-            entry.runtime().inner().rootfs_store_dir(),
-            entry.runtime().inner().setup_commits_host_dir(),
+            entry
+                .runtime()
+                .linux()
+                .expect("Linux runtime")
+                .rootfs_store_dir(),
+            entry
+                .runtime()
+                .linux()
+                .expect("Linux runtime")
+                .setup_commits_host_dir(),
             entry.data_path().join("linux-target"),
         ] {
             ensure!(fs::canonicalize(child)?.starts_with(&root));
@@ -1681,7 +1695,7 @@ async fn run_inner(
             .context("fixture Machine ID")?;
         let entry = prepared.attach_machine(&store, &registry, &first_up, machine_id)?;
         cleanup_targets.push(CleanupTarget {
-            runtime: entry.runtime().inner().clone(),
+            runtime: entry.runtime().linux().expect("Linux runtime").clone(),
             stack_id: fixture.stack_id().into(),
         });
         let replay = prepared.attach_machine(&store, &registry, &first_up, machine_id)?;
@@ -1791,7 +1805,8 @@ async fn run_inner(
     ensure!(
         entries[0]
             .runtime()
-            .inner()
+            .linux()
+            .expect("Linux runtime")
             .inspect_shared_vm_identity(fixtures[0].stack_id())
             .await?
             == Some(first[0].clone())
@@ -1975,7 +1990,7 @@ async fn run_inner(
                 .context("fixture Machine ID")?,
         )?;
         cleanup_targets.push(CleanupTarget {
-            runtime: entry.runtime().inner().clone(),
+            runtime: entry.runtime().linux().expect("Linux runtime").clone(),
             stack_id: fixture.stack_id().into(),
         });
         reopened_entries.push(entry);
@@ -2039,11 +2054,11 @@ async fn run_inner(
     )?;
     for ((entry, old), new) in reopened_entries.iter().zip(&first).zip(&second) {
         ensure!(
-            matches!(shutdown(entry.runtime().inner(), old, second_stop.operation_id.as_str()).await?, StackRuntimeShutdownOutcome::ReplacementPresent { current } if current == *new)
+            matches!(shutdown(entry.runtime().linux().expect("Linux runtime"), old, second_stop.operation_id.as_str()).await?, StackRuntimeShutdownOutcome::ReplacementPresent { current } if current == *new)
         );
         ensure!(
             shutdown(
-                entry.runtime().inner(),
+                entry.runtime().linux().expect("Linux runtime"),
                 new,
                 second_stop.operation_id.as_str()
             )

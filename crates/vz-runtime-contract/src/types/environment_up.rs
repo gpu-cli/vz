@@ -22,8 +22,8 @@ impl EnvironmentUpRequest {
         self.definition
             .validate()
             .map_err(|error| error.to_string())?;
-        if !(1_000..=600_000).contains(&self.timeout_millis) {
-            return Err("Up deadline must be 1..600 seconds".into());
+        if !(1_000..=3_600_000).contains(&self.timeout_millis) {
+            return Err("Up deadline must be 1..3600 seconds".into());
         }
         let mut selection = self.selection.clone();
         if selection.explicit.is_some() {
@@ -46,6 +46,31 @@ pub struct EnvironmentUpProgress {
     pub phase: String,
     pub operation: Option<EnvironmentLifecycleOperation>,
     pub completion: Option<EnvironmentUpCompletion>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preparation: Option<EnvironmentPreparationProgress>,
+}
+
+/// Bounded preparation progress independent of lifecycle phase. Units are local
+/// to each label; clients can always render completed/total as a progress bar.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct EnvironmentPreparationProgress {
+    pub label: String,
+    pub completed: u64,
+    pub total: u64,
+}
+impl EnvironmentPreparationProgress {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.label.is_empty()
+            || self.label.len() > 128
+            || self.label.chars().any(char::is_control)
+            || self.total == 0
+            || self.completed > self.total
+        {
+            return Err("invalid bounded preparation progress".into());
+        }
+        Ok(())
+    }
 }
 
 /// Immutable intent reserved in the same transaction as a newly named instance.

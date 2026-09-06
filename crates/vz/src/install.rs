@@ -279,7 +279,7 @@ pub async fn fetch_latest_ipsw_url() -> Result<String, VzError> {
 }
 
 /// Generate a new machine identifier and return its serialized data.
-fn generate_machine_id_data() -> Result<Vec<u8>, VzError> {
+pub fn generate_machine_id_data() -> Result<Vec<u8>, VzError> {
     let machine_id = unsafe { VZMacMachineIdentifier::init(VZMacMachineIdentifier::alloc()) };
     let data = unsafe { machine_id.dataRepresentation() };
     Ok(data.to_vec())
