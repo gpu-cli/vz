@@ -51,7 +51,13 @@ OOM_EXIT_CODE = 137
 SURVIVOR_EXIT_CODE = 61
 EVENTS = ('create', 'start', 'oom', 'die')
 EVENT_MARGIN_NS = 5_000_000_000
-HEALTH = {'sibling_health_probe_seconds': 60, 'sibling_health_probe_interval_seconds': 1, 'sibling_health_failures': 0}
+# The gate requires at least sixty one-second probes with zero failures. The
+# probe must also bracket this suite's own workload, and on a Machine that has
+# already run other suites the OOM allocator, wait, inspect and event reads
+# outgrow a sixty-second window, so the window is sized to cover them. A longer
+# window at the same cadence is strictly more evidence than the minimum.
+HEALTH = {'sibling_health_probe_seconds': 180, 'sibling_health_probe_interval_seconds': 1,
+          'sibling_health_failures': 0, 'sibling_health_probe_minimum_seconds': 60}
 BUSYBOX = '/bin/busybox'
 
 
@@ -302,7 +308,8 @@ def run_machine(harness, descriptor, scope, proof, images, index):
               'health_image_scope': 'prepared_python_compose_image_used_only_by_sibling_health_service'}
     startup.document(output / 'limits-machine.intent.json', intent)
     try:
-        health = parallel_health.Health(harness, descriptor, images, index)
+        health = parallel_health.Health(harness, descriptor, images, index,
+                                        samples=HEALTH['sibling_health_probe_seconds'])
         health.prepare()
         baseline = image_baseline(harness, descriptor, 'limits-image-baseline')
         require(image_id in baseline and images['compose']['id'] in baseline, 'baseline lacks owned images')
@@ -346,7 +353,9 @@ def run_machine(harness, descriptor, scope, proof, images, index):
         require(during == before, 'sibling limits or identity changed during OOM')
         require(len(envelopes) == 4 and all(health_started < begin < end for begin, end in envelopes), 'envelopes')
         health_proof = health.finish(envelopes)
-        require(health_proof['samples'] == HEALTH['sibling_health_probe_seconds'] and health_proof['sample_errors'] == 0 and
+        require(health_proof['samples'] == HEALTH['sibling_health_probe_seconds'] and
+                health_proof['samples'] >= HEALTH['sibling_health_probe_minimum_seconds'] and
+                health_proof['sample_errors'] == 0 and
                 health_proof['missed_deadlines'] == 0 and health_proof['timing']['interval_ns'] == 10 ** 9,
                 'sibling health proof differs from contract')
         after = sibling_snapshot(session, 'limits-after')

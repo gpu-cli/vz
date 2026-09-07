@@ -11,6 +11,18 @@ require = driver.require
 FIXTURE = Path(__file__).resolve().parents[2] / 'tests/fixtures/vz-0.4/docker-parallel'
 TIMING = {'samples': 60, 'interval_ns': 1_000_000_000, 'max_lateness_ns': 250_000_000,
           'request_timeout_ns': 500_000_000, 'observer_bound_ns': 70_000_000_000}
+# The fixture's contract fixes the cadence and the sixty-sample minimum the gate
+# requires. A caller whose workload runs longer may probe for more samples at the
+# same cadence, which is strictly more evidence, never less: only the sample
+# count and the observer bound that follows from it may differ.
+MAX_SAMPLES = 600
+OBSERVER_SLACK_NS = TIMING['observer_bound_ns'] - TIMING['samples'] * TIMING['interval_ns']
+
+
+def timing_for(samples):
+    require(type(samples) is int and TIMING['samples'] <= samples <= MAX_SAMPLES, 'health sample count')
+    return dict(TIMING, samples=samples,
+                observer_bound_ns=samples * TIMING['interval_ns'] + OBSERVER_SLACK_NS)
 LIMIT = 128 * 1024
 LABEL = 'dev.vz.linux-compose-proof'
 
@@ -32,7 +44,8 @@ def validate(raw, stderr, token, timing, run_intervals):
     Envelope construction, Engine bounds and overlap proof belong to the slot
     and group validators; this validator must cover each supplied whole envelope.
     """
-    require(timing == TIMING and all(type(v) is int for v in timing.values()), 'unknown health timing contract')
+    require(type(timing) is dict and all(type(v) is int for v in timing.values()) and
+            timing == timing_for(timing.get('samples')), 'unknown health timing contract')
     require(type(raw) is bytes and 0 < len(raw) <= LIMIT and raw.endswith(b'\n') and stderr == b'',
             'incomplete, oversized or erroneous health stream')
     lines = raw.splitlines()
@@ -126,10 +139,11 @@ def validate_record(output, expected, token, timing, run_intervals):
 
 
 class Health:
-    def __init__(self, harness, descriptor, images, index):
+    def __init__(self, harness, descriptor, images, index, samples=None):
         self.harness, self.descriptor = harness, json.loads(json.dumps(descriptor))
         self.images = json.loads(json.dumps(images))
         require(type(index) is int and 0 <= index < 3, 'invalid health Machine index')
+        self.timing = timing_for(samples if samples is not None else TIMING['samples'])
         # A composed run reuses this probe from more than one suite over the same
         # Machine index, so the evidence directory carries the executing suite.
         suite = getattr(harness, 'active_suite', None)
@@ -144,6 +158,7 @@ class Health:
         self.contract_raw = driver.regular(self.fixture / 'contract.json', LIMIT)
         contract = json.loads(self.contract_raw, object_pairs_hook=unique)
         require(contract['health'] == TIMING, 'health fixture contract differs')
+        require(self.timing['samples'] >= contract['health']['samples'], 'health window below the fixture minimum')
 
     def verify_inputs(self):
         require(driver.regular(self.fixture / 'health.py', LIMIT) == self.source.encode() and
@@ -220,7 +235,7 @@ class Health:
         self.before = self.inspect('health-service-before')
         startup.document(self.output / 'ownership.json', {'descriptor': self.descriptor, 'token': self.token,
             'container_id': self.container_id, 'image_id': self.images['compose']['id'],
-            'script_sha256': hashlib.sha256(self.source.encode()).hexdigest(), 'timing': TIMING, 'before': self.before})
+            'script_sha256': hashlib.sha256(self.source.encode()).hexdigest(), 'timing': self.timing, 'before': self.before})
         self.prepared = True
 
     def start(self):
@@ -228,11 +243,11 @@ class Health:
         self.verify_inputs()
         argv = ['docker', '--config', self.descriptor['config_dir'], '--context', self.descriptor['name'],
                 'exec', self.container_id, 'python3', '-u', '-c', self.source, 'probe', self.token,
-                json.dumps(TIMING, sort_keys=True, separators=(',', ':'))]
+                json.dumps(self.timing, sort_keys=True, separators=(',', ':'))]
         self.observer_input = {'schema_version': 1, 'descriptor': self.descriptor, 'argv': argv,
             'executable': self.harness.info['clients']['docker']['canonical'], 'cwd': str(self.harness.root),
             'environment': self.environment, 'script_sha256': hashlib.sha256(self.source.encode()).hexdigest(),
-            'contract_sha256': hashlib.sha256(self.contract_raw).hexdigest(), 'timing': dict(TIMING)}
+            'contract_sha256': hashlib.sha256(self.contract_raw).hexdigest(), 'timing': dict(self.timing)}
         startup.document(self.output / 'observer-input.json', self.observer_input)
         def observe():
             try:
@@ -256,7 +271,7 @@ class Health:
                 self.record.receipts[0]['capture_complete'] is True and
                 self.record.receipts[0]['effects_uncertain'] is False, 'health observer completion unproven')
         self.verify_inputs()
-        proof = validate_record(self.output, self.observer_input, self.token, TIMING, run_intervals)
+        proof = validate_record(self.output, self.observer_input, self.token, self.timing, run_intervals)
         self.route()
         after = self.inspect('health-service-after')
         for key in ('Id', 'Name', 'Image', 'Config', 'HostConfig'):

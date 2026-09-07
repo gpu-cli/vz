@@ -193,11 +193,16 @@ class Machine(unittest.TestCase):
             harness.docker, harness.mutate, harness.exact_absent = Mock(side_effect=docker), Mock(side_effect=mutate), Mock(side_effect=exact_absent)
             self_case = self
             class Health:
-                def __init__(self, given_harness, given_descriptor, given_images, index):
+                def __init__(self, given_harness, given_descriptor, given_images, index, samples=None):
                     self_case.assertIs(given_harness, harness)
                     self_case.assertEqual(given_descriptor, descriptor)
                     self_case.assertEqual(given_images, images)
                     self_case.assertEqual(index, 0)
+                    # The window must cover this suite's workload and stay at or
+                    # above the sixty-sample minimum the gate requires.
+                    self_case.assertEqual(samples, subject.HEALTH['sibling_health_probe_seconds'])
+                    self_case.assertGreaterEqual(samples, subject.HEALTH['sibling_health_probe_minimum_seconds'])
+                    self.samples = samples
                     self.prepared, self.started_at, self.finished, self.container_id = False, None, False, 'e' * 64
                     holder.health = self
                     events.append('health-construct')
@@ -217,7 +222,8 @@ class Machine(unittest.TestCase):
                     self_case.assertTrue(all(self.started_at < b < e for b, e in intervals))
                     if health_fail:
                         raise ValueError(health_fail)
-                    return {'samples': 60, 'sample_errors': 0, 'missed_deadlines': 0, 'timing': dict(subject.parallel_health.TIMING),
+                    return {'samples': self.samples, 'sample_errors': 0, 'missed_deadlines': 0,
+                            'timing': subject.parallel_health.timing_for(self.samples),
                             'guest_run_envelopes': intervals, 'container_id': self.container_id}
             generated = 'vzlimits-' + 'd' * 24
             holder.token = generated
@@ -240,7 +246,8 @@ class Machine(unittest.TestCase):
             self.assertEqual(workload['before'], workload['during'])
             self.assertEqual(workload['before'], workload['after'])
             self.assertEqual(workload['events']['actions'], ['create', 'start', 'oom', 'die'])
-            self.assertEqual(workload['sibling_health']['samples'], 60)
+            self.assertEqual(workload['sibling_health']['samples'], subject.HEALTH['sibling_health_probe_seconds'])
+            self.assertGreaterEqual(workload['sibling_health']['samples'], 60)
             self.assertEqual(workload['allocator_progress']['reported_steps'], 9)
             self.assertEqual(case.holder.removed, ['oom', 'limited', 'control'])
             self.assertEqual(result['cleanup']['containers_removed'],
