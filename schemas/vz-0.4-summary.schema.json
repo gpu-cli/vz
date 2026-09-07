@@ -1,0 +1,254 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 aggregate gate summary",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate_tuple_sha256",
+    "counts",
+    "developer_overrides",
+    "findings",
+    "kind",
+    "lanes",
+    "run_id",
+    "scenarios",
+    "schema_version",
+    "verdict"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-summary"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "verdict": {
+      "enum": [
+        "PASS",
+        "FAIL"
+      ]
+    },
+    "candidate_tuple_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "developer_overrides": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "dry_lanes"
+        ]
+      }
+    },
+    "counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "FAIL",
+        "MISSING",
+        "PASS",
+        "findings",
+        "required"
+      ],
+      "properties": {
+        "required": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "PASS": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "FAIL": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "MISSING": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "findings": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "lane",
+          "phase",
+          "reason",
+          "status"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(gate|docker)\\.[a-z_]+\\.[a-z_]+$"
+          },
+          "lane": {
+            "enum": [
+              "sandbox-vm",
+              "topology",
+              "linux-docker",
+              "native-macos"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "clean-provision",
+              "persisted-recovery/pre-sleep",
+              "persisted-recovery/post-wake",
+              "final-cleanup"
+            ]
+          },
+          "status": {
+            "enum": [
+              "PASS",
+              "FAIL",
+              "MISSING"
+            ]
+          },
+          "reason": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "lanes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "failure_reason",
+          "lane",
+          "outcome",
+          "phase",
+          "result_path"
+        ],
+        "properties": {
+          "lane": {
+            "enum": [
+              "sandbox-vm",
+              "topology",
+              "linux-docker",
+              "native-macos"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "clean-provision",
+              "persisted-recovery/pre-sleep",
+              "persisted-recovery/post-wake",
+              "final-cleanup"
+            ]
+          },
+          "result_path": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "outcome": {
+            "enum": [
+              "passed",
+              "failed"
+            ]
+          },
+          "failure_reason": {
+            "anyOf": [
+              {
+                "type": "null"
+              },
+              {
+                "enum": [
+                  "not_implemented",
+                  "assertion",
+                  "prerequisite",
+                  "cleanup",
+                  "timeout",
+                  "crash",
+                  "input_rejected",
+                  "uncertain_effects"
+                ]
+              }
+            ]
+          }
+        }
+      }
+    },
+    "findings": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "detail",
+          "subject"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]*$"
+          },
+          "subject": {
+            "type": "string",
+            "minLength": 1
+          },
+          "detail": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "PASS"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "findings": {
+            "maxItems": 0
+          },
+          "developer_overrides": {
+            "maxItems": 0
+          },
+          "counts": {
+            "properties": {
+              "FAIL": {
+                "const": 0
+              },
+              "MISSING": {
+                "const": 0
+              },
+              "findings": {
+                "const": 0
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

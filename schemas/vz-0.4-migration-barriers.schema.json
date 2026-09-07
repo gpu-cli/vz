@@ -1,0 +1,110 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 migration mutation-boundary inventory (frozen input)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "barriers",
+    "contract_state",
+    "kind",
+    "legacy_release_tag",
+    "normative_source",
+    "schema_version",
+    "target_release"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../schemas/vz-0.4-migration-barriers.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-migration-barriers"
+    },
+    "target_release": {
+      "const": "0.4.0"
+    },
+    "contract_state": {
+      "enum": [
+        "draft_unverified",
+        "inputs_frozen"
+      ]
+    },
+    "normative_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "legacy_release_tag": {
+      "const": "v0.3.20"
+    },
+    "barriers": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "component",
+          "domain",
+          "expected_failure_state",
+          "failure_injection",
+          "id",
+          "post_state",
+          "pre_state",
+          "receipt_field",
+          "rollback_assertion",
+          "source_reference"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^mig\\.[a-z0-9_]+\\.[a-z0-9_]+$"
+          },
+          "domain": {
+            "enum": [
+              "schema",
+              "filesystem",
+              "context",
+              "credential",
+              "ownership"
+            ]
+          },
+          "component": {
+            "type": "string",
+            "minLength": 1
+          },
+          "source_reference": {
+            "type": "string",
+            "minLength": 1
+          },
+          "pre_state": {
+            "type": "string",
+            "minLength": 1
+          },
+          "post_state": {
+            "type": "string",
+            "minLength": 1
+          },
+          "failure_injection": {
+            "type": "string",
+            "minLength": 1
+          },
+          "expected_failure_state": {
+            "type": "string",
+            "minLength": 1
+          },
+          "rollback_assertion": {
+            "type": "string",
+            "minLength": 1
+          },
+          "receipt_field": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]*$"
+          }
+        }
+      }
+    }
+  }
+}

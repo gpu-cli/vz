@@ -1,0 +1,123 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 decision-signing authorities (frozen input)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "authorities",
+    "kind",
+    "schema_version",
+    "signature_namespace",
+    "target_release"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../schemas/vz-0.4-decision-authorities.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-decision-authorities"
+    },
+    "target_release": {
+      "const": "0.4.0"
+    },
+    "signature_namespace": {
+      "const": "vz-0.4-decision"
+    },
+    "authorities": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "algorithm",
+          "custody",
+          "key_id",
+          "principal",
+          "public_key",
+          "revoked",
+          "revoked_at_commit",
+          "valid_from_commit"
+        ],
+        "properties": {
+          "key_id": {
+            "type": "string",
+            "pattern": "^vz04-[a-z0-9-]+$"
+          },
+          "principal": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@-]+$"
+          },
+          "algorithm": {
+            "const": "ssh-ed25519"
+          },
+          "public_key": {
+            "type": "string",
+            "pattern": "^ssh-ed25519 AAAA[0-9A-Za-z+/]+=*$"
+          },
+          "valid_from_commit": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{40}$"
+          },
+          "revoked": {
+            "type": "boolean"
+          },
+          "revoked_at_commit": {
+            "anyOf": [
+              {
+                "type": "string",
+                "pattern": "^[0-9a-f]{40}$"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "custody": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "allOf": [
+          {
+            "if": {
+              "properties": {
+                "revoked": {
+                  "const": true
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "revoked_at_commit": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{40}$"
+                }
+              }
+            }
+          },
+          {
+            "if": {
+              "properties": {
+                "revoked": {
+                  "const": false
+                }
+              }
+            },
+            "then": {
+              "properties": {
+                "revoked_at_commit": {
+                  "type": "null"
+                }
+              }
+            }
+          }
+        ]
+      }
+    }
+  }
+}

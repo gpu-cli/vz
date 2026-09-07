@@ -1,0 +1,9 @@
+{
+  "$schema": "../schemas/vz-0.4-decisions.schema.json",
+  "schema_version": 1,
+  "kind": "vz-0.4-decisions",
+  "target_release": "0.4.0",
+  "signature_namespace": "vz-0.4-decision",
+  "signatures_dir": "config/vz-0.4-decision-signatures",
+  "decisions": []
+}

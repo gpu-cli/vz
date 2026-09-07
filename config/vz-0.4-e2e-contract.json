@@ -1,0 +1,223 @@
+{
+  "$schema": "../schemas/vz-0.4-e2e-contract.schema.json",
+  "schema_version": 1,
+  "kind": "vz-0.4-e2e-contract",
+  "target_release": "0.4.0",
+  "contract_state": "draft_unverified",
+  "normative_source": "planning/developer-environments/GOAL-0.4.0.md#strict-e2e-release-gate",
+  "host_envelope": {
+    "minimum_mac_model": null,
+    "minimum_macos_version": "14.0",
+    "minimum_free_memory_bytes": null,
+    "minimum_free_disk_bytes": null,
+    "architecture": "arm64",
+    "docker_client_ranges": null
+  },
+  "release": {
+    "signing_classes": ["local-test-signed", "developer-id-notarized"],
+    "ga_signing_class": "developer-id-notarized",
+    "required_components": [
+      "bin/vz",
+      "bin/vz-runtimed",
+      "bin/vz-macos-setup",
+      "bin/vz-guest-agent",
+      "bin/vz-agent-loader"
+    ],
+    "entitlements_path": "entitlements/vz-cli.entitlements.plist",
+    "hardened_runtime_components": ["bin/vz", "bin/vz-runtimed", "bin/vz-macos-setup"],
+    "notarization_required_for_ga": true,
+    "prohibited_invocations": ["cargo run", "debug binaries", "PATH fallback", "Docker Desktop", "host system dockerd", "runc", "crun", "arbitrary SSH hosts"]
+  },
+  "native_macos": {
+    "ipsw_pin": "config/macos-26.6.2-25G83-ipsw.json",
+    "guest_version": "26.6.2",
+    "guest_build": "25G83",
+    "guest_agent_sha256": null,
+    "prepared_image_sha256": null,
+    "xcode_toolchain_sha256": null,
+    "setup_recipe": null,
+    "privilege_steps": [],
+    "license_steps": []
+  },
+  "migration": {
+    "barriers_path": "config/vz-0.4-migration-barriers.json",
+    "legacy_release_tag": "v0.3.20",
+    "legacy_artifact_url": null,
+    "legacy_artifact_sha256": null,
+    "legacy_state_fixture": null,
+    "legacy_state_fixture_sha256": null
+  },
+  "resources": {
+    "developer_machine": {"cpus": 2, "memory_bytes": 4294967296, "disk_bytes": 21474836480},
+    "hardened_machine": {"cpus": 1, "memory_bytes": 2147483648, "disk_bytes": 10737418240},
+    "native_macos_machine": {"cpus": 4, "memory_bytes": 8589934592, "disk_bytes": 68719476736}
+  },
+  "deadlines_seconds": {
+    "cold_topology_up": 600,
+    "warm_recovery": 60,
+    "fault_activation": 5,
+    "fault_removal": 5,
+    "peer_revocation": 5,
+    "stop": 120,
+    "up": 600,
+    "operator_ack": 1800
+  },
+  "network_tolerances": {
+    "latency": {"injected_one_way_ms": 100, "tolerance_ms": 30, "requests": 100},
+    "bandwidth": {"cap_bytes_per_second": 10485760, "tolerance_fraction": 0.2},
+    "loss_partition": {
+      "connection_attempts": 100,
+      "window_seconds": 30,
+      "allowed_successful_connections": 0,
+      "probe_interval_seconds": 1,
+      "allowed_probe_failures": 0
+    }
+  },
+  "pressure": {
+    "containers": 20,
+    "containers_window_seconds": 60,
+    "concurrent_pulls": 4,
+    "concurrent_builds": 4,
+    "concurrent_execs": 8
+  },
+  "sleep_wake": {
+    "required": true,
+    "minimum_sleep_seconds": 20,
+    "operator_ack_deadline_seconds": 1800,
+    "clock_sources": ["CLOCK_MONOTONIC", "CLOCK_UPTIME_RAW", "wall_clock"],
+    "power_log_sources": ["pmset -g log", "log show --predicate sleep/wake"],
+    "boot_session_keys": ["kern.bootsessionuuid", "kern.boottime"]
+  },
+  "readiness_polls": [
+    {"id": "poll.machine.healthy", "condition": "vz status --json reports every Machine healthy", "deadline_seconds": 600, "interval_seconds": 2},
+    {"id": "poll.docker.engine_ready", "condition": "docker --context <machine context> version returns the server version", "deadline_seconds": 120, "interval_seconds": 1},
+    {"id": "poll.service.health_probe", "condition": "declared service health probe succeeds", "deadline_seconds": 60, "interval_seconds": 1},
+    {"id": "poll.native.guest_agent", "condition": "native macOS Machine guest agent answers exec", "deadline_seconds": 600, "interval_seconds": 5}
+  ],
+  "listener_checks": {
+    "interfaces_probed": ["lo0", "en0", "bridge100", "utun"],
+    "loopback_only_exports": true,
+    "wildcard_listeners_forbidden": true
+  },
+  "cleanup_rules": {
+    "run_id_marker": "vz04-run-id",
+    "owned_resource_kinds": ["environment", "machine", "docker_context", "listener", "socket", "process", "disk", "route", "dns_record", "fault", "credential_materialization"],
+    "unrelated_resources_untouched": true
+  },
+  "canaries": {"prefix": "vz04-canary-", "scan_all_evidence": true},
+  "lanes": [
+    {
+      "name": "sandbox-vm",
+      "entry_point": "scripts/run-sandbox-vm-e2e.sh",
+      "argv": ["--suite", "all", "--profile", "release"],
+      "role": "prerequisite",
+      "phases": ["clean-provision"],
+      "argv_contract": "legacy_sandbox",
+      "result_adapter": "sandbox_summary_txt",
+      "native_result_required": false
+    },
+    {
+      "name": "topology",
+      "entry_point": "scripts/run-developer-environment-e2e.sh",
+      "argv": ["--suite", "all"],
+      "role": "acceptance",
+      "phases": ["clean-provision", "persisted-recovery/pre-sleep", "persisted-recovery/post-wake", "final-cleanup"],
+      "argv_contract": "vz04",
+      "result_adapter": null,
+      "native_result_required": true
+    },
+    {
+      "name": "linux-docker",
+      "entry_point": "scripts/run-linux-docker-e2e.sh",
+      "argv": ["--suite", "all"],
+      "role": "acceptance",
+      "phases": ["clean-provision", "persisted-recovery/pre-sleep", "persisted-recovery/post-wake", "final-cleanup"],
+      "argv_contract": "vz04",
+      "result_adapter": null,
+      "native_result_required": true
+    },
+    {
+      "name": "native-macos",
+      "entry_point": "scripts/run-macos-developer-environment-e2e.sh",
+      "argv": ["--suite", "all"],
+      "role": "acceptance",
+      "phases": ["clean-provision", "persisted-recovery/pre-sleep", "persisted-recovery/post-wake", "final-cleanup"],
+      "argv_contract": "vz04",
+      "result_adapter": null,
+      "native_result_required": true
+    }
+  ],
+  "harness": {
+    "files": [
+      "scripts/build-vz-0.4-release-candidate.sh",
+      "scripts/run-vz-0.4-release-gate.sh",
+      "scripts/validate-vz-0.4-evidence.sh",
+      "scripts/run-sandbox-vm-e2e.sh",
+      "scripts/run-developer-environment-e2e.sh",
+      "scripts/run-linux-docker-e2e.sh",
+      "scripts/run-macos-developer-environment-e2e.sh",
+      "scripts/helpers/vz04_common.py",
+      "scripts/helpers/vz04_schema.py",
+      "scripts/helpers/vz04_contract.py",
+      "scripts/helpers/vz04_candidate.py",
+      "scripts/helpers/vz04_source_tree.py",
+      "scripts/helpers/vz04_decisions.py",
+      "scripts/helpers/vz04_lanes.py",
+      "scripts/helpers/vz04_phases.py",
+      "scripts/helpers/vz04_validate.py",
+      "scripts/helpers/vz04_gate.py",
+      "scripts/helpers/docker_compatibility_contract.py",
+      "scripts/helpers/docker_host_driver.py",
+      "scripts/helpers/gate-requirements.txt",
+      "entitlements/vz-cli.entitlements.plist"
+    ]
+  },
+  "fixtures": {
+    "root": "tests/fixtures/vz-0.4",
+    "required_dirs": [
+      "tests/fixtures/vz-0.4/docker",
+      "tests/fixtures/vz-0.4/docker-container-io",
+      "tests/fixtures/vz-0.4/docker-parallel",
+      "tests/fixtures/vz-0.4/docker-ssh",
+      "tests/fixtures/vz-0.4/native-macos-swift"
+    ]
+  },
+  "docker_contract": {
+    "path": "config/docker-compatibility-v0.4.json",
+    "schema": "schemas/docker-compatibility-v0.4.schema.json",
+    "required_ids_source": "scripts/helpers/docker_compatibility_contract.py:REQUIRED_IDS",
+    "lane": "linux-docker"
+  },
+  "capabilities_contract": {
+    "path": "config/host-target-capabilities-v0.4.json",
+    "schema": "schemas/host-target-capabilities-v0.4.schema.json"
+  },
+  "pins": {
+    "buildkit": "config/buildkit-artifact-v0.19.0.json",
+    "cli_removal": "config/cli-removal-v0.4.json"
+  },
+  "scenarios": [
+    {"id": "gate.instances.three_concurrent_no_collision", "criterion": 1, "lane": "topology", "phase": "clean-provision", "title": "Multiple instances: three concurrent Environments with repeated names, ports, aliases and CIDRs without collision"},
+    {"id": "gate.machines.mixed_profile_topology_status", "criterion": 2, "lane": "topology", "phase": "clean-provision", "title": "Multiple Machines: two Developer Linux, one Hardened Linux, one native macOS; exact status JSON; ambiguous exec fails closed"},
+    {"id": "gate.docker.machine_scoped_contexts", "criterion": 3, "lane": "linux-docker", "phase": "clean-provision", "title": "Machine-scoped Docker: independent engines driven by the Mac's unmodified clients"},
+    {"id": "gate.native.target_native_execution", "criterion": 4, "lane": "native-macos", "phase": "clean-provision", "title": "Native macOS Machine executes target-native Swift build/test with streaming exec"},
+    {"id": "gate.network.private_topology_paths", "criterion": 5, "lane": "topology", "phase": "clean-provision", "title": "Private topology paths reachable only inside the Environment"},
+    {"id": "gate.network.public_like_ingress", "criterion": 6, "lane": "topology", "phase": "clean-provision", "title": "Environment-local public-like ingress paths bind and serve as declared"},
+    {"id": "gate.host.import_export_boundaries", "criterion": 7, "lane": "topology", "phase": "clean-provision", "title": "Host import/export boundaries: exact authenticated grants, loopback-only exports"},
+    {"id": "gate.isolation.cross_environment_peering", "criterion": 8, "lane": "topology", "phase": "persisted-recovery/pre-sleep", "title": "Cross-Environment default deny and explicit directional peering grants"},
+    {"id": "gate.faults.measured_network_faults", "criterion": 9, "lane": "topology", "phase": "persisted-recovery/pre-sleep", "title": "Measured latency, bandwidth and loss/partition faults within contract tolerances"},
+    {"id": "gate.lifecycle.recovery_including_sleep_wake", "criterion": 10, "lane": "topology", "phase": "persisted-recovery/post-wake", "title": "Stop/up, crash injection and hardware sleep/wake recovery within deadlines"},
+    {"id": "gate.delete.single_environment_safety", "criterion": 11, "lane": "topology", "phase": "final-cleanup", "title": "Delete removes exactly one Environment and leaves siblings and unrelated state intact"},
+    {"id": "gate.agent.deterministic_workers", "criterion": 12, "lane": "topology", "phase": "persisted-recovery/pre-sleep", "title": "Deterministic agent-driver workers across Environments without cross-observation"},
+    {"id": "gate.pressure.resource_pressure", "criterion": 13, "lane": "linux-docker", "phase": "persisted-recovery/pre-sleep", "title": "Resource pressure: 20 containers in 60 s, 4 pulls, 4 builds, 8 execs"},
+    {"id": "gate.runtime.youki_only_provenance", "criterion": 14, "lane": "linux-docker", "phase": "final-cleanup", "title": "youki is the only OCI runtime binary and every invocation is proven"},
+    {"id": "gate.cli_api.agreement", "criterion": 15, "lane": "topology", "phase": "clean-provision", "title": "Public CLI and typed API agree on topology, identities and state"},
+    {"id": "gate.reproducibility.recreate_from_definition", "criterion": 16, "lane": "topology", "phase": "final-cleanup", "title": "Recreate the topology from the definition with identical resolved shape"},
+    {"id": "gate.storage.workspace_projection_policy", "criterion": 17, "lane": "topology", "phase": "clean-provision", "title": "Workspace projection modes enforced; no silent multi-attach"},
+    {"id": "gate.secrets.snapshots_scoped_redacted", "criterion": 18, "lane": "topology", "phase": "persisted-recovery/post-wake", "title": "Secrets scoped per Machine, redacted in evidence, absent from snapshots"},
+    {"id": "gate.migration.install_upgrade_rollback_uninstall", "criterion": 19, "lane": "topology", "phase": "clean-provision", "title": "v0.3.20 install, 0.4 upgrade with every barrier injected, rollback and uninstall"},
+    {"id": "gate.network.exhaustive_denial_matrix", "criterion": 20, "lane": "topology", "phase": "persisted-recovery/post-wake", "title": "Exhaustive source×destination×protocol×port denial matrix"},
+    {"id": "gate.cli.legacy_removal_and_bootstrap", "criterion": 21, "lane": "topology", "phase": "clean-provision", "title": "Legacy CLI removal with actionable errors; bare vz and bootstrap behave as contracted"},
+    {"id": "gate.definition.reconciliation_fencing", "criterion": 22, "lane": "topology", "phase": "persisted-recovery/pre-sleep", "title": "Definition reconciliation fencing against stale and concurrent writers"}
+  ]
+}

@@ -31,7 +31,9 @@ SSH_SCOPE = "DEV_INSTALLED_LINUX_SSH_BUILD_NOT_RELEASE_CERTIFICATION"
 LIFECYCLE_SCOPE = "DEV_INSTALLED_LINUX_CONTAINER_LIFECYCLE_NOT_RELEASE_CERTIFICATION"
 IMAGES_SCOPE = "DEV_INSTALLED_LINUX_IMAGE_ROUNDTRIP_NOT_RELEASE_CERTIFICATION"
 REGISTRY_SCOPE = "DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTIFICATION"
-SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry")
+HANDSHAKE_SCOPE = "DEV_INSTALLED_LINUX_ENGINE_HANDSHAKE_NOT_RELEASE_CERTIFICATION"
+LIMITS_SCOPE = "DEV_INSTALLED_LINUX_RESOURCE_LIMITS_OOM_NOT_RELEASE_CERTIFICATION"
+SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -85,10 +87,10 @@ def arguments(argv):
 
 def preflight(args, require_host=True):
     require(args.suite in SUITES, "full contract unavailable")
-    if args.suite in ('images', 'registry'):
+    if args.suite in ('images', 'registry', 'handshake', 'limits'):
         require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
-                ('image' if args.suite == 'images' else 'registry') + ' suite rejects builder, foreign fixture and terminal options')
+                ('image' if args.suite == 'images' else args.suite) + ' suite rejects builder, foreign fixture and terminal options')
     for name in ('registry_archive', 'registry_layout'):
         require((getattr(args, name, None) is not None) == (args.suite == 'registry'),
                 '--' + name.replace('_', '-') + ' is required only for the registry suite')
@@ -110,7 +112,8 @@ def preflight(args, require_host=True):
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
-              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE}
+              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
+              "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -186,6 +189,24 @@ def preflight(args, require_host=True):
             info['inputs'][str(path)] = startup.digest(Path(path))
         require(info['inputs'][str(registry_machine.PIN)] == startup.digest(registry_machine.PIN) and
                 startup.digest(registry_archive) == registry['archive_sha256'], 'registry pin or archive changed')
+    if args.suite == 'handshake':
+        from linux_docker_handshake_machine import manifest_expectations, required_source_paths as handshake_sources
+        # Manifest-versus-upstream pins are checked before any client execution.
+        manifest_expectations()
+        for path in handshake_sources():
+            info['inputs'][str(path)] = startup.digest(Path(path))
+    if args.suite == 'limits':
+        from linux_docker_limits_machine import fixture_contract as limits_fixture_contract
+        from linux_docker_limits_machine import required_source_paths as limits_sources
+        limits_fixture_contract()
+        # The sibling health probe reuses the parallel fixture's health service.
+        selected = startup.canonical(str(REPO / "tests/fixtures/vz-0.4/docker-parallel"))
+        info.update(parallel_fixture=str(selected), parallel_fixture_sha256=driver.tree_digest(selected))
+        for path in limits_sources():
+            info['inputs'][str(path)] = startup.digest(Path(path))
+        for path in selected.rglob("*"):
+            if path.is_file():
+                info['inputs'][str(path)] = startup.digest(path)
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
@@ -662,6 +683,9 @@ class ComposeHarness(startup.Harness):
                     'registry Session lacks completed cleanup; registry state retained; cleanup withheld')
             session.commands.assert_certain()
             session.certain()
+        for session in getattr(self, 'limits_sessions', []):
+            require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
+                    'limits Session lacks completed cleanup; containers retained; cleanup withheld')
         require(all(getattr(self, "keep_proofs_verified", [])),
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
@@ -788,7 +812,7 @@ class ComposeHarness(startup.Harness):
                 self.monitor.check()
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
-                if suite in ('images', 'registry'):
+                if suite in ('images', 'registry', 'handshake'):
                     # Driver schema compatibility only: this recipe uses tiny
                     # source-selected archives, not the Python/Compose image.
                     # Never pull/build/execute those admission-only image pins.
@@ -796,7 +820,7 @@ class ComposeHarness(startup.Harness):
                     images = {'base': dict(base), 'compose': dict(base)}
                 else:
                     images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry"}:
+                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
                     elif suite == "parallel":
@@ -807,6 +831,10 @@ class ComposeHarness(startup.Harness):
                         from linux_docker_image_machine import run_machine
                     elif suite == 'registry':
                         from linux_docker_registry_machine import run_machine
+                    elif suite == 'handshake':
+                        from linux_docker_handshake_machine import run_machine
+                    elif suite == 'limits':
+                        from linux_docker_limits_machine import run_machine
                     else:
                         from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()
@@ -951,7 +979,7 @@ def run(info):
         for path, expected in (info["inputs"] | harness.staged_inputs).items():
             require(startup.digest(Path(path)) == expected, "selected input changed during physical run")
         require(driver.tree_digest(Path(info["fixture"])) == info["fixture_sha256"], "fixture changed during run")
-        if info["suite"] == "parallel":
+        if info["suite"] in ("parallel", "limits"):
             require(driver.tree_digest(Path(info["parallel_fixture"])) == info["parallel_fixture_sha256"],
                     "parallel fixture changed during run")
         if info["suite"] == "ssh":

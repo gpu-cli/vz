@@ -1,0 +1,90 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 source×destination×protocol×port expected/observed matrix",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "kind",
+    "rows",
+    "run_id",
+    "scenario_id",
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-connectivity-matrix"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "scenario_id": {
+      "type": "string",
+      "pattern": "^(gate|docker)\\.[a-z_]+\\.[a-z_]+$"
+    },
+    "rows": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "destination",
+          "expected",
+          "match",
+          "observed",
+          "port",
+          "protocol",
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1
+          },
+          "destination": {
+            "type": "string",
+            "minLength": 1
+          },
+          "protocol": {
+            "enum": [
+              "tcp",
+              "udp",
+              "icmp",
+              "dns",
+              "http",
+              "https"
+            ]
+          },
+          "port": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "expected": {
+            "enum": [
+              "allow",
+              "deny"
+            ]
+          },
+          "observed": {
+            "enum": [
+              "allow",
+              "deny",
+              "error"
+            ]
+          },
+          "match": {
+            "type": "boolean"
+          }
+        }
+      }
+    }
+  }
+}

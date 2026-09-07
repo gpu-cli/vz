@@ -1,0 +1,19 @@
+{
+  "$schema": "../schemas/vz-0.4-decision-authorities.schema.json",
+  "schema_version": 1,
+  "kind": "vz-0.4-decision-authorities",
+  "target_release": "0.4.0",
+  "signature_namespace": "vz-0.4-decision",
+  "authorities": [
+    {
+      "key_id": "vz04-owner-1",
+      "principal": "vz04-decision-owner",
+      "algorithm": "ssh-ed25519",
+      "public_key": "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIFBhIiB5pgDp4vBQHsi98SW/WWykrmoBjq1jKbcbyUwo",
+      "valid_from_commit": "05cf2d662c9f64d1738dd4f5ca8c98ef1a5e72f5",
+      "revoked": false,
+      "revoked_at_commit": null,
+      "custody": "Private key ~/.ssh/vz04-decision-owner on the project owner's Mac, outside the repository; rotation is the project owner's responsibility (see docs/vz-0.4-release-gate.md)."
+    }
+  ]
+}

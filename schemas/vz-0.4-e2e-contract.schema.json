@@ -1,0 +1,971 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 aggregate E2E gate contract (frozen input)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "canaries",
+    "capabilities_contract",
+    "cleanup_rules",
+    "contract_state",
+    "deadlines_seconds",
+    "docker_contract",
+    "fixtures",
+    "harness",
+    "host_envelope",
+    "kind",
+    "lanes",
+    "listener_checks",
+    "migration",
+    "native_macos",
+    "network_tolerances",
+    "normative_source",
+    "pins",
+    "pressure",
+    "readiness_polls",
+    "release",
+    "resources",
+    "scenarios",
+    "schema_version",
+    "sleep_wake",
+    "target_release"
+  ],
+  "properties": {
+    "$schema": {
+      "const": "../schemas/vz-0.4-e2e-contract.schema.json"
+    },
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-e2e-contract"
+    },
+    "target_release": {
+      "const": "0.4.0"
+    },
+    "contract_state": {
+      "enum": [
+        "draft_unverified",
+        "inputs_frozen"
+      ]
+    },
+    "normative_source": {
+      "type": "string",
+      "minLength": 1
+    },
+    "host_envelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "docker_client_ranges",
+        "minimum_free_disk_bytes",
+        "minimum_free_memory_bytes",
+        "minimum_mac_model",
+        "minimum_macos_version"
+      ],
+      "properties": {
+        "minimum_mac_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "minimum_macos_version": {
+          "type": "string",
+          "pattern": "^[0-9]+(\\.[0-9]+){1,2}$"
+        },
+        "minimum_free_memory_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "minimum_free_disk_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "architecture": {
+          "const": "arm64"
+        },
+        "docker_client_ranges": {
+          "type": [
+            "object",
+            "null"
+          ],
+          "additionalProperties": false,
+          "required": [
+            "docker",
+            "compose",
+            "buildx"
+          ],
+          "properties": {
+            "docker": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "maximum",
+                "minimum"
+              ],
+              "properties": {
+                "minimum": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maximum": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "compose": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "maximum",
+                "minimum"
+              ],
+              "properties": {
+                "minimum": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maximum": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            },
+            "buildx": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "maximum",
+                "minimum"
+              ],
+              "properties": {
+                "minimum": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "maximum": {
+                  "type": "string",
+                  "minLength": 1
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "entitlements_path",
+        "ga_signing_class",
+        "hardened_runtime_components",
+        "notarization_required_for_ga",
+        "prohibited_invocations",
+        "required_components",
+        "signing_classes"
+      ],
+      "properties": {
+        "signing_classes": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 2,
+          "items": {
+            "enum": [
+              "local-test-signed",
+              "developer-id-notarized"
+            ]
+          }
+        },
+        "ga_signing_class": {
+          "const": "developer-id-notarized"
+        },
+        "required_components": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        },
+        "entitlements_path": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "hardened_runtime_components": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        },
+        "notarization_required_for_ga": {
+          "const": true
+        },
+        "prohibited_invocations": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "native_macos": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "guest_agent_sha256",
+        "guest_build",
+        "guest_version",
+        "ipsw_pin",
+        "license_steps",
+        "prepared_image_sha256",
+        "privilege_steps",
+        "setup_recipe",
+        "xcode_toolchain_sha256"
+      ],
+      "properties": {
+        "ipsw_pin": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "guest_version": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "guest_build": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "guest_agent_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "prepared_image_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "xcode_toolchain_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "setup_recipe": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "privilege_steps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "license_steps": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "migration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "barriers_path",
+        "legacy_artifact_sha256",
+        "legacy_artifact_url",
+        "legacy_release_tag",
+        "legacy_state_fixture",
+        "legacy_state_fixture_sha256"
+      ],
+      "properties": {
+        "barriers_path": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "legacy_release_tag": {
+          "const": "v0.3.20"
+        },
+        "legacy_artifact_url": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "legacy_artifact_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "legacy_state_fixture": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "legacy_state_fixture_sha256": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "developer_machine",
+        "hardened_machine",
+        "native_macos_machine"
+      ],
+      "properties": {
+        "developer_machine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpus",
+            "disk_bytes",
+            "memory_bytes"
+          ],
+          "properties": {
+            "cpus": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "memory_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "disk_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "hardened_machine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpus",
+            "disk_bytes",
+            "memory_bytes"
+          ],
+          "properties": {
+            "cpus": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "memory_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "disk_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "native_macos_machine": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cpus",
+            "disk_bytes",
+            "memory_bytes"
+          ],
+          "properties": {
+            "cpus": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "memory_bytes": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "disk_bytes": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "deadlines_seconds": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cold_topology_up",
+        "fault_activation",
+        "fault_removal",
+        "operator_ack",
+        "peer_revocation",
+        "stop",
+        "up",
+        "warm_recovery"
+      ],
+      "properties": {
+        "cold_topology_up": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "warm_recovery": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fault_activation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "fault_removal": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "peer_revocation": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "stop": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "up": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "operator_ack": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "network_tolerances": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "bandwidth",
+        "latency",
+        "loss_partition"
+      ],
+      "properties": {
+        "latency": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "injected_one_way_ms",
+            "requests",
+            "tolerance_ms"
+          ],
+          "properties": {
+            "injected_one_way_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "tolerance_ms": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "requests": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "bandwidth": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "cap_bytes_per_second",
+            "tolerance_fraction"
+          ],
+          "properties": {
+            "cap_bytes_per_second": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "tolerance_fraction": {
+              "type": "number",
+              "exclusiveMinimum": 0,
+              "maximum": 1
+            }
+          }
+        },
+        "loss_partition": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "allowed_probe_failures",
+            "allowed_successful_connections",
+            "connection_attempts",
+            "probe_interval_seconds",
+            "window_seconds"
+          ],
+          "properties": {
+            "connection_attempts": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "window_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "allowed_successful_connections": {
+              "const": 0
+            },
+            "probe_interval_seconds": {
+              "type": "integer",
+              "minimum": 1
+            },
+            "allowed_probe_failures": {
+              "const": 0
+            }
+          }
+        }
+      }
+    },
+    "pressure": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "concurrent_builds",
+        "concurrent_execs",
+        "concurrent_pulls",
+        "containers",
+        "containers_window_seconds"
+      ],
+      "properties": {
+        "containers": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "containers_window_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "concurrent_pulls": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "concurrent_builds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "concurrent_execs": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "sleep_wake": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boot_session_keys",
+        "clock_sources",
+        "minimum_sleep_seconds",
+        "operator_ack_deadline_seconds",
+        "power_log_sources",
+        "required"
+      ],
+      "properties": {
+        "required": {
+          "const": true
+        },
+        "minimum_sleep_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "operator_ack_deadline_seconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "clock_sources": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "power_log_sources": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "boot_session_keys": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "readiness_polls": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "condition",
+          "deadline_seconds",
+          "id",
+          "interval_seconds"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^poll\\.[a-z_.]+$"
+          },
+          "condition": {
+            "type": "string",
+            "minLength": 1
+          },
+          "deadline_seconds": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "interval_seconds": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    "listener_checks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "interfaces_probed",
+        "loopback_only_exports",
+        "wildcard_listeners_forbidden"
+      ],
+      "properties": {
+        "interfaces_probed": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "loopback_only_exports": {
+          "const": true
+        },
+        "wildcard_listeners_forbidden": {
+          "const": true
+        }
+      }
+    },
+    "cleanup_rules": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "owned_resource_kinds",
+        "run_id_marker",
+        "unrelated_resources_untouched"
+      ],
+      "properties": {
+        "run_id_marker": {
+          "type": "string",
+          "minLength": 1
+        },
+        "owned_resource_kinds": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "unrelated_resources_untouched": {
+          "const": true
+        }
+      }
+    },
+    "canaries": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prefix",
+        "scan_all_evidence"
+      ],
+      "properties": {
+        "prefix": {
+          "const": "vz04-canary-"
+        },
+        "scan_all_evidence": {
+          "const": true
+        }
+      }
+    },
+    "lanes": {
+      "type": "array",
+      "minItems": 4,
+      "maxItems": 4,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "argv",
+          "argv_contract",
+          "entry_point",
+          "name",
+          "native_result_required",
+          "phases",
+          "result_adapter",
+          "role"
+        ],
+        "properties": {
+          "name": {
+            "enum": [
+              "sandbox-vm",
+              "topology",
+              "linux-docker",
+              "native-macos"
+            ]
+          },
+          "entry_point": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "argv": {
+            "type": "array",
+            "items": {
+              "type": "string",
+              "minLength": 1
+            }
+          },
+          "role": {
+            "enum": [
+              "prerequisite",
+              "acceptance"
+            ]
+          },
+          "phases": {
+            "type": "array",
+            "minItems": 1,
+            "uniqueItems": true,
+            "items": {
+              "enum": [
+                "clean-provision",
+                "persisted-recovery/pre-sleep",
+                "persisted-recovery/post-wake",
+                "final-cleanup"
+              ]
+            }
+          },
+          "argv_contract": {
+            "enum": [
+              "legacy_sandbox",
+              "vz04"
+            ]
+          },
+          "result_adapter": {
+            "enum": [
+              "sandbox_summary_txt",
+              null
+            ]
+          },
+          "native_result_required": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "harness": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "files"
+      ],
+      "properties": {
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        }
+      }
+    },
+    "fixtures": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "required_dirs",
+        "root"
+      ],
+      "properties": {
+        "root": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "required_dirs": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        }
+      }
+    },
+    "docker_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "lane",
+        "path",
+        "required_ids_source",
+        "schema"
+      ],
+      "properties": {
+        "path": {
+          "const": "config/docker-compatibility-v0.4.json"
+        },
+        "schema": {
+          "const": "schemas/docker-compatibility-v0.4.schema.json"
+        },
+        "required_ids_source": {
+          "const": "scripts/helpers/docker_compatibility_contract.py:REQUIRED_IDS"
+        },
+        "lane": {
+          "const": "linux-docker"
+        }
+      }
+    },
+    "capabilities_contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "schema"
+      ],
+      "properties": {
+        "path": {
+          "const": "config/host-target-capabilities-v0.4.json"
+        },
+        "schema": {
+          "const": "schemas/host-target-capabilities-v0.4.schema.json"
+        }
+      }
+    },
+    "pins": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "buildkit",
+        "cli_removal"
+      ],
+      "properties": {
+        "buildkit": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "cli_removal": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        }
+      }
+    },
+    "scenarios": {
+      "type": "array",
+      "minItems": 22,
+      "maxItems": 22,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "criterion",
+          "id",
+          "lane",
+          "phase",
+          "title"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^gate\\.[a-z_]+\\.[a-z_]+$"
+          },
+          "criterion": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 22
+          },
+          "lane": {
+            "enum": [
+              "topology",
+              "linux-docker",
+              "native-macos"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "clean-provision",
+              "persisted-recovery/pre-sleep",
+              "persisted-recovery/post-wake",
+              "final-cleanup"
+            ]
+          },
+          "title": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    }
+  }
+}

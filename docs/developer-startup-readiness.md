@@ -121,7 +121,7 @@ or the mixed-target 0.4 aggregate. Nothing was installed over the daily binaries
 The [host Compose entry point](../scripts/helpers/linux_docker_e2e.md) now binds
 normal public Up activation identities, installed configuration/artifact pins,
 startup runtime inventories and exact host contexts before fixture mutations.
-It implements an eight-recipe DEV slice with independent raw-evidence replay;
+It implements a nine-recipe DEV slice (compose-logs added 2026-09-07, pending an installed rerun) with independent raw-evidence replay;
 `--suite all` rejects before provisioning because the full63 dispatcher is not
 implemented. The standalone Python image input pins actual ARM64 registry
 metadata; physical suitability still requires pull/inspection/execution in each

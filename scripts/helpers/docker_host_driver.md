@@ -13,11 +13,12 @@ test infrastructure: the installed container-lifecycle lane is not yet complete.
 
 The executable subset currently covers:
 
-- Compose create, healthy up with Engine-event dependency ordering, exact
-  stdout/stderr/exit 37 exec, declared network membership and denial by name and
-  actual IP, volume persistence across Compose stop/up, three-replica scale-up
-  and exact scale-down identities, unhealthy-dependency blocking, failure exit
-  propagation and retained partial resources;
+- Compose create, healthy up with Engine-event dependency ordering, bounded
+  `logs --follow` with exact per-service log bytes/order and owned-container
+  attribution, exact stdout/stderr/exit 37 exec, declared network membership and
+  denial by name and actual IP, volume persistence across Compose stop/up,
+  three-replica scale-up and exact scale-down identities, unhealthy-dependency
+  blocking, failure exit propagation and retained partial resources;
 - BuildKit local multi-stage exports, build argument variation, explicit raw
   vertex cache-hit/miss observations, cold/warm cache-mount contents, and positive
   and uncached missing-secret builds;
@@ -51,7 +52,7 @@ Required JSON keys (unknown keys fail):
 | `docker_config` | Canonical absolute disposable directory, mode `0700`, not the user's `.docker` |
 | `clients` | `docker`, `compose`, `buildx`, each `{ "path": <canonical installed binary path>, "sha256": <actual digest> }` |
 | `images` | `base` and `compose`, each `{ "reference": <immutable reference>, "id": <verified sha256 image config ID>, "platform": "linux/arm64" }` |
-| `builder` | Required for `build`/`all`; optional (not null) for `compose`. Exact `name`, `node`, `container_id` and `image_id` of a fresh, already-running owned docker-container buildx builder |
+| `builder` | Required for `build`/`build_compose`; optional (not null) for `compose`. Exact `name`, `node`, `container_id` and `image_id` of a fresh, already-running owned docker-container buildx builder |
 | `runtime_evidence` | Optional exact `receipt_path`, `receipt_sha256`, `inventory_path`, `inventory_sha256`, `youki_sha256`; required when Engine advertises inert stock runc metadata |
 
 `images.base.reference` must be a repository `@sha256:` digest and provide Python
@@ -66,8 +67,8 @@ acceptable input. The driver does not bootstrap or create a builder, attach one
 to another endpoint, or remove the caller's builder/cache. The surrounding gate
 owns its provisioning, recursive runtime inventory and final destruction.
 Compose-only execution neither requires nor inspects a builder. The Python API
-admits inputs with `Inputs(raw, suite="compose")`; the default remains `all` and
-requires a builder. Switching suite after admission is rejected before commands.
+admits inputs with `Inputs(raw, suite="compose")`; the default is `build_compose`
+and requires a builder. Switching suite after admission is rejected before commands.
 
 Runtime evidence paths must be canonical, bounded regular files with their exact
 SHA-256 digests. The completed immutable operational-probe receipt and adjacent
@@ -111,12 +112,15 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/helpers/docker_host_driver.py \
   --inputs /absolute/owned/verified-inputs.json \
   --fixture /absolute/checkout/tests/fixtures/vz-0.4/docker \
   --output /absolute/owned/fresh-evidence-directory \
-  --suite all
+  --suite build_compose
 ```
 
-`--suite compose` and `--suite build` select subsets, not release-lane waivers.
-The result records the selected suite. A successful subset requires exactly its
-ordered inventory: five BuildKit recipes, eight Compose recipes, or all thirteen.
+`--suite compose` and `--suite build` select subsets, not release-lane waivers;
+`--suite build_compose` is their union. There is deliberately **no** driver
+suite named `all`: the contract's `all` is the 63-scenario release lane, and a
+green fourteen-recipe driver run must never be mistaken for it. The result
+records the selected suite. A successful subset requires exactly its ordered
+inventory: five BuildKit recipes, nine Compose recipes, or all fourteen.
 Every successful recipe must have a nonempty, non-overlapping command range
 within `1..command_count`; unexecuted, missing, extra or duplicate recipes cannot
 pass. These inventories do not replace the full 63-scenario release contract.
@@ -144,6 +148,28 @@ Only an exact expected-negative semantic proof can write a separate durable
 The terminal receipt itself retains its original uncertainty; consumers must
 verify the acknowledgement and replay its proof, never treat host exit alone as
 daemon-side quiescence.
+
+The `compose-logs` recipe runs immediately after the healthy up, when every
+container holds exactly one startup sequence. It first runs `compose stop` and
+inspects all four containers as `exited`; only then does it dispatch
+`compose logs --follow --no-color`. The follow terminates deterministically for
+that reason alone: the Engine does not follow a non-running container's log
+stream and Compose has no running container left to watch. No `--until`,
+`--since`, `--timestamps` or wall-clock heuristic is used, and a follow that
+does not exit is a timed-out failure. The recipe then replays `up --wait`,
+requires unchanged resource identities and healthy state, and the later
+recipes proceed. Each stdout line must match Compose's `name | message`
+prefix form and resolve to one of the exact inspected owned containers
+(`<service>-1`, or its full `<project>-<service>-1` name); padding and
+cross-service interleaving are not deterministic and are not compared. The
+per-service message sequence must equal `fixture.json → expected.logs` with
+this run/Machine owner token substituted, so a line from another project,
+Machine or replica cannot satisfy the inventory, and stderr must be empty.
+The observation records the raw stdout SHA-256 as an assertion, which the
+independent Compose replay recomputes from the retained stream. This is a
+history-through-follow observation and is not live running-container
+streaming; the physical Compose behavior on the installed clients still
+requires the installed harness run.
 
 Compose admission and cleanup inspect exact generated volume/network names even
 without labels, reject collisions, and reconcile actual mounts/network IDs to
@@ -187,8 +213,9 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --with jsonschema==4.23.0 \
 
 Physical execution; authenticated runtime/owner provenance; full cache export /
 fresh-builder import and cross-Machine tests; OCI metadata/layer comparisons;
-all-layer/decompressed-cache secret scans; complete SSH support; Compose live-log
-stream tests; unrelated cleanup decoys and surviving-environment health; full
+all-layer/decompressed-cache secret scans; complete SSH support; live
+running-container Compose log streaming; unrelated cleanup decoys and
+surviving-environment health; full
 registry/container/storage/network/resource-pressure/recovery coverage and the
 single aggregate release run remain open.
 

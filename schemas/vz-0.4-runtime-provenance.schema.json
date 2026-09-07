@@ -1,0 +1,115 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 OCI runtime provenance (youki only)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "invocations",
+    "kind",
+    "machine_id",
+    "oci_runtime_binaries",
+    "prohibited_found",
+    "run_id",
+    "schema_version",
+    "youki_only"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-runtime-provenance"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "machine_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "oci_runtime_binaries": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "path",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^/[^\\r\\n\\x00]*$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "name": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "invocations": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "argv0",
+          "pid",
+          "sha256"
+        ],
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "argv0": {
+            "type": "string",
+            "minLength": 1
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "prohibited_found": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "youki_only": {
+      "type": "boolean"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "youki_only": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "prohibited_found": {
+            "maxItems": 0
+          },
+          "oci_runtime_binaries": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}

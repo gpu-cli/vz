@@ -7,7 +7,7 @@ import unittest
 
 from jsonschema import Draft202012Validator, ValidationError
 
-from docker_host_driver import BUILD_RECIPES, Rejected, validate_result
+from docker_host_driver import BUILD_RECIPES, COMPOSE_RECIPES, Rejected, validate_result
 
 
 class ResultSchemaTests(unittest.TestCase):
@@ -59,6 +59,27 @@ class ResultSchemaTests(unittest.TestCase):
                         {"observations": self.result["observations"][:-1]}):
             with self.subTest(changed=changed), self.assertRaises(Rejected):
                 validate_result(self.result | changed)
+
+    def test_compose_suite_requires_exactly_nine_recipes_and_no_all_alias(self):
+        observations = [{"recipe": recipe, "related_scenario_ids": ["docker.compose.logs" if recipe == "compose-logs" else "docker.compose.up"],
+                         "first_command": index * 2 + 1, "last_command": index * 2 + 2,
+                         "outcome": "fixture_assertions_passed", "assertions": ["synthetic schema test only"]}
+                        for index, recipe in enumerate(COMPOSE_RECIPES)]
+        result = self.result | {"suite": "compose", "observations": observations, "command_count": len(observations) * 2}
+        self.assertEqual(len(observations), 9)
+        self.validator.validate(result)
+        validate_result(result)
+        with self.assertRaises(ValidationError):
+            self.validator.validate(result | {"observations": observations[:-1], "command_count": 16})
+        with self.assertRaises(ValidationError):
+            self.validator.validate(result | {"suite": "all"})
+        union = self.result["observations"] + [x | {"first_command": x["first_command"] + 10, "last_command": x["last_command"] + 10}
+                                              for x in observations]
+        combined = self.result | {"suite": "build_compose", "observations": union, "command_count": 28}
+        self.validator.validate(combined)
+        validate_result(combined)
+        with self.assertRaises(ValidationError):
+            self.validator.validate(combined | {"observations": union[:-1]})
 
     def test_semantic_rejects_invalid_range_types_and_order(self):
         for first, last in ((True, 2), (1, False), (0, 2), (2, 1), (1, 100)):

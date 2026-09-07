@@ -117,11 +117,11 @@ class BoundaryTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 self.guarded_builder(self.bare_driver(), [[changed]])
 
-    def test_compose_only_omits_builder_but_build_all_and_suite_switch_reject(self):
+    def test_compose_only_omits_builder_but_build_union_and_suite_switch_reject(self):
         raw = copy.deepcopy(self.raw)
         del raw["builder"]
         driver.Inputs(raw, suite="compose")
-        for suite in ("all", "build"):
+        for suite in ("build_compose", "build"):
             with self.subTest(suite=suite), self.assertRaises(driver.Rejected):
                 driver.Inputs(raw, suite=suite)
         with self.assertRaises(driver.Rejected):
@@ -129,8 +129,94 @@ class BoundaryTests(unittest.TestCase):
         item = self.bare_driver()
         item.inputs = driver.Inputs(raw, suite="compose")
         with patch.object(item, "guard") as guard, self.assertRaises(driver.Rejected):
+            item.run("build_compose")
+        guard.assert_not_called()
+
+    def test_driver_union_suite_is_never_named_all(self):
+        # The contract's ``all`` is the 63-scenario release lane; the driver's
+        # fourteen-recipe union must not be mistakable for it.
+        self.assertNotIn("all", driver.SUITE_RECIPES)
+        self.assertEqual(driver.SUITE_RECIPES["build_compose"], driver.BUILD_RECIPES + driver.COMPOSE_RECIPES)
+        self.assertEqual(len(driver.SUITE_RECIPES["build_compose"]), 14)
+        self.assertEqual(driver.Inputs(copy.deepcopy(self.raw)).suite, "build_compose")
+        with self.assertRaises(driver.Rejected):
+            driver.Inputs(copy.deepcopy(self.raw), suite="all")
+        item = self.bare_driver()
+        item.inputs = driver.Inputs(copy.deepcopy(self.raw))
+        with patch.object(item, "guard") as guard, self.assertRaises(driver.Rejected):
             item.run("all")
         guard.assert_not_called()
+        self.assertIn("compose-logs", driver.COMPOSE_RECIPES)
+        self.assertEqual(driver.COMPOSE_RECIPES.index("compose-logs"), driver.COMPOSE_RECIPES.index("compose-up-order") + 1)
+
+    def test_compose_subcommand_marks_only_logs_and_version_readonly(self):
+        prefix = ["compose", "--project-name", "owned", "--file", "/f/compose.json", "--file", "/f/owner.json"]
+        self.assertEqual(driver.compose_subcommand(prefix + driver.COMPOSE_LOGS), "logs")
+        self.assertEqual(driver.compose_subcommand(prefix + ["--profile", "failure", "down"]), "down")
+        self.assertEqual(driver.compose_subcommand(prefix + ["--file", "/f/blocked.json", *driver.COMPOSE_UP]), "up")
+        self.assertIsNone(driver.compose_subcommand(prefix))
+        self.assertIsNone(driver.compose_subcommand(["logs", "abc"]))
+        self.assertIsNone(driver.compose_subcommand([]))
+        item = self.bare_driver()
+        item.inputs = driver.Inputs(copy.deepcopy(self.raw), suite="compose")
+        item.config_snapshot = item.validate_config()
+        seen = []
+        def run(argv, **kwargs):
+            seen.append(kwargs["mutation"])
+            return driver.Command(len(seen), argv, 0, b"", b"")
+        item.record = type("Record", (), {"run": staticmethod(run)})()
+        item.command(prefix + driver.COMPOSE_LOGS)
+        item.command(prefix + ["stop"])
+        item.command(prefix + ["version"])
+        item.command(["logs", "a" * 64])
+        self.assertEqual(seen, [False, True, False, False])
+
+    def compose_logs_case(self):
+        owner = "vz04-" + "a" * 24
+        project = owner + "-compose"
+        containers = {role: {"Name": f"/{project}-{role}-1"} for role in ("db", "api", "worker", "isolated")}
+        expected = json.loads((Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker/fixture.json").read_text())["expected"]["logs"]
+        lines = [f"db-1 | vz04|db|{owner}|listening\n", f"api-1 | vz04|api|{owner}|dependency-healthy\n",
+                 f"worker-1 | vz04|worker|{owner}|dependency-healthy\n", f"isolated-1 | vz04|isolated|{owner}|listening\n",
+                 f"api-1      | vz04|api|{owner}|listening\n", f"worker-1   | vz04|worker|{owner}|listening\n"]
+        return owner, project, containers, expected, "".join(lines).encode()
+
+    def test_compose_logs_exact_per_service_bytes_with_nondeterministic_padding_and_full_names(self):
+        owner, project, containers, expected, stdout = self.compose_logs_case()
+        sizes = driver.assert_compose_logs(stdout, b"", project, containers, expected, owner)
+        self.assertEqual(sizes, {role: sum(len(line.format(owner=owner)) for line in lines) for role, lines in expected.items()})
+        full = stdout.replace(b"db-1 |", (project + "-db-1 |").encode())
+        self.assertEqual(driver.assert_compose_logs(full, b"", project, containers, expected, owner), sizes)
+
+    def test_compose_logs_rejects_foreign_missing_extra_reordered_and_noisy_output(self):
+        owner, project, containers, expected, stdout = self.compose_logs_case()
+        lines = stdout.splitlines(keepends=True)
+        swapped = list(lines); swapped[1], swapped[4] = swapped[4], swapped[1]
+        cases = {
+            "foreign owner": stdout.replace(("|" + owner + "|listening").encode(), b"|vz04-foreign|listening", 1),
+            "neighbor Machine same role": stdout + b"db-1 | vz04|db|vz04-neighbor|listening\n",
+            "other project container": stdout + f"failure-1 | vz04|failure|{owner}|exit-37\n".encode(),
+            "other project full name": stdout + f"{owner}-failure-db-1 | vz04|db|{owner}|listening\n".encode(),
+            "replica two": stdout + f"worker-2 | vz04|worker|{owner}|listening\n".encode(),
+            "unattributed": stdout + f"vz04|db|{owner}|listening\n".encode(),
+            "missing": b"".join(lines[:-1]),
+            "duplicate": stdout + lines[0],
+            "reordered": b"".join(swapped),
+            "unterminated": stdout[:-1],
+            "empty": b"",
+            "oversized": stdout + b"x" * driver.MAX_STREAM_BYTES,
+        }
+        for name, raw in cases.items():
+            with self.subTest(case=name), self.assertRaises(driver.Rejected):
+                driver.assert_compose_logs(raw, b"", project, containers, expected, owner)
+        with self.assertRaises(driver.Rejected):
+            driver.assert_compose_logs(stdout, b"warning\n", project, containers, expected, owner)
+        with self.assertRaises(driver.Rejected):
+            driver.assert_compose_logs(stdout, b"", project, containers | {"db": {"Name": "/" + project + "-db-2"}}, expected, owner)
+        with self.assertRaises(driver.Rejected):
+            driver.assert_compose_logs(stdout, b"", project, {k: v for k, v in containers.items() if k != "db"}, expected, owner)
+        with self.assertRaises(driver.Rejected):
+            driver.assert_compose_logs(stdout, b"", project, containers, expected | {"db": ["vz04|db|listening\n"]}, owner)
 
     def test_real_home_preserved_with_owned_temporary_directory(self):
         fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"

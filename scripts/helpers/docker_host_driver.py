@@ -37,9 +37,20 @@ from typing import Any
 
 MAX_STREAM_BYTES = 4 * 1024 * 1024
 BUILD_RECIPES = ("build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount")
-COMPOSE_RECIPES = ("compose-create", "compose-up-order", "compose-exec", "compose-network-paths",
+COMPOSE_RECIPES = ("compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths",
                    "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure")
-SUITE_RECIPES = {"build": BUILD_RECIPES, "compose": COMPOSE_RECIPES, "all": BUILD_RECIPES + COMPOSE_RECIPES}
+# The driver-level combined suite is deliberately NOT called ``all``: the
+# contract's ``all`` means the 63-scenario release lane, which this DEV runner
+# can never satisfy. A green ``build_compose`` run is fourteen fixture recipes.
+SUITE_RECIPES = {"build": BUILD_RECIPES, "compose": COMPOSE_RECIPES, "build_compose": BUILD_RECIPES + COMPOSE_RECIPES}
+COMPOSE_UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
+# Follow terminates deterministically only because every project container has
+# already been stopped: the Engine closes a non-running container's log stream
+# after its history and Compose has no running container left to watch. No
+# ``--until``/timestamp heuristic is used; a hang is a timed-out failure.
+COMPOSE_LOGS = ["logs", "--follow", "--no-color"]
+COMPOSE_LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
+COMPOSE_GLOBAL_OPTIONS = {"--project-name", "--file", "--profile"}
 
 
 class Rejected(ValueError):
@@ -109,7 +120,7 @@ def immutable_image(value: Any) -> str:
 @dataclasses.dataclass(frozen=True)
 class Inputs:
     raw: dict[str, Any]
-    suite: str = "all"
+    suite: str = "build_compose"
 
     def __post_init__(self) -> None:
         required = {"schema_version", "run_id", "release_sha256", "fixture_sha256",
@@ -657,7 +668,7 @@ class Driver:
         readonly = args[0] in {"version", "info", "events", "logs"} or args[:2] in [
             ["context", "inspect"], ["image", "inspect"], ["container", "inspect"], ["container", "ls"],
             ["network", "inspect"], ["network", "ls"], ["volume", "inspect"], ["volume", "ls"],
-            ["buildx", "inspect"], ["compose", "version"]]
+            ["buildx", "inspect"]] or compose_subcommand(args) in {"logs", "version"}
         options = {"interaction_plan": interaction_plan} if interaction_plan is not None else {}
         if progress_observer is not None:
             options["progress_observer"] = progress_observer
@@ -911,6 +922,36 @@ class Driver:
         self.observe("compose-up-order", ["docker.compose.up", "docker.compose.dependency_ordering",
                                           "docker.compose.health_ordering"], up)
 
+        def logs() -> list[str]:
+            # Exactly one startup sequence exists per container at this point.
+            # Stopping first is what makes ``logs --follow`` terminate: the
+            # Engine does not follow a non-running container and Compose has
+            # nothing left to watch. The retained follow is therefore history
+            # replayed through the follow path, not live streaming.
+            self.compose(project, ["stop"])
+            stopped = self.capture(project)
+            services = self.by_service(stopped)
+            require(set(services) == {"db", "api", "worker", "isolated"} and all(
+                len(items) == 1 and items[0]["State"]["Status"] == "exited" and items[0]["State"]["Running"] is False
+                for items in services.values()), "services not stopped; follow termination would be nondeterministic")
+            result = self.compose(project, COMPOSE_LOGS, timeout=40)
+            sizes = assert_compose_logs(result.stdout, result.stderr, project,
+                                        {role: items[0] for role, items in services.items()},
+                                        self.fixture_spec["expected"]["logs"], self.inputs.owner)
+            self.compose(project, COMPOSE_UP, timeout=40)
+            after = self.capture(project)
+            require(self.identities(stopped) == self.identities(after), "Compose stop/up changed resource identity")
+            require(all(len(items) == 1 and items[0]["State"].get("Health", {}).get("Status") == "healthy"
+                        for items in self.by_service(after).values()), "service unhealthy after restart")
+            return ["four stopped services followed to termination; exact per-service log bytes and order: " +
+                    json.dumps(sizes, sort_keys=True, separators=(",", ":")) + " bytes",
+                    "every line attributed to this project's exact owned container names and owner token; "
+                    "no foreign project/Machine output",
+                    "compose logs raw stdout sha256 " + sha256(result.stdout),
+                    "Compose stop/up preserved IDs and health; live running-container streaming still required"]
+
+        self.observe("compose-logs", ["docker.compose.logs"], logs)
+
         def execute() -> list[str]:
             result = self.compose(project, ["exec", "--no-TTY", "api", "python3", "/fixture/service.py", "exec"], expected=37)
             require(result.stdout == f"vz04|api|{self.inputs.owner}|exec-stdout\n".encode() and
@@ -1155,9 +1196,9 @@ class Driver:
         try:
             self.guard()
             self.verify_images()
-            if suite in {"build", "all"}:
+            if suite in {"build", "build_compose"}:
                 self.build_workloads()
-            if suite in {"compose", "all"}:
+            if suite in {"compose", "build_compose"}:
                 self.compose_workloads()
         except (Exception, KeyboardInterrupt) as error:
             failure = f"{type(error).__name__}: {error}"
@@ -1191,6 +1232,54 @@ class Driver:
                 rows.append(f"{sha256(regular(path))}  {path.relative_to(self.output).as_posix()}\n")
         (self.output / "checksums.sha256").write_text("".join(rows))
         return result
+
+
+def compose_subcommand(args: list[str]) -> str | None:
+    """Return the Compose subcommand that follows the driver's fixed global options."""
+    if not args or args[0] != "compose":
+        return None
+    index = 1
+    while index < len(args) and args[index] in COMPOSE_GLOBAL_OPTIONS:
+        index += 2
+    return args[index] if index < len(args) else None
+
+
+def assert_compose_logs(stdout: bytes, stderr: bytes, project: str, containers: dict[str, dict[str, Any]],
+                        expected: dict[str, list[str]], owner: str) -> dict[str, int]:
+    """Attribute every followed line to one exact owned container; exact per-service bytes and order.
+
+    Compose prefixes each line with the container name minus the project
+    (``db-1 | ``), padded to the widest name seen so far, so padding and
+    cross-service interleaving are not deterministic and only the per-service
+    sequence is compared. Every message must carry this run/Machine owner token
+    in the fixture template, so a line from another project, Machine or replica
+    cannot satisfy the exact inventory. Returns retained bytes per service.
+    """
+    require(not stderr, "Compose logs emitted diagnostics")
+    require(0 < len(stdout) <= MAX_STREAM_BYTES and stdout.endswith(b"\n"), "missing or unterminated Compose logs")
+    checked_text(owner, r"[a-z0-9][a-z0-9-]{0,63}", "fixture owner")
+    require(isinstance(expected, dict) and set(containers) == set(expected) and all(
+        isinstance(lines, list) and lines and all(isinstance(line, str) and line.endswith("\n") for line in lines)
+        for lines in expected.values()), "expected log inventory differs from owned services")
+    names: dict[bytes, str] = {}
+    for role, item in containers.items():
+        full = item["Name"]
+        require(full == "/" + project + "-" + role + "-1", "unexpected owned container name")
+        for name in (full[len(project) + 2:], full[1:]):
+            require(name.encode() not in names, "ambiguous log prefix")
+            names[name.encode()] = role
+    observed: dict[str, list[bytes]] = {role: [] for role in expected}
+    for line in stdout.split(b"\n")[:-1]:
+        match = COMPOSE_LOG_LINE.fullmatch(line)
+        require(match is not None, "unattributed Compose log line")
+        role = names.get(match[1])
+        require(role is not None, "log line from a container outside the exact owned project")
+        observed[role].append(match[2] + b"\n")
+    for role, lines in expected.items():
+        wanted = [line.format(owner=owner).encode() for line in lines]
+        require(all(("|" + owner + "|").encode() in line for line in wanted), "fixture log template lacks owner token")
+        require(observed[role] == wanted, role + " log bytes or order differ from fixture")
+    return {role: sum(len(line) for line in lines) for role, lines in observed.items()}
 
 
 def assert_transport_denied(command: Command, url: str, *, dns_name: bool) -> None:
@@ -1568,7 +1657,8 @@ def main() -> int:
                         help="JSON: schema_version, run_id, release_sha256, fixture_sha256, scope, docker_config, clients, images, builder")
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="fresh absolute private evidence directory")
-    parser.add_argument("--suite", choices=("compose", "build", "all"), required=True)
+    parser.add_argument("--suite", choices=("compose", "build", "build_compose"), required=True,
+                        help="fixture recipe subset; build_compose is the driver's fourteen-recipe union, never the contract's 63-scenario all")
     args = parser.parse_args()
     try:
         inputs = Inputs(json.loads(regular(args.inputs)), suite=args.suite)

@@ -1,0 +1,246 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 hardware sleep/wake evidence",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "checkpoint",
+    "kind",
+    "minimum_sleep_seconds",
+    "observed",
+    "reason",
+    "run_id",
+    "schema_version",
+    "wake"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-sleep-wake"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "minimum_sleep_seconds": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "observed": {
+      "type": "boolean"
+    },
+    "reason": {
+      "enum": [
+        null,
+        "not_observed_step1",
+        "operator_ack_missing",
+        "ack_deadline_exceeded",
+        "boot_session_changed",
+        "nonce_mismatch",
+        "discontinuity_too_small",
+        "power_events_missing"
+      ]
+    },
+    "checkpoint": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "boot_session_uuid",
+            "boottime_unix",
+            "clock_monotonic_ns",
+            "clock_uptime_raw_ns",
+            "nonce",
+            "pmset_log_sha256",
+            "wall_clock_utc"
+          ],
+          "properties": {
+            "nonce": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "boot_session_uuid": {
+              "type": "string",
+              "minLength": 1
+            },
+            "boottime_unix": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "clock_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "clock_uptime_raw_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "wall_clock_utc": {
+              "type": "string",
+              "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+            },
+            "pmset_log_sha256": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{64}$"
+            }
+          }
+        }
+      ]
+    },
+    "wake": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "capture",
+            "delta_monotonic_ns",
+            "delta_uptime_raw_ns",
+            "discontinuity_seconds",
+            "nonce_echoed",
+            "power_events",
+            "same_boot_session"
+          ],
+          "properties": {
+            "capture": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "boot_session_uuid",
+                "boottime_unix",
+                "clock_monotonic_ns",
+                "clock_uptime_raw_ns",
+                "nonce",
+                "pmset_log_sha256",
+                "wall_clock_utc"
+              ],
+              "properties": {
+                "nonce": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "boot_session_uuid": {
+                  "type": "string",
+                  "minLength": 1
+                },
+                "boottime_unix": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "clock_monotonic_ns": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "clock_uptime_raw_ns": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "wall_clock_utc": {
+                  "type": "string",
+                  "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+                },
+                "pmset_log_sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                }
+              }
+            },
+            "delta_monotonic_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "delta_uptime_raw_ns": {
+              "type": "integer",
+              "minimum": 0
+            },
+            "discontinuity_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "nonce_echoed": {
+              "type": "boolean"
+            },
+            "same_boot_session": {
+              "type": "boolean"
+            },
+            "power_events": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "event",
+                  "source",
+                  "timestamp_utc"
+                ],
+                "properties": {
+                  "source": {
+                    "type": "string",
+                    "minLength": 1
+                  },
+                  "timestamp_utc": {
+                    "type": "string",
+                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+                  },
+                  "event": {
+                    "type": "string",
+                    "minLength": 1
+                  }
+                }
+              }
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "observed": {
+            "const": true
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "checkpoint": {
+            "type": "object"
+          },
+          "wake": {
+            "type": "object"
+          },
+          "reason": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "observed": {
+            "const": false
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "reason": {
+            "type": "string"
+          }
+        }
+      }
+    }
+  ]
+}

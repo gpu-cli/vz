@@ -44,7 +44,7 @@ real runtime identity and incarnation to public status, the installed catalog,
 startup receipt, post-startup inventory, context endpoint and Engine identity.
 These checks precede fixture mutation.
 
-Eight real Compose recipes run on both primary Machines and one neighboring
+Nine real Compose recipes run on both primary Machines and one neighboring
 Machine. Three separate driver outputs retain all stdout/stderr, exit codes,
 timestamps, pre-dispatch intents, semantic acknowledgements for expected
 negative mutations, input pins and checksums. Independent replay requires the

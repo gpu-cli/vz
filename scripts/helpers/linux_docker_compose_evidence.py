@@ -14,17 +14,23 @@ import stat
 
 
 RECIPES = (
-    "compose-create", "compose-up-order", "compose-exec", "compose-network-paths",
+    "compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths",
     "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure",
 )
 RELATED = (
     ["docker.compose.create"],
     ["docker.compose.up", "docker.compose.dependency_ordering", "docker.compose.health_ordering"],
+    ["docker.compose.logs"],
     ["docker.compose.exec"], ["docker.compose.networks"], ["docker.compose.volumes"],
     ["docker.compose.scaling"], ["docker.compose.health_ordering"], ["docker.compose.failure_propagation"],
 )
 ROLES = {"db", "api", "worker", "isolated"}
 UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
+LOGS = ["logs", "--follow", "--no-color"]
+LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
+# One startup sequence per service, in order; every line carries the owner token.
+LOG_EVENTS = {"db": ("listening",), "api": ("dependency-healthy", "listening"),
+              "worker": ("dependency-healthy", "listening"), "isolated": ("listening",)}
 READ = "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())"
 WRITE = "import os,sys;f=open(sys.argv[1],'xb');f.write(sys.argv[2].encode());f.flush();os.fsync(f.fileno());f.close()"
 MAX = 4 * 1024 * 1024
@@ -261,7 +267,7 @@ class Replay:
             row["_args"] = row["argv"][5:]
             self.rows.append(row)
         require(set(self.files) == expected_files, "unrecognized evidence or receipt files")
-        require([item["recipe"] for item in result["observations"]] == list(RECIPES), "exact eight recipes required")
+        require([item["recipe"] for item in result["observations"]] == list(RECIPES), "exact nine recipes required")
         self.fixture = None
 
     def take(self, args, code=0, mutation=False, env=None):
@@ -337,7 +343,7 @@ class Replay:
         self.projects[project] = {kind: set() for kind in inventory}
         return project
 
-    def compose(self, project, args, code=0, blocked=False):
+    def compose(self, project, args, code=0, blocked=False, mutation=True):
         self.guard()
         row = self.rows[self.i]
         actual = row["_args"]
@@ -354,7 +360,7 @@ class Replay:
                   "--file", str(self.directory / "compose-owner.json")]
         if blocked:
             prefix += ["--file", str(fixture / "compose/blocked-health.json")]
-        return self.take(prefix + args, code=code, mutation=True,
+        return self.take(prefix + args, code=code, mutation=mutation,
                          env={"FIXTURE_IMAGE": self.inputs["images"]["compose"]["id"], "FIXTURE_OWNER": self.owner})
 
     @staticmethod
@@ -436,6 +442,20 @@ class Replay:
             require(all(ready[role][0]["Id"] == created[role][0]["Id"] and ready[role][0]["State"]["Health"]["Status"] == "healthy"
                         and ready[role][0]["State"]["Running"] for role in ROLES), "wrong healthy service identity")
             self.events(project, ready)
+        with self.observation("compose-logs"):
+            # Follow can only terminate because every container was stopped
+            # first; replay demands that stopped inventory before the follow.
+            self.compose(project, ["stop"])
+            stopped = self.services(self.inventory(project))
+            require(all(stopped[role][0]["Id"] == ready[role][0]["Id"] and stopped[role][0]["State"]["Status"] == "exited"
+                        and stopped[role][0]["State"]["Running"] is False for role in ROLES), "follow precondition: services not stopped")
+            row = self.compose(project, LOGS, mutation=False)
+            self.logs(project, row, {role: stopped[role][0] for role in ROLES})
+            self.compose(project, UP)
+            restarted = self.services(self.inventory(project))
+            require(all(restarted[role][0]["Id"] == ready[role][0]["Id"] and restarted[role][0]["State"]["Running"]
+                        and restarted[role][0]["State"]["Health"]["Status"] == "healthy" for role in ROLES),
+                    "restart after follow changed identity or health")
         with self.observation("compose-exec"):
             row = self.compose(project, ["exec", "--no-TTY", "api", "python3", "/fixture/service.py", "exec"], code=37)
             require(row["_stdout"] == f"vz04|api|{self.owner}|exec-stdout\n".encode()
@@ -482,6 +502,27 @@ class Replay:
                 "scope": self.scope, "recipes_validated": list(RECIPES), "command_count": self.i,
                 "owned_projects": self.result["owned_projects"], "compatibility_certified": False,
                 "release_scenarios_passed": []}
+
+    def logs(self, project, row, containers):
+        """Every followed line must belong to an exact owned container and carry this owner's token."""
+        stdout = row["_stdout"]
+        require(not row["_stderr"] and 0 < len(stdout) <= MAX and stdout.endswith(b"\n"),
+                "Compose logs diagnostics, empty or unterminated output")
+        names = {}
+        for role, item in containers.items():
+            require(item["Name"] == f"/{project}-{role}-1", "unexpected owned container name")
+            # Compose prints the name without the project; accept the exact full name too.
+            names[f"{role}-1".encode()] = names[f"{project}-{role}-1".encode()] = role
+        observed = {role: [] for role in ROLES}
+        for line in stdout.split(b"\n")[:-1]:
+            match = LOG_LINE.fullmatch(line)
+            require(match is not None and match[1] in names, "log line not attributable to an exact owned container")
+            observed[names[match[1]]].append(match[2])
+        for role, events in LOG_EVENTS.items():
+            require(observed[role] == [f"vz04|{role}|{self.owner}|{event}".encode() for event in events],
+                    "per-service log bytes or order differ")
+        assertions = self.result["observations"][RECIPES.index("compose-logs")]["assertions"]
+        require("compose logs raw stdout sha256 " + sha(stdout) in assertions, "raw stdout digest claim differs")
 
     def networks(self, project):
         with self.observation("compose-network-paths"):
@@ -557,7 +598,7 @@ class Replay:
 
 
 def validate(directory: Path, expected_inputs: dict) -> dict:
-    """Reject incomplete/foreign evidence; replay all eight recipes and cleanup."""
+    """Reject incomplete/foreign evidence; replay all nine recipes and cleanup."""
     try:
         return Replay(directory, expected_inputs).run()
     except (KeyError, IndexError, TypeError, OSError, UnicodeError, json.JSONDecodeError) as error:

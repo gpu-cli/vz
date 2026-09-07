@@ -44,6 +44,18 @@ class SyntheticEngine:
     def labels(self, project):
         return {"com.docker.compose.project": project, "dev.vz.fixture-owner": self.owner}
 
+    def compose_logs(self, project):
+        """Interleaved services with Compose's grow-as-seen prefix padding; never a real stream."""
+        items = {item["Config"]["Labels"]["com.docker.compose.service"]: item for item in self.projects[project]["container"]}
+        order = [("db", "listening"), ("api", "dependency-healthy"), ("worker", "dependency-healthy"),
+                 ("isolated", "listening"), ("api", "listening"), ("worker", "listening")]
+        width, lines = 0, []
+        for role, event in order:
+            name = items[role]["Name"][len(project) + 2:]
+            width = max(width, len(name))
+            lines.append(f"{name:<{width}} | vz04|{role}|{self.owner}|{event}\n".encode())
+        return b"".join(lines)
+
     def container(self, project, role, number=1):
         identity = self.identity(project + role + str(number))
         names = {"db": ("backend",), "api": ("frontend", "backend"), "worker": ("frontend",),
@@ -98,6 +110,10 @@ class SyntheticEngine:
             elif action == "exec":
                 code = 37
                 stdout, stderr = (f"vz04|api|{self.owner}|exec-{stream}\n".encode() for stream in ("stdout", "stderr"))
+            elif action == "logs":
+                assert tail == ["logs", "--follow", "--no-color"], tail
+                assert all(not item["State"]["Running"] for item in self.projects[project]["container"]), "follow on running services"
+                stdout = self.compose_logs(project)
             else:
                 self.install(project, failure="--exit-code-from" in tail)
                 items = self.projects[project]["container"]
@@ -348,11 +364,111 @@ class ComposeEvidenceTests(unittest.TestCase):
     def raw_inputs(self):
         return copy.deepcopy(self.__class__.fixture_inputs)
 
-    def test_complete_synthetic_evidence_replays_eight_without_certification(self):
+    def test_complete_synthetic_evidence_replays_nine_without_certification(self):
         value = evidence.validate(self.directory, self.raw_inputs())
         self.assertEqual(value["recipes_validated"], list(evidence.RECIPES))
+        self.assertEqual(len(evidence.RECIPES), 9)
+        self.assertEqual(evidence.RELATED[evidence.RECIPES.index("compose-logs")], ["docker.compose.logs"])
         self.assertIs(value["compatibility_certified"], False)
         self.assertEqual(len(value["owned_projects"]), 3)
+
+    def logs_row(self, row):
+        return row["argv"][-3:] == evidence.LOGS
+
+    def fresh(self):
+        shutil.rmtree(self.directory)
+        self.setUp()
+
+    def rewrite_logs(self, change):
+        """Rewrite the followed stream and re-bind the observation's raw digest claim."""
+        self.raw(self.logs_row, change)
+        _path, row = next(item for item in self.receipts() if self.logs_row(item[1]))
+        digest = evidence.sha((self.directory / row["stdout"]).read_bytes())
+        result_path = self.directory / "result.json"
+        result = json.loads(result_path.read_bytes())
+        item = result["observations"][evidence.RECIPES.index("compose-logs")]
+        item["assertions"] = [x if not x.startswith("compose logs raw stdout sha256 ") else
+                              "compose logs raw stdout sha256 " + digest for x in item["assertions"]]
+        result_path.write_bytes(data(result))
+        self.refresh()
+
+    def test_compose_logs_recipe_is_readonly_follow_after_stop_and_before_restart(self):
+        rows = [row for _path, row in self.receipts()]
+        index = next(i for i, row in enumerate(rows) if self.logs_row(row))
+        self.assertIs(rows[index]["mutation"], False)
+        self.assertEqual(rows[index]["exit_code"], 0)
+        self.assertEqual(rows[index]["argv"][5:9][:3], ["compose", "--project-name", driver.Inputs(self.raw_inputs(), suite="compose").owner + "-compose"])
+        before = [row["argv"][-1] for row in rows[:index] if row["argv"][5] == "compose"]
+        after = [row["argv"][-1] for row in rows[index + 1:] if row["argv"][5] == "compose"]
+        self.assertEqual(before[-1], "stop")
+        self.assertEqual(after[0], "30")  # up --wait --wait-timeout 30 restores the topology
+
+    def test_compose_logs_padding_and_full_container_name_prefixes_are_accepted(self):
+        owner = driver.Inputs(self.raw_inputs(), suite="compose").owner
+        def change(raw):
+            lines = []
+            for line in raw.splitlines():
+                name, message = line.split(b" | ", 1)
+                name = name.strip()
+                if name.startswith(b"api"):
+                    name = (owner + "-compose-").encode() + name
+                lines.append(name + b"        | " + message + b"\n")
+            return b"".join(lines)
+        self.rewrite_logs(change)
+        evidence.validate(self.directory, self.raw_inputs())
+
+    def test_compose_logs_foreign_owner_unknown_container_and_diagnostics_rejected(self):
+        owner = driver.Inputs(self.raw_inputs(), suite="compose").owner
+        for name, change in (
+                ("foreign-owner", lambda raw: raw.replace(("|" + owner + "|listening").encode(), b"|vz04-foreign|listening", 1)),
+                ("foreign-project-container", lambda raw: raw + b"failure-1 | vz04|failure|" + owner.encode() + b"|exit-37\n"),
+                ("neighbor-machine-line", lambda raw: raw + b"db-1 | vz04|db|vz04-neighbor|listening\n"),
+                ("unattributed-line", lambda raw: raw + b"vz04|db|" + owner.encode() + b"|listening\n"),
+                ("unterminated", lambda raw: raw[:-1]),
+                ("empty", lambda _raw: b"")):
+            with self.subTest(change=name):
+                self.fresh()
+                self.rewrite_logs(change)
+                self.rejected()
+        self.fresh()
+        self.raw(self.logs_row, lambda _raw: b"WARN follow stopped\n", stream="stderr")
+        self.rejected()
+
+    def test_compose_logs_missing_duplicate_or_reordered_service_lines_rejected(self):
+        def reorder(raw):
+            lines = raw.splitlines(keepends=True)
+            api = [i for i, line in enumerate(lines) if line.lstrip().startswith(b"api-1")]
+            lines[api[0]], lines[api[1]] = lines[api[1]], lines[api[0]]
+            return b"".join(lines)
+        for name, change in (("missing", lambda raw: b"".join(raw.splitlines(keepends=True)[:-1])),
+                             ("duplicate", lambda raw: raw + raw.splitlines(keepends=True)[0]),
+                             ("reordered", reorder)):
+            with self.subTest(change=name):
+                self.fresh()
+                self.rewrite_logs(change)
+                self.rejected()
+
+    def test_compose_logs_raw_digest_claim_must_match_retained_stream(self):
+        result_path = self.directory / "result.json"
+        result = json.loads(result_path.read_bytes())
+        item = result["observations"][evidence.RECIPES.index("compose-logs")]
+        item["assertions"] = [x if not x.startswith("compose logs raw stdout sha256 ") else
+                              "compose logs raw stdout sha256 " + "0" * 64 for x in item["assertions"]]
+        result_path.write_bytes(data(result))
+        self.refresh()
+        self.rejected()
+
+    def test_compose_logs_follow_requires_every_service_stopped_first(self):
+        rows = [row for _path, row in self.receipts()]
+        index = next(i for i, row in enumerate(rows) if self.logs_row(row))
+        inspect = next(row for row in reversed(rows[:index]) if row["argv"][5:7] == ["container", "inspect"])
+        def change(raw):
+            items = json.loads(raw)
+            next(item for item in items if item["Config"]["Labels"]["com.docker.compose.service"] == "worker")["State"].update(
+                Status="running", Running=True)
+            return data(items)
+        self.raw(lambda row: row["index"] == inspect["index"], change)
+        self.rejected()
 
     def test_checksum_and_missing_raw_file_fail(self):
         (self.directory / "command-00001.stdout").write_bytes(b"changed")

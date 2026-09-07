@@ -1,0 +1,649 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 aggregate gate manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "candidate_tuple",
+    "candidate_tuple_sha256",
+    "clients",
+    "developer_overrides",
+    "finished_at_utc",
+    "host",
+    "index_path",
+    "inputs",
+    "inventories",
+    "kind",
+    "lanes",
+    "leak_diff",
+    "phases",
+    "prerequisites",
+    "release",
+    "required_scenarios",
+    "run_id",
+    "schema_version",
+    "source",
+    "started_at_utc",
+    "state_root",
+    "suite",
+    "toolchain",
+    "verdict"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-gate-manifest"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "suite": {
+      "const": "all"
+    },
+    "verdict": {
+      "enum": [
+        "running",
+        "PASS",
+        "FAIL"
+      ]
+    },
+    "started_at_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "finished_at_utc": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "developer_overrides": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "dry_lanes"
+        ]
+      }
+    },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit",
+        "dirty",
+        "repo_root"
+      ],
+      "properties": {
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "dirty": {
+          "type": "boolean"
+        },
+        "repo_root": {
+          "type": "string",
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        }
+      }
+    },
+    "host": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "architecture",
+        "cpu_count",
+        "hardware_model",
+        "hostname_sha256",
+        "memory_bytes",
+        "os",
+        "os_build",
+        "os_version"
+      ],
+      "properties": {
+        "os": {
+          "type": "string",
+          "minLength": 1
+        },
+        "os_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "os_build": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "hardware_model": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "architecture": {
+          "type": "string",
+          "minLength": 1
+        },
+        "memory_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "cpu_count": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 1
+        },
+        "hostname_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "cargo",
+        "codesign",
+        "python",
+        "rustc",
+        "uv"
+      ],
+      "properties": {
+        "python": {
+          "type": "string",
+          "minLength": 1
+        },
+        "uv": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "cargo": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "rustc": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "codesign": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    },
+    "release": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "components",
+        "dir",
+        "normalized_content_sha256",
+        "release_dir_sha256",
+        "release_manifest_sha256",
+        "release_version",
+        "signed_content_sha256",
+        "signing_class",
+        "source_commit"
+      ],
+      "properties": {
+        "dir": {
+          "type": "string",
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        },
+        "release_dir_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "release_manifest_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signing_class": {
+          "enum": [
+            "local-test-signed",
+            "developer-id-notarized"
+          ]
+        },
+        "release_version": {
+          "type": "string",
+          "minLength": 1
+        },
+        "normalized_content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "signed_content_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "source_commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "components": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        }
+      }
+    },
+    "inputs": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "path",
+          "present",
+          "sha256"
+        ],
+        "properties": {
+          "path": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "sha256": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "present": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "candidate_tuple": {
+      "type": "object"
+    },
+    "candidate_tuple_sha256": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "index_path": {
+      "type": "string",
+      "pattern": "^/[^\\r\\n\\x00]*$"
+    },
+    "state_root": {
+      "type": "string",
+      "pattern": "^/[^\\r\\n\\x00]*$"
+    },
+    "clients": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "buildx_plugin",
+        "compose_plugin",
+        "docker"
+      ],
+      "properties": {
+        "docker": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        },
+        "compose_plugin": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        },
+        "buildx_plugin": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        }
+      }
+    },
+    "prerequisites": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "receipts",
+        "status"
+      ],
+      "properties": {
+        "status": {
+          "enum": [
+            "passed",
+            "failed",
+            "not_executed"
+          ]
+        },
+        "receipts": {
+          "type": "array",
+          "items": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        }
+      }
+    },
+    "lanes": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "entry_point",
+          "phases",
+          "role",
+          "sha256"
+        ],
+        "properties": {
+          "entry_point": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "sha256": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          },
+          "role": {
+            "enum": [
+              "prerequisite",
+              "acceptance"
+            ]
+          },
+          "phases": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "enum": [
+                "clean-provision",
+                "persisted-recovery/pre-sleep",
+                "persisted-recovery/post-wake",
+                "final-cleanup"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "required_scenarios": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "id",
+          "lane",
+          "phase"
+        ],
+        "properties": {
+          "id": {
+            "type": "string",
+            "pattern": "^(gate|docker)\\.[a-z_]+\\.[a-z_]+$"
+          },
+          "lane": {
+            "enum": [
+              "sandbox-vm",
+              "topology",
+              "linux-docker",
+              "native-macos"
+            ]
+          },
+          "phase": {
+            "enum": [
+              "clean-provision",
+              "persisted-recovery/pre-sleep",
+              "persisted-recovery/post-wake",
+              "final-cleanup"
+            ]
+          }
+        }
+      }
+    },
+    "phases": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "finished_at_utc",
+          "handoff_path",
+          "lanes",
+          "leak_diff_path",
+          "name",
+          "sleep_wake_path",
+          "started_at_utc"
+        ],
+        "properties": {
+          "name": {
+            "enum": [
+              "clean-provision",
+              "persisted-recovery",
+              "final-cleanup"
+            ]
+          },
+          "started_at_utc": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          },
+          "finished_at_utc": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          },
+          "lanes": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "failure_reason",
+                "lane",
+                "outcome",
+                "phase",
+                "result_path"
+              ],
+              "properties": {
+                "lane": {
+                  "enum": [
+                    "sandbox-vm",
+                    "topology",
+                    "linux-docker",
+                    "native-macos"
+                  ]
+                },
+                "phase": {
+                  "enum": [
+                    "clean-provision",
+                    "persisted-recovery/pre-sleep",
+                    "persisted-recovery/post-wake",
+                    "final-cleanup"
+                  ]
+                },
+                "result_path": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+                },
+                "outcome": {
+                  "enum": [
+                    "passed",
+                    "failed"
+                  ]
+                },
+                "failure_reason": {
+                  "anyOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "enum": [
+                        "not_implemented",
+                        "assertion",
+                        "prerequisite",
+                        "cleanup",
+                        "timeout",
+                        "crash",
+                        "input_rejected",
+                        "uncertain_effects"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "handoff_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "sleep_wake_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          },
+          "leak_diff_path": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+          }
+        }
+      }
+    },
+    "inventories": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "after",
+        "before"
+      ],
+      "properties": {
+        "before": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        },
+        "after": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "pattern": "^[A-Za-z0-9._@+-]+(/[A-Za-z0-9._@+-]+)*$"
+        }
+      }
+    },
+    "leak_diff": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "performed",
+            "reason",
+            "survivors"
+          ],
+          "properties": {
+            "performed": {
+              "type": "boolean"
+            },
+            "survivors": {
+              "type": "array",
+              "items": {
+                "type": "string",
+                "minLength": 1
+              }
+            },
+            "reason": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "enum": [
+              "PASS",
+              "FAIL"
+            ]
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "finished_at_utc": {
+            "type": "string",
+            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "verdict": {
+            "const": "PASS"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "developer_overrides": {
+            "maxItems": 0
+          }
+        }
+      }
+    }
+  ]
+}

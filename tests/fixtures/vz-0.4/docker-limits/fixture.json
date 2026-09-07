@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "scope": "DEV_DOCKER_LIMITS_FIXTURE_NOT_DOCKER_CERTIFICATION",
+  "image": "developer-probe-rootfs.tar imported by the harness sentinel; no registry pull",
+  "allocator": {
+    "path": "allocate.sh",
+    "sha256": "7f65d83d8b73c2f69ea5f9395db1b67bfa5d9042af7a7c48a7d9abe69bd01192",
+    "bytes": 841,
+    "interpreter": ["/bin/busybox", "sh", "-c"],
+    "chunk_bytes": 1048576,
+    "doublings": 11,
+    "target_bytes": 2147483648,
+    "progress_prefix": "VZ_ALLOC step=",
+    "survivor_exit_code": 61,
+    "chunk_failure_exit_code": 62
+  },
+  "resource_limits": {
+    "memory_bytes": 1073741824,
+    "cpus": "1",
+    "pids_limit": 64,
+    "swap_limit_scope": "developer kernel builds CONFIG_SWAP=n (linux/vz-linux.config); memory.swap.max is absent and --memory-swap is not requested",
+    "cgroup_files": ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/cpu.max", "/sys/fs/cgroup/pids.max"],
+    "limited": {"memory.max": "1073741824", "cpu.max": "100000 100000", "pids.max": "64"},
+    "control": {"memory.max": "max", "cpu.max": "max 100000", "pids.max": "max"},
+    "sleep_seconds": 600
+  },
+  "oom": {
+    "memory_limit_bytes": 1073741824,
+    "oom_killed": true,
+    "container_exit_code": 137,
+    "events": ["create", "start", "oom", "die"],
+    "die_exit_code": "137",
+    "sibling_health_probe_seconds": 60,
+    "sibling_health_probe_interval_seconds": 1,
+    "sibling_health_failures": 0
+  }
+}

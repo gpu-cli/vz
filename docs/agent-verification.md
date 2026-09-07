@@ -34,6 +34,7 @@ Run from the repository root and attach artifact paths and logs to the issue:
 | Container/stack runtime | `scripts/run-sandbox-vm-e2e.sh --profile release --suite all` and artifact logs |
 | Linux-target Docker | Ship and run `scripts/run-linux-docker-e2e.sh --suite all` from the host when the Docker wave lands; prove youki is the only OCI runtime binary present in the target |
 | btrfs portability | `scripts/run-linux-btrfs-e2e.sh`, with `.artifacts/linux-btrfs-e2e/<timestamp>/summary.txt` and logs |
+| Aggregate 0.4 release gate (topology, Docker, native macOS, migration) | `scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <verified release dir> --run-id <id> …`, then `scripts/validate-vz-0.4-evidence.sh .artifacts/vz-0.4-e2e/<run-id>/manifest.json` must reproduce `PASS`; see [vz-0.4-release-gate.md](vz-0.4-release-gate.md). Today the gate is step 1 and verdicts FAIL with 85 MISSING; `--dry-lanes` output is DEV only |
 
 The Docker suite is a required deliverable, not an already-present harness.
 This requirement includes `vz-5in`, `vz-yr9`, `vz-k3v`, and `vz-7ez`.

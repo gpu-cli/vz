@@ -1,0 +1,399 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vz.dev/schemas/vz-0.4-release-manifest.schema.json",
+  "title": "vz 0.4 release candidate manifest",
+  "description": "release-manifest.json written by scripts/build-vz-0.4-release-candidate.sh. Normative source: planning/developer-environments/GOAL-0.4.0.md#release-candidate-and-entry-point. A manifest with source.clean=false, builder.development_only=true, or signing_class=local-test-signed is development evidence only; GA requires developer-id-notarized with the same source.commit and normalized_content_sha256 as the release workflow's distribution.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema", "schema_version", "kind", "signing_class", "release_version", "built_at_utc", "source", "toolchain",
+    "components", "guest_bundles", "buildkit", "machine_target_catalog", "normalized_content_sha256",
+    "signed_content_sha256", "builder"
+  ],
+  "$defs": {
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "gitObject": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+    "relativePath": { "type": "string", "minLength": 1, "pattern": "^(?!/)(?!.*(^|/)\\.\\.(/|$))[^\\u0000\\r\\n]+$" },
+    "utcTimestamp": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$" },
+    "cargo": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["package_id", "target", "features", "profile", "locked"],
+      "properties": {
+        "package_id": { "type": "string", "minLength": 1 },
+        "target": { "type": "string", "minLength": 1 },
+        "features": { "type": "array", "items": { "type": "string" }, "uniqueItems": true },
+        "profile": { "const": "release" },
+        "locked": { "const": true }
+      }
+    },
+    "codesign": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identifier", "cdhash", "flags", "team_id", "signature", "runtime_version", "entitlements_sha256",
+        "hardened_runtime", "metadata_file", "entitlements_file", "signing"
+      ],
+      "properties": {
+        "identifier": { "type": "string", "minLength": 1 },
+        "cdhash": { "type": "string", "pattern": "^[0-9a-f]{40}$" },
+        "flags": { "type": "string", "pattern": "^0x[0-9a-f]+\\([a-z,-]*\\)$" },
+        "team_id": { "type": ["string", "null"] },
+        "signature": { "type": "string", "minLength": 1 },
+        "runtime_version": { "type": ["string", "null"] },
+        "entitlements_sha256": { "oneOf": [ { "$ref": "#/$defs/sha256" }, { "type": "null" } ] },
+        "hardened_runtime": { "type": "boolean" },
+        "metadata_file": { "$ref": "#/$defs/relativePath" },
+        "entitlements_file": { "oneOf": [ { "$ref": "#/$defs/relativePath" }, { "type": "null" } ] },
+        "signing": { "enum": ["ad-hoc-hardened-runtime-entitled", "ad-hoc", "developer-id-hardened-runtime-entitled", "developer-id"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "signing": { "enum": ["ad-hoc-hardened-runtime-entitled", "developer-id-hardened-runtime-entitled"] } } },
+          "then": {
+            "properties": {
+              "hardened_runtime": { "const": true },
+              "entitlements_sha256": { "$ref": "#/$defs/sha256" },
+              "entitlements_file": { "$ref": "#/$defs/relativePath" }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "signing": { "enum": ["ad-hoc", "ad-hoc-hardened-runtime-entitled"] } } },
+          "then": { "properties": { "signature": { "const": "adhoc" }, "team_id": { "const": null } } }
+        }
+      ]
+    },
+    "component": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "unsigned_sha256", "signed_sha256", "cargo", "codesign"],
+      "properties": {
+        "kind": {
+          "enum": [
+            "host-binary", "guest-kernel", "guest-initramfs", "guest-oci-runtime", "guest-version",
+            "guest-probe-archive", "buildkit-archive", "entitlements"
+          ]
+        },
+        "unsigned_sha256": { "$ref": "#/$defs/sha256" },
+        "signed_sha256": { "$ref": "#/$defs/sha256" },
+        "cargo": { "oneOf": [ { "$ref": "#/$defs/cargo" }, { "type": "null" } ] },
+        "codesign": { "oneOf": [ { "$ref": "#/$defs/codesign" }, { "type": "null" } ] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "kind": { "const": "host-binary" } } },
+          "then": {
+            "properties": { "cargo": { "$ref": "#/$defs/cargo" }, "codesign": { "$ref": "#/$defs/codesign" } }
+          },
+          "else": {
+            "properties": { "cargo": { "const": null }, "codesign": { "const": null } }
+          }
+        }
+      ]
+    },
+    "guestProfile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dir", "version_json_sha256", "version"],
+      "properties": {
+        "dir": { "enum": ["linux/developer", "linux/container"] },
+        "version_json_sha256": { "$ref": "#/$defs/sha256" },
+        "version": {
+          "type": "object",
+          "required": ["profile", "kernel", "agent", "youki", "sha256_vmlinux", "sha256_initramfs", "sha256_youki", "capabilities"],
+          "properties": {
+            "profile": { "enum": ["developer", "container"] },
+            "kernel": { "type": "string", "minLength": 1 },
+            "agent": { "type": "string", "minLength": 1 },
+            "youki": { "type": "string", "minLength": 1 },
+            "sha256_vmlinux": { "$ref": "#/$defs/sha256" },
+            "sha256_initramfs": { "$ref": "#/$defs/sha256" },
+            "sha256_youki": { "$ref": "#/$defs/sha256" },
+            "developer_probe": { "type": ["object", "null"] },
+            "capabilities": { "type": "array", "items": { "type": "string" }, "minItems": 1, "uniqueItems": true }
+          }
+        }
+      }
+    }
+  },
+  "properties": {
+    "$schema": { "const": "../schemas/vz-0.4-release-manifest.schema.json" },
+    "schema_version": { "const": 1 },
+    "kind": { "const": "vz-0.4-release-candidate" },
+    "signing_class": { "enum": ["local-test-signed", "developer-id-notarized"] },
+    "release_version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(-[A-Za-z0-9.-]+)?$" },
+    "built_at_utc": { "$ref": "#/$defs/utcTimestamp" },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "commit", "git_tree", "tree_sha256", "tree_digest_algorithm", "tracked_file_count", "clean", "tracked_changes",
+        "untracked_paths", "submodules", "lockfile", "post_build_tree_sha256", "stable_during_build"
+      ],
+      "properties": {
+        "commit": { "$ref": "#/$defs/gitObject" },
+        "git_tree": { "$ref": "#/$defs/gitObject" },
+        "tree_sha256": { "$ref": "#/$defs/sha256" },
+        "tree_digest_algorithm": { "type": "string", "minLength": 1 },
+        "tracked_file_count": { "type": "integer", "minimum": 1 },
+        "clean": { "type": "boolean" },
+        "tracked_changes": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["status", "path", "original"],
+            "properties": {
+              "status": { "type": "string", "minLength": 2, "maxLength": 2 },
+              "path": { "type": "string", "minLength": 1 },
+              "original": { "type": ["string", "null"] }
+            }
+          }
+        },
+        "untracked_paths": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+        "submodules": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "commit", "state"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "commit": { "$ref": "#/$defs/gitObject" },
+              "state": { "enum": ["clean", "checkout_differs", "not_initialized", "merge_conflict"] }
+            }
+          }
+        },
+        "lockfile": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "tracked", "unchanged"],
+          "properties": {
+            "path": { "const": "crates/Cargo.lock" },
+            "tracked": { "const": true },
+            "unchanged": { "const": true }
+          }
+        },
+        "post_build_tree_sha256": { "$ref": "#/$defs/sha256" },
+        "stable_during_build": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "clean": { "const": true } } },
+          "then": {
+            "properties": {
+              "tracked_changes": { "maxItems": 0 },
+              "untracked_paths": { "maxItems": 0 },
+              "submodules": { "items": { "properties": { "state": { "const": "clean" } } } },
+              "stable_during_build": { "const": true }
+            }
+          }
+        }
+      ]
+    },
+    "toolchain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rustc", "cargo", "host_triple", "git", "macos_product_version", "macos_build_version", "jq", "python"],
+      "properties": {
+        "rustc": { "type": "string", "pattern": "^rustc [0-9]" },
+        "cargo": { "type": "string", "pattern": "^cargo [0-9]" },
+        "host_triple": { "const": "aarch64-apple-darwin" },
+        "git": { "type": "string", "pattern": "^git version " },
+        "macos_product_version": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+){1,2}$" },
+        "macos_build_version": { "type": "string", "minLength": 1 },
+        "jq": { "type": "string", "pattern": "^jq-" },
+        "python": { "type": "string", "pattern": "^Python 3\\.9\\." }
+      }
+    },
+    "components": {
+      "type": "object",
+      "propertyNames": { "$ref": "#/$defs/relativePath" },
+      "additionalProperties": { "$ref": "#/$defs/component" },
+      "required": [
+        "bin/vz", "bin/vz-runtimed", "bin/vz-macos-setup", "bin/vz-guest-agent", "bin/vz-agent-loader",
+        "linux/developer/vmlinux", "linux/developer/initramfs.img", "linux/developer/youki",
+        "linux/developer/version.json", "linux/developer/developer-probe-rootfs.tar",
+        "linux/container/vmlinux", "linux/container/initramfs.img", "linux/container/youki", "linux/container/version.json",
+        "buildkit/vz-buildkit-v0.19.0-linux-arm64.tar", "entitlements.plist"
+      ],
+      "properties": {
+        "bin/vz": { "properties": { "kind": { "const": "host-binary" }, "codesign": { "properties": { "signing": { "pattern": "hardened-runtime-entitled$" } } } } },
+        "bin/vz-runtimed": { "properties": { "kind": { "const": "host-binary" }, "cargo": { "properties": { "features": { "maxItems": 0 } } }, "codesign": { "properties": { "signing": { "pattern": "hardened-runtime-entitled$" } } } } },
+        "bin/vz-macos-setup": { "properties": { "kind": { "const": "host-binary" }, "codesign": { "properties": { "signing": { "pattern": "hardened-runtime-entitled$" } } } } },
+        "bin/vz-guest-agent": { "properties": { "kind": { "const": "host-binary" } } },
+        "bin/vz-agent-loader": { "properties": { "kind": { "const": "host-binary" } } },
+        "linux/developer/vmlinux": { "properties": { "kind": { "const": "guest-kernel" } } },
+        "linux/developer/initramfs.img": { "properties": { "kind": { "const": "guest-initramfs" } } },
+        "linux/developer/youki": { "properties": { "kind": { "const": "guest-oci-runtime" } } },
+        "linux/developer/version.json": { "properties": { "kind": { "const": "guest-version" } } },
+        "linux/developer/developer-probe-rootfs.tar": { "properties": { "kind": { "const": "guest-probe-archive" } } },
+        "linux/container/vmlinux": { "properties": { "kind": { "const": "guest-kernel" } } },
+        "linux/container/initramfs.img": { "properties": { "kind": { "const": "guest-initramfs" } } },
+        "linux/container/youki": { "properties": { "kind": { "const": "guest-oci-runtime" } } },
+        "linux/container/version.json": { "properties": { "kind": { "const": "guest-version" } } },
+        "buildkit/vz-buildkit-v0.19.0-linux-arm64.tar": { "properties": { "kind": { "const": "buildkit-archive" } } },
+        "entitlements.plist": { "properties": { "kind": { "const": "entitlements" } } }
+      },
+      "not": { "required": ["linux/container/developer-probe-rootfs.tar"] }
+    },
+    "guest_bundles": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "linux_docker_context", "reused_from", "build_logs", "profiles"],
+      "properties": {
+        "source": { "enum": ["rebuilt", "reused"] },
+        "linux_docker_context": { "type": ["string", "null"] },
+        "reused_from": {
+          "oneOf": [
+            { "type": "null" },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["path", "content_sha256"],
+              "properties": {
+                "path": { "type": "string", "pattern": "^/" },
+                "content_sha256": { "$ref": "#/$defs/sha256" }
+              }
+            }
+          ]
+        },
+        "build_logs": { "type": "array", "items": { "$ref": "#/$defs/relativePath" } },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["developer", "container"],
+          "properties": {
+            "developer": {
+              "allOf": [
+                { "$ref": "#/$defs/guestProfile" },
+                { "properties": { "dir": { "const": "linux/developer" }, "version": { "properties": { "profile": { "const": "developer" }, "developer_probe": { "type": "object" } } } } }
+              ]
+            },
+            "container": {
+              "allOf": [
+                { "$ref": "#/$defs/guestProfile" },
+                { "properties": { "dir": { "const": "linux/container" }, "version": { "properties": { "profile": { "const": "container" }, "developer_probe": { "const": null } } } } }
+              ]
+            }
+          }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "source": { "const": "rebuilt" } } },
+          "then": {
+            "properties": {
+              "linux_docker_context": { "type": "string", "minLength": 1 },
+              "reused_from": { "const": null },
+              "build_logs": { "minItems": 2 }
+            }
+          },
+          "else": {
+            "properties": {
+              "linux_docker_context": { "const": null },
+              "reused_from": { "type": "object" },
+              "build_logs": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "buildkit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "archive", "sha256", "source_mode", "contract", "contract_sha256", "provenance", "provenance_sha256",
+        "verification", "verification_sha256"
+      ],
+      "properties": {
+        "archive": { "const": "buildkit/vz-buildkit-v0.19.0-linux-arm64.tar" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "source_mode": { "const": "candidate-build" },
+        "contract": { "const": "config/buildkit-artifact-v0.19.0.json" },
+        "contract_sha256": { "$ref": "#/$defs/sha256" },
+        "provenance": { "$ref": "#/$defs/relativePath" },
+        "provenance_sha256": { "$ref": "#/$defs/sha256" },
+        "verification": { "$ref": "#/$defs/relativePath" },
+        "verification_sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "machine_target_catalog": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "prefix", "writer"],
+      "properties": {
+        "path": { "const": "machine-target-catalog.json" },
+        "sha256": { "$ref": "#/$defs/sha256" },
+        "prefix": { "type": "string", "pattern": "^/" },
+        "writer": { "const": "bin/vz-runtimed --write-installed-machine-target-catalog" }
+      }
+    },
+    "normalized_content_sha256": {
+      "$ref": "#/$defs/sha256",
+      "description": "sha256(canonical_json(sorted [[path, unsigned_sha256] for every component]) + LF)"
+    },
+    "signed_content_sha256": {
+      "$ref": "#/$defs/sha256",
+      "description": "sha256(canonical_json(sorted [[path, signed_sha256] for every component]) + LF)"
+    },
+    "builder": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "script", "script_sha256", "guest_bundles_lib_sha256", "source_tree_helper_sha256", "arguments", "dev_flags",
+        "development_only"
+      ],
+      "properties": {
+        "script": { "const": "scripts/build-vz-0.4-release-candidate.sh" },
+        "script_sha256": { "$ref": "#/$defs/sha256" },
+        "guest_bundles_lib_sha256": { "$ref": "#/$defs/sha256" },
+        "source_tree_helper_sha256": { "$ref": "#/$defs/sha256" },
+        "arguments": { "type": "array", "items": { "type": "string" } },
+        "dev_flags": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "enum": ["dev-unclean-checkout", "reuse-guest-bundles"] }
+        },
+        "development_only": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "dev_flags": { "minItems": 1 } } },
+          "then": { "properties": { "development_only": { "const": true } } },
+          "else": { "properties": { "development_only": { "const": false } } }
+        }
+      ]
+    }
+  },
+  "allOf": [
+    {
+      "if": { "properties": { "source": { "properties": { "clean": { "const": false } } } } },
+      "then": {
+        "properties": {
+          "signing_class": { "const": "local-test-signed" },
+          "builder": { "properties": { "development_only": { "const": true }, "dev_flags": { "contains": { "const": "dev-unclean-checkout" } } } }
+        }
+      }
+    },
+    {
+      "if": { "properties": { "builder": { "properties": { "development_only": { "const": true } } } } },
+      "then": { "properties": { "signing_class": { "const": "local-test-signed" } } }
+    },
+    {
+      "if": { "properties": { "guest_bundles": { "properties": { "source": { "const": "reused" } } } } },
+      "then": { "properties": { "builder": { "properties": { "dev_flags": { "contains": { "const": "reuse-guest-bundles" } } } } } }
+    },
+    {
+      "if": { "properties": { "signing_class": { "const": "developer-id-notarized" } } },
+      "then": {
+        "properties": {
+          "source": { "properties": { "clean": { "const": true } } },
+          "builder": { "properties": { "development_only": { "const": false } } },
+          "guest_bundles": { "properties": { "source": { "const": "rebuilt" } } }
+        }
+      }
+    }
+  ]
+}

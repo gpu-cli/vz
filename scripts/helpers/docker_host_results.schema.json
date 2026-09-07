@@ -7,7 +7,7 @@
   "properties": {
     "schema_version": {"const": 1},
     "kind": {"const": "docker_host_fixture_subset"},
-    "suite": {"enum": ["build", "compose", "all"]},
+    "suite": {"enum": ["build", "compose", "build_compose"]},
     "run_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9-]{7,39}$"},
     "scope": {
       "type": "object", "additionalProperties": false,
@@ -38,7 +38,7 @@
         "type": "object", "additionalProperties": false,
         "required": ["recipe", "related_scenario_ids", "first_command", "last_command", "outcome", "assertions"],
         "properties": {
-          "recipe": {"enum": ["build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount", "compose-create", "compose-up-order", "compose-exec", "compose-network-paths", "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure"]},
+          "recipe": {"enum": ["build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount", "compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths", "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure"]},
           "related_scenario_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
                                    "items": {"type": "string", "pattern": "^docker\\.[a-z_]+\\.[a-z_]+$"}},
           "first_command": {"type": "integer", "minimum": 1},
@@ -72,10 +72,10 @@
     "then": {"properties": {"observations": {"minItems": 5, "maxItems": 5}}}
   }, {
     "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "compose"}}},
-    "then": {"properties": {"observations": {"minItems": 8, "maxItems": 8}}}
+    "then": {"properties": {"observations": {"minItems": 9, "maxItems": 9}}}
   }, {
-    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "all"}}},
-    "then": {"properties": {"observations": {"minItems": 13, "maxItems": 13}}}
+    "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "build_compose"}}},
+    "then": {"properties": {"observations": {"minItems": 14, "maxItems": 14}}}
   }],
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
