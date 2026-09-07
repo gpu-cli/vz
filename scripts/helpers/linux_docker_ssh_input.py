@@ -18,7 +18,7 @@ import linux_docker_image_input as image_input
 require = driver.require
 REPO = Path(__file__).resolve().parents[2]
 PIN = REPO / "config/docker-ssh-packages-bookworm-arm64.json"
-PIN_SHA256 = "aa751b309dfb8a0c7c0c3ab61c30bc9efd9ea2ec67fe15b7bc252a321e6cb4ca"
+PIN_SHA256 = "b06dfd62622fc8b3aba62032b78d4f908f0545f51a92be99b350a4aa9fc27d53"
 IMAGE = REPO / "tests/fixtures/vz-0.4/docker/python-image-input.json"
 ENV = {"PATH": "/usr/bin:/bin", "LC_ALL": "C", "LANG": "C"}
 

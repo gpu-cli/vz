@@ -365,6 +365,7 @@
     },
     {
       "filename": "bookworm-Sources.xz",
+      "repository_path": "dists/bookworm/main/source/Sources.xz",
       "sha256": "92d11a035571df011f06f28c61cb9825130ef1d92abb2f2e0525e8674dc44af8",
       "size": 9491888
     },
@@ -375,16 +376,19 @@
     },
     {
       "filename": "openssh_9.2p1-2+deb12u10.dsc",
+      "repository_path": "pool/main/o/openssh/openssh_9.2p1-2+deb12u10.dsc",
       "sha256": "af8cfb3ce783604abd28183a52aa0bde8c6bc603cc35758035db48d1dac5f2e2",
       "size": 3455
     },
     {
       "filename": "openssh_9.2p1.orig.tar.gz",
+      "repository_path": "pool/main/o/openssh/openssh_9.2p1.orig.tar.gz",
       "sha256": "3f66dbf1655fb45f50e1c56da62ab01218c228807b21338d634ebcdf9d71cf46",
       "size": 1852380
     },
     {
       "filename": "openssh_9.2p1-2+deb12u10.debian.tar.xz",
+      "repository_path": "pool/main/o/openssh/openssh_9.2p1-2+deb12u10.debian.tar.xz",
       "sha256": "65cbc8353a4197d0e543dd5330ca9798663256ea54b91a9c7c49116e7ea342ea",
       "size": 204884
     }
