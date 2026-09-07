@@ -29,6 +29,10 @@
       "failure_injection": "abort after the topology schema DDL commits and before the first project write",
       "expected_failure_state": "topology tables exist and are empty; legacy tables unchanged; migration resumes idempotently",
       "rollback_assertion": "restoring the backup removes the topology tables and v0.3.20 reads the legacy tables",
+      "state_schema_step": {
+        "from": 1,
+        "to": 2
+      },
       "receipt_field": "receipts.schema.topology_schema_created"
     },
     {
@@ -41,6 +45,10 @@
       "failure_injection": "abort after the first project write with further legacy sandboxes pending",
       "expected_failure_state": "the written project is complete and consistent; remaining sandboxes still classified as pending; re-run migrates only the remainder",
       "rollback_assertion": "restoring the backup leaves no project rows and every legacy sandbox record intact",
+      "state_schema_step": {
+        "from": 1,
+        "to": 2
+      },
       "receipt_field": "receipts.schema.project_written"
     },
     {
@@ -53,6 +61,10 @@
       "failure_injection": "inject a record carrying both Developer and Hardened markers, and a LinuxFirecracker/Other backend record",
       "expected_failure_state": "migration reports AmbiguousClassification/UnresolvedTargetArchitecture for those records, writes nothing for them, and migrates the others",
       "rollback_assertion": "no Hardened or generic record is ever converted into Developer; rejected records are byte-identical after rollback",
+      "state_schema_step": {
+        "from": 1,
+        "to": 2
+      },
       "receipt_field": "receipts.ownership.legacy_sandbox_classification"
     },
     {
@@ -65,6 +77,10 @@
       "failure_injection": "abort after ownership rebuild and before the lifecycle schema is created",
       "expected_failure_state": "ownership rows complete; lifecycle schema absent; user_version unchanged; migration resumes",
       "rollback_assertion": "backup restore drops ownership rows; no resource has two owners at any observable point",
+      "state_schema_step": {
+        "from": 2,
+        "to": 3
+      },
       "receipt_field": "receipts.ownership.topology_v3_ownership_rebuilt"
     },
     {
@@ -77,6 +93,10 @@
       "failure_injection": "abort inside the lifecycle DDL transaction",
       "expected_failure_state": "transaction rolled back; ownership rows remain; user_version still 2",
       "rollback_assertion": "backup restore returns user_version to the legacy value",
+      "state_schema_step": {
+        "from": 2,
+        "to": 3
+      },
       "receipt_field": "receipts.schema.topology_v3_lifecycle_schema"
     },
     {
@@ -89,6 +109,10 @@
       "failure_injection": "abort after journal DDL and before user_version update",
       "expected_failure_state": "journal tables present and empty or absent; user_version 3; migration is idempotent",
       "rollback_assertion": "backup restore has no journal tables",
+      "state_schema_step": {
+        "from": 3,
+        "to": 4
+      },
       "receipt_field": "receipts.schema.stack_journal_v4"
     },
     {
@@ -101,6 +125,10 @@
       "failure_injection": "abort after durable actions are rebuilt and before observed state is rebuilt",
       "expected_failure_state": "durable actions in v5 shape, observed state still v4, user_version 4; resume completes",
       "rollback_assertion": "backup restore returns durable actions to the v4 shape",
+      "state_schema_step": {
+        "from": 4,
+        "to": 5
+      },
       "receipt_field": "receipts.schema.replica_v5_durable_actions"
     },
     {
@@ -113,6 +141,10 @@
       "failure_injection": "abort after observed state rebuild and before user_version update",
       "expected_failure_state": "both tables in v5 shape; user_version 4; re-run detects the completed shape and only bumps the version",
       "rollback_assertion": "backup restore has v4 observed state",
+      "state_schema_step": {
+        "from": 4,
+        "to": 5
+      },
       "receipt_field": "receipts.schema.replica_v5_observed_state"
     },
     {
@@ -125,6 +157,10 @@
       "failure_injection": "abort after archival and before durable actions are rebuilt",
       "expected_failure_state": "archive table populated; source rows retained; no double archival on resume",
       "rollback_assertion": "backup restore has no archive table and complete inline history",
+      "state_schema_step": {
+        "from": 5,
+        "to": 6
+      },
       "receipt_field": "receipts.schema.reconcile_v6_terminal_history"
     },
     {
@@ -137,6 +173,10 @@
       "failure_injection": "abort after the rebuild and before the replica claim index is created",
       "expected_failure_state": "v6 durable actions without claim index; user_version 5; resume creates only the index",
       "rollback_assertion": "backup restore returns v5 durable actions",
+      "state_schema_step": {
+        "from": 5,
+        "to": 6
+      },
       "receipt_field": "receipts.schema.reconcile_v6_durable_actions"
     },
     {
@@ -149,6 +189,10 @@
       "failure_injection": "abort after index creation and before user_version update",
       "expected_failure_state": "index present; user_version 5; resume bumps the version only",
       "rollback_assertion": "backup restore has no claim index",
+      "state_schema_step": {
+        "from": 5,
+        "to": 6
+      },
       "receipt_field": "receipts.schema.reconcile_v6_claim_index"
     },
     {
@@ -161,6 +205,10 @@
       "failure_injection": "abort after guards are created and before user_version update",
       "expected_failure_state": "guards present and enforcing; user_version 6; resume is idempotent",
       "rollback_assertion": "backup restore has no guards and v0.3.20-era rows are unchanged",
+      "state_schema_step": {
+        "from": 6,
+        "to": 7
+      },
       "receipt_field": "receipts.schema.claim_v7_immutability_guards"
     },
     {
@@ -173,7 +221,43 @@
       "failure_injection": "abort after finalizer DDL and before user_version update",
       "expected_failure_state": "finalizer tables present and empty; user_version 7; resume bumps the version",
       "rollback_assertion": "backup restore has no finalizer tables",
+      "state_schema_step": {
+        "from": 7,
+        "to": 8
+      },
       "receipt_field": "receipts.schema.teardown_finalizer_v8"
+    },
+    {
+      "id": "mig.schema.teardown_runtime_identity_v9",
+      "domain": "schema",
+      "component": "vz-stack state store teardown runtime identity v9 migration",
+      "source_reference": "crates/vz-stack/src/state_store/topology.rs TEARDOWN_RUNTIME_IDENTITY_SCHEMA_V9_DDL, migrate_teardown_runtime_identity_v8_to_v9",
+      "pre_state": "user_version 8; teardown_finalizers has no initial_runtime_identity_json column and its immutability trigger does not guard one",
+      "post_state": "initial_runtime_identity_json added to teardown_finalizers, the identity-immutability trigger replaced to guard it, and user_version advanced to 9, all in one immediate transaction",
+      "failure_injection": "migrate a v8 store holding a teardown finalizer in status 'prepared', which by construction recorded no exact runtime identity",
+      "expected_failure_state": "the open fails with `lacks exact runtime identity evidence` naming the operation key; the transaction rolls back so the column and the replaced trigger are absent and user_version is still 8; the prepared finalizer row is untouched and awaits explicit recovery",
+      "rollback_assertion": "restoring the backup returns user_version to 8 with the original teardown_finalizer_identity_immutable trigger definition, and v0.3.20 reads the store; a prepared finalizer is never silently completed or given a synthesized identity",
+      "state_schema_step": {
+        "from": 8,
+        "to": 9
+      },
+      "receipt_field": "receipts.schema.teardown_runtime_identity_v9"
+    },
+    {
+      "id": "mig.schema.environment_network_v10",
+      "domain": "schema",
+      "component": "vz-stack state store Environment network topology v10 migration",
+      "source_reference": "crates/vz-stack/src/state_store/topology.rs ENVIRONMENT_NETWORK_SCHEMA_V10_DDL, migrate_environment_network_v9_to_v10, EnvironmentNetworkV10MigrationFailpoint::AfterNetworkSchemaCreated",
+      "pre_state": "user_version 9; no environment_network_attachments, environment_host_exports, environment_host_imports or environment_machine_egress table exists, and a v9 Environment cannot declare any of them",
+      "post_state": "the four declared-topology projection tables and idx_environment_network_attachment_machine created in one immediate transaction with user_version advanced to 10; every new table is legitimately empty because no v9 Environment could declare a network attachment, host relay or non-Offline egress",
+      "failure_injection": "abort at EnvironmentNetworkV10MigrationFailpoint::AfterNetworkSchemaCreated, after the network DDL executes and before the schema is validated and the version advanced",
+      "expected_failure_state": "the transaction rolls back, so the application schema snapshot is byte-identical to the pre-migration one, none of the four tables exists, and user_version is still 9; reopening the store migrates it to 10 and the pre-v10 project aggregate loads unchanged",
+      "rollback_assertion": "restoring the backup drops the four projection tables and its index and returns user_version to 9; no pre-existing row is rewritten, since the migration is pure schema and adds no data",
+      "state_schema_step": {
+        "from": 9,
+        "to": 10
+      },
+      "receipt_field": "receipts.schema.environment_network_v10"
     },
     {
       "id": "mig.filesystem.legacy_checkpoint_archive",

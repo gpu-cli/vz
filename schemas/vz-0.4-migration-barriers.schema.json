@@ -102,6 +102,25 @@
           "receipt_field": {
             "type": "string",
             "pattern": "^[a-z][a-z0-9_.]*$"
+          },
+          "state_schema_step": {
+            "$comment": "Present exactly on a barrier that is a stage of a vz-stack state-store schema migration, naming the user_version step it belongs to. A barrier outside the state store (filesystem, Docker context, credential scope) omits it. crates/vz-stack/tests/migration_barriers.rs requires these steps to cover every version up to StateStore::CURRENT_SCHEMA_VERSION.",
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "from",
+              "to"
+            ],
+            "properties": {
+              "from": {
+                "type": "integer",
+                "minimum": 1
+              },
+              "to": {
+                "type": "integer",
+                "minimum": 2
+              }
+            }
           }
         }
       }
