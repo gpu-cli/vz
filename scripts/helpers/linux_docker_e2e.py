@@ -804,6 +804,17 @@ class ComposeHarness(startup.Harness):
             self.assert_certain()
             descriptor, token = row["descriptor"], row["token"]
             require(not row.get("probe_name"), "unreconciled input probe retained")
+            if row.get("kind") == "health":
+                # A health probe owns only its container; the image it runs is
+                # owned by the fixture row a composed run shares between suites.
+                require(row.get("container_id") and row.get("image_id"), "unreconciled health container retained")
+                raw, _, _ = self.docker("owned-health-check", descriptor, ["container", "inspect", row["container_id"]])
+                item = json.loads(raw)[0]
+                require(item["Id"] == row["container_id"] and item["Image"] == row["image_id"] and
+                        item["Config"]["Labels"][LABEL] == token, "foreign health container before cleanup")
+                self.mutate("owned-health-remove", descriptor, ["container", "rm", "--force", row["container_id"]])
+                self.exact_absent(descriptor, "container", token)
+                continue
             if row.get("container_id"):
                 raw, _, _ = self.docker("owned-container-check", descriptor, ["container", "inspect", row["container_id"]])
                 item = json.loads(raw)[0]

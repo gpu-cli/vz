@@ -181,12 +181,25 @@ class Health:
         require(not self.prepared and self.thread is None, 'health preparation cannot repeat')
         h = self.harness
         matches = [row for row in h.owned if row.get('descriptor') == self.descriptor and
-                   row.get('image_id') == self.images['compose']['id'] and row.get('kind') != 'sentinel']
-        require(len(matches) == 1 and not matches[0].get('container_id'), 'exact unused owned health image required')
-        row = matches[0]
+                   row.get('image_id') == self.images['compose']['id'] and
+                   row.get('kind') not in ('sentinel', 'health')]
+        require(len(matches) == 1, 'exact owned health image required')
+        source = matches[0]
         self.verify_inputs()
         self.route()
-        self.token = row['token']
+        if h.info.get('suite') != 'all':
+            # A single-suite run keeps its existing container name and ownership
+            # row byte-for-byte.
+            require(not source.get('container_id'), 'exact unused owned health image required')
+            row, self.token = source, source['token']
+        else:
+            # A composed run reuses this probe from more than one suite over the
+            # same Machine and fixture image, so each suite's health container is
+            # named and owned separately; the image stays owned by the fixture row.
+            self.token = source['token'] + '-health-' + (getattr(h, 'active_suite', None) or 'all')
+            row = {'descriptor': self.descriptor, 'kind': 'health', 'token': self.token,
+                   'image_id': self.images['compose']['id']}
+            h.owned.append(row)
         h.exact_absent(self.descriptor, 'container', self.token)
         raw, error, _ = h.mutate('health-container-create', self.descriptor,
             ['container', 'create', '--network', 'none', '--label', LABEL + '=' + self.token,
