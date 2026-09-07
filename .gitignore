@@ -5,3 +5,6 @@ target/
 *.db
 __pycache__/
 .artifacts/
+# Gate run-frozen inputs, acquired from their checked-in pins and cached by
+# the pin's own digest. Reproducible, so never committed.
+.cache/

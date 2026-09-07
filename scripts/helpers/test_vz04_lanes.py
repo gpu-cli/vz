@@ -3,6 +3,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+import unittest.mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -16,7 +17,9 @@ DIGEST = "a" * 64
 
 
 def _ctx(root, **overrides):
-    options = dict(tmux="/usr/bin/true")
+    options = dict(tmux="/usr/bin/true",
+                   acquired_inputs={"registry-archive": "/acquired/registry.tar",
+                                    "registry-layout": "/acquired/layout"})
     options.update(overrides)
     return lanes.LaneContext(run_id="gate-test-run-1", release_dir=root, release_dir_sha256=DIGEST, state_root=root / "state",
                              contract_path=root / "c.json", contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST, fixture_sha256=DIGEST,
@@ -181,6 +184,31 @@ class LaneTests(unittest.TestCase):
         finally:
             fixtures.make_writable(release)
 
+    def test_the_composed_docker_lane_requires_its_acquired_inputs(self):
+        """The registry archive and layout are run-frozen inputs the candidate
+        does not carry. The gate acquires them from the checked-in pin; a lane
+        that did not receive them must refuse rather than invent a path."""
+        release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
+        try:
+            ctx = _ctx(self.root)
+            ctx.release_dir = release
+            argv = lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+            flags = dict(zip(argv, argv[1:]))
+            self.assertEqual(flags["--registry-archive"], "/acquired/registry.tar")
+            self.assertEqual(flags["--registry-layout"], "/acquired/layout")
+            for missing in ("registry-archive", "registry-layout"):
+                partial = _ctx(self.root, acquired_inputs={k: v for k, v in ctx.acquired_inputs.items()
+                                                           if k != missing})
+                partial.release_dir = release
+                with self.assertRaisesRegex(Exception, f"requires an acquired --{missing}"):
+                    lanes.lane_argv(self.lanes["linux-docker"], partial, "clean-provision", self.root / "e2", None)
+            # Other lanes neither need them nor receive them.
+            topology = lanes.lane_argv(self.lanes["topology"], ctx, "clean-provision", self.root / "e3", None)
+            for flag in ("--registry-archive", "--registry-layout"):
+                self.assertNotIn(flag, topology)
+        finally:
+            fixtures.make_writable(release)
+
     def test_a_dry_lane_still_substitutes_when_its_argv_cannot_be_built(self):
         """A dry run substitutes the lane without starting it, so an argv it
         could not have built must not change that verdict — it is recorded as
@@ -286,3 +314,47 @@ class LaneTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class RunInputTests(unittest.TestCase):
+    """The gate's run-frozen inputs come from their checked-in pins.
+
+    Nothing here reaches the network: the acquisition helpers are exercised by
+    their own tests. What matters at this level is that the cache is keyed by
+    the pin that produced it, so changing a pin can never reuse the artifact of
+    the previous one.
+    """
+
+    def test_a_cache_entry_is_named_by_its_pin_digest(self):
+        import vz04_run_inputs as run_inputs
+        root = Path("/cache")
+        first = run_inputs.cache_entry(root, "registry", "a" * 64)
+        second = run_inputs.cache_entry(root, "registry", "b" * 64)
+        self.assertNotEqual(first, second)
+        self.assertEqual(first, run_inputs.cache_entry(root, "registry", "a" * 64))
+        self.assertTrue(first.name.startswith("registry-"))
+        for bad in ("", "a" * 63, "z" * 64, "A" * 64):
+            with self.assertRaises(Exception):
+                run_inputs.cache_entry(root, "registry", bad)
+
+    def test_only_what_was_really_acquired_is_offered(self):
+        """The SSH package set is deliberately absent: its pin does not carry a
+        repository path for every source-proof row, so an acquirer would have to
+        guess where those bytes came from. Offering it here would hand the lane
+        a path to something nothing fetched, and the lane would then run."""
+        import vz04_run_inputs as run_inputs
+        with tempfile.TemporaryDirectory() as cache:
+            with unittest.mock.patch.object(run_inputs, "registry_inputs",
+                                            return_value={"registry-archive": Path(cache),
+                                                          "registry-layout": Path(cache)}):
+                acquired = run_inputs.acquired_inputs(common.REPO_ROOT, Path(cache))
+        self.assertEqual(sorted(acquired), ["registry-archive", "registry-layout"])
+        self.assertNotIn("ssh-packages", acquired)
+
+    def test_an_input_that_vanished_after_acquisition_is_refused(self):
+        import vz04_run_inputs as run_inputs
+        with tempfile.TemporaryDirectory() as cache:
+            with unittest.mock.patch.object(run_inputs, "registry_inputs",
+                                            return_value={"registry-archive": Path(cache) / "gone"}):
+                with self.assertRaisesRegex(Exception, "missing after acquisition"):
+                    run_inputs.acquired_inputs(common.REPO_ROOT, Path(cache))

@@ -40,7 +40,7 @@ class LaneContext:
 
     def __init__(self, *, run_id, release_dir, release_dir_sha256, state_root, contract_path, contract_sha256,
                  candidate_tuple_sha256, fixture_sha256, clients, repo_root=REPO_ROOT, linux_docker_context=None,
-                 tmux=None):
+                 tmux=None, acquired_inputs=None):
         self.run_id = run_id
         self.release_dir = Path(release_dir)
         self.release_dir_sha256 = release_dir_sha256
@@ -56,6 +56,10 @@ class LaneContext:
         # tool like the Docker clients, so the gate resolves it and passes the
         # path rather than the contract naming one.
         self.tmux = tmux
+        # Run-frozen inputs the gate acquired from their checked-in pins, by the
+        # option name the lane passes them as. Absent means nothing was acquired,
+        # which a lane that needs one refuses on rather than inventing a path.
+        self.acquired_inputs = dict(acquired_inputs or {})
 
 
 def entry_point_record(repo_root: Path, lane: dict, argv: list) -> dict:
@@ -113,6 +117,10 @@ def lane_argv(lane: dict, ctx: LaneContext, phase: str, evidence_dir: Path, hand
             extra += ["--" + name, str(value)]
         require(ctx.tmux, "the composed Docker lane drives a terminal and requires --tmux")
         extra += ["--tmux", str(ctx.tmux)]
+        for name in ("registry-archive", "registry-layout"):
+            value = ctx.acquired_inputs.get(name)
+            require(value, f"the composed Docker lane requires an acquired --{name}")
+            extra += ["--" + name, str(value)]
     argv += ["--run-id", ctx.run_id, "--phase", phase, "--release-dir", str(release_dir),
              "--evidence-dir", str(evidence_dir), "--state-root", str(ctx.state_root),
              "--contract", str(ctx.contract_path), "--candidate-tuple", ctx.candidate_tuple_sha256,

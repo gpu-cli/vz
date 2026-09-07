@@ -30,6 +30,7 @@ import vz04_contract as contract_module
 import vz04_host as host
 import vz04_lanes as lanes
 import vz04_phases as phases
+import vz04_run_inputs as run_inputs
 import vz04_schema as schema
 import vz04_validate as validate
 from vz04_common import (EVIDENCE_ROOT_DEFAULT, REPO_ROOT, RUN_ID_PATTERN, GateError, canonical_path, checked_text,
@@ -68,6 +69,7 @@ def parse_args(argv):
     parser.add_argument("--buildx-plugin", default=None)
     parser.add_argument("--linux-docker-context", default=None)
     parser.add_argument("--tmux", default=None)
+    parser.add_argument("--run-inputs-cache", default=None, type=Path)
     parser.add_argument("--sleep-wake-ack-file", default=None)
     parser.add_argument("--dry-lanes", action="store_true", help="DEV ONLY: substitute lanes with not_implemented results")
     return parser.parse_args(argv)
@@ -181,6 +183,12 @@ def run(args) -> int:
     # the same terms, but kept out of `clients`, which names Docker clients and
     # is what the manifest's client facts are built from.
     tmux = host_executable("tmux")
+    # Run-frozen inputs are acquired from their checked-in pins rather than
+    # carried by the candidate or retained in the tree. Cached by the pin's own
+    # digest, so a changed pin can never reuse the previous artifact. A dry run
+    # invokes no lane, so it acquires nothing, exactly as it resolves no client.
+    acquired = {} if args.dry_lanes else run_inputs.acquired_inputs(
+        repo_root, args.run_inputs_cache or (repo_root / ".cache" / "vz-0.4-run-inputs"))
 
     contract = contract_module.load_contract(repo_root)
     docker = contract_module.load_docker_contract(repo_root)
@@ -252,7 +260,7 @@ def run(args) -> int:
                                 contract_path=repo_root / "config/vz-0.4-e2e-contract.json", contract_sha256=frozen["inputs"]["e2e_contract"]["sha256"],
                                 candidate_tuple_sha256=tuple_value["sha256"], fixture_sha256=frozen["digests"]["fixtures_tree_sha256"],
                                 clients=clients, repo_root=repo_root, linux_docker_context=args.linux_docker_context,
-                                tmux=tmux)
+                                tmux=tmux, acquired_inputs=acquired)
 
         def observer(phase, lane, lane_phase, result):
             reason = "" if result["failure"] is None else f" ({result['failure']['reason']})"
