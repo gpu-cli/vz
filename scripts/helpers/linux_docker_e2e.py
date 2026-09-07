@@ -518,6 +518,7 @@ class ComposeHarness(startup.Harness):
         self.runtime_audits = []
         self.registry_sessions = []
         self.prepared_images = {}
+        self.active_suite = None
         self.recovery_sessions, self.recovery_cycles, self.recovery_monitors = [], {}, []
         self.registry_controls = None
         self.registry_project = None
@@ -547,10 +548,13 @@ class ComposeHarness(startup.Harness):
         require(len(self.runtime_audits) == 4, 'all four Machine audit sessions required')
         return [session.capture() for session in self.runtime_audits]
 
-    @staticmethod
-    def builder_key(descriptor, role):
+    def builder_key(self, descriptor, role):
+        """Keyed by the executing suite as well as owner and role: a composed run
+        walks several builder-using suites over the same Machines, and suites
+        that assert cold-cache behaviour must not inherit a warm builder."""
         require(type(role) is str and role in {"source", "cold-control", "importer"}, "unknown builder role")
-        return (json.dumps(descriptor["owner"], sort_keys=True, separators=(",", ":")), role)
+        suite = getattr(self, "active_suite", None) or getattr(self, "info", {}).get("suite", "compose")
+        return (suite, json.dumps(descriptor["owner"], sort_keys=True, separators=(",", ":")), role)
 
     def get_builder(self, descriptor, role="source"):
         key = self.builder_key(descriptor, role)
@@ -845,6 +849,7 @@ class ComposeHarness(startup.Harness):
 
     def run_machine_suite(self, suite, selected_machines, bindings):
         """One suite across its selected Machines; the caller owns the topology."""
+        self.active_suite = suite
         observations = []
         for index, (_environment, machine) in enumerate(selected_machines):
             self.monitor.check()
