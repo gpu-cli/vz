@@ -529,7 +529,7 @@ class ComposeHarness(startup.Harness):
         self.prepared_images = {}
         self.active_suite = None
         self.recovery_sessions, self.recovery_cycles, self.recovery_monitors = [], {}, []
-        self.builders_removed = False
+        self.builders_removed, self.live_cleanup = False, False
         self.registry_controls = None
         self.registry_project = None
 
@@ -754,7 +754,10 @@ class ComposeHarness(startup.Harness):
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
         if self.monitor is not None:
-            require(not self.monitor.thread.is_alive(), "live monitor prevents cleanup")
+            if getattr(self, "live_cleanup", False):
+                self.monitor.check()
+            else:
+                require(not self.monitor.thread.is_alive(), "live monitor prevents cleanup")
             recorders.append(self.monitor.record)
         for selected in self.drivers:
             follower = getattr(selected, "follow_thread", None)
@@ -779,50 +782,43 @@ class ComposeHarness(startup.Harness):
 
         A composed run calls this before `recovery` cycles Stop and Up: a builder
         created before that cycle cannot be reconciled after it, because the
-        Machine it lived in restarted.
+        Machine it lived in restarted. `assert_certain` is the final-cleanup
+        guard and requires a stopped monitor, so for that window it demands a
+        healthy monitor instead of a stopped one.
         """
         if getattr(self, "builders_removed", False):
             return
-        # `assert_certain` is the final-cleanup guard and requires a stopped
-        # monitor, so a composed run's mid-scenario removal uses the live-run
-        # equivalent: the sentinels must still be healthy and no dispatched
-        # command may have uncertain effects.
-        def certain():
-            if final:
+        self.live_cleanup = not final
+        try:
+            self.assert_certain()
+            for builder in reversed(getattr(self, "builders", [])):
                 self.assert_certain()
-                return
-            if self.monitor is not None:
-                self.monitor.check()
-            require(not self.effects_uncertain, "uncertain harness mutation prevents builder removal")
-            for record in (self.record, *(item.record for item in self.drivers)):
-                require(all(row.get("effects_uncertain") is False for row in record.receipts),
-                        "uncertain command prevents builder removal")
-        certain()
-        for builder in reversed(getattr(self, "builders", [])):
-            certain()
-            jobs = [job for job in self.ssh_cache_requests if job["builder"] is builder]
-            require(len(jobs) <= 1, "ambiguous SSH worker-cache ownership")
-            if jobs:
-                from linux_docker_ssh_cache_capture import Capture
-                job = jobs[0]
-                def capture(stopped, stop_proof):
-                    item = Capture(builder, job["canaries"], self.root / ("ssh-cache-private-" + str(job["index"])),
-                                   self.evidence / ("ssh-cache-" + str(job["index"])))
-                    self.ssh_cache_captures.append(item)
-                    result = item.run(stopped, stop_proof)
-                    require(result["owner"] == item.owner and result["normal_stop"] == stop_proof and
-                            result["scan"]["complete"] is True and result["guard_receipts_complete"] is True and
-                            result["builder_restarted"] is False and
-                            all(result["capture"][key] is True for key in
-                                ("owned_process_reaped", "capture_complete", "archive_published")) and
-                            result["capture"]["effects_uncertain"] is False,
-                            "SSH worker-cache proof incomplete or foreign")
-                    self.ssh_cache_proofs.append(result)
-                    return result
-                builder.remove_owned(before_remove=capture)
-            else:
-                builder.remove_owned()
-        require(len(self.ssh_cache_proofs) == len(self.ssh_cache_requests), "SSH worker-cache scan not complete")
+                jobs = [job for job in self.ssh_cache_requests if job["builder"] is builder]
+                require(len(jobs) <= 1, "ambiguous SSH worker-cache ownership")
+                if jobs:
+                    from linux_docker_ssh_cache_capture import Capture
+                    job = jobs[0]
+
+                    def capture(stopped, stop_proof, builder=builder, job=job):
+                        item = Capture(builder, job["canaries"], self.root / ("ssh-cache-private-" + str(job["index"])),
+                                       self.evidence / ("ssh-cache-" + str(job["index"])))
+                        self.ssh_cache_captures.append(item)
+                        result = item.run(stopped, stop_proof)
+                        require(result["owner"] == item.owner and result["normal_stop"] == stop_proof and
+                                result["scan"]["complete"] is True and result["guard_receipts_complete"] is True and
+                                result["builder_restarted"] is False and
+                                all(result["capture"][key] is True for key in
+                                    ("owned_process_reaped", "capture_complete", "archive_published")) and
+                                result["capture"]["effects_uncertain"] is False,
+                                "SSH worker-cache proof incomplete or foreign")
+                        self.ssh_cache_proofs.append(result)
+                        return result
+                    builder.remove_owned(before_remove=capture)
+                else:
+                    builder.remove_owned()
+            require(len(self.ssh_cache_proofs) == len(self.ssh_cache_requests), "SSH worker-cache scan not complete")
+        finally:
+            self.live_cleanup = False
         self.builders_removed = True
 
     def remove_owned(self):
