@@ -9,6 +9,8 @@ use vz_linux::{
     ensure_kernel_profile_with_options, ensure_kernel_with_options, verify_kernel_bundle_read_only,
 };
 
+use crate::error::MacosOciError as OciError;
+
 // Re-export shared types from the runtime contract.
 pub use vz_runtime_contract::{MountAccess, MountSpec, MountType, PortMapping, PortProtocol};
 
@@ -175,6 +177,82 @@ pub(crate) async fn ensure_kernel_for_config(
     match config.linux_profile {
         Some(profile) => ensure_kernel_profile_with_options(profile, options).await,
         None => ensure_kernel_with_options(options).await,
+    }
+}
+
+/// What two boots of the same Machine on the same Environment network must
+/// agree on.
+///
+/// Descriptors do not survive comparison: a second boot presents a different
+/// socket for the same port, so idempotency is decided on the declaration —
+/// which network, at which address, with which MTU — and never on the
+/// descriptor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredAttachment {
+    /// The Environment network this port belongs to.
+    pub network_id: String,
+    /// The address the switch assigned this port, `"XX:XX:XX:XX:XX:XX"`.
+    pub address: String,
+    /// The MTU the attachment was sized for.
+    pub mtu: u32,
+}
+
+/// One Environment-network port a Machine boots attached to.
+///
+/// The socket is the guest end of a switch port and is taken by value, because
+/// `FileHandleNetwork` requires ownership and because a descriptor that reaches
+/// a boot which does not happen must not be usable again. Dropping one is a
+/// caller error rather than a hazard: the switch degrades that port to counted
+/// undeliverable frames and keeps forwarding between the Machines that remain.
+#[derive(Debug)]
+pub struct SharedVmAttachment {
+    declaration: DeclaredAttachment,
+    socket: std::os::fd::OwnedFd,
+}
+
+impl SharedVmAttachment {
+    /// Declare a port, refusing an address the VM configuration would only
+    /// reject later, once a VM already existed.
+    pub fn new(
+        network_id: impl Into<String>,
+        address: impl Into<String>,
+        mtu: u32,
+        socket: std::os::fd::OwnedFd,
+    ) -> Result<Self, OciError> {
+        let (network_id, address) = (network_id.into(), address.into());
+        if network_id.is_empty() {
+            return Err(OciError::InvalidConfig(
+                "network attachment requires a network id".to_string(),
+            ));
+        }
+        let octets: Vec<&str> = address.split(':').collect();
+        if octets.len() != 6
+            || !octets
+                .iter()
+                .all(|octet| octet.len() == 2 && octet.bytes().all(|b| b.is_ascii_hexdigit()))
+        {
+            return Err(OciError::InvalidConfig(format!(
+                "network attachment address must be six colon-separated hex bytes: {address}"
+            )));
+        }
+        Ok(Self {
+            declaration: DeclaredAttachment {
+                network_id,
+                address,
+                mtu,
+            },
+            socket,
+        })
+    }
+
+    /// What a later boot of the same Machine must present again.
+    pub fn declaration(&self) -> &DeclaredAttachment {
+        &self.declaration
+    }
+
+    /// Consume this attachment into its declaration and its guest end.
+    pub(crate) fn into_parts(self) -> (DeclaredAttachment, std::os::fd::OwnedFd) {
+        (self.declaration, self.socket)
     }
 }
 

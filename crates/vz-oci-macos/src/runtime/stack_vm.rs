@@ -171,19 +171,28 @@ pub(super) fn require_explicit_verified_profile(
 pub(super) fn require_matching_shared_vm_boot_request(
     stack_id: &str,
     actual_ports: &[PortMapping],
+    actual_attachments: &[crate::config::DeclaredAttachment],
     actual_resources: &vz_runtime_contract::StackResourceHint,
     requested_ports: &[PortMapping],
+    requested_attachments: &[crate::config::DeclaredAttachment],
     requested_resources: &vz_runtime_contract::StackResourceHint,
 ) -> Result<(), OciError> {
     let resources_match = actual_resources.cpus == requested_resources.cpus
         && actual_resources.memory_mb == requested_resources.memory_mb
         && actual_resources.volume_mounts == requested_resources.volume_mounts
         && actual_resources.disk_image_path == requested_resources.disk_image_path;
-    if actual_ports == requested_ports && resources_match {
+    // Attachments compare by declaration. The descriptor a caller presents is
+    // new on every boot, so comparing sockets would make every retry drift and
+    // comparing nothing would let a Machine be re-attached to a different
+    // network without notice.
+    if actual_ports == requested_ports
+        && actual_attachments == requested_attachments
+        && resources_match
+    {
         return Ok(());
     }
     Err(OciError::InvalidConfig(format!(
-        "shared VM boot request drift for stack '{stack_id}': the active boot has different ports or resources"
+        "shared VM boot request drift for stack '{stack_id}': the active boot has different ports, network attachments or resources"
     )))
 }
 
@@ -1482,7 +1491,7 @@ esac
             .await
             .write_owned()
             .await;
-        self.boot_shared_vm_locked(stack_id, ports, resources, None)
+        self.boot_shared_vm_locked(stack_id, ports, Vec::new(), resources, None)
             .await
     }
 
@@ -1490,6 +1499,7 @@ esac
         &self,
         stack_id: &str,
         ports: Vec<PortMapping>,
+        attachments: Vec<crate::config::SharedVmAttachment>,
         resources: vz_runtime_contract::StackResourceHint,
         required_profile: Option<KernelProfile>,
     ) -> Result<(), OciError> {
@@ -1670,8 +1680,26 @@ esac
             vm_config.serial_log_file = Some(std::path::PathBuf::from(log_path));
         }
 
+        // One NIC per declared attachment, after the Machine's own default
+        // network. An attachment is a port on an Environment switch, so it is
+        // additional to egress, not a replacement for it; egress policy governs
+        // the default NIC and is decided elsewhere.
+        let mut boot_attachments = Vec::with_capacity(attachments.len());
+        let mut attachment_nics = Vec::with_capacity(attachments.len());
+        for attachment in attachments {
+            let (declaration, socket) = attachment.into_parts();
+            let network = vz::FileHandleNetwork::new(socket, declaration.mtu)
+                .map_err(|error| OciError::InvalidConfig(error.to_string()))?;
+            attachment_nics
+                .push(vz::Nic::file_handle(network).with_mac(declaration.address.clone()));
+            boot_attachments.push(declaration);
+        }
         if !self.config.default_network_enabled {
-            vm_config.nics = Some(Vec::new());
+            vm_config.nics = Some(attachment_nics);
+        } else if !attachment_nics.is_empty() {
+            let mut nics = vec![vz::Nic::nat()];
+            nics.extend(attachment_nics);
+            vm_config.nics = Some(nics);
         }
 
         let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
@@ -1689,6 +1717,7 @@ esac
                 boot_complete: false,
                 docker_shutdown: Arc::new(Mutex::new(None)),
                 boot_ports: ports.clone(),
+                boot_attachments: boot_attachments.clone(),
                 boot_resources: resources.clone(),
                 vm: Arc::clone(&vm),
             },
@@ -2930,6 +2959,7 @@ esac
         &self,
         stack_id: &str,
         ports: Vec<PortMapping>,
+        attachments: Vec<crate::config::SharedVmAttachment>,
         resources: vz_runtime_contract::StackResourceHint,
     ) -> Result<SharedVmLifecycleLease, OciError> {
         vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
@@ -2954,18 +2984,35 @@ esac
                     record.verified_linux_profile,
                     "boot_or_inspect_shared_vm",
                 )?;
+                let requested: Vec<_> = attachments
+                    .iter()
+                    .map(|attachment| attachment.declaration().clone())
+                    .collect();
                 require_matching_shared_vm_boot_request(
                     stack_id,
                     &record.boot_ports,
+                    &record.boot_attachments,
                     &record.boot_resources,
                     &ports,
+                    &requested,
                     &resources,
                 )?;
+                // The descriptors go here. This boot already happened, so its
+                // ports are already attached; a guest end dropped now is one
+                // the caller minted for a boot that did not occur, and the
+                // switch degrades that port rather than stalling.
+                drop(attachments);
                 record
             }
             None => {
-                self.boot_shared_vm_locked(stack_id, ports, resources, Some(required_profile))
-                    .await?;
+                self.boot_shared_vm_locked(
+                    stack_id,
+                    ports,
+                    attachments,
+                    resources,
+                    Some(required_profile),
+                )
+                .await?;
                 self.stack_vms
                     .lock()
                     .await

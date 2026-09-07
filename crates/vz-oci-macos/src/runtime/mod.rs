@@ -533,6 +533,9 @@ struct StackVmRecord {
     // exact incarnation remains owned. Never reconstruct this from VM absence.
     docker_shutdown: Arc<Mutex<Option<vz_linux::DockerShutdownComplete>>>,
     boot_ports: Vec<PortMapping>,
+    // The declarations, not the descriptors: a second boot of the same Machine
+    // on the same network presents a different socket for the same port.
+    boot_attachments: Vec<crate::config::DeclaredAttachment>,
     boot_resources: vz_runtime_contract::StackResourceHint,
     vm: Arc<LinuxVm>,
 }

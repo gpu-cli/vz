@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::env;
 use std::process::{Command, Stdio};
@@ -168,6 +168,7 @@ async fn managed_shared_vm_missing_profile_fails_before_runtime_filesystem_effec
         .boot_or_inspect_shared_vm(
             "machine-no-profile",
             Vec::new(),
+            Vec::new(),
             vz_runtime_contract::StackResourceHint::default(),
         )
         .await;
@@ -200,12 +201,19 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         }],
         disk_image_path: Some(std::path::PathBuf::from("/tmp/vz-machine-volume.img")),
     };
+    let attachments = vec![crate::config::DeclaredAttachment {
+        network_id: "net-frontend".to_string(),
+        address: "02:11:22:33:44:55".to_string(),
+        mtu: 1500,
+    }];
     assert!(
         require_matching_shared_vm_boot_request(
             "machine-a",
             &ports,
+            &attachments,
             &resources,
             &ports,
+            &attachments,
             &resources,
         )
         .is_ok()
@@ -221,18 +229,33 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
     drifted_mounts.volume_mounts[0].read_only = true;
     let mut drifted_disk = resources.clone();
     drifted_disk.disk_image_path = None;
-    for (requested_ports, requested_resources) in [
-        (drifted_ports, resources.clone()),
-        (ports.clone(), drifted_cpus),
-        (ports.clone(), drifted_memory),
-        (ports.clone(), drifted_mounts),
-        (ports.clone(), drifted_disk),
+    // A Machine may not be re-attached to a different network, moved to a
+    // different address on the same network, or given a different MTU, and it
+    // may not silently lose or gain a port.
+    let mut drifted_network = attachments.clone();
+    drifted_network[0].network_id = "net-backend".to_string();
+    let mut drifted_address = attachments.clone();
+    drifted_address[0].address = "02:11:22:33:44:56".to_string();
+    let mut drifted_mtu = attachments.clone();
+    drifted_mtu[0].mtu = 9000;
+    for (requested_ports, requested_attachments, requested_resources) in [
+        (drifted_ports, attachments.clone(), resources.clone()),
+        (ports.clone(), attachments.clone(), drifted_cpus),
+        (ports.clone(), attachments.clone(), drifted_memory),
+        (ports.clone(), attachments.clone(), drifted_mounts),
+        (ports.clone(), attachments.clone(), drifted_disk),
+        (ports.clone(), drifted_network, resources.clone()),
+        (ports.clone(), drifted_address, resources.clone()),
+        (ports.clone(), drifted_mtu, resources.clone()),
+        (ports.clone(), Vec::new(), resources.clone()),
     ] {
         let error = require_matching_shared_vm_boot_request(
             "machine-a",
             &ports,
+            &attachments,
             &resources,
             &requested_ports,
+            &requested_attachments,
             &requested_resources,
         )
         .unwrap_err();
@@ -246,7 +269,63 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         );
         assert!(!resources.volume_mounts[0].read_only);
         assert!(resources.disk_image_path.is_some());
+        assert_eq!(
+            attachments[0].network_id, "net-frontend",
+            "drift check mutated the active attachment"
+        );
     }
+}
+
+#[test]
+fn a_reboot_of_the_same_machine_on_the_same_network_is_not_drift() {
+    // The descriptor is new on every boot; the declaration is what a retry
+    // must present again. Comparing sockets would make every idempotent Up of
+    // an attached Machine look like a request for a different VM.
+    let first = crate::config::SharedVmAttachment::new(
+        "net-frontend",
+        "02:11:22:33:44:55",
+        1500,
+        std::os::unix::net::UnixDatagram::unbound().unwrap().into(),
+    )
+    .unwrap();
+    let second = crate::config::SharedVmAttachment::new(
+        "net-frontend",
+        "02:11:22:33:44:55",
+        1500,
+        std::os::unix::net::UnixDatagram::unbound().unwrap().into(),
+    )
+    .unwrap();
+    assert_eq!(first.declaration(), second.declaration());
+    require_matching_shared_vm_boot_request(
+        "machine-a",
+        &[],
+        std::slice::from_ref(first.declaration()),
+        &vz_runtime_contract::StackResourceHint::default(),
+        &[],
+        std::slice::from_ref(second.declaration()),
+        &vz_runtime_contract::StackResourceHint::default(),
+    )
+    .expect("the same declaration through a different descriptor is the same boot request");
+}
+
+#[test]
+fn an_attachment_refuses_an_address_the_vm_configuration_would_only_reject_later() {
+    let socket = || std::os::unix::net::UnixDatagram::unbound().unwrap().into();
+    for address in [
+        "",
+        "02:11:22:33:44",
+        "02:11:22:33:44:55:66",
+        "02-11-22-33-44-55",
+        "02:11:22:33:44:zz",
+        "2:11:22:33:44:55",
+    ] {
+        let error = crate::config::SharedVmAttachment::new("net", address, 1500, socket())
+            .expect_err("a malformed address must be refused before a VM exists");
+        assert!(error.to_string().contains("six colon-separated hex bytes"));
+    }
+    let error = crate::config::SharedVmAttachment::new("", "02:11:22:33:44:55", 1500, socket())
+        .expect_err("an attachment must name its network");
+    assert!(error.to_string().contains("requires a network id"));
 }
 
 #[tokio::test]

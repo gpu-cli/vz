@@ -185,7 +185,16 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
             MacosRuntimeBackend::Linux(runtime) => MachineExecutionLease::Linux(
                 runtime
                     .inner()
-                    .boot_or_inspect_shared_vm(&reservation.resource_id, ports, resources)
+                    // No Environment-network attachments yet: switches exist
+                    // (`EnvironmentSwitches`) but nothing mints ports for a
+                    // Machine boot, so every Machine boots with its default
+                    // network alone.
+                    .boot_or_inspect_shared_vm(
+                        &reservation.resource_id,
+                        ports,
+                        Vec::new(),
+                        resources,
+                    )
                     .await?,
             ),
             MacosRuntimeBackend::Native(runtime) => {
