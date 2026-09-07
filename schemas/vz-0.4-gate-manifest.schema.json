@@ -97,13 +97,16 @@
       "additionalProperties": false,
       "required": [
         "architecture",
+        "boot_session_uuid",
+        "boottime_unix",
         "cpu_count",
         "hardware_model",
         "hostname_sha256",
         "memory_bytes",
         "os",
         "os_build",
-        "os_version"
+        "os_version",
+        "state_root_free_disk_bytes"
       ],
       "properties": {
         "os": {
@@ -149,6 +152,27 @@
         "hostname_sha256": {
           "type": "string",
           "pattern": "^[0-9a-f]{64}$"
+        },
+        "boot_session_uuid": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "boottime_unix": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "state_root_free_disk_bytes": {
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
         }
       }
     },
@@ -157,9 +181,13 @@
       "additionalProperties": false,
       "required": [
         "cargo",
+        "cargo_nextest",
         "codesign",
+        "gate_requirements_sha256",
         "python",
+        "python_executable",
         "rustc",
+        "system_python",
         "uv"
       ],
       "properties": {
@@ -194,6 +222,28 @@
             "null"
           ],
           "minLength": 1
+        },
+        "python_executable": {
+          "type": "string",
+          "pattern": "^/[^\\r\\n\\x00]*$"
+        },
+        "system_python": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "cargo_nextest": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "gate_requirements_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
         }
       }
     },
@@ -308,25 +358,118 @@
       ],
       "properties": {
         "docker": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^/[^\\r\\n\\x00]*$"
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "resolved",
+                "sha256",
+                "version"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                },
+                "resolved": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                }
+              }
+            }
+          ]
         },
         "compose_plugin": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^/[^\\r\\n\\x00]*$"
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "resolved",
+                "sha256",
+                "version"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                },
+                "resolved": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                }
+              }
+            }
+          ]
         },
         "buildx_plugin": {
-          "type": [
-            "string",
-            "null"
-          ],
-          "pattern": "^/[^\\r\\n\\x00]*$"
+          "anyOf": [
+            {
+              "type": "null"
+            },
+            {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "path",
+                "resolved",
+                "sha256",
+                "version"
+              ],
+              "properties": {
+                "path": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                },
+                "sha256": {
+                  "type": "string",
+                  "pattern": "^[0-9a-f]{64}$"
+                },
+                "version": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                },
+                "resolved": {
+                  "type": "string",
+                  "pattern": "^/[^\\r\\n\\x00]*$"
+                }
+              }
+            }
+          ]
         }
       }
     },

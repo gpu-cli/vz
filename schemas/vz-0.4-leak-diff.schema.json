@@ -1,0 +1,128 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 final-cleanup leak diff between the before and after host inventories",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "after_capture_state",
+    "before_capture_state",
+    "kind",
+    "listener_checks",
+    "new_listeners",
+    "performed",
+    "reason",
+    "run_id",
+    "schema_version",
+    "survivors",
+    "unrelated_new_listener_count"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-leak-diff"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "performed": {
+      "const": true
+    },
+    "reason": {
+      "type": "null"
+    },
+    "survivors": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "minLength": 1
+      }
+    },
+    "new_listeners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "address",
+          "command",
+          "pid",
+          "port",
+          "protocol",
+          "run_owned",
+          "scope",
+          "source"
+        ],
+        "properties": {
+          "protocol": {
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          },
+          "address": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "scope": {
+            "enum": [
+              "loopback",
+              "wildcard",
+              "non_loopback"
+            ]
+          },
+          "source": {
+            "enum": [
+              "lsof",
+              "netstat",
+              "both"
+            ]
+          },
+          "run_owned": {
+            "type": "boolean"
+          }
+        }
+      }
+    },
+    "unrelated_new_listener_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "listener_checks": {
+      "type": "object"
+    },
+    "before_capture_state": {
+      "enum": [
+        "captured",
+        "partial"
+      ]
+    },
+    "after_capture_state": {
+      "enum": [
+        "captured",
+        "partial"
+      ]
+    }
+  }
+}

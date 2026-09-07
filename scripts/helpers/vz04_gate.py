@@ -19,23 +19,22 @@ provisioning. It is refused for `developer-id-notarized` releases, recorded in
 from __future__ import annotations
 
 import argparse
-import hashlib
 import os
 from pathlib import Path
-import platform
 import subprocess
 import sys
 import tempfile
 
 import vz04_candidate as candidate
 import vz04_contract as contract_module
+import vz04_host as host
 import vz04_lanes as lanes
 import vz04_phases as phases
 import vz04_schema as schema
 import vz04_validate as validate
 from vz04_common import (EVIDENCE_ROOT_DEFAULT, REPO_ROOT, RUN_ID_PATTERN, GateError, canonical_path, checked_text,
-                         digest_file, document, git_dirty, git_head, load_json, now_ns, require, sha256_bytes,
-                         utc_iso, write_checksums, write_exclusive)
+                         digest_file, document, git_dirty, git_head, load_json, now_ns, require, utc_iso, write_checksums,
+                         write_exclusive)
 
 # Injection point for unit tests only (never a CLI flag): tests build fake
 # release directories with dummy files and substitute a fake verifier here.
@@ -71,34 +70,6 @@ def parse_args(argv):
     parser.add_argument("--sleep-wake-ack-file", default=None)
     parser.add_argument("--dry-lanes", action="store_true", help="DEV ONLY: substitute lanes with not_implemented results")
     return parser.parse_args(argv)
-
-
-def _run_text(argv, timeout=30):
-    try:
-        completed = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False)
-    except (OSError, subprocess.TimeoutExpired):
-        return None
-    text = completed.stdout.decode("utf-8", "replace").strip()
-    return text.splitlines()[0][:200] if completed.returncode == 0 and text else None
-
-
-def host_facts() -> dict:
-    def sysctl(name):
-        value = _run_text(["/usr/sbin/sysctl", "-n", name])
-        return value
-
-    memory = sysctl("hw.memsize")
-    cpus = sysctl("hw.ncpu")
-    return {"os": platform.system(), "os_version": _run_text(["/usr/bin/sw_vers", "-productVersion"]) or platform.release(),
-            "os_build": _run_text(["/usr/bin/sw_vers", "-buildVersion"]), "hardware_model": sysctl("hw.model"),
-            "architecture": platform.machine(), "memory_bytes": int(memory) if memory and memory.isdigit() else None,
-            "cpu_count": int(cpus) if cpus and cpus.isdigit() else None,
-            "hostname_sha256": sha256_bytes(platform.node().encode("utf-8"))}
-
-
-def toolchain_facts() -> dict:
-    return {"python": platform.python_version(), "uv": _run_text(["uv", "--version"]), "cargo": _run_text(["cargo", "--version"]),
-            "rustc": _run_text(["rustc", "--version"]), "codesign": "/usr/bin/codesign" if os.access("/usr/bin/codesign", os.X_OK) else None}
 
 
 class Receipts:
@@ -156,17 +127,6 @@ def load_index(path: Path) -> dict:
     return {"schema_version": 1, "kind": "vz-0.4-run-index", "entries": []}
 
 
-def write_inventory(root: Path, run_id: str, moment: str) -> str:
-    directory = root / "host"
-    directory.mkdir(exist_ok=True)
-    path = directory / f"{moment}-inventory.json"
-    document(path, {"schema_version": 1, "kind": "vz-0.4-resource-inventory", "run_id": run_id, "moment": moment,
-                    "capture_state": "not_captured", "captured_at_utc": utc_iso(),
-                    "not_captured_reason": "host listener/process/interface/context inventories not implemented (build order step 2)",
-                    "listeners": [], "processes": [], "interfaces": [], "sockets": [], "docker_contexts": []})
-    return str(path.relative_to(root))
-
-
 def summary_text(manifest: dict, summary: dict) -> str:
     lines = [f"verdict={summary['verdict']}", f"run_id={manifest['run_id']}", f"candidate_tuple_sha256={manifest['candidate_tuple_sha256']}",
              f"release_dir={manifest['release']['dir']}", f"signing_class={manifest['release']['signing_class']}",
@@ -210,8 +170,11 @@ def run(args) -> int:
             require(args.dry_lanes, f"--{key.replace('_', '-')} is required unless --dry-lanes")
             clients[key] = None
         else:
-            path = canonical_path(value)
-            require(os.access(path, os.X_OK), f"client is not executable: {path}")
+            # Clients are invoked by the path given: OrbStack/Docker Desktop ship
+            # multi-call binaries dispatched by argv[0], so symlinked plugin paths
+            # are admitted as-is and the resolved target is recorded with its digest.
+            path = canonical_path(value, must_exist=False)
+            require(path.is_file() and os.access(path, os.X_OK), f"client is not an executable file: {path}")
             clients[key] = str(path)
 
     contract = contract_module.load_contract(repo_root)
@@ -240,14 +203,14 @@ def run(args) -> int:
         "schema_version": 1, "kind": "vz-0.4-gate-manifest", "run_id": run_id, "suite": "all", "verdict": "running",
         "started_at_utc": started, "finished_at_utc": None, "developer_overrides": overrides,
         "source": {"commit": source_commit, "dirty": git_dirty(repo_root), "repo_root": str(repo_root)},
-        "host": host_facts(), "toolchain": toolchain_facts(),
+        "host": host.host_facts(state_root), "toolchain": host.toolchain_facts(),
         "release": {"dir": release["dir"], "release_dir_sha256": release["release_dir_sha256"],
                     "release_manifest_sha256": release["release_manifest_sha256"], "signing_class": release["signing_class"],
                     "release_version": release["release_version"], "normalized_content_sha256": release["normalized_content_sha256"],
                     "signed_content_sha256": release["signed_content_sha256"], "source_commit": release["source_commit"],
                     "components": release["components"]},
         "inputs": frozen["inputs"], "candidate_tuple": tuple_value["tuple"], "candidate_tuple_sha256": tuple_value["sha256"],
-        "index_path": str(index_path), "state_root": str(state_root), "clients": clients,
+        "index_path": str(index_path), "state_root": str(state_root), "clients": host.client_facts(clients),
         "prerequisites": {"status": "not_executed", "receipts": []},
         "lanes": {lane["name"]: {"entry_point": lane["entry_point"], "sha256": lanes.entry_point_record(repo_root, lane, [])["sha256"],
                                  "role": lane["role"], "phases": lane["phases"]} for lane in contract["lanes"]},
@@ -275,7 +238,9 @@ def run(args) -> int:
             print(f"==> prerequisite {label} failed; stopping before lanes", flush=True)
             break
     manifest["prerequisites"] = {"status": prerequisite_status, "receipts": [str(p.relative_to(root)) for p in receipts.paths]}
-    manifest["inventories"]["before"] = write_inventory(root, run_id, "before")
+    scope = host.HostScope(run_id=run_id, state_root=state_root, release_dir=Path(release["dir"]), clients=clients)
+    manifest["inventories"]["before"] = host.write_inventory(root, scope, "before")
+    print(f"==> host inventory before: {manifest['inventories']['before']}", flush=True)
 
     if prerequisite_status != "failed":
         ctx = lanes.LaneContext(run_id=run_id, release_dir=release["dir"], release_dir_sha256=release["release_dir_sha256"], state_root=state_root,
@@ -287,10 +252,15 @@ def run(args) -> int:
             reason = "" if result["failure"] is None else f" ({result['failure']['reason']})"
             print(f"==> {phase}: {lane} {lane_phase} -> {result['outcome']}{reason}", flush=True)
 
-        outcome = phases.run_phases(root, contract, ctx, dry=args.dry_lanes, observer=observer)
+        outcome = phases.run_phases(root, contract, ctx, dry=args.dry_lanes, scope=scope, before_inventory=manifest["inventories"]["before"],
+                                    ack_file=args.sleep_wake_ack_file, observer=observer)
         manifest["phases"] = outcome["phases"]
-    manifest["inventories"]["after"] = write_inventory(root, run_id, "after")
-    manifest["leak_diff"] = {"performed": False, "survivors": [], "reason": "host inventories and leak diff not implemented (build order step 2)"}
+        manifest["inventories"]["after"] = outcome["after_inventory"]
+        manifest["leak_diff"] = outcome["leak_diff"]
+    else:
+        manifest["inventories"]["after"] = host.write_inventory(root, scope, "after")
+        manifest["leak_diff"] = {"performed": False, "survivors": [],
+                                 "reason": "prerequisites failed before any lane ran; no final-cleanup phase to diff"}
 
     evaluation = validate.evaluate(root, manifest, repo_root=repo_root, codesign_verifier=CODESIGN_VERIFIER)
     verdict = validate.verdict_for(evaluation["findings"], evaluation["scenarios"])

@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 sleep/wake checkpoint persisted before the operator sleeps the host",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "checkpoint",
+    "kind",
+    "run_id",
+    "schema_version"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-sleep-wake-checkpoint"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "checkpoint": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "boot_session_uuid",
+        "boottime_unix",
+        "clock_monotonic_ns",
+        "clock_uptime_raw_ns",
+        "nonce",
+        "pmset_log_sha256",
+        "wall_clock_utc"
+      ],
+      "properties": {
+        "nonce": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "boot_session_uuid": {
+          "type": "string",
+          "minLength": 1
+        },
+        "boottime_unix": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clock_monotonic_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "clock_uptime_raw_ns": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "wall_clock_utc": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+        },
+        "pmset_log_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        }
+      }
+    }
+  }
+}

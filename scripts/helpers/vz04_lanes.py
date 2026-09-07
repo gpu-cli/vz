@@ -24,6 +24,7 @@ import sys
 import time
 
 import vz04_schema as schema
+from vz04_host import DOCKER_CONFIG_DIRNAME
 from vz04_common import (CONFIG_FILES, LANE_PHASES, REPO_ROOT, GateError, canonical_path, digest_file, document,
                          load_json, now_ns, read_regular, require, sha256_bytes, tree_digest, write_exclusive)
 
@@ -125,7 +126,8 @@ def translate_sandbox_summary(lane_name, phase, ctx, entry_point, run_dir: Path,
 
 def minimal_env(ctx: LaneContext) -> dict:
     env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin:/opt/homebrew/bin:/usr/local/bin", "HOME": os.environ.get("HOME", "/"),
-           "TMPDIR": str(ctx.state_root / "tmp"), "LANG": "C.UTF-8", "VZ04_RUN_ID": ctx.run_id}
+           "TMPDIR": str(ctx.state_root / "tmp"), "LANG": "C.UTF-8", "VZ04_RUN_ID": ctx.run_id,
+           "VZ_DOCKER_CONFIG": str(ctx.state_root / DOCKER_CONFIG_DIRNAME)}
     if ctx.linux_docker_context:
         env["LINUX_DOCKER_CONTEXT"] = ctx.linux_docker_context
     cargo_home = os.environ.get("CARGO_HOME")

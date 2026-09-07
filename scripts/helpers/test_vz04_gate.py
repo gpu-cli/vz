@@ -1,4 +1,5 @@
 import io
+import os
 from pathlib import Path
 import sys
 import tempfile
@@ -49,9 +50,41 @@ class GateDryRunTests(unittest.TestCase):
         self.assertEqual(len(lane_rows), 1 + 3 * 4)
         self.assertTrue(all(row["failure_reason"] == "not_implemented" for row in lane_rows))
         codes = {row["code"] for row in summary["findings"]}
-        for code in ("gate.developer_override", "sleep_wake.not_observed", "cleanup.leak_diff_not_performed", "inventory.not_captured",
+        for code in ("gate.developer_override", "sleep_wake.not_observed", "clients.unrecorded",
                      "prerequisites.not_executed", "input.draft", "release.signing_class", "scenario.missing", "handoff.incomplete"):
             self.assertIn(code, codes)
+        for code in ("cleanup.leak_diff_not_performed", "cleanup.leak_diff_missing", "inventory.not_captured", "inventory.partial",
+                     "cleanup.survivors", "cleanup.leak_diff_mismatch", "evidence.unknown_kind"):
+            self.assertNotIn(code, codes)
+
+    def test_host_inventories_captured_and_diffed(self):
+        manifest = common.load_json(self.run_root / "manifest.json")
+        self.assertEqual(manifest["inventories"], {"before": "host/before.json", "after": "host/after.json"})
+        for moment in ("before", "after"):
+            inventory = common.load_json(self.run_root / "host" / f"{moment}.json")
+            self.assertEqual(inventory["capture_state"], "captured", inventory["capture_errors"])
+            self.assertTrue(inventory["listeners"])
+            self.assertEqual(inventory["processes"], [])
+            self.assertEqual(inventory["sockets"], [])
+            self.assertIn(os.getpid(), inventory["excluded_pids"])
+        diff = common.load_json(self.run_root / "phases" / "final-cleanup" / "leak-diff.json")
+        self.assertEqual(diff["kind"], "vz-0.4-leak-diff")
+        self.assertEqual(diff["survivors"], [])
+        self.assertEqual(manifest["leak_diff"], {"performed": True, "survivors": [], "reason": None})
+        self.assertEqual(manifest["clients"], {"docker": None, "compose_plugin": None, "buildx_plugin": None})
+        self.assertIsNotNone(manifest["host"]["boot_session_uuid"])
+        self.assertGreater(manifest["host"]["state_root_free_disk_bytes"], 0)
+        self.assertRegex(manifest["toolchain"]["gate_requirements_sha256"], r"^[0-9a-f]{64}$")
+
+    def test_dry_sleep_wake_writes_checkpoint_without_ack(self):
+        record = common.load_json(self.run_root / "phases" / "persisted-recovery" / "sleep-wake.json")
+        self.assertFalse(record["observed"])
+        self.assertEqual(record["reason"], "dry_lanes")
+        self.assertEqual(record["ack"]["state"], "not_attempted")
+        self.assertRegex(record["checkpoint"]["nonce"], r"^[0-9a-f]{64}$")
+        stored = common.load_json(self.run_root / "phases" / "persisted-recovery" / "sleep-wake-checkpoint.json")
+        self.assertEqual(stored["checkpoint"], record["checkpoint"])
+        self.assertIsNone(record["wake"])
 
     def test_summary_txt_lists_every_unmet_requirement(self):
         text = (self.run_root / "summary.txt").read_text()

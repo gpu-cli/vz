@@ -4,6 +4,7 @@
   "type": "object",
   "additionalProperties": false,
   "required": [
+    "ack",
     "checkpoint",
     "kind",
     "minimum_sleep_seconds",
@@ -34,13 +35,14 @@
     "reason": {
       "enum": [
         null,
-        "not_observed_step1",
+        "dry_lanes",
         "operator_ack_missing",
         "ack_deadline_exceeded",
         "boot_session_changed",
         "nonce_mismatch",
         "discontinuity_too_small",
-        "power_events_missing"
+        "power_events_missing",
+        "clock_unavailable"
       ]
     },
     "checkpoint": {
@@ -105,10 +107,12 @@
             "capture",
             "delta_monotonic_ns",
             "delta_uptime_raw_ns",
+            "discontinuity_ns",
             "discontinuity_seconds",
             "nonce_echoed",
             "power_events",
-            "same_boot_session"
+            "same_boot_session",
+            "unified_log"
           ],
           "properties": {
             "capture": {
@@ -197,6 +201,103 @@
                   }
                 }
               }
+            },
+            "discontinuity_ns": {
+              "type": "integer"
+            },
+            "unified_log": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "argv",
+                "bytes",
+                "elapsed_seconds",
+                "error",
+                "message_count",
+                "state"
+              ],
+              "properties": {
+                "argv": {
+                  "type": "array",
+                  "items": {
+                    "type": "string"
+                  }
+                },
+                "state": {
+                  "enum": [
+                    "captured",
+                    "timeout",
+                    "truncated",
+                    "error",
+                    "unavailable"
+                  ]
+                },
+                "bytes": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "message_count": {
+                  "type": "integer",
+                  "minimum": 0
+                },
+                "error": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "minLength": 1
+                },
+                "elapsed_seconds": {
+                  "type": [
+                    "number",
+                    "null"
+                  ],
+                  "minimum": 0
+                }
+              }
+            }
+          }
+        }
+      ]
+    },
+    "ack": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "channel",
+            "detail",
+            "state",
+            "waited_seconds"
+          ],
+          "properties": {
+            "state": {
+              "enum": [
+                "acked",
+                "not_attempted",
+                "operator_ack_missing",
+                "ack_deadline_exceeded",
+                "nonce_mismatch"
+              ]
+            },
+            "channel": {
+              "enum": [
+                null,
+                "tty",
+                "file"
+              ]
+            },
+            "waited_seconds": {
+              "type": "number",
+              "minimum": 0
+            },
+            "detail": {
+              "type": "string",
+              "minLength": 1
             }
           }
         }

@@ -18,18 +18,20 @@ import docker_host_driver as driver
 import vz04_candidate as candidate
 import vz04_contract as contract_module
 import vz04_decisions as decisions
+import vz04_host as host
 import vz04_lanes as lanes
 import vz04_schema as schema
+import vz04_sleepwake as sleepwake
 from vz04_common import (CANARY_PREFIX, REPO_ROOT, GateError, canonical_digest, canonical_path, digest_file, load_json,
                          read_regular, tree_entries, verify_checksums)
 
 KIND_TO_SCHEMA = {
     "vz-0.4-gate-manifest": "gate-manifest", "vz-0.4-lane-result": "lane-result", "vz-0.4-summary": "summary",
     "vz-0.4-state-handoff": "state-handoff", "vz-0.4-sleep-wake": "sleep-wake", "vz-0.4-connectivity-matrix": "connectivity-matrix",
-    "vz-0.4-runtime-provenance": "runtime-provenance", "vz-0.4-resource-inventory": "resource-inventory",
-    "vz-0.4-receipt": "receipt", "vz-0.4-run-index": "run-index",
+    "vz-0.4-runtime-provenance": "runtime-provenance", "vz-0.4-host-inventory": "host-inventory", "vz-0.4-leak-diff": "leak-diff",
+    "vz-0.4-sleep-wake-checkpoint": "sleep-wake-checkpoint", "vz-0.4-receipt": "receipt", "vz-0.4-run-index": "run-index",
 }
-UNKINDED_ALLOWED = frozenset(("invocation.json", "leak-diff.json", "facts.json", "lane-result.rejected.json"))
+UNKINDED_ALLOWED = frozenset(("invocation.json", "lane-result.rejected.json"))
 MAX_SCAN = 512 * 1024 * 1024
 
 
@@ -243,23 +245,25 @@ def evaluate(root: Path, manifest: dict, *, repo_root: Path = REPO_ROOT, codesig
         if phase["name"] == "persisted-recovery":
             sleep = _load_evidence(root, phase["sleep_wake_path"], "sleep-wake", findings, "sleep-wake")
             if sleep is not None:
-                if not sleep["observed"]:
-                    findings.add("sleep_wake.not_observed", phase["sleep_wake_path"], f"hardware sleep/wake not observed: {sleep['reason']}")
-                else:
-                    wake = sleep["wake"]
-                    if wake["discontinuity_seconds"] < contract["sleep_wake"]["minimum_sleep_seconds"]:
-                        findings.add("sleep_wake.short", phase["sleep_wake_path"], "clock discontinuity below minimum_sleep_seconds")
-                    if not (wake["nonce_echoed"] and wake["same_boot_session"] and wake["power_events"]):
-                        findings.add("sleep_wake.unbound", phase["sleep_wake_path"], "nonce/boot session/power events do not bind the interval")
+                findings.extend(sleepwake.verify(sleep, contract["sleep_wake"]["minimum_sleep_seconds"]))
+                if sleep["minimum_sleep_seconds"] != contract["sleep_wake"]["minimum_sleep_seconds"]:
+                    findings.add("sleep_wake.contract", phase["sleep_wake_path"], "recorded minimum_sleep_seconds differs from the contract")
+                if sleep["checkpoint"] is not None:
+                    stored = _load_evidence(root, str(sleepwake.checkpoint_path(root).relative_to(root)), "sleep-wake-checkpoint", findings, "sleep-wake-checkpoint")
+                    if stored is not None and stored["checkpoint"] != sleep["checkpoint"]:
+                        findings.add("sleep_wake.checkpoint", phase["sleep_wake_path"], "persisted checkpoint differs from the sleep-wake record")
         if phase["name"] == "final-cleanup":
-            if not phase["leak_diff_path"] or not (root / phase["leak_diff_path"]).is_file():
-                findings.add("cleanup.leak_diff_missing", "final-cleanup", "no leak diff recorded")
-            else:
-                diff = load_json(root / phase["leak_diff_path"])
-                if not diff.get("performed"):
-                    findings.add("cleanup.leak_diff_not_performed", phase["leak_diff_path"], str(diff.get("reason")))
-                elif diff.get("survivors"):
-                    findings.add("cleanup.survivors", phase["leak_diff_path"], ", ".join(diff["survivors"])[:300])
+            diff = _load_evidence(root, phase["leak_diff_path"], "leak-diff", findings, "leak-diff")
+            if diff is not None:
+                if diff["survivors"]:
+                    findings.add("cleanup.survivors", phase["leak_diff_path"], f"{len(diff['survivors'])} survivors: " + "; ".join(diff["survivors"])[:400])
+                if manifest["leak_diff"] is None or manifest["leak_diff"]["survivors"] != diff["survivors"] or not manifest["leak_diff"]["performed"]:
+                    findings.add("cleanup.leak_diff_manifest", phase["leak_diff_path"], "manifest leak_diff differs from the recorded diff")
+                inventories = [_load_evidence(root, manifest["inventories"][m], "host-inventory", Findings(), m) for m in ("before", "after")]
+                if all(inventories):
+                    recomputed = host.diff(inventories[0], inventories[1], contract["listener_checks"])
+                    if recomputed["survivors"] != diff["survivors"] or recomputed["new_listeners"] != diff["new_listeners"]:
+                        findings.add("cleanup.leak_diff_mismatch", phase["leak_diff_path"], "leak diff does not recompute from the before/after inventories")
     recorded_phases = [phase["name"] for phase in manifest["phases"]]
     if recorded_phases != ["clean-provision", "persisted-recovery", "final-cleanup"]:
         findings.add("phases.incomplete", "manifest", f"phases recorded: {recorded_phases}")
@@ -284,12 +288,30 @@ def evaluate(root: Path, manifest: dict, *, repo_root: Path = REPO_ROOT, codesig
         _load_evidence(root, relative, "receipt", findings, relative)
 
     for moment in ("before", "after"):
-        inventory = _load_evidence(root, manifest["inventories"][moment], "resource-inventory", findings, f"inventory.{moment}")
-        if inventory is not None and inventory["capture_state"] != "captured":
-            findings.add("inventory.not_captured", moment, inventory["not_captured_reason"] or "not captured")
+        inventory = _load_evidence(root, manifest["inventories"][moment], "host-inventory", findings, f"inventory.{moment}")
+        if inventory is None:
+            continue
+        if (inventory["run_id"], inventory["moment"], inventory["state_root"]) != (manifest["run_id"], moment, manifest["state_root"]):
+            findings.add("inventory.identity", moment, "inventory run-id/moment/state root differ from the manifest")
+        if inventory["capture_state"] != "captured":
+            findings.add("inventory.partial", moment, "; ".join(f"{e['source']}: {e['error']}" for e in inventory["capture_errors"])[:400])
+    if manifest["leak_diff"] is not None and not manifest["leak_diff"]["performed"]:
+        findings.add("cleanup.leak_diff_not_performed", "manifest", manifest["leak_diff"]["reason"] or "leak diff not performed")
 
-    if manifest["clients"]["docker"] is None or manifest["clients"]["compose_plugin"] is None or manifest["clients"]["buildx_plugin"] is None:
-        findings.add("clients.unrecorded", "clients", "host Docker/Compose/buildx client paths not recorded")
+    for kind in ("docker", "compose_plugin", "buildx_plugin"):
+        client = manifest["clients"][kind]
+        if client is None:
+            findings.add("clients.unrecorded", kind, "host Docker/Compose/buildx client path, digest and version not recorded")
+            continue
+        if client["version"] is None:
+            findings.add("clients.version_unknown", kind, f"{client['path']} reported no version")
+        try:
+            current = digest_file(Path(client["resolved"]))
+        except GateError as error:
+            findings.add("clients.unavailable", kind, str(error))
+            continue
+        if current != client["sha256"]:
+            findings.add("clients.digest_mismatch", kind, f"{client['path']} digest changed since the run")
 
     scan_canaries(root, contract["canaries"]["prefix"], findings)
     return {"findings": findings.sorted(), "scenarios": accounting["rows"], "lanes": lane_rows}

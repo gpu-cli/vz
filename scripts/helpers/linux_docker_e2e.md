@@ -241,3 +241,27 @@ closed. Failed Docker objects and disks at `/private/tmp/vzdev-1vxano0n` remain
 preserved. Disposition manifest SHA256:
 `981c504b72105698bbf86c30aa177b443d01ab7b22df4e2f19ff2cd4104c3401`.
 This proves actionable runtime diagnostics, not a passing Buildx slice.
+
+## Handshake and limits slices (DEV, not release)
+
+`--suite handshake` covers `docker.engine.version` (complete tuple through the
+Machine context) and `docker.engine.api_negotiation`: `DOCKER_API_VERSION` 1.39
+is rejected with the daemon's exact "too old" text, 1.40 and 1.55 are accepted,
+and 1.56 is lowered to the daemon maximum 1.55 by the vendored client's
+`negotiateAPIVersion`, so the daemon's "too new" rejection is proven by a raw
+`/v1.56/_ping` probe over the Machine socket (HTTP 400, exact JSON body) beside
+the CLI probes. Installed candidate 4 passed on three Machines
+(`.artifacts/linux-docker-handshake-candidate-4`). Earlier candidates failed
+closed on observed facts now pinned: the OrbStack-distributed CLI emits no
+`Client.Platform`; the youki component reports `: 0.7.0`.
+
+`--suite limits` covers `docker.operation.resource_limits` and
+`docker.operation.oom`: exact `memory.max`/`cpu.max`/`pids.max` inside a
+limited container versus `max` in a control, an allocator killed at 1 GiB with
+exit 137, `OOMKilled`, and `oom`/`die` events, while a sibling health probe runs
+at one second for sixty seconds with zero failures. The guest kernel is built
+with `CONFIG_SWAP=n`, so every `--memory` run carries Moby's exact swap-limit
+warning, which is pinned rather than silenced. Installed candidate 2 passed on
+three Machines (`.artifacts/linux-docker-limits-candidate-2`).
+
+Both slices are DEV evidence; the 63-scenario `--suite all` remains rejected.

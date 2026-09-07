@@ -19,8 +19,8 @@ SHARED_SCHEMAS = {
     "release-manifest": "schemas/vz-0.4-release-manifest.schema.json",
 }
 INPUT_SCHEMAS = ("e2e-contract", "migration-barriers", "decisions", "decision-authorities")
-EVIDENCE_SCHEMAS = ("gate-manifest", "lane-result", "summary", "state-handoff", "sleep-wake",
-                    "connectivity-matrix", "runtime-provenance", "resource-inventory", "receipt", "run-index")
+EVIDENCE_SCHEMAS = ("gate-manifest", "lane-result", "summary", "state-handoff", "sleep-wake", "sleep-wake-checkpoint",
+                    "connectivity-matrix", "runtime-provenance", "host-inventory", "leak-diff", "receipt", "run-index")
 
 _cache: dict = {}
 

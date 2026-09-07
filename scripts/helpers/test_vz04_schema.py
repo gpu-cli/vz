@@ -75,8 +75,12 @@ class SchemaTests(unittest.TestCase):
 
     def test_sleep_wake_observed_requires_bindings(self):
         value = {"schema_version": 1, "kind": "vz-0.4-sleep-wake", "run_id": "gate-test-run-1", "minimum_sleep_seconds": 20,
-                 "observed": False, "reason": "not_observed_step1", "checkpoint": None, "wake": None}
+                 "observed": False, "reason": "dry_lanes", "checkpoint": None, "wake": None,
+                 "ack": {"state": "not_attempted", "channel": None, "waited_seconds": 0.0, "detail": "dry"}}
         self.assertEqual(schema.validate("sleep-wake", value), [])
+        value["reason"] = "not_observed_step1"
+        self.assertTrue(schema.validate("sleep-wake", value))
+        value["reason"] = "dry_lanes"
         value["observed"] = True
         self.assertTrue(schema.validate("sleep-wake", value))
 

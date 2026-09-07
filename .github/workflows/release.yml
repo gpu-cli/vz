@@ -59,10 +59,35 @@ jobs:
       - name: Build release binaries
         run: |
           cd crates
-          cargo build --release -p vz-cli
-          cargo build --release -p vz-runtimed
-          cargo build --release -p vz-guest-agent
-          cargo build --release -p vz-agent-loader
+          cargo build --locked --release -p vz-cli
+          cargo build --locked --release -p vz-runtimed
+          cargo build --locked --release -p vz-guest-agent
+          cargo build --locked --release -p vz-agent-loader
+
+      - name: Record pre-signing digests
+        # Parity with scripts/build-vz-0.4-release-candidate.sh: unsigned
+        # SHA-256 of every host binary before codesign touches it, plus
+        # normalized_content_sha256 = sha256(canonical_json(sorted [[path,
+        # unsigned_sha256], ...]) + LF) via the builder's canonical-sha256 rule.
+        # Scope is the five host binaries only (the builder also covers guest
+        # bundles, BuildKit and the entitlements file), which is recorded.
+        run: |
+          mkdir -p dist
+          components='{}'
+          for name in vz vz-runtimed vz-macos-setup vz-guest-agent vz-agent-loader; do
+            digest="$(shasum -a 256 "crates/target/release/$name" | cut -d' ' -f1)"
+            components="$(jq -c --arg path "bin/$name" --arg digest "$digest" '. + {($path): $digest}' <<<"$components")"
+          done
+          normalized="$(jq -c 'to_entries | map([.key, .value]) | sort' <<<"$components" \
+            | /usr/bin/python3 scripts/helpers/vz04_source_tree.py canonical-sha256)"
+          jq -n --argjson components "$components" --arg normalized "$normalized" \
+            --arg commit "$GITHUB_SHA" --arg run_id "$GITHUB_RUN_ID" --arg ref "$GITHUB_REF" \
+            '{schema_version: 1, kind: "vz-0.4-release-manifest-presign", source: {commit: $commit, ref: $ref},
+              github_run_id: $run_id, cargo_locked: true, components_scope: "host-binaries",
+              digest_rule: "sha256(canonical_json(sorted [[path, unsigned_sha256]...]) + LF)",
+              components: $components, normalized_content_sha256: $normalized}' \
+            > dist/release-manifest-presign.json
+          cat dist/release-manifest-presign.json
 
       - name: Import code signing certificate
         env:

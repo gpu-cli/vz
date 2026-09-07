@@ -1,0 +1,436 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "vz 0.4 host resource inventory (listeners, run-scoped processes, sockets, Docker contexts)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "capture_errors",
+    "capture_state",
+    "captured_at_utc",
+    "docker_config",
+    "docker_contexts",
+    "excluded_pids",
+    "kind",
+    "listeners",
+    "moment",
+    "process_count",
+    "processes",
+    "run_id",
+    "schema_version",
+    "sockets",
+    "sources",
+    "state_root"
+  ],
+  "properties": {
+    "schema_version": {
+      "const": 1
+    },
+    "kind": {
+      "const": "vz-0.4-host-inventory"
+    },
+    "run_id": {
+      "type": "string",
+      "pattern": "^[a-z0-9][a-z0-9-]{7,63}$"
+    },
+    "moment": {
+      "enum": [
+        "before",
+        "after"
+      ]
+    },
+    "captured_at_utc": {
+      "type": "string",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"
+    },
+    "capture_state": {
+      "enum": [
+        "captured",
+        "partial"
+      ]
+    },
+    "capture_errors": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "error",
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "string",
+            "minLength": 1
+          },
+          "error": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    "state_root": {
+      "type": "string",
+      "pattern": "^/[^\\r\\n\\x00]*$"
+    },
+    "docker_config": {
+      "type": "string",
+      "pattern": "^/[^\\r\\n\\x00]*$"
+    },
+    "sources": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "docker_context_ls",
+        "lsof",
+        "netstat",
+        "ps"
+      ],
+      "properties": {
+        "lsof": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv",
+            "error",
+            "exit_code",
+            "stdout_sha256",
+            "truncated"
+          ],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "stdout_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        "netstat": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv",
+            "error",
+            "exit_code",
+            "stdout_sha256",
+            "truncated"
+          ],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "stdout_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        "ps": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv",
+            "error",
+            "exit_code",
+            "stdout_sha256",
+            "truncated"
+          ],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "stdout_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        },
+        "docker_context_ls": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "argv",
+            "error",
+            "exit_code",
+            "stdout_sha256",
+            "truncated"
+          ],
+          "properties": {
+            "argv": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            },
+            "exit_code": {
+              "type": [
+                "integer",
+                "null"
+              ]
+            },
+            "error": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "minLength": 1
+            },
+            "stdout_sha256": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "pattern": "^[0-9a-f]{64}$"
+            },
+            "truncated": {
+              "type": "boolean"
+            }
+          }
+        }
+      }
+    },
+    "listeners": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "address",
+          "command",
+          "pid",
+          "port",
+          "protocol",
+          "scope",
+          "source"
+        ],
+        "properties": {
+          "protocol": {
+            "enum": [
+              "tcp",
+              "udp"
+            ]
+          },
+          "address": {
+            "type": "string",
+            "minLength": 1
+          },
+          "port": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 65535
+          },
+          "pid": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "minimum": 1
+          },
+          "command": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          },
+          "scope": {
+            "enum": [
+              "loopback",
+              "wildcard",
+              "non_loopback"
+            ]
+          },
+          "source": {
+            "enum": [
+              "lsof",
+              "netstat",
+              "both"
+            ]
+          }
+        }
+      }
+    },
+    "processes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "command",
+          "matched",
+          "pid",
+          "ppid"
+        ],
+        "properties": {
+          "pid": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "ppid": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "command": {
+            "type": "string",
+            "minLength": 1
+          },
+          "matched": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "enum": [
+                "run_id",
+                "state_root",
+                "release_bin"
+              ]
+            }
+          }
+        }
+      }
+    },
+    "excluded_pids": {
+      "type": "array",
+      "items": {
+        "type": "integer",
+        "minimum": 1
+      }
+    },
+    "process_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "sockets": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "pattern": "^/[^\\r\\n\\x00]*$"
+      }
+    },
+    "docker_contexts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "endpoint",
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "minLength": 1
+          },
+          "endpoint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "minLength": 1
+          }
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "capture_state": {
+            "const": "captured"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "capture_errors": {
+            "maxItems": 0
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "capture_state": {
+            "const": "partial"
+          }
+        }
+      },
+      "then": {
+        "properties": {
+          "capture_errors": {
+            "minItems": 1
+          }
+        }
+      }
+    }
+  ]
+}
