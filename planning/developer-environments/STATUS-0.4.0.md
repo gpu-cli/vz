@@ -9,16 +9,30 @@ proven, and what remains. It is written to be read on its own.
 The release gate now exists and runs, and it says FAIL. That is the honest
 result: of the 85 scenarios the contract requires, none yet passes through the
 aggregate. Two of the four lanes are unimplemented, the Docker lane's own
-coverage has known gaps, and — found 2026-09-07 — **the Docker lane cannot be
+coverage has known gaps, and — found 2026-09-07 — **the Docker lane could not be
 invoked by the gate at all**: the contract gives it `["--suite", "all"]`, and
 the harness rejects that argv until eight more required options are supplied
-(`vz-ao8`). Only `--dry-lanes` runs have taken that path, and a dry lane
+(`vz-ao8`). Only `--dry-lanes` runs had taken that path, and a dry lane
 substitutes its result without starting the process, so the rejection had never
-been observed. That is the gap between a composed candidate passing all ten
-suites directly and zero scenarios passing the aggregate. What changed recently
-is that the gate, its validator, its frozen inputs and three of its four lanes
-are real, so every remaining piece now lands against a mechanical verdict
-instead of accumulating as separate focused passes.
+been observed. That is the gap between a composed candidate passing every suite
+directly and zero scenarios passing the aggregate.
+
+Seven and a half of those eight now land. Five are facts about the candidate
+and are derived from it by a `linux_docker` argv contract; `--tmux` is resolved
+by the gate like the Docker clients; the registry archive and layout are
+acquired from `config/docker-registry-artifact-v3.1.1.json`, reproducing the
+byte-identical artifact the candidates use. `--ssh-packages` is the remainder:
+its pin now carries a verified `repository_path` for every locatable row and an
+acquirer fetches them, but the base-image extracts, one derived stanza and about
+38 KB of generated provenance still stand between that and a supplied option.
+
+The Docker lane owns 66 of the 85 scenarios — 63 `docker.*` plus three `gate.*`
+— so this one defect stands in front of 78% of the release gate. The topology
+lane owns 18 and native-macOS owns 1.
+
+What changed recently is that the gate, its validator, its frozen inputs and
+three of its four lanes are real, so every remaining piece now lands against a
+mechanical verdict instead of accumulating as separate focused passes.
 
 ## Tracked work
 
