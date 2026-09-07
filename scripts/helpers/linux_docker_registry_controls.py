@@ -126,7 +126,10 @@ def scan_bytes(raw, variants):
 class Controls:
     def __init__(self, harness, contexts, selected_descriptors, sentinel_descriptor):
         require(type(contexts) is list and len(contexts) == 4, 'exactly four Machine descriptors required')
-        require(type(selected_descriptors) is list and len(selected_descriptors) == 3, 'three selected Machines required')
+        # The gate selects three; a development loop may select fewer, and the
+        # unselected Machines are then observed as neighbours like the sentinel.
+        require(type(selected_descriptors) is list and 1 <= len(selected_descriptors) <= 3,
+                'between one and three selected Machines required')
         require(all(any(row is item for item in contexts) for row in selected_descriptors), 'selected Machine not in contexts')
         require(any(sentinel_descriptor is item for item in contexts), 'sentinel Machine not in contexts')
         require(not any(sentinel_descriptor is item for item in selected_descriptors), 'sentinel cannot be selected')

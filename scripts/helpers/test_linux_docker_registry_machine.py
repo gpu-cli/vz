@@ -574,7 +574,7 @@ class FinalizationTests(unittest.TestCase):
                 elif problem == 'archive':
                     self.assertIn('archive changed', result['error'])
                 else:
-                    self.assertIn('three completed registry Sessions', result['error'])
+                    self.assertIn('completed registry Session', result['error'])
 
 
 class WrapperTests(unittest.TestCase):

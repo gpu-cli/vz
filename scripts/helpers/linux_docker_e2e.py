@@ -53,6 +53,9 @@ ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATIO
 # `--suite lifecycle` remains the way to prove them.
 SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
                "images", "limits", "registry", "recovery")
+# The gate's selection: both primary Machines and the neighbour's first, with
+# the neighbour's second left as an untouched sentinel.
+GATE_MACHINES = (0, 1, 2)
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
@@ -63,7 +66,7 @@ def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
              "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux", "registry-archive", "registry-layout",
-             *lane_result.GATE_OPTIONS)
+             *lane_result.GATE_OPTIONS, "machines")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
@@ -74,6 +77,10 @@ def arguments(argv):
     # argv. They select no behaviour here beyond emitting a lane result.
     for name in lane_result.GATE_OPTIONS:
         parser.add_argument("--" + name)
+    # The gate proves each behaviour on three Machines across two Environments.
+    # Fewer is a development loop only: it cannot prove the isolation family and
+    # its result says so, so it can never be mistaken for gate evidence.
+    parser.add_argument("--machines", type=int, default=len(GATE_MACHINES), choices=(1, 2, 3))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -878,7 +885,8 @@ class ComposeHarness(startup.Harness):
         selected_descriptors = [machine["docker_context"] for _, machine in selected_machines]
         sentinel_descriptor = neighbor["machines"][1]["docker_context"]
         require(sentinel_descriptor not in selected_descriptors and
-                len({json.dumps(d, sort_keys=True) for d in selected_descriptors}) == 3, 'registry Machine selection')
+                len({json.dumps(d, sort_keys=True) for d in selected_descriptors}) == len(selected_machines),
+                'registry Machine selection')
         self.registry_controls = registry_controls.Controls(self, contexts, selected_descriptors, sentinel_descriptor)
         self.registry_project = str(project)
 
@@ -995,8 +1003,9 @@ class ComposeHarness(startup.Harness):
                     credential_controls = {'baseline': controls.baseline()}
                 slices[suite] = self.run_machine_suite(suite, selected_machines, bindings)
                 if controls is not None:
-                    require(len(self.registry_sessions) == 3 and all(s.cleanup_complete is True for s in self.registry_sessions),
-                            'three completed registry Sessions required')
+                    require(len(self.registry_sessions) == len(selected_machines) and
+                            all(s.cleanup_complete is True for s in self.registry_sessions),
+                            'every selected Machine needs a completed registry Session')
                     credential_controls['final'] = controls.final()
             if 'recovery' in suites:
                 # Stop/Up cycles legitimately advance incarnations; stable identity must hold.
@@ -1151,16 +1160,17 @@ def run(info):
             selected = Path(info["container_fixture"])
             fixture_contract(selected)
             require(driver.tree_digest(selected) == info["container_fixture_sha256"], "container fixture changed during run")
+        selected = info.get("machines", len(GATE_MACHINES))
         if executes(info, "registry"):
             sessions = harness.registry_sessions
-            require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
-                    "three completed registry Sessions required")
+            require(len(sessions) == selected and all(s.cleanup_complete is True and s.failed is False for s in sessions),
+                    "every selected Machine needs a completed registry Session")
             require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
                     "registry archive changed during run")
         if executes(info, "recovery"):
             sessions = harness.recovery_sessions
-            require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
-                    "three completed recovery Sessions required")
+            require(len(sessions) == selected and all(s.cleanup_complete is True and s.failed is False for s in sessions),
+                    "every selected Machine needs a completed recovery Session")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:
