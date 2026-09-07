@@ -48,9 +48,13 @@ fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
             project_id: project_id.clone(),
             name: "compose-fixture".to_string(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),
                     profile: MachineProfile::Developer,
@@ -64,6 +68,10 @@ fn install_planning_authority(store: &vz_stack::StateStore, stack_id: &str) {
             },
         };
         let environment = EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),

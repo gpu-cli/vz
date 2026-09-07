@@ -134,6 +134,7 @@ fn unknown_definition_fields_fail_instead_of_silently_dropping_policy() {
     base["environment"]["networks"] = serde_json::json!([
         {"schema_version": 1, "name": "private", "kind": "private"}
     ]);
+    base["environment"]["machines"][0]["networks"] = serde_json::json!(["private"]);
     base["environment"]["endpoints"] = serde_json::json!([
         {"schema_version": 1, "name": "api", "machine": "dev", "network": "private", "protocol": "tcp", "port": 8080}
     ]);

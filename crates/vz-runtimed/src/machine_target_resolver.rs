@@ -279,6 +279,8 @@ impl ResolvedMachineConfiguration {
             return Err(invalid("unsupported resolved configuration schema"));
         }
         EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![machine.clone()],
@@ -820,6 +822,8 @@ mod tests {
             project_id: ProjectId::new("prj_resolution").unwrap(),
             name: "resolution".into(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 networks: Vec::new(),
@@ -828,6 +832,8 @@ mod tests {
                     .iter()
                     .enumerate()
                     .map(|(index, entry)| MachineSpec {
+                        networks: Vec::new(),
+                        egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: format!("machine-{index}"),
                         profile: entry.profile,

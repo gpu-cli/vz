@@ -3,21 +3,24 @@ use std::collections::{BTreeMap, BTreeSet};
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use vz_runtime_contract::types::{
-    EndpointInstance, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
+    EgressInstance, EndpointInstance, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
     EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSelection,
     EnvironmentSelectionContext, EnvironmentState, EnvironmentTombstone, EnvironmentUpDecision,
-    LegacyMigrationError, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
-    MachineInstance, MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineState,
-    NetworkInstance, OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord,
-    ProjectDefinition, ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError,
-    TopologyResolutionError, WorkspaceBinding, migrate_legacy_developer_sandbox,
+    HostExportInstance, HostImportInstance, LegacyMigrationError, LifecycleOperationId,
+    LifecycleStepResult, LifecycleStepStatus, MachineInstance, MachineLifecycleStep,
+    MachineLifecycleStepAcknowledgement, MachineState, NetworkAttachmentInstance, NetworkInstance,
+    OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
+    ProjectState, TOPOLOGY_SCHEMA_VERSION, TopologyLifecycleError, TopologyResolutionError,
+    WorkspaceBinding, migrate_legacy_developer_sandbox,
 };
 
 use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 9;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 10;
+/// First schema version that projects declared Environment network topology.
+const ENVIRONMENT_NETWORK_STORE_SCHEMA_VERSION: u32 = 10;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
 const REPLICA_SCHEMA_VERSION: u32 = 5;
 const CLAIM_SCHEMA_VERSION: u32 = 7;
@@ -842,6 +845,70 @@ CREATE INDEX idx_topology_ownership_environment
     ON topology_ownership(environment_id, machine_id);
 "#;
 
+/// Declared Environment network topology added in state-store schema v10.
+///
+/// These are identity projections only: bound host ports, relay credentials and
+/// switch state are runtime-owned and never persisted here. Machine egress is
+/// recorded exactly for a Machine that declared a non-Offline policy, because
+/// Offline is the absence of an external attachment rather than a filter on one.
+const ENVIRONMENT_NETWORK_SCHEMA_V10_DDL: &str = r#"
+CREATE TABLE environment_network_attachments (
+    attachment_id TEXT PRIMARY KEY CHECK(length(trim(attachment_id)) BETWEEN 1 AND 128),
+    environment_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    network_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    instance_json TEXT NOT NULL CHECK(json_valid(instance_json)),
+    UNIQUE(environment_id, machine_id, network_id),
+    FOREIGN KEY(environment_id, machine_id)
+        REFERENCES machine_instances(environment_id, machine_id) ON DELETE CASCADE,
+    FOREIGN KEY(environment_id, network_id)
+        REFERENCES environment_networks(environment_id, network_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_environment_network_attachment_machine
+    ON environment_network_attachments(environment_id, machine_id);
+
+CREATE TABLE environment_host_exports (
+    export_id TEXT PRIMARY KEY CHECK(length(trim(export_id)) BETWEEN 1 AND 128),
+    environment_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 128),
+    instance_json TEXT NOT NULL CHECK(json_valid(instance_json)),
+    UNIQUE(environment_id, name),
+    FOREIGN KEY(environment_id, machine_id)
+        REFERENCES machine_instances(environment_id, machine_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_environment_host_export_machine
+    ON environment_host_exports(environment_id, machine_id);
+
+CREATE TABLE environment_host_imports (
+    import_id TEXT PRIMARY KEY CHECK(length(trim(import_id)) BETWEEN 1 AND 128),
+    environment_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    name TEXT NOT NULL CHECK(length(trim(name)) BETWEEN 1 AND 128),
+    instance_json TEXT NOT NULL CHECK(json_valid(instance_json)),
+    UNIQUE(environment_id, name),
+    FOREIGN KEY(environment_id, machine_id)
+        REFERENCES machine_instances(environment_id, machine_id) ON DELETE CASCADE
+);
+CREATE INDEX idx_environment_host_import_machine
+    ON environment_host_imports(environment_id, machine_id);
+
+CREATE TABLE environment_machine_egress (
+    egress_id TEXT PRIMARY KEY CHECK(length(trim(egress_id)) BETWEEN 1 AND 128),
+    environment_id TEXT NOT NULL,
+    machine_id TEXT NOT NULL,
+    schema_version INTEGER NOT NULL CHECK(schema_version = 1),
+    policy TEXT NOT NULL CHECK(length(trim(policy)) > 0),
+    instance_json TEXT NOT NULL CHECK(json_valid(instance_json)),
+    UNIQUE(environment_id, machine_id),
+    FOREIGN KEY(environment_id, machine_id)
+        REFERENCES machine_instances(environment_id, machine_id) ON DELETE CASCADE
+);
+"#;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegacyMigrationStage {
     TopologySchemaCreated,
@@ -880,6 +947,11 @@ enum ClaimV7MigrationStage {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TeardownFinalizerV8MigrationStage {
     FinalizerSchemaCreated,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvironmentNetworkV10MigrationStage {
+    NetworkSchemaCreated,
 }
 
 #[cfg(test)]
@@ -929,6 +1001,12 @@ pub(super) enum ClaimV7MigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum TeardownFinalizerV8MigrationFailpoint {
     AfterFinalizerSchemaCreated,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnvironmentNetworkV10MigrationFailpoint {
+    AfterNetworkSchemaCreated,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -1087,6 +1165,10 @@ fn lifecycle_ownership_digest(
             OwnedResourceKind::DockerContext => "docker_context".to_string(),
             OwnedResourceKind::Network => "network".to_string(),
             OwnedResourceKind::Endpoint => "endpoint".to_string(),
+            OwnedResourceKind::NetworkAttachment => "network_attachment".to_string(),
+            OwnedResourceKind::HostExport => "host_export".to_string(),
+            OwnedResourceKind::HostImport => "host_import".to_string(),
+            OwnedResourceKind::PortRange => "port_range".to_string(),
             OwnedResourceKind::Credential => "credential".to_string(),
             OwnedResourceKind::Fault => "fault".to_string(),
             OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
@@ -1273,6 +1355,24 @@ impl StateStore {
         self.validate_schema_against(9, &reference.conn)
     }
 
+    pub(super) fn validate_v10_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+        reference.create_teardown_finalizer_schema_v8()?;
+        reference.create_teardown_runtime_identity_schema_v9()?;
+        reference.create_environment_network_schema_v10()?;
+
+        self.validate_schema_against(10, &reference.conn)
+    }
+
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
         self.conn.execute_batch(RECONCILE_SCHEMA_V6_ARCHIVE_DDL)?;
         self.conn
@@ -1295,6 +1395,12 @@ impl StateStore {
     pub(super) fn create_teardown_runtime_identity_schema_v9(&self) -> Result<(), StackError> {
         self.conn
             .execute_batch(TEARDOWN_RUNTIME_IDENTITY_SCHEMA_V9_DDL)?;
+        Ok(())
+    }
+
+    pub(super) fn create_environment_network_schema_v10(&self) -> Result<(), StackError> {
+        self.conn
+            .execute_batch(ENVIRONMENT_NETWORK_SCHEMA_V10_DDL)?;
         Ok(())
     }
 
@@ -1548,13 +1654,31 @@ impl StateStore {
     }
 
     fn delete_project_environments(&self, project_id: &str) -> Result<(), StackError> {
+        // Child projections are dropped newest-schema-first. A table introduced
+        // by a later schema version is absent only while an older database is
+        // being written before its migration, exactly like the v3 lifecycle
+        // projection guard in `insert_environment`.
         for table in [
             "topology_ownership",
+            "environment_machine_egress",
+            "environment_host_imports",
+            "environment_host_exports",
+            "environment_network_attachments",
             "environment_endpoints",
             "environment_networks",
             "machine_instances",
             "workspace_bindings",
         ] {
+            let table_exists: bool = self.conn.query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?1
+                 )",
+                params![table],
+                |row| row.get(0),
+            )?;
+            if !table_exists {
+                continue;
+            }
             self.conn.execute(
                 &format!(
                     "DELETE FROM {table} WHERE environment_id IN
@@ -1678,6 +1802,67 @@ impl StateStore {
                     endpoint.schema_version,
                     endpoint.name,
                     serde_json::to_string(endpoint)?,
+                ],
+            )?;
+        }
+        for attachment in &environment.network_attachments {
+            self.conn.execute(
+                "INSERT INTO environment_network_attachments
+                    (attachment_id, environment_id, machine_id, network_id, schema_version,
+                     instance_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    attachment.attachment_id.as_str(),
+                    attachment.environment_id.as_str(),
+                    attachment.machine_id.as_str(),
+                    attachment.network_id.as_str(),
+                    attachment.schema_version,
+                    serde_json::to_string(attachment)?,
+                ],
+            )?;
+        }
+        for export in &environment.host_exports {
+            self.conn.execute(
+                "INSERT INTO environment_host_exports
+                    (export_id, environment_id, machine_id, schema_version, name, instance_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    export.export_id.as_str(),
+                    export.environment_id.as_str(),
+                    export.machine_id.as_str(),
+                    export.schema_version,
+                    export.name,
+                    serde_json::to_string(export)?,
+                ],
+            )?;
+        }
+        for import in &environment.host_imports {
+            self.conn.execute(
+                "INSERT INTO environment_host_imports
+                    (import_id, environment_id, machine_id, schema_version, name, instance_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    import.import_id.as_str(),
+                    import.environment_id.as_str(),
+                    import.machine_id.as_str(),
+                    import.schema_version,
+                    import.name,
+                    serde_json::to_string(import)?,
+                ],
+            )?;
+        }
+        for egress in &environment.egress {
+            self.conn.execute(
+                "INSERT INTO environment_machine_egress
+                    (egress_id, environment_id, machine_id, schema_version, policy, instance_json)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    egress.egress_id.as_str(),
+                    egress.environment_id.as_str(),
+                    egress.machine_id.as_str(),
+                    egress.schema_version,
+                    serde_json::to_string(&egress.policy)?,
+                    serde_json::to_string(egress)?,
                 ],
             )?;
         }
@@ -4146,6 +4331,68 @@ impl StateStore {
             "endpoints",
         )?;
 
+        // Declared network topology is projected only from schema v10 onward, so
+        // an older database legitimately holds none of it.
+        let network_topology_projected =
+            self.schema_version()? >= ENVIRONMENT_NETWORK_STORE_SCHEMA_VERSION;
+        let network_attachments = if network_topology_projected {
+            self.load_network_attachment_instances(environment_id)?
+        } else {
+            Vec::new()
+        };
+        require_projection(
+            semantic_collections_match(
+                &environment.network_attachments,
+                &network_attachments,
+                |attachment| attachment.attachment_id.to_string(),
+            ),
+            "environment_instances",
+            environment_id,
+            "network_attachments",
+        )?;
+
+        let host_exports = if network_topology_projected {
+            self.load_host_export_instances(environment_id)?
+        } else {
+            Vec::new()
+        };
+        require_projection(
+            semantic_collections_match(&environment.host_exports, &host_exports, |export| {
+                export.export_id.to_string()
+            }),
+            "environment_instances",
+            environment_id,
+            "host_exports",
+        )?;
+
+        let host_imports = if network_topology_projected {
+            self.load_host_import_instances(environment_id)?
+        } else {
+            Vec::new()
+        };
+        require_projection(
+            semantic_collections_match(&environment.host_imports, &host_imports, |import| {
+                import.import_id.to_string()
+            }),
+            "environment_instances",
+            environment_id,
+            "host_imports",
+        )?;
+
+        let egress = if network_topology_projected {
+            self.load_egress_instances(environment_id)?
+        } else {
+            Vec::new()
+        };
+        require_projection(
+            semantic_collections_match(&environment.egress, &egress, |egress| {
+                egress.egress_id.to_string()
+            }),
+            "environment_instances",
+            environment_id,
+            "egress",
+        )?;
+
         let ownership = self.load_ownership_records(environment_id)?;
         require_projection(
             semantic_collections_match(&environment.ownership, &ownership, |record| {
@@ -4162,8 +4409,263 @@ impl StateStore {
         environment.machines = machines;
         environment.networks = networks;
         environment.endpoints = endpoints;
+        environment.network_attachments = network_attachments;
+        environment.host_exports = host_exports;
+        environment.host_imports = host_imports;
+        environment.egress = egress;
         environment.ownership = ownership;
         Ok(())
+    }
+
+    fn load_network_attachment_instances(
+        &self,
+        environment_id: &str,
+    ) -> Result<Vec<NetworkAttachmentInstance>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT attachment_id, environment_id, machine_id, network_id, schema_version,
+                    instance_json
+             FROM environment_network_attachments WHERE environment_id = ?1
+             ORDER BY attachment_id",
+        )?;
+        let rows = stmt
+            .query_map(params![environment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, i64>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(
+                    attachment_id,
+                    sql_environment_id,
+                    machine_id,
+                    network_id,
+                    schema_version,
+                    json,
+                )| {
+                    let table = "environment_network_attachments";
+                    let attachment: NetworkAttachmentInstance =
+                        parse_persisted_json(table, &attachment_id, "instance_json", &json)?;
+                    require_projection(
+                        attachment_id == attachment.attachment_id.as_str(),
+                        table,
+                        &attachment_id,
+                        "attachment_id",
+                    )?;
+                    require_projection(
+                        sql_environment_id == attachment.environment_id.as_str(),
+                        table,
+                        &attachment_id,
+                        "environment_id",
+                    )?;
+                    require_projection(
+                        machine_id == attachment.machine_id.as_str(),
+                        table,
+                        &attachment_id,
+                        "machine_id",
+                    )?;
+                    require_projection(
+                        network_id == attachment.network_id.as_str(),
+                        table,
+                        &attachment_id,
+                        "network_id",
+                    )?;
+                    require_projection(
+                        schema_version == i64::from(attachment.schema_version),
+                        table,
+                        &attachment_id,
+                        "schema_version",
+                    )?;
+                    Ok(attachment)
+                },
+            )
+            .collect()
+    }
+
+    fn load_host_export_instances(
+        &self,
+        environment_id: &str,
+    ) -> Result<Vec<HostExportInstance>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT export_id, environment_id, machine_id, schema_version, name, instance_json
+             FROM environment_host_exports WHERE environment_id = ?1 ORDER BY export_id",
+        )?;
+        let rows = stmt
+            .query_map(params![environment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(export_id, sql_environment_id, machine_id, schema_version, name, json)| {
+                    let table = "environment_host_exports";
+                    let export: HostExportInstance =
+                        parse_persisted_json(table, &export_id, "instance_json", &json)?;
+                    require_projection(
+                        export_id == export.export_id.as_str(),
+                        table,
+                        &export_id,
+                        "export_id",
+                    )?;
+                    require_projection(
+                        sql_environment_id == export.environment_id.as_str(),
+                        table,
+                        &export_id,
+                        "environment_id",
+                    )?;
+                    require_projection(
+                        machine_id == export.machine_id.as_str(),
+                        table,
+                        &export_id,
+                        "machine_id",
+                    )?;
+                    require_projection(
+                        schema_version == i64::from(export.schema_version),
+                        table,
+                        &export_id,
+                        "schema_version",
+                    )?;
+                    require_projection(name == export.name, table, &export_id, "name")?;
+                    Ok(export)
+                },
+            )
+            .collect()
+    }
+
+    fn load_host_import_instances(
+        &self,
+        environment_id: &str,
+    ) -> Result<Vec<HostImportInstance>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT import_id, environment_id, machine_id, schema_version, name, instance_json
+             FROM environment_host_imports WHERE environment_id = ?1 ORDER BY import_id",
+        )?;
+        let rows = stmt
+            .query_map(params![environment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(import_id, sql_environment_id, machine_id, schema_version, name, json)| {
+                    let table = "environment_host_imports";
+                    let import: HostImportInstance =
+                        parse_persisted_json(table, &import_id, "instance_json", &json)?;
+                    require_projection(
+                        import_id == import.import_id.as_str(),
+                        table,
+                        &import_id,
+                        "import_id",
+                    )?;
+                    require_projection(
+                        sql_environment_id == import.environment_id.as_str(),
+                        table,
+                        &import_id,
+                        "environment_id",
+                    )?;
+                    require_projection(
+                        machine_id == import.machine_id.as_str(),
+                        table,
+                        &import_id,
+                        "machine_id",
+                    )?;
+                    require_projection(
+                        schema_version == i64::from(import.schema_version),
+                        table,
+                        &import_id,
+                        "schema_version",
+                    )?;
+                    require_projection(name == import.name, table, &import_id, "name")?;
+                    Ok(import)
+                },
+            )
+            .collect()
+    }
+
+    fn load_egress_instances(
+        &self,
+        environment_id: &str,
+    ) -> Result<Vec<EgressInstance>, StackError> {
+        let mut stmt = self.conn.prepare(
+            "SELECT egress_id, environment_id, machine_id, schema_version, policy, instance_json
+             FROM environment_machine_egress WHERE environment_id = ?1 ORDER BY egress_id",
+        )?;
+        let rows = stmt
+            .query_map(params![environment_id], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+
+        rows.into_iter()
+            .map(
+                |(egress_id, sql_environment_id, machine_id, schema_version, policy, json)| {
+                    let table = "environment_machine_egress";
+                    let egress: EgressInstance =
+                        parse_persisted_json(table, &egress_id, "instance_json", &json)?;
+                    require_projection(
+                        egress_id == egress.egress_id.as_str(),
+                        table,
+                        &egress_id,
+                        "egress_id",
+                    )?;
+                    require_projection(
+                        sql_environment_id == egress.environment_id.as_str(),
+                        table,
+                        &egress_id,
+                        "environment_id",
+                    )?;
+                    require_projection(
+                        machine_id == egress.machine_id.as_str(),
+                        table,
+                        &egress_id,
+                        "machine_id",
+                    )?;
+                    require_projection(
+                        schema_version == i64::from(egress.schema_version),
+                        table,
+                        &egress_id,
+                        "schema_version",
+                    )?;
+                    require_projection(
+                        policy == serde_json::to_string(&egress.policy)?,
+                        table,
+                        &egress_id,
+                        "policy",
+                    )?;
+                    Ok(egress)
+                },
+            )
+            .collect()
     }
 
     fn load_workspace_bindings(
@@ -4656,6 +5158,35 @@ impl StateStore {
             }
             store.create_teardown_runtime_identity_schema_v9()?;
             store.validate_v9_schema()?;
+            store.set_schema_version(9)?;
+            Ok(())
+        })
+    }
+
+    /// Add the declared Environment network topology projections.
+    ///
+    /// The migration is pure schema: v9 Environments could not declare network
+    /// attachments, host exports, host imports or non-Offline egress, so every
+    /// new table is legitimately empty and no aggregate is rewritten.
+    pub(super) fn migrate_environment_network_v9_to_v10(&self) -> Result<(), StackError> {
+        self.migrate_environment_network_v9_to_v10_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_environment_network_v9_to_v10_with_hook(
+        &self,
+        mut hook: impl FnMut(EnvironmentNetworkV10MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 9 {
+                return Err(StackError::InvalidSpec(format!(
+                    "environment-network migration requires state schema version 9, found {schema_version}"
+                )));
+            }
+            store.validate_v9_schema()?;
+            store.create_environment_network_schema_v10()?;
+            hook(EnvironmentNetworkV10MigrationStage::NetworkSchemaCreated)?;
+            store.validate_v10_schema()?;
             store.set_schema_version(STORE_SCHEMA_VERSION)?;
             Ok(())
         })
@@ -5224,6 +5755,28 @@ impl StateStore {
             ) {
                 return Err(StackError::InvalidSpec(
                     "injected v7-to-v8 migration failure after finalizer schema creation"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_environment_network_v9_to_v10_with_failpoint(
+        &self,
+        failpoint: EnvironmentNetworkV10MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_environment_network_v9_to_v10_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    EnvironmentNetworkV10MigrationFailpoint::AfterNetworkSchemaCreated,
+                    EnvironmentNetworkV10MigrationStage::NetworkSchemaCreated
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v9-to-v10 migration failure after network schema creation"
                         .to_string(),
                 ));
             }

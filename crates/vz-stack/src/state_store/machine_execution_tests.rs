@@ -10,9 +10,13 @@ fn fixture() -> (tempfile::TempDir, StateStore, MachineExecutionReceipt) {
         project_id: ProjectId::generate(),
         name: "exec-test".into(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: 1,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: 1,
                 name: "worker".into(),
                 profile: MachineProfile::Hardened,

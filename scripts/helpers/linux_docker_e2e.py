@@ -1072,10 +1072,15 @@ class SentinelMonitor:
         require(json.loads(raw)[0]["Endpoints"]["docker"]["Host"] == descriptor["endpoint"], "sentinel context rerouted")
 
     def probe_for(self, descriptor):
-        probe = self.probes.get(descriptor["name"])
+        # A subclass may build its own state, so the probe cache is created on
+        # demand rather than assumed to exist.
+        probes = getattr(self, "probes", None)
+        if probes is None:
+            probes = self.probes = {}
+        probe = probes.get(descriptor["name"])
         if probe is None:
             probe = engine_probe.EngineProbe(descriptor["endpoint"], timeout=8)
-            self.probes[descriptor["name"]] = probe
+            probes[descriptor["name"]] = probe
         return probe
 
     def sample(self, row):
@@ -1150,6 +1155,12 @@ class SentinelMonitor:
                         "no contemporaneous sibling/neighbor liveness observation")
 
     def stop(self):
+        # Stopping twice must not raise: a caller that already stopped this
+        # monitor and then failed would otherwise have its real error masked by
+        # an exclusive write of the samples this call repeats.
+        if getattr(self, "stopped", False):
+            return
+        self.stopped = True
         self.finished.set()
         self.thread.join(timeout=40)
         require(not self.thread.is_alive(), "monitor did not positively terminate; no cleanup allowed")

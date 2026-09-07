@@ -846,6 +846,8 @@ mod tests {
                     ("requested_capabilities", 5),
                     ("workspace", 6),
                     ("profile", 7),
+                    ("networks", 8),
+                    ("egress", 9),
                 ],
             ),
             (
@@ -865,6 +867,29 @@ mod tests {
                 ],
             ),
             (
+                "HostExportSpec",
+                &[
+                    ("schema_version", 1),
+                    ("name", 2),
+                    ("machine", 3),
+                    ("protocol", 4),
+                    ("machine_port", 5),
+                    ("host_port", 6),
+                ],
+            ),
+            (
+                "HostImportSpec",
+                &[
+                    ("schema_version", 1),
+                    ("name", 2),
+                    ("machine", 3),
+                    ("protocol", 4),
+                    ("host_port", 5),
+                    ("guest_port", 6),
+                    ("alias", 7),
+                ],
+            ),
+            (
                 "EnvironmentSpec",
                 &[
                     ("schema_version", 1),
@@ -872,6 +897,8 @@ mod tests {
                     ("networks", 3),
                     ("endpoints", 4),
                     ("default_machine", 5),
+                    ("host_exports", 6),
+                    ("host_imports", 7),
                 ],
             ),
             (
@@ -975,6 +1002,46 @@ mod tests {
                     ("machine_id", 4),
                     ("network_id", 5),
                     ("name", 6),
+                ],
+            ),
+            (
+                "NetworkAttachmentInstance",
+                &[
+                    ("schema_version", 1),
+                    ("attachment_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("network_id", 5),
+                ],
+            ),
+            (
+                "HostExportInstance",
+                &[
+                    ("schema_version", 1),
+                    ("export_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("name", 5),
+                ],
+            ),
+            (
+                "HostImportInstance",
+                &[
+                    ("schema_version", 1),
+                    ("import_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("name", 5),
+                ],
+            ),
+            (
+                "EgressInstance",
+                &[
+                    ("schema_version", 1),
+                    ("egress_id", 2),
+                    ("environment_id", 3),
+                    ("machine_id", 4),
+                    ("policy", 5),
                 ],
             ),
             (
@@ -1095,6 +1162,10 @@ mod tests {
                     ("updated_at", 14),
                     ("lifecycle_generation", 15),
                     ("active_operation_id", 16),
+                    ("network_attachments", 17),
+                    ("host_exports", 18),
+                    ("host_imports", 19),
+                    ("egress", 20),
                 ],
             ),
             (
@@ -1419,6 +1490,21 @@ mod tests {
                 ],
             ),
             (
+                "EgressPolicy",
+                &[
+                    ("EGRESS_POLICY_UNSPECIFIED", 0),
+                    ("EGRESS_POLICY_OFFLINE", 1),
+                    ("EGRESS_POLICY_ALLOWED", 2),
+                ],
+            ),
+            (
+                "TransportProtocol",
+                &[
+                    ("TRANSPORT_PROTOCOL_UNSPECIFIED", 0),
+                    ("TRANSPORT_PROTOCOL_TCP", 1),
+                ],
+            ),
+            (
                 "EnvironmentState",
                 &[
                     ("ENVIRONMENT_STATE_UNSPECIFIED", 0),
@@ -1500,6 +1586,10 @@ mod tests {
                     ("OWNED_RESOURCE_KIND_FAULT", 9),
                     ("OWNED_RESOURCE_KIND_LEGACY_SANDBOX", 10),
                     ("OWNED_RESOURCE_KIND_OTHER", 11),
+                    ("OWNED_RESOURCE_KIND_NETWORK_ATTACHMENT", 12),
+                    ("OWNED_RESOURCE_KIND_HOST_EXPORT", 13),
+                    ("OWNED_RESOURCE_KIND_HOST_IMPORT", 14),
+                    ("OWNED_RESOURCE_KIND_PORT_RANGE", 15),
                 ],
             ),
         ] {
@@ -1562,6 +1652,8 @@ mod tests {
             disk_bytes: Some(512 * 1024 * 1024 * 1024),
         };
         let machine_spec = MachineSpec {
+            networks: Vec::new(),
+            egress: Default::default(),
             schema_version: 1,
             name: "api".into(),
             profile: MachineProfile::Developer as i32,
@@ -1594,6 +1686,8 @@ mod tests {
             project_id: "prj_demo".into(),
             name: "shop".into(),
             environment: Some(EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: 1,
                 default_machine: None,
                 machines: vec![machine_spec],
@@ -1638,6 +1732,10 @@ mod tests {
             }),
         };
         let environment = EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: 1,
             environment_id: "env_agent_a".into(),
             project_id: "prj_demo".into(),

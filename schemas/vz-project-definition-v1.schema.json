@@ -69,7 +69,9 @@
         "target": {"$ref": "#/$defs/target"},
         "resources": {"$ref": "#/$defs/resources"},
         "requested_capabilities": {"$ref": "#/$defs/requestedCapabilities"},
-        "workspace": {"anyOf": [{"$ref": "#/$defs/workspace"}, {"type": "null"}]}
+        "workspace": {"anyOf": [{"$ref": "#/$defs/workspace"}, {"type": "null"}]},
+        "networks": {"type": "array", "items": {"$ref": "#/$defs/name"}, "description": "Topology-local network names this Machine attaches to. Semantic validation requires each name to be a declared network and rejects duplicates."},
+        "egress": {"enum": ["offline", "allowed"], "description": "Absent means offline: no external attachment exists at all. Never a filter over a shared gateway address."}
       },
       "allOf": [
         {
@@ -82,6 +84,13 @@
             {"properties": {"target": {"properties": {"os": {"enum": ["macos", "windows"]}}, "required": ["os"]}}, "required": ["target"]}
           ]},
           "then": {"properties": {"requested_capabilities": {"properties": {"capabilities": {"not": {"contains": {"enum": ["docker_engine", "compose", "buildx"]}}}}}}}
+        },
+        {
+          "if": {"anyOf": [
+            {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
+            {"properties": {"target": {"properties": {"os": {"enum": ["macos", "windows"]}}, "required": ["os"]}}, "required": ["target"]}
+          ]},
+          "then": {"properties": {"networks": {"maxItems": 0}, "egress": {"const": "offline"}}}
         }
       ],
       "description": "Developer Linux implicitly owns Docker; no Docker flag, global socket or Linux sidecar exists for other profiles/targets."
@@ -109,6 +118,33 @@
         "hostname": {"$ref": "#/$defs/optionalString"}
       }
     },
+    "hostExport": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "machine", "protocol", "machine_port"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "machine": {"$ref": "#/$defs/name"},
+        "protocol": {"enum": ["tcp"]},
+        "machine_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "host_port": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "null"}]}
+      },
+      "description": "The host destination is always 127.0.0.1. No host address is declarable, so no export can become a LAN or wildcard listener; absent host_port requests dynamic loopback allocation."
+    },
+    "hostImport": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "machine", "protocol", "host_port"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "machine": {"$ref": "#/$defs/name"},
+        "protocol": {"enum": ["tcp"]},
+        "host_port": {"type": "integer", "minimum": 1, "maximum": 65535},
+        "guest_port": {"anyOf": [{"type": "integer", "minimum": 1, "maximum": 65535}, {"type": "null"}]},
+        "alias": {"anyOf": [{"$ref": "#/$defs/name"}, {"type": "null"}]}
+      },
+      "description": "Imports name exactly one 127.0.0.1 host service. The guest never sends a destination, and an alias is a guest-local convenience, never an authorization."
+    },
     "environment": {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "machines"],
@@ -117,9 +153,11 @@
         "machines": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/machine"}},
         "default_machine": {"anyOf": [{"$ref": "#/$defs/name"}, {"type": "null"}], "description": "Optional topology-local Machine name. Semantic validation requires an exact declared Machine. Explicit and process selectors take precedence without fallback."},
         "networks": {"type": "array", "items": {"$ref": "#/$defs/network"}},
-        "endpoints": {"type": "array", "items": {"$ref": "#/$defs/endpoint"}}
+        "endpoints": {"type": "array", "items": {"$ref": "#/$defs/endpoint"}},
+        "host_exports": {"type": "array", "items": {"$ref": "#/$defs/hostExport"}},
+        "host_imports": {"type": "array", "items": {"$ref": "#/$defs/hostImport"}}
       },
-      "description": "Semantic validation checks unique names and exact endpoint Machine/network references. More than one named Environment may instantiate this same topology, including within one worktree."
+      "description": "Semantic validation checks unique names, exact endpoint Machine/network references, that every endpoint Machine is attached to that endpoint's network, and that host exports/imports name a declared Machine. More than one named Environment may instantiate this same topology, including within one worktree."
     }
   }
 }

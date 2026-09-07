@@ -205,6 +205,8 @@ fn definition(
 ) -> Result<ProjectDefinition> {
     let spec = |name: &str, profile: MachineProfile, memory_mb: u64, digest: &str| {
         Ok::<_, anyhow::Error>(MachineSpec {
+            networks: Vec::new(),
+            egress: Default::default(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             name: name.into(),
             profile,
@@ -231,6 +233,8 @@ fn definition(
         project_id,
         name: "machine-runtime-registry-e2e".into(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![

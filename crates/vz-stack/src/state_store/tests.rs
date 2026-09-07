@@ -1,24 +1,29 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use super::topology::{ClaimV7MigrationFailpoint, TeardownFinalizerV8MigrationFailpoint};
+use super::topology::{
+    ClaimV7MigrationFailpoint, EnvironmentNetworkV10MigrationFailpoint,
+    TeardownFinalizerV8MigrationFailpoint,
+};
 use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use vz_runtime_contract::types::{
-    Architecture, CapabilitySet, EndpointId, EndpointInstance, EndpointProtocol,
-    EndpointSpec as TopologyEndpointSpec, EnvironmentId, EnvironmentInstance,
-    EnvironmentLifecycleKind, EnvironmentLifecycleOperation, EnvironmentLifecycleStatus,
-    EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentSpec,
-    EnvironmentState, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
-    MachineActivationEvidence, MachineBackend, MachineCapability, MachineId, MachineIncarnation,
-    MachineIncarnationId, MachineInstance, MachineLifecycleStepAcknowledgement, MachineProfile,
-    MachineResources, MachineRuntimeIdentity, MachineSpec, MachineState, NetworkId,
+    Architecture, CapabilitySet, EgressId, EgressInstance, EgressPolicy, EndpointId,
+    EndpointInstance, EndpointProtocol, EndpointSpec as TopologyEndpointSpec, EnvironmentId,
+    EnvironmentInstance, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
+    EnvironmentLifecycleStatus, EnvironmentSelectionContext, EnvironmentSelectionSource,
+    EnvironmentSelector, EnvironmentSpec, EnvironmentState, HostExportId, HostExportInstance,
+    HostExportSpec, HostImportId, HostImportInstance, HostImportSpec, LifecycleOperationId,
+    LifecycleStepResult, LifecycleStepStatus, MachineActivationEvidence, MachineBackend,
+    MachineCapability, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineRuntimeIdentity,
+    MachineSpec, MachineState, NetworkAttachmentId, NetworkAttachmentInstance, NetworkId,
     NetworkInstance, NetworkKind, NetworkSpec as TopologyNetworkSpec, OperatingSystem,
     OwnedResourceKind, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
     ProjectId, ProjectState, ResourceOwner, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
-    TopologyResolutionError, WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection,
-    WorkspaceProjectionMode,
+    TopologyResolutionError, TransportProtocol, WorkspaceBinding, WorkspaceBindingId,
+    WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_contract::{ContainerCreateReceipt, MachineErrorCode};
 
@@ -235,6 +240,8 @@ fn topology_project_state(
         MachineCapability::Buildx,
     ]);
     let machine_spec = MachineSpec {
+        networks: vec!["private".to_string()],
+        egress: EgressPolicy::Allowed,
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         name: "linux".to_string(),
         profile: MachineProfile::Developer,
@@ -252,6 +259,8 @@ fn topology_project_state(
         project_id: project_id.clone(),
         name: "shop".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![machine_spec],
@@ -282,7 +291,25 @@ fn topology_project_state(
             let incarnation_id = MachineIncarnationId::new(format!("inc_{name}")).unwrap();
             let network_id = NetworkId::new(format!("net_{name}")).unwrap();
             let endpoint_id = EndpointId::new(format!("end_{name}")).unwrap();
+            let attachment_id = NetworkAttachmentId::new(format!("att_{name}")).unwrap();
+            let egress_id = EgressId::new(format!("egr_{name}")).unwrap();
             EnvironmentInstance {
+                network_attachments: vec![NetworkAttachmentInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    attachment_id: attachment_id.clone(),
+                    environment_id: environment_id.clone(),
+                    machine_id: machine_id.clone(),
+                    network_id: network_id.clone(),
+                }],
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
+                egress: vec![EgressInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    egress_id,
+                    environment_id: environment_id.clone(),
+                    machine_id: machine_id.clone(),
+                    policy: EgressPolicy::Allowed,
+                }],
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 environment_id: environment_id.clone(),
                 project_id: project_id.clone(),
@@ -363,8 +390,15 @@ fn topology_project_state(
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         resource_kind: OwnedResourceKind::Network,
                         resource_id: network_id.to_string(),
-                        environment_id,
+                        environment_id: environment_id.clone(),
                         machine_id: None,
+                    },
+                    OwnershipRecord {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        resource_kind: OwnedResourceKind::NetworkAttachment,
+                        resource_id: attachment_id.to_string(),
+                        environment_id,
+                        machine_id: Some(machine_id.clone()),
                     },
                 ],
                 legacy_migration: None,
@@ -380,9 +414,52 @@ fn topology_project_state(
     }
 }
 
+/// Aggregate shaped as a state database created before schema v10 could hold
+/// it: no declared attachments, host relays or non-Offline egress.
+fn legacy_topology_project_state(
+    project_id: &str,
+    environment_names: &[&str],
+    path_hint: &str,
+) -> ProjectState {
+    let mut state = topology_project_state(project_id, environment_names, path_hint);
+    state.definition.environment.endpoints.clear();
+    for machine in &mut state.definition.environment.machines {
+        machine.networks.clear();
+        machine.egress = EgressPolicy::Offline;
+    }
+    let definition_digest = state.definition.digest().unwrap();
+    for environment in &mut state.environments {
+        environment.definition_digest = definition_digest.clone();
+        environment.endpoints.clear();
+        environment.network_attachments.clear();
+        environment.egress.clear();
+        environment.ownership.retain(|record| {
+            !matches!(
+                record.resource_kind,
+                OwnedResourceKind::Endpoint | OwnedResourceKind::NetworkAttachment
+            )
+        });
+    }
+    state
+}
+
 fn hardened_topology_project_state(project_id: &str, environment_name: &str) -> ProjectState {
     let mut state = topology_project_state(project_id, &[environment_name], "/checkout");
+    // Hardened Machines declare no network attachments, host relays or egress,
+    // so the shared fixture's declared topology is removed with the profile.
+    state.definition.environment.endpoints.clear();
+    state.environments[0].endpoints.clear();
+    state.environments[0].network_attachments.clear();
+    state.environments[0].egress.clear();
+    state.environments[0].ownership.retain(|record| {
+        !matches!(
+            record.resource_kind,
+            OwnedResourceKind::Endpoint | OwnedResourceKind::NetworkAttachment
+        )
+    });
     let machine_spec = &mut state.definition.environment.machines[0];
+    machine_spec.networks.clear();
+    machine_spec.egress = EgressPolicy::Offline;
     machine_spec.profile = MachineProfile::Hardened;
     for capability in [
         MachineCapability::DockerEngine,
@@ -3453,7 +3530,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
 }
 
 #[test]
@@ -4548,13 +4625,13 @@ fn phase2_validation_schema_version_survives_reopen() {
 
     {
         let store = StateStore::open(&db_path).unwrap();
-        store.set_schema_version(9).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        store.set_schema_version(10).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 10);
     }
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
     }
 }
 
@@ -5082,6 +5159,217 @@ fn v0_3_20_negative_fixture_extensions_are_distinct_and_loadable() {
     }
 }
 
+/// Aggregate declaring every network record kind introduced by schema v10.
+fn network_topology_project_state(project_id: &str, environment_name: &str) -> ProjectState {
+    let mut state = topology_project_state(project_id, &[environment_name], "/checkout");
+    state.definition.environment.host_exports = vec![HostExportSpec {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        name: "web".to_string(),
+        machine: "linux".to_string(),
+        protocol: TransportProtocol::Tcp,
+        machine_port: 443,
+        host_port: Some(18443),
+    }];
+    state.definition.environment.host_imports = vec![HostImportSpec {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        name: "registry".to_string(),
+        machine: "linux".to_string(),
+        protocol: TransportProtocol::Tcp,
+        host_port: 5000,
+        guest_port: Some(15000),
+        alias: Some("registry".to_string()),
+    }];
+    let definition_digest = state.definition.digest().unwrap();
+    let environment = &mut state.environments[0];
+    environment.definition_digest = definition_digest;
+    let environment_id = environment.environment_id.clone();
+    let machine_id = environment.machines[0].machine_id.clone();
+    let export_id = HostExportId::new(format!("hxp_{environment_name}")).unwrap();
+    let import_id = HostImportId::new(format!("hmp_{environment_name}")).unwrap();
+    environment.host_exports = vec![HostExportInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        export_id: export_id.clone(),
+        environment_id: environment_id.clone(),
+        machine_id: machine_id.clone(),
+        name: "web".to_string(),
+    }];
+    environment.host_imports = vec![HostImportInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        import_id: import_id.clone(),
+        environment_id: environment_id.clone(),
+        machine_id: machine_id.clone(),
+        name: "registry".to_string(),
+    }];
+    environment.ownership.push(OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::HostExport,
+        resource_id: export_id.to_string(),
+        environment_id: environment_id.clone(),
+        machine_id: Some(machine_id.clone()),
+    });
+    environment.ownership.push(OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::HostImport,
+        resource_id: import_id.to_string(),
+        environment_id,
+        machine_id: Some(machine_id),
+    });
+    // Normalized ownership rows load ordered by kind then id.
+    environment.ownership.sort_by_key(|record| {
+        (
+            serde_json::to_string(&record.resource_kind).unwrap(),
+            record.resource_id.clone(),
+        )
+    });
+    state.validate().unwrap();
+    state
+}
+
+#[test]
+fn environment_network_topology_round_trips_through_normalized_projections() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("network-topology.db");
+    let expected = network_topology_project_state("prj_network", "agent");
+
+    {
+        let store = StateStore::open(&path).unwrap();
+        assert_eq!(store.schema_version().unwrap(), 10);
+        store.save_project_state(&expected).unwrap();
+        for (table, column) in [
+            ("environment_network_attachments", "attachment_id"),
+            ("environment_host_exports", "export_id"),
+            ("environment_host_imports", "import_id"),
+            ("environment_machine_egress", "egress_id"),
+        ] {
+            let count: i64 = store
+                .conn
+                .query_row(
+                    &format!(
+                        "SELECT COUNT(*) FROM {table}
+                         WHERE environment_id = 'env_agent' AND length(trim({column})) > 0"
+                    ),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing normalized projection in {table}");
+        }
+        let policy: String = store
+            .conn
+            .query_row(
+                "SELECT policy FROM environment_machine_egress WHERE environment_id = 'env_agent'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(policy, "\"allowed\"");
+    }
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(
+        reopened.load_project_state("prj_network").unwrap(),
+        Some(expected)
+    );
+
+    // Every child projection is owned by its Environment and disappears with it.
+    reopened
+        .conn
+        .execute(
+            "DELETE FROM topology_ownership WHERE environment_id = 'env_agent'",
+            [],
+        )
+        .unwrap();
+    reopened
+        .conn
+        .execute(
+            "DELETE FROM environment_instances WHERE environment_id = 'env_agent'",
+            [],
+        )
+        .unwrap();
+    for table in [
+        "environment_network_attachments",
+        "environment_host_exports",
+        "environment_host_imports",
+        "environment_machine_egress",
+    ] {
+        let count: i64 = reopened
+            .conn
+            .query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(count, 0, "stale rows left in {table}");
+    }
+}
+
+#[test]
+fn v9_to_v10_environment_network_migration_rolls_back_then_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v9-to-v10-environment-network.db");
+    let store = StateStore::open(&path).unwrap();
+    let legacy = legacy_topology_project_state("prj_v9_network", &["agent"], "/checkout");
+    store.save_project_state(&legacy).unwrap();
+    downgrade_environment_network_fixture_to_v9(&store);
+    let before = application_schema_snapshot(&store.conn);
+
+    let error = store
+        .migrate_environment_network_v9_to_v10_with_failpoint(
+            EnvironmentNetworkV10MigrationFailpoint::AfterNetworkSchemaCreated,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected v9-to-v10 migration failure"));
+    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(application_schema_snapshot(&store.conn), before);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 10);
+    reopened.validate_v10_schema().unwrap();
+    for object in [
+        "environment_network_attachments",
+        "environment_host_exports",
+        "environment_host_imports",
+        "environment_machine_egress",
+        "idx_environment_network_attachment_machine",
+    ] {
+        assert_eq!(
+            reopened
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sqlite_master WHERE name = ?1",
+                    params![object],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap(),
+            1
+        );
+    }
+    // The migration is pure schema: the pre-v10 aggregate survives unchanged and
+    // every new projection is legitimately empty.
+    assert_eq!(
+        reopened.load_project_state("prj_v9_network").unwrap(),
+        Some(legacy)
+    );
+    let rows: i64 = reopened
+        .conn
+        .query_row(
+            "SELECT (SELECT COUNT(*) FROM environment_network_attachments)
+                  + (SELECT COUNT(*) FROM environment_host_exports)
+                  + (SELECT COUNT(*) FROM environment_host_imports)
+                  + (SELECT COUNT(*) FROM environment_machine_egress)",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rows, 0);
+
+    // The declared topology becomes writable only after the migration.
+    reopened
+        .save_project_state(&network_topology_project_state("prj_v10_network", "agent2"))
+        .unwrap();
+}
+
 #[test]
 fn topology_complete_aggregate_round_trips_after_database_relocation() {
     let first_dir = tempfile::tempdir().unwrap();
@@ -5095,7 +5383,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
         let definition_json: String = store
             .conn
             .query_row(
@@ -5326,6 +5614,8 @@ fn topology_save_is_all_or_nothing_on_cross_environment_id_collision() {
     second.machines[0].machine_id = duplicate_machine_id.clone();
     second.machines[0].incarnation.as_mut().unwrap().machine_id = duplicate_machine_id.clone();
     second.endpoints[0].machine_id = duplicate_machine_id.clone();
+    second.network_attachments[0].machine_id = duplicate_machine_id.clone();
+    second.egress[0].machine_id = duplicate_machine_id.clone();
     for ownership in &mut second.ownership {
         if ownership.machine_id.is_some() {
             ownership.machine_id = Some(duplicate_machine_id.clone());
@@ -7340,6 +7630,10 @@ fn lifecycle_partial_up_requires_evidence_even_for_ready_sibling() {
     let environment = &mut state.environments[0];
     let mut second_spec = state.definition.environment.machines[0].clone();
     second_spec.name = "worker".to_string();
+    // The second Machine declares no network topology of its own, so the
+    // aggregate keeps exactly the first Machine's attachment and egress.
+    second_spec.networks.clear();
+    second_spec.egress = EgressPolicy::Offline;
     state.definition.environment.machines.push(second_spec);
 
     let mut second_machine = environment.machines[0].clone();
@@ -7675,7 +7969,7 @@ fn v2_to_v3_migration_preserves_topology_and_restricts_owned_parent_deletion() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("v2-to-v3.db");
     let store = create_v2_store(&db_path);
-    let expected = topology_project_state("prj_v2_migration", &["agent"], "/checkout");
+    let expected = legacy_topology_project_state("prj_v2_migration", &["agent"], "/checkout");
     store.save_project_state(&expected).unwrap();
     let ownership_before = ownership_snapshot(&store.conn);
     assert!(!ownership_before.is_empty());
@@ -7739,7 +8033,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_path = temp_dir.path().join("v2-to-v3-failpoint.db");
     let store = create_v2_store(&db_path);
-    let expected = topology_project_state("prj_v2_failpoint", &["agent"], "/checkout");
+    let expected = legacy_topology_project_state("prj_v2_failpoint", &["agent"], "/checkout");
     store.save_project_state(&expected).unwrap();
     let schema_before = application_schema_snapshot(&store.conn);
     let ownership_before = ownership_snapshot(&store.conn);
@@ -7757,7 +8051,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 9);
+    assert_eq!(retried.schema_version().unwrap(), 10);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -7815,7 +8109,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 9);
+        assert_eq!(store.schema_version().unwrap(), 10);
         assert_eq!(
             store
                 .conn
@@ -8050,7 +8344,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 9);
+    assert_eq!(retried.schema_version().unwrap(), 10);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -8197,7 +8491,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v9 shape mismatch"));
+    assert!(error.contains("state schema v10 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -8226,7 +8520,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v9 shape mismatch"));
+    assert!(error.contains("state schema v10 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -8331,7 +8625,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v9 shape mismatch"),
+            error.contains("state schema v10 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -8702,10 +8996,10 @@ fn migration_v4_schema_detectable() {
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "9");
+    assert_eq!(version_str, "10");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
 
     // created_at must also be set.
     assert!(
@@ -8765,7 +9059,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -8847,7 +9141,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
 }
 
 fn journal_fixture(
@@ -8857,7 +9151,7 @@ fn journal_fixture(
     StackContainerCreateIntent,
     StackContainerGenerationBinding,
 ) {
-    let project = topology_project_state("prj_journal", &["journal"], "/checkout");
+    let project = legacy_topology_project_state("prj_journal", &["journal"], "/checkout");
     let (intent, binding) = journal_records_for_environment(
         &project,
         0,
@@ -9304,7 +9598,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -9347,7 +9641,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -10004,7 +10298,7 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
 #[test]
 fn fresh_store_uses_v7_reconcile_claim_schema_and_replica_claim_index() {
     let store = StateStore::in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 9);
+    assert_eq!(store.schema_version().unwrap(), 10);
 
     for table in ["reconcile_sessions", "reconcile_progress"] {
         let sql: String = store
@@ -10293,7 +10587,7 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 9);
+        assert_eq!(reopened.schema_version().unwrap(), 10);
         assert_eq!(
             reopened
                 .conn
@@ -10323,7 +10617,25 @@ fn downgrade_claim_fixture_to_v6(store: &StateStore) {
     store.validate_v6_schema().unwrap();
 }
 
+fn downgrade_environment_network_fixture_to_v9(store: &StateStore) {
+    store
+        .conn
+        .execute_batch(
+            "DROP INDEX idx_environment_host_import_machine;
+             DROP INDEX idx_environment_host_export_machine;
+             DROP INDEX idx_environment_network_attachment_machine;
+             DROP TABLE environment_machine_egress;
+             DROP TABLE environment_host_imports;
+             DROP TABLE environment_host_exports;
+             DROP TABLE environment_network_attachments;",
+        )
+        .unwrap();
+    store.set_schema_version(9).unwrap();
+    store.validate_v9_schema().unwrap();
+}
+
 fn downgrade_teardown_finalizer_fixture_to_v7(store: &StateStore) {
+    downgrade_environment_network_fixture_to_v9(store);
     store
         .conn
         .execute_batch(
@@ -10361,8 +10673,8 @@ fn v7_to_v8_teardown_finalizer_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
-    reopened.validate_v9_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 10);
+    reopened.validate_v10_schema().unwrap();
     for object in [
         "teardown_finalizers",
         "teardown_one_active_workload",
@@ -10434,7 +10746,7 @@ fn v7_to_v8_preserves_terminal_claimed_teardown_history() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     let session = reopened
         .load_reconcile_session(session_id)
         .unwrap()
@@ -10451,8 +10763,8 @@ fn v8_to_v9_adds_exact_runtime_identity_projection() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
-    reopened.validate_v9_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 10);
+    reopened.validate_v10_schema().unwrap();
     let column_count: i64 = reopened
         .conn
         .query_row(
@@ -11015,7 +11327,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     for trigger in [
         "reconcile_session_identity_immutable",
         "reconcile_audit_identity_immutable",
@@ -11033,7 +11345,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
             1
         );
     }
-    reopened.validate_v9_schema().unwrap();
+    reopened.validate_v10_schema().unwrap();
 }
 
 #[test]
@@ -11106,7 +11418,7 @@ fn v6_to_v7_preserves_effect_free_active_session_and_terminal_history() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 9);
+        assert_eq!(reopened.schema_version().unwrap(), 10);
         assert_eq!(
             reopened
                 .load_reconcile_session_actions(&session_id)
@@ -11177,7 +11489,7 @@ fn v6_to_v7_preserves_terminal_history_beside_one_effect_free_active_session() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     assert_eq!(
         reopened
             .load_audit_log_for_session("rs-v6-terminal")
@@ -11299,7 +11611,7 @@ fn v6_to_v7_preserves_length_framed_whitespace_ids_for_atomic_claim() {
     };
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     assert_eq!(
         crate::reconcile::ReconcileActionExecutionKey::new(
             session_id,
@@ -11364,7 +11676,7 @@ fn v7_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 9);
+    assert_eq!(reopened.schema_version().unwrap(), 10);
     assert_eq!(
         reopened
             .load_reconcile_session_actions(&session.session_id)
@@ -13078,7 +13390,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v9_schema().unwrap();
+    store.validate_v10_schema().unwrap();
 }
 
 #[test]
@@ -14095,6 +14407,7 @@ fn exact_owned_resource_requirement_validates_active_up_and_rejects_nonowners_wi
 fn never_started_admission_project() -> ProjectState {
     let mut template = topology_project_state("prj_admission_fence", &["template"], "/checkout");
     template.definition.environment.machines[0].workspace = None;
+    template.definition.environment.machines[0].networks.clear();
     template.definition.environment.networks.clear();
     template.definition.environment.endpoints.clear();
     let environment = template
@@ -15468,7 +15781,9 @@ fn persisted_actions_reject_unknown_nested_target_and_workload_fields() {
 }
 
 fn exact_batch_actions_for_claim(store: &StateStore) -> Vec<Action> {
-    let project = topology_project_state("prj_exact_batch", &["machine"], "/checkout");
+    // Downgrade fixtures rewind this database below schema v10, so the saved
+    // aggregate must be one a pre-v10 store could hold.
+    let project = legacy_topology_project_state("prj_exact_batch", &["machine"], "/checkout");
     let (mut recreate_intent, mut recreate_binding) = journal_records_for_environment(
         &project,
         0,

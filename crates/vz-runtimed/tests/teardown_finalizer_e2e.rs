@@ -193,9 +193,13 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
         project_id: project_id.clone(),
         name: "runtimed-finalizer-e2e".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Developer,
@@ -209,6 +213,10 @@ fn install_stack_authority(store: &StateStore, stack_id: &str) -> MachineWorkloa
         },
     };
     let environment = EnvironmentInstance {
+        network_attachments: Vec::new(),
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
+        egress: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),

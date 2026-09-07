@@ -28,10 +28,14 @@ impl Fixture {
             project_id: ProjectId::generate(),
             name: "stop-tests".into(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: ["app", "worker"]
                     .map(|name| MachineSpec {
+                        networks: Vec::new(),
+                        egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: name.into(),
                         profile: MachineProfile::Developer,

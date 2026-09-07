@@ -125,6 +125,66 @@ async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_adm
 }
 
 #[tokio::test]
+async fn declared_host_relays_and_egress_reject_before_project_creation() {
+    // These are declarable records with no adapter behind them yet. Admitting
+    // one would start a Machine that silently lacks the boundary its definition
+    // asks for, so Up must refuse and create no project.
+    for mutate in [
+        (|request: &mut EnvironmentUpRequest| {
+            request
+                .definition
+                .environment
+                .host_exports
+                .push(HostExportSpec {
+                    schema_version: 1,
+                    name: "api".into(),
+                    machine: request.definition.environment.machines[0].name.clone(),
+                    protocol: TransportProtocol::Tcp,
+                    machine_port: 8080,
+                    host_port: None,
+                });
+        }) as fn(&mut EnvironmentUpRequest),
+        |request: &mut EnvironmentUpRequest| {
+            request
+                .definition
+                .environment
+                .host_imports
+                .push(HostImportSpec {
+                    schema_version: 1,
+                    name: "db".into(),
+                    machine: request.definition.environment.machines[0].name.clone(),
+                    protocol: TransportProtocol::Tcp,
+                    host_port: 5432,
+                    guest_port: None,
+                    alias: None,
+                });
+        },
+        |request: &mut EnvironmentUpRequest| {
+            request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
+        },
+    ] {
+        let (_root, daemon, mut request, metadata) = fixture();
+        mutate(&mut request);
+        assert_eq!(
+            daemon
+                .up_environment(request.clone(), metadata)
+                .await
+                .unwrap_err()
+                .code,
+            MachineErrorCode::UnsupportedOperation
+        );
+        assert!(
+            daemon
+                .with_state_store(
+                    |store| store.load_project_state(request.definition.project_id.as_str())
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     let (_root, daemon, mut request, mut metadata) = fixture();
     request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {

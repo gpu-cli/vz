@@ -160,9 +160,13 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
         project_id: project_id.clone(),
         name: "executor-fixture".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Developer,
@@ -200,6 +204,10 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
         legacy_sandbox_id: None,
     };
     let environment = EnvironmentInstance {
+        network_attachments: Vec::new(),
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
+        egress: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),

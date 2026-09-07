@@ -109,9 +109,13 @@ fn seed_stack_topology(
         project_id: project_id.clone(),
         name: "runtimed-client".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Developer,
@@ -125,6 +129,10 @@ fn seed_stack_topology(
         },
     };
     let environment = EnvironmentInstance {
+        network_attachments: Vec::new(),
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
+        egress: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),
@@ -235,9 +243,13 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
         project_id: project_id.clone(),
         name: "status-roundtrip".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Developer,
@@ -265,6 +277,10 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
         let incarnation_id =
             MachineIncarnationId::new(incarnation_id).expect("valid incarnation id");
         EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),

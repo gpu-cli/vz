@@ -96,9 +96,13 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             project_id: project_id.clone(),
             name: "stack-fixture".to_string(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),
                     profile: MachineProfile::Developer,
@@ -112,6 +116,10 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             },
         };
         let environment = EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),
@@ -5695,9 +5703,13 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         project_id: project_id.clone(),
         name: "environment-lifecycle-e2e".to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Hardened,
@@ -5722,6 +5734,10 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
                             disk_resource: String,
                             created_at: u64| {
         EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),

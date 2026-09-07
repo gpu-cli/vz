@@ -94,6 +94,8 @@ async fn target(source: &Path) -> ResolvedLinuxMachineTarget {
         channels: BTreeSet::from(["test".into()]),
     };
     let machine = MachineSpec {
+        networks: Vec::new(),
+        egress: Default::default(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         name: "cancel-machine".into(),
         profile: MachineProfile::Hardened,
@@ -127,6 +129,8 @@ async fn target(source: &Path) -> ResolvedLinuxMachineTarget {
         project_id: ProjectId::new("prj_cancel_pin").unwrap(),
         name: "cancel-pin".into(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![machine],

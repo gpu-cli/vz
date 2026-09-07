@@ -1983,6 +1983,10 @@ mod tests {
             legacy_sandbox_id: None,
         };
         let environment = vz_runtime_contract::EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             project_id: owner.project_id.clone(),
             environment_id: owner.environment_id.clone(),

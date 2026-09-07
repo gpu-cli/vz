@@ -150,9 +150,13 @@ impl Fixture {
             project_id: project_id.clone(),
             name: "controller-prepare".into(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "main".into(),
                     profile: MachineProfile::Developer,

@@ -692,6 +692,10 @@ mod tests {
             legacy_sandbox_id: None,
         };
         EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: ProjectId::new("prj-status").unwrap(),
@@ -781,11 +785,15 @@ mod tests {
             project_id: ProjectId::new("prj-status").unwrap(),
             name: "status-project".to_string(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: ["app", "worker"]
                     .into_iter()
                     .map(|name| MachineSpec {
+                        networks: Vec::new(),
+                        egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: name.to_string(),
                         profile: MachineProfile::Developer,

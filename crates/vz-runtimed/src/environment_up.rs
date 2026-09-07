@@ -268,6 +268,23 @@ fn validate_supported(
             "declared network, endpoint and workspace projection adapters remain required; this Up cannot apply them and performs no admission",
         ));
     }
+    // Host relays and non-offline egress are declarable but not yet applied by
+    // any adapter. Admitting them would start a Machine that silently lacks the
+    // boundary its definition asks for, so they are refused here until the
+    // relay and egress adapters exist.
+    if !spec.host_exports.is_empty()
+        || !spec.host_imports.is_empty()
+        || spec
+            .machines
+            .iter()
+            .any(|machine| machine.egress != EgressPolicy::Offline)
+    {
+        return Err(failure(
+            metadata,
+            MachineErrorCode::UnsupportedOperation,
+            "declared host import/export and non-offline egress adapters remain required; this Up cannot apply them and performs no admission",
+        ));
+    }
     for machine in &spec.machines {
         if !matches!(
             machine.target.os,

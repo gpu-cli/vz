@@ -19,23 +19,25 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vz_runtime_contract::{
     Architecture, Build, BuildSpec, BuildState, CapabilitySet, Checkpoint, CheckpointClass,
-    CheckpointState, Container, ContainerSpec, ContainerState, EndpointId, EndpointInstance,
-    EndpointProtocol, EndpointSpec, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
-    EnvironmentLifecycleOperation, EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState,
-    EnvironmentTombstone, Event, EventScope, Execution, ExecutionSpec, ExecutionState, HostSpec,
-    Lease, LeaseState, LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult,
-    LifecycleStepStatus, MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence,
-    MachineBackend, MachineCapability, MachineDockerContextDescriptor, MachineError,
-    MachineErrorCode, MachineId, MachineIncarnation, MachineIncarnationId, MachineInstance,
-    MachineLifecycleStep, MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources,
-    MachineRuntimeIdentity, MachineSpec, MachineState, MachineWorkloadScope, NetworkId,
-    NetworkInstance, NetworkKind, NetworkSpec, OperatingSystem, OwnedResourceKind,
-    OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement, OwnershipRecord, ProjectDefinition,
-    ProjectId, ProjectState, RequestMetadata, ResourceOwner, RuntimeCapabilities,
-    SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox, SandboxBackend,
-    SandboxSpec, SandboxState, TargetSpec, TopologyCandidate, TopologyLifecycleError,
-    TopologyResolutionError, TopologyValidationError, WorkspaceBinding, WorkspaceBindingId,
-    WorkspaceProjection, WorkspaceProjectionMode,
+    CheckpointState, Container, ContainerSpec, ContainerState, EgressId, EgressInstance,
+    EgressPolicy, EndpointId, EndpointInstance, EndpointProtocol, EndpointSpec, EnvironmentId,
+    EnvironmentInstance, EnvironmentLifecycleKind, EnvironmentLifecycleOperation,
+    EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, EnvironmentTombstone, Event,
+    EventScope, Execution, ExecutionSpec, ExecutionState, HostExportId, HostExportInstance,
+    HostExportSpec, HostImportId, HostImportInstance, HostImportSpec, HostSpec, Lease, LeaseState,
+    LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
+    MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence, MachineBackend,
+    MachineCapability, MachineDockerContextDescriptor, MachineError, MachineErrorCode, MachineId,
+    MachineIncarnation, MachineIncarnationId, MachineInstance, MachineLifecycleStep,
+    MachineLifecycleStepAcknowledgement, MachineProfile, MachineResources, MachineRuntimeIdentity,
+    MachineSpec, MachineState, MachineWorkloadScope, NetworkAttachmentId,
+    NetworkAttachmentInstance, NetworkId, NetworkInstance, NetworkKind, NetworkSpec,
+    OperatingSystem, OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement,
+    OwnershipRecord, ProjectDefinition, ProjectId, ProjectState, RequestMetadata, ResourceOwner,
+    RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox,
+    SandboxBackend, SandboxSpec, SandboxState, TargetSpec, TopologyCandidate,
+    TopologyLifecycleError, TopologyResolutionError, TopologyValidationError, TransportProtocol,
+    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -136,6 +138,16 @@ pub fn environment_spec_to_proto(spec: &EnvironmentSpec) -> runtime_v2::Environm
         machines: spec.machines.iter().map(machine_spec_to_proto).collect(),
         networks: spec.networks.iter().map(network_spec_to_proto).collect(),
         endpoints: spec.endpoints.iter().map(endpoint_spec_to_proto).collect(),
+        host_exports: spec
+            .host_exports
+            .iter()
+            .map(host_export_spec_to_proto)
+            .collect(),
+        host_imports: spec
+            .host_imports
+            .iter()
+            .map(host_import_spec_to_proto)
+            .collect(),
     }
 }
 
@@ -161,6 +173,16 @@ pub fn environment_spec_from_proto(
             .iter()
             .map(endpoint_spec_from_proto)
             .collect::<Result<_, _>>()?,
+        host_exports: spec
+            .host_exports
+            .iter()
+            .map(host_export_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+        host_imports: spec
+            .host_imports
+            .iter()
+            .map(host_import_spec_from_proto)
+            .collect::<Result<_, _>>()?,
     })
 }
 
@@ -174,6 +196,8 @@ pub fn machine_spec_to_proto(spec: &MachineSpec) -> runtime_v2::MachineSpec {
         resources: Some(machine_resources_to_proto(&spec.resources)),
         requested_capabilities: Some(capability_set_to_proto(&spec.requested_capabilities)),
         workspace: spec.workspace.as_ref().map(workspace_projection_to_proto),
+        networks: spec.networks.clone(),
+        egress: egress_policy_to_proto(spec.egress) as i32,
     }
 }
 
@@ -199,6 +223,8 @@ pub fn machine_spec_from_proto(
             .as_ref()
             .map(workspace_projection_from_proto)
             .transpose()?,
+        networks: spec.networks.clone(),
+        egress: egress_policy_from_proto(spec.egress, "machine_spec.egress")?,
     })
 }
 
@@ -407,6 +433,66 @@ pub fn endpoint_spec_from_proto(
             value: spec.port.to_string(),
         })?,
         hostname: spec.hostname.clone(),
+    })
+}
+
+/// Convert a desired host export to wire form.
+pub fn host_export_spec_to_proto(spec: &HostExportSpec) -> runtime_v2::HostExportSpec {
+    runtime_v2::HostExportSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        protocol: transport_protocol_to_proto(spec.protocol) as i32,
+        machine_port: u32::from(spec.machine_port),
+        host_port: spec.host_port.map(u32::from),
+    }
+}
+
+/// Decode a desired host export, rejecting ports outside the domain width.
+pub fn host_export_spec_from_proto(
+    spec: &runtime_v2::HostExportSpec,
+) -> Result<HostExportSpec, TranslationError> {
+    Ok(HostExportSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        protocol: transport_protocol_from_proto(spec.protocol, "host_export_spec.protocol")?,
+        machine_port: port_from_proto(spec.machine_port, "host_export_spec.machine_port")?,
+        host_port: spec
+            .host_port
+            .map(|port| port_from_proto(port, "host_export_spec.host_port"))
+            .transpose()?,
+    })
+}
+
+/// Convert a desired host import to wire form.
+pub fn host_import_spec_to_proto(spec: &HostImportSpec) -> runtime_v2::HostImportSpec {
+    runtime_v2::HostImportSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        protocol: transport_protocol_to_proto(spec.protocol) as i32,
+        host_port: u32::from(spec.host_port),
+        guest_port: spec.guest_port.map(u32::from),
+        alias: spec.alias.clone(),
+    }
+}
+
+/// Decode a desired host import, rejecting ports outside the domain width.
+pub fn host_import_spec_from_proto(
+    spec: &runtime_v2::HostImportSpec,
+) -> Result<HostImportSpec, TranslationError> {
+    Ok(HostImportSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        machine: spec.machine.clone(),
+        protocol: transport_protocol_from_proto(spec.protocol, "host_import_spec.protocol")?,
+        host_port: port_from_proto(spec.host_port, "host_import_spec.host_port")?,
+        guest_port: spec
+            .guest_port
+            .map(|port| port_from_proto(port, "host_import_spec.guest_port"))
+            .transpose()?,
+        alias: spec.alias.clone(),
     })
 }
 
@@ -762,6 +848,108 @@ pub fn endpoint_instance_from_proto(
         machine_id: MachineId::new(endpoint.machine_id.clone())?,
         network_id: NetworkId::new(endpoint.network_id.clone())?,
         name: endpoint.name.clone(),
+    })
+}
+
+/// Convert a persisted network attachment identity to wire form.
+pub fn network_attachment_instance_to_proto(
+    attachment: &NetworkAttachmentInstance,
+) -> runtime_v2::NetworkAttachmentInstance {
+    runtime_v2::NetworkAttachmentInstance {
+        schema_version: attachment.schema_version,
+        attachment_id: attachment.attachment_id.to_string(),
+        environment_id: attachment.environment_id.to_string(),
+        machine_id: attachment.machine_id.to_string(),
+        network_id: attachment.network_id.to_string(),
+    }
+}
+
+/// Decode a persisted network attachment identity.
+pub fn network_attachment_instance_from_proto(
+    attachment: &runtime_v2::NetworkAttachmentInstance,
+) -> Result<NetworkAttachmentInstance, TranslationError> {
+    Ok(NetworkAttachmentInstance {
+        schema_version: attachment.schema_version,
+        attachment_id: NetworkAttachmentId::new(attachment.attachment_id.clone())?,
+        environment_id: EnvironmentId::new(attachment.environment_id.clone())?,
+        machine_id: MachineId::new(attachment.machine_id.clone())?,
+        network_id: NetworkId::new(attachment.network_id.clone())?,
+    })
+}
+
+/// Convert a persisted host export identity to wire form.
+pub fn host_export_instance_to_proto(
+    export: &HostExportInstance,
+) -> runtime_v2::HostExportInstance {
+    runtime_v2::HostExportInstance {
+        schema_version: export.schema_version,
+        export_id: export.export_id.to_string(),
+        environment_id: export.environment_id.to_string(),
+        machine_id: export.machine_id.to_string(),
+        name: export.name.clone(),
+    }
+}
+
+/// Decode a persisted host export identity.
+pub fn host_export_instance_from_proto(
+    export: &runtime_v2::HostExportInstance,
+) -> Result<HostExportInstance, TranslationError> {
+    Ok(HostExportInstance {
+        schema_version: export.schema_version,
+        export_id: HostExportId::new(export.export_id.clone())?,
+        environment_id: EnvironmentId::new(export.environment_id.clone())?,
+        machine_id: MachineId::new(export.machine_id.clone())?,
+        name: export.name.clone(),
+    })
+}
+
+/// Convert a persisted host import identity to wire form.
+pub fn host_import_instance_to_proto(
+    import: &HostImportInstance,
+) -> runtime_v2::HostImportInstance {
+    runtime_v2::HostImportInstance {
+        schema_version: import.schema_version,
+        import_id: import.import_id.to_string(),
+        environment_id: import.environment_id.to_string(),
+        machine_id: import.machine_id.to_string(),
+        name: import.name.clone(),
+    }
+}
+
+/// Decode a persisted host import identity.
+pub fn host_import_instance_from_proto(
+    import: &runtime_v2::HostImportInstance,
+) -> Result<HostImportInstance, TranslationError> {
+    Ok(HostImportInstance {
+        schema_version: import.schema_version,
+        import_id: HostImportId::new(import.import_id.clone())?,
+        environment_id: EnvironmentId::new(import.environment_id.clone())?,
+        machine_id: MachineId::new(import.machine_id.clone())?,
+        name: import.name.clone(),
+    })
+}
+
+/// Convert a persisted Machine egress decision to wire form.
+pub fn egress_instance_to_proto(egress: &EgressInstance) -> runtime_v2::EgressInstance {
+    runtime_v2::EgressInstance {
+        schema_version: egress.schema_version,
+        egress_id: egress.egress_id.to_string(),
+        environment_id: egress.environment_id.to_string(),
+        machine_id: egress.machine_id.to_string(),
+        policy: egress_policy_to_proto(egress.policy) as i32,
+    }
+}
+
+/// Decode a persisted Machine egress decision.
+pub fn egress_instance_from_proto(
+    egress: &runtime_v2::EgressInstance,
+) -> Result<EgressInstance, TranslationError> {
+    Ok(EgressInstance {
+        schema_version: egress.schema_version,
+        egress_id: EgressId::new(egress.egress_id.clone())?,
+        environment_id: EnvironmentId::new(egress.environment_id.clone())?,
+        machine_id: MachineId::new(egress.machine_id.clone())?,
+        policy: egress_policy_from_proto(egress.policy, "egress_instance.policy")?,
     })
 }
 
@@ -1227,6 +1415,26 @@ pub fn environment_instance_to_proto(
             .iter()
             .map(endpoint_instance_to_proto)
             .collect(),
+        network_attachments: environment
+            .network_attachments
+            .iter()
+            .map(network_attachment_instance_to_proto)
+            .collect(),
+        host_exports: environment
+            .host_exports
+            .iter()
+            .map(host_export_instance_to_proto)
+            .collect(),
+        host_imports: environment
+            .host_imports
+            .iter()
+            .map(host_import_instance_to_proto)
+            .collect(),
+        egress: environment
+            .egress
+            .iter()
+            .map(egress_instance_to_proto)
+            .collect(),
         ownership: environment
             .ownership
             .iter()
@@ -1276,6 +1484,26 @@ pub fn environment_instance_from_proto(
             .endpoints
             .iter()
             .map(endpoint_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        network_attachments: environment
+            .network_attachments
+            .iter()
+            .map(network_attachment_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        host_exports: environment
+            .host_exports
+            .iter()
+            .map(host_export_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        host_imports: environment
+            .host_imports
+            .iter()
+            .map(host_import_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        egress: environment
+            .egress
+            .iter()
+            .map(egress_instance_from_proto)
             .collect::<Result<_, _>>()?,
         ownership: environment
             .ownership
@@ -1915,6 +2143,47 @@ fn endpoint_protocol_from_proto(raw: i32) -> Result<EndpointProtocol, Translatio
     }
 }
 
+fn egress_policy_to_proto(value: EgressPolicy) -> runtime_v2::EgressPolicy {
+    match value {
+        EgressPolicy::Offline => runtime_v2::EgressPolicy::Offline,
+        EgressPolicy::Allowed => runtime_v2::EgressPolicy::Allowed,
+    }
+}
+
+fn egress_policy_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<EgressPolicy, TranslationError> {
+    match runtime_v2::EgressPolicy::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::EgressPolicy::Offline => Ok(EgressPolicy::Offline),
+        runtime_v2::EgressPolicy::Allowed => Ok(EgressPolicy::Allowed),
+        runtime_v2::EgressPolicy::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn transport_protocol_to_proto(value: TransportProtocol) -> runtime_v2::TransportProtocol {
+    match value {
+        TransportProtocol::Tcp => runtime_v2::TransportProtocol::Tcp,
+    }
+}
+
+fn transport_protocol_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<TransportProtocol, TranslationError> {
+    match runtime_v2::TransportProtocol::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::TransportProtocol::Tcp => Ok(TransportProtocol::Tcp),
+        runtime_v2::TransportProtocol::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn port_from_proto(value: u32, field: &'static str) -> Result<u16, TranslationError> {
+    u16::try_from(value).map_err(|_| TranslationError::InvalidValue {
+        field,
+        value: value.to_string(),
+    })
+}
+
 fn environment_state_to_proto(value: EnvironmentState) -> runtime_v2::EnvironmentState {
     match value {
         EnvironmentState::Creating => runtime_v2::EnvironmentState::Creating,
@@ -2162,6 +2431,12 @@ fn owned_resource_kind_to_proto(
         OwnedResourceKind::DockerContext => (runtime_v2::OwnedResourceKind::DockerContext, None),
         OwnedResourceKind::Network => (runtime_v2::OwnedResourceKind::Network, None),
         OwnedResourceKind::Endpoint => (runtime_v2::OwnedResourceKind::Endpoint, None),
+        OwnedResourceKind::NetworkAttachment => {
+            (runtime_v2::OwnedResourceKind::NetworkAttachment, None)
+        }
+        OwnedResourceKind::HostExport => (runtime_v2::OwnedResourceKind::HostExport, None),
+        OwnedResourceKind::HostImport => (runtime_v2::OwnedResourceKind::HostImport, None),
+        OwnedResourceKind::PortRange => (runtime_v2::OwnedResourceKind::PortRange, None),
         OwnedResourceKind::Credential => (runtime_v2::OwnedResourceKind::Credential, None),
         OwnedResourceKind::Fault => (runtime_v2::OwnedResourceKind::Fault, None),
         OwnedResourceKind::LegacySandbox => (runtime_v2::OwnedResourceKind::LegacySandbox, None),
@@ -2205,6 +2480,22 @@ fn owned_resource_kind_from_proto(
         runtime_v2::OwnedResourceKind::Endpoint => {
             reject_other(field, other)?;
             Ok(OwnedResourceKind::Endpoint)
+        }
+        runtime_v2::OwnedResourceKind::NetworkAttachment => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::NetworkAttachment)
+        }
+        runtime_v2::OwnedResourceKind::HostExport => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::HostExport)
+        }
+        runtime_v2::OwnedResourceKind::HostImport => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::HostImport)
+        }
+        runtime_v2::OwnedResourceKind::PortRange => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::PortRange)
         }
         runtime_v2::OwnedResourceKind::Credential => {
             reject_other(field, other)?;
@@ -2962,6 +3253,22 @@ mod tests {
         EndpointId::new(value).expect("valid endpoint ID")
     }
 
+    fn attachment_id(value: &str) -> NetworkAttachmentId {
+        NetworkAttachmentId::new(value).expect("valid network attachment ID")
+    }
+
+    fn host_export_id(value: &str) -> HostExportId {
+        HostExportId::new(value).expect("valid host export ID")
+    }
+
+    fn host_import_id(value: &str) -> HostImportId {
+        HostImportId::new(value).expect("valid host import ID")
+    }
+
+    fn egress_id(value: &str) -> EgressId {
+        EgressId::new(value).expect("valid egress ID")
+    }
+
     fn requested_linux_capabilities() -> CapabilitySet {
         CapabilitySet::new([
             MachineCapability::PosixExec,
@@ -3038,7 +3345,18 @@ mod tests {
             ),
             OperatingSystem::Windows => (CapabilitySet::default(), None),
         };
+        let (networks, egress) = match os {
+            OperatingSystem::Linux => (
+                vec!["private".to_string(), "public-like".to_string()],
+                EgressPolicy::Allowed,
+            ),
+            OperatingSystem::Macos | OperatingSystem::Windows => {
+                (Vec::new(), EgressPolicy::Offline)
+            }
+        };
         MachineSpec {
+            networks,
+            egress,
             schema_version: V,
             name: name.to_string(),
             profile: MachineProfile::Developer,
@@ -3059,6 +3377,23 @@ mod tests {
             project_id: project_id("prj-roundtrip"),
             name: "roundtrip".to_string(),
             environment: EnvironmentSpec {
+                host_exports: vec![HostExportSpec {
+                    schema_version: V,
+                    name: "web".to_string(),
+                    machine: "linux".to_string(),
+                    protocol: TransportProtocol::Tcp,
+                    machine_port: 8443,
+                    host_port: Some(18443),
+                }],
+                host_imports: vec![HostImportSpec {
+                    schema_version: V,
+                    name: "registry".to_string(),
+                    machine: "linux".to_string(),
+                    protocol: TransportProtocol::Tcp,
+                    host_port: 5000,
+                    guest_port: Some(15000),
+                    alias: Some("registry".to_string()),
+                }],
                 schema_version: V,
                 default_machine: None,
                 machines: vec![
@@ -3104,6 +3439,43 @@ mod tests {
         let public_network_id = network_id(&format!("net-{suffix}-public"));
         let private_network_id = network_id(&format!("net-{suffix}-private"));
         EnvironmentInstance {
+            network_attachments: vec![
+                NetworkAttachmentInstance {
+                    schema_version: V,
+                    attachment_id: attachment_id(&format!("att-{suffix}-private")),
+                    environment_id: environment_id.clone(),
+                    machine_id: linux_id.clone(),
+                    network_id: private_network_id.clone(),
+                },
+                NetworkAttachmentInstance {
+                    schema_version: V,
+                    attachment_id: attachment_id(&format!("att-{suffix}-public")),
+                    environment_id: environment_id.clone(),
+                    machine_id: linux_id.clone(),
+                    network_id: public_network_id.clone(),
+                },
+            ],
+            host_exports: vec![HostExportInstance {
+                schema_version: V,
+                export_id: host_export_id(&format!("hxp-{suffix}-web")),
+                environment_id: environment_id.clone(),
+                machine_id: linux_id.clone(),
+                name: "web".to_string(),
+            }],
+            host_imports: vec![HostImportInstance {
+                schema_version: V,
+                import_id: host_import_id(&format!("hmp-{suffix}-registry")),
+                environment_id: environment_id.clone(),
+                machine_id: linux_id.clone(),
+                name: "registry".to_string(),
+            }],
+            egress: vec![EgressInstance {
+                schema_version: V,
+                egress_id: egress_id(&format!("egr-{suffix}-linux")),
+                environment_id: environment_id.clone(),
+                machine_id: linux_id.clone(),
+                policy: EgressPolicy::Allowed,
+            }],
             schema_version: V,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),
@@ -3265,7 +3637,42 @@ mod tests {
                     resource_kind: OwnedResourceKind::Endpoint,
                     resource_id: format!("ep-{suffix}-web"),
                     environment_id: environment_id.clone(),
-                    machine_id: Some(linux_id),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::NetworkAttachment,
+                    resource_id: format!("att-{suffix}-private"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::NetworkAttachment,
+                    resource_id: format!("att-{suffix}-public"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::HostExport,
+                    resource_id: format!("hxp-{suffix}-web"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::HostImport,
+                    resource_id: format!("hmp-{suffix}-registry"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::PortRange,
+                    resource_id: format!("ports-{suffix}-linux"),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(linux_id.clone()),
                 },
                 OwnershipRecord {
                     schema_version: V,
@@ -4338,6 +4745,88 @@ mod tests {
                 value: "65536".to_string()
             })
         );
+    }
+
+    #[test]
+    fn network_topology_records_round_trip_and_reject_unspecified_enums() {
+        let definition = project_definition();
+        let export = &definition.environment.host_exports[0];
+        let import = &definition.environment.host_imports[0];
+        assert_eq!(
+            host_export_spec_from_proto(&host_export_spec_to_proto(export)),
+            Ok(export.clone())
+        );
+        assert_eq!(
+            host_import_spec_from_proto(&host_import_spec_to_proto(import)),
+            Ok(import.clone())
+        );
+
+        let environment = environment("wire", "/tmp/wire");
+        let attachment = &environment.network_attachments[0];
+        assert_eq!(
+            network_attachment_instance_from_proto(&network_attachment_instance_to_proto(
+                attachment
+            )),
+            Ok(attachment.clone())
+        );
+        let export_instance = &environment.host_exports[0];
+        assert_eq!(
+            host_export_instance_from_proto(&host_export_instance_to_proto(export_instance)),
+            Ok(export_instance.clone())
+        );
+        let import_instance = &environment.host_imports[0];
+        assert_eq!(
+            host_import_instance_from_proto(&host_import_instance_to_proto(import_instance)),
+            Ok(import_instance.clone())
+        );
+        let egress_instance = &environment.egress[0];
+        assert_eq!(
+            egress_instance_from_proto(&egress_instance_to_proto(egress_instance)),
+            Ok(egress_instance.clone())
+        );
+
+        let mut unspecified_protocol = host_export_spec_to_proto(export);
+        unspecified_protocol.protocol = runtime_v2::TransportProtocol::Unspecified as i32;
+        assert_eq!(
+            host_export_spec_from_proto(&unspecified_protocol),
+            Err(TranslationError::InvalidEnumValue {
+                field: "host_export_spec.protocol",
+                value: "0".to_string()
+            })
+        );
+
+        let mut unspecified_egress = machine_spec_to_proto(&definition.environment.machines[0]);
+        unspecified_egress.egress = runtime_v2::EgressPolicy::Unspecified as i32;
+        assert_eq!(
+            machine_spec_from_proto(&unspecified_egress),
+            Err(TranslationError::InvalidEnumValue {
+                field: "machine_spec.egress",
+                value: "0".to_string()
+            })
+        );
+
+        let mut oversized_port = host_import_spec_to_proto(import);
+        oversized_port.host_port = u32::from(u16::MAX) + 1;
+        assert_eq!(
+            host_import_spec_from_proto(&oversized_port),
+            Err(TranslationError::InvalidValue {
+                field: "host_import_spec.host_port",
+                value: "65536".to_string()
+            })
+        );
+
+        for kind in [
+            OwnedResourceKind::NetworkAttachment,
+            OwnedResourceKind::HostExport,
+            OwnedResourceKind::HostImport,
+            OwnedResourceKind::PortRange,
+        ] {
+            let (wire, other) = owned_resource_kind_to_proto(&kind);
+            assert_eq!(
+                owned_resource_kind_from_proto(wire as i32, other.as_deref()),
+                Ok(kind)
+            );
+        }
     }
 
     #[test]

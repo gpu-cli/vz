@@ -82,6 +82,10 @@ topology_id!(MachineIncarnationId, "machine_incarnation_id", "inc_");
 topology_id!(WorkspaceBindingId, "workspace_binding_id", "wsp_");
 topology_id!(NetworkId, "network_id", "net_");
 topology_id!(EndpointId, "endpoint_id", "end_");
+topology_id!(NetworkAttachmentId, "network_attachment_id", "att_");
+topology_id!(HostExportId, "host_export_id", "hxp_");
+topology_id!(HostImportId, "host_import_id", "hmp_");
+topology_id!(EgressId, "egress_id", "egr_");
 topology_id!(LifecycleOperationId, "lifecycle_operation_id", "lop_");
 
 /// Host or Machine operating system.
@@ -215,6 +219,28 @@ pub struct WorkspaceProjection {
     pub mode: WorkspaceProjectionMode,
 }
 
+/// Whether one Machine may reach anything outside its Environment.
+///
+/// `Offline` is the default and means no external attachment exists at all;
+/// it is never expressed as a filter over a shared gateway address.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum EgressPolicy {
+    #[default]
+    Offline,
+    Allowed,
+}
+
+/// Transport carried by a host export or host import relay.
+///
+/// Only TCP relays exist; UDP and higher-level protocols arrive with their own
+/// data plane rather than being reserved here.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord)]
+#[serde(rename_all = "snake_case")]
+pub enum TransportProtocol {
+    Tcp,
+}
+
 /// Desired Machine within the reusable Environment topology.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -229,6 +255,12 @@ pub struct MachineSpec {
     pub requested_capabilities: CapabilitySet,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub workspace: Option<WorkspaceProjection>,
+    /// Topology-local names of the Environment networks this Machine attaches to.
+    #[serde(default)]
+    pub networks: Vec<String>,
+    /// External reachability for this Machine. Absent means `Offline`.
+    #[serde(default)]
+    pub egress: EgressPolicy,
 }
 
 /// Desired network kind. Data-plane behavior is implemented by later slices.
@@ -273,6 +305,44 @@ pub struct EndpointSpec {
     pub hostname: Option<String>,
 }
 
+/// Desired loopback-only host export of one Machine port.
+///
+/// The host destination is always `127.0.0.1`. There is deliberately no host
+/// address field, so no declaration can widen an export to a LAN or wildcard
+/// listener, and `host_port` only chooses which loopback port is bound.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostExportSpec {
+    pub schema_version: u32,
+    pub name: String,
+    pub machine: String,
+    pub protocol: TransportProtocol,
+    pub machine_port: u16,
+    /// Fixed host loopback port. Absent requests a dynamically allocated port.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_port: Option<u16>,
+}
+
+/// Desired authenticated import of one host-loopback service into a Machine.
+///
+/// The host destination is always `127.0.0.1`, so a guest can never select a
+/// host address; only the exact declared `host_port` is reachable.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct HostImportSpec {
+    pub schema_version: u32,
+    pub name: String,
+    pub machine: String,
+    pub protocol: TransportProtocol,
+    pub host_port: u16,
+    /// Guest-loopback port for the relay. Absent reuses `host_port`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_port: Option<u16>,
+    /// Optional guest-local name for the relay address. Never an authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
 /// Reusable desired topology instantiated by each EnvironmentInstance.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
@@ -286,6 +356,10 @@ pub struct EnvironmentSpec {
     pub networks: Vec<NetworkSpec>,
     #[serde(default)]
     pub endpoints: Vec<EndpointSpec>,
+    #[serde(default)]
+    pub host_exports: Vec<HostExportSpec>,
+    #[serde(default)]
+    pub host_imports: Vec<HostImportSpec>,
 }
 
 /// Versioned, portable project definition.
@@ -551,6 +625,46 @@ pub struct EndpointInstance {
     pub name: String,
 }
 
+/// Persisted attachment of one Machine to one Environment network.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct NetworkAttachmentInstance {
+    pub schema_version: u32,
+    pub attachment_id: NetworkAttachmentId,
+    pub environment_id: EnvironmentId,
+    pub machine_id: MachineId,
+    pub network_id: NetworkId,
+}
+
+/// Persisted host export identity. The bound loopback port is runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostExportInstance {
+    pub schema_version: u32,
+    pub export_id: HostExportId,
+    pub environment_id: EnvironmentId,
+    pub machine_id: MachineId,
+    pub name: String,
+}
+
+/// Persisted host import identity. The import credential is runtime state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HostImportInstance {
+    pub schema_version: u32,
+    pub import_id: HostImportId,
+    pub environment_id: EnvironmentId,
+    pub machine_id: MachineId,
+    pub name: String,
+}
+
+/// Persisted external-reachability decision for one Machine.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct EgressInstance {
+    pub schema_version: u32,
+    pub egress_id: EgressId,
+    pub environment_id: EnvironmentId,
+    pub machine_id: MachineId,
+    pub policy: EgressPolicy,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum OwnedResourceKind {
@@ -561,6 +675,10 @@ pub enum OwnedResourceKind {
     DockerContext,
     Network,
     Endpoint,
+    NetworkAttachment,
+    HostExport,
+    HostImport,
+    PortRange,
     Credential,
     Fault,
     LegacySandbox,
@@ -795,6 +913,14 @@ pub struct EnvironmentInstance {
     pub networks: Vec<NetworkInstance>,
     #[serde(default)]
     pub endpoints: Vec<EndpointInstance>,
+    #[serde(default)]
+    pub network_attachments: Vec<NetworkAttachmentInstance>,
+    #[serde(default)]
+    pub host_exports: Vec<HostExportInstance>,
+    #[serde(default)]
+    pub host_imports: Vec<HostImportInstance>,
+    #[serde(default)]
+    pub egress: Vec<EgressInstance>,
     #[serde(default)]
     pub ownership: Vec<OwnershipRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1200,6 +1326,66 @@ impl ProjectDefinition {
             })
             .collect();
 
+        let network_attachments: Vec<_> = self
+            .environment
+            .machines
+            .iter()
+            .flat_map(|machine| {
+                machine
+                    .networks
+                    .iter()
+                    .map(|network| NetworkAttachmentInstance {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        attachment_id: NetworkAttachmentId::generate(),
+                        environment_id: environment_id.clone(),
+                        machine_id: machine_ids[machine.name.as_str()].clone(),
+                        network_id: network_ids[network.as_str()].clone(),
+                    })
+            })
+            .collect();
+
+        let host_exports: Vec<_> = self
+            .environment
+            .host_exports
+            .iter()
+            .map(|export| HostExportInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                export_id: HostExportId::generate(),
+                environment_id: environment_id.clone(),
+                machine_id: machine_ids[export.machine.as_str()].clone(),
+                name: export.name.clone(),
+            })
+            .collect();
+
+        let host_imports: Vec<_> = self
+            .environment
+            .host_imports
+            .iter()
+            .map(|import| HostImportInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                import_id: HostImportId::generate(),
+                environment_id: environment_id.clone(),
+                machine_id: machine_ids[import.machine.as_str()].clone(),
+                name: import.name.clone(),
+            })
+            .collect();
+
+        // Offline is the absence of an external attachment, so no record exists
+        // for it; a record is materialized exactly for a non-Offline Machine.
+        let egress: Vec<_> = self
+            .environment
+            .machines
+            .iter()
+            .filter(|machine| machine.egress != EgressPolicy::Offline)
+            .map(|machine| EgressInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                egress_id: EgressId::generate(),
+                environment_id: environment_id.clone(),
+                machine_id: machine_ids[machine.name.as_str()].clone(),
+                policy: machine.egress,
+            })
+            .collect();
+
         let mut ownership: Vec<_> = machines
             .iter()
             .map(|machine| OwnershipRecord {
@@ -1224,6 +1410,31 @@ impl ProjectDefinition {
             environment_id: environment_id.clone(),
             machine_id: Some(endpoint.machine_id.clone()),
         }));
+        ownership.extend(
+            network_attachments
+                .iter()
+                .map(|attachment| OwnershipRecord {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    resource_kind: OwnedResourceKind::NetworkAttachment,
+                    resource_id: attachment.attachment_id.to_string(),
+                    environment_id: environment_id.clone(),
+                    machine_id: Some(attachment.machine_id.clone()),
+                }),
+        );
+        ownership.extend(host_exports.iter().map(|export| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::HostExport,
+            resource_id: export.export_id.to_string(),
+            environment_id: environment_id.clone(),
+            machine_id: Some(export.machine_id.clone()),
+        }));
+        ownership.extend(host_imports.iter().map(|import| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::HostImport,
+            resource_id: import.import_id.to_string(),
+            environment_id: environment_id.clone(),
+            machine_id: Some(import.machine_id.clone()),
+        }));
 
         let environment = EnvironmentInstance {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -1238,6 +1449,10 @@ impl ProjectDefinition {
             machines,
             networks,
             endpoints,
+            network_attachments,
+            host_exports,
+            host_imports,
+            egress,
             ownership,
             legacy_migration: None,
             created_at: now,
@@ -1271,6 +1486,14 @@ impl EnvironmentSpec {
         let network_names =
             validate_unique_names("network", self.networks.iter().map(|n| &n.name))?;
         validate_unique_names("endpoint", self.endpoints.iter().map(|e| &e.name))?;
+        validate_unique_names("host_export", self.host_exports.iter().map(|e| &e.name))?;
+        validate_unique_names("host_import", self.host_imports.iter().map(|i| &i.name))?;
+        let mut attachments: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+        let machines_by_name: BTreeMap<&str, &MachineSpec> = self
+            .machines
+            .iter()
+            .map(|machine| (machine.name.as_str(), machine))
+            .collect();
         for machine in &self.machines {
             validate_schema(machine.schema_version)?;
             validate_name("machine", &machine.name)?;
@@ -1283,6 +1506,22 @@ impl EnvironmentSpec {
                 &machine.requested_capabilities,
                 None,
             )?;
+            let declared = validate_unique_names("machine_network", machine.networks.iter())?;
+            for network in &declared {
+                if !network_names.contains(network) {
+                    return Err(TopologyValidationError::MissingReference {
+                        kind: "machine.networks".to_string(),
+                        value: (*network).to_string(),
+                    });
+                }
+            }
+            if !declared.is_empty() {
+                validate_machine_network_support(machine, "network attachments")?;
+            }
+            if machine.egress != EgressPolicy::Offline {
+                validate_machine_network_support(machine, "allowed egress")?;
+            }
+            attachments.insert(machine.name.as_str(), declared);
         }
         for network in &self.networks {
             validate_schema(network.schema_version)?;
@@ -1301,12 +1540,52 @@ impl EnvironmentSpec {
                     value: endpoint.network.clone(),
                 });
             }
+            if !attachments
+                .get(endpoint.machine.as_str())
+                .is_some_and(|declared| declared.contains(endpoint.network.as_str()))
+            {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "endpoint.machine_attachment".to_string(),
+                    value: format!("{}/{}", endpoint.machine, endpoint.network),
+                });
+            }
             if endpoint.port == 0 {
                 return Err(TopologyValidationError::InvalidIdentifier {
                     kind: "endpoint.port".to_string(),
                     value: "0".to_string(),
                     reason: "port must be non-zero".to_string(),
                 });
+            }
+        }
+        for export in &self.host_exports {
+            validate_schema(export.schema_version)?;
+            let Some(machine) = machines_by_name.get(export.machine.as_str()) else {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "host_export.machine".to_string(),
+                    value: export.machine.clone(),
+                });
+            };
+            validate_machine_network_support(machine, "host exports")?;
+            validate_port("host_export.machine_port", export.machine_port)?;
+            if let Some(host_port) = export.host_port {
+                validate_port("host_export.host_port", host_port)?;
+            }
+        }
+        for import in &self.host_imports {
+            validate_schema(import.schema_version)?;
+            let Some(machine) = machines_by_name.get(import.machine.as_str()) else {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "host_import.machine".to_string(),
+                    value: import.machine.clone(),
+                });
+            };
+            validate_machine_network_support(machine, "host imports")?;
+            validate_port("host_import.host_port", import.host_port)?;
+            if let Some(guest_port) = import.guest_port {
+                validate_port("host_import.guest_port", guest_port)?;
+            }
+            if let Some(alias) = &import.alias {
+                validate_name("host_import.alias", alias)?;
             }
         }
         Ok(())
@@ -1818,6 +2097,137 @@ impl EnvironmentInstance {
                 return Err(TopologyValidationError::Duplicate {
                     kind: "endpoint_name".to_string(),
                     value: endpoint.name.clone(),
+                });
+            }
+        }
+        let mut attachment_ids = BTreeSet::new();
+        let mut attachment_pairs = BTreeSet::new();
+        for attachment in &self.network_attachments {
+            validate_schema(attachment.schema_version)?;
+            attachment.attachment_id.validate()?;
+            if attachment.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "network_attachment.environment".to_string(),
+                    value: attachment.attachment_id.to_string(),
+                });
+            }
+            if !machine_ids.contains(attachment.machine_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "network_attachment.machine_id".to_string(),
+                    value: attachment.machine_id.to_string(),
+                });
+            }
+            if !network_ids.contains(attachment.network_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "network_attachment.network_id".to_string(),
+                    value: attachment.network_id.to_string(),
+                });
+            }
+            if !attachment_ids.insert(attachment.attachment_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "network_attachment_id".to_string(),
+                    value: attachment.attachment_id.to_string(),
+                });
+            }
+            if !attachment_pairs.insert((
+                attachment.machine_id.as_str(),
+                attachment.network_id.as_str(),
+            )) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "network_attachment".to_string(),
+                    value: format!("{}/{}", attachment.machine_id, attachment.network_id),
+                });
+            }
+        }
+        let mut export_ids = BTreeSet::new();
+        let mut export_names = BTreeSet::new();
+        for export in &self.host_exports {
+            validate_schema(export.schema_version)?;
+            export.export_id.validate()?;
+            validate_name("host_export", &export.name)?;
+            if export.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "host_export.environment".to_string(),
+                    value: export.export_id.to_string(),
+                });
+            }
+            if !machine_ids.contains(export.machine_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "host_export.machine_id".to_string(),
+                    value: export.machine_id.to_string(),
+                });
+            }
+            if !export_ids.insert(export.export_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "host_export_id".to_string(),
+                    value: export.export_id.to_string(),
+                });
+            }
+            if !export_names.insert(export.name.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "host_export_name".to_string(),
+                    value: export.name.clone(),
+                });
+            }
+        }
+        let mut import_ids = BTreeSet::new();
+        let mut import_names = BTreeSet::new();
+        for import in &self.host_imports {
+            validate_schema(import.schema_version)?;
+            import.import_id.validate()?;
+            validate_name("host_import", &import.name)?;
+            if import.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "host_import.environment".to_string(),
+                    value: import.import_id.to_string(),
+                });
+            }
+            if !machine_ids.contains(import.machine_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "host_import.machine_id".to_string(),
+                    value: import.machine_id.to_string(),
+                });
+            }
+            if !import_ids.insert(import.import_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "host_import_id".to_string(),
+                    value: import.import_id.to_string(),
+                });
+            }
+            if !import_names.insert(import.name.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "host_import_name".to_string(),
+                    value: import.name.clone(),
+                });
+            }
+        }
+        let mut egress_ids = BTreeSet::new();
+        let mut egress_machines = BTreeSet::new();
+        for egress in &self.egress {
+            validate_schema(egress.schema_version)?;
+            egress.egress_id.validate()?;
+            if egress.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "egress.environment".to_string(),
+                    value: egress.egress_id.to_string(),
+                });
+            }
+            if !machine_ids.contains(egress.machine_id.as_str()) {
+                return Err(TopologyValidationError::MissingReference {
+                    kind: "egress.machine_id".to_string(),
+                    value: egress.machine_id.to_string(),
+                });
+            }
+            if !egress_ids.insert(egress.egress_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "egress_id".to_string(),
+                    value: egress.egress_id.to_string(),
+                });
+            }
+            if !egress_machines.insert(egress.machine_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "egress_machine".to_string(),
+                    value: egress.machine_id.to_string(),
                 });
             }
         }
@@ -3750,6 +4160,48 @@ fn validate_exact_topology_ownership(
         }
     }
 
+    for attachment in &environment.network_attachments {
+        let exact = environment.ownership.iter().filter(|record| {
+            record.resource_kind == OwnedResourceKind::NetworkAttachment
+                && record.resource_id == attachment.attachment_id.as_str()
+                && record.machine_id.as_ref() == Some(&attachment.machine_id)
+        });
+        if exact.count() != 1 {
+            return Err(ownership_mismatch(
+                "network_attachment",
+                attachment.attachment_id.to_string(),
+            ));
+        }
+    }
+
+    for export in &environment.host_exports {
+        let exact = environment.ownership.iter().filter(|record| {
+            record.resource_kind == OwnedResourceKind::HostExport
+                && record.resource_id == export.export_id.as_str()
+                && record.machine_id.as_ref() == Some(&export.machine_id)
+        });
+        if exact.count() != 1 {
+            return Err(ownership_mismatch(
+                "host_export",
+                export.export_id.to_string(),
+            ));
+        }
+    }
+
+    for import in &environment.host_imports {
+        let exact = environment.ownership.iter().filter(|record| {
+            record.resource_kind == OwnedResourceKind::HostImport
+                && record.resource_id == import.import_id.as_str()
+                && record.machine_id.as_ref() == Some(&import.machine_id)
+        });
+        if exact.count() != 1 {
+            return Err(ownership_mismatch(
+                "host_import",
+                import.import_id.to_string(),
+            ));
+        }
+    }
+
     for record in &environment.ownership {
         let known = match record.resource_kind {
             OwnedResourceKind::Machine => environment.machines.iter().any(|machine| {
@@ -3769,6 +4221,20 @@ fn validate_exact_topology_ownership(
             OwnedResourceKind::Endpoint => environment.endpoints.iter().any(|endpoint| {
                 record.resource_id == endpoint.endpoint_id.as_str()
                     && record.machine_id.as_ref() == Some(&endpoint.machine_id)
+            }),
+            OwnedResourceKind::NetworkAttachment => {
+                environment.network_attachments.iter().any(|attachment| {
+                    record.resource_id == attachment.attachment_id.as_str()
+                        && record.machine_id.as_ref() == Some(&attachment.machine_id)
+                })
+            }
+            OwnedResourceKind::HostExport => environment.host_exports.iter().any(|export| {
+                record.resource_id == export.export_id.as_str()
+                    && record.machine_id.as_ref() == Some(&export.machine_id)
+            }),
+            OwnedResourceKind::HostImport => environment.host_imports.iter().any(|import| {
+                record.resource_id == import.import_id.as_str()
+                    && record.machine_id.as_ref() == Some(&import.machine_id)
             }),
             OwnedResourceKind::LegacySandbox => {
                 environment
@@ -3921,6 +4387,128 @@ fn validate_definition_instance(
             );
         }
     }
+
+    let desired_attachments: BTreeSet<(&str, &str)> = spec
+        .machines
+        .iter()
+        .flat_map(|machine| {
+            machine
+                .networks
+                .iter()
+                .map(|network| (machine.name.as_str(), network.as_str()))
+        })
+        .collect();
+    let actual_attachments: BTreeSet<(&str, &str)> = environment
+        .network_attachments
+        .iter()
+        .filter_map(|attachment| {
+            let machine = machine_names_by_id
+                .get(attachment.machine_id.as_str())
+                .copied()?;
+            let network = network_names_by_id
+                .get(attachment.network_id.as_str())
+                .copied()?;
+            Some((machine, network))
+        })
+        .collect();
+    if environment.network_attachments.len() != desired_attachments.len()
+        || actual_attachments != desired_attachments
+    {
+        return definition_topology_mismatch(
+            &environment_id,
+            "Machine network attachments differ from the project definition",
+        );
+    }
+
+    let exports: BTreeMap<_, _> = environment
+        .host_exports
+        .iter()
+        .map(|export| (export.name.as_str(), export))
+        .collect();
+    if exports.len() != spec.host_exports.len() {
+        return definition_topology_mismatch(
+            &environment_id,
+            "Host export names/count differ from the project definition",
+        );
+    }
+    for desired in &spec.host_exports {
+        let Some(actual) = exports.get(desired.name.as_str()) else {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("missing host export `{}`", desired.name),
+            );
+        };
+        if machine_names_by_id.get(actual.machine_id.as_str()).copied()
+            != Some(desired.machine.as_str())
+        {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("host export `{}` Machine differs", desired.name),
+            );
+        }
+    }
+
+    let imports: BTreeMap<_, _> = environment
+        .host_imports
+        .iter()
+        .map(|import| (import.name.as_str(), import))
+        .collect();
+    if imports.len() != spec.host_imports.len() {
+        return definition_topology_mismatch(
+            &environment_id,
+            "Host import names/count differ from the project definition",
+        );
+    }
+    for desired in &spec.host_imports {
+        let Some(actual) = imports.get(desired.name.as_str()) else {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("missing host import `{}`", desired.name),
+            );
+        };
+        if machine_names_by_id.get(actual.machine_id.as_str()).copied()
+            != Some(desired.machine.as_str())
+        {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("host import `{}` Machine differs", desired.name),
+            );
+        }
+    }
+
+    // Offline Machines own no egress record, so the record set must match the
+    // set of Machines that declared a non-Offline policy, exactly.
+    let egress: BTreeMap<_, _> = environment
+        .egress
+        .iter()
+        .filter_map(|egress| {
+            machine_names_by_id
+                .get(egress.machine_id.as_str())
+                .copied()
+                .map(|machine| (machine, egress.policy))
+        })
+        .collect();
+    let declared_egress = spec
+        .machines
+        .iter()
+        .filter(|machine| machine.egress != EgressPolicy::Offline)
+        .count();
+    if egress.len() != environment.egress.len() || egress.len() != declared_egress {
+        return definition_topology_mismatch(
+            &environment_id,
+            "Machine egress records differ from the project definition",
+        );
+    }
+    for desired in &spec.machines {
+        let actual = egress.get(desired.name.as_str()).copied();
+        let expected = (desired.egress != EgressPolicy::Offline).then_some(desired.egress);
+        if actual != expected {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("Machine `{}` egress policy differs", desired.name),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -3945,6 +4533,46 @@ fn validate_requested_capabilities(
         machine_id: machine.to_string(),
         reason: "requested capabilities cannot contain unsupported results".to_string(),
     })
+}
+
+/// Reject declared network topology on Machines whose target cannot carry it.
+///
+/// Hardened Machines mirror the existing Docker-capability rejection: the
+/// restricted profile declares none of this. Native (non-Linux) targets have no
+/// switch, relay or egress implementation yet and are rejected the same way the
+/// file already rejects implicit Docker capabilities on those targets.
+fn validate_machine_network_support(
+    machine: &MachineSpec,
+    declaration: &str,
+) -> Result<(), TopologyValidationError> {
+    if machine.profile == MachineProfile::Hardened {
+        return Err(TopologyValidationError::InvalidMachineProfile {
+            machine_id: machine.name.clone(),
+            profile: machine.profile,
+            reason: format!("Hardened Machines cannot declare {declaration}"),
+        });
+    }
+    if machine.target.os != OperatingSystem::Linux {
+        return Err(TopologyValidationError::InvalidCapabilityDeclaration {
+            machine_id: machine.name.clone(),
+            reason: format!(
+                "native {:?} target cannot declare {declaration}",
+                machine.target.os
+            ),
+        });
+    }
+    Ok(())
+}
+
+fn validate_port(kind: &str, port: u16) -> Result<(), TopologyValidationError> {
+    if port == 0 {
+        return Err(TopologyValidationError::InvalidIdentifier {
+            kind: kind.to_string(),
+            value: "0".to_string(),
+            reason: "port must be within 1..=65535".to_string(),
+        });
+    }
+    Ok(())
 }
 
 fn validate_machine_profile(
@@ -4080,6 +4708,8 @@ pub fn migrate_legacy_developer_sandbox(
     ]);
     let (environment_state, machine_state) = legacy_state(sandbox.state);
     let machine_spec = MachineSpec {
+        networks: Vec::new(),
+        egress: Default::default(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         name: "linux".to_string(),
         profile: MachineProfile::Developer,
@@ -4101,6 +4731,8 @@ pub fn migrate_legacy_developer_sandbox(
         }),
     };
     let environment_spec = EnvironmentSpec {
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         default_machine: None,
         machines: vec![machine_spec],
@@ -4145,6 +4777,10 @@ pub fn migrate_legacy_developer_sandbox(
         legacy_sandbox_id: Some(sandbox.sandbox_id.clone()),
     };
     let environment = EnvironmentInstance {
+        network_attachments: Vec::new(),
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
+        egress: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),
@@ -4220,6 +4856,10 @@ fn resource_kind_requires_machine(kind: &OwnedResourceKind) -> bool {
             | OwnedResourceKind::Socket
             | OwnedResourceKind::DockerContext
             | OwnedResourceKind::Endpoint
+            | OwnedResourceKind::NetworkAttachment
+            | OwnedResourceKind::HostExport
+            | OwnedResourceKind::HostImport
+            | OwnedResourceKind::PortRange
             | OwnedResourceKind::LegacySandbox
     )
 }
@@ -4261,6 +4901,10 @@ fn resource_kind_identity(kind: &OwnedResourceKind) -> String {
         OwnedResourceKind::DockerContext => "docker_context".to_string(),
         OwnedResourceKind::Network => "network".to_string(),
         OwnedResourceKind::Endpoint => "endpoint".to_string(),
+        OwnedResourceKind::NetworkAttachment => "network_attachment".to_string(),
+        OwnedResourceKind::HostExport => "host_export".to_string(),
+        OwnedResourceKind::HostImport => "host_import".to_string(),
+        OwnedResourceKind::PortRange => "port_range".to_string(),
         OwnedResourceKind::Credential => "credential".to_string(),
         OwnedResourceKind::Fault => "fault".to_string(),
         OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
@@ -4370,6 +5014,8 @@ mod tests {
 
     fn linux_spec(name: &str) -> MachineSpec {
         MachineSpec {
+            networks: Vec::new(),
+            egress: Default::default(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             name: name.to_string(),
             profile: MachineProfile::Developer,
@@ -4400,17 +5046,31 @@ mod tests {
         }
     }
 
+    fn attached_linux_spec(name: &str, networks: &[&str]) -> MachineSpec {
+        MachineSpec {
+            networks: networks
+                .iter()
+                .map(|network| (*network).to_string())
+                .collect(),
+            ..linux_spec(name)
+        }
+    }
+
     fn project_definition() -> ProjectDefinition {
         ProjectDefinition {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             project_id: ProjectId::new("prj_shop").unwrap(),
             name: "shop".to_string(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![
-                    linux_spec("api"),
+                    attached_linux_spec("api", &["private"]),
                     MachineSpec {
+                        networks: Vec::new(),
+                        egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: "ios".to_string(),
                         profile: MachineProfile::Developer,
@@ -4668,8 +5328,12 @@ mod tests {
         implicit_docker.validate().unwrap();
 
         let mut hardened = project_definition();
+        // Hardened Machines declare no network topology, so the shared fixture's
+        // attachment and endpoint are removed with the same edit.
+        hardened.environment.endpoints.clear();
         let hardened_machine = &mut hardened.environment.machines[0];
         hardened_machine.profile = MachineProfile::Hardened;
+        hardened_machine.networks.clear();
         for capability in [
             MachineCapability::DockerEngine,
             MachineCapability::Compose,
@@ -4772,6 +5436,10 @@ mod tests {
     #[test]
     fn unsupported_target_is_structured_and_never_substituted() {
         let mut definition = project_definition();
+        // Native targets carry no declared network topology yet, so the shared
+        // fixture's attachment and endpoint go with the retargeted Machine.
+        definition.environment.endpoints.clear();
+        definition.environment.machines[0].networks.clear();
         definition.environment.machines[0].target.os = OperatingSystem::Windows;
         for capability in [
             MachineCapability::DockerEngine,
@@ -5146,6 +5814,10 @@ mod tests {
         assert_generated!(WorkspaceBindingId, "wsp_");
         assert_generated!(NetworkId, "net_");
         assert_generated!(EndpointId, "end_");
+        assert_generated!(NetworkAttachmentId, "att_");
+        assert_generated!(HostExportId, "hxp_");
+        assert_generated!(HostImportId, "hmp_");
+        assert_generated!(EgressId, "egr_");
     }
 
     #[test]
@@ -5158,7 +5830,12 @@ mod tests {
         assert!(first.bindings.is_empty());
         assert_eq!(
             first.ownership.len(),
-            first.machines.len() + first.networks.len() + first.endpoints.len()
+            first.machines.len()
+                + first.networks.len()
+                + first.endpoints.len()
+                + first.network_attachments.len()
+                + first.host_exports.len()
+                + first.host_imports.len()
         );
         assert_eq!(first.state, EnvironmentState::Creating);
         assert_eq!(first.created_at, 42);
@@ -7032,5 +7709,389 @@ mod tests {
         let decoded: TopologyLifecycleError =
             serde_json::from_str(&serde_json::to_string(&error).unwrap()).unwrap();
         assert_eq!(decoded, error);
+    }
+
+    fn network_topology_definition() -> ProjectDefinition {
+        let mut definition = project_definition();
+        let environment = &mut definition.environment;
+        environment.machines[0].egress = EgressPolicy::Allowed;
+        environment.host_exports = vec![HostExportSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            name: "api".to_string(),
+            machine: "api".to_string(),
+            protocol: TransportProtocol::Tcp,
+            machine_port: 443,
+            host_port: Some(18443),
+        }];
+        environment.host_imports = vec![HostImportSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            name: "registry".to_string(),
+            machine: "api".to_string(),
+            protocol: TransportProtocol::Tcp,
+            host_port: 5000,
+            guest_port: Some(15000),
+            alias: Some("registry".to_string()),
+        }];
+        definition
+    }
+
+    #[test]
+    fn declared_network_topology_is_accepted_and_instantiated_with_exact_ownership() {
+        let definition = network_topology_definition();
+        definition.validate().unwrap();
+
+        let environment = definition.instantiate_environment("agent", 7).unwrap();
+        assert_eq!(environment.network_attachments.len(), 1);
+        assert_eq!(environment.host_exports.len(), 1);
+        assert_eq!(environment.host_imports.len(), 1);
+        // Only the Allowed Machine owns an egress record; Offline is absence.
+        assert_eq!(environment.egress.len(), 1);
+        assert_eq!(environment.egress[0].policy, EgressPolicy::Allowed);
+
+        let attachment = &environment.network_attachments[0];
+        assert_eq!(attachment.machine_id, environment.machines[0].machine_id);
+        assert_eq!(attachment.network_id, environment.networks[0].network_id);
+        for (kind, resource_id, machine_id) in [
+            (
+                OwnedResourceKind::NetworkAttachment,
+                attachment.attachment_id.to_string(),
+                attachment.machine_id.clone(),
+            ),
+            (
+                OwnedResourceKind::HostExport,
+                environment.host_exports[0].export_id.to_string(),
+                environment.host_exports[0].machine_id.clone(),
+            ),
+            (
+                OwnedResourceKind::HostImport,
+                environment.host_imports[0].import_id.to_string(),
+                environment.host_imports[0].machine_id.clone(),
+            ),
+        ] {
+            assert_eq!(
+                environment
+                    .ownership
+                    .iter()
+                    .filter(|record| record.resource_kind == kind
+                        && record.resource_id == resource_id
+                        && record.machine_id.as_ref() == Some(&machine_id))
+                    .count(),
+                1
+            );
+        }
+        // Egress is a policy record, not an owned physical resource.
+        assert!(!environment.ownership.iter().any(|record| {
+            environment
+                .egress
+                .iter()
+                .any(|egress| record.resource_id == egress.egress_id.as_str())
+        }));
+
+        let round_trip: ProjectDefinition =
+            serde_json::from_str(&serde_json::to_string(&definition).unwrap()).unwrap();
+        assert_eq!(round_trip, definition);
+    }
+
+    #[test]
+    fn network_topology_rejects_every_malformed_declaration() {
+        let missing_network = |mut definition: ProjectDefinition| {
+            definition.environment.machines[0].networks = vec!["absent".to_string()];
+            definition
+        };
+        type Mutation = Box<dyn Fn(ProjectDefinition) -> ProjectDefinition>;
+        let cases: Vec<(&str, Mutation)> = vec![
+            ("machine.networks", Box::new(missing_network)),
+            (
+                "machine_network_name",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.machines[0].networks =
+                        vec!["private".to_string(), "private".to_string()];
+                    definition
+                }),
+            ),
+            (
+                "endpoint.machine_attachment",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.machines[0].networks.clear();
+                    definition
+                }),
+            ),
+            (
+                "host_export.machine",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_exports[0].machine = "absent".to_string();
+                    definition
+                }),
+            ),
+            (
+                "host_import.machine",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_imports[0].machine = "absent".to_string();
+                    definition
+                }),
+            ),
+            (
+                "host_export_name",
+                Box::new(|mut definition: ProjectDefinition| {
+                    let duplicate = definition.environment.host_exports[0].clone();
+                    definition.environment.host_exports.push(duplicate);
+                    definition
+                }),
+            ),
+            (
+                "host_import_name",
+                Box::new(|mut definition: ProjectDefinition| {
+                    let duplicate = definition.environment.host_imports[0].clone();
+                    definition.environment.host_imports.push(duplicate);
+                    definition
+                }),
+            ),
+            (
+                "host_export.machine_port",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_exports[0].machine_port = 0;
+                    definition
+                }),
+            ),
+            (
+                "host_export.host_port",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_exports[0].host_port = Some(0);
+                    definition
+                }),
+            ),
+            (
+                "host_import.host_port",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_imports[0].host_port = 0;
+                    definition
+                }),
+            ),
+            (
+                "host_import.guest_port",
+                Box::new(|mut definition: ProjectDefinition| {
+                    definition.environment.host_imports[0].guest_port = Some(0);
+                    definition
+                }),
+            ),
+        ];
+
+        for (expected, mutate) in cases {
+            let error = mutate(network_topology_definition())
+                .validate()
+                .unwrap_err();
+            let observed = match &error {
+                TopologyValidationError::MissingReference { kind, .. }
+                | TopologyValidationError::Duplicate { kind, .. }
+                | TopologyValidationError::InvalidIdentifier { kind, .. } => kind.clone(),
+                other => panic!("unexpected error for `{expected}`: {other:?}"),
+            };
+            assert_eq!(observed, expected, "wrong rejection for `{expected}`");
+        }
+    }
+
+    #[test]
+    fn hardened_and_native_machines_declare_no_network_topology() {
+        for mutate in [
+            |definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].networks = vec!["private".to_string()];
+            },
+            |definition: &mut ProjectDefinition| {
+                definition.environment.machines[0].egress = EgressPolicy::Allowed;
+            },
+            |definition: &mut ProjectDefinition| {
+                definition.environment.host_exports = vec![HostExportSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "api".to_string(),
+                    machine: "api".to_string(),
+                    protocol: TransportProtocol::Tcp,
+                    machine_port: 443,
+                    host_port: None,
+                }];
+            },
+            |definition: &mut ProjectDefinition| {
+                definition.environment.host_imports = vec![HostImportSpec {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    name: "registry".to_string(),
+                    machine: "api".to_string(),
+                    protocol: TransportProtocol::Tcp,
+                    host_port: 5000,
+                    guest_port: None,
+                    alias: None,
+                }];
+            },
+        ] {
+            let mut hardened = project_definition();
+            hardened.environment.endpoints.clear();
+            hardened.environment.machines[0].networks.clear();
+            hardened.environment.machines[0].profile = MachineProfile::Hardened;
+            for capability in [
+                MachineCapability::DockerEngine,
+                MachineCapability::Compose,
+                MachineCapability::Buildx,
+            ] {
+                hardened.environment.machines[0]
+                    .requested_capabilities
+                    .capabilities
+                    .remove(&capability);
+            }
+            mutate(&mut hardened);
+            assert!(
+                matches!(
+                    hardened.validate(),
+                    Err(TopologyValidationError::InvalidMachineProfile {
+                        profile: MachineProfile::Hardened,
+                        ..
+                    })
+                ),
+                "Hardened Machine accepted declared network topology"
+            );
+
+            let mut native = project_definition();
+            native.environment.endpoints.clear();
+            native.environment.machines[0].networks.clear();
+            native.environment.machines[0].target.os = OperatingSystem::Macos;
+            for capability in [
+                MachineCapability::DockerEngine,
+                MachineCapability::Compose,
+                MachineCapability::Buildx,
+            ] {
+                native.environment.machines[0]
+                    .requested_capabilities
+                    .capabilities
+                    .remove(&capability);
+            }
+            mutate(&mut native);
+            assert!(
+                matches!(
+                    native.validate(),
+                    Err(TopologyValidationError::InvalidCapabilityDeclaration { .. })
+                ),
+                "native macOS Machine accepted declared network topology"
+            );
+        }
+    }
+
+    #[test]
+    fn network_topology_instances_require_exact_references_and_uniqueness() {
+        let definition = network_topology_definition();
+        let baseline = definition.instantiate_environment("agent", 7).unwrap();
+
+        let mut foreign_machine = baseline.clone();
+        foreign_machine.network_attachments[0].machine_id = MachineId::generate();
+        assert!(matches!(
+            foreign_machine.validate(),
+            Err(TopologyValidationError::MissingReference { ref kind, .. })
+                if kind == "network_attachment.machine_id"
+        ));
+
+        let mut foreign_network = baseline.clone();
+        foreign_network.network_attachments[0].network_id = NetworkId::generate();
+        assert!(matches!(
+            foreign_network.validate(),
+            Err(TopologyValidationError::MissingReference { ref kind, .. })
+                if kind == "network_attachment.network_id"
+        ));
+
+        let mut duplicate_attachment = baseline.clone();
+        let attachment = NetworkAttachmentInstance {
+            attachment_id: NetworkAttachmentId::generate(),
+            ..duplicate_attachment.network_attachments[0].clone()
+        };
+        duplicate_attachment.network_attachments.push(attachment);
+        assert!(matches!(
+            duplicate_attachment.validate(),
+            Err(TopologyValidationError::Duplicate { ref kind, .. })
+                if kind == "network_attachment"
+        ));
+
+        let mut duplicate_egress = baseline.clone();
+        let egress = EgressInstance {
+            egress_id: EgressId::generate(),
+            ..duplicate_egress.egress[0].clone()
+        };
+        duplicate_egress.egress.push(egress);
+        assert!(matches!(
+            duplicate_egress.validate(),
+            Err(TopologyValidationError::Duplicate { ref kind, .. }) if kind == "egress_machine"
+        ));
+
+        let mut unowned_export = baseline.clone();
+        unowned_export
+            .ownership
+            .retain(|record| record.resource_kind != OwnedResourceKind::HostExport);
+        assert!(matches!(
+            unowned_export.validate(),
+            Err(TopologyValidationError::OwnershipMismatch { ref kind, .. })
+                if kind == "host_export"
+        ));
+
+        let mut dropped_egress = baseline;
+        dropped_egress.egress.clear();
+        assert!(matches!(
+            validate_definition_instance(&definition.environment, &dropped_egress),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn owned_resource_kind_identity_covers_every_variant() {
+        let kinds = [
+            OwnedResourceKind::Machine,
+            OwnedResourceKind::Incarnation,
+            OwnedResourceKind::Disk,
+            OwnedResourceKind::Socket,
+            OwnedResourceKind::DockerContext,
+            OwnedResourceKind::Network,
+            OwnedResourceKind::Endpoint,
+            OwnedResourceKind::NetworkAttachment,
+            OwnedResourceKind::HostExport,
+            OwnedResourceKind::HostImport,
+            OwnedResourceKind::PortRange,
+            OwnedResourceKind::Credential,
+            OwnedResourceKind::Fault,
+            OwnedResourceKind::LegacySandbox,
+            OwnedResourceKind::Other("audit".to_string()),
+        ];
+        for kind in &kinds {
+            // Exhaustive by construction: a new variant fails to compile here.
+            let expected = match kind {
+                OwnedResourceKind::Machine => "machine".to_string(),
+                OwnedResourceKind::Incarnation => "incarnation".to_string(),
+                OwnedResourceKind::Disk => "disk".to_string(),
+                OwnedResourceKind::Socket => "socket".to_string(),
+                OwnedResourceKind::DockerContext => "docker_context".to_string(),
+                OwnedResourceKind::Network => "network".to_string(),
+                OwnedResourceKind::Endpoint => "endpoint".to_string(),
+                OwnedResourceKind::NetworkAttachment => "network_attachment".to_string(),
+                OwnedResourceKind::HostExport => "host_export".to_string(),
+                OwnedResourceKind::HostImport => "host_import".to_string(),
+                OwnedResourceKind::PortRange => "port_range".to_string(),
+                OwnedResourceKind::Credential => "credential".to_string(),
+                OwnedResourceKind::Fault => "fault".to_string(),
+                OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
+                OwnedResourceKind::Other(value) => format!("other:{value}"),
+            };
+            assert_eq!(resource_kind_identity(kind), expected);
+            let wire = serde_json::to_value(kind).unwrap();
+            let decoded: OwnedResourceKind = serde_json::from_value(wire).unwrap();
+            assert_eq!(&decoded, kind);
+        }
+        assert_eq!(
+            kinds
+                .iter()
+                .map(resource_kind_identity)
+                .collect::<BTreeSet<_>>()
+                .len(),
+            kinds.len()
+        );
+        for kind in [
+            OwnedResourceKind::NetworkAttachment,
+            OwnedResourceKind::HostExport,
+            OwnedResourceKind::HostImport,
+            OwnedResourceKind::PortRange,
+        ] {
+            assert!(resource_kind_requires_machine(&kind));
+        }
     }
 }

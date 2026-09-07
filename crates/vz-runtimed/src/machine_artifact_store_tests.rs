@@ -55,6 +55,8 @@ impl Fixture {
             arch: Architecture::Aarch64,
         };
         let machine = MachineSpec {
+            networks: Vec::new(),
+            egress: Default::default(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             name: "machine-artifacts".into(),
             profile,
@@ -75,6 +77,8 @@ impl Fixture {
             project_id: ProjectId::new("prj_artifact_store").expect("Project ID"),
             name: "artifact-store".into(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![machine.clone()],

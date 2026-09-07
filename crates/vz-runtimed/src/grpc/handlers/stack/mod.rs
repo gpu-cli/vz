@@ -635,9 +635,13 @@ mod runtime_error_mapping_tests {
             project_id: project_id.clone(),
             name: "daemon-scope".to_string(),
             environment: EnvironmentSpec {
+                host_exports: Vec::new(),
+                host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "linux".to_string(),
                     profile: MachineProfile::Developer,
@@ -651,6 +655,10 @@ mod runtime_error_mapping_tests {
             },
         };
         let environment = EnvironmentInstance {
+            network_attachments: Vec::new(),
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
+            egress: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             environment_id: environment_id.clone(),
             project_id: project_id.clone(),

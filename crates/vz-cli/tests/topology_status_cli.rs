@@ -258,10 +258,14 @@ fn definition(project_name: &str, image: &str) -> ProjectDefinition {
         project_id: ProjectId::new("prj_status_cli").unwrap(),
         name: project_name.to_string(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![
                 MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "app".to_string(),
                     profile: MachineProfile::Developer,
@@ -278,6 +282,8 @@ fn definition(project_name: &str, image: &str) -> ProjectDefinition {
                     workspace: None,
                 },
                 MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "worker".to_string(),
                     profile: MachineProfile::Developer,

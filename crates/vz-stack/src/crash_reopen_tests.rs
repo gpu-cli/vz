@@ -413,9 +413,13 @@ fn install_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope
         project_id: scope.project_id.clone(),
         name: format!("project-{stack_id}"),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![MachineSpec {
+                networks: Vec::new(),
+                egress: Default::default(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 name: "linux".to_string(),
                 profile: MachineProfile::Developer,
@@ -429,6 +433,10 @@ fn install_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope
         },
     };
     let environment = EnvironmentInstance {
+        network_attachments: Vec::new(),
+        host_exports: Vec::new(),
+        host_imports: Vec::new(),
+        egress: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: scope.environment_id.clone(),
         project_id: scope.project_id.clone(),

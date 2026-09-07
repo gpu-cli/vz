@@ -98,6 +98,11 @@ pub struct MachineSpec {
     pub workspace: ::core::option::Option<WorkspaceProjection>,
     #[prost(enumeration = "MachineProfile", tag = "7")]
     pub profile: i32,
+    /// Topology-local names of the Environment networks this Machine attaches to.
+    #[prost(string, repeated, tag = "8")]
+    pub networks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    #[prost(enumeration = "EgressPolicy", tag = "9")]
+    pub egress: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkSpec {
@@ -127,6 +132,48 @@ pub struct EndpointSpec {
     #[prost(string, optional, tag = "7")]
     pub hostname: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// Loopback-only export of one Machine port.
+///
+/// The host destination is always 127.0.0.1; there is deliberately no host
+/// address field, so no declaration can widen an export beyond loopback.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostExportSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine: ::prost::alloc::string::String,
+    #[prost(enumeration = "TransportProtocol", tag = "4")]
+    pub protocol: i32,
+    #[prost(uint32, tag = "5")]
+    pub machine_port: u32,
+    /// Absent requests a dynamically allocated host loopback port.
+    #[prost(uint32, optional, tag = "6")]
+    pub host_port: ::core::option::Option<u32>,
+}
+/// Authenticated import of exactly one 127.0.0.1 host service into a Machine.
+///
+/// The guest never sends a destination, so no host address field exists here.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostImportSpec {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub name: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine: ::prost::alloc::string::String,
+    #[prost(enumeration = "TransportProtocol", tag = "4")]
+    pub protocol: i32,
+    #[prost(uint32, tag = "5")]
+    pub host_port: u32,
+    /// Absent reuses host_port on the guest loopback relay address.
+    #[prost(uint32, optional, tag = "6")]
+    pub guest_port: ::core::option::Option<u32>,
+    /// Guest-local convenience name; never an authorization.
+    #[prost(string, optional, tag = "7")]
+    pub alias: ::core::option::Option<::prost::alloc::string::String>,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentSpec {
     #[prost(uint32, tag = "1")]
@@ -140,6 +187,10 @@ pub struct EnvironmentSpec {
     /// Topology-local name; explicit and process Machine selectors take precedence.
     #[prost(string, optional, tag = "5")]
     pub default_machine: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "6")]
+    pub host_exports: ::prost::alloc::vec::Vec<HostExportSpec>,
+    #[prost(message, repeated, tag = "7")]
+    pub host_imports: ::prost::alloc::vec::Vec<HostImportSpec>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectDefinition {
@@ -297,6 +348,58 @@ pub struct EndpointInstance {
     pub network_id: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct NetworkAttachmentInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub attachment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub network_id: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostExportInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub export_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostImportInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub import_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "5")]
+    pub name: ::prost::alloc::string::String,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct EgressInstance {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub egress_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "4")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "EgressPolicy", tag = "5")]
+    pub policy: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OwnershipRecord {
@@ -500,6 +603,14 @@ pub struct EnvironmentInstance {
     pub lifecycle_generation: u64,
     #[prost(string, optional, tag = "16")]
     pub active_operation_id: ::core::option::Option<::prost::alloc::string::String>,
+    #[prost(message, repeated, tag = "17")]
+    pub network_attachments: ::prost::alloc::vec::Vec<NetworkAttachmentInstance>,
+    #[prost(message, repeated, tag = "18")]
+    pub host_exports: ::prost::alloc::vec::Vec<HostExportInstance>,
+    #[prost(message, repeated, tag = "19")]
+    pub host_imports: ::prost::alloc::vec::Vec<HostImportInstance>,
+    #[prost(message, repeated, tag = "20")]
+    pub egress: ::prost::alloc::vec::Vec<EgressInstance>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ProjectState {
@@ -3155,6 +3266,63 @@ impl MachineProfile {
         }
     }
 }
+/// Absent means Offline: no external attachment exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum EgressPolicy {
+    Unspecified = 0,
+    Offline = 1,
+    Allowed = 2,
+}
+impl EgressPolicy {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "EGRESS_POLICY_UNSPECIFIED",
+            Self::Offline => "EGRESS_POLICY_OFFLINE",
+            Self::Allowed => "EGRESS_POLICY_ALLOWED",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "EGRESS_POLICY_UNSPECIFIED" => Some(Self::Unspecified),
+            "EGRESS_POLICY_OFFLINE" => Some(Self::Offline),
+            "EGRESS_POLICY_ALLOWED" => Some(Self::Allowed),
+            _ => None,
+        }
+    }
+}
+/// Transport carried by a host export or host import relay.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TransportProtocol {
+    Unspecified = 0,
+    Tcp = 1,
+}
+impl TransportProtocol {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TRANSPORT_PROTOCOL_UNSPECIFIED",
+            Self::Tcp => "TRANSPORT_PROTOCOL_TCP",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TRANSPORT_PROTOCOL_UNSPECIFIED" => Some(Self::Unspecified),
+            "TRANSPORT_PROTOCOL_TCP" => Some(Self::Tcp),
+            _ => None,
+        }
+    }
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum NetworkKind {
@@ -3357,6 +3525,10 @@ pub enum OwnedResourceKind {
     Fault = 9,
     LegacySandbox = 10,
     Other = 11,
+    NetworkAttachment = 12,
+    HostExport = 13,
+    HostImport = 14,
+    PortRange = 15,
 }
 impl OwnedResourceKind {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -3377,6 +3549,10 @@ impl OwnedResourceKind {
             Self::Fault => "OWNED_RESOURCE_KIND_FAULT",
             Self::LegacySandbox => "OWNED_RESOURCE_KIND_LEGACY_SANDBOX",
             Self::Other => "OWNED_RESOURCE_KIND_OTHER",
+            Self::NetworkAttachment => "OWNED_RESOURCE_KIND_NETWORK_ATTACHMENT",
+            Self::HostExport => "OWNED_RESOURCE_KIND_HOST_EXPORT",
+            Self::HostImport => "OWNED_RESOURCE_KIND_HOST_IMPORT",
+            Self::PortRange => "OWNED_RESOURCE_KIND_PORT_RANGE",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -3394,6 +3570,10 @@ impl OwnedResourceKind {
             "OWNED_RESOURCE_KIND_FAULT" => Some(Self::Fault),
             "OWNED_RESOURCE_KIND_LEGACY_SANDBOX" => Some(Self::LegacySandbox),
             "OWNED_RESOURCE_KIND_OTHER" => Some(Self::Other),
+            "OWNED_RESOURCE_KIND_NETWORK_ATTACHMENT" => Some(Self::NetworkAttachment),
+            "OWNED_RESOURCE_KIND_HOST_EXPORT" => Some(Self::HostExport),
+            "OWNED_RESOURCE_KIND_HOST_IMPORT" => Some(Self::HostImport),
+            "OWNED_RESOURCE_KIND_PORT_RANGE" => Some(Self::PortRange),
             _ => None,
         }
     }

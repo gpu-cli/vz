@@ -7,11 +7,15 @@ pub(super) fn fixture() -> (EnvironmentInstance, MachineExecInput, MachineExecut
         project_id: ProjectId::generate(),
         name: "execution-tests".into(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: 1,
             default_machine: None,
             machines: ["app", "worker"]
                 .into_iter()
                 .map(|name| MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: 1,
                     name: name.into(),
                     profile: MachineProfile::Hardened,
@@ -221,12 +225,16 @@ fn daemon_fixture_with_default(
         project_id: input.project_id.clone(),
         name: "execution-tests".into(),
         environment: EnvironmentSpec {
+            host_exports: Vec::new(),
+            host_imports: Vec::new(),
             schema_version: 1,
             default_machine: default_machine.map(str::to_owned),
             machines: environment
                 .machines
                 .iter()
                 .map(|machine| MachineSpec {
+                    networks: Vec::new(),
+                    egress: Default::default(),
                     schema_version: 1,
                     name: machine.name.clone(),
                     profile: machine.profile,

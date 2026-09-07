@@ -129,6 +129,19 @@ enum MachineProfile {
   MACHINE_PROFILE_HARDENED = 2;
 }
 
+// Absent means Offline: no external attachment exists at all.
+enum EgressPolicy {
+  EGRESS_POLICY_UNSPECIFIED = 0;
+  EGRESS_POLICY_OFFLINE = 1;
+  EGRESS_POLICY_ALLOWED = 2;
+}
+
+// Transport carried by a host export or host import relay.
+enum TransportProtocol {
+  TRANSPORT_PROTOCOL_UNSPECIFIED = 0;
+  TRANSPORT_PROTOCOL_TCP = 1;
+}
+
 message MachineSpec {
   uint32 schema_version = 1;
   string name = 2;
@@ -137,6 +150,9 @@ message MachineSpec {
   CapabilitySet requested_capabilities = 5;
   optional WorkspaceProjection workspace = 6;
   MachineProfile profile = 7;
+  // Topology-local names of the Environment networks this Machine attaches to.
+  repeated string networks = 8;
+  EgressPolicy egress = 9;
 }
 
 enum NetworkKind {
@@ -170,6 +186,35 @@ message EndpointSpec {
   optional string hostname = 7;
 }
 
+// Loopback-only export of one Machine port.
+//
+// The host destination is always 127.0.0.1; there is deliberately no host
+// address field, so no declaration can widen an export beyond loopback.
+message HostExportSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  string machine = 3;
+  TransportProtocol protocol = 4;
+  uint32 machine_port = 5;
+  // Absent requests a dynamically allocated host loopback port.
+  optional uint32 host_port = 6;
+}
+
+// Authenticated import of exactly one 127.0.0.1 host service into a Machine.
+//
+// The guest never sends a destination, so no host address field exists here.
+message HostImportSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  string machine = 3;
+  TransportProtocol protocol = 4;
+  uint32 host_port = 5;
+  // Absent reuses host_port on the guest loopback relay address.
+  optional uint32 guest_port = 6;
+  // Guest-local convenience name; never an authorization.
+  optional string alias = 7;
+}
+
 message EnvironmentSpec {
   uint32 schema_version = 1;
   repeated MachineSpec machines = 2;
@@ -177,6 +222,8 @@ message EnvironmentSpec {
   repeated EndpointSpec endpoints = 4;
   // Topology-local name; explicit and process Machine selectors take precedence.
   optional string default_machine = 5;
+  repeated HostExportSpec host_exports = 6;
+  repeated HostImportSpec host_imports = 7;
 }
 
 message ProjectDefinition {
@@ -305,6 +352,38 @@ message EndpointInstance {
   string name = 6;
 }
 
+message NetworkAttachmentInstance {
+  uint32 schema_version = 1;
+  string attachment_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string network_id = 5;
+}
+
+message HostExportInstance {
+  uint32 schema_version = 1;
+  string export_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string name = 5;
+}
+
+message HostImportInstance {
+  uint32 schema_version = 1;
+  string import_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  string name = 5;
+}
+
+message EgressInstance {
+  uint32 schema_version = 1;
+  string egress_id = 2;
+  string environment_id = 3;
+  string machine_id = 4;
+  EgressPolicy policy = 5;
+}
+
 enum OwnedResourceKind {
   OWNED_RESOURCE_KIND_UNSPECIFIED = 0;
   OWNED_RESOURCE_KIND_MACHINE = 1;
@@ -318,6 +397,10 @@ enum OwnedResourceKind {
   OWNED_RESOURCE_KIND_FAULT = 9;
   OWNED_RESOURCE_KIND_LEGACY_SANDBOX = 10;
   OWNED_RESOURCE_KIND_OTHER = 11;
+  OWNED_RESOURCE_KIND_NETWORK_ATTACHMENT = 12;
+  OWNED_RESOURCE_KIND_HOST_EXPORT = 13;
+  OWNED_RESOURCE_KIND_HOST_IMPORT = 14;
+  OWNED_RESOURCE_KIND_PORT_RANGE = 15;
 }
 
 message OwnershipRecord {
@@ -462,6 +545,10 @@ message EnvironmentInstance {
   uint64 updated_at = 14;
   uint64 lifecycle_generation = 15;
   optional string active_operation_id = 16;
+  repeated NetworkAttachmentInstance network_attachments = 17;
+  repeated HostExportInstance host_exports = 18;
+  repeated HostImportInstance host_imports = 19;
+  repeated EgressInstance egress = 20;
 }
 
 message ProjectState {
