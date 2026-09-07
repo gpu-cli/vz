@@ -1,8 +1,9 @@
 # Installed local-Mac Compose and Buildx slices (DEV)
 
 `scripts/run-linux-docker-e2e.sh` is the host entry point. `--suite compose`,
-`--suite build`, and `--suite artifacts` select distinct DEV slices. `--suite all` rejects before client execution, state creation,
-or VM provisioning; it never aliases the full 63-scenario contract to a subset.
+`--suite build`, and `--suite artifacts` select distinct DEV slices. `--suite all` composes every suite against one
+provisioning (see below); it never aliases the 63-scenario contract to a subset,
+and it is refused before any state when its inputs are incomplete.
 
 Pass absolute paths for every artifact/client and a fresh evidence directory:
 

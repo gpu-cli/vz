@@ -3,8 +3,10 @@
 
 Normal installed Up provisions four private Machines. All workload commands use
 their authenticated contexts. Daily installation/configuration is untouched.
-Full --suite all is deliberately rejected before provisioning until the complete
-63-scenario contract is implemented. Retained stopped Machine disks are NOT Delete.
+`--suite all` composes every suite against one provisioning, in an order that
+leaves the topology undisturbed until recovery runs last; it is not an alias for
+any subset, and the scenario table names the IDs no suite yet proves so they are
+reported missing rather than silently absent. Retained stopped disks are NOT Delete.
 Owned BuildKit builder cache volumes are removed by successful workload cleanup.
 """
 from __future__ import annotations
