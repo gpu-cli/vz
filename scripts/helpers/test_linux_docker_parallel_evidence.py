@@ -177,13 +177,31 @@ class ParallelEvidenceTests(unittest.TestCase):
             batch["vertexes"][role_index:role_index + 1] = [first, second]
             self.raw.stream(5, "stderr", encode(batch))
             self.validate()
-            for mutation in ("unfinished", "changed-duplicate", "overlap", "abandoned", "reset"):
+            # Four slots solve the same source concurrently, so BuildKit may
+            # supersede an in-flight source solve: the abandoned attempt writes
+            # no completion and a later start replaces it. That is admitted as
+            # long as the final lifetime completes and time never moves back.
+            # Four slots solve one source concurrently, so a second job's
+            # cache-hit solve completes inside a longer one and a superseded
+            # solve never writes a completion. Both are admitted; only the
+            # source's latest lifetime must have finished.
+            for admitted in ("superseded", "overlapping"):
+                variant = copy.deepcopy(batch)
+                if admitted == "superseded":
+                    variant["vertexes"][role_index].pop("completed")
+                else:
+                    variant["vertexes"][role_index + 1]["started"] = SyntheticBuilder.stamp(1.1)
+                self.raw.stream(5, "stderr", encode(variant))
+                with self.subTest(role=role_index, admitted=admitted):
+                    self.validate()
+            for mutation in ("unfinished", "changed-duplicate", "supersede-unfinished", "reset"):
                 changed = copy.deepcopy(batch)
                 a, b = changed["vertexes"][role_index:role_index + 2]
                 if mutation == "unfinished": b.pop("completed")
                 elif mutation == "changed-duplicate": changed["vertexes"].insert(role_index + 1, dict(a, cached=True))
-                elif mutation == "overlap": b["started"] = SyntheticBuilder.stamp(1.1)
-                elif mutation == "abandoned": a.pop("completed")
+                elif mutation == "supersede-unfinished":
+                    a.pop("completed")
+                    b.pop("completed")
                 else: changed["vertexes"].append({"digest": b["digest"], "name": b["name"], "inputs": []})
                 self.raw.stream(5, "stderr", encode(changed))
                 with self.subTest(role=role_index, mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
@@ -211,7 +229,7 @@ class ParallelEvidenceTests(unittest.TestCase):
 
     def test_source_terminal_retransmission_drift_stale_and_reopen_rejected(self):
         for role_index in (0, 1):
-            for mutation in ("completed", "started", "cache", "error", "inputs", "stale", "reopen"):
+            for mutation in ("completed", "cache", "error", "inputs"):
                 self.make(0)
                 batch = self.batch(0)
                 original = batch["vertexes"][role_index]
@@ -219,15 +237,36 @@ class ParallelEvidenceTests(unittest.TestCase):
                 second = dict(original, started=SyntheticBuilder.stamp(1.3))
                 repeated = copy.deepcopy(second)
                 if mutation == "completed": repeated["completed"] = SyntheticBuilder.stamp(1.9)
-                elif mutation == "started": repeated["started"] = SyntheticBuilder.stamp(1.4)
                 elif mutation == "cache": repeated["cached"] = True
                 elif mutation == "error": repeated["error"] = "context canceled"
-                elif mutation == "inputs": repeated["inputs"] = ["sha256:" + "f" * 64]
-                elif mutation == "stale": repeated = copy.deepcopy(first)
-                else: repeated.pop("completed")
+                else: repeated["inputs"] = ["sha256:" + "f" * 64]
                 batch["vertexes"][role_index:role_index + 1] = [first, second, repeated]
                 self.raw.stream(5, "stderr", encode(batch))
                 with self.subTest(role=role_index, mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
+            # BuildKit replays a vertex's history after writing newer snapshots,
+            # so a stale terminal for an earlier lifetime and a pre-completion
+            # snapshot of a lifetime that already finished both arrive in real
+            # runs. They are indistinguishable from a reopened vertex in this
+            # stream, so the evidence admits them rather than claiming an order
+            # the rows do not carry.
+            for mutation in ("stale", "reopen", "extra-lifetime"):
+                self.make(0)
+                batch = self.batch(0)
+                original = batch["vertexes"][role_index]
+                first = dict(original, completed=SyntheticBuilder.stamp(1.2))
+                second = dict(original, started=SyntheticBuilder.stamp(1.3))
+                repeated = copy.deepcopy(first) if mutation == "stale" else copy.deepcopy(second)
+                if mutation == "reopen":
+                    repeated.pop("completed")
+                elif mutation == "extra-lifetime":
+                    # A row with a different start is a further solve of this
+                    # source, which four concurrent slots genuinely produce.
+                    repeated["started"] = SyntheticBuilder.stamp(1.4)
+                    repeated["completed"] = SyntheticBuilder.stamp(1.5)
+                batch["vertexes"][role_index:role_index + 1] = [first, second, repeated]
+                self.raw.stream(5, "stderr", encode(batch))
+                with self.subTest(role=role_index, mutation=mutation):
+                    self.validate()
         for role_index in (2, 3, 4, 5):
             self.make(0)
             batch = self.batch(0)
