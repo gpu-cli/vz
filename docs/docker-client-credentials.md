@@ -1,9 +1,10 @@
 # Machine-owned Docker client credentials
 
 Status: **DEV**, implementation and focused verification in progress under
-`vz-mzs.7.1.9`. Installed registry/login, restart/recovery and Delete acceptance
-remain required; neither the image round-trip slice nor this document closes
-the full Docker or 0.4 release gate.
+`vz-mzs.7.1.9`. Installed public Up/Stop/Up and happy-path Delete pass;
+actual registry authentication, daemon-restart credential persistence, migration
+and fault acceptance remain required. Neither this slice nor this document
+closes the full Docker or 0.4 release gate.
 
 Every Developer Linux Machine owns a client configuration directory inside its
 existing, authenticated runtime store. A separate immutable ownership claim
@@ -99,7 +100,46 @@ contents. Log `.artifacts/managed-docker-config-python-regression-4.log`, SHA-25
 Production-library strict Clippy and formatting pass. Strict all-target Clippy
 still fails on test-target diagnostics; it is not reported as passing.
 
-Locally signed release artifacts pass 31 installed control-plane tests across
-eight drivers in `.artifacts/topology-cli-installed-BWHPhd`. These are not VM
-workloads or a GA-signed distribution. New physical public-Up/recovery/Delete
-and authenticated-registry acceptance remain open.
+Locally signed release artifacts built from commit `17a0a442` pass 31 installed
+control-plane tests across eight drivers in
+`.artifacts/topology-cli-installed-BVlJY5`. CLI SHA-256:
+`531308e1f7aa86430e217914317d8bb866f866e88fd2af1136c22662076bf287`;
+daemon SHA-256:
+`b44a38afcb3b2b88486cd66b675e20e74a500df373bc651d797e1f3e268b2d33`.
+These are locally test-signed artifacts, not a GA-signed distribution.
+
+Two fresh physical installed local-Mac runs using those artifacts passed and
+were independently audited against their complete checksummed inventories:
+
+- `.artifacts/managed-docker-config-startup-candidate-1`: normal public Up
+  produced four distinct Developer Machine configs across two Environments.
+  Docker, Compose and buildx workloads passed; primary Stop/Up preserved Machine
+  config paths while advancing incarnation, without disturbing the neighbor.
+  Hardened behavior and final clean guest Stops passed. All 1,135 evidence files
+  were verified. Manifest SHA-256:
+  `e72cbefce1cdb8e2c9f21ce71c243100f93b29feb765d205ed94e73ee9357937`;
+  result SHA-256:
+  `879cebd9a7641ef8c2fc8843e7aa0a726d86caedbbdc420274fd12e5f3e113f5`.
+- `.artifacts/managed-docker-config-delete-candidate-1`: ready and stopped
+  public Delete removed six exact owned Machine stores, including private client
+  configs. Old-request replay returned the original tombstone and preserved the
+  same-name replacement Environment. Neighbor checks and host files/defaults
+  remained intact. All 4,164 evidence files were verified. Manifest SHA-256:
+  `6eb9f88e1f020b49a11574ebe4718c7fe0108603ffff1afe9f545fecc3ab6c91`;
+  result SHA-256:
+  `48fab46e692e24b143f4c7872e0398eee23bca1d93364587274e208ca73c1931`.
+
+Delete continuity is sampled, not a zero-downtime claim: ready Delete had 51
+overlapping samples covering both neighbors; the fast old-request replay had
+none, and stopped Delete had one covering only one neighbor. Each operation
+also had positive checks for both neighbors before and after. Both run daemons
+exited normally; their sockets and PID files are absent. Public collectors
+excluded private client contents. Startup disks/configs remain retained after
+Stop; the six disposable Delete stores were removed and require fixture
+recreation to recover their contents.
+
+Neither run performs a real registry login or proves credential persistence
+through daemon restart, migration, or fault recovery. Authenticated TLS registry
+login/push/pull is tracked in `vz-mzs.7.1.10` and must supply the remaining actual
+credential-isolation evidence for `vz-mzs.7.1.9`. Both that issue and the full
+Docker-63/0.4 aggregate remain open.
