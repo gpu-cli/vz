@@ -4,7 +4,9 @@ Status: DEV. Clean macOS setup, warm reuse, and the installed native lifecycle
 have passed, including private clones, terminal behavior, restart persistence,
 and public cleanup after a rejected start at the host VM limit. The earlier
 Xcode setup passed signature/license/Swift validation and warm reuse. Fresh
-optional-Xcode setup preserving the clean selection is in progress.
+optional-Xcode setup preserving the clean selection has also passed provisioning,
+signature/license/compiler checks, Swift build/test/run, and graceful shutdown.
+Its image publication, warm reuse, and installed lifecycle remain in progress.
 See the [current evidence](macos-local-setup-evidence.json).
 Tracked by `vz-mzs.11.4.2`, on `feat/macos26-bootstrap`. Main remains reserved
 for other work; no runtime merge before installed-user verification.

@@ -1,10 +1,10 @@
 {
   "schema_version": 1,
   "scope": "INSTALLED_LOCAL_MACOS_SETUP_IN_PROGRESS",
-  "source_commit": "de356312",
+  "source_commit": "de356312f5bd09122f1a755c2f0f42f7923017ad",
   "branch": "feat/macos26-bootstrap",
   "passed": false,
-  "pending": "Fresh optional Xcode setup completed IPSW installation and is waiting at the macOS administrator authentication dialog before provisioning; full Xcode lifecycle/coexistence gate pending",
+  "pending": "Fresh optional Xcode setup passed administrator provisioning, guest signature/license/compiler validation, Swift build/test/run and graceful shutdown; prepared image verification/cache publication, warm reuse and installed lifecycle remain in progress.",
   "host": {
     "os": "macos",
     "architecture": "aarch64",
@@ -117,7 +117,7 @@
     {
       "path": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
       "scope": "fresh optional Xcode setup preserving validated clean template, final signed runtime",
-      "result": "license-required and cancellation/retry gates passed; local Xcode archive and pinned cached IPSW verification passed; fresh macOS installation completed in approximately 208 seconds; waiting for administrator authentication before provisioning"
+      "result": "license-required and cancellation/retry checks, local Xcode archive, cached IPSW verification and fresh macOS installation passed; administrator provisioning, guest Xcode signature/license/compiler identity, Swift build/test/run and graceful shutdown passed; verifying and caching prepared image"
     }
   ],
   "regression_evidence": ".artifacts/macos-local-setup-2/linux-terminal-regression",
@@ -128,12 +128,11 @@
     "Archive hashing uses native OpenSSL before Xcode is installed.",
     "Xcode signed symlink text is preserved literally, including doubled separators; regression uses the guest BSD tar extractor with short and long link targets and entry names.",
     "Guest preparation verifies the Xcode signature before license acceptance and logs command timings plus signature-service diagnostics on failure.",
-    "Native capacity rejection exposed a lost activation lease and retained Up fence that blocked public Stop. Fix retains the exact failed-start VM in live sessions so Stop can obtain positive framework shutdown evidence. E2E regression pending.",
+    "Native capacity rejection exposed a lost activation lease and retained Up fence that blocked public Stop. Fix retains the exact failed-start VM in live sessions so Stop can obtain positive framework shutdown evidence. Installed capacity rejection Stop/Delete and survivor regression passed.",
     "Both live primary VMs from the colliding runs were publicly Stopped; only exact owned test daemons were terminated afterwards. Failed-start directories and logs are retained; no successful public Delete is claimed for those old failed-start cases.",
     "Clean setup, shared readiness, and optional Xcode verification used explicitly recorded binary updates. Per-run raw layout and update records retain exact hashes; no immutable-binary claim spans an update.",
     "The final 495-test framework/runtime suite passed with one nextest lingering-handle warning in an unchanged Linux artifact-copy cancellation test. Focused rerun passed without warning; raw logs retained.",
-    "Apple documents the exact framework Error state as irrecoverable and requiring VM destruction. Retirement queries the original VM on its dispatch queue, rejects unknown states, and releases the original object under the native lifecycle write fence.",
-    "Public feature-branch and Beads sync were rejected by automatic approval review, which requires explicit approval for public disclosure of source/tests/sanitized evidence to the verified existing public gpu-cli/vz GitHub origin. Approval requested; local commits retained, main untouched."
+    "Apple documents the exact framework Error state as irrecoverable and requiring VM destruction. Retirement queries the original VM on its dispatch queue, rejects unknown states, and releases the original object under the native lifecycle write fence."
   ],
   "clean": {
     "setup_evidence": ".artifacts/macos-local-setup-2/clean-evidence",
