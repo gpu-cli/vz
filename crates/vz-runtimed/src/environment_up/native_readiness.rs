@@ -28,9 +28,11 @@ pub(super) async fn verify(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    let probe = activation.exec("/bin/sh".into(),vec!["-c".into(),"set -eu; /usr/bin/sw_vers -productVersion; /usr/bin/sw_vers -buildVersion; /usr/sbin/sysctl -n hw.model; /usr/bin/shasum -a 256 /usr/local/bin/vz-guest-agent".into()],Duration::from_secs(20)).await.map_err(|e|bad(e.to_string()))?;
+    let started = std::time::Instant::now();
+    tracing::info!("verifying native OS and guest-agent identity");
+    let probe = activation.exec("/bin/sh".into(),vec!["-c".into(),"set -eu; /usr/bin/sw_vers -productVersion; /usr/bin/sw_vers -buildVersion; /usr/sbin/sysctl -n hw.model; /usr/bin/openssl dgst -sha256 -r /usr/local/bin/vz-guest-agent".into()],Duration::from_secs(20)).await.map_err(|e|bad(format!("native OS/agent probe: {e}")))?;
     let expected = format!(
-        "{}\n{}\nVirtualMac2,1\n{}  /usr/local/bin/vz-guest-agent\n",
+        "{}\n{}\nVirtualMac2,1\n{} */usr/local/bin/vz-guest-agent\n",
         pin.release().macos_version,
         pin.release().macos_build,
         pin.release().guest_agent_sha256
@@ -39,6 +41,53 @@ pub(super) async fn verify(
         return Err(bad(format!(
             "native version, hardware or guest-agent pin check failed: {probe:?}"
         )));
+    }
+    tracing::info!(
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "native OS and guest-agent identity verified"
+    );
+    if !pin.release().toolchain_sha256.is_empty() {
+        use vz_macos_provision::toolchain::{MAX_RECEIPT_BYTES, RECEIPT_PATH, ToolchainManifest};
+        let receipt = activation
+            .exec(
+                "/usr/bin/head".into(),
+                vec![
+                    "-c".into(),
+                    (MAX_RECEIPT_BYTES + 1).to_string(),
+                    RECEIPT_PATH.into(),
+                ],
+                Duration::from_secs(10),
+            )
+            .await
+            .map_err(|e| bad(format!("native toolchain receipt probe: {e}")))?;
+        if receipt.exit_code != 0 || !receipt.stderr.is_empty() {
+            return Err(bad("pinned native toolchain receipt is unavailable".into()));
+        }
+        let toolchain = ToolchainManifest::from_verified_bytes(
+            receipt.stdout.as_bytes(),
+            &pin.release().toolchain_sha256,
+        )
+        .map_err(|e| bad(e.to_string()))?;
+        let (script, expected) = toolchain.verification().map_err(|e| bad(e.to_string()))?;
+        let started = std::time::Instant::now();
+        tracing::info!("verifying native compiler and SDK identity");
+        let observed = activation
+            .exec(
+                "/bin/sh".into(),
+                vec!["-c".into(), script],
+                Duration::from_secs(120),
+            )
+            .await
+            .map_err(|e| bad(format!("native compiler/SDK identity probe: {e}")))?;
+        tracing::info!(
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "native compiler and SDK probe completed"
+        );
+        if observed.exit_code != 0 || observed.stdout != expected || !observed.stderr.is_empty() {
+            return Err(bad(format!(
+                "native Swift/toolchain pin verification failed: {observed:?}"
+            )));
+        }
     }
     let ticket = activation
         .execution_lease()

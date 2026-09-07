@@ -1,0 +1,165 @@
+{
+  "schema_version": 1,
+  "scope": "INSTALLED_LOCAL_MACOS_SETUP_IN_PROGRESS",
+  "source_commit": "de356312f5bd09122f1a755c2f0f42f7923017ad",
+  "branch": "feat/macos26-bootstrap",
+  "passed": false,
+  "pending": "Fresh optional Xcode setup, cache publication, clean/Xcode catalog coexistence and warm reuse passed; the installed Xcode lifecycle gate is running.",
+  "host": {
+    "os": "macos",
+    "architecture": "aarch64",
+    "os_version": "26.3.1"
+  },
+  "ipsw": {
+    "url": "https://updates.cdn-apple.com/2026WinterFCS/fullrestores/047-88313/2E098049-1731-4415-A206-546D09301973/UniversalMac_26.3.1_25D2128_Restore.ipsw",
+    "sha256": "4ff171ba3fa6db4758a2a7cedc8f24d44f4e3de8051a84400984872619abd6bc",
+    "size_bytes": 19330833456
+  },
+  "macos_version": "26.3.1",
+  "macos_build": "25D2128",
+  "checks": {
+    "default_apple_download_and_full_hash": true,
+    "missing_license_rejected": true,
+    "cancelled_packaging_removed_staging": true,
+    "fresh_ipsw_installation": true,
+    "installation_seconds": 293.879,
+    "library_and_integration_tests_passed": 568,
+    "existing_test_skips": 6,
+    "strict_production_clippy": true,
+    "installer_tests_passed": 11,
+    "installed_linux_hardened_lifecycle": true,
+    "linux_test_daemon_cleaned_up": true,
+    "administrator_provisioning": true,
+    "guest_loader_boot": true,
+    "xcode_transfer_and_archive_hash": true,
+    "xcode_extraction": true,
+    "host_xcode_deep_strict_signature": true,
+    "literal_symlink_regression_failed_before_and_passed_after": true,
+    "latest_cli_tests_passed": 94,
+    "latest_cli_test_skips": 1,
+    "latest_strict_cli_clippy": true,
+    "guest_xcode_signature": true,
+    "authorized_guest_xcode_license": true,
+    "native_swift_build_test_run": true,
+    "template_registration": true,
+    "warm_xcode_setup_seconds": 2.8868,
+    "clean_setup_seconds": 998.306,
+    "clean_warm_setup_seconds": 0.12356,
+    "clean_xcode_and_clt_absent": true,
+    "installed_clean_native_lifecycle": true,
+    "native_capacity_rejection_stop_delete": true,
+    "native_capacity_survivors_usable": true,
+    "native_clone_platform_audit": true,
+    "final_framework_runtime_tests_passed": 495,
+    "final_framework_runtime_test_skips": 15,
+    "final_installed_linux_hardened_lifecycle": true
+  },
+  "remaining": [
+    "finish installed optional-Xcode lifecycle and clone isolation",
+    "reconcile final signed-binary lifecycle evidence"
+  ],
+  "attempts": [
+    {
+      "path": ".artifacts/macos-local-setup-1/evidence",
+      "scope": "fresh default Apple download",
+      "result": "IPSW hash passed; framework rejected digest-only filename before installation"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/retry-evidence",
+      "scope": "fixed installed retry, verified download only retained; no prepared guest reused",
+      "result": "administrator provisioning and guest boot passed; pre-Xcode Perl shasum archive verification exceeded 120 seconds; stage cleaned without publication"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/native-hash-evidence",
+      "scope": "fresh guest, verified download only reused",
+      "result": "native archive hash passed in 2.916s and Xcode extraction in 48.826s; system xcodebuild shim exceeded 60 seconds; stage cleaned without publication"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/first-launch-evidence",
+      "scope": "fresh guest, direct Xcode first launch with longer deadline",
+      "result": "Gatekeeper rejected Xcode with SecCSResourceAltered (-67054) and exit 137; identified normalized signed symlink targets in Rust tar packaging; stage cleaned without publication"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/literal-link-evidence",
+      "scope": "fresh guest with literal symlink packaging, guest signature validation, verified download only reused",
+      "result": "Xcode setup and warm reuse passed; nested lifecycle fixture PATH hid tmux, fixed separately"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/literal-link-lifecycle-evidence",
+      "scope": "installed Xcode native lifecycle",
+      "result": "native readiness hash timed out; public Stop/Delete passed and owned daemon exited; readiness changed to native OpenSSL"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/clean-evidence",
+      "scope": "fresh clean macOS setup and reuse; runtime updated before first native invocation, recorded in runtime-update.json",
+      "result": "cold and warm setup passed; absence checks and native execution/PTY/restart passed; concurrent test collision hit native VM limit at second Up"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-1/readiness-fixed-lifecycle-evidence",
+      "scope": "fixed readiness, existing validated Xcode local template",
+      "result": "Up/Swift build/test/run/PTY/restart passed; concurrent test collision hit native VM limit at second Up"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/xcode-evidence",
+      "scope": "fresh optional Xcode setup preserving clean template",
+      "result": "cancel/retry passed; installation start rejected by native capacity while lifecycle tests were running; no template published"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/clean-serial-lifecycle",
+      "scope": "owned native start error recovery",
+      "result": "two native VMs passed isolation; capacity Stop admitted but timed out on irrecoverable framework Error; both successful VMs publicly Deleted and daemon exited"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/clean-terminal-lifecycle",
+      "scope": "exact framework terminal-state cleanup and clean installed lifecycle",
+      "result": "PASS: five verbs, PTY/cancel, restart persistence, clean absence, two private clones, third-start rejection followed by successful Stop/Delete with both survivors usable, platform audit, all public Deletes and daemon cleanup"
+    },
+    {
+      "path": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
+      "scope": "fresh optional Xcode setup preserving validated clean template, final signed runtime",
+      "result": "PASS: license-required and cancellation/retry checks, local Xcode packaging, cached IPSW verification, fresh macOS installation, administrator provisioning, guest signature/license/compiler identity, Swift build/test/run, graceful shutdown, template publication, preserved clean channel and warm setup reuse; installed Xcode lifecycle running"
+    }
+  ],
+  "regression_evidence": ".artifacts/macos-local-setup-2/linux-terminal-regression",
+  "notes": [
+    "The IPSW filename issue was fixed by a private APFS clone named restore.ipsw.",
+    "An earlier full run reproduced the previously recorded legacy concurrent CreateSandbox idempotency flake; the final unfiltered affected suite passed.",
+    "No code has been merged into main; public native/aggregate release conformance is not claimed.",
+    "Archive hashing uses native OpenSSL before Xcode is installed.",
+    "Xcode signed symlink text is preserved literally, including doubled separators; regression uses the guest BSD tar extractor with short and long link targets and entry names.",
+    "Guest preparation verifies the Xcode signature before license acceptance and logs command timings plus signature-service diagnostics on failure.",
+    "Native capacity rejection exposed a lost activation lease and retained Up fence that blocked public Stop. Fix retains the exact failed-start VM in live sessions so Stop can obtain positive framework shutdown evidence. Installed capacity rejection Stop/Delete and survivor regression passed.",
+    "Both live primary VMs from the colliding runs were publicly Stopped; only exact owned test daemons were terminated afterwards. Failed-start directories and logs are retained; no successful public Delete is claimed for those old failed-start cases.",
+    "Clean setup, shared readiness, and optional Xcode verification used explicitly recorded binary updates. Per-run raw layout and update records retain exact hashes; no immutable-binary claim spans an update.",
+    "The final 495-test framework/runtime suite passed with one nextest lingering-handle warning in an unchanged Linux artifact-copy cancellation test. Focused rerun passed without warning; raw logs retained.",
+    "Apple documents the exact framework Error state as irrecoverable and requiring VM destruction. Retirement queries the original VM on its dispatch queue, rejects unknown states, and releases the original object under the native lifecycle write fence."
+  ],
+  "clean": {
+    "setup_evidence": ".artifacts/macos-local-setup-2/clean-evidence",
+    "lifecycle_evidence": ".artifacts/macos-local-setup-2/clean-terminal-lifecycle",
+    "manifest_sha256": "1cee0fe8aba2abbe45b8326c3fe9706617992410a411181a1ce8c0a03369032f",
+    "setup_seconds": 998.3064481250476,
+    "warm_setup_seconds": 0.12355866702273488,
+    "first_up_with_cache_verification_seconds": 229.31278658297379,
+    "warm_up_seconds": 9.29193020798266,
+    "second_clone_up_seconds": 18.189121040981263,
+    "capacity_stop_seconds": 0.13039175001904368,
+    "capacity_delete_seconds": 0.18151579098775983,
+    "all_test_environments_publicly_deleted": true,
+    "owned_daemon_exited": true
+  },
+  "xcode": {
+    "evidence": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
+    "manifest_sha256": "c373e732f41546de017d026df5f191e94303277de119b80d8a62d748f89a9373",
+    "binary_sha256": {
+      "vz": "320d3102ad542c34a84fcacdf443a226979fbdbc0d5c4373a1ee32a2dd386974",
+      "vz-runtimed": "82ade2fc2d767f2b241cfd8f47a887a2040998cdb5ba1a228b2627b15392a344",
+      "vz-macos-setup": "e4e37a0d1a0696e263d7ccf721e0d927bd7f714117a12d43ba90baad1290b1ab",
+      "vz-agent-loader": "6db9504152bf24f00a69d1b64ba9be994047d53edfb92d380d3ed4b65e4679f8",
+      "vz-guest-agent": "d7283c69d15276a6e18fad36205e6f583bde96d36df34a2a9d09d2bdb755e994"
+    },
+    "warm_setup_seconds": 1.8538199589820579,
+    "clean_channel_preserved": true,
+    "installed_lifecycle_passed": false
+  }
+}

@@ -15,6 +15,7 @@ pub mod artifact_cache;
 #[cfg(unix)]
 pub mod bootstrap;
 pub mod image_delta;
+pub mod toolchain;
 
 /// Default binary name for the guest agent.
 const DEFAULT_AGENT_BINARY_NAME: &str = "vz-guest-agent";
@@ -348,6 +349,29 @@ fn create_user_account(mount_point: &Path, config: &UserConfig) -> anyhow::Resul
     // Create home directory
     let home_dir = mount_point.join(config.home.strip_prefix('/').unwrap_or(&config.home));
     std::fs::create_dir_all(&home_dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        anyhow::ensure!(
+            std::fs::symlink_metadata(&home_dir)?.is_dir(),
+            "guest home must be a directory"
+        );
+        let mounted_root = mount_point.canonicalize()?;
+        let resolved_home = home_dir.canonicalize()?;
+        anyhow::ensure!(
+            resolved_home != mounted_root && resolved_home.starts_with(&mounted_root),
+            "guest home must remain inside the mounted image"
+        );
+        std::os::unix::fs::chown(&home_dir, Some(config.uid), Some(config.gid)).map_err(
+            |error| {
+                anyhow::anyhow!(
+                    "set guest home ownership at {}: {error}",
+                    home_dir.display()
+                )
+            },
+        )?;
+        std::fs::set_permissions(&home_dir, std::fs::Permissions::from_mode(0o700))?;
+    }
 
     info!(
         user = %config.username,
@@ -414,42 +438,39 @@ fn enable_auto_login(mount_point: &Path, username: &str, password: &str) -> anyh
 /// a base64-encoded binary plist suitable for the `ShadowHashData` field in a
 /// dslocal user plist.
 ///
-/// Shells out to python3 (always available on macOS) to compute the PBKDF2 hash
-/// and create the binary plist format.
+/// Generates the binary plist directly in Rust; no external tools are required.
 fn generate_shadow_hash_data(password: &str) -> anyhow::Result<String> {
-    let script = r#"
-import hashlib, os, plistlib, base64, sys
-password = sys.argv[1]
-salt = os.urandom(32)
-iterations = 40000
-entropy = hashlib.pbkdf2_hmac('sha512', password.encode('utf-8'), salt, iterations, dklen=128)
-shadow_hash = {
-    'SALTED-SHA512-PBKDF2': {
-        'entropy': entropy,
-        'salt': salt,
-        'iterations': iterations,
-    }
-}
-binary_plist = plistlib.dumps(shadow_hash, fmt=plistlib.FMT_BINARY)
-print(base64.b64encode(binary_plist).decode())
-"#;
-
-    let output = std::process::Command::new("python3")
-        .args(["-c", script, password])
-        .output()?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!("failed to generate ShadowHashData: {}", stderr.trim());
-    }
-
-    let b64 = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    if b64.is_empty() {
-        anyhow::bail!("ShadowHashData generation produced empty output");
-    }
-
-    debug!(len = b64.len(), "generated ShadowHashData");
-    Ok(b64)
+    use base64::{Engine, engine::general_purpose::STANDARD};
+    use ring::{
+        pbkdf2,
+        rand::{SecureRandom, SystemRandom},
+    };
+    let mut salt = [0_u8; 32];
+    SystemRandom::new()
+        .fill(&mut salt)
+        .map_err(|_| anyhow::anyhow!("password salt generation failed"))?;
+    let mut entropy = [0_u8; 128];
+    let iterations = std::num::NonZeroU32::new(40000)
+        .ok_or_else(|| anyhow::anyhow!("invalid iteration count"))?;
+    pbkdf2::derive(
+        pbkdf2::PBKDF2_HMAC_SHA512,
+        iterations,
+        &salt,
+        password.as_bytes(),
+        &mut entropy,
+    );
+    let mut fields = plist::Dictionary::new();
+    fields.insert("entropy".into(), plist::Value::Data(entropy.to_vec()));
+    fields.insert("salt".into(), plist::Value::Data(salt.to_vec()));
+    fields.insert("iterations".into(), plist::Value::Integer(40000_u64.into()));
+    let mut root = plist::Dictionary::new();
+    root.insert(
+        "SALTED-SHA512-PBKDF2".into(),
+        plist::Value::Dictionary(fields),
+    );
+    let mut bytes = Vec::new();
+    plist::Value::Dictionary(root).to_writer_binary(&mut bytes)?;
+    Ok(STANDARD.encode(bytes))
 }
 
 /// Encode a password using macOS kcpassword XOR cipher.
@@ -1490,6 +1511,41 @@ mod tests {
         assert!(decoded.len() > 50, "binary plist should be substantial");
         // Binary plist magic: "bplist"
         assert_eq!(&decoded[..6], b"bplist", "should be a binary plist");
+        let value = plist::Value::from_reader(std::io::Cursor::new(&decoded)).unwrap();
+        let fields = value.as_dictionary().unwrap()["SALTED-SHA512-PBKDF2"]
+            .as_dictionary()
+            .unwrap();
+        let salt = fields["salt"].as_data().unwrap();
+        let entropy = fields["entropy"].as_data().unwrap();
+        assert_eq!(salt.len(), 32);
+        assert_eq!(entropy.len(), 128);
+        assert_eq!(fields["iterations"].as_unsigned_integer(), Some(40000));
+        let count = std::num::NonZeroU32::new(40000).unwrap();
+        assert!(
+            ring::pbkdf2::verify(
+                ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                count,
+                salt,
+                b"dev",
+                entropy
+            )
+            .is_ok()
+        );
+        assert!(
+            ring::pbkdf2::verify(
+                ring::pbkdf2::PBKDF2_HMAC_SHA512,
+                count,
+                salt,
+                b"wrong",
+                entropy
+            )
+            .is_err()
+        );
+        assert_ne!(
+            b64,
+            generate_shadow_hash_data("dev").unwrap(),
+            "fresh password salts required"
+        );
     }
 
     #[test]
@@ -1730,5 +1786,51 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "mac-agent-guest-agent")
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod user_home_tests {
+    use super::*;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    #[test]
+    fn account_creation_makes_the_guest_home_private_and_owned() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let owner = root.path().metadata()?;
+        std::fs::create_dir_all(
+            root.path()
+                .join("private/var/db/dslocal/nodes/Default/users"),
+        )?;
+        let home = root.path().join("Users/dev");
+        std::fs::create_dir_all(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))?;
+        let config = UserConfig {
+            uid: owner.uid(),
+            gid: owner.gid(),
+            ..Default::default()
+        };
+        create_user_account(root.path(), &config)?;
+        let metadata = home.metadata()?;
+        assert_eq!((metadata.uid(), metadata.gid()), (config.uid, config.gid));
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        Ok(())
+    }
+
+    #[test]
+    fn home_ownership_never_follows_a_link_outside_the_image() -> anyhow::Result<()> {
+        let root = tempfile::tempdir()?;
+        let outside = tempfile::tempdir()?;
+        std::fs::create_dir_all(
+            root.path()
+                .join("private/var/db/dslocal/nodes/Default/users"),
+        )?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("Users"))?;
+        let home = outside.path().join("dev");
+        std::fs::create_dir(&home)?;
+        std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o755))?;
+        assert!(create_user_account(root.path(), &UserConfig::default()).is_err());
+        assert_eq!(home.metadata()?.permissions().mode() & 0o777, 0o755);
+        Ok(())
     }
 }

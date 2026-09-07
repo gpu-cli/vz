@@ -1,0 +1,211 @@
+{
+  "schema_version": 1,
+  "scope": "INSTALLED_NATIVE_MACOS_SWIFT_DEV_LOCAL_BUNDLE",
+  "passed": true,
+  "aggregate_release_certified": false,
+  "recorded_at": "2026-09-06T16:40:27.534921+00:00",
+  "implementation_commit": "cbfdd66090b59c5d171d75bd6caecba004c6bf40",
+  "sources": {
+    "crates/vz-runtimed/src/environment_up/supervisor.rs": "1b2e763b293a149f0aebd4de2fc59cee1884da01206523b8bfe67dc1036aa379",
+    "crates/vz-runtimed/src/machine_live_sessions.rs": "a9da1b0974061ff2ae1762e74acf638fb9a3736081d73f74faecb9c7b78c4957",
+    "crates/vz-runtimed/src/machine_live_sessions/failed_up.rs": "c85427ae66114f6d6115c84145e5c63fd3f6eb4ab6036e76de440a1bf0d127f9",
+    "scripts/run-installed-native-macos-e2e.py": "322e847e66117bb9af2375071d23ad3e1f7c35c356e85e2b70afab090923e5fc",
+    "crates/vz-runtimed/src/environment_up/native_readiness.rs": "e52d6d90042351e959335bae28e93b92a7577c73fc19de800a7254347dcbcc9c",
+    "crates/vz-macos-provision/src/toolchain.rs": "2a3fc5823a3e2628bca83e2af806bf9326838aafcf60c4fccd84222df9059d77"
+  },
+  "host": {
+    "os": "macOS",
+    "version": "26.3.1(a)",
+    "build": "25D771280a",
+    "hardware": "Mac16,5",
+    "euid": 501
+  },
+  "guest": {
+    "version": "26.3.1",
+    "build": "25D2128",
+    "hardware": "VirtualMac2,1",
+    "cpus": 4,
+    "memory_mb": 8192
+  },
+  "manifest_sha256": "5595d334981bfc7a1de6c9d974ca05ba6dbe778f0765846170943e56de130c56",
+  "manifest": {
+    "development": true,
+    "schema_version": 1,
+    "macos_version": "26.3.1",
+    "macos_build": "25D2128",
+    "base": {
+      "url": "bundle:f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858",
+      "sha256": "f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858",
+      "size_bytes": 85899345920
+    },
+    "patch": {
+      "url": "bundle:3226f357ce4eac9d4f5bc89be0fd51de9821d7b01c8a4fb007374b4ab9f1da40",
+      "sha256": "3226f357ce4eac9d4f5bc89be0fd51de9821d7b01c8a4fb007374b4ab9f1da40",
+      "size_bytes": 3940620548
+    },
+    "prepared_image": {
+      "sha256": "21818773a98bd4287120ac4a80934a0469464806666ead459017685872a49f7e",
+      "size_bytes": 85899345920
+    },
+    "platform": {
+      "architecture": "aarch64",
+      "minimum_host_version": "26.3.1",
+      "minimum_cpu_count": 2,
+      "minimum_memory_bytes": 4294967296,
+      "hardware_model": {
+        "url": "bundle:976e66740c64041cf9f127588f93eabf7efb9e7d3cbaee9582bcded88ba5e8d3",
+        "sha256": "976e66740c64041cf9f127588f93eabf7efb9e7d3cbaee9582bcded88ba5e8d3",
+        "size_bytes": 132
+      },
+      "auxiliary_storage_seed": {
+        "url": "bundle:9bc08b3578761f03e653afae5395ef568e915f88444cb7f8105c4ff94807f773",
+        "sha256": "9bc08b3578761f03e653afae5395ef568e915f88444cb7f8105c4ff94807f773",
+        "size_bytes": 33579164
+      }
+    },
+    "guest_agent_sha256": "76a5c8d93762f126e79e19d968a702fca0825fffe991602f21e858c76fdee3a3",
+    "toolchain_sha256": "4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c"
+  },
+  "binary_sha256": {
+    "vz": "ba22f42358fbfee4b9e01ef766e72a65dc71e176272584796932446dc527d56e",
+    "vz-runtimed": "2c54d752f62c3561263c5fc94b75e17c6baef80deb981346efa09ed10554e67c"
+  },
+  "swift": {
+    "toolchain_sha256": "4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c",
+    "identity": {
+      "archive": {
+        "sha256": "c8a3d1a14f255462e0d0f75f3dee305e7785650980456661f663a28d89c45619",
+        "size_bytes": 4442355108
+      },
+      "files": {
+        "Platforms/MacOSX.platform/Developer/SDKs/MacOSX26.2.sdk/SDKSettings.json": "95882a9cea02396e76f3e406a5728269b2a1a11bcd241430a84c9e63d09a6cd3",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/clang": "15339439a6be4a9d33d281ec040a7e0092190b1c8d7de5f94d824b50ffae0769",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/ld": "d24bf72261b0a8832fa87e841b8e9a857620bb789c78cef4ad97bb2dbd6e1d29",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-driver": "0b52997eb231ab8a445cc6138816b8c3d7b4621e3e29f169f6473975d1c71cfa",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-frontend": "9bbc29c4dca73682d62011992be2ecfebcaef681ad490018a48e6643ac5847b7",
+        "Toolchains/XcodeDefault.xctoolchain/usr/bin/swift-package": "95d261fd60cbe038e0598acf46d338872a28c6b98703485ec6691d49f2d61229"
+      },
+      "layout": "xcode",
+      "schema_version": 1,
+      "sdk_version": "26.2",
+      "swift_version": "swift-driver version: 1.127.15 Apple Swift version 6.2.4 (swiftlang-6.2.4.1.4 clang-1700.6.4.2)\nTarget: arm64-apple-macosx26.0"
+    },
+    "source_sha256": {
+      "Package.swift": "6b8dacb9666547ff57e9a8ab6dd9d1088a5e38ea91b50fec3a0ed2b650c530fc",
+      "Sources/NativeProbe/NativeProbe.swift": "d04745281f66c5d12d9981ae7698424b00eab764cdbfd652250ba3fe395e164e",
+      "Tests/NativeProbeTests/NativeProbeTests.swift": "9b32033a91186088170bf6620671310443d331f690703081f02fe77a490d73e7"
+    },
+    "probe": {
+      "hardware_model": "VirtualMac2,1",
+      "os_build": "25D2128",
+      "os_version": "26.3.1",
+      "pid": 466,
+      "protocol": "vz-native-macos-swift",
+      "protocol_version": 1
+    },
+    "persisted_probe": {
+      "hardware_model": "VirtualMac2,1",
+      "os_build": "25D2128",
+      "os_version": "26.3.1",
+      "pid": 382,
+      "protocol": "vz-native-macos-swift",
+      "protocol_version": 1
+    }
+  },
+  "timings_seconds": {
+    "cold-up": 750.9484862079844,
+    "swift-build": 10.199159999960102,
+    "swift-test": 6.616919000050984,
+    "swift-run": 0.6009279589634389,
+    "stop": 5.293974208063446,
+    "warm-up": 27.59583875001408,
+    "swift-persisted-run": 0.6054229999426752,
+    "second-up": 59.74181229190435,
+    "altered-toolchain-up": 9.97164900007192,
+    "altered-toolchain-stop": 5.231863458990119,
+    "altered-toolchain-up-again": 7.547362916986458,
+    "second-delete": 14.119379458017647,
+    "delete": 10.93017399997916
+  },
+  "timing_scope": "Cold Up imports a local bundle, applies the patch and verifies the full image; excludes internet download. Warm Up includes guest and toolchain readiness checks.",
+  "checks": [
+    "fresh empty cache; exact base and patch import/application with full prepared-image SHA-256 verification",
+    "installed Ready with exact guest OS, hardware, agent and toolchain receipt/anchor/version checks",
+    "ordinary dev Swift build -c release, swift test with one named Swift Testing test, and native-probe reporting VirtualMac",
+    "source-only fixture transferred through public vz exec stdin; no consumer provisioning or repair",
+    "stdin/stdout/stderr, exit status 23, dev user, literal environment value and working directory",
+    "tmux PTY input, 35x100 resize, Ctrl-C and exit 17",
+    "TERM-ignoring shell and child positively reaped after deadline; exit 137",
+    "Stop/Up preserves marker, compiled binary, platform identity and exact Swift toolchain identity",
+    "second Environment isolated from first user fixture and marker; distinct private platform files",
+    "modified toolchain receipt digest confirmed by readback; restart rejects Ready with the exact mismatch diagnostic",
+    "Stop succeeds after failed readiness; another restart rejects the unchanged corrupt receipt; direct Delete succeeds; first Environment still executes and its running Delete succeeds",
+    "installed Linux Hardened lifecycle and persistence regression using identical signed binaries"
+  ],
+  "checks_not_claimed": [
+    "SDK-file fault injection: macOS refused the initial write inside Xcode; the qualifying negative check mutates the toolchain receipt instead",
+    "Xcode GUI, debugger, simulator and non-macOS targets",
+    "public artifact redistribution or internet delivery",
+    "aggregate 0.4 topology conformance"
+  ],
+  "automated_checks": {
+    "runtime_contract_state_nextest": {
+      "passed": 1606,
+      "skipped": 31
+    },
+    "prior_provisioning_runtime_nextest": {
+      "passed": 467,
+      "skipped": 5
+    },
+    "archive_tests_passed": 4,
+    "production_clippy": "passed",
+    "maintainer_example_clippy": "passed",
+    "rustfmt": "passed",
+    "python_compile": "passed"
+  },
+  "regression_fixed": "Failed restart acknowledgements no longer report the prior incarnation as a successful result. A sealed binding to the exact failed Up journal, prior persisted identity and original registered runtime permits Stop/Delete of the unready boot without advertising Ready or adopting another Runtime.",
+  "test_rerun_note": "Initial broad suite hit a concurrent legacy CreateSandbox idempotency failure in its separate unchanged path; complete no-fail-fast rerun passed all 1606 tests.",
+  "nonqualifying_attempts": {
+    "installed-swift-candidate-2": "CLT user-home ownership and ordinary Swift Testing failures; diagnostic consumer repairs are excluded.",
+    "installed-xcode-candidate-1": "Positive Swift/persistence passed, but SDK mutation was denied and shell sync masked the failure.",
+    "installed-xcode-candidate-1-continuation": "Unqualified status was ambiguous with two Environments; corrected to select explicitly.",
+    "installed-xcode-candidate-2": "Correctly rejected corrupt receipt with backend_unavailable exit 5, but Delete found prior persisted identity versus current unready boot ownership gap; fixed with exact failed-Up cleanup authority.",
+    "installed-xcode-candidate-1-continuation-2": "Real receipt mismatch exposed stale-incarnation acknowledgement/retained-fence bug; failed second Delete required diagnostic daemon termination."
+  },
+  "evidence_paths": {
+    "installed": ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3",
+    "platform_audit": ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/platform-audit.json",
+    "maintainer": ".artifacts/macos26-bootstrap/native-e2e/swift-image-xcode-2",
+    "toolchain": ".artifacts/macos26-bootstrap/native-e2e/swift-toolchain-xcode-1",
+    "bundle": ".artifacts/macos26-bootstrap/native-e2e/installed-bundle-xcode-1",
+    "linux": ".artifacts/macos26-bootstrap/native-e2e/linux-swift-regression-2",
+    "checks": ".artifacts/macos26-bootstrap/native-e2e/swift-verification-1"
+  },
+  "evidence_sha256": {
+    ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/summary.json": "5348f21ecb52370b893c02073a210daffaa9465faba620ea850674a91a010c39",
+    ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/platform-audit.json": "bcf515789a72b9614202c96acbdb24c7cfd036e26c33c6bbeb23f27f1da9d782",
+    ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/layout.json": "7dea343ba4d4426a679c31b509422e855dccd0e8691798ec860253af09732790",
+    ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/altered-toolchain-up.stderr": "3882c39f822cc67e1bd1ff64d0ea4498c0f1ae6e4885b3cdb5e69b47603578e5",
+    ".artifacts/macos26-bootstrap/native-e2e/swift-image-xcode-2/license-acceptance.json": "260f689cc9d4459f74dc76c0a8005f7ef9b47b353a6e2ab33cf24573d6ca5525",
+    ".artifacts/macos26-bootstrap/native-e2e/swift-image-xcode-2/shutdown.json": "e2afe2e00d75d1aa76d25cd245dc6f0ae6a02fca81fc2dcbb3471c3a1d6943a5",
+    ".artifacts/macos26-bootstrap/native-e2e/linux-swift-regression-2/summary.json": "7460853f78f95f4a6e3df09d3755107533bb0bff45e0e953e9da1278e5cf91cd",
+    ".artifacts/macos26-bootstrap/native-e2e/installed-xcode-candidate-3/host-cleanup.json": "5aa0225b3d1de90fe262dc38350931150b845553de3bc79ed02b20ebe8b96628"
+  },
+  "remaining_release_gates": [
+    "published authenticated base/patch/catalog and release automation",
+    "native networking/workspace integration",
+    "mixed-target aggregate conformance",
+    "escaped-session execution supervision parity"
+  ],
+  "host_cleanup": {
+    "passed": true,
+    "both_environments_positively_deleted": true,
+    "private_machine_disks_absent": true,
+    "daemon_pid": 11742,
+    "daemon_exited": true,
+    "daemon_exit_observation": "Original PID already absent after successful harness completion; no termination signal sent by final cleanup.",
+    "stale_socket_removed_after_process_exit": true,
+    "redundant_test_base_copy_removed": "/private/tmp/vzmac-cli-5dg2im00/r/native-bootstrap/downloads/f2fe7a840f6251fb7e7e2603a4e3b5d99c769b0886b3a46288f92c22b9767858",
+    "prepared_template_retained": true
+  }
+}

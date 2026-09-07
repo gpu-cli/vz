@@ -1,6 +1,14 @@
 # Automated macOS bootstrap delivery (DEV)
 
-Tracks: `vz-mzs.11.4`. Native integration and release acceptance remain open.
+> **Delivery decision updated 2026-09-06:** the supported 0.4 path is now
+> pinned IPSW → local install → scoped privileged provisioning → native validation
+> → cached template → private Machine clones. See [local macOS setup](macos-local-setup.md).
+> Earlier published-base/patch requirements below describe the previous design;
+> the delta implementation remains optional. The product contract and 0.4 gate
+> carry the current acceptance criteria.
+
+Tracks: `vz-mzs.11.4`. The installed native lifecycle works with a local DEV
+bundle; publication and complete release acceptance remain open.
 
 ## Workflow
 
@@ -55,9 +63,12 @@ Its full download verified, installation completed in 281 seconds, and two
 independent clones of the provisioned image booted their loader and guest agent
 on this host. The real matching block patch applied as UID 501 with verified base
 and output hashes; the reconstructed image booted and preserved a guest marker
-across stop/start with the same VM identity. Native Swift, artifact publication
-and the installed user lifecycle remain unvalidated. See the
-[integration evidence](macos-bootstrap-integration.md#installed-user-validation-findings-in-progress).
+across stop/start with the same VM identity. The subsequent installed DEV
+five-verb lifecycle passed with the updated native guest agent. See the
+[integration evidence](macos-bootstrap-integration.md#installed-user-validation-findings-in-progress)
+and the [pinned Swift recipe](macos-swift-toolchain.md) for the subsequently passed
+Xcode/Swift installed qualification.
+Artifact publication and aggregate release acceptance remain open.
 
 ## Selected base delivery contract
 
@@ -82,9 +93,10 @@ without resolving `latest` again. Keep prior published artifact sets obtainable
 for pinned recreation. A supported release with no matching artifacts cannot be
 advertised as ready.
 
-The first milestone is the manually prepared macOS 26.3.1 / 25D2128 base plus loader
-patch, followed by a fresh download/apply/boot proof. Artifact publication and
-native integration remain unimplemented; this decision selects their contract.
+The local DEV milestone uses the manually prepared macOS 26.3.1 / 25D2128 base
+plus matching patch through the installed native adapter. It has passed fresh
+local artifact import/apply/boot. Public download and artifact publication still
+require their own proof.
 
 ## Implemented prerequisite APIs
 
@@ -127,11 +139,11 @@ for the exact API, trust boundary, cache layout, runnable example and next work.
 
 ## Next integration and acceptance
 
-Add the pinned native toolchain to the candidate recipe, regenerate its patch and
-repeat reconstruction/boot verification. Publish the authenticated pair and immutable release manifest. Bind all
-artifacts and platform resources to the native target catalog and Machine ownership. Connect the operation-owned
-prepared-template cache and clone API to streamed Up progress and native
-exec/lifecycle adapters. Automate the proven maintainer recipe in a release
-workflow. Finish with a clean consumer download/bootstrap and the pinned Swift
-fixture, mixed-target paths, Stop/Up, Delete, and the canonical installed native
-and aggregate gates. Keep `vz-mzs.11.4` open until that evidence exists.
+Use the [pinned Swift recipe and evidence](macos-swift-toolchain.md) when producing
+the next candidate. The DEV installed catalog, Machine-owned platform state,
+prepared-template cache, streamed Up progress and native exec/lifecycle adapters
+are implemented. Publish the authenticated pair and immutable manifest, and
+automate the proven maintainer recipe in a release workflow. Finish with a clean
+consumer download/bootstrap, pinned Swift fixture, native networking and workspace
+paths, mixed-target behavior and the canonical installed native and aggregate
+gates. Keep `vz-mzs.11.4` open until that evidence exists.

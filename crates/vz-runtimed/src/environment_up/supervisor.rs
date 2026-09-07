@@ -2,6 +2,7 @@ use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
 use super::*;
 use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use crate::machine_docker_endpoint::MachineDockerEndpoint;
+use crate::machine_runtime_activation::MachineRuntimeActivationError;
 use crate::machine_runtime_registry::MachineRuntimeEntry;
 
 impl RuntimeDaemon {
@@ -274,9 +275,13 @@ impl RuntimeDaemon {
                     }
                     self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                     self.with_state_store(|store|store.consume_machine_boot_non_dispatch(&operation,&step.machine_id)).map_err(state_error)?;
-                    let activation=match entry.boot_or_inspect_machine(&reservation,vec![],StackResourceHint {
+                    let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,vec![],StackResourceHint {
                         cpus:Some(cpus),memory_mb:Some(memory_mb),..Default::default()
-                    }).await { Ok(activation)=>Arc::new(activation),Err(error)=>{uncertain=true;return Err(backend_error(format!("Machine boot failed; original Runtime and fence retained, absence unproven: {error}")));} };
+                    }).await {
+                        Ok(activation)=>(Arc::new(activation),None),
+                        Err(MachineRuntimeActivationError::NativeStart {error,activation})=>(Arc::from(activation),Some(error)),
+                        Err(error)=>{uncertain=true;return Err(backend_error(format!("Machine boot failed; original Runtime and fence retained, absence unproven: {error}")));}
+                    };
                     run.uncertain.lock().map_err(|error|backend_error(error.to_string()))?.push(Arc::clone(&activation));
                     if let Err(error)=self.machine_live_sessions.register(prepared.lease(),Arc::clone(&activation),&mut None) {
                         uncertain=true; return Err(backend_error(error.to_string()));
@@ -284,6 +289,12 @@ impl RuntimeDaemon {
                     // Registry now owns the original boot; no extra reader may
                     // survive and obstruct a later positive Stop shutdown.
                     run.uncertain.lock().map_err(|error|backend_error(error.to_string()))?.clear();
+                    // Failed dispatch is not absence or readiness evidence. The
+                    // registry owns the exact VM, so release the Up fence and
+                    // let public Stop obtain positive shutdown evidence.
+                    if let Some(error)=start_error {
+                        return Err(backend_error(format!("native Machine start failed; original VM retained for Stop: {error}")));
+                    }
                     activation
                 };
                 if machine.target.os==OperatingSystem::Linux && machine.profile==MachineProfile::Developer && self.machine_live_sessions.docker_endpoint_path(prepared.lease(),&activation)
@@ -316,6 +327,7 @@ impl RuntimeDaemon {
                     (None, LifecycleStepResult::Failed { reason })
                 }
             };
+            let readiness_failed = matches!(&result, LifecycleStepResult::Failed { .. });
             operation = self
                 .with_state_store(|store| {
                     store.acknowledge_environment_machine_step(
@@ -326,10 +338,11 @@ impl RuntimeDaemon {
                             initial_state: step.initial_state,
                             target_state: step.target_state,
                             expected_incarnation: step.expected_incarnation.clone(),
+                            // A failed readiness check has no resulting activation.
+                            // Retain the old incarnation only as the expected fence.
                             resulting_incarnation: activation
                                 .as_ref()
-                                .map(|activation| activation.incarnation.clone())
-                                .or(step.expected_incarnation),
+                                .map(|activation| activation.incarnation.clone()),
                             resulting_activation: activation,
                             result,
                         },
@@ -337,6 +350,11 @@ impl RuntimeDaemon {
                     )
                 })
                 .map_err(state_error)?;
+            if readiness_failed {
+                self.machine_live_sessions
+                    .record_failed_up(prepared.lease(), &self.state_store, &operation, machine)
+                    .map_err(|error| backend_error(error.to_string()))?;
+            }
             run.publish("machine_acknowledged", Some(operation.clone()), None);
             if uncertain {
                 break;

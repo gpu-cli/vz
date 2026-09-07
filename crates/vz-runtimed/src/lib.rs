@@ -1662,6 +1662,7 @@ mod tests {
         let root = temp.path().join("not-created");
         let config = startup_validation_config(&root);
         let catalog = machine_target_resolver::MachineTargetCatalog {
+            source_path: None,
             macos: Vec::new(),
             schema_version: 0,
             linux: Vec::new(),
@@ -1699,6 +1700,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary directory");
         let digest = format!("sha256:{}", "b".repeat(64));
         let catalog = machine_target_resolver::MachineTargetCatalog {
+            source_path: None,
             macos: Vec::new(),
             schema_version: machine_target_resolver::MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
             linux: vec![machine_target_resolver::LinuxTargetCatalogEntry {

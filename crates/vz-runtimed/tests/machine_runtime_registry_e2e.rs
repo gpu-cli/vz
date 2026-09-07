@@ -269,6 +269,7 @@ fn target_catalog(
         channels: BTreeSet::from(["local-physical-e2e".to_string()]),
     };
     MachineTargetCatalog {
+        source_path: None,
         macos: Vec::new(),
         schema_version: MACHINE_TARGET_CATALOG_SCHEMA_VERSION,
         linux: vec![

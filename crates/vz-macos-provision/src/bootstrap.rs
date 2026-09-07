@@ -1,4 +1,4 @@
-//! Exact macOS base/patch preparation, independent of catalog and VM lifecycle.
+//! Local macOS image and optional base/patch preparation, separate from VM lifecycle.
 //!
 //! [`BootstrapCache::prepare`] accepts a manifest pin from an authenticated catalog.
 //! Persist that pin in Environment state first: this layer never follows `latest`.
@@ -34,6 +34,8 @@ pub enum Component {
     Base,
     /// Matching disk patch.
     Patch,
+    /// Locally prepared complete image.
+    LocalImage,
     /// Serialized hardware model.
     HardwareModel,
     /// Immutable auxiliary-storage seed.
@@ -199,28 +201,36 @@ impl BootstrapCache {
         let staging = self.templates.join(format!("{key}.staging"));
         template::remove_stale_stage(&staging)?;
         let mut inputs = Vec::new();
-        for (component, artifact) in [
-            (Component::Base, &manifest.base),
-            (Component::Patch, &manifest.patch),
-            (Component::HardwareModel, &manifest.platform.hardware_model),
-            (
-                Component::AuxiliaryStorageSeed,
-                &manifest.platform.auxiliary_storage_seed,
-            ),
-        ] {
-            inputs.push(
-                self.acquire(artifact, bundle, |p| {
-                    progress(Progress::Artifact {
-                        component,
-                        progress: p,
+        for artifact in manifest.artifacts() {
+            let component = if Some(artifact) == manifest.local_image.as_ref() {
+                Component::LocalImage
+            } else if Some(artifact) == manifest.base.as_ref() {
+                Component::Base
+            } else if Some(artifact) == manifest.patch.as_ref() {
+                Component::Patch
+            } else if artifact == &manifest.platform.hardware_model {
+                Component::HardwareModel
+            } else {
+                Component::AuxiliaryStorageSeed
+            };
+            // Local disks are APFS-cloned and hashed by the worker. Never stream
+            // their sparse extents into a second fully allocated download blob.
+            if component == Component::LocalImage {
+                let bundle = bundle.context("local preparation requires an installed bundle")?;
+                private_directory(bundle)?;
+                inputs.push(bundle.join(&artifact.sha256));
+            } else {
+                inputs.push(
+                    self.acquire(artifact, bundle, |p| {
+                        progress(Progress::Artifact {
+                            component,
+                            progress: p,
+                        })
                     })
-                })
-                .await?,
-            );
+                    .await?,
+                );
+            }
         }
-        let [base, patch, hardware, auxiliary]: [PathBuf; 4] = inputs
-            .try_into()
-            .map_err(|_| anyhow::anyhow!("missing bootstrap inputs"))?;
         let key = key.clone();
         let (sender, mut receiver) = tokio::sync::mpsc::channel(1);
         let worker = tokio::task::spawn_blocking(move || {
@@ -232,7 +242,7 @@ impl BootstrapCache {
                 &key,
                 manifest,
                 &bytes,
-                [&base, &patch, &hardware, &auxiliary],
+                &inputs,
                 |p| {
                     let (ack, accepted) = tokio::sync::oneshot::channel();
                     sender

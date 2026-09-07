@@ -27,6 +27,12 @@ pub enum MachineRuntimeActivationError {
     Admission(#[from] MachineRuntimeRegistryError),
     #[error(transparent)]
     Runtime(#[from] OciError),
+    /// A failed native start with its original VM and store ownership retained.
+    #[error("native Machine start failed: {error}")]
+    NativeStart {
+        error: OciError,
+        activation: Box<MachineRuntimeActivation>,
+    },
 }
 
 /// Retains the store lock until this exact VM lease is released.
@@ -40,6 +46,15 @@ pub struct MachineRuntimeActivation {
     // Release the VM lifecycle fence before dropping the owning runtime store.
     lease: MachineExecutionLease,
     entry: Arc<MachineRuntimeEntry<MacosRuntimeBackend>>,
+}
+
+impl std::fmt::Debug for MachineRuntimeActivation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MachineRuntimeActivation")
+            .field("owner", self.owner())
+            .field("runtime_identity", self.runtime_identity())
+            .finish_non_exhaustive()
+    }
 }
 
 impl MachineRuntimeActivation {
@@ -174,7 +189,20 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
                     .await?,
             ),
             MacosRuntimeBackend::Native(runtime) => {
-                MachineExecutionLease::Native(runtime.boot(&reservation.resource_id).await?)
+                use crate::native_macos::runtime::NativeMacosBootError;
+                match runtime.boot(&reservation.resource_id).await {
+                    Ok(lease) => MachineExecutionLease::Native(lease),
+                    Err(NativeMacosBootError::BeforeStart(error)) => return Err(error.into()),
+                    Err(NativeMacosBootError::Start { error, lease }) => {
+                        return Err(MachineRuntimeActivationError::NativeStart {
+                            error,
+                            activation: Box::new(MachineRuntimeActivation {
+                                lease: MachineExecutionLease::Native(lease),
+                                entry: Arc::clone(&entry),
+                            }),
+                        });
+                    }
+                }
             }
         };
         Ok(MachineRuntimeActivation { lease, entry })

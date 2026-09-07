@@ -102,6 +102,13 @@ unsafe impl Send for VmHandle {}
 // happens on the serial dispatch queue.
 unsafe impl Sync for VmHandle {}
 
+fn framework_state_is_terminal(state: VZVirtualMachineState) -> bool {
+    matches!(
+        state,
+        VZVirtualMachineState::Stopped | VZVirtualMachineState::Error
+    )
+}
+
 /// A macOS or Linux virtual machine.
 ///
 /// Wraps `VZVirtualMachine` from Apple's Virtualization.framework.
@@ -228,6 +235,23 @@ impl Vm {
                 let _ = state_tx.send(vz_state_to_vm_state(apple_state));
             })
             .await;
+    }
+
+    /// Query whether the original framework VM is stopped or irrecoverably errored.
+    ///
+    /// Apple's terminal Error state requires destroying the VM object; waiting
+    /// for guest shutdown cannot transition it to Stopped. Unknown future states
+    /// are never terminal evidence. Callers must fence concurrent lifecycle
+    /// operations and release the original VM before publishing teardown.
+    /// See <https://developer.apple.com/documentation/virtualization/vzvirtualmachinestate/vzvirtualmachinestateerror>.
+    pub async fn has_terminal_state(&self) -> Result<bool, VzError> {
+        let handle = Arc::clone(&self.handle);
+        self.queue
+            .dispatch(move || {
+                // SAFETY: the framework state is read on this VM's serial queue.
+                framework_state_is_terminal(unsafe { handle.vm.state() })
+            })
+            .await
     }
 
     /// Start (cold boot) the VM.
@@ -749,5 +773,30 @@ mod tests {
         assert_eq!(std::fs::read(&destination).unwrap(), b"checkpoint-bytes");
 
         std::fs::remove_dir_all(temp).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod terminal_state_tests {
+    use super::*;
+
+    #[test]
+    fn only_known_stopped_or_irrecoverable_states_authorize_retirement() {
+        for state in [VZVirtualMachineState::Stopped, VZVirtualMachineState::Error] {
+            assert!(framework_state_is_terminal(state));
+        }
+        for state in [
+            VZVirtualMachineState::Running,
+            VZVirtualMachineState::Paused,
+            VZVirtualMachineState::Starting,
+            VZVirtualMachineState::Stopping,
+            VZVirtualMachineState::Pausing,
+            VZVirtualMachineState::Resuming,
+            VZVirtualMachineState::Saving,
+            VZVirtualMachineState::Restoring,
+            VZVirtualMachineState(999),
+        ] {
+            assert!(!framework_state_is_terminal(state));
+        }
     }
 }

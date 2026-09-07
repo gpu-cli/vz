@@ -85,6 +85,7 @@ impl Fixture {
         let resolver = MachineTargetResolver::new(
             host,
             MachineTargetCatalog {
+                source_path: None,
                 macos: Vec::new(),
                 schema_version: 1,
                 linux: vec![entry],

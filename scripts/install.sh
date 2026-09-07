@@ -141,6 +141,8 @@ install_binaries() {
     install_binary "$version" "vz"
     install_binary "$version" "vz-runtimed"
     install_binary "$version" "vz-guest-agent"
+    install_binary "$version" "vz-agent-loader"
+    install_binary "$version" "vz-macos-setup"
 }
 
 install_linux_artifacts() {
@@ -337,6 +339,11 @@ print_getting_started() {
     echo "The 0.4 Developer Environment design uses a project topology in vz.json."
     echo "Commands and capabilities depend on the installed version; consult its help."
     echo "Do not reuse the pre-0.4 sandbox configuration as a topology definition."
+    echo "For native macOS without developer tools, prepare a local template:"
+    printf '  %q\n' "$BIN_DIR/vz-macos-setup"
+    echo "To also prepare an Xcode template, review its license and run:"
+    printf '  %q --xcode /Applications/Xcode.app --accept-xcode-license\n' "$BIN_DIR/vz-macos-setup"
+    echo "Setup requests administrator access once to provision the new guest disk."
 }
 
 main() {

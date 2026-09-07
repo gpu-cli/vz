@@ -175,16 +175,27 @@ Existing macOS VM primitives are **ACTIVE**; their integration into the shared
 topology contract is **DEV**.
 
 The 0.4 native macOS release gate requires at least one exact macOS 26+ guest
-version/build with an obtainable exact published base image, an authenticated
-published matching bootstrap patch, and installed first-use evidence. The product
-downloads and prepares this pair automatically with streamed progress, caching an
-immutable prepared template per pinned release for subsequent Machine creation.
-A latest-supported pointer resolves to a pinned compatible pair; existing
-Environments retain that resolution until an explicit update. IPSW installation
-is a maintainer preparation step. First-use preparation must apply the patch
-and Machine creation must start the guest agent without manual
-host sudo, disk mounting, ownership repair, or agent injection. Patcher code or
-a manually prepared VM alone does not establish this supported path.
+version/build prepared locally from pinned Apple IPSW bytes. The explicit host
+setup operation installs macOS, requests administrator authorization to provision
+the new guest disk, and validates an immutable local template. By default it
+prepares macOS without Xcode or Command Line Tools. Opting in with `--xcode`
+installs the selected local application and validates native Swift build/test/run.
+The native release gate covers both clean and Xcode-equipped Machines; Xcode is
+not required for users who want a clean OS for testing. The `clean` and `xcode`
+catalog channels select separate templates when both are installed.
+Setup is once per host and recipe/toolchain pin. Ordinary Machine creation uses
+private APFS clones with fresh platform identities; Up/exec/Stop/Delete require
+no host sudo or manual guest repair. Repeating a completed setup reuses its
+validated template. Existing Environments retain their original pins.
+
+`vz-macos-setup` is an installation utility, separate from the five Environment
+lifecycle verbs. It reports preparation progress and accepts the selected Xcode
+license only with explicit operator authorization. This local setup path is
+**DEV** until its fresh installed-user gate passes. Public redistribution of
+macOS/Xcode disk images is not a 0.4 dependency. The `vz-macos-provision::image_delta`
+API and version-1 exact-base/patch format remain available for optional artifact
+workflows; local setup uses a version-2 complete local-image manifest and never
+creates or applies a block patch.
 
 Linux-on-Windows precedes Windows-on-Windows. Native Windows Machines will expose
 Windows process, service, console, NTFS, and isolation capabilities without

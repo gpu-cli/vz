@@ -11,6 +11,10 @@ repository.workspace = true
 name = "vz"
 path = "src/main.rs"
 
+[[bin]]
+name = "vz-macos-setup"
+path = "src/macos_setup_main.rs"
+
 [dependencies]
 # Cross-platform dependencies
 vz-stack = { workspace = true }
@@ -40,6 +44,7 @@ tonic = { workspace = true }
 shell-words = { workspace = true }
 sha2 = { workspace = true }
 ring = "0.17.14"
+fs2 = { workspace = true }
 vz-macos-provision = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -54,6 +59,7 @@ objc2-app-kit = { workspace = true }
 objc2-virtualization = { workspace = true }
 tokio-stream = { workspace = true }
 tar = "0.4"
+flate2 = "1"
 zstd = "0.13"
 
 [target.'cfg(target_os = "linux")'.dependencies]
