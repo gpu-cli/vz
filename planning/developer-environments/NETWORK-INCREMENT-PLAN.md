@@ -1,8 +1,36 @@
 # Network increment plan: exports, imports, private paths, offline/allowed egress
 
-Status: implementation plan (2026-09-07). Normative source:
-[`GOAL-0.4.0.md`](GOAL-0.4.0.md) required-implementation items 5 and 6 and
-acceptance criteria 5, 6, 7, 8, 9, 20. Tracked under `vz-mzs.5`.
+Status: implementation plan (2026-09-07), step 1 complete and step 2 in
+progress. Normative source: [`GOAL-0.4.0.md`](GOAL-0.4.0.md)
+required-implementation items 5 and 6 and acceptance criteria 5, 6, 7, 8, 9, 20.
+Tracked under `vz-mzs.5`.
+
+## What has landed
+
+- **Step 1, typed records** (`321972dd`). `MachineSpec.networks` and `.egress`,
+  `EnvironmentSpec.host_exports` and `.host_imports`, their four instances and
+  four owned-resource kinds, the JSON schema, the proto with appended field
+  numbers only, translation both ways, and state-store persistence at schema v10
+  with its migration and an injected-failure test. Up refuses declared host
+  relays and non-offline egress, because admitting one would start a Machine
+  that silently lacks the boundary its definition asks for.
+- **Migration barriers** (`58e5bfd4`). The v10 network step and the previously
+  unrecorded v9 step are both in `config/vz-0.4-migration-barriers.json`, and
+  `crates/vz-stack/tests/migration_barriers.rs` now requires every state-store
+  version up to `StateStore::CURRENT_SCHEMA_VERSION` to be covered, so a future
+  migration cannot land without its barrier.
+- **The file-handle attachment** (`e4cdeee5`), the first half of step 2's
+  substrate. `NetworkConfig::FileHandle` carries a `FileHandleNetwork` that
+  adopts a socket and enforces what `VZFileHandleNetworkDeviceAttachment`
+  requires silently: a datagram socket, a connected peer, and buffers sized from
+  the MTU with receive at least twice send, read back because macOS may grant
+  less than requested. No Machine's behaviour changed; there is no switch yet.
+- **One defect found while surveying the substrate.** The guest `PortForward`
+  handler dials whatever `target_host` the caller names
+  (`crates/vz-guest-agent/src/grpc_server.rs:3189-3197`). It is contained only
+  because Machines do not use that path and the host listener is loopback-bound.
+  Steps 3 and 4 route real traffic through it, so `vz-mzs.5.10` pins the
+  destination server-side first, the way `DockerForward` already does.
 
 ## Current state (verified)
 
@@ -28,9 +56,13 @@ acceptance criteria 5, 6, 7, 8, 9, 20. Tracked under `vz-mzs.5`.
   `environment_delete.rs:645-678`).
 - Typed `NetworkSpec` and `EndpointSpec` exist
   (`crates/vz-runtime-contract/src/types/topology.rs:233-274, 537-552`), with
-  state-store tables (`crates/vz-stack/src/state_store/topology.rs:647-672`),
-  but `MachineSpec` has no network attachment and no `HostImport`,
-  `HostExport`, `EgressPolicy` or `PeerGrant` type exists.
+  state-store tables (`crates/vz-stack/src/state_store/topology.rs:647-672`).
+  Step 1 added the attachment, host relay and egress records beside them; no
+  `PeerGrant` type exists yet. One inconsistency to resolve while building the
+  switch: `instantiate` appends an `OwnershipRecord` for every new kind except
+  egress, because there is no `OwnedResourceKind::Egress`. Decide whether egress
+  is an owned resource or deliberately only a Machine attribute, and say which
+  in the type.
 - Docker traffic already relays Mac to guest over vsock
   (`machine_docker_endpoint.rs:128-146, 214-226` to
   `crates/vz-guest-agent/src/docker_forward.rs:58-163`), and a general TCP relay
