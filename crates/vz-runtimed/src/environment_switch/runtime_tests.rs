@@ -225,3 +225,39 @@ async fn a_frame_larger_than_a_machine_will_read_is_still_one_datagram() {
     assert_eq!(received, sent);
     switch.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_machine_whose_guest_end_is_closed_becomes_a_dead_port_and_stalls_nothing() {
+    // A port whose guest end is gone is the shape a caller produces by minting
+    // a port and never attaching it to a VM. It must degrade to a counted drop:
+    // one Machine that cannot receive may not stall the frames between the
+    // others, and it may not take the switch down.
+    let (mut switch, mut guests) = started(3);
+    let closed = guests.remove(2);
+    drop(closed);
+
+    guests[0]
+        .send(&frame(mac(3), mac(1), b"to-the-dead"))
+        .unwrap();
+    // The live pair still carries traffic after the failed delivery.
+    guests[0]
+        .send(&frame(mac(2), mac(1), b"to-the-living"))
+        .unwrap();
+    assert_eq!(
+        recv(&guests[1]).as_deref(),
+        Some(frame(mac(2), mac(1), b"to-the-living").as_slice()),
+        "a dead port must not stall the frames between the Machines that remain"
+    );
+
+    let receipt = switch.shutdown().await.unwrap();
+    assert_eq!(receipt.frames_read, 2);
+    assert_eq!(receipt.frames_delivered, 1);
+    assert_eq!(
+        receipt.undeliverable, 1,
+        "the frame for the closed Machine is counted, not retried and not lost silently"
+    );
+    // The fabric still resolved it: the address is assigned, so this is a
+    // delivery failure, not a forwarding decision.
+    assert_eq!(receipt.counters.unicast_forwarded, 2);
+    assert!(receipt.counters.dropped.is_empty());
+}
