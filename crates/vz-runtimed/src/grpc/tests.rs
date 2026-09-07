@@ -7071,6 +7071,11 @@ async fn concurrent_create_sandbox_replays_idempotent_result_with_single_mutatio
         "only one receipt should persist for idempotent concurrent creates"
     );
     assert!(has_idempotency_record);
+    // The failure this guards is a lost race, not a wrong result: every caller
+    // reads no idempotency record, one of them writes it, and the rest then see
+    // the sandbox it created. Before the second replay lookup in the `exists`
+    // branch of `create_sandbox`, that produced `state_conflict: sandbox
+    // already exists` for roughly one run in five.
 
     shutdown.notify_waiters();
     let result = tokio::time::timeout(Duration::from_secs(5), server)

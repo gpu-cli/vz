@@ -10,6 +10,10 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
     type OpenSandboxShellStream = OpenSandboxShellEventStream;
     type CloseSandboxShellStream = CloseSandboxShellEventStream;
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the replay closure returns the same tonic::Status this service method's signature already fixes"
+    )]
     async fn create_sandbox(
         &self,
         request: Request<runtime_v2::CreateSandboxRequest>,
@@ -112,39 +116,53 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             );
         }
 
-        if let Some(key) = normalized_idempotency_key {
-            if let Some(cached_sandbox) = load_idempotent_sandbox_replay(
+        // Replaying a cached result is two reads, so it is repeated below: a
+        // request that finds no record here can still lose the race to a
+        // concurrent request carrying the same key, and must replay that
+        // result rather than see the sandbox it created and call it a conflict.
+        let replay = |sequence: &mut u64,
+                      events: &mut Vec<Result<runtime_v2::CreateSandboxEvent, Status>>|
+         -> Result<Option<Response<Self::CreateSandboxStream>>, Status> {
+            let Some(key) = normalized_idempotency_key else {
+                return Ok(None);
+            };
+            let Some(cached_sandbox) = load_idempotent_sandbox_replay(
                 &self.daemon,
                 key,
                 "create_sandbox",
                 &request_hash,
                 &request_id,
-            )? {
-                tracing::info!(
-                    target: "vz_post_stop",
-                    sandbox_id = %sandbox_id,
-                    port_count_dropped = explicit_port_mappings.len(),
-                    "[L1/runtimed] IDEMPOTENCY REPLAY — port_mappings DROPPED (BUG SUSPECT (d))"
-                );
-                sequence += 1;
-                events.push(Ok(create_sandbox_progress_event(
-                    &request_id,
-                    sequence,
-                    "idempotency_replay",
-                    "replaying cached create sandbox result",
-                )));
-                sequence += 1;
-                events.push(Ok(create_sandbox_completion_event(
-                    &request_id,
-                    sequence,
-                    runtime_v2::SandboxResponse {
-                        request_id: request_id.clone(),
-                        sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
-                    },
-                    "",
-                )));
-                return Ok(sandbox_stream_response(events, None));
-            }
+            )?
+            else {
+                return Ok(None);
+            };
+            tracing::info!(
+                target: "vz_post_stop",
+                sandbox_id = %sandbox_id,
+                port_count_dropped = explicit_port_mappings.len(),
+                "[L1/runtimed] IDEMPOTENCY REPLAY — port_mappings DROPPED (BUG SUSPECT (d))"
+            );
+            *sequence += 1;
+            events.push(Ok(create_sandbox_progress_event(
+                &request_id,
+                *sequence,
+                "idempotency_replay",
+                "replaying cached create sandbox result",
+            )));
+            *sequence += 1;
+            events.push(Ok(create_sandbox_completion_event(
+                &request_id,
+                *sequence,
+                runtime_v2::SandboxResponse {
+                    request_id: request_id.clone(),
+                    sandbox: Some(sandbox_to_proto_payload(&cached_sandbox)),
+                },
+                "",
+            )));
+            Ok(Some(sandbox_stream_response(std::mem::take(events), None)))
+        };
+        if let Some(response) = replay(&mut sequence, &mut events)? {
+            return Ok(response);
         }
 
         let exists = self
@@ -159,6 +177,13 @@ impl runtime_v2::sandbox_service_server::SandboxService for SandboxServiceImpl {
             "[L1/runtimed] state_store load_sandbox check"
         );
         if exists {
+            // The sandbox may be the one a concurrent request carrying this
+            // exact key just created: both requests read no record, and only
+            // one of them got to write it. An idempotency key exists so a retry
+            // is safe, so look again before calling this a conflict.
+            if let Some(response) = replay(&mut sequence, &mut events)? {
+                return Ok(response);
+            }
             tracing::info!(
                 target: "vz_post_stop",
                 sandbox_id = %sandbox_id,
