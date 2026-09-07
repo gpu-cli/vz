@@ -19,6 +19,12 @@ MAX_SAMPLES = 600
 OBSERVER_SLACK_NS = TIMING['observer_bound_ns'] - TIMING['samples'] * TIMING['interval_ns']
 
 
+def observer_timeout_seconds(timing):
+    """The host command must outlast the window it observes, with the same slack
+    the sixty-sample contract allowed."""
+    return timing['observer_bound_ns'] // 10 ** 9 + 5
+
+
 def timing_for(samples):
     require(type(samples) is int and TIMING['samples'] <= samples <= MAX_SAMPLES, 'health sample count')
     return dict(TIMING, samples=samples,
@@ -110,7 +116,8 @@ def validate_record(output, expected, token, timing, run_intervals):
     intent = document('001-http-health.intent.json')
     result = document('001-http-health.result.json')
     fixed = {'index': 1, 'label': 'http-health', 'argv': expected['argv'], 'argv0': 'docker',
-             'executable': expected['executable'], 'cwd': expected['cwd'], 'timeout_seconds': 75,
+             'executable': expected['executable'], 'cwd': expected['cwd'],
+             'timeout_seconds': observer_timeout_seconds(timing),
              'termination_scope': 'owned_host_process_group'}
     require(set(intent) == set(fixed) | {'started_unix_ns', 'effects_uncertain', 'capture_complete'} and
             all(intent[k] == v for k, v in fixed.items()) and
@@ -252,7 +259,8 @@ class Health:
         def observe():
             try:
                 self.result = self.record.run('http-health', argv,
-                    executable=self.observer_input['executable'], cwd=self.harness.root, timeout=75)
+                    executable=self.observer_input['executable'], cwd=self.harness.root,
+                    timeout=observer_timeout_seconds(self.timing))
             except BaseException as error:
                 self.error = error
         self.thread = threading.Thread(target=observe, name='vz-parallel-http-health', daemon=False)
@@ -262,7 +270,7 @@ class Health:
     def finish(self, run_intervals):
         # Always positively join first, even when callers pass [] after failure.
         if self.thread is not None and self.thread.ident is not None:
-            self.thread.join(timeout=85)
+            self.thread.join(timeout=observer_timeout_seconds(self.timing) + 10)
             require(not self.thread.is_alive(), 'health observer did not positively terminate; cleanup withheld')
         require(self.started and self.result is not None and self.error is None,
                 'health observer failed or never completed: ' + repr(self.error))
