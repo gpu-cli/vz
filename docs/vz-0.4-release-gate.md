@@ -42,8 +42,15 @@ Lane entry points invoked by the gate, in contract order:
 `run-developer-environment-e2e.sh` and `run-macos-developer-environment-e2e.sh`
 are explicit failing stubs: they write a schema-valid lane result with
 `outcome: failed`, `failure.reason: not_implemented` and exit 3.
-`run-linux-docker-e2e.sh` rejects `--suite all` today, which the gate records as
-`input_rejected`/`not_implemented`. There is no `skipped` state anywhere.
+`run-linux-docker-e2e.sh` runs `--suite all` when it is invoked directly, but
+the gate cannot invoke it: the argv below is everything a lane receives, and the
+harness additionally requires `--registry-archive`, `--registry-layout`,
+`--buildkit-archive`, `--ssh-packages`, `--release-version`,
+`--developer-bundle`, `--hardened-bundle` and `--tmux`. It therefore rejects the
+lane invocation, which the gate records as `input_rejected`/`not_implemented`
+(`vz-ao8`). Only `--dry-lanes` runs had exercised this path, and a dry lane
+substitutes its result without starting the process, so the rejection had never
+been observed. There is no `skipped` state anywhere.
 
 Lanes receive everything through argv, never ambient environment: `--run-id`,
 `--phase`, `--release-dir`, `--evidence-dir`, `--state-root`, `--contract`,
