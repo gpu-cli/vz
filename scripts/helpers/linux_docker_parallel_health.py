@@ -130,7 +130,11 @@ class Health:
         self.harness, self.descriptor = harness, json.loads(json.dumps(descriptor))
         self.images = json.loads(json.dumps(images))
         require(type(index) is int and 0 <= index < 3, 'invalid health Machine index')
-        self.output = startup.private(harness.evidence / ('parallel-health-' + str(index)))
+        # A composed run reuses this probe from more than one suite over the same
+        # Machine index, so the evidence directory carries the executing suite.
+        suite = getattr(harness, 'active_suite', None)
+        stem = 'parallel-health-' if suite in (None, 'parallel') else suite + '-health-'
+        self.output = startup.private(harness.evidence / (stem + str(index)))
         self.environment = dict(harness.env)
         self.record = startup.Recorder(self.output, self.environment)
         self.thread, self.error, self.result = None, None, None
