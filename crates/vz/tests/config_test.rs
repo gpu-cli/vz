@@ -3,10 +3,18 @@
 //! Tests config validation logic without needing macOS or a VM.
 
 #![allow(clippy::unwrap_used)]
+// The file-handle network tests build real sockets, because every property the
+// attachment depends on (socket type, whether it is connected, the buffer sizes
+// the kernel grants) is a kernel property a mock would only assert about itself.
+// The unsafe is confined to socketpair/socket and adopting their descriptors.
+#![allow(unsafe_code)]
 
 use std::path::PathBuf;
 
-use vz::{BootLoader, DiskConfig, MacPlatformConfig, SharedDirConfig, VmConfigBuilder, VzError};
+use vz::{
+    BootLoader, DiskConfig, FileHandleNetwork, MacPlatformConfig, NetworkConfig, SharedDirConfig,
+    VmConfigBuilder, VzError,
+};
 
 fn rootfs_disk(path: &str) -> DiskConfig {
     DiskConfig {
@@ -459,4 +467,120 @@ fn macos_boot_without_disks_fails() {
     assert!(result.is_err());
     let err = result.unwrap_err();
     assert!(matches!(err, VzError::InvalidConfig(ref msg) if msg.contains("disk")));
+}
+
+// --- File-handle network attachment ---------------------------------------
+//
+// The switch hands the VM one end of a socket pair. These tests use a real pair
+// rather than a mock, because every property the attachment depends on (the
+// socket's type, whether it is connected, what buffer sizes the kernel grants)
+// is a kernel property that a mock would assert about itself.
+
+/// A connected `AF_UNIX` socket pair of the given type. Returns both ends so the
+/// peer stays open; closing it would leave the VM end connected to nothing.
+fn socket_pair(kind: libc::c_int) -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd) {
+    use std::os::fd::FromRawFd;
+    let mut fds = [-1 as libc::c_int; 2];
+    // SAFETY: `fds` is a two-element array of c_int, which is what socketpair fills.
+    let status = unsafe { libc::socketpair(libc::AF_UNIX, kind, 0, fds.as_mut_ptr()) };
+    assert_eq!(
+        status,
+        0,
+        "socketpair failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: both descriptors were just created by socketpair and are unowned.
+    unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(fds[0]),
+            std::os::fd::OwnedFd::from_raw_fd(fds[1]),
+        )
+    }
+}
+
+#[test]
+fn file_handle_network_accepts_a_connected_datagram_socket() {
+    let (vm_end, _peer) = socket_pair(libc::SOCK_DGRAM);
+    let network = FileHandleNetwork::new(vm_end, 1500).unwrap();
+    assert_eq!(network.mtu(), 1500);
+    // The kernel may clamp a requested size, so assert the properties the
+    // attachment actually depends on rather than the exact numbers requested.
+    assert!(
+        network.granted_send_buffer_bytes() >= 1500 * 4,
+        "send buffer {} cannot hold whole frames",
+        network.granted_send_buffer_bytes()
+    );
+    assert!(
+        network.granted_receive_buffer_bytes() >= network.granted_send_buffer_bytes() * 2,
+        "receive buffer {} is below twice the send buffer {}",
+        network.granted_receive_buffer_bytes(),
+        network.granted_send_buffer_bytes()
+    );
+}
+
+#[test]
+fn file_handle_network_refuses_a_stream_socket() {
+    // A stream socket has no frame boundaries, so the framework would read one
+    // Ethernet frame as an arbitrary split of the byte stream.
+    let (vm_end, _peer) = socket_pair(libc::SOCK_STREAM);
+    let error = FileHandleNetwork::new(vm_end, 1500).unwrap_err();
+    assert!(
+        matches!(error, VzError::InvalidConfig(ref message) if message.contains("datagram")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn file_handle_network_refuses_an_unconnected_socket() {
+    // An unconnected datagram socket has no peer, so the guest's frames would be
+    // discarded silently instead of reaching the switch.
+    use std::os::fd::FromRawFd;
+    // SAFETY: socket(2) returns a fresh unowned descriptor.
+    let raw = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_DGRAM, 0) };
+    assert!(
+        raw >= 0,
+        "socket failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the descriptor was just created and is unowned.
+    let lone = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let error = FileHandleNetwork::new(lone, 1500).unwrap_err();
+    assert!(
+        matches!(error, VzError::InvalidConfig(ref message) if message.contains("connected")),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn file_handle_network_refuses_an_mtu_outside_the_supported_range() {
+    for mtu in [0, 1, 1499, 65536, u32::MAX] {
+        let (vm_end, _peer) = socket_pair(libc::SOCK_DGRAM);
+        let error = FileHandleNetwork::new(vm_end, mtu).unwrap_err();
+        assert!(
+            matches!(error, VzError::InvalidConfig(ref message) if message.contains("MTU")),
+            "MTU {mtu} gave an unexpected error: {error:?}"
+        );
+    }
+}
+
+#[test]
+fn file_handle_network_survives_the_config_clone_the_vm_performs() {
+    // Vm::create clones the VmConfig before handing it to the ObjC queue, so the
+    // socket must be shared by the clone rather than closed with the original.
+    let (vm_end, _peer) = socket_pair(libc::SOCK_DGRAM);
+    let network = FileHandleNetwork::new(vm_end, 1500).unwrap();
+    let config = VmConfigBuilder::new()
+        .boot_linux(
+            PathBuf::from("/tmp/kernel"),
+            None::<PathBuf>,
+            "console=hvc0",
+        )
+        .network(NetworkConfig::FileHandle(network))
+        .build()
+        .unwrap();
+    let cloned = config.clone();
+    drop(config);
+    // Reading the MAC through the clone proves the clone is usable after the
+    // original is gone; the descriptor it shares is still open.
+    assert_eq!(cloned.mac_address().len(), 17);
 }

@@ -54,6 +54,183 @@ pub enum NetworkConfig {
     Nat,
     /// No network — fully isolated.
     None,
+    /// The guest NIC's Ethernet frames are carried over a host-side socket.
+    ///
+    /// This is the attachment an Environment-owned switch uses: the host end
+    /// stays in the runtime, so two Environments never share an L2 segment the
+    /// way they share Apple's NAT bridge.
+    FileHandle(FileHandleNetwork),
+}
+
+/// Apple's documented MTU range for a file-handle network attachment.
+const MIN_MTU: u32 = 1500;
+const MAX_MTU: u32 = 65535;
+/// Socket buffer sizing. Apple requires the receive buffer to be at least twice
+/// the send buffer and recommends four times; a buffer too small to hold whole
+/// frames drops packets under load instead of applying backpressure, because the
+/// transport is datagrams. The floor keeps a jumbo MTU from being sized below a
+/// useful number of frames.
+const MIN_SEND_BUFFER_BYTES: u32 = 1024 * 1024;
+const SEND_BUFFER_FRAMES: u32 = 16;
+const RECEIVE_BUFFER_MULTIPLE: u32 = 4;
+/// The smallest granted buffer that can still hold whole frames. macOS may clamp
+/// a requested size, so the grant is read back and checked rather than assumed.
+const MIN_GRANTED_BUFFER_FRAMES: u32 = 4;
+
+/// A connected datagram socket carrying one guest NIC's Ethernet frames.
+///
+/// `VZFileHandleNetworkDeviceAttachment` writes one frame per datagram and
+/// expects a fixed peer, so an unconnected socket silently discards traffic
+/// rather than failing. Both properties are checked here, at the point the
+/// caller hands over the socket, instead of surfacing as a guest with no
+/// network much later.
+///
+/// The socket is reference-counted because [`VmConfig`] is cloned before the VM
+/// is built, and the VM retains its configuration for its whole life, which is
+/// what keeps the descriptor open for as long as the guest can send on it.
+#[derive(Debug, Clone)]
+pub struct FileHandleNetwork {
+    socket: std::sync::Arc<std::os::fd::OwnedFd>,
+    mtu: u32,
+    granted_send_buffer_bytes: u32,
+    granted_receive_buffer_bytes: u32,
+}
+
+impl FileHandleNetwork {
+    /// Adopt a connected datagram socket as one guest NIC's frame transport.
+    ///
+    /// Takes ownership of the descriptor, verifies it is the kind of socket the
+    /// framework requires, and sizes its buffers for `mtu`. Returns the sizes the
+    /// kernel actually granted, which can be smaller than requested.
+    pub fn new(socket: std::os::fd::OwnedFd, mtu: u32) -> Result<Self, VzError> {
+        use std::os::fd::AsRawFd;
+
+        if !(MIN_MTU..=MAX_MTU).contains(&mtu) {
+            return Err(VzError::InvalidConfig(format!(
+                "network MTU {mtu} is outside the supported range {MIN_MTU}..={MAX_MTU}"
+            )));
+        }
+        let raw = socket.as_raw_fd();
+        let socket_type = getsockopt_int(raw, libc::SO_TYPE)?;
+        if socket_type != libc::SOCK_DGRAM {
+            return Err(VzError::InvalidConfig(format!(
+                "network attachment requires a datagram socket; SO_TYPE is {socket_type}"
+            )));
+        }
+        require_connected(raw)?;
+
+        let send = MIN_SEND_BUFFER_BYTES.max(mtu.saturating_mul(SEND_BUFFER_FRAMES));
+        let receive = send.saturating_mul(RECEIVE_BUFFER_MULTIPLE);
+        setsockopt_int(raw, libc::SO_SNDBUF, send)?;
+        setsockopt_int(raw, libc::SO_RCVBUF, receive)?;
+        let granted_send = u32::try_from(getsockopt_int(raw, libc::SO_SNDBUF)?).unwrap_or(0);
+        let granted_receive = u32::try_from(getsockopt_int(raw, libc::SO_RCVBUF)?).unwrap_or(0);
+        let floor = mtu.saturating_mul(MIN_GRANTED_BUFFER_FRAMES);
+        if granted_send < floor || granted_receive < floor {
+            return Err(VzError::InvalidConfig(format!(
+                "kernel granted send {granted_send} and receive {granted_receive} socket buffer \
+                 bytes, below the {floor} needed to hold whole {mtu}-byte frames"
+            )));
+        }
+        if granted_receive < granted_send.saturating_mul(2) {
+            return Err(VzError::InvalidConfig(format!(
+                "granted receive buffer {granted_receive} is below twice the granted send buffer \
+                 {granted_send}, which the file-handle attachment requires"
+            )));
+        }
+        Ok(Self {
+            socket: std::sync::Arc::new(socket),
+            mtu,
+            granted_send_buffer_bytes: granted_send,
+            granted_receive_buffer_bytes: granted_receive,
+        })
+    }
+
+    /// The MTU the guest NIC is configured with.
+    pub fn mtu(&self) -> u32 {
+        self.mtu
+    }
+
+    /// The send buffer size the kernel granted, in bytes.
+    pub fn granted_send_buffer_bytes(&self) -> u32 {
+        self.granted_send_buffer_bytes
+    }
+
+    /// The receive buffer size the kernel granted, in bytes.
+    pub fn granted_receive_buffer_bytes(&self) -> u32 {
+        self.granted_receive_buffer_bytes
+    }
+
+    pub(crate) fn raw_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd;
+        self.socket.as_raw_fd()
+    }
+}
+
+fn getsockopt_int(fd: std::os::fd::RawFd, option: libc::c_int) -> Result<libc::c_int, VzError> {
+    let mut value: libc::c_int = 0;
+    let mut length = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // SAFETY: `value` and `length` are a correctly sized c_int and its length,
+    // and `fd` is borrowed from an OwnedFd that outlives this call.
+    let status = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_mut(&mut value).cast::<libc::c_void>(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(VzError::InvalidConfig(format!(
+            "cannot read socket option {option}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(value)
+}
+
+fn setsockopt_int(fd: std::os::fd::RawFd, option: libc::c_int, value: u32) -> Result<(), VzError> {
+    let value = libc::c_int::try_from(value).unwrap_or(libc::c_int::MAX);
+    // SAFETY: `value` is a live c_int and its length is passed exactly; `fd` is
+    // borrowed from an OwnedFd that outlives this call.
+    let status = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            option,
+            std::ptr::from_ref(&value).cast::<libc::c_void>(),
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+    if status != 0 {
+        return Err(VzError::InvalidConfig(format!(
+            "cannot set socket option {option} to {value}: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
+}
+
+fn require_connected(fd: std::os::fd::RawFd) -> Result<(), VzError> {
+    let mut address = std::mem::MaybeUninit::<libc::sockaddr_storage>::zeroed();
+    let mut length = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+    // SAFETY: the buffer is a zeroed sockaddr_storage and `length` is its exact
+    // size, which is what getpeername requires; `fd` outlives this call.
+    let status = unsafe {
+        libc::getpeername(
+            fd,
+            address.as_mut_ptr().cast::<libc::sockaddr>(),
+            &mut length,
+        )
+    };
+    if status != 0 {
+        return Err(VzError::InvalidConfig(format!(
+            "network attachment requires a connected socket; getpeername failed: {}",
+            std::io::Error::last_os_error()
+        )));
+    }
+    Ok(())
 }
 
 /// One block device attached to the VM.
