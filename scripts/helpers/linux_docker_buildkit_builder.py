@@ -181,6 +181,11 @@ class Builder:
         # roles separate runtime/cache ownership, never workload inputs.
         if role != "source":
             material["role"] = role
+        # A composed run walks several builder-using suites over one Machine with
+        # one run ID, so the suite separates their objects too. Single-suite runs
+        # are unaffected and keep their existing names.
+        if harness.info.get("suite") == "all":
+            material["suite"] = getattr(harness, "active_suite", None) or "all"
         self.identity_bytes = json.dumps(material, sort_keys=True).encode()
         self.identity_sha256 = sha(self.identity_bytes)
         token = self.identity_sha256[:24]
