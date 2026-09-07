@@ -131,7 +131,11 @@ def execute_slots(selected, operations):
             except BaseException as error:
                 failures.append((index, error))
     if failures:
-        raise RuntimeError("parallel slots failed: " + ",".join(str(index) for index, _ in failures)) from failures[0][1]
+        # Name the first slot's actual cause: without it a composed run reports
+        # only which slots failed, and the retained evidence cannot say why.
+        detail = "; ".join(f"slot {index}: {type(error).__name__}: {error}" for index, error in failures[:2])
+        raise RuntimeError("parallel slots failed: " +
+                           ",".join(str(index) for index, _ in failures) + " (" + detail + ")") from failures[0][1]
     return results
 
 
