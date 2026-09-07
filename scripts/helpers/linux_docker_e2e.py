@@ -190,11 +190,14 @@ def preflight(args, require_host=True):
         require(info['inputs'][str(registry_machine.PIN)] == startup.digest(registry_machine.PIN) and
                 startup.digest(registry_archive) == registry['archive_sha256'], 'registry pin or archive changed')
     if args.suite == 'handshake':
-        from linux_docker_handshake_machine import manifest_expectations, required_source_paths as handshake_sources
+        from linux_docker_handshake_machine import manifest_expectations, tool_inputs
+        from linux_docker_handshake_machine import required_source_paths as handshake_sources
         # Manifest-versus-upstream pins are checked before any client execution.
         manifest_expectations()
         for path in handshake_sources():
             info['inputs'][str(path)] = startup.digest(Path(path))
+        for row in tool_inputs().values():
+            info['inputs'][row['path']] = row['sha256']
     if args.suite == 'limits':
         from linux_docker_limits_machine import fixture_contract as limits_fixture_contract
         from linux_docker_limits_machine import required_source_paths as limits_sources
@@ -839,7 +842,7 @@ class ComposeHarness(startup.Harness):
                         from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()
                     observation = run_machine(self, descriptor, scope, proof, images, index)
-                    end = time.time_ns()
+                    end = self.monitor.close_interval(begin, descriptor["name"])
                     self.monitor.check_interval(begin, end, descriptor["name"])
                     observations.append(observation)
                     continue
@@ -852,7 +855,7 @@ class ComposeHarness(startup.Harness):
                 self.driver_cleanup_verified.append(False)
                 begin = time.time_ns()
                 result = selected.run(suite)
-                end = time.time_ns()
+                end = self.monitor.close_interval(begin, descriptor["name"])
                 require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
                         str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
                 require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
@@ -937,6 +940,22 @@ class SentinelMonitor:
 
     def check(self):
         require(not self.errors and self.thread.is_alive(), "sibling liveness failed: " + repr(self.errors))
+
+    def close_interval(self, begin, active, deadline_seconds=5.0):
+        """Return an interval end only once every sibling has a sample at or after begin.
+
+        Fast Machine workloads can finish inside the one-second sampling cadence;
+        this bounded wait is a declared readiness condition for contemporaneous
+        liveness evidence, not a retry, and it never relaxes check_interval.
+        """
+        deadline = time.monotonic() + deadline_seconds
+        while True:
+            self.check()
+            names = {row["descriptor"]["name"] for row in self.rows} - {active}
+            if all(any(x["context"] == name and x["unix_ns"] >= begin for x in self.samples) for name in names):
+                return time.time_ns()
+            require(time.monotonic() < deadline, "sibling liveness sample did not arrive within the interval deadline")
+            self.finished.wait(0.05)
 
     def check_interval(self, begin, end, active):
         self.check()

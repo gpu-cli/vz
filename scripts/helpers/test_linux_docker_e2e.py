@@ -716,6 +716,7 @@ class BuildDispatchTests(unittest.TestCase):
         harness.docker, harness.mutate = Mock(), Mock()
         harness.driver_inputs, harness.validate_driver = Mock(), Mock()
         monitor = Mock()
+        monitor.close_interval = Mock(side_effect=lambda begin, active: gate.time.time_ns())
         monitor.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
         monitor.thread.is_alive.return_value = False
         monitor.summary.return_value = {"samples": "observed"}
@@ -1133,6 +1134,17 @@ class UncertaintyTests(unittest.TestCase):
         self.assertIs(h.ssh_cache_captures[0].pending_process, pending)
         self.assertEqual(h.ssh_cache_proofs, [])
         h.mutate.assert_not_called(); h.docker.assert_not_called()
+
+    def test_close_interval_waits_for_every_sibling_sample_after_begin(self):
+        monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)
+        monitor.check = Mock()
+        monitor.finished = threading.Event()
+        monitor.rows = [{"descriptor": {"name": x}} for x in ("active", "sibling", "neighbor")]
+        monitor.samples = [{"context": "sibling", "unix_ns": 15}, {"context": "neighbor", "unix_ns": 9}]
+        with self.assertRaisesRegex(driver.Rejected, "interval deadline"):
+            monitor.close_interval(10, "active", deadline_seconds=0.2)
+        monitor.samples.append({"context": "neighbor", "unix_ns": 12})
+        self.assertGreaterEqual(monitor.close_interval(10, "active", deadline_seconds=0.2), 12)
 
     def test_liveness_requires_every_neighbor_during_exact_interval(self):
         monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)

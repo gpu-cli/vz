@@ -179,7 +179,7 @@ class Machine(unittest.TestCase):
                         self.assertEqual(args[index + 1:4 + index], ['/bin/busybox', 'sh', '-c'])
                         self.assertEqual(subject.sha256(args[index + 4].encode()), subject.ALLOCATOR_SHA256)
                         self.assertIsNotNone(holder.health.started_at)
-                    return (IDS[role] + '\n').encode(), b'', 0
+                    return (IDS[role] + '\n').encode(), (subject.SWAP_WARNING if '--memory' in args else b''), 0
                 if label.startswith('limits-remove-'):
                     role = label[len('limits-remove-'):]
                     self.assertEqual(args, ['container', 'rm', *(['--force'] if role != 'oom' else []), IDS[role]])

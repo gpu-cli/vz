@@ -11,6 +11,18 @@ path performs any removal. Nothing here certifies a release scenario.
 Per-call `DOCKER_API_VERSION` overrides never touch `harness.env`: each override
 runs through a private `startup.Recorder` whose environment is an explicit copy
 of the harness environment plus that single variable.
+
+The manifest's `api_1_56: reject` is a daemon-side property. The unmodified CLI
+cannot observe it: the vendored moby client still pings with negotiation on its
+first request and lowers any override above the daemon maximum to that maximum
+(`negotiateAPIVersion`: `if versions.LessThan(pingVersion, negotiatedVersion)`),
+so `DOCKER_API_VERSION=1.56` succeeds at 1.55 (observed candidate 2). The daemon
+rejection is therefore proved through raw HTTP on the Machine's Unix socket with
+the pinned host `/usr/bin/curl` (`/v1.56/_ping` and `/v1.39/_ping` -> 400 with
+the exact JSON message; `/v1.55/_ping` -> 200 "OK"), while the CLI probe records
+the client-side downgrade. `DOCKER_API_VERSION=1.39` is below the daemon's
+default minimum and the client cannot lower it, so the CLI does observe that
+rejection text.
 """
 import copy
 import hashlib
@@ -47,6 +59,10 @@ REJECTED = {
             'please upgrade your client to a newer version',
     '1.56': 'client version 1.56 is too new. Maximum supported API version is 1.55'}
 DAEMON_ERROR_PREFIX = 'Error response from daemon: '
+# CLI overrides above the daemon maximum are lowered to it by client negotiation.
+CLI_DOWNGRADED = ('1.56',)
+CURL = '/usr/bin/curl'
+PING_PROBES = ('1.56', '1.39', '1.55')
 COMPONENTS_REQUIRED = ('Engine', 'containerd', 'docker-init', 'youki')
 COMPONENTS_FORBIDDEN = ('runc', 'crun')
 SOURCES = {
@@ -62,7 +78,24 @@ SOURCES = {
     'client_error_prefix': 'https://raw.githubusercontent.com/docker/cli/v29.4.0/vendor/github.com/moby/moby/client/'
                            'request.go (checkResponseErr: "Error response from daemon: %w")',
     'client_version_command': 'https://raw.githubusercontent.com/docker/cli/v29.4.0/cli/command/system/version.go '
-                              '(DefaultAPIVersion: client.MaxAPIVersion; Server nil on error; client printed first)'}
+                              '(DefaultAPIVersion: client.MaxAPIVersion; Server nil on error; client printed first)',
+    'client_negotiation_downgrade': 'https://raw.githubusercontent.com/docker/cli/v29.4.0/vendor/github.com/moby/moby/client/'
+                                    'client.go (checkVersion pings with NegotiateAPIVersion; negotiateAPIVersion: '
+                                    '`if versions.LessThan(pingVersion, negotiatedVersion) { negotiatedVersion = pingVersion }`; '
+                                    'an override above the daemon maximum is lowered to it, so the daemon "too new" text is '
+                                    'unreachable through the CLI)',
+    'server_version_middleware': 'https://raw.githubusercontent.com/moby/moby/6a43e3d5afddf4111da0f864bbc7cae5d7e95001/'
+                                 'daemon/server/middleware/version.go (WrapHandler sets Server, Api-Version=defaultAPIVersion, '
+                                 'Ostype headers; returns versionUnsupportedError with InvalidParameter() marker)',
+    'server_error_response': 'https://raw.githubusercontent.com/moby/moby/6a43e3d5afddf4111da0f864bbc7cae5d7e95001/'
+                             'daemon/server/server.go (statusCode := httpstatus.FromError(err); '
+                             'httputils.WriteJSON(w, statusCode, &common.ErrorResponse{Message: err.Error()})) + '
+                             'daemon/server/httpstatus/status.go (cerrdefs.IsInvalidArgument -> http.StatusBadRequest) + '
+                             'daemon/server/httputils/httputils.go (WriteJSON: Content-Type application/json, '
+                             'json.NewEncoder(w).Encode -> trailing newline)',
+    'server_ping': 'https://raw.githubusercontent.com/moby/moby/6a43e3d5afddf4111da0f864bbc7cae5d7e95001/'
+                   'daemon/server/router/system/system_routes.go (pingHandler GET writes []byte{\'O\', \'K\'}, no newline)'}
+CURL_WRITE_OUT = '\\n%{http_code}\\n%header{api-version}\\n%header{ostype}\\n'
 VERSION_ARGS = ['version', '--format', '{{json .}}']
 INFO_ARGS = ['info', '--format', '{{json .}}']
 FLAG_SCRIPT = '\n'.join((
@@ -90,6 +123,23 @@ def verify_sources(pins):
     for name, digest in pins.items():
         require(type(digest) is str and re.fullmatch('[0-9a-f]{64}', digest) and
                 driver.sha256(driver.regular(Path(name), LIMIT)) == digest, 'handshake source changed: ' + name)
+
+
+def tool_inputs():
+    """Read-only pin of the host curl used for raw daemon probes; for the parent's preflight freeze."""
+    path = Path(CURL)
+    require(path.is_absolute() and path.resolve(strict=True) == path, 'redirected curl executable')
+    data = driver.regular(path, 64 * 1024 * 1024)
+    mode = path.lstat().st_mode
+    require(mode & 0o111 and not mode & 0o022, 'unsafe curl executable mode')
+    return {'curl': {'path': CURL, 'sha256': sha256(data)}}
+
+
+def verify_tools(harness):
+    tools = tool_inputs()
+    pinned = harness.info['inputs'].get(CURL)
+    require(pinned is None or pinned == tools['curl']['sha256'], 'frozen curl input differs from the executable')
+    return tools
 
 
 def unique(pairs):
@@ -274,10 +324,17 @@ def override_probe(harness, descriptor, output, version):
             recorder.receipts[0]['effects_uncertain'] is False, 'override probe capture incomplete')
     value = parse(raw)
     require(set(value) == {'Client', 'Server'}, 'version JSON shape')
-    check_client(value['Client'], descriptor, version)
+    downgraded = version in CLI_DOWNGRADED
+    check_client(value['Client'], descriptor, SERVER['MaxAPIVersion'] if downgraded else version)
     row = {'api_version': version, 'exit_code': code, 'stdout_sha256': sha256(raw), 'stderr_sha256': sha256(stderr),
-           'environment_variable': 'DOCKER_API_VERSION', 'negotiation': 'disabled_by_explicit_override'}
-    if version in REJECTED:
+           'environment_variable': 'DOCKER_API_VERSION',
+           'negotiation': 'override_lowered_to_daemon_maximum_by_client_ping' if downgraded else 'disabled_by_explicit_override'}
+    if downgraded:
+        require(code == 0 and stderr == b'', 'API ' + version + ' client downgrade differs: exit ' + repr(code))
+        row.update(outcome='downgraded_by_client_negotiation', effective_api_version=SERVER['MaxAPIVersion'],
+                   daemon_rejection_scope='raw_api_probe_not_cli', source=SOURCES['client_negotiation_downgrade'],
+                   server=check_server(value['Server']))
+    elif version in REJECTED:
         text = stderr.decode('utf-8', 'strict').rstrip('\n')
         require(code == 1 and value['Server'] is None and text == DAEMON_ERROR_PREFIX + REJECTED[version],
                 'API ' + version + ' rejection differs: exit ' + repr(code) + ', stderr ' + repr(text))
@@ -287,6 +344,54 @@ def override_probe(harness, descriptor, output, version):
         require(code == 0 and stderr == b'', 'API ' + version + ' acceptance differs')
         row.update(outcome='accepted', server=check_server(value['Server']))
     return row
+
+
+def socket_path(descriptor):
+    endpoint = descriptor['endpoint']
+    require(type(endpoint) is str and endpoint.startswith('unix:///'), 'Unix socket endpoint required')
+    path = Path(endpoint[len('unix://'):])
+    require(path.is_absolute() and path.is_socket(), 'Machine Docker socket absent: ' + str(path))
+    return path
+
+
+def expected_ping(version):
+    if version in REJECTED:
+        body, status = json.dumps({'message': REJECTED[version]}, separators=(',', ':')) + '\n', '400'
+    else:
+        require(version == SERVER['MaxAPIVersion'], 'unknown ping probe')
+        body, status = 'OK', '200'
+    return (body + '\n' + status + '\n' + SERVER['MaxAPIVersion'] + '\n' + SERVER['Os'] + '\n').encode()
+
+
+def raw_api_probe(harness, descriptor, output, version, tools):
+    """GET /v<version>/_ping on the Machine socket with pinned curl through a private Recorder.
+
+    stdout is the exact body, then `--write-out`: HTTP status, the middleware's
+    Api-Version and Ostype headers, one per line. Rejections are HTTP 400 with the
+    daemon's JSON ErrorResponse; the positive control is 200 "OK".
+    """
+    version_string(version)
+    directory = startup.private(output / ('raw-api-' + version.replace('.', '-')))
+    environment = dict(harness.env)
+    recorder = startup.Recorder(directory, environment)
+    socket = socket_path(descriptor)
+    argv = [CURL, '--silent', '--show-error', '--unix-socket', str(socket), '--write-out', CURL_WRITE_OUT,
+            'http://localhost/v' + version + '/_ping']
+    raw, stderr, code = recorder.run('handshake-raw-api-' + version, argv, executable=CURL, cwd=harness.root,
+                                     timeout=30, success=False)
+    require(dict(harness.env) == environment, 'harness environment changed during raw probe')
+    require(len(recorder.receipts) == 1 and recorder.receipts[0]['capture_complete'] is True and
+            recorder.receipts[0]['effects_uncertain'] is False, 'raw probe capture incomplete')
+    expected = expected_ping(version)
+    require(code == 0 and stderr == b'' and raw == expected,
+            'raw /v' + version + '/_ping differs: exit ' + repr(code) + ', stdout ' + repr(raw) + ', stderr ' + repr(stderr))
+    lines = raw.decode('ascii').split('\n')
+    suffix = '\n'.join(['', *lines[-4:]])
+    return {'api_version': version, 'path': '/v' + version + '/_ping', 'http_status': int(lines[-4]),
+            'api_version_header': lines[-3], 'ostype_header': lines[-2], 'body': raw.decode('ascii')[:-len(suffix)],
+            'outcome': 'rejected_by_daemon' if version in REJECTED else 'accepted_by_daemon',
+            'daemon_error': REJECTED.get(version), 'transport': 'unix_socket_raw_http_no_cli',
+            'curl': dict(tools['curl']), 'exit_code': code, 'stdout_sha256': sha256(raw), 'stderr_sha256': sha256(stderr)}
 
 
 def run_machine(harness, descriptor, scope, proof, images, index):
@@ -307,6 +412,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     require(type(proof) is dict and bool(proof), 'authenticated runtime proof required')
     pins = {name: harness.info['inputs'][name] for name in required_source_paths()}
     verify_sources(pins)
+    tools = verify_tools(harness)
     manifest = manifest_expectations()
     require(not harness.effects_uncertain, 'uncertain earlier mutation prevents handshake dispatch')
     output = harness.evidence / ('handshake-machine-' + str(index))
@@ -317,7 +423,8 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     intent = {'schema_version': 1, 'scope': SCOPE, 'descriptor': copy.deepcopy(descriptor),
               'machine_scope': copy.deepcopy(scope), 'source_pins': pins, 'started_unix_ns': started,
               'manifest': manifest, 'upstream_pins': {'client': CLIENT, 'server': SERVER, 'negotiated': NEGOTIATED,
-              'accepted': list(ACCEPTED), 'rejected': REJECTED}, 'sources': SOURCES,
+              'accepted': list(ACCEPTED), 'rejected': REJECTED, 'cli_downgraded': list(CLI_DOWNGRADED)},
+              'sources': SOURCES, 'tools': tools,
               'input_images_scope': 'admission_only_unused_by_handshake_recipe', 'mutations': 0}
     startup.document(output / 'handshake-machine.intent.json', intent)
     raw, stderr, _ = harness.docker('handshake-version', descriptor, VERSION_ARGS)
@@ -337,13 +444,18 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     info.update(stdout_sha256=sha256(raw), stderr_sha256=sha256(stderr))
     flags = daemon_flags(harness, descriptor)
     probes = [override_probe(harness, descriptor, output, version) for version in ('1.39', '1.56', *ACCEPTED)]
-    require([row['outcome'] for row in probes] == ['rejected', 'rejected', 'accepted', 'accepted'], 'probe outcomes')
+    require([row['outcome'] for row in probes] ==
+            ['rejected', 'downgraded_by_client_negotiation', 'accepted', 'accepted'], 'CLI probe outcomes')
+    raw_probes = [raw_api_probe(harness, descriptor, output, version, tools) for version in PING_PROBES]
+    require([row['http_status'] for row in raw_probes] == [400, 400, 200], 'raw daemon probe outcomes')
     harness.monitor.check()
     verify_sources(pins)
+    require(verify_tools(harness) == tools, 'curl changed during handshake')
     result = {'schema_version': 1, 'scope': SCOPE, 'machine_scope': copy.deepcopy(scope), 'index': index,
               'started_unix_ns': started, 'ended_unix_ns': time.time_ns(), 'source_pins': pins,
               'manifest': manifest, 'sources': SOURCES, 'negotiated': negotiated, 'info': info,
-              'daemon_flags': flags, 'api_version_probes': probes,
+              'daemon_flags': flags, 'api_version_probes': probes, 'raw_api_probes': raw_probes, 'tools': tools,
+              'api_1_56_rejection_scope': 'daemon_raw_http_400_cli_downgrades_to_1.55',
               'scenarios': {'docker.engine.version': 'dev_observed_not_release_certified',
                             'docker.engine.api_negotiation': 'dev_observed_not_release_certified'},
               'mutations': 0, 'cleanup_required': False, 'test_case_retries': 0,

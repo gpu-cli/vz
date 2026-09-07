@@ -36,6 +36,8 @@ REPO = Path(__file__).resolve().parents[2]
 HELPERS = Path(__file__).resolve().parent
 FIXTURE = REPO / 'tests/fixtures/vz-0.4/docker-limits'
 LABEL = 'dev.vz.linux-compose-proof'
+SWAP_WARNING = (b'WARNING: Your kernel does not support swap limit capabilities or the cgroup is not '
+                b'mounted. Memory limited without swap.\n')
 ALLOCATOR_SHA256 = '7f65d83d8b73c2f69ea5f9395db1b67bfa5d9042af7a7c48a7d9abe69bd01192'
 ALLOCATOR_BYTES = 841
 MEMORY_BYTES = 1073741824
@@ -204,7 +206,13 @@ class Session:
         raw, stderr, _ = self.harness.mutate('limits-run-' + role, self.descriptor,
             ['run', '--detach', '--network', 'none', '--name', name, '--label', LABEL + '=' + self.token, *args,
              self.image_id, *command], timeout=timeout)
-        require(stderr == b'', role + ' run emitted stderr (kernel limit support warning?): ' + repr(stderr))
+        # linux/vz-linux.config builds the guest kernel with CONFIG_SWAP=n, so
+        # sysInfo.SwapLimit is false and Moby daemon_unix.go
+        # verifyPlatformContainerResources warns once for every --memory run
+        # (MemorySwap forced to -1); the CLI prints it as a WARNING line on
+        # stderr. Observed installed candidate 1. Any other stderr fails closed.
+        expected_stderr = SWAP_WARNING if '--memory' in args else b''
+        require(stderr == expected_stderr, role + ' run stderr differs from the pinned kernel expectation: ' + repr(stderr))
         self.ids[role] = driver.checked_text(raw.decode().strip(), r'[0-9a-f]{64}', role + ' container ID')
         return self.ids[role]
 

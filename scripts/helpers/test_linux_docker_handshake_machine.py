@@ -3,6 +3,7 @@ import copy
 from contextlib import ExitStack, contextmanager
 import json
 from pathlib import Path
+import socket
 import tempfile
 from types import SimpleNamespace
 import unittest
@@ -52,15 +53,19 @@ def flags_stream(args=('/usr/bin/dockerd', '--host', 'unix:///run/docker.sock', 
 
 class Machine(unittest.TestCase):
     @contextmanager
-    def case(self, *, outputs=None, probes=None, flags=None):
+    def case(self, *, outputs=None, probes=None, flags=None, pings=None, socket_present=True):
         with tempfile.TemporaryDirectory(prefix='vz-handshake-unit-') as temporary:
             root = Path(temporary).resolve()
             evidence = root / 'evidence'
             evidence.mkdir(mode=0o700)
             events = []
+            listener = socket.socket(socket.AF_UNIX)
+            self.addCleanup(listener.close)
+            if socket_present:
+                listener.bind(str(root / 'd.sock'))
             scope = {'project_id': 'project-1', 'environment_id': 'environment-1', 'machine_id': 'machine-1',
                      'machine_incarnation': 'incarnation-1', 'runtime_identity': 'runtime-1',
-                     'docker_context': 'owned-machine', 'docker_endpoint': 'unix:///private/owned/docker.sock',
+                     'docker_context': 'owned-machine', 'docker_endpoint': 'unix://' + str(root / 'd.sock'),
                      'engine_id': ENGINE}
             descriptor = {'owner': {key: scope[key] for key in ('project_id', 'environment_id', 'machine_id')},
                           'name': scope['docker_context'], 'endpoint': scope['docker_endpoint'], 'config_dir': str(root / 'cfg'),
@@ -72,11 +77,15 @@ class Machine(unittest.TestCase):
             outputs.setdefault('handshake-version', (version_json('1.54'), b'', 0))
             outputs.setdefault('handshake-info', (info_json(), b'', 0))
             probes = dict(probes or {})
-            for version in ('1.39', '1.56'):
-                probes.setdefault(version, (version_json(version, with_server=False),
-                                            (subject.DAEMON_ERROR_PREFIX + subject.REJECTED[version] + '\n').encode(), 1))
+            probes.setdefault('1.39', (version_json('1.39', with_server=False),
+                                       (subject.DAEMON_ERROR_PREFIX + subject.REJECTED['1.39'] + '\n').encode(), 1))
+            # Candidate 2: the client lowers 1.56 to the daemon maximum and succeeds.
+            probes.setdefault('1.56', (version_json('1.55'), b'', 0))
             for version in ('1.40', '1.55'):
                 probes.setdefault(version, (version_json(version), b'', 0))
+            pings = dict(pings or {})
+            for version in subject.PING_PROBES:
+                pings.setdefault(version, (subject.expected_ping(version), b'', 0))
             flags = flags_stream() if flags is None else flags
             env = {'PATH': '/usr/bin:/bin', 'LC_ALL': 'C', 'VZ_DOCKER_CONFIG': str(root / 'docker')}
             harness = SimpleNamespace(evidence=evidence, descriptors=[copy.deepcopy(descriptor)], effects_uncertain=False,
@@ -99,21 +108,30 @@ class Machine(unittest.TestCase):
                 self.assertFalse(kwargs['success'])
                 return flags, b'', 0
             harness.docker, harness.command = Mock(side_effect=docker), Mock(side_effect=command)
-            recorders = []
+            recorders, curls = [], []
             class Recorder:
                 def __init__(self, directory, environment):
                     self.root, self.env, self.receipts = directory, dict(environment), []
-                    recorders.append(self)
                 def run(self, label, argv, *, executable, cwd, timeout, success):
                     events.append(label)
                     self_case.assertTrue(self.root.is_dir())
                     self_case.assertFalse(success)
-                    self_case.assertEqual(executable, '/owned/docker')
                     self_case.assertEqual(cwd, root)
+                    self.receipts.append({'capture_complete': True, 'effects_uncertain': False})
+                    if argv[0] == subject.CURL:
+                        curls.append(self)
+                        self_case.assertEqual(executable, subject.CURL)
+                        self_case.assertEqual(self.env, env)
+                        version = argv[-1][len('http://localhost/v'):-len('/_ping')]
+                        self_case.assertEqual(argv, [subject.CURL, '--silent', '--show-error', '--unix-socket', str(root / 'd.sock'),
+                                                     '--write-out', subject.CURL_WRITE_OUT, 'http://localhost/v' + version + '/_ping'])
+                        self_case.assertEqual(self.root, evidence / 'handshake-machine-0' / ('raw-api-' + version.replace('.', '-')))
+                        return pings[version]
+                    recorders.append(self)
+                    self_case.assertEqual(executable, '/owned/docker')
                     version = self.env['DOCKER_API_VERSION']
                     self_case.assertEqual(argv, ['docker', '--config', descriptor['config_dir'], '--context', 'owned-machine',
                                                  'version', '--format', '{{json .}}'])
-                    self.receipts.append({'capture_complete': True, 'effects_uncertain': False})
                     return probes[version]
             self_case = self
             binding = {'project_path': str(root / 'project'), 'project_definition_sha256': 'd' * 64,
@@ -123,7 +141,7 @@ class Machine(unittest.TestCase):
                 stack.enter_context(patch.object(subject.startup, 'Recorder', Recorder))
                 stack.enter_context(patch.object(subject.cgroup, 'project_binding', Mock(return_value=dict(binding))))
                 yield SimpleNamespace(harness=harness, scope=scope, proof=proof, images=images, descriptor=descriptor,
-                    events=events, outputs=outputs, probes=probes, recorders=recorders, env=env, evidence=evidence,
+                    events=events, outputs=outputs, probes=probes, recorders=recorders, curls=curls, env=env, evidence=evidence,
                     invoke=lambda: subject.run_machine(harness, descriptor, scope, proof, images, 0))
 
     def test_full_handshake_records_proof_without_mutation_or_environment_leak(self):
@@ -137,7 +155,19 @@ class Machine(unittest.TestCase):
             self.assertEqual(result['info']['default_runtime'], 'youki')
             self.assertTrue(result['daemon_flags']['min_api_override_absent'])
             self.assertEqual([row['outcome'] for row in result['api_version_probes']],
-                             ['rejected', 'rejected', 'accepted', 'accepted'])
+                             ['rejected', 'downgraded_by_client_negotiation', 'accepted', 'accepted'])
+            downgraded = result['api_version_probes'][1]
+            self.assertEqual((downgraded['exit_code'], downgraded['effective_api_version']), (0, '1.55'))
+            self.assertEqual(downgraded['source'], subject.SOURCES['client_negotiation_downgrade'])
+            self.assertEqual([(row['api_version'], row['http_status'], row['outcome']) for row in result['raw_api_probes']],
+                             [('1.56', 400, 'rejected_by_daemon'), ('1.39', 400, 'rejected_by_daemon'), ('1.55', 200, 'accepted_by_daemon')])
+            self.assertEqual(result['raw_api_probes'][0]['body'], json.dumps({'message': subject.REJECTED['1.56']}, separators=(',', ':')) + '\n')
+            self.assertEqual(result['raw_api_probes'][2]['body'], 'OK')
+            self.assertTrue(all(row['api_version_header'] == '1.55' and row['ostype_header'] == 'linux' for row in result['raw_api_probes']))
+            self.assertEqual(result['tools'], subject.tool_inputs())
+            self.assertEqual(result['raw_api_probes'][0]['curl'], result['tools']['curl'])
+            self.assertEqual(len(case.curls), 3)
+            self.assertEqual(result['api_1_56_rejection_scope'], 'daemon_raw_http_400_cli_downgrades_to_1.55')
             self.assertEqual([row['api_version'] for row in result['api_version_probes']], ['1.39', '1.56', '1.40', '1.55'])
             self.assertFalse(result['release_certified'])
             self.assertFalse(result['docker_parity_certified'])
@@ -230,7 +260,11 @@ class Machine(unittest.TestCase):
             '1.39-wrong-text': ('1.39', (version_json('1.39', False), rejected.replace(b'1.40', b'1.44'), 1)),
             '1.39-no-prefix': ('1.39', (version_json('1.39', False), (subject.REJECTED['1.39'] + '\n').encode(), 1)),
             '1.39-server-present': ('1.39', (version_json('1.39'), rejected, 1)),
-            '1.56-old-text': ('1.56', (version_json('1.56', False), rejected, 1)),
+            '1.56-cli-rejected': ('1.56', (version_json('1.56', False),
+                                  (subject.DAEMON_ERROR_PREFIX + subject.REJECTED['1.56'] + '\n').encode(), 1)),
+            '1.56-not-lowered': ('1.56', (version_json('1.56'), b'', 0)),
+            '1.56-lowered-too-far': ('1.56', (version_json('1.54'), b'', 0)),
+            '1.56-stderr': ('1.56', (version_json('1.55'), b'warning\n', 0)),
             '1.40-rejected': ('1.40', (version_json('1.40', False), rejected, 1)),
             '1.55-stderr': ('1.55', (version_json('1.55'), b'warning\n', 0)),
             '1.55-negotiated-instead': ('1.55', (version_json('1.54'), b'', 0)),
@@ -241,6 +275,45 @@ class Machine(unittest.TestCase):
                     case.invoke()
                 self.assertEqual(case.harness.env, case.env)
                 self.assertFalse((case.evidence / 'handshake-machine-0/machine-handshake-validation.json').exists())
+
+    def test_raw_daemon_probes_require_exact_status_body_and_headers(self):
+        good = subject.expected_ping('1.56')
+        cases = {
+            '1.56-200': ('1.56', (good.replace(b'\n400\n', b'\n200\n'), b'', 0)),
+            '1.56-other-text': ('1.56', (good.replace(b'1.55', b'1.54', 1), b'', 0)),
+            '1.56-no-json-newline': ('1.56', (good.replace(b'}\n\n400', b'}\n400'), b'', 0)),
+            '1.56-api-header': ('1.56', (good.replace(b'\n1.55\nlinux', b'\n1.54\nlinux'), b'', 0)),
+            '1.56-ostype': ('1.56', (good.replace(b'\nlinux\n', b'\ndarwin\n'), b'', 0)),
+            '1.56-curl-failed': ('1.56', (b'\n000\n\n\n', b'curl: (7) Failed to connect\n', 7)),
+            '1.56-header-unsupported': ('1.56', (good.replace(b'1.55\nlinux', b'%header{api-version}\n%header{ostype}'), b'', 0)),
+            '1.39-accepted': ('1.39', (subject.expected_ping('1.55'), b'', 0)),
+            '1.55-rejected': ('1.55', (good, b'', 0)),
+            '1.55-newline-body': ('1.55', (b'OK\n\n200\n1.55\nlinux\n', b'', 0))}
+        for name, (version, output) in cases.items():
+            with self.subTest(name=name), self.case(pings={version: output}) as case:
+                with self.assertRaises(ValueError):
+                    case.invoke()
+                self.assertEqual(case.harness.env, case.env)
+                self.assertFalse((case.evidence / 'handshake-machine-0/machine-handshake-validation.json').exists())
+        with self.case(socket_present=False) as case:
+            with self.assertRaisesRegex(ValueError, 'Docker socket absent'):
+                case.invoke()
+            self.assertEqual(case.curls, [])
+        with self.case() as case:
+            case.harness.info['inputs'][subject.CURL] = '0' * 64
+            with self.assertRaisesRegex(ValueError, 'frozen curl input differs'):
+                case.invoke()
+            self.assertEqual(case.events, [])
+        with self.case() as case:
+            case.harness.info['inputs'][subject.CURL] = subject.tool_inputs()['curl']['sha256']
+            case.invoke()
+        tools = subject.tool_inputs()
+        self.assertEqual(set(tools), {'curl'})
+        self.assertEqual(tools['curl']['path'], '/usr/bin/curl')
+        self.assertRegex(tools['curl']['sha256'], '[0-9a-f]{64}')
+        self.assertEqual(subject.expected_ping('1.55'), b'OK\n200\n1.55\nlinux\n')
+        with self.assertRaises(ValueError):
+            subject.expected_ping('1.54')
 
     def test_harness_environment_with_override_is_rejected(self):
         with self.case() as case:
