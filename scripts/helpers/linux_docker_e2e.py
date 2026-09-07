@@ -24,6 +24,7 @@ import uuid
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
+import linux_docker_engine_probe as engine_probe
 import linux_docker_lane_result as lane_result
 import linux_docker_image_input as image_input
 
@@ -1041,6 +1042,7 @@ class SentinelMonitor:
         self.record = startup.Recorder(self.output, harness.env)
         self.finished, self.first = threading.Event(), threading.Event()
         self.samples, self.errors = [], []
+        self.probes = {}
         self.thread = threading.Thread(target=self.loop, name="vz-compose-sibling-liveness", daemon=False)
 
     def command(self, descriptor, args):
@@ -1049,19 +1051,43 @@ class SentinelMonitor:
         return self.record.run("sentinel", ["docker", "--config", descriptor["config_dir"], "--context", descriptor["name"], *args],
                                executable=self.harness.info["clients"]["docker"]["canonical"], cwd=self.harness.root, timeout=8)
 
-    def sample(self, row):
+    def route_check(self, row):
+        """The context still names this Machine's endpoint. This is a property of
+        the CLI's own configuration, so it is the one observation that must go
+        through the client; it cannot change without the harness changing it, so
+        it is checked when the monitor starts and again when it stops."""
         descriptor = row["descriptor"]
         raw, _, _ = self.command(descriptor, ["context", "inspect", descriptor["name"]])
         require(json.loads(raw)[0]["Endpoints"]["docker"]["Host"] == descriptor["endpoint"], "sentinel context rerouted")
-        raw, _, _ = self.command(descriptor, ["info", "--format", "{{.ID}}"])
-        require(raw.decode().strip() == descriptor["engine_id"], "sentinel Engine changed")
-        raw, _, _ = self.command(descriptor, ["container", "inspect", row["container_id"]])
-        item = json.loads(raw)[0]
+
+    def probe_for(self, descriptor):
+        probe = self.probes.get(descriptor["name"])
+        if probe is None:
+            probe = engine_probe.EngineProbe(descriptor["endpoint"], timeout=8)
+            self.probes[descriptor["name"]] = probe
+        return probe
+
+    def sample(self, row):
+        """One liveness observation, taken straight from the Machine's own socket.
+
+        The Docker CLI costs about 17 ms of process startup before it reaches the
+        Engine, and this runs four times a second per Machine for the length of a
+        run; that load falls on the very Engines the suites are being timed
+        against. The questions asked are unchanged and the endpoint is the one the
+        Docker context names. This is the harness's own observation, never
+        scenario evidence: every contract behaviour goes through the CLI.
+        """
+        if self.finished.is_set():
+            raise MonitorStopped()
+        descriptor = row["descriptor"]
+        probe = self.probe_for(descriptor)
+        require(probe.info().get("ID") == descriptor["engine_id"], "sentinel Engine changed")
+        item = probe.container(row["container_id"])
         require(item["Id"] == row["container_id"] and item["Image"] == row["image_id"] and item["State"]["Running"] and
                 item["State"]["StartedAt"] == row["started_at"] and item["RestartCount"] == 0 and
                 item["Config"]["Labels"][LABEL] == row["token"], "sentinel stopped/restarted/replaced")
-        raw, stderr, _ = self.command(descriptor, ["exec", row["container_id"], "/bin/cat", "/sentinel"])
-        require(raw == (row["token"] + "\n").encode() and not stderr, "host-written sentinel changed")
+        raw = probe.exec_stdout(row["container_id"], ["/bin/cat", "/sentinel"])
+        require(raw == (row["token"] + "\n").encode(), "host-written sentinel changed")
         self.samples.append({"context": descriptor["name"], "unix_ns": time.time_ns(), "container_id": row["container_id"]})
 
     def loop(self):
@@ -1078,6 +1104,8 @@ class SentinelMonitor:
             self.first.set()
 
     def start(self):
+        for row in self.rows:
+            self.route_check(row)
         self.thread.start()
         require(self.first.wait(45), "initial sibling observation deadline exceeded")
         self.check()
@@ -1113,6 +1141,11 @@ class SentinelMonitor:
         self.finished.set()
         self.thread.join(timeout=40)
         require(not self.thread.is_alive(), "monitor did not positively terminate; no cleanup allowed")
+        for probe in self.probes.values():
+            probe.close()
+        if not self.errors:
+            for row in self.rows:
+                self.route_check(row)
         startup.document(self.output / "samples.json", self.summary())
         require(not self.errors, "sibling liveness failed: " + repr(self.errors))
 
