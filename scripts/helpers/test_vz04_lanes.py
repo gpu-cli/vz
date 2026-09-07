@@ -63,12 +63,15 @@ class LaneTests(unittest.TestCase):
         self.assertIn("--output-dir", sandbox)
 
     def test_stub_script_writes_valid_result_and_exits_3(self):
+        """The native-macOS lane is still a stub: it must account for itself rather
+        than be absent. The topology lane is a real lane and is covered by
+        `test_developer_environment_e2e`."""
         release = fixtures.build_fake_release_dir(self.root / "release")
         try:
             evidence = self.root / "evidence"
             evidence.mkdir()
-            script = common.REPO_ROOT / "scripts/run-developer-environment-e2e.sh"
-            argv = lanes.lane_argv(self.lanes["topology"], lanes.LaneContext(
+            script = common.REPO_ROOT / "scripts/run-macos-developer-environment-e2e.sh"
+            argv = lanes.lane_argv(self.lanes["native-macos"], lanes.LaneContext(
                 run_id="gate-test-run-1", release_dir=release, release_dir_sha256=common.tree_digest(release), state_root=self.root / "state",
                 contract_path=common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"], contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST,
                 fixture_sha256=DIGEST, clients={}), "clean-provision", evidence, None)
@@ -76,8 +79,9 @@ class LaneTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 3, completed.stderr.decode())
             result = common.load_json(evidence / "lane-result.json")
             self.assertEqual(schema.validate("lane-result", result), [])
-            self.assertEqual((result["lane"], result["failure"]["reason"], result["failure"]["exit_code"]), ("topology", "not_implemented", 3))
-            self.assertEqual(result["entry_point"]["path"], "scripts/run-developer-environment-e2e.sh")
+            self.assertEqual((result["lane"], result["failure"]["reason"], result["failure"]["exit_code"]),
+                             ("native-macos", "not_implemented", 3))
+            self.assertEqual(result["entry_point"]["path"], "scripts/run-macos-developer-environment-e2e.sh")
             rejected = subprocess.run([str(script), "--suite", "lifecycle"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False)
             self.assertEqual(rejected.returncode, 2)
         finally:

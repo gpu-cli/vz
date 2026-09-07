@@ -24,6 +24,31 @@ FULL_CLOSURE_GATE_SELECTED=false
 SUITE_TOKENS=()
 SCENARIO_TOKENS=()
 RUN_ARGS=("--ignored" "--nocapture" "--test-threads=1")
+ORIGINAL_ARGV=("$@")
+
+# vz 0.4 gate lane argv (docs/vz-0.4-release-gate.md). Every value is recorded
+# in run-info.txt and lane-result.json; none is silently ignored.
+LANE_RUN_ID=""
+LANE_PHASE=""
+LANE_RELEASE_DIR=""
+LANE_EVIDENCE_DIR=""
+LANE_STATE_ROOT=""
+LANE_CONTRACT=""
+LANE_CANDIDATE_TUPLE=""
+LANE_FIXTURE_SHA256=""
+LANE_HANDOFF=""
+LANE_DOCKER=""
+LANE_COMPOSE_PLUGIN=""
+LANE_BUILDX_PLUGIN=""
+LANE_RESULT_HELPER="$SCRIPT_DIR/helpers/sandbox_lane_result.py"
+# Progress marker consumed by the lane-result writer to type failures:
+# arguments|lane-arguments -> input_rejected, preflight|provision -> prerequisite,
+# suites (no summary) -> crash, summary -> passed/assertion.
+LANE_STAGE="arguments"
+LANE_INTERRUPTED=""
+LANE_RESULT_WRITTEN=false
+LANE_RESULT_SUPPRESSED=false
+RUN_DIR=""
 
 usage() {
     cat <<'USAGE'
@@ -58,6 +83,24 @@ Options:
   -h, --help                  Show help
   -- <args...>                Override rust test binary args (default is
                               --ignored --nocapture --test-threads=1)
+
+vz 0.4 release-gate lane options (all recorded; see docs/vz-0.4-release-gate.md):
+  --run-id <id>               Gate run id ([a-z0-9][a-z0-9-]{7,63})
+  --phase <phase>             Lane phase; this lane runs only clean-provision
+  --release-dir <dir>         Release candidate directory (must hold release-manifest.json)
+  --evidence-dir <dir>        Where lane-result.json and copied evidence are written
+                              (default: the timestamped run directory)
+  --state-root <dir>          Gate state root (recorded)
+  --contract <file>           Frozen e2e contract (digest recorded)
+  --candidate-tuple <sha256>  Candidate tuple digest (recorded)
+  --fixture-sha256 <sha256>   Fixture tree digest (recorded)
+  --handoff <none>            State handoff; this lane consumes none
+  --docker <path|none>        Docker CLI path (recorded, unused by this lane)
+  --compose-plugin <path|none>
+  --buildx-plugin <path|none>
+
+Every run writes a native vz-0.4 lane-result.json (schemas/vz-0.4-lane-result.schema.json)
+beside summary.txt, including failed and interrupted runs.
 
 Environment:
   VZ_SKIP_KERNEL_CHECK=1      Skip ~/.vz/linux preflight check
@@ -294,10 +337,120 @@ scenario_test_filter() {
     esac
 }
 
+# Write the native lane result. Runs at the end of the summary writer and from
+# the EXIT trap on every other path; the helper refuses to overwrite an existing
+# lane-result.json, so at most one document is produced per destination.
+write_lane_result() {
+    local exit_code="$1"
+    local helper_args=(
+        "--repo-root" "$REPO_ROOT"
+        "--exit-code" "$exit_code"
+        "--stage" "$LANE_STAGE"
+    )
+    [[ -n "$LANE_INTERRUPTED" ]] && helper_args+=("--interrupted" "$LANE_INTERRUPTED")
+    [[ -n "$RUN_DIR" ]] && helper_args+=("--run-dir" "$RUN_DIR")
+    [[ -n "$LANE_EVIDENCE_DIR" ]] && helper_args+=("--evidence-dir" "$LANE_EVIDENCE_DIR")
+    [[ -n "$LANE_RUN_ID" ]] && helper_args+=("--run-id" "$LANE_RUN_ID")
+    [[ -n "$LANE_PHASE" ]] && helper_args+=("--phase" "$LANE_PHASE")
+    [[ -n "$LANE_RELEASE_DIR" ]] && helper_args+=("--release-dir" "$LANE_RELEASE_DIR")
+    [[ -n "$LANE_STATE_ROOT" ]] && helper_args+=("--state-root" "$LANE_STATE_ROOT")
+    [[ -n "$LANE_CONTRACT" ]] && helper_args+=("--contract" "$LANE_CONTRACT")
+    [[ -n "$LANE_CANDIDATE_TUPLE" ]] && helper_args+=("--candidate-tuple" "$LANE_CANDIDATE_TUPLE")
+    [[ -n "$LANE_FIXTURE_SHA256" ]] && helper_args+=("--fixture-sha256" "$LANE_FIXTURE_SHA256")
+    [[ -n "$LANE_HANDOFF" ]] && helper_args+=("--handoff" "$LANE_HANDOFF")
+    [[ -n "$LANE_DOCKER" ]] && helper_args+=("--docker" "$LANE_DOCKER")
+    [[ -n "$LANE_COMPOSE_PLUGIN" ]] && helper_args+=("--compose-plugin" "$LANE_COMPOSE_PLUGIN")
+    [[ -n "$LANE_BUILDX_PLUGIN" ]] && helper_args+=("--buildx-plugin" "$LANE_BUILDX_PLUGIN")
+    if [[ -z "$RUN_DIR" && -z "$LANE_EVIDENCE_DIR" ]]; then
+        echo "warn: no run or evidence directory exists yet; lane-result.json not written" >&2
+        return 1
+    fi
+    local written
+    if written="$(python3 "$LANE_RESULT_HELPER" "${helper_args[@]}" -- "${ORIGINAL_ARGV[@]}")"; then
+        LANE_RESULT_WRITTEN=true
+        echo "==> lane result: $written"
+        return 0
+    fi
+    echo "error: sandbox lane result writer failed" >&2
+    return 1
+}
+
+on_exit() {
+    local exit_code=$?
+    trap - EXIT
+    if [[ "$LANE_RESULT_SUPPRESSED" == "true" || "$LANE_RESULT_WRITTEN" == "true" ]]; then
+        exit "$exit_code"
+    fi
+    # Never mask the original exit status; a writer failure is reported on stderr.
+    write_lane_result "$exit_code" || true
+    exit "$exit_code"
+}
+
+on_signal() {
+    local signal="$1"
+    local exit_code="$2"
+    LANE_INTERRUPTED="$signal"
+    echo "error: interrupted by $signal during $LANE_STAGE" >&2
+    exit "$exit_code"
+}
+
+trap on_exit EXIT
+trap 'on_signal SIGINT 130' INT
+trap 'on_signal SIGTERM 143' TERM
+trap 'on_signal SIGHUP 129' HUP
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --profile)
             PROFILE="${2:-}"
+            shift 2
+            ;;
+        --run-id)
+            LANE_RUN_ID="${2:-}"
+            shift 2
+            ;;
+        --phase)
+            LANE_PHASE="${2:-}"
+            shift 2
+            ;;
+        --release-dir)
+            LANE_RELEASE_DIR="${2:-}"
+            shift 2
+            ;;
+        --evidence-dir)
+            LANE_EVIDENCE_DIR="${2:-}"
+            shift 2
+            ;;
+        --state-root)
+            LANE_STATE_ROOT="${2:-}"
+            shift 2
+            ;;
+        --contract)
+            LANE_CONTRACT="${2:-}"
+            shift 2
+            ;;
+        --candidate-tuple)
+            LANE_CANDIDATE_TUPLE="${2:-}"
+            shift 2
+            ;;
+        --fixture-sha256)
+            LANE_FIXTURE_SHA256="${2:-}"
+            shift 2
+            ;;
+        --handoff)
+            LANE_HANDOFF="${2:-}"
+            shift 2
+            ;;
+        --docker)
+            LANE_DOCKER="${2:-}"
+            shift 2
+            ;;
+        --compose-plugin)
+            LANE_COMPOSE_PLUGIN="${2:-}"
+            shift 2
+            ;;
+        --buildx-plugin)
+            LANE_BUILDX_PLUGIN="${2:-}"
             shift 2
             ;;
         --suite)
@@ -317,6 +470,7 @@ while [[ $# -gt 0 ]]; do
             shift
             ;;
         -h|--help)
+            LANE_RESULT_SUPPRESSED=true
             usage
             exit 0
             ;;
@@ -335,6 +489,41 @@ if [[ "$PROFILE" != "debug" && "$PROFILE" != "release" ]]; then
     err "--profile must be one of: debug, release"
 fi
 
+# Gate lane arguments are validated before any host state is touched; a
+# rejection here becomes failure.reason=input_rejected in lane-result.json.
+LANE_STAGE="lane-arguments"
+if [[ -n "$LANE_RUN_ID" && ! "$LANE_RUN_ID" =~ ^[a-z0-9][a-z0-9-]{7,63}$ ]]; then
+    err "--run-id must match [a-z0-9][a-z0-9-]{7,63}: '$LANE_RUN_ID'"
+fi
+if [[ -n "$LANE_PHASE" && "$LANE_PHASE" != "clean-provision" ]]; then
+    err "the sandbox-vm lane runs only the clean-provision phase, got --phase '$LANE_PHASE'"
+fi
+if [[ -n "$LANE_HANDOFF" && "$LANE_HANDOFF" != "none" ]]; then
+    err "the sandbox-vm lane consumes no state handoff; --handoff must be 'none'"
+fi
+if [[ -n "$LANE_EVIDENCE_DIR" ]]; then
+    [[ "$LANE_EVIDENCE_DIR" == /* ]] || err "--evidence-dir must be an absolute path"
+    mkdir -p "$LANE_EVIDENCE_DIR"
+    LANE_EVIDENCE_DIR="$(cd "$LANE_EVIDENCE_DIR" && pwd)"
+fi
+if [[ -n "$LANE_RELEASE_DIR" ]]; then
+    [[ "$LANE_RELEASE_DIR" == /* && -d "$LANE_RELEASE_DIR" && ! -L "$LANE_RELEASE_DIR" ]] \
+        || err "--release-dir must be an absolute existing directory: '$LANE_RELEASE_DIR'"
+    [[ -f "$LANE_RELEASE_DIR/release-manifest.json" && ! -L "$LANE_RELEASE_DIR/release-manifest.json" ]] \
+        || err "--release-dir lacks a regular release-manifest.json: '$LANE_RELEASE_DIR'"
+fi
+if [[ -n "$LANE_CONTRACT" ]]; then
+    [[ "$LANE_CONTRACT" == /* && -f "$LANE_CONTRACT" && ! -L "$LANE_CONTRACT" ]] \
+        || err "--contract must be an absolute regular file: '$LANE_CONTRACT'"
+fi
+for lane_digest in "$LANE_CANDIDATE_TUPLE" "$LANE_FIXTURE_SHA256"; do
+    if [[ -n "$lane_digest" && ! "$lane_digest" =~ ^[0-9a-f]{64}$ ]]; then
+        err "--candidate-tuple and --fixture-sha256 must be 64 lowercase hex characters: '$lane_digest'"
+    fi
+done
+if [[ -n "$LANE_STATE_ROOT" && "$LANE_STATE_ROOT" != /* ]]; then
+    err "--state-root must be an absolute path"
+fi
 RESOLVED_SUITES=()
 RESOLVED_SCENARIOS=()
 
@@ -472,6 +661,9 @@ if [[ "$BUILDKIT_SELECTED" == "true" ]]; then
     fi
 fi
 
+# Host preflight begins: failures from here to the run loop are prerequisites.
+LANE_STAGE="preflight"
+
 if [[ "$(uname -s)" != "Darwin" ]]; then
     err "VM E2E suites require macOS"
 fi
@@ -510,6 +702,11 @@ if ! mkdir "$RUN_DIR" 2>/dev/null; then
 fi
 RUN_NAME="$(basename "$RUN_DIR")"
 ln -sfn "$RUN_NAME" "$OUTPUT_ROOT/latest"
+# One `label<TAB>pid<TAB>argv0` row per test-binary start; lane-result.json
+# derives process_starts from it.
+PROCESS_STARTS_RECORD="$RUN_DIR/process-starts.tsv"
+: > "$PROCESS_STARTS_RECORD"
+LANE_STAGE="provision"
 BUILDKIT_RUNTIME_INVENTORY_EVIDENCE="$RUN_DIR/buildkit-runtime-inventory.txt"
 CONTAINER_ID_OWNERSHIP_EVIDENCE="$RUN_DIR/container-id-ownership.json"
 CONTAINER_ID_OWNERSHIP_SHA256="$RUN_DIR/container-id-ownership.json.sha256"
@@ -3283,8 +3480,14 @@ run_and_log() {
 
     echo "running [$label/$suite]: $binary ${args[*]}"
 
+    # The pipeline group execs the test binary, so $BASHPID recorded before the
+    # exec is the binary's own PID (env execs it in place as well).
+    LANE_STAGE="suites"
     set +e
-    env "${cmd_env[@]}" "$binary" "${args[@]}" 2>&1 | tee "$log_file"
+    {
+        printf '%s\t%s\t%s\n' "$label" "$BASHPID" "$binary" >> "$PROCESS_STARTS_RECORD"
+        exec env "${cmd_env[@]}" "$binary" "${args[@]}"
+    } 2>&1 | tee "$log_file"
     local pipeline_status=("${PIPESTATUS[@]}")
     local status="${pipeline_status[0]}"
     local tee_status="${pipeline_status[1]}"
@@ -3612,6 +3815,19 @@ echo "==> output directory: $RUN_DIR"
     echo "suites=${RESOLVED_SUITES[*]}"
     echo "scenarios=${RESOLVED_SCENARIOS[*]:-none}"
     echo "run_args=${RUN_ARGS[*]}"
+    echo "lane_run_id=${LANE_RUN_ID:-none}"
+    echo "lane_phase=${LANE_PHASE:-clean-provision}"
+    echo "lane_release_dir=${LANE_RELEASE_DIR:-none}"
+    echo "lane_evidence_dir=${LANE_EVIDENCE_DIR:-$RUN_DIR}"
+    echo "lane_state_root=${LANE_STATE_ROOT:-none}"
+    echo "lane_contract=${LANE_CONTRACT:-none}"
+    echo "lane_candidate_tuple=${LANE_CANDIDATE_TUPLE:-none}"
+    echo "lane_fixture_sha256=${LANE_FIXTURE_SHA256:-none}"
+    echo "lane_handoff=${LANE_HANDOFF:-none}"
+    echo "lane_docker=${LANE_DOCKER:-none}"
+    echo "lane_compose_plugin=${LANE_COMPOSE_PLUGIN:-none}"
+    echo "lane_buildx_plugin=${LANE_BUILDX_PLUGIN:-none}"
+    echo "process_starts_record=$PROCESS_STARTS_RECORD"
     echo "guest_agent_build_tool=$GUEST_AGENT_BUILD_TOOL"
     echo "developer_initramfs_sha256=$DEVELOPER_INITRAMFS_SHA256"
     echo "container_initramfs_sha256=$CONTAINER_INITRAMFS_SHA256"
@@ -3733,6 +3949,9 @@ run_stack_crash_reopen_companion() {
 }
 
 for suite in "${RESOLVED_SUITES[@]}"; do
+    # Building and signing the suite's test binaries is provisioning; run_and_log
+    # flips the stage to "suites" when a binary actually starts.
+    LANE_STAGE="provision"
     package="$(suite_package "$suite")" || err "unknown suite '$suite'"
     test_name="$(suite_test_name "$suite")" || err "unknown suite '$suite'"
     if [[ "$suite" == "stack" ]] && { [[ ${#RESOLVED_SCENARIOS[@]} -eq 0 ]] \
@@ -4076,7 +4295,16 @@ action_summary="$RUN_DIR/summary.txt"
     echo "machine_runtime_registry_validated=$MACHINE_REGISTRY_EVIDENCE_VALIDATED"
 } > "$action_summary"
 
+# The native lane result is written from the summary facts; a writer failure is
+# itself a lane failure because the gate would otherwise see no result.
+LANE_STAGE="summary"
+lane_exit_code=0
 if [[ ${#FAILED[@]} -gt 0 ]]; then
+    lane_exit_code=1
+fi
+write_lane_result "$lane_exit_code" || err "unable to write lane-result.json for $RUN_DIR"
+
+if [[ $lane_exit_code -ne 0 ]]; then
     exit 1
 fi
 

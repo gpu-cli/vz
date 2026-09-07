@@ -114,7 +114,7 @@
       "phases": ["clean-provision"],
       "argv_contract": "legacy_sandbox",
       "result_adapter": "sandbox_summary_txt",
-      "native_result_required": false
+      "native_result_required": true
     },
     {
       "name": "topology",

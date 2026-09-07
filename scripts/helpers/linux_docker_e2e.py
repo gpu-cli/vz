@@ -21,6 +21,7 @@ import uuid
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
+import linux_docker_lane_result as lane_result
 import linux_docker_image_input as image_input
 
 SCOPE = "DEV_INSTALLED_LINUX_COMPOSE_NOT_RELEASE_CERTIFICATION"
@@ -43,13 +44,18 @@ require = driver.require
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
-             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux", "registry-archive", "registry-layout")
+             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux", "registry-archive", "registry-layout",
+             *lane_result.GATE_OPTIONS)
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
     parser.add_argument("--suite", required=True, choices=(*SUITES, "all"))
+    # Accepted for every suite: the aggregate gate passes its identity through
+    # argv. They select no behaviour here beyond emitting a lane result.
+    for name in lane_result.GATE_OPTIONS:
+        parser.add_argument("--" + name)
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -1071,11 +1077,36 @@ def run(info):
 
 
 def main(argv):
+    """Standalone DEV runs behave exactly as before; a gate invocation (identified
+    by --run-id, --phase and --candidate-tuple together) additionally writes one
+    schema-valid lane result beside the harness evidence, including for the
+    `--suite all` rejection, so the aggregate accounting is never silent."""
+    ctx = None
     try:
-        return run(preflight(arguments(argv)))
+        ctx = lane_result.gate_context(argv)
+        if ctx is not None:
+            ctx.validate()
     except (Exception, KeyboardInterrupt) as error:
         print(f"error: {error}", file=sys.stderr)
         return 2
+    try:
+        args = arguments(argv)
+        if ctx is not None:
+            # The gate owns the lane directory; the harness gets a fresh child.
+            args.evidence_dir = str(ctx.harness_dir())
+        info = preflight(args)
+        code = run(info)
+    except (Exception, KeyboardInterrupt) as error:
+        print(f"error: {error}", file=sys.stderr)
+        if ctx is not None:
+            reason = "not_implemented" if ctx.suite == "all" else "input_rejected"
+            lane_result.write(ctx, lane_result.failed(ctx, reason, f"{type(error).__name__}: {error}", 2))
+        return 2
+    if ctx is not None:
+        harness = ctx.harness_dir()
+        result = lane_result.load_result(harness)
+        lane_result.write(ctx, lane_result.from_run(ctx, result, info, harness, code))
+    return code
 
 
 if __name__ == "__main__":

@@ -4,9 +4,10 @@ No `skipped` state exists. A lane that does not exist, refuses `--suite all`,
 crashes, or writes no schema-valid result yields `outcome: failed` with a
 typed `failure.reason`; every scenario assigned to it becomes MISSING.
 
-The sandbox lane is translated from its `summary.txt` (`passed=`/`failed=`)
-and `run-info.txt` until it emits a native result (`native_result_required`
-flips that to a hard requirement).
+The sandbox lane writes a native result through
+`scripts/helpers/sandbox_lane_result.py`; the contract marks it
+`native_result_required`, so a missing result is a `crash` failure. The
+`summary.txt` translator survives only for a contract that clears that flag.
 
 CLI (used by the failing lane stubs):
   python vz04_lanes.py stub --lane <name> --entry-point <repo-relative> <lane argv...>
@@ -59,15 +60,21 @@ def entry_point_record(repo_root: Path, lane: dict, argv: list) -> dict:
 
 
 def lane_argv(lane: dict, ctx: LaneContext, phase: str, evidence_dir: Path, handoff) -> list:
+    """The lane's contract argv plus the gate identity options every lane receives.
+
+    `legacy_sandbox` additionally names the harness's own artifact root
+    (`--output-dir`), where `run-sandbox-vm-e2e.sh` keeps its timestamped run
+    directory; its native `lane-result.json` is written into `--evidence-dir`.
+    """
     argv = list(lane["argv"])
-    if lane["argv_contract"] == "legacy_sandbox":
-        return argv + ["--output-dir", str(ctx.state_root / "sandbox-vm-output")]
     argv += ["--run-id", ctx.run_id, "--phase", phase, "--release-dir", str(ctx.release_dir),
              "--evidence-dir", str(evidence_dir), "--state-root", str(ctx.state_root),
              "--contract", str(ctx.contract_path), "--candidate-tuple", ctx.candidate_tuple_sha256,
              "--fixture-sha256", ctx.fixture_sha256, "--handoff", handoff if handoff else "none"]
     for key in ("docker", "compose_plugin", "buildx_plugin"):
         argv += ["--" + key.replace("_", "-"), ctx.clients.get(key) or "none"]
+    if lane["argv_contract"] == "legacy_sandbox":
+        argv += ["--output-dir", str(ctx.state_root / "sandbox-vm-output")]
     return argv
 
 
@@ -173,17 +180,6 @@ def invoke_lane(lane: dict, phase: str, ctx: LaneContext, evidence_dir: Path, ha
             exit_code = None
     document(evidence_dir / "invocation.json", {"argv": [str(script), *argv], "started_unix_ns": started, "ended_unix_ns": now_ns(),
                                                 "exit_code": exit_code, "cwd": str(ctx.repo_root)})
-    if lane["result_adapter"] == "sandbox_summary_txt":
-        output_root = ctx.state_root / "sandbox-vm-output"
-        runs = sorted(p for p in output_root.iterdir() if p.is_dir() and not p.is_symlink()) if output_root.is_dir() else []
-        if not runs:
-            result = failed_result(lane["name"], phase, ctx, entry, "crash", "sandbox lane produced no run directory", exit_code)
-        else:
-            result = translate_sandbox_summary(lane["name"], phase, ctx, entry, runs[-1], exit_code if exit_code is not None else -1, evidence_dir)
-            if exit_code is None:
-                result["outcome"], result["failure"] = "failed", {"reason": "timeout", "detail": "sandbox lane exceeded timeout", "exit_code": None}
-        document(result_path, result)
-        return result
     if exit_code is None:
         result = failed_result(lane["name"], phase, ctx, entry, "timeout", f"lane exceeded {timeout_seconds}s", None)
         if result_path.exists():
@@ -191,6 +187,16 @@ def invoke_lane(lane: dict, phase: str, ctx: LaneContext, evidence_dir: Path, ha
         document(result_path, result)
         return result
     if not result_path.is_file():
+        if lane["result_adapter"] == "sandbox_summary_txt" and not lane["native_result_required"]:
+            # Legacy translation, only while the contract still tolerates a lane without a native result.
+            output_root = ctx.state_root / "sandbox-vm-output"
+            runs = sorted(p for p in output_root.iterdir() if p.is_dir() and not p.is_symlink()) if output_root.is_dir() else []
+            if not runs:
+                result = failed_result(lane["name"], phase, ctx, entry, "crash", "sandbox lane produced no run directory", exit_code)
+            else:
+                result = translate_sandbox_summary(lane["name"], phase, ctx, entry, runs[-1], exit_code, evidence_dir)
+            document(result_path, result)
+            return result
         result = failed_result(lane["name"], phase, ctx, entry, "crash", "lane wrote no lane-result.json", exit_code)
         document(result_path, result)
         return result
