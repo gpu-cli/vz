@@ -62,7 +62,6 @@ import os
 from pathlib import Path
 import re
 import tarfile
-import threading
 import time
 import uuid
 
@@ -309,12 +308,10 @@ def phase_monitor(harness, rows, output):
     class PhaseMonitor(gate.SentinelMonitor):
         def __init__(self, harness, rows, output):
             require(rows, 'phase monitor needs at least one sentinel')
-            self.harness, self.rows = harness, rows
-            self.output = startup.private(output)
-            self.record = startup.Recorder(self.output, harness.env)
-            self.finished, self.first = threading.Event(), threading.Event()
-            self.samples, self.errors = [], []
-            self.thread = threading.Thread(target=self.loop, name='vz-recovery-liveness', daemon=False)
+            # Everything this monitor differs in is a parameter. Rebuilding the
+            # base's fields here is what made it miss the probe cache and then
+            # the exclusion set as each was added.
+            super().__init__(harness, rows, output=output, thread_name='vz-recovery-liveness')
     return PhaseMonitor(harness, rows, output)
 
 

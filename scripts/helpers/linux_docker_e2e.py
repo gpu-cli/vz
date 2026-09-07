@@ -1087,9 +1087,16 @@ class ComposeHarness(startup.Harness):
 
 class SentinelMonitor:
     """Independent, bounded raw observations; no retries, restarts or repairs."""
-    def __init__(self, harness, rows):
+    def __init__(self, harness, rows, *, output=None, thread_name="vz-compose-sibling-liveness"):
+        # Subclasses vary only in where their evidence goes and what their
+        # thread is called, and they must reach this initializer: a subclass
+        # that rebuilt these fields itself silently missed every field added
+        # here afterwards, which is how the recovery monitor lost first the
+        # probe cache and then the exclusion set.
         self.harness, self.rows = harness, rows
-        self.output = startup.private(harness.evidence / "sibling-liveness")
+        self.output = startup.private(
+            output if output is not None else harness.evidence / "sibling-liveness"
+        )
         self.record = startup.Recorder(self.output, harness.env)
         self.finished, self.first = threading.Event(), threading.Event()
         self.samples, self.errors = [], []
@@ -1102,7 +1109,7 @@ class SentinelMonitor:
         # frozenset is one attribute store, which the sampling thread reads
         # atomically; no lock is needed and none is taken on the sampling path.
         self.excluded = frozenset()
-        self.thread = threading.Thread(target=self.loop, name="vz-compose-sibling-liveness", daemon=False)
+        self.thread = threading.Thread(target=self.loop, name=thread_name, daemon=False)
 
     @contextlib.contextmanager
     def excluding(self, *names):
@@ -1147,15 +1154,13 @@ class SentinelMonitor:
         require(json.loads(raw)[0]["Endpoints"]["docker"]["Host"] == descriptor["endpoint"], "sentinel context rerouted")
 
     def probe_for(self, descriptor):
-        # A subclass may build its own state, so the probe cache is created on
-        # demand rather than assumed to exist.
-        probes = getattr(self, "probes", None)
-        if probes is None:
-            probes = self.probes = {}
-        probe = probes.get(descriptor["name"])
+        # Every monitor runs `__init__`, so the cache exists. It is not created
+        # on demand here: a second cache built lazily would be a monitor whose
+        # probes nothing closes.
+        probe = self.probes.get(descriptor["name"])
         if probe is None:
             probe = engine_probe.EngineProbe(descriptor["endpoint"], timeout=8)
-            probes[descriptor["name"]] = probe
+            self.probes[descriptor["name"]] = probe
         return probe
 
     def sample(self, row):

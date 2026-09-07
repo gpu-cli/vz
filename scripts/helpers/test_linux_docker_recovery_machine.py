@@ -706,3 +706,47 @@ class Machine(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class PhaseMonitorTests(unittest.TestCase):
+    """The recovery monitor must be the composed monitor, differing only where
+    it says it differs.
+
+    It used to rebuild the base's fields itself, so every field added to
+    `SentinelMonitor` afterwards was silently missing from it: first the probe
+    cache, then the exclusion set the composed run uses to keep a Machine's
+    runtime-audit journal for its own suite. Both surfaced only in a full
+    installed candidate, one suite from the end of an hour-long run.
+    """
+
+    def setUp(self):
+        import linux_docker_e2e as gate
+        self.gate = gate
+        root = tempfile.TemporaryDirectory(dir='/private/tmp')
+        self.addCleanup(root.cleanup)
+        self.root = Path(root.name)
+        self.rows = [{'descriptor': {'name': 'context-0'}}]
+        harness = SimpleNamespace(env={'PATH': '/usr/bin'}, evidence=self.root / 'composed')
+        (self.root / 'composed').mkdir()
+        self.harness = harness
+        self.monitor = subject.phase_monitor(harness, self.rows, self.root / 'recovery-liveness')
+
+    def test_the_recovery_monitor_carries_every_field_the_composed_one_does(self):
+        reference = self.gate.SentinelMonitor(self.harness, self.rows)
+        missing = sorted(set(vars(reference)) - set(vars(self.monitor)))
+        self.assertEqual(missing, [], 'recovery monitor is missing base state')
+        # The two things it does differ in.
+        self.assertEqual(self.monitor.thread.name, 'vz-recovery-liveness')
+        self.assertEqual(reference.thread.name, 'vz-compose-sibling-liveness')
+        self.assertNotEqual(self.monitor.output, reference.output)
+
+    def test_the_recovery_monitor_can_exclude_and_sample(self):
+        self.assertEqual(self.monitor.excluded, frozenset())
+        with self.monitor.excluding('context-0'):
+            self.assertEqual(self.monitor.excluded, frozenset({'context-0'}))
+        self.assertEqual(self.monitor.excluded, frozenset())
+        self.assertEqual(self.monitor.probes, {})
+
+    def test_a_phase_monitor_needs_at_least_one_sentinel(self):
+        with self.assertRaisesRegex(Exception, 'at least one sentinel'):
+            subject.phase_monitor(self.harness, [], self.root / 'empty-liveness')
