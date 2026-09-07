@@ -15,10 +15,12 @@ import vz04_schema as schema  # noqa: E402
 DIGEST = "a" * 64
 
 
-def _ctx(root):
+def _ctx(root, **overrides):
+    options = dict(tmux="/usr/bin/true")
+    options.update(overrides)
     return lanes.LaneContext(run_id="gate-test-run-1", release_dir=root, release_dir_sha256=DIGEST, state_root=root / "state",
                              contract_path=root / "c.json", contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST, fixture_sha256=DIGEST,
-                             clients={"docker": None, "compose_plugin": None, "buildx_plugin": None})
+                             clients={"docker": None, "compose_plugin": None, "buildx_plugin": None}, **options)
 
 
 def _passed(lane, phase, ids, ctx):
@@ -155,6 +157,44 @@ class LaneTests(unittest.TestCase):
                                    "--buildkit-archive", "--release-dir"):
                 self.assertFalse(any(release_option in text for text in rejections),
                                  f"{release_option} still refused: {rejections}")
+        finally:
+            fixtures.make_writable(release)
+
+    def test_the_composed_docker_lane_requires_the_terminal_it_drives(self):
+        """The lifecycle suite inside a composed run drives tmux, so the gate
+        resolves it like the Docker clients and passes the path. A contract
+        naming a host path would be wrong; a lane silently running without it
+        would be worse."""
+        release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
+        try:
+            ctx = _ctx(self.root, tmux="/usr/bin/true")
+            ctx.release_dir = release
+            argv = lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+            self.assertEqual(dict(zip(argv, argv[1:]))["--tmux"], "/usr/bin/true")
+            # Other lanes neither need it nor receive it.
+            topology = lanes.lane_argv(self.lanes["topology"], ctx, "clean-provision", self.root / "e2", None)
+            self.assertNotIn("--tmux", topology)
+            without = _ctx(self.root, tmux=None)
+            without.release_dir = release
+            with self.assertRaisesRegex(Exception, "requires --tmux"):
+                lanes.lane_argv(self.lanes["linux-docker"], without, "clean-provision", self.root / "e3", None)
+        finally:
+            fixtures.make_writable(release)
+
+    def test_a_dry_lane_still_substitutes_when_its_argv_cannot_be_built(self):
+        """A dry run substitutes the lane without starting it, so an argv it
+        could not have built must not change that verdict — it is recorded as
+        the reason and the lane stays `not_implemented`."""
+        release = fixtures.build_fake_release_dir(self.root / "release")
+        try:
+            ctx = _ctx(self.root, tmux=None)
+            ctx.release_dir = release
+            directory = self.root / "linux-docker" / "dry"
+            result = lanes.invoke_lane(self.lanes["linux-docker"], "clean-provision", ctx, directory, dry=True)
+            self.assertEqual(result["failure"]["reason"], "not_implemented")
+            self.assertIn("argv could not be built", result["failure"]["detail"])
+            self.assertEqual(result["entry_point"]["argv"], [])
+            self.assertEqual(schema.validate("lane-result", result), [])
         finally:
             fixtures.make_writable(release)
 

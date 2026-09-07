@@ -1,7 +1,7 @@
 """Aggregate vz 0.4 release-gate orchestrator.
 
     vz04_gate.py --suite all --release-dir <dir> --run-id <id> [--evidence-root]
-                 [--state-root] [--docker] [--compose-plugin] [--buildx-plugin]
+                 [--state-root] [--docker] [--compose-plugin] [--buildx-plugin] [--tmux]
                  [--linux-docker-context] [--sleep-wake-ack-file] [--dry-lanes]
 
 Only `--suite all` is accepted; anything else exits 2 before touching state.
@@ -67,6 +67,7 @@ def parse_args(argv):
     parser.add_argument("--compose-plugin", default=None)
     parser.add_argument("--buildx-plugin", default=None)
     parser.add_argument("--linux-docker-context", default=None)
+    parser.add_argument("--tmux", default=None)
     parser.add_argument("--sleep-wake-ack-file", default=None)
     parser.add_argument("--dry-lanes", action="store_true", help="DEV ONLY: substitute lanes with not_implemented results")
     return parser.parse_args(argv)
@@ -163,19 +164,23 @@ def run(args) -> int:
     if args.dry_lanes:
         require(release["signing_class"] != "developer-id-notarized", "--dry-lanes is refused for developer-id-notarized releases")
         overrides.append("dry_lanes")
-    clients = {}
-    for key in ("docker", "compose_plugin", "buildx_plugin"):
-        value = getattr(args, key)
+    def host_executable(name):
+        value = getattr(args, name)
         if value is None:
-            require(args.dry_lanes, f"--{key.replace('_', '-')} is required unless --dry-lanes")
-            clients[key] = None
-        else:
-            # Clients are invoked by the path given: OrbStack/Docker Desktop ship
-            # multi-call binaries dispatched by argv[0], so symlinked plugin paths
-            # are admitted as-is and the resolved target is recorded with its digest.
-            path = canonical_path(value, must_exist=False)
-            require(path.is_file() and os.access(path, os.X_OK), f"client is not an executable file: {path}")
-            clients[key] = str(path)
+            require(args.dry_lanes, f"--{name.replace('_', '-')} is required unless --dry-lanes")
+            return None
+        # Clients are invoked by the path given: OrbStack/Docker Desktop ship
+        # multi-call binaries dispatched by argv[0], so symlinked plugin paths
+        # are admitted as-is and the resolved target is recorded with its digest.
+        path = canonical_path(value, must_exist=False)
+        require(path.is_file() and os.access(path, os.X_OK), f"client is not an executable file: {path}")
+        return str(path)
+
+    clients = {key: host_executable(key) for key in ("docker", "compose_plugin", "buildx_plugin")}
+    # The terminal the composed Docker lane drives. Resolved the same way and on
+    # the same terms, but kept out of `clients`, which names Docker clients and
+    # is what the manifest's client facts are built from.
+    tmux = host_executable("tmux")
 
     contract = contract_module.load_contract(repo_root)
     docker = contract_module.load_docker_contract(repo_root)
@@ -246,7 +251,8 @@ def run(args) -> int:
         ctx = lanes.LaneContext(run_id=run_id, release_dir=release["dir"], release_dir_sha256=release["release_dir_sha256"], state_root=state_root,
                                 contract_path=repo_root / "config/vz-0.4-e2e-contract.json", contract_sha256=frozen["inputs"]["e2e_contract"]["sha256"],
                                 candidate_tuple_sha256=tuple_value["sha256"], fixture_sha256=frozen["digests"]["fixtures_tree_sha256"],
-                                clients=clients, repo_root=repo_root, linux_docker_context=args.linux_docker_context)
+                                clients=clients, repo_root=repo_root, linux_docker_context=args.linux_docker_context,
+                                tmux=tmux)
 
         def observer(phase, lane, lane_phase, result):
             reason = "" if result["failure"] is None else f" ({result['failure']['reason']})"

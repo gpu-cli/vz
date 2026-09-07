@@ -5,7 +5,8 @@
 # uv (no global/user-site install, system Python untouched).
 #
 #   scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <dir> --run-id <id> \
-#     --docker <path> --compose-plugin <path> --buildx-plugin <path> [--evidence-root <dir>] \
+#     --docker <path> --compose-plugin <path> --buildx-plugin <path> --tmux <path> \
+#     [--evidence-root <dir>] \
 #     [--state-root <dir>] [--linux-docker-context <name>] [--sleep-wake-ack-file <path>]
 #
 # Only --suite all is accepted. --dry-lanes is DEV ONLY (see docs/vz-0.4-release-gate.md):

@@ -39,7 +39,8 @@ class LaneContext:
     """Everything a lane receives through argv; never ambient environment."""
 
     def __init__(self, *, run_id, release_dir, release_dir_sha256, state_root, contract_path, contract_sha256,
-                 candidate_tuple_sha256, fixture_sha256, clients, repo_root=REPO_ROOT, linux_docker_context=None):
+                 candidate_tuple_sha256, fixture_sha256, clients, repo_root=REPO_ROOT, linux_docker_context=None,
+                 tmux=None):
         self.run_id = run_id
         self.release_dir = Path(release_dir)
         self.release_dir_sha256 = release_dir_sha256
@@ -51,6 +52,10 @@ class LaneContext:
         self.clients = clients
         self.repo_root = Path(repo_root)
         self.linux_docker_context = linux_docker_context
+        # The terminal the composed Docker lane's lifecycle suite drives. A host
+        # tool like the Docker clients, so the gate resolves it and passes the
+        # path rather than the contract naming one.
+        self.tmux = tmux
 
 
 def entry_point_record(repo_root: Path, lane: dict, argv: list) -> dict:
@@ -106,6 +111,8 @@ def lane_argv(lane: dict, ctx: LaneContext, phase: str, evidence_dir: Path, hand
         release_dir = components.pop("release-dir")
         for name, value in sorted(components.items()):
             extra += ["--" + name, str(value)]
+        require(ctx.tmux, "the composed Docker lane drives a terminal and requires --tmux")
+        extra += ["--tmux", str(ctx.tmux)]
     argv += ["--run-id", ctx.run_id, "--phase", phase, "--release-dir", str(release_dir),
              "--evidence-dir", str(evidence_dir), "--state-root", str(ctx.state_root),
              "--contract", str(ctx.contract_path), "--candidate-tuple", ctx.candidate_tuple_sha256,
@@ -195,20 +202,26 @@ def invoke_lane(lane: dict, phase: str, ctx: LaneContext, evidence_dir: Path, ha
     """
     evidence_dir.mkdir(parents=True, exist_ok=False)
     result_path = evidence_dir / "lane-result.json"
+    unbuildable = None
     try:
         argv = lane_argv(lane, ctx, phase, evidence_dir, handoff)
     except GateError as error:
-        # A lane whose argv depends on the candidate can be unbuildable, and a
-        # release candidate that cannot supply an input is a finding, not a
-        # crash. Account for it the way any other rejected input is accounted.
-        result = failed_result(lane["name"], phase, ctx, entry_point_record(ctx.repo_root, lane, []),
-                               "input_rejected", str(error), 2)
-        document(result_path, result)
-        return result
+        # A lane whose argv depends on the candidate or the host can be
+        # unbuildable, and that is a finding rather than a crash. A dry run is
+        # substituting this lane anyway, so it records why the command could
+        # not be built and stays `not_implemented`; a real run rejects it.
+        argv, unbuildable = [], str(error)
+        if not dry:
+            result = failed_result(lane["name"], phase, ctx, entry_point_record(ctx.repo_root, lane, []),
+                                   "input_rejected", unbuildable, 2)
+            document(result_path, result)
+            return result
     entry = entry_point_record(ctx.repo_root, lane, argv)
     if dry:
-        result = failed_result(lane["name"], phase, ctx, entry, "not_implemented",
-                               "dry-lanes developer substitution: lane not invoked", STUB_EXIT)
+        detail = "dry-lanes developer substitution: lane not invoked"
+        if unbuildable is not None:
+            detail += "; argv could not be built: " + unbuildable
+        result = failed_result(lane["name"], phase, ctx, entry, "not_implemented", detail, STUB_EXIT)
         document(result_path, result)
         return result
     script = ctx.repo_root / lane["entry_point"]

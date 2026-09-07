@@ -17,7 +17,7 @@ Implementation plan: [`RELEASE-GATE-PLAN.md`](../planning/developer-environments
 ```bash
 scripts/build-vz-0.4-release-candidate.sh --output <new dir> --version <x.y.z[-pre]>   # builder (separate doc)
 scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <dir> --run-id <id> \
-    --docker <path> --compose-plugin <path> --buildx-plugin <path> \
+    --docker <path> --compose-plugin <path> --buildx-plugin <path> --tmux <path> \
     [--evidence-root <dir>] [--state-root <dir>] [--linux-docker-context <name>] [--sleep-wake-ack-file <path>]
 scripts/validate-vz-0.4-evidence.sh .artifacts/vz-0.4-e2e/<run-id>/manifest.json
 ```
@@ -42,15 +42,20 @@ Lane entry points invoked by the gate, in contract order:
 `run-developer-environment-e2e.sh` and `run-macos-developer-environment-e2e.sh`
 are explicit failing stubs: they write a schema-valid lane result with
 `outcome: failed`, `failure.reason: not_implemented` and exit 3.
-`run-linux-docker-e2e.sh` runs `--suite all` when it is invoked directly, but
-the gate cannot invoke it: the argv below is everything a lane receives, and the
-harness additionally requires `--registry-archive`, `--registry-layout`,
-`--buildkit-archive`, `--ssh-packages`, `--release-version`,
-`--developer-bundle`, `--hardened-bundle` and `--tmux`. It therefore rejects the
-lane invocation, which the gate records as `input_rejected`/`not_implemented`
-(`vz-ao8`). Only `--dry-lanes` runs had exercised this path, and a dry lane
-substitutes its result without starting the process, so the rejection had never
-been observed. There is no `skipped` state anywhere.
+`run-linux-docker-e2e.sh` runs `--suite all` when it is invoked directly, and
+the gate could not invoke it at all: the argv below was everything a lane
+received, and the harness requires eight more options. Five are facts about the
+candidate — `--release-version`, `--developer-bundle`, `--hardened-bundle`,
+`--buildkit-archive`, and `--release-dir` pointing at its `bin/` — and the
+`linux_docker` argv contract now derives them from the candidate the gate was
+pointed at. `--tmux` is resolved by the gate like the Docker clients, because
+the composed lifecycle suite drives a terminal. The remaining three,
+`--registry-archive`, `--registry-layout` and `--ssh-packages`, are acquired
+inputs that nothing acquires yet, so the lane is still rejected and the gate
+still records `input_rejected` (`vz-ao8`). Only `--dry-lanes` runs had ever
+exercised this path, and a dry lane substitutes its result without starting the
+process, so the rejection had never been observed. There is no `skipped` state
+anywhere.
 
 Lanes receive everything through argv, never ambient environment: `--run-id`,
 `--phase`, `--release-dir`, `--evidence-dir`, `--state-root`, `--contract`,
