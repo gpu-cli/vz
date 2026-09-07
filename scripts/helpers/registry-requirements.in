@@ -1,0 +1,7 @@
+# Isolated installed-registry fixture tooling, not product runtime dependencies.
+cryptography==50.0.1
+bcrypt==5.0.0
+cffi==2.0.0
+pycparser==2.23
+typing_extensions==4.16.0
+jsonschema==4.23.0

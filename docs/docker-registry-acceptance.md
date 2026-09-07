@@ -6,6 +6,14 @@ cases are `docker.image.registry_login`, `docker.image.pull`, and
 passes for those scenarios. The installed registry dispatcher and full
 Docker-63/0.4 aggregate remain unfinished.
 
+The subsequent private-session checkpoint adds native TLS/private credential
+admission, guest setup/cleanup scripts, private command receipts, tiny-image and
+binary validators, and an unwired Session assembly. Its selected Python family
+passes 1,137 tests; no registry VM/Docker run has occurred. See the
+[continuation handoff](../planning/developer-environments/HANDOFF-registry-checkpoint.md)
+for the known TLS-log parsing issue, remaining integration, evidence boundaries,
+and exact resume instructions. The input-checkpoint results below are historical.
+
 ## Frozen public fixture
 
 `config/docker-registry-artifact-v3.1.1.json` pins the real Distribution 3.1.1

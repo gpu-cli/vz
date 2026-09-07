@@ -232,6 +232,16 @@ class PrivateStdinTests(unittest.TestCase):
             self.assertFalse(result.receipt['owned_process_reaped'])
             self.public_only(result)
 
+    def test_public_script_bound_only_argv_expanded(self):
+        private.Capture(['tool', 'x' * private.MAX_ARG], executable='/owned/tool', cwd='/owned', env={},
+            private_input=SECRET, expected_stdout=ACK, expected_stderr=b'')
+        for argv, env in ((['tool', 'x' * (private.MAX_ARG + 1)], {}),
+                          (['tool'], {'VALUE': 'x' * 4097}),
+                          (['tool'] + ['x' * private.MAX_ARG] * 4, {})):
+            with self.assertRaises(private.PrivateStdinError):
+                private.Capture(argv, executable='/owned/tool', cwd='/owned', env=env,
+                    private_input=SECRET, expected_stdout=ACK, expected_stderr=b'')
+
 
 if __name__ == '__main__':
     unittest.main()

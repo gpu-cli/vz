@@ -29,6 +29,7 @@ import linux_docker_interactive_capture as transport
 MAX_INPUT = 65536
 MAX_OUTPUT = 65536
 MAX_PUBLIC = 65536
+MAX_ARG = 16384
 
 
 class PrivateStdinError(ValueError):
@@ -91,7 +92,7 @@ class Capture:
                  expected_stderr, expected_exit=0, timeout_seconds=30, output_limit=MAX_OUTPUT):
         require(type(private_input) is bytes and 0 < len(private_input) <= MAX_INPUT, 'private_input_bounds')
         require(type(argv) is list and 0 < len(argv) <= 64 and
-                all(type(value) is str and value and '\0' not in value and len(value) <= 4096 for value in argv),
+                all(type(value) is str and value and '\0' not in value and len(value) <= MAX_ARG for value in argv),
                 'public_argv_shape')
         require(type(env) is dict and len(env) <= 64 and all(type(key) is str and type(value) is str and
                 re.fullmatch('[A-Za-z_][A-Za-z0-9_]*', key) and '\0' not in value and len(value) <= 4096
