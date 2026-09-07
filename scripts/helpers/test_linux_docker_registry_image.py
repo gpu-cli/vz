@@ -40,8 +40,17 @@ class ImageTests(unittest.TestCase):
         self.assertEqual(subject.contract(other)['expected'], self.expected)
 
     def test_actual_seed_export_and_remote_bytes(self):
-        proof = subject.validate_export(subject.seed(self.spec), spec=self.spec)
+        proof = subject.validate_export(subject.pulled_export(self.spec), spec=self.spec)
         self.assertTrue(proof)
+        # The seed (never pulled) lacks containerd's distribution-source annotation.
+        with self.assertRaises(ValueError): subject.validate_export(subject.seed(self.spec), spec=self.spec)
+        annotation = subject.distribution_source_annotation(self.spec)
+        self.assertEqual(annotation, {'containerd.io/distribution.source.' + self.spec['address']:
+                                      self.spec['repository'].split('/', 1)[1]})
+        for wrong in ({'containerd.io/distribution.source.' + self.spec['authority']: list(annotation.values())[0]},
+                      {list(annotation)[0]: 'foreign'}, {**annotation, 'extra': 'untrusted'}):
+            raw = subject.image.archive('subject', self.recipe['export_reference'], extra_annotations=wrong)
+            with self.assertRaises(ValueError): subject.validate_export(raw, spec=self.spec)
         blobs = self.blobs()
         proof = subject.validate_remote(**blobs)
         self.assertEqual(proof['manifest_digest'], self.expected['manifest_digest'])

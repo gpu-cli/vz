@@ -134,8 +134,18 @@ def _descriptor(row, media, expected, content, *, indexed=False):
 def validate(raw, *, expected_manifest_digest, expected_config_digest,
              expected_layer_digest, expected_diff_id, expected_reference,
              expected_payload_path, expected_payload_sha256, expected_payload_size,
-             expected_labels):
-    """Validate only source-selected archive bytes; expected identities come from caller."""
+             expected_labels, expected_extra_annotations=None):
+    """Validate only source-selected archive bytes; expected identities come from caller.
+
+    expected_extra_annotations is the exact additional index annotation set a caller
+    proves from its own source (e.g. containerd's distribution-source label after a
+    registry pull); the default admits only the two naming annotations.
+    """
+    extra = {} if expected_extra_annotations is None else expected_extra_annotations
+    require(type(extra) is dict and len(extra) <= 4 and all(
+        type(k) is str and type(v) is str and 0 < len(k) <= 256 and 0 < len(v) <= 256 and
+        k not in ('io.containerd.image.name', 'org.opencontainers.image.ref.name') for k, v in extra.items()),
+            'extra annotation expectation')
     identities = tuple(digest(item) for item in (expected_manifest_digest,
                        expected_config_digest, expected_layer_digest))
     require(len(set(identities)) == 3 and digest(expected_diff_id) == expected_layer_digest,
@@ -167,7 +177,7 @@ def validate(raw, *, expected_manifest_digest, expected_config_digest,
     desc = index['manifests'][0]
     _descriptor(desc, MANIFEST, identities[0], files[paths[0]], indexed=True)
     require(desc.get('annotations') == {'io.containerd.image.name': full,
-            'org.opencontainers.image.ref.name': tag}, 'index naming annotations')
+            'org.opencontainers.image.ref.name': tag, **extra}, 'index naming annotations')
     manifest = _json(files[paths[0]])
     fields(manifest, ('schemaVersion', 'mediaType', 'config', 'layers'))
     require(type(manifest['schemaVersion']) is int and manifest['schemaVersion'] == 2 and

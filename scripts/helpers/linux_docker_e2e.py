@@ -30,6 +30,8 @@ PARALLEL_SCOPE = "DEV_INSTALLED_LINUX_PARALLEL_BUILD_NOT_RELEASE_CERTIFICATION"
 SSH_SCOPE = "DEV_INSTALLED_LINUX_SSH_BUILD_NOT_RELEASE_CERTIFICATION"
 LIFECYCLE_SCOPE = "DEV_INSTALLED_LINUX_CONTAINER_LIFECYCLE_NOT_RELEASE_CERTIFICATION"
 IMAGES_SCOPE = "DEV_INSTALLED_LINUX_IMAGE_ROUNDTRIP_NOT_RELEASE_CERTIFICATION"
+REGISTRY_SCOPE = "DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTIFICATION"
+SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -38,13 +40,13 @@ require = driver.require
 def arguments(argv):
     parser = argparse.ArgumentParser(description=__doc__, allow_abbrev=False)
     names = (*startup.OPTIONS, "suite", "fixture", "image-input", "run-id", "buildkit-archive", "parallel-fixture",
-             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux")
+             "ssh-fixture", "ssh-packages", "ssh-gpgv", "container-fixture", "tmux", "registry-archive", "registry-layout")
     for name in names:
         require(sum(x == "--" + name or x.startswith("--" + name + "=") for x in argv) <= 1,
                 "duplicate option: --" + name)
     # Admit the suite before demanding provisioning inputs. `all` must fail even
     # on hosts lacking artifacts, without running a client or creating a file.
-    parser.add_argument("--suite", required=True, choices=("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "all"))
+    parser.add_argument("--suite", required=True, choices=(*SUITES, "all"))
     for name in startup.OPTIONS:
         parser.add_argument("--" + name)
     parser.add_argument("--fixture", default=str(REPO / "tests/fixtures/vz-0.4/docker"))
@@ -57,8 +59,13 @@ def arguments(argv):
     parser.add_argument("--ssh-gpgv")
     parser.add_argument("--container-fixture")
     parser.add_argument("--tmux")
+    parser.add_argument("--registry-archive")
+    parser.add_argument("--registry-layout")
     args = parser.parse_args(argv)
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images"}, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in SUITES, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    for name in ("registry_archive", "registry_layout"):
+        require((getattr(args, name) is not None) == (args.suite == "registry"),
+                "--" + name.replace("_", "-") + " is required only for the registry suite")
     require(args.container_fixture is None or args.suite == "lifecycle", "container-fixture requires the lifecycle suite")
     require((args.tmux is not None) == (args.suite == "lifecycle"),
             "--tmux is required only for the lifecycle suite")
@@ -77,11 +84,22 @@ def arguments(argv):
 
 
 def preflight(args, require_host=True):
-    require(args.suite in {"compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images"}, "full contract unavailable")
-    if args.suite == 'images':
+    require(args.suite in SUITES, "full contract unavailable")
+    if args.suite in ('images', 'registry'):
         require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
-                'image suite rejects builder, foreign fixture and terminal options')
+                ('image' if args.suite == 'images' else 'registry') + ' suite rejects builder, foreign fixture and terminal options')
+    for name in ('registry_archive', 'registry_layout'):
+        require((getattr(args, name, None) is not None) == (args.suite == 'registry'),
+                '--' + name.replace('_', '-') + ' is required only for the registry suite')
+    if args.suite == 'registry':
+        # Admit every registry input read-only before startup preflight touches
+        # anything: pinned layout, exact archive bytes, unexecuted binary
+        # metadata and the isolated Python dependencies behind the fixture.
+        import linux_docker_registry_machine as registry_machine
+        registry_archive = startup.canonical(args.registry_archive)
+        registry_layout = startup.canonical(args.registry_layout)
+        registry = registry_machine.admit_inputs(registry_archive, registry_layout)
     require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
             "--tmux is required only for the lifecycle suite")
     terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
@@ -92,7 +110,7 @@ def preflight(args, require_host=True):
     ca_path = REPO / "linux/ca-trust/inputs.json"
     ca_pin = public_ca_input(ca_path)
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
-              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE}
+              "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -161,6 +179,13 @@ def preflight(args, require_host=True):
         from linux_docker_image_machine import required_source_paths
         for path in required_source_paths():
             info['inputs'][str(path)] = startup.digest(Path(path))
+    if args.suite == 'registry':
+        info.update(registry=registry, registry_archive=str(registry_archive), registry_layout=str(registry_layout))
+        info['inputs'][str(registry_archive)] = registry['archive_sha256']
+        for path in registry_machine.required_source_paths():
+            info['inputs'][str(path)] = startup.digest(Path(path))
+        require(info['inputs'][str(registry_machine.PIN)] == startup.digest(registry_machine.PIN) and
+                startup.digest(registry_archive) == registry['archive_sha256'], 'registry pin or archive changed')
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
@@ -438,6 +463,9 @@ class ComposeHarness(startup.Harness):
         self.ssh_cache_proofs = []
         self.ssh_cache_captures = []
         self.runtime_audits = []
+        self.registry_sessions = []
+        self.registry_controls = None
+        self.registry_project = None
 
     def enroll_runtime_audits(self, contexts):
         """Fresh diagnostic sessions before this candidate's Docker mutations.
@@ -626,6 +654,14 @@ class ComposeHarness(startup.Harness):
         # every already-dispatched acquisition must nevertheless be certain.
         for session in getattr(self, 'runtime_audits', []):
             session.assert_enrolled_certain()
+        # A registry Session that never reached its own exact cleanup, or whose
+        # private receipts are uncertain, retains its network/volume/server/
+        # credential state: no blind removal, force or public Stop follows.
+        for session in getattr(self, 'registry_sessions', []):
+            require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
+                    'registry Session lacks completed cleanup; registry state retained; cleanup withheld')
+            session.commands.assert_certain()
+            session.certain()
         require(all(getattr(self, "keep_proofs_verified", [])),
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
@@ -725,16 +761,34 @@ class ComposeHarness(startup.Harness):
                         "actual Machine public CA bytes differ from selected immutable input")
         if suite == 'lifecycle':
             self.enroll_runtime_audits(contexts)
+        selected_machines = [(primary, m) for m in primary["machines"]] + [(neighbor, neighbor["machines"][0])]
+        controls = None
+        if suite == 'registry':
+            # Three selected Machines run the registry; the fourth is only a
+            # same-authority neighbor sentinel. Controls observe all four Docker
+            # config directories before, between and after every Session.
+            import linux_docker_registry_controls as registry_controls
+            require(len(self.registry_sessions) == 0 and self.registry_controls is None, 'registry controls already exist')
+            selected_descriptors = [machine["docker_context"] for _, machine in selected_machines]
+            sentinel_descriptor = neighbor["machines"][1]["docker_context"]
+            require(sentinel_descriptor not in selected_descriptors and
+                    len({json.dumps(d, sort_keys=True) for d in selected_descriptors}) == 3, 'registry Machine selection')
+            controls = registry_controls.Controls(self, contexts, selected_descriptors, sentinel_descriptor)
+            self.registry_controls = controls
+            self.registry_project = str(project)
         sentinels = [self.sentinel(descriptor) for descriptor in contexts]
         self.monitor = SentinelMonitor(self, sentinels)
         observations = []
+        credential_controls = None
         try:
             self.monitor.start()
-            for index, (environment, machine) in enumerate([(primary, m) for m in primary["machines"]] + [(neighbor, neighbor["machines"][0])]):
+            if controls is not None:
+                credential_controls = {'baseline': controls.baseline()}
+            for index, (environment, machine) in enumerate(selected_machines):
                 self.monitor.check()
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
-                if suite == 'images':
+                if suite in ('images', 'registry'):
                     # Driver schema compatibility only: this recipe uses tiny
                     # source-selected archives, not the Python/Compose image.
                     # Never pull/build/execute those admission-only image pins.
@@ -742,7 +796,7 @@ class ComposeHarness(startup.Harness):
                     images = {'base': dict(base), 'compose': dict(base)}
                 else:
                     images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images"}:
+                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
                     elif suite == "parallel":
@@ -751,6 +805,8 @@ class ComposeHarness(startup.Harness):
                         from linux_docker_build_ssh import run_machine
                     elif suite == 'images':
                         from linux_docker_image_machine import run_machine
+                    elif suite == 'registry':
+                        from linux_docker_registry_machine import run_machine
                     else:
                         from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()
@@ -786,13 +842,20 @@ class ComposeHarness(startup.Harness):
                 if builder_runtime is not None:
                     observation["builder_runtime"] = builder_runtime
                 observations.append(observation)
+            if controls is not None:
+                require(len(self.registry_sessions) == 3 and all(s.cleanup_complete is True for s in self.registry_sessions),
+                        'three completed registry Sessions required')
+                credential_controls['final'] = controls.final()
             require(self.inspect(self.status(project, primary["environment_id"])) == primary_contexts and
                     self.inspect(self.status(project, neighbor["environment_id"])) == neighbor_contexts,
                     "topology identity changed during Docker fixture work")
         finally:
             self.monitor.stop()
-        return {"machine_slices": observations, "continuous_sentinels": self.monitor.summary(),
-                "runtime_inventory_scope": "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit"}
+        result = {"machine_slices": observations, "continuous_sentinels": self.monitor.summary(),
+                  "runtime_inventory_scope": "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit"}
+        if controls is not None:
+            result["credential_controls"] = credential_controls
+        return result
 
 
 class SentinelMonitor:
@@ -898,6 +961,12 @@ def run(info):
             selected = Path(info["container_fixture"])
             fixture_contract(selected)
             require(driver.tree_digest(selected) == info["container_fixture_sha256"], "container fixture changed during run")
+        if info["suite"] == "registry":
+            sessions = harness.registry_sessions
+            require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
+                    "three completed registry Sessions required")
+            require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
+                    "registry archive changed during run")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:

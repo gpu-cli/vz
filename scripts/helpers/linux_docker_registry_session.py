@@ -5,6 +5,7 @@ IDs: independent command replay, credential controls across Machines and the
 aggregate lifecycle remain the orchestrator's responsibility. Secrets stay in
 memory or the exact guest-owned private fixture, never public command input.
 """
+import hashlib
 import json
 from pathlib import Path
 import re
@@ -20,6 +21,139 @@ import linux_docker_registry_image as image
 import linux_docker_registry_route as route
 
 require = driver.require
+
+# Pinned from offline binary admission (Distribution v3.1.1 built with Go 1.25.9);
+# runtime log rows must match these pins, never define them.
+REGISTRY_VERSION = '3.1.1'  # observed logrus 'version' field of the pinned v3.1.1 binary (candidates 1-2)
+REGISTRY_GO_VERSION = 'go1.25.9'
+# Distribution v3.1.1 registry/registry.go: logrus JSONFormatter (RFC3339Nano) on
+# a context carrying instance.id/version/go.version; our config sets no log.fields,
+# so startup rows carry exactly these keys.
+STARTUP_KEYS = frozenset({'time', 'level', 'msg', 'go.version', 'instance.id', 'version'})
+# Request/response/error keys from internal/dcontext/http.go GetRequestLogger and
+# GetResponseLogger, registry/handlers/app.go (auth.user.name, err.*, vars.*) and the
+# optional log.fields service key. Anything else is not a Distribution 3.1.1 record.
+RECORD_KEYS = STARTUP_KEYS | {
+    'service', 'auth.user.name', 'http.request.id', 'http.request.method', 'http.request.host',
+    'http.request.uri', 'http.request.referer', 'http.request.useragent', 'http.request.remoteaddr',
+    'http.request.contenttype', 'http.response.written', 'http.response.status',
+    'http.response.contenttype', 'http.response.duration', 'err.code', 'err.message', 'err.detail',
+    'vars.name', 'vars.reference', 'vars.digest', 'vars.uuid',
+    # registry/auth/htpasswd/access.go logs a failed basic-auth attempt with
+    # WithFields username/error ("user failed to authenticate"); observed candidate 3.
+    'username', 'error'}
+# Distribution v3.1.1 registry/registry.go constructs http.Server{Handler: handler}
+# without ErrorLog, so Go net/http server.go conn.serve logs failed handshakes via
+# log.Printf (LstdFlags date/time prefix) as "http: TLS handshake error from %s: %v".
+# crypto/tls conn.go wraps a received alert as net.OpError{Op: "remote error"} whose
+# text is "tls: " + alert.go's name. Go 1.25 handshake_client.go verifyServerCertificate
+# sends alertBadCertificate for EVERY certificate verification failure (the Go client
+# never sends alertUnknownCA), so the Engine's wrong-CA rejection is exactly one
+# "remote error: tls: bad certificate" line from the bridge gateway peer.
+HANDSHAKE_PREFIX = r'\d{4}/\d\d/\d\d \d\d:\d\d:\d\d http: TLS handshake error from '
+HANDSHAKE_SUFFIX = r':([1-9][0-9]{0,4}): remote error: tls: ([a-z ]{1,64})'
+WRONG_CA_ALERTS = ('bad certificate',)
+
+
+# Moby/containerd push existence probes against an empty repository: HEAD each blob
+# and the tag before uploading. Distribution answers 404 and app.go logs the request
+# at level error ("response completed with error", err.code BLOB_UNKNOWN /
+# MANIFEST_UNKNOWN rendered by their messages). Observed exactly once per push in
+# installed candidate 5; admitted only when the caller declares the completed push.
+PUSH_PROBES = {'blob': 2, 'manifest': 1}
+
+
+def _push_probe(row, probes):
+    """Classify one level=error row as an exact authorized 404 push probe or reject it."""
+    repo = probes['repository_name']
+    require(row['msg'] == 'response completed with error' and row['http.request.method'] == 'HEAD' and
+            row['http.response.status'] == 404 and row['http.response.contenttype'] == 'application/json' and
+            row.get('auth.user.name') == probes['username'] and row.get('vars.name') == repo and
+            row['http.request.host'] == probes['host'], 'registry error record is not an authorized push probe')
+    uri = row['http.request.uri']
+    if uri == '/v2/' + repo + '/manifests/subject':
+        require(row['err.code'] == 'manifest unknown' and row['err.message'] == 'manifest unknown' and
+                row['err.detail'] == 'unknown tag=subject' and row.get('vars.reference') == 'subject',
+                'registry manifest probe fields')
+        return 'manifest'
+    digest = row.get('vars.digest')
+    require(type(digest) is str and re.fullmatch('sha256:[0-9a-f]{64}', digest) is not None and
+            uri == '/v2/' + repo + '/blobs/' + digest and row['err.code'] == 'blob unknown' and
+            row['err.message'] == 'blob unknown to registry' and row['err.detail'] == digest and
+            digest in probes['blob_digests'], 'registry blob probe fields')
+    return 'blob'
+
+
+def classify_log(raw, *, instance_id, gateway, phase, handshake_alerts=(), push_probes=None):
+    """Every complete-log line is a Distribution record of this instance or an allowed
+    Go TLS handshake error from the owned gateway; nothing else is admitted or filtered."""
+    require(type(raw) is bytes and len(raw) <= route.MAX_BYTES and (not raw or raw.endswith(b'\n')),
+            'registry log bounds')
+    require(type(instance_id) is str and re.fullmatch(route.UUID, instance_id) is not None, 'registry instance id')
+    require(type(phase) is str and re.fullmatch('[a-z-]{1,32}', phase) is not None, 'registry log phase')
+    require(type(handshake_alerts) is tuple and all(a in WRONG_CA_ALERTS for a in handshake_alerts),
+            'registry handshake alert allowlist')
+    require(type(gateway) is str and re.fullmatch(r'[0-9.]{7,15}', gateway) is not None, 'registry gateway')
+    pattern = HANDSHAKE_PREFIX + re.escape(gateway) + HANDSHAKE_SUFFIX
+    lines = raw.split(b'\n')[:-1]
+    records, reasons, levels, probes = 0, {}, {}, {}
+    require(push_probes is None or (type(push_probes) is dict and set(push_probes) ==
+            {'repository_name', 'username', 'host', 'blob_digests'}), 'registry push probe declaration')
+    for line in lines:
+        require(0 < len(line) <= route.MAX_LINE, 'registry log line bounds')
+        if line.startswith(b'{'):
+            row = fixture.decode(line)
+            require(type(row) is dict and STARTUP_KEYS <= set(row) <= RECORD_KEYS, 'registry log record fields')
+            require(all(type(row[key]) is str for key in STARTUP_KEYS), 'registry log record scalars')
+            require(row['instance.id'] == instance_id and row['version'] == REGISTRY_VERSION and
+                    row['go.version'] == REGISTRY_GO_VERSION, 'registry log record identity')
+            if row['level'] == 'error':
+                require(push_probes is not None, 'registry log record level')
+                kind = _push_probe(row, push_probes)
+                probes[kind] = probes.get(kind, 0) + 1
+            else:
+                require(row['level'] in ('info', 'warning'), 'registry log record level')
+            route.timestamp_ns(row['time'])
+            records += 1
+            levels[row['level']] = levels.get(row['level'], 0) + 1
+            continue
+        try:
+            text = line.decode('ascii')
+        except UnicodeError:
+            raise driver.Rejected('registry log line is neither JSON nor ASCII (' + phase + ')') from None
+        match = re.fullmatch(pattern, text)
+        require(match is not None, 'registry log line is neither a Distribution record nor a gateway TLS '
+                'handshake error (' + phase + ')')
+        require(int(match[1]) <= 65535, 'registry handshake peer port')
+        require(match[2] in handshake_alerts, 'unexpected TLS handshake alert during ' + phase)
+        reasons[match[2]] = reasons.get(match[2], 0) + 1
+    require(push_probes is None or probes == PUSH_PROBES, 'registry push probe count')
+    return {'phase': phase, 'lines': len(lines), 'json_records': records, 'record_levels': levels,
+            'push_not_found_probes': probes,
+            'handshake_errors': sum(reasons.values()), 'handshake_reasons': reasons,
+            'handshake_alerts_allowed': list(handshake_alerts), 'instance_id': instance_id,
+            'raw_bytes': len(raw), 'raw_sha256': hashlib.sha256(raw).hexdigest(), 'filtered_lines': 0}
+
+
+def startup_identity(raw, *, authority):
+    """Startup rows before any client connection: all JSON, one instance, TLS listener."""
+    require(type(raw) is bytes and 0 < len(raw) <= route.MAX_BYTES and raw.endswith(b'\n'), 'registry startup bounds')
+    rows = [fixture.decode(line) for line in raw.split(b'\n')[:-1]]
+    require(all(type(row) is dict and set(row) == STARTUP_KEYS and
+                all(type(value) is str for value in row.values()) for row in rows), 'registry startup fields')
+    instances = {row['instance.id'] for row in rows}
+    require(len(instances) == 1, 'one registry process instance required')
+    instance_id = route.token(next(iter(instances)), route.UUID)
+    require(all(row['version'] == REGISTRY_VERSION and row['go.version'] == REGISTRY_GO_VERSION and
+                row['level'] == 'info' for row in rows), 'registry startup identity')
+    for row in rows:
+        route.timestamp_ns(row['time'])
+    listening = 'listening on ' + authority + ', tls'
+    require(sum(row['msg'] == listening for row in rows) == 1 and
+            not any(row['msg'].startswith('listening on ') and row['msg'] != listening for row in rows),
+            'registry TLS listener record')
+    return {'instance_id': instance_id, 'rows': len(rows), 'listening': listening, 'version': REGISTRY_VERSION,
+            'go_version': REGISTRY_GO_VERSION, 'raw_bytes': len(raw), 'raw_sha256': hashlib.sha256(raw).hexdigest()}
 
 
 def labels(spec):
@@ -69,6 +203,8 @@ class Session:
         self.initial_credentials = self.store.snapshot(expected='empty')
         self.credential_state = 'empty'
         self.identities = self.network = self.volume = self.container_id = None
+        self.instance_id = self.startup_log = None
+        self.wrong_ca_probed = False
         self.prepared = self.workload_complete = self.cleanup_complete = False
         self.failed = False
         if not hasattr(harness, 'registry_sessions'):
@@ -139,14 +275,44 @@ class Session:
         if running:
             require(set(row['NetworkSettings']['Networks']) == {self.spec['network_name']}, 'registry network inventory')
             net = row['NetworkSettings']['Networks'][self.spec['network_name']]
+            # Moby leaves the endpoint Gateway empty on --internal networks (no
+            # default route); the bridge address in the network IPAM config is the
+            # daemon-side peer the route verifier binds. Observed candidate 1.
             require(net['NetworkID'] == self.network['Id'] and net['IPAddress'] == self.spec['address'] and
-                    net['Gateway'] == self.spec['gateway'], 'registry private route')
+                    net['IPAMConfig'] == {'IPv4Address': self.spec['address']} and net['IPPrefixLen'] == 24 and
+                    net['Gateway'] == '' and not net['Links'] and not net['Aliases'], 'registry private route')
         return row
 
     def logs(self):
         raw, stderr, _ = self.docker('server-logs', ['logs', self.container_id])
         require(not raw and len(stderr) <= route.MAX_BYTES, 'registry JSON stderr bound')
         return stderr
+
+    def classify(self, raw, phase):
+        """Complete raw log so far: startup prefix intact, exactly the expected handshake errors."""
+        require(self.instance_id is not None and raw.startswith(self.startup_log), 'registry log prefix changed')
+        probes = None
+        if self.workload_complete:
+            expected = self.recipe['expected']
+            probes = {'repository_name': self.spec['repository'].split('/', 1)[1], 'username': 'vz-registry-user',
+                      'host': self.spec['authority'],
+                      'blob_digests': (expected['config_digest'], expected['layer_digest'])}
+        proof = classify_log(raw, instance_id=self.instance_id, gateway=self.spec['gateway'], phase=phase,
+                             handshake_alerts=WRONG_CA_ALERTS if self.wrong_ca_probed else (), push_probes=probes)
+        # Moby daemon/pkg/registry/service.go Auth iterates lookupV2Endpoints; a
+        # non-insecure private authority yields one TLS endpoint, whose PingV2Registry
+        # dials once, so the wrong-CA probe leaves exactly one handshake error forever.
+        require(proof['handshake_errors'] == int(self.wrong_ca_probed), 'registry TLS handshake error count')
+        return proof
+
+    def retain_log(self, name, raw, phase):
+        """Persist complete raw stderr after classification and a private canary scan."""
+        proof = self.classify(raw, phase)
+        require(not driver.contains_canary((raw,), self.private_fixture.canaries()), 'private registry log rejected')
+        startup.write(self.output / ('registry-stderr-' + name + '.log'), raw)
+        proof['retained_file'] = 'registry-stderr-' + name + '.log'
+        self.document(name + '-log.json', proof)
+        return proof
 
     def prepare(self):
         """Create exact resources; failed admission leaves them visibly uncertain."""
@@ -200,15 +366,21 @@ class Session:
             deadline = time.monotonic() + 30
             while True:
                 self.inspect_server(running=True)
-                rows = [fixture.decode(line) for line in self.logs().splitlines()]
-                if any(type(row.get('msg')) is str and row['msg'].startswith('listening on ') and
-                       'tls' in row['msg'].lower() for row in rows):
+                raw = self.logs()
+                # No client has connected yet, so every row must already be JSON;
+                # a plaintext row here is a failure, not something to skip.
+                rows = [fixture.decode(line) for line in raw.splitlines()]
+                if any(type(row.get('msg')) is str and row['msg'].startswith('listening on ') for row in rows):
                     break
                 require(time.monotonic() < deadline, 'registry listener readiness deadline')
                 time.sleep(0.2)
+            identity = startup_identity(raw, authority=self.spec['authority'])
+            self.instance_id, self.startup_log = identity['instance_id'], raw
+            self.document('startup-log.json', identity)
             self.prepared = True
             self.document('prepared.json', {'owner': self.descriptor['owner'], 'container_id': self.container_id,
-                'network_id': self.network['Id'], 'volume': self.volume, 'tls_handshake_proven': False})
+                'network_id': self.network['Id'], 'volume': self.volume, 'instance_id': self.instance_id,
+                'tls_handshake_proven': False})
         except BaseException:
             self.failed = True
             raise
@@ -240,23 +412,37 @@ class Session:
         """Wrong trust, wrong password, then one source-attributed good login."""
         self.certain()
         authority = self.spec['authority']
+        # Moby daemon/pkg/registry/auth.go PingV2Registry returns http.Client.Do's
+        # url.Error (Op "Get") wrapping crypto/tls CertificateVerificationError
+        # ("tls: failed to verify certificate: %s") around x509.UnknownAuthorityError.
+        # The wrong CA's subject ("vz registry wrong CA") never matches the server
+        # issuer, so x509 finds no candidate parent and appends no hint text.
         self.login(case='wrong-ca', role='valid', expected_stdout=b'', expected_exit=1,
             expected_stderr=('Error response from daemon: Get "https://' + authority +
                 '/v2/": tls: failed to verify certificate: x509: certificate signed by unknown authority\n').encode())
+        self.wrong_ca_probed = True
+        self.document('login-wrong-ca-log.json', self.classify(self.logs(), 'wrong-ca'))
         self.private_exec('trust', guest.install_trust_script(self.plan, self.identities,
                 fixture.sha(self.private_fixture.ca_pem(wrong=True)), fixture.sha(self.private_fixture.ca_pem())),
                 self.private_fixture.ca_pem(), guest.fixed_ack(self.plan, action='TRUST'))
         inspected = self.public_exec('guest-inspect', guest.inspect_script(self.plan, self.identities))
         guest.parse_ack(inspected, self.plan, action='INSPECT', expected=self.identities)
+        # daemon/pkg/registry/auth.go loginV2: non-200 ping response yields
+        # "login attempt to %s failed with status: %d %s" with http.StatusText.
         self.login(case='invalid', role='invalid', expected_stdout=b'', expected_exit=1,
             expected_stderr=('Error response from daemon: login attempt to https://' + authority +
                              '/v2/ failed with status: 401 Unauthorized\n').encode())
+        self.document('login-invalid-log.json', self.classify(self.logs(), 'invalid-login'))
         self.unauthenticated_push()
+        self.document('unauthorized-push-log.json', self.classify(self.logs(), 'unauthorized-push'))
         # The command window is bracketed using the same guest clock as its
         # registry logs. Second-resolution samples give explicit interval bounds;
         # the exact append-only log delta additionally excludes earlier requests.
         before = self.logs()
+        self.classify(before, 'pre-login')
         start = self.guest_seconds() * 10**9
+        # Docker CLI v29.4.0 cli/config/credentials/file_store.go Store: Fprintln of
+        # unencryptedWarning (leading and trailing newline) with the config filename.
         warning = ("\nWARNING! Your credentials are stored unencrypted in '" +
             self.descriptor['config_dir'] + "/config.json'.\n"
             "Configure a credential helper to remove this warning. See\n"
@@ -266,20 +452,21 @@ class Session:
         end = (self.guest_seconds() + 1) * 10**9
         after = self.logs()
         require(after.startswith(before) and len(after) > len(before), 'registry log prefix changed')
+        retained = self.retain_log('authenticate', after, 'authenticate')
         raw, _, _ = self.docker('engine-version', ['version', '--format', '{{json .Server}}'])
         version = fixture.decode(raw)
         engine = {key: version[field] for key, field in (
             ('version', 'Version'), ('go_version', 'GoVersion'), ('git_commit', 'GitCommit'),
             ('kernel_version', 'KernelVersion'), ('os', 'Os'), ('arch', 'Arch'))}
-        startup_rows = [fixture.decode(line) for line in before.splitlines()]
-        instances = {row['instance.id'] for row in startup_rows if 'instance.id' in row}
-        require(len(instances) == 1, 'one registry process instance required')
         proof = route.validate(after[len(before):], engine=engine, cli_version='29.4.0',
-            registry={'instance_id': next(iter(instances)), 'go_version': 'go1.25.9', 'version': 'v3.1.1',
-                'host': authority, 'remote_ip': self.spec['gateway'], 'realm': 'vz-private-registry'},
+            registry={'instance_id': self.instance_id, 'go_version': REGISTRY_GO_VERSION,
+                'version': REGISTRY_VERSION, 'host': authority, 'remote_ip': self.spec['gateway'],
+                'realm': 'vz-private-registry'},
             username='vz-registry-user', window_ns=(start, end), canaries=self.private_fixture.canaries())
         proof.update(container_id=self.container_id, owner=self.descriptor['owner'],
-                     log_prefix_bytes=len(before), guest_clock_resolution_ns=10**9)
+                     log_prefix_bytes=len(before), guest_clock_resolution_ns=10**9,
+                     complete_log_sha256=retained['raw_sha256'], complete_log_bytes=retained['raw_bytes'],
+                     complete_log_handshake_errors=retained['handshake_errors'])
         self.document('login-route.json', proof)
         return proof
 
@@ -308,6 +495,9 @@ class Session:
         self.docker('unauthorized-subject-tag', selected['tag_remote'], mutate=True)
         raw, _, _ = self.docker('unauthorized-subject-inspect', selected['inspect_tagged'])
         image.validate_inspect(raw, spec=self.spec, stage='tagged')
+        # containerd core/remotes/docker/authorizer.go AddResponses: a Basic challenge
+        # without credentials fails with "%w: no basic auth credentials" (ErrInvalidAuthorization);
+        # Moby's own integration-cli push test asserts this same substring.
         _, stderr, code = self.docker('unauthorized-push', selected['push'], success=False, timeout=60)
         require(code == 1 and b'no basic auth credentials' in stderr,
                 'unauthenticated push did not fail for expected authorization cause')
@@ -381,6 +571,7 @@ class Session:
         self.document('logout-credentials.json', self.store.check_transition(before, expected='empty'))
         self.credential_state = 'empty'
         self.inspect_server(running=True)
+        final = self.retain_log('final', self.logs(), 'final')
         self.docker('server-stop', ['container', 'stop', '--timeout', '10', self.container_id], mutate=True)
         row = self.inspect_server(running=False)
         require(row['State']['ExitCode'] == 0 and not row['State']['OOMKilled'], 'registry did not stop cleanly')
@@ -399,6 +590,8 @@ class Session:
         self.harness.exact_absent(self.descriptor, 'image', 'docker.io/library/registry:3.1.1')
         self.cleanup_complete = True
         proof = {'owner': self.descriptor['owner'], 'container_id': self.container_id,
+                 'instance_id': self.instance_id, 'final_log_sha256': final['raw_sha256'],
+                 'final_log_handshake_errors': final['handshake_errors'],
                  'owned_registry_removed': True, 'guest_private_fixture_removed': True,
                  'full_environment_delete_certified': False}
         self.document('cleanup.json', proof)

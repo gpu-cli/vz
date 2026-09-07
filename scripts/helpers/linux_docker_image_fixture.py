@@ -113,14 +113,18 @@ def fixture(role):
     return _content(role)[0]
 
 
-def archive(role, reference):
-    """Return <=1MiB OCI-layout TAR; no mutable source files are consulted."""
+def archive(role, reference, extra_annotations=None):
+    """Return <=1MiB OCI-layout TAR; no mutable source files are consulted.
+
+    extra_annotations models store-added index annotations (containerd's
+    distribution-source label after a registry pull); default is naming only.
+    """
     _, tag = reference_parts(reference)
     identity, blobs = _content(role)
     descriptor = {'mediaType': MANIFEST_TYPE, 'digest': identity['manifest_digest'],
                   'size': identity['manifest_size'], 'platform': dict(PLATFORM),
                   'annotations': {'io.containerd.image.name': reference,
-                                  'org.opencontainers.image.ref.name': tag}}
+                                  'org.opencontainers.image.ref.name': tag, **(extra_annotations or {})}}
     index = {'schemaVersion': 2, 'mediaType': INDEX_TYPE, 'manifests': [descriptor]}
     compatible = [{'Config': 'blobs/sha256/' + identity['config_digest'][7:],
                    'RepoTags': [familiar_reference(reference)],

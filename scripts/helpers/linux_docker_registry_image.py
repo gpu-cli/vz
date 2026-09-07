@@ -49,6 +49,12 @@ def seed(spec):
     return image.archive('subject', contract(spec)['seed_reference'])
 
 
+def pulled_export(spec):
+    """Expected export bytes of the subject after pull-by-digest (test oracle only)."""
+    return image.archive('subject', contract(spec)['export_reference'],
+                         extra_annotations=distribution_source_annotation(spec))
+
+
 def validate_remote(manifest, config, layer):
     """Validate independently acquired exact remote bytes, not their transport."""
     expected = image.fixture('subject')
@@ -114,7 +120,18 @@ def validate_export(raw, *, spec):
         expected_config_digest=expected['config_digest'], expected_layer_digest=expected['layer_digest'],
         expected_diff_id=expected['diff_id'], expected_reference=recipe['export_reference'],
         expected_payload_path=expected['payload']['path'], expected_payload_sha256=expected['payload']['sha256'],
-        expected_payload_size=expected['payload']['size'], expected_labels=expected['labels'])
+        expected_payload_size=expected['payload']['size'], expected_labels=expected['labels'],
+        expected_extra_annotations=distribution_source_annotation(spec))
+
+
+def distribution_source_annotation(spec):
+    """containerd labels a pulled image's index descriptor with its distribution source
+    (labels.LabelDistributionSource + registry host, value = repository path). The pinned
+    Engine 29.7.2 store keys it by the reference host WITHOUT the port; observed in
+    installed candidate 4 for pull-by-digest from the owned registry."""
+    authority, name = spec['repository'].split('/', 1)
+    require(authority == spec['authority'] and name and '/' not in name)
+    return {'containerd.io/distribution.source.' + spec['address']: name}
 
 
 def validate_absent(raw_image_ids, *, spec):

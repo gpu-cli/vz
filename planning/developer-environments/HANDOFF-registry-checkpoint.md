@@ -1,5 +1,13 @@
 # Continuation: installed registry checkpoint
 
+> **Superseded 2026-09-07.** The work below was resumed: the Session log seam is
+> fixed, `--suite registry` is wired (`scripts/run-linux-docker-registry-e2e.sh`),
+> cross-Machine credential controls, independent replay and canary scans exist,
+> and installed candidate 6 passed the DEV registry slice on three Machines
+> (`.artifacts/linux-docker-registry-candidate-6`). See
+> `docs/docker-registry-acceptance.md` for the current status and remaining
+> work; the numbered list below is retained as history, not instructions.
+
 This is an unfinished DEV checkpoint, not a 0.4 release or a registry acceptance
 pass. The user requested a handoff because of usage limits. Do not resume an
 assumed physical run: this checkpoint dispatched no Docker command or VM.

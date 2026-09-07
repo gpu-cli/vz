@@ -22,6 +22,15 @@ CLI v29.4.0 cli/command/registry/login.go's fallback uses only the CLI UA.
 This supports successful basic-auth login only. It is not an arbitrary registry
 log validator, failed-login classifier, TLS certificate verifier, socket trace,
 or proof that a malicious same-owner process cannot forge User-Agent strings.
+
+Route witness: every admitted record must carry http.request.method GET and
+http.request.uri /v2/ (the Engine login ping), the exact Engine User-Agent with
+the escaped upstream CLI identity, and a remoteaddr on the owned bridge gateway.
+That is Distribution's own per-request server-side record, produced inside the
+registry process, of the request the daemon made. It excludes the CLI's
+client-side fallback (whose UA is only the bare CLI UA and whose peer would not
+be the guest daemon), but it is still inference from the server's log, not a
+captured wire trace of the daemon's /auth handling or the TLS socket.
 """
 import calendar
 import datetime
@@ -43,6 +52,9 @@ COMMON = {'time', 'level', 'msg', 'go.version', 'instance.id', 'version',
           'http.request.uri', 'http.request.useragent', 'http.request.remoteaddr'}
 RESPONSE = {'http.response.status', 'http.response.written',
             'http.response.contenttype', 'http.response.duration'}
+# Moby daemon/pkg/registry/auth.go PingV2Registry and loginV2 both issue GET on
+# the trimmed endpoint + "/v2/"; nothing else is an Engine login route.
+LOGIN_METHOD, LOGIN_URI = 'GET', '/v2/'
 
 
 class RouteError(ValueError):
@@ -176,7 +188,7 @@ def validate(raw_delta, *, engine, cli_version, registry, username, window_ns, c
         require(row['go.version'] == registry['go_version'] and row['version'] == registry['version'] and
                 row['instance.id'] == registry['instance_id'], 'registry identity')
         request = token(row['http.request.id'], UUID)
-        require(row['http.request.method'] == 'GET' and row['http.request.uri'] == '/v2/' and
+        require(row['http.request.method'] == LOGIN_METHOD and row['http.request.uri'] == LOGIN_URI and
                 row['http.request.host'] == registry['host'] and row['http.request.useragent'] == ua,
                 'Engine request route')
         remote = row['http.request.remoteaddr']
@@ -212,4 +224,10 @@ def validate(raw_delta, *, engine, cli_version, registry, username, window_ns, c
             'tls_validation_proven': False, 'raw_sha256': hashlib.sha256(raw_delta).hexdigest(),
             'raw_bytes': len(raw_delta), 'records': len(lines), 'engine_user_agent': ua,
             'registry_instance_id': registry['instance_id'], 'window_ns': list(window_ns),
-            'authenticated_requests': list(done.values()), 'anonymous_challenges': len(challenges)}
+            'authenticated_requests': list(done.values()), 'anonymous_challenges': len(challenges),
+            'server_side_request_witness': {
+                'source': 'distribution_request_context_json_record', 'method': LOGIN_METHOD,
+                'uri': LOGIN_URI, 'host': registry['host'], 'user_agent_kind': 'engine_with_upstream_cli',
+                'remote_peer': registry['remote_ip'], 'asserted_on_every_record': True},
+            'client_side_cli_fallback_excluded_by': 'engine_user_agent_and_daemon_remoteaddr',
+            'wire_trace_captured': False}

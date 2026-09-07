@@ -59,6 +59,24 @@ class RouteTests(unittest.TestCase):
             'docker/29.7.2 go/go1.25.7 git-commit/6a43e3d kernel/6.12.85 os/linux arch/arm64 '
             r'UpstreamClient(Docker-Client/29.4.0 \(darwin\))')
 
+    def test_server_side_witness_reports_only_what_every_record_asserted(self):
+        proof = self.check()
+        self.assertEqual(proof['server_side_request_witness'], {
+            'source': 'distribution_request_context_json_record', 'method': 'GET', 'uri': '/v2/',
+            'host': REGISTRY['host'], 'user_agent_kind': 'engine_with_upstream_cli',
+            'remote_peer': REGISTRY['remote_ip'], 'asserted_on_every_record': True})
+        self.assertEqual(proof['client_side_cli_fallback_excluded_by'], 'engine_user_agent_and_daemon_remoteaddr')
+        self.assertFalse(proof['wire_trace_captured'])
+        self.assertFalse(proof['direct_auth_endpoint_trace'])
+        for key, value in [('http.request.method', 'POST'), ('http.request.method', 'HEAD'),
+                           ('http.request.uri', '/v2/_catalog'), ('http.request.uri', '/v2'),
+                           ('http.request.uri', '/auth')]:
+            rows = records()
+            for row in rows:
+                row[key] = value
+            with self.subTest(key=key, value=value):
+                self.reject(rows)
+
     def test_anonymous_challenge_has_no_invented_status_or_username(self):
         rows = records()
         challenge = dict(rows[0], time='2026-09-06T20:00:00.0001Z', level='warning',

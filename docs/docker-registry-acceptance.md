@@ -2,17 +2,58 @@
 
 Status: **DEV**, in progress under `vz-mzs.7.1.10`. The three required catalog
 cases are `docker.image.registry_login`, `docker.image.pull`, and
-`docker.image.push`. Input admission and transport tests are prerequisites, not
-passes for those scenarios. The installed registry dispatcher and full
-Docker-63/0.4 aggregate remain unfinished.
+`docker.image.push`. An explicit `--suite registry` dispatcher now exists and
+one installed local-Mac candidate has passed it (below). This is a DEV slice
+pass, not a release certification: Docker-63 and the full 0.4 aggregate remain
+open, and `--suite all` still rejects incomplete coverage.
 
-The subsequent private-session checkpoint adds native TLS/private credential
-admission, guest setup/cleanup scripts, private command receipts, tiny-image and
-binary validators, and an unwired Session assembly. Its selected Python family
-passes 1,137 tests; no registry VM/Docker run has occurred. See the
-[continuation handoff](../planning/developer-environments/HANDOFF-registry-checkpoint.md)
-for the known TLS-log parsing issue, remaining integration, evidence boundaries,
-and exact resume instructions. The input-checkpoint results below are historical.
+## Installed registry candidate 6 (2026-09-07)
+
+`scripts/run-linux-docker-registry-e2e.sh` (isolated `uv` invocation of the
+pinned Python dependencies; no global install) with the installed
+`.artifacts/topology-cli-installed-BVlJY5` CLI/daemon (source commit
+`17a0a442`, not HEAD), the `20260906T210423Z` developer/container guest bundles,
+OrbStack's Docker CLI 29.4.0 under Machine-private `--config`/`--context`, the
+pinned `registry-3.1.1-load-candidate-1.tar` and the admitted
+`registry-3.1.1-bounded-replay-1/layout`. Evidence:
+`.artifacts/linux-docker-registry-candidate-6` (1,480 files, `evidence.sha256`
+verifies), outcome `passed_dev_installed_registry_slice`, zero retries.
+
+Two Environments × two Linux Machines; the registry ran on three selected
+Machines at the same private authority `172.30.241.2:5443`, the fourth Machine
+stayed a neighbor sentinel. Per selected Machine, in order and exactly once:
+fixture load, private guest setup/admit, owned `--internal` network/volume/server,
+startup-log identity (five JSON rows, one instance id, `listening on
+172.30.241.2:5443, tls`), wrong-CA login rejected with the exact daemon x509
+error and exactly one `remote error: tls: bad certificate` handshake line,
+owned CA trust install, invalid-password login `401 Unauthorized` with
+credentials unchanged, unauthenticated push denied with storage inventory
+unchanged, valid login (exact stdout/stderr, only the selected config gained an
+auth entry), server-side route witness (one authorized `GET /v2/` by the guest
+Engine 29.7.2 User-Agent with the upstream CLI suffix, from the bridge
+gateway, inside a same-guest clock window), authorized push, remote
+manifest/config/layer bytes validated, local removal, pull-by-digest, export
+re-verified byte-for-byte, independent receipt replay and secret-canary scan
+(313 files per Machine, no canary in raw/base64/hex/auth-blob forms), logout,
+final log classification (exactly two blob and one manifest 404 push probes),
+exact cleanup with guest CLEANUP acknowledgment. Cross-Machine controls proved
+four distinct config directories, siblings/sentinel/host defaults/credential
+helpers/shared plugins unchanged at every phase, all four empty at the end.
+
+Candidates 1–5 failed closed on source-based expectations that the real
+Engine/Distribution pair corrected (empty endpoint gateway on `--internal`
+networks, `version` logged as `3.1.1`, htpasswd `username`/`error` keys,
+containerd's `distribution.source` index annotation, 404 push probes). Each
+was dispositioned by exact positive-inspection cleanup, public Stop and
+graceful daemon termination (`linux-docker-registry-candidate-disposition.py`);
+their runtime roots and evidence are retained.
+
+Not closed by this pass: the literal raw `/auth` route witness (see "Route
+witness boundary"), `vz-mzs.7.1.9` credential recovery/migration across
+Stop/Up, a candidate built from HEAD (the installed CLI predates the native
+macOS bootstrap merge), Docker-63 and the 0.4 aggregate.
+
+The earlier checkpoints below are historical.
 
 ## Frozen public fixture
 
@@ -91,6 +132,31 @@ logger explicitly disabled or separately retained; never silently filter lines.
 Provision the exact private htpasswd file before server startup: missing-file
 initialization can generate and log credentials. Unknown fields and fixture
 canaries fail admission.
+
+## Route witness boundary
+
+Distribution 3.1.1's own per-request JSON records (`registry/handlers/app.go`
+dispatcher, `internal/dcontext/http.go`) carry `http.request.method`,
+`http.request.uri`, `http.request.useragent`, `http.request.remoteaddr` and
+`http.request.id`. The verifier requires GET `/v2/` on every record, the exact
+Engine 29.7.2 User-Agent with the escaped `UpstreamClient(Docker-Client/29.4.0
+\(darwin\))` suffix, a `remoteaddr` on the owned bridge gateway, and paired
+`authorized request`/`response completed` rows for the fixture user inside an
+independently sampled same-guest clock window. This is a server-side request
+witness emitted inside the registry process for the request the guest daemon
+actually made, and it excludes the CLI's client-side fallback (whose UA is the
+bare CLI UA and whose peer could not be the guest daemon on an `--internal`
+network). It does **not** satisfy the issue's literal "raw `/auth` route
+witness": nothing captures the CLI-to-daemon `/auth` HTTP call or the
+daemon-to-registry TLS socket, so the proof reports
+`direct_auth_endpoint_trace: False` and `wire_trace_captured: False`. What
+remains is a daemon-side witness of the `/auth` request that does not leak
+credentials (generic `dockerd` debug logging is unacceptable because it can log
+tokens). Until one exists, acceptance rests on this server-side inference plus
+the complete classified registry stderr (`startup-log.json`, per-phase
+`*-log.json`, retained `registry-stderr-*.log`), where every non-JSON line is
+accounted for as exactly one `remote error: tls: bad certificate` handshake
+failure from the wrong-CA probe.
 
 ## Required installed integration
 

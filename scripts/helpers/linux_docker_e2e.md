@@ -146,6 +146,56 @@ freezing, all63 scenarios, full OCI/cache/runtime audits, host binds/forwarding,
 recovery, native macOS, the five-verb Delete path, and the canonical three-phase
 aggregate with measured hardware sleep remain separate required work.
 
+## Registry slice (DEV, not release)
+
+`scripts/run-linux-docker-registry-e2e.sh` is the only host entry for
+`--suite registry`; it fixes the suite (passing `--suite` is an error) and runs
+the dispatcher under `uv run --no-project --python /usr/bin/python3
+--with-requirements scripts/helpers/registry-requirements.txt`. The hash-pinned
+`cryptography`/`bcrypt` dependencies exist only for that process; nothing is
+installed into system Python or the user site. The registry suite additionally
+requires `--registry-archive` (the deterministic load TAR, e.g.
+`.artifacts/registry-3.1.1-load-candidate-1.tar`) and `--registry-layout` (an
+admitted selected-only OCI layout). It rejects builder, parallel, SSH, container
+fixture and tmux options, and `--suite all` is still rejected before any client
+execution. See `docs/docker-registry-acceptance.md` for the acceptance contract.
+
+Before startup preflight, and before any client execution, state creation or
+VM provisioning, the runner admits the registry inputs read-only against
+`config/docker-registry-artifact-v3.1.1.json`: exact layout inventory and every
+decoded layer diff ID; byte-for-byte archive replay against that layout; the
+unexecuted `bin/registry` binary (SHA-256 `669f0d98...572834`, Go 1.25.9,
+Distribution v3.1.1) read from the pinned layer stream; and the isolated Python
+dependency versions against the lock. Every registry helper
+(`linux_docker_registry_*.py`, `linux_docker_private_stdin.py`, the pin, the
+lock, the Machine adapter and the wrapper) plus the archive digest are frozen in
+`inputs.json` and rechecked at the end of the run.
+
+Normal public Up still provisions two Environments with two Developer Linux
+Machines each. The registry recipe runs on three selected Machines (both
+primary, first neighbor); the second neighbor Machine is only a same-authority
+credential sentinel. Every Machine uses the same private nonloopback authority
+`172.30.241.2:5443` on its own internal Docker network with distinct in-memory
+secrets, so cross-Machine credential controls observe all four Machine-private
+Docker config directories: a baseline before the first Machine, after each
+valid login, after each logout, and a final check. Per Machine the sequence is
+prepare (load, private guest fixture, network/volume/server), authenticate
+(wrong CA, wrong password, unauthenticated push, then one route-attributed
+valid login), roundtrip (push, remove local references, pull by digest,
+export and compare bytes), independent raw-command replay plus secret-canary
+scan, and only then the exact owned cleanup and logout controls. No exception
+path calls cleanup; an incomplete or uncertain Session stays registered and
+withholds the harness's normal sentinel removal and public Stop, recording the
+retained state in `cleanup_errors`. Private material travels only through
+bounded private stdin and is never documented; evidence documents are rejected
+if they contain a fixture canary.
+
+This slice is `DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTIFICATION`.
+It does not close `docker.image.registry_login`, `docker.image.pull` or
+`docker.image.push`, does not prove a directly captured `/auth` request, and
+does not cover Stop/recovery credential persistence or migration. No physical
+registry candidate has been run through this wiring yet.
+
 ## Buildx candidate 1: failed, retained
 
 `.artifacts/linux-docker-build-candidate-1` exercised the signed installed
