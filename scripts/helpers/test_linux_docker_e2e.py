@@ -271,12 +271,33 @@ class AdmissionTests(unittest.TestCase):
             preflight.assert_not_called()
             run.assert_not_called()
         self.assertEqual(gate.SUITE_ORDER[-1], "recovery", "recovery cycles Stop/Up and must run last")
-        # `lifecycle` needs its own bounded runtime-audit window, so a composed
-        # run does not perform it and must not claim its scenarios.
-        self.assertEqual(set(gate.SUITES) - set(gate.SUITE_ORDER), {"lifecycle"})
-        self.assertFalse(gate.executes({"suite": "all"}, "lifecycle"))
+        # A composed run performs every suite exactly once.
+        self.assertEqual(set(gate.SUITES), set(gate.SUITE_ORDER))
+        self.assertEqual(len(gate.SUITE_ORDER), len(set(gate.SUITE_ORDER)))
+        # `lifecycle` needs its runtime-audit window to hold almost nothing but
+        # its own mutations, so it runs immediately before the last suite and
+        # opens that window itself.
+        self.assertEqual(gate.SUITE_ORDER[-2], "lifecycle")
+        self.assertTrue(gate.executes({"suite": "all"}, "lifecycle"))
         self.assertTrue(gate.executes({"suite": "all"}, "registry"))
         self.assertTrue(gate.executes({"suite": "lifecycle"}, "lifecycle"))
+        # Performing lifecycle means carrying its inputs: a composed run needs
+        # the terminal it drives, and may pin the container fixture.
+        common = []
+        for name in gate.startup.OPTIONS:
+            common.extend(["--" + name, "/absolute/input"])
+        composed = common + ["--suite", "all", "--registry-archive", "/absolute/archive",
+                             "--registry-layout", "/absolute/layout", "--buildkit-archive", "/absolute/buildkit",
+                             "--ssh-packages", "/absolute/packages"]
+        with self.assertRaisesRegex(driver.Rejected, "--tmux is required"):
+            gate.arguments(composed)
+        args = gate.arguments(composed + ["--tmux", "/absolute/tmux",
+                                          "--container-fixture", "/absolute/container"])
+        self.assertEqual((args.suite, args.tmux, args.container_fixture),
+                         ("all", "/absolute/tmux", "/absolute/container"))
+        # A suite that does not perform lifecycle still rejects both.
+        with self.assertRaisesRegex(driver.Rejected, "--tmux is required"):
+            gate.arguments(common + ["--suite", "compose", "--tmux", "/absolute/tmux"])
 
     def test_duplicate_suite_rejected(self):
         with self.assertRaisesRegex(driver.Rejected, "duplicate"):
@@ -695,6 +716,77 @@ class BuildDispatchTests(unittest.TestCase):
     def test_parallel_branch_calls_only_parallel_orchestrator_and_monitors_every_machine(self):
         self.check_owned_orchestrator("parallel", "linux_docker_build_parallel")
 
+    def test_prepare_suites_opens_the_whole_run_window_only_for_a_lifecycle_only_run(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.registry_controls, harness.registry_sessions = None, []
+        harness.enroll_runtime_audits = Mock()
+        for suites in (["lifecycle"], ["registry", "lifecycle", "recovery"], ["compose"]):
+            harness.enroll_runtime_audits.reset_mock()
+            # `registry` is absent from two of these, and its own preparation
+            # returns early; only the audit decision is under test here.
+            harness.prepare_suites([s for s in suites if s != "registry"],
+                                   ("c0",), (), None, Path("/owned/project"))
+            if suites == ["lifecycle"]:
+                harness.enroll_runtime_audits.assert_called_once_with(("c0",))
+            else:
+                harness.enroll_runtime_audits.assert_not_called()
+
+    def test_a_composed_run_opens_the_audit_window_around_lifecycle_only(self):
+        """The window must hold the lifecycle suite's mutations and little else.
+
+        A whole-run window overruns youki's 2048-record journal on sentinel
+        sampling alone, so a composed run enrolls immediately before the suite
+        and captures immediately after it, with the monitor paused so the
+        journal cannot move underneath the capture's own replay comparison.
+        """
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.runtime_audits, harness.runtime_audit_validation = [], None
+        harness.registry_controls, harness.registry_sessions = None, []
+        harness.live_cleanup = False
+        order = []
+        harness.enroll_runtime_audits = Mock(side_effect=lambda contexts: order.append(("enroll", tuple(contexts))))
+        def capture():
+            # Mid-run capture must run under the live-cleanup window, or
+            # `assert_certain` refuses it because the monitor is still alive.
+            self.assertTrue(harness.live_cleanup)
+            order.append("capture")
+            return ["four sessions"]
+        harness.capture_runtime_audits = Mock(side_effect=capture)
+        harness.run_machine_suite = Mock(side_effect=lambda suite, *_: order.append(("suite", suite)) or [suite])
+        paused = []
+        @contextlib.contextmanager
+        def pausing():
+            paused.append(("enter", tuple(order)))
+            try:
+                yield
+            finally:
+                paused.append(("exit", tuple(order)))
+        harness.monitor = Mock()
+        harness.monitor.paused = Mock(side_effect=pausing)
+        for suites, composed in ((["registry", "lifecycle", "recovery"], True), (["lifecycle"], False)):
+            order.clear(); paused.clear()
+            harness.runtime_audit_validation = None
+            harness.enroll_runtime_audits.reset_mock(); harness.capture_runtime_audits.reset_mock()
+            for suite in suites:
+                gate.ComposeHarness.run_suite_with_audit_window(harness, suite, suites, ("c0", "c1"), None, None)
+            if composed:
+                self.assertEqual(order, [("suite", "registry"), ("enroll", ("c0", "c1")),
+                                         ("suite", "lifecycle"), "capture", ("suite", "recovery")])
+                self.assertEqual(harness.runtime_audit_validation, ["four sessions"])
+                # Paused for the capture and nothing else.
+                self.assertEqual([edge for edge, _ in paused], ["enter", "exit"])
+                self.assertEqual(paused[0][1][-1], ("suite", "lifecycle"))
+                self.assertEqual(paused[1][1][-1], "capture")
+                self.assertFalse(harness.live_cleanup, "the live-cleanup window must close")
+            else:
+                # A lifecycle-only run keeps the whole-run window `prepare_suites`
+                # opened, so this path must neither enroll nor capture early.
+                self.assertEqual(order, [("suite", "lifecycle")])
+                harness.enroll_runtime_audits.assert_not_called()
+                harness.capture_runtime_audits.assert_not_called()
+                self.assertIsNone(harness.runtime_audit_validation)
+                self.assertEqual(paused, [])
+
     def check_owned_orchestrator(self, suite, module_name, fail_at=None):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
         image_pin = {'reference': 'python@sha256:' + 'b' * 64, 'id': 'sha256:' + 'c' * 64,
@@ -725,6 +817,18 @@ class BuildDispatchTests(unittest.TestCase):
         harness.docker, harness.mutate = Mock(), Mock()
         harness.driver_inputs, harness.validate_driver = Mock(), Mock()
         monitor = Mock()
+        # The monitor must stop sampling the Machine under test for exactly the
+        # timed region, so the mock is a real context manager and records both
+        # edges: the workload has to run inside it, and it has to end.
+        exclusions = []
+        @contextlib.contextmanager
+        def excluding(*names):
+            exclusions.append(("enter",) + names)
+            try:
+                yield
+            finally:
+                exclusions.append(("exit",) + names)
+        monitor.excluding = Mock(side_effect=excluding)
         monitor.close_interval = Mock(side_effect=lambda begin, active: gate.time.time_ns())
         monitor.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
         monitor.thread.is_alive.return_value = False
@@ -779,6 +883,11 @@ class BuildDispatchTests(unittest.TestCase):
             for i in range(3 if fail_at is None else fail_at + 1)])
         self.assertEqual(monitor.check_interval.call_args_list, [unittest.mock.call(
             10+2*i, 11+2*i, contexts[i]["name"]) for i in range(3 if fail_at is None else fail_at)])
+        dispatched = 3 if fail_at is None else fail_at + 1
+        self.assertEqual(exclusions, [edge for i in range(dispatched)
+                                      for edge in (("enter", contexts[i]["name"]),
+                                                   ("exit", contexts[i]["name"]))],
+                         "each Machine is unobserved for its own workload and no longer")
         monitor.start.assert_called_once_with()
         monitor.stop.assert_called_once_with()
         harness.driver_inputs.assert_not_called()
@@ -1164,6 +1273,51 @@ class UncertaintyTests(unittest.TestCase):
             monitor.check_interval(10, 20, "active")
         monitor.samples.append({"context": "neighbor", "unix_ns": 19})
         monitor.check_interval(10, 20, "active")
+
+    def monitor_loop_fixture(self, excluded=()):
+        """A monitor whose loop runs exactly one pass and records what it sampled."""
+        monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)
+        monitor.finished, monitor.first = threading.Event(), threading.Event()
+        monitor.errors, monitor.samples = [], []
+        monitor.rows = [{"descriptor": {"name": x}} for x in ("active", "sibling", "neighbor")]
+        monitor.excluded = frozenset(excluded)
+        sampled = []
+        def sample(row):
+            sampled.append(row["descriptor"]["name"])
+            monitor.finished.set()
+        monitor.sample = sample
+        return monitor, sampled
+
+    def test_the_loop_skips_the_machine_whose_journal_is_spent_elsewhere(self):
+        monitor, sampled = self.monitor_loop_fixture(excluded=("active",))
+        monitor.loop()
+        # Every liveness assertion already excludes the active Machine, so
+        # sampling it only consumed its bounded runtime-audit journal.
+        self.assertEqual(sampled, ["sibling", "neighbor"])
+        self.assertEqual(monitor.errors, [])
+        self.assertTrue(monitor.first.is_set())
+
+    def test_an_unexcluded_loop_samples_every_machine(self):
+        monitor, sampled = self.monitor_loop_fixture()
+        monitor.loop()
+        self.assertEqual(sampled, ["active", "sibling", "neighbor"])
+
+    def test_excluding_restores_the_previous_set_even_when_the_block_fails(self):
+        monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)
+        monitor.rows = [{"descriptor": {"name": x}} for x in ("active", "sibling")]
+        monitor.excluded = frozenset()
+        with monitor.excluding("active"):
+            self.assertEqual(monitor.excluded, frozenset({"active"}))
+            # Nesting adds rather than replaces, so an inner pause cannot
+            # silently re-expose the Machine an outer block is protecting.
+            with monitor.paused():
+                self.assertEqual(monitor.excluded, frozenset({"active", "sibling"}))
+            self.assertEqual(monitor.excluded, frozenset({"active"}))
+        self.assertEqual(monitor.excluded, frozenset())
+        with self.assertRaisesRegex(ValueError, "workload failed"):
+            with monitor.excluding("active"):
+                raise ValueError("workload failed")
+        self.assertEqual(monitor.excluded, frozenset())
 
     def test_monitor_cancellation_prevents_next_command(self):
         monitor = gate.SentinelMonitor.__new__(gate.SentinelMonitor)

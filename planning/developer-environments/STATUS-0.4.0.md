@@ -8,11 +8,17 @@ proven, and what remains. It is written to be read on its own.
 
 The release gate now exists and runs, and it says FAIL. That is the honest
 result: of the 85 scenarios the contract requires, none yet passes through the
-aggregate, because two of the four lanes are unimplemented and the Docker lane's
-own coverage has known gaps. What changed recently is that the gate, its
-validator, its frozen inputs and three of its four lanes are real, so every
-remaining piece now lands against a mechanical verdict instead of accumulating
-as separate focused passes.
+aggregate. Two of the four lanes are unimplemented, the Docker lane's own
+coverage has known gaps, and — found 2026-09-07 — **the Docker lane cannot be
+invoked by the gate at all**: the contract gives it `["--suite", "all"]`, and
+the harness rejects that argv until eight more required options are supplied
+(`vz-ao8`). Only `--dry-lanes` runs have taken that path, and a dry lane
+substitutes its result without starting the process, so the rejection had never
+been observed. That is the gap between a composed candidate passing all ten
+suites directly and zero scenarios passing the aggregate. What changed recently
+is that the gate, its validator, its frozen inputs and three of its four lanes
+are real, so every remaining piece now lands against a mechanical verdict
+instead of accumulating as separate focused passes.
 
 ## Tracked work
 
@@ -142,16 +148,32 @@ Candidates 17 to 21 continued the same pattern, each exposing one real coupling:
   for it, so the precondition is checked rather than assumed. Candidate 20 had
   won the same coin flip.
 
-One coupling remains. **lifecycle** cannot be composed, because its evidence is a
-youki runtime-audit journal bounded at 2,048 records per Machine that must be
-enrolled before any owned mutation and captured only after the monitor stops.
-Measured on candidate 21, the sentinel monitor alone reaches about 1,488 records
-per Machine in 25 minutes. It is excluded, its sixteen scenario IDs are reported
-missing rather than proven with a broken journal, and `--suite lifecycle` still
-proves them. The fix is identified: the monitor executes into the Machine
-currently running a suite, but both liveness assertions exclude that Machine's
-samples, so that execution is burning the exact resource lifecycle needs and
-proving nothing.
+Candidate 23 passed all ten composed suites with no non-zero exit outside the
+run's own negative assertions, so the fast path and every coupling above hold
+together across one provisioning.
+
+**lifecycle** was the last suite excluded from `--suite all`, because its
+evidence is a youki runtime-audit journal bounded at 2,048 records per Machine
+and a whole-run window overruns that on sentinel sampling alone — about 1,488
+records per Machine in 25 minutes, measured on candidate 21. Two changes compose
+it (`vz-mzs.7.1.16`), unit-tested but **not yet proven by a composed candidate**;
+the count of audit records on the lifecycle Machine is what will prove it:
+
+- The monitor no longer samples the Machine running the workload. Both liveness
+  assertions already excluded that Machine — `close_interval` subtracts it and
+  `check_interval` skips it — so the per-second exec into it produced evidence
+  no check ever read while spending the exact journal lifecycle needs. Sampling
+  resumes the moment another Machine is active, where it is a sibling and its
+  samples are used, so no sibling liveness is lost anywhere in the run.
+- A composed run opens the audit window immediately before the lifecycle suite
+  and closes it immediately after, with the monitor paused for the capture
+  alone. That is complete evidence for the suite, because it removes its own
+  containers and image before it returns. `--suite lifecycle` keeps the
+  whole-run window it always had.
+
+`lifecycle` now runs second to last in `SUITE_ORDER`, before `recovery`, which
+must stay last because it cycles Stop/Up and replaces the monitor. A composed
+run therefore carries `--tmux`, and may pin `--container-fixture`.
 
 The limits window coupling recorded here earlier is closed: the suite now runs
 180 one-second samples, and the reasoning is recorded beside the constant.

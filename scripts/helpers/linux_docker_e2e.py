@@ -12,6 +12,7 @@ Owned BuildKit builder cache volumes are removed by successful workload cleanup.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import copy
 import json
 import os
@@ -44,16 +45,16 @@ ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATIO
 # undisturbed until the end: `recovery` cycles Stop/Up and replaces the
 # sentinel monitor, so it always runs last.
 #
-# `lifecycle` is deliberately absent. Its evidence is a youki runtime-audit
-# journal bounded at 2048 records per Machine, and it must be enrolled before
-# any owned mutation and captured only once the monitor has stopped. A composed
-# run's sentinel sampling alone exceeds that bound, so youki correctly marks the
-# journal incomplete. Composing it needs its own enrolled window with the
-# monitor paused around it; until then `--suite all` reports the lifecycle
-# scenario IDs missing rather than proving them with a broken journal, and
-# `--suite lifecycle` remains the way to prove them.
+# `lifecycle` is second to last because its evidence is a youki runtime-audit
+# journal bounded at 2048 records per Machine. A whole-run window overflows
+# that bound on sentinel sampling alone, so in a composed run the window opens
+# immediately before the lifecycle suite and closes immediately after it: the
+# suite removes its own containers and image inside `run_machine`, so its own
+# mutations are still journaled end to end. Everything before it is proved by
+# its own suite evidence, not by this journal. `--suite lifecycle` keeps the
+# whole-run window it always had.
 SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
-               "images", "limits", "registry", "recovery")
+               "images", "limits", "registry", "lifecycle", "recovery")
 # The gate's selection: both primary Machines and the neighbour's first, with
 # the neighbour's second left as an untouched sentinel.
 GATE_MACHINES = (0, 1, 2)
@@ -104,10 +105,10 @@ def arguments(argv):
     for name in ("registry_archive", "registry_layout"):
         require((getattr(args, name) is not None) == (args.suite == "registry" or composed),
                 "--" + name.replace("_", "-") + " is required for the registry suite and for --suite all")
-    require(args.container_fixture is None or args.suite == "lifecycle",
+    require(args.container_fixture is None or args.suite == "lifecycle" or composed,
             "container-fixture requires the lifecycle suite")
-    require((args.tmux is not None) == (args.suite == "lifecycle"),
-            "--tmux is required only for the lifecycle suite")
+    require((args.tmux is not None) == (args.suite == "lifecycle" or composed),
+            "--tmux is required for the lifecycle suite and for --suite all")
     require(args.parallel_fixture is None or args.suite == "parallel" or composed,
             "parallel-fixture requires the parallel suite")
     require(args.suite == "ssh" or composed or all(getattr(args, name) is None
@@ -142,9 +143,9 @@ def preflight(args, require_host=True):
         registry_archive = startup.canonical(args.registry_archive)
         registry_layout = startup.canonical(args.registry_layout)
         registry = registry_machine.admit_inputs(registry_archive, registry_layout)
-    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
-            "--tmux is required only for the lifecycle suite")
-    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
+    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle" or composed),
+            "--tmux is required for the lifecycle suite and for --suite all")
+    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" or composed else None
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
@@ -263,7 +264,7 @@ def preflight(args, require_host=True):
         recovery_fixture_contract()
         for path in recovery_sources():
             info['inputs'][str(path)] = startup.digest(Path(path))
-    if args.suite == "lifecycle":
+    if composed or args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
         from linux_docker_runtime_audit_evidence import required_source_paths as audit_source_paths
@@ -540,6 +541,9 @@ class ComposeHarness(startup.Harness):
         self.ssh_cache_proofs = []
         self.ssh_cache_captures = []
         self.runtime_audits = []
+        # Set when a composed run closes its own audit window; the run's final
+        # cleanup must publish that capture rather than attempt a second one.
+        self.runtime_audit_validation = None
         self.registry_sessions = []
         self.prepared_images = {}
         self.active_suite = None
@@ -881,7 +885,12 @@ class ComposeHarness(startup.Harness):
         """Everything a suite needs in place before any workload, including the
         sentinels: runtime audits must journal every owned mutation, and the
         registry controls must observe the Docker configs before they change."""
-        if 'lifecycle' in suites:
+        # A lifecycle-only run keeps the whole-run window it always had: every
+        # owned mutation it makes, sentinels included, is inside the journal. A
+        # composed run cannot — sentinel sampling alone overruns the 2048-record
+        # bound — so it opens its window immediately before the lifecycle suite
+        # instead, in `scenario`.
+        if suites == ['lifecycle']:
             self.enroll_runtime_audits(contexts)
         if 'registry' not in suites:
             return
@@ -935,10 +944,11 @@ class ComposeHarness(startup.Harness):
                     from linux_docker_recovery_machine import run_machine
                 else:
                     from linux_docker_container_lifecycle import run_machine
-                begin = time.time_ns()
-                observation = run_machine(self, descriptor, scope, proof, images, index)
-                end = self.monitor.close_interval(begin, descriptor["name"])
-                self.monitor.check_interval(begin, end, descriptor["name"])
+                with self.monitor.excluding(descriptor["name"]):
+                    begin = time.time_ns()
+                    observation = run_machine(self, descriptor, scope, proof, images, index)
+                    end = self.monitor.close_interval(begin, descriptor["name"])
+                    self.monitor.check_interval(begin, end, descriptor["name"])
                 observations.append(observation)
                 continue
             inputs = self.driver_inputs(descriptor, scope, proof, images, suite)
@@ -948,26 +958,58 @@ class ComposeHarness(startup.Harness):
             selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
             self.drivers.append(selected)
             self.driver_cleanup_verified.append(False)
-            begin = time.time_ns()
-            result = selected.run(suite)
-            end = self.monitor.close_interval(begin, descriptor["name"])
-            require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
-                    str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
-            require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
-            builder_runtime = None
-            if suite == "build":
-                builder = self.get_builder(descriptor)
-                builder_runtime = builder.verify(require_invocation=True)
-                from linux_docker_buildkit_keep import verify_worker_log
-                builder_runtime["post_workload_log"] = verify_worker_log(builder)
-            replay = self.validate_driver(output, inputs, suite)
-            self.driver_cleanup_verified[-1] = True
-            self.monitor.check_interval(begin, end, descriptor["name"])
+            with self.monitor.excluding(descriptor["name"]):
+                begin = time.time_ns()
+                result = selected.run(suite)
+                end = self.monitor.close_interval(begin, descriptor["name"])
+                require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
+                        str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
+                require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
+                builder_runtime = None
+                if suite == "build":
+                    builder = self.get_builder(descriptor)
+                    builder_runtime = builder.verify(require_invocation=True)
+                    from linux_docker_buildkit_keep import verify_worker_log
+                    builder_runtime["post_workload_log"] = verify_worker_log(builder)
+                replay = self.validate_driver(output, inputs, suite)
+                self.driver_cleanup_verified[-1] = True
+                self.monitor.check_interval(begin, end, descriptor["name"])
             observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
                            "independent_validation": replay}
             if builder_runtime is not None:
                 observation["builder_runtime"] = builder_runtime
             observations.append(observation)
+        return observations
+
+    def run_suite_with_audit_window(self, suite, suites, contexts, selected_machines, bindings):
+        """One suite, inside its runtime-audit window when it needs its own.
+
+        Only `lifecycle` reads the youki journal, and only a composed run has
+        to bound it: a whole-run window overruns the 2048-record limit on
+        sentinel sampling alone. So the window opens immediately before the
+        suite and closes immediately after it, which is complete evidence for
+        this suite because it removes its own containers and image before it
+        returns. A `--suite lifecycle` run keeps the whole-run window
+        `prepare_suites` opened and captures it after owned removal, as before.
+        """
+        composed = suite == 'lifecycle' and len(suites) > 1
+        if composed:
+            self.enroll_runtime_audits(contexts)
+        observations = self.run_machine_suite(suite, selected_machines, bindings)
+        if composed:
+            # Capture snapshots the journal and requires an independent replay
+            # to match it exactly, so nothing may write to it in between; a
+            # sibling sample is the one writer still running at this point.
+            #
+            # `assert_certain` is the final-cleanup guard and demands a stopped
+            # monitor. This capture is mid-run, so it demands a healthy one
+            # instead, the same window `remove_builders(final=False)` uses.
+            self.live_cleanup = True
+            try:
+                with self.monitor.paused():
+                    self.runtime_audit_validation = self.capture_runtime_audits()
+            finally:
+                self.live_cleanup = False
         return observations
 
     def scenario(self):
@@ -1010,7 +1052,8 @@ class ComposeHarness(startup.Harness):
                 controls = self.registry_controls if suite == 'registry' else None
                 if controls is not None:
                     credential_controls = {'baseline': controls.baseline()}
-                slices[suite] = self.run_machine_suite(suite, selected_machines, bindings)
+                slices[suite] = self.run_suite_with_audit_window(
+                    suite, suites, contexts, selected_machines, bindings)
                 if controls is not None:
                     require(len(self.registry_sessions) == len(selected_machines) and
                             all(s.cleanup_complete is True for s in self.registry_sessions),
@@ -1051,7 +1094,39 @@ class SentinelMonitor:
         self.finished, self.first = threading.Event(), threading.Event()
         self.samples, self.errors = [], []
         self.probes = {}
+        # Context names this monitor must not sample right now. Every liveness
+        # assertion already excludes the Machine running the workload
+        # (`close_interval` subtracts it, `check_interval` skips it), so
+        # sampling it produced evidence no check reads while spending that
+        # Machine's bounded youki runtime-audit journal. Rebinding the whole
+        # frozenset is one attribute store, which the sampling thread reads
+        # atomically; no lock is needed and none is taken on the sampling path.
+        self.excluded = frozenset()
         self.thread = threading.Thread(target=self.loop, name="vz-compose-sibling-liveness", daemon=False)
+
+    @contextlib.contextmanager
+    def excluding(self, *names):
+        """Stop sampling these Machines for the duration of the block.
+
+        Sampling resumes the moment the block ends, including on failure, so a
+        Machine is unobserved only while it is the one under test or while its
+        journal is being captured.
+        """
+        previous = self.excluded
+        self.excluded = previous | frozenset(names)
+        try:
+            yield
+        finally:
+            self.excluded = previous
+
+    def paused(self):
+        """Exclude every Machine, for work that needs a quiescent journal.
+
+        An audit capture snapshots the journal, replays it independently and
+        requires the two to be identical; a sample arriving between them would
+        make that comparison fail for a reason unrelated to the evidence.
+        """
+        return self.excluding(*(row["descriptor"]["name"] for row in self.rows))
 
     def command(self, descriptor, args, *, after_stop=False):
         # The guard exists so a sampling thread stops dispatching the moment the
@@ -1110,7 +1185,12 @@ class SentinelMonitor:
     def loop(self):
         try:
             while not self.finished.is_set():
+                # Read once per pass so a row cannot be sampled against one
+                # exclusion set and skipped against another within a pass.
+                excluded = self.excluded
                 for row in self.rows:
+                    if row["descriptor"]["name"] in excluded:
+                        continue
                     self.sample(row)
                 self.first.set()
                 self.finished.wait(1)
@@ -1234,7 +1314,11 @@ def run(info):
             require(harness.monitor is None or not harness.monitor.thread.is_alive(), "live monitor prevents cleanup")
             harness.remove_owned()
             if executes(info, 'lifecycle'):
-                result['runtime_audit_validation'] = harness.capture_runtime_audits()
+                # A composed run closed its own window right after the suite;
+                # a lifecycle-only run closes it here, after owned removal.
+                captured = getattr(harness, 'runtime_audit_validation', None)
+                result['runtime_audit_validation'] = (
+                    captured if captured is not None else harness.capture_runtime_audits())
             if executes(info, "ssh"):
                 require(len(harness.ssh_cache_proofs) == 3, "three stopped SSH worker-cache proofs required")
                 result["ssh_stopped_cache_validation"] = harness.ssh_cache_proofs

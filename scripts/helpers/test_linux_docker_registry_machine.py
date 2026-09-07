@@ -51,11 +51,14 @@ class ArgumentTests(unittest.TestCase):
             with self.subTest(option=option), self.assertRaises(ValueError):
                 gate.arguments(['--suite', 'registry', *COMMON, *REGISTRY, '--' + option, '/foreign/input'])
         # A composed run carries every suite's inputs, so the registry ones are
-        # required rather than rejected, and the other suites' remain required too.
+        # required rather than rejected, and the other suites' remain required
+        # too — including the terminal the composed lifecycle suite drives.
         with self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
             gate.arguments(['--suite', 'all', *COMMON])
-        with self.assertRaisesRegex(ValueError, '--ssh-packages is required'):
+        with self.assertRaisesRegex(ValueError, '--tmux is required'):
             gate.arguments(['--suite', 'all', *COMMON, *REGISTRY])
+        with self.assertRaisesRegex(ValueError, '--ssh-packages is required'):
+            gate.arguments(['--suite', 'all', *COMMON, *REGISTRY, '--tmux', '/owned/tmux'])
 
     def test_registry_rejection_precedes_provisioning_inputs(self):
         # Suite/option admission fails before required startup options are demanded.
@@ -421,6 +424,9 @@ class ScenarioTests(unittest.TestCase):
         harness.docker, harness.mutate = Mock(), Mock()
         harness.driver_inputs, harness.validate_driver = Mock(), Mock()
         monitor = Mock()
+        # The monitor stops sampling the Machine under test for its workload,
+        # so this mock has to be a real context manager.
+        monitor.excluding = Mock(side_effect=lambda *names: contextlib.nullcontext())
         monitor.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
         monitor.thread.is_alive.return_value = False
         monitor.summary.return_value = {'samples': 'observed'}
