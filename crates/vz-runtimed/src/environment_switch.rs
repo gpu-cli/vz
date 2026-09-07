@@ -308,6 +308,7 @@ impl Fabric {
     }
 }
 
+pub mod registry;
 pub mod runtime;
 
 #[cfg(test)]
