@@ -43,6 +43,13 @@ COMPOSE_RECIPES = ("compose-create", "compose-up-order", "compose-logs", "compos
 # contract's ``all`` means the 63-scenario release lane, which this DEV runner
 # can never satisfy. A green ``build_compose`` run is fourteen fixture recipes.
 SUITE_RECIPES = {"build": BUILD_RECIPES, "compose": COMPOSE_RECIPES, "build_compose": BUILD_RECIPES + COMPOSE_RECIPES}
+# Compose operations here are gated by the fixture's own health intervals and by
+# `--wait-timeout 30`, so their duration is a property of the fixture, not of the
+# assertion. A composed run observed a correct `--abort-on-container-exit` take
+# longer than a 40s bound that a standalone run finished in 36s, so the bound is
+# a generous liveness deadline; every assertion is still on exact exit codes,
+# bytes and resource identity.
+COMPOSE_DEADLINE = 180
 COMPOSE_UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
 # A non-follow history read: Compose ``logs --follow`` keeps watching the
 # project for new containers regardless of running state (observed on the
@@ -883,7 +890,7 @@ class Driver:
         read = ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", marker]
         require(self.exec_container(db, read).stdout == payload, "host persistence marker was not written exactly")
         self.compose(project, ["stop"])
-        self.compose(project, COMPOSE_UP, timeout=40)
+        self.compose(project, COMPOSE_UP, timeout=COMPOSE_DEADLINE)
         after = self.capture(project)
         require(self.identities(before) == self.identities(after), "Compose stop/up changed resource identity")
         require(self.exec_container(self.by_service(after)["db"][0], read).stdout == payload,
@@ -906,7 +913,7 @@ class Driver:
         self.observe("compose-create", ["docker.compose.create"], create)
 
         def up() -> list[str]:
-            self.compose(project, COMPOSE_UP, timeout=40)
+            self.compose(project, COMPOSE_UP, timeout=COMPOSE_DEADLINE)
             services = self.by_service(self.capture(project))
             require(set(services) == {"db", "api", "worker", "isolated"}, "wrong ready services")
             require(all(len(items) == 1 and items[0]["State"].get("Health", {}).get("Status") == "healthy"
@@ -933,7 +940,7 @@ class Driver:
                 len(items) == 1 and items[0]["State"]["Running"] is True and
                 items[0]["State"].get("Health", {}).get("Status") == "healthy" for items in services.values()),
                 "logs read requires the exact healthy running inventory")
-            result = self.compose(project, COMPOSE_LOGS, timeout=40)
+            result = self.compose(project, COMPOSE_LOGS, timeout=COMPOSE_DEADLINE)
             sizes = assert_compose_logs(result.stdout, result.stderr, project,
                                         {role: items[0] for role, items in services.items()},
                                         self.fixture_spec["expected"]["logs"], self.inputs.owner)
@@ -989,7 +996,7 @@ class Driver:
 
         def scale() -> list[str]:
             self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--scale", "worker=3",
-                                   "--wait", "--wait-timeout", "30"], timeout=40)
+                                   "--wait", "--wait-timeout", "30"], timeout=COMPOSE_DEADLINE)
             items = self.by_service(self.capture(project))["worker"]
             require(len(items) == 3 and len({x["Id"] for x in items}) == 3, "three distinct replicas required")
             for item in items:
@@ -998,7 +1005,7 @@ class Driver:
                                                        "hostname": item["Config"]["Hostname"]}, "replica identity mismatch")
             before = {x["Id"] for x in items}
             self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--scale", "worker=1",
-                                   "--wait", "--wait-timeout", "30"], timeout=40)
+                                   "--wait", "--wait-timeout", "30"], timeout=COMPOSE_DEADLINE)
             after = self.by_service(self.capture(project))["worker"]
             require(len(after) == 1 and after[0]["Id"] in before, "scaled-down survivor changed identity")
             for removed_id in sorted(before - {after[0]["Id"]}):
@@ -1014,7 +1021,7 @@ class Driver:
             blocked_project = self.new_project("blocked")
             began = str(int(time.time()))
             result = self.compose(blocked_project, ["up", "--detach", "--no-build", "--pull", "never", "--wait",
-                                                    "--wait-timeout", "30"], blocked=True, expected=None, timeout=40)
+                                                    "--wait-timeout", "30"], blocked=True, expected=None, timeout=COMPOSE_DEADLINE)
             require(not result.timed_out and result.returncode > 0, "blocked dependency must fail normally")
             services = self.by_service(self.capture(blocked_project))
             require(set(services) == {"db", "api", "worker", "isolated"} and
@@ -1037,7 +1044,7 @@ class Driver:
         def failure() -> list[str]:
             failing_project = self.new_project("failure")
             result = self.compose(failing_project, ["--profile", "failure", "up", "--no-build", "--pull", "never",
-                                            "--abort-on-container-exit", "--exit-code-from", "failure"], expected=37, timeout=40)
+                                            "--abort-on-container-exit", "--exit-code-from", "failure"], expected=37, timeout=COMPOSE_DEADLINE)
             services = self.by_service(self.capture(failing_project))
             require(len(services.get("failure", [])) == 1, "failure container evidence missing")
             job = services["failure"][0]
