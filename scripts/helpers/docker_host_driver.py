@@ -44,11 +44,11 @@ COMPOSE_RECIPES = ("compose-create", "compose-up-order", "compose-logs", "compos
 # can never satisfy. A green ``build_compose`` run is fourteen fixture recipes.
 SUITE_RECIPES = {"build": BUILD_RECIPES, "compose": COMPOSE_RECIPES, "build_compose": BUILD_RECIPES + COMPOSE_RECIPES}
 COMPOSE_UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
-# Follow terminates deterministically only because every project container has
-# already been stopped: the Engine closes a non-running container's log stream
-# after its history and Compose has no running container left to watch. No
-# ``--until``/timestamp heuristic is used; a hang is a timed-out failure.
-COMPOSE_LOGS = ["logs", "--follow", "--no-color"]
+# A non-follow history read: Compose ``logs --follow`` keeps watching the
+# project for new containers regardless of running state (observed on the
+# installed clients, candidate 5), so follow never terminates deterministically.
+# No timestamps: the fixture services print exactly their startup lines.
+COMPOSE_LOGS = ["logs", "--no-color"]
 COMPOSE_LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
 COMPOSE_GLOBAL_OPTIONS = {"--project-name", "--file", "--profile"}
 
@@ -883,7 +883,7 @@ class Driver:
         read = ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", marker]
         require(self.exec_container(db, read).stdout == payload, "host persistence marker was not written exactly")
         self.compose(project, ["stop"])
-        self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"], timeout=40)
+        self.compose(project, COMPOSE_UP, timeout=40)
         after = self.capture(project)
         require(self.identities(before) == self.identities(after), "Compose stop/up changed resource identity")
         require(self.exec_container(self.by_service(after)["db"][0], read).stdout == payload,
@@ -906,7 +906,7 @@ class Driver:
         self.observe("compose-create", ["docker.compose.create"], create)
 
         def up() -> list[str]:
-            self.compose(project, ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"], timeout=40)
+            self.compose(project, COMPOSE_UP, timeout=40)
             services = self.by_service(self.capture(project))
             require(set(services) == {"db", "api", "worker", "isolated"}, "wrong ready services")
             require(all(len(items) == 1 and items[0]["State"].get("Health", {}).get("Status") == "healthy"
@@ -923,32 +923,26 @@ class Driver:
                                           "docker.compose.health_ordering"], up)
 
         def logs() -> list[str]:
-            # Exactly one startup sequence exists per container at this point.
-            # Stopping first is what makes ``logs --follow`` terminate: the
-            # Engine does not follow a non-running container and Compose has
-            # nothing left to watch. The retained follow is therefore history
-            # replayed through the follow path, not live streaming.
-            self.compose(project, ["stop"])
-            stopped = self.capture(project)
-            services = self.by_service(stopped)
+            # Read-only history of the running, healthy project: each container
+            # holds exactly one startup sequence and the fixture servers print
+            # nothing afterwards (HTTP logging is silenced; health checks are
+            # execs), so the expectation is exact equality, not a prefix rule.
+            # No state is mutated by this recipe.
+            services = self.by_service(self.capture(project))
             require(set(services) == {"db", "api", "worker", "isolated"} and all(
-                len(items) == 1 and items[0]["State"]["Status"] == "exited" and items[0]["State"]["Running"] is False
-                for items in services.values()), "services not stopped; follow termination would be nondeterministic")
+                len(items) == 1 and items[0]["State"]["Running"] is True and
+                items[0]["State"].get("Health", {}).get("Status") == "healthy" for items in services.values()),
+                "logs read requires the exact healthy running inventory")
             result = self.compose(project, COMPOSE_LOGS, timeout=40)
             sizes = assert_compose_logs(result.stdout, result.stderr, project,
                                         {role: items[0] for role, items in services.items()},
                                         self.fixture_spec["expected"]["logs"], self.inputs.owner)
-            self.compose(project, COMPOSE_UP, timeout=40)
-            after = self.capture(project)
-            require(self.identities(stopped) == self.identities(after), "Compose stop/up changed resource identity")
-            require(all(len(items) == 1 and items[0]["State"].get("Health", {}).get("Status") == "healthy"
-                        for items in self.by_service(after).values()), "service unhealthy after restart")
-            return ["four stopped services followed to termination; exact per-service log bytes and order: " +
+            return ["exact per-service startup log bytes and order read from the running project: " +
                     json.dumps(sizes, sort_keys=True, separators=(",", ":")) + " bytes",
                     "every line attributed to this project's exact owned container names and owner token; "
                     "no foreign project/Machine output",
                     "compose logs raw stdout sha256 " + sha256(result.stdout),
-                    "Compose stop/up preserved IDs and health; live running-container streaming still required"]
+                    "history read only; live follow streaming still required"]
 
         self.observe("compose-logs", ["docker.compose.logs"], logs)
 
@@ -1246,7 +1240,7 @@ def compose_subcommand(args: list[str]) -> str | None:
 
 def assert_compose_logs(stdout: bytes, stderr: bytes, project: str, containers: dict[str, dict[str, Any]],
                         expected: dict[str, list[str]], owner: str) -> dict[str, int]:
-    """Attribute every followed line to one exact owned container; exact per-service bytes and order.
+    """Attribute every history line to one exact owned container; exact per-service bytes and order.
 
     Compose prefixes each line with the container name minus the project
     (``db-1 | ``), padded to the widest name seen so far, so padding and

@@ -33,7 +33,8 @@ IMAGES_SCOPE = "DEV_INSTALLED_LINUX_IMAGE_ROUNDTRIP_NOT_RELEASE_CERTIFICATION"
 REGISTRY_SCOPE = "DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTIFICATION"
 HANDSHAKE_SCOPE = "DEV_INSTALLED_LINUX_ENGINE_HANDSHAKE_NOT_RELEASE_CERTIFICATION"
 LIMITS_SCOPE = "DEV_INSTALLED_LINUX_RESOURCE_LIMITS_OOM_NOT_RELEASE_CERTIFICATION"
-SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits")
+RECOVERY_SCOPE = "DEV_INSTALLED_LINUX_PERSISTENCE_STOP_UP_RECOVERY_NOT_RELEASE_CERTIFICATION"
+SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -87,7 +88,7 @@ def arguments(argv):
 
 def preflight(args, require_host=True):
     require(args.suite in SUITES, "full contract unavailable")
-    if args.suite in ('images', 'registry', 'handshake', 'limits'):
+    if args.suite in ('images', 'registry', 'handshake', 'limits', 'recovery'):
         require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
                 ('image' if args.suite == 'images' else args.suite) + ' suite rejects builder, foreign fixture and terminal options')
@@ -113,7 +114,7 @@ def preflight(args, require_host=True):
     ca_pin = public_ca_input(ca_path)
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
               "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
-              "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE}
+              "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "recovery": RECOVERY_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -210,6 +211,12 @@ def preflight(args, require_host=True):
         for path in selected.rglob("*"):
             if path.is_file():
                 info['inputs'][str(path)] = startup.digest(path)
+    if args.suite == 'recovery':
+        from linux_docker_recovery_machine import fixture_contract as recovery_fixture_contract
+        from linux_docker_recovery_machine import required_source_paths as recovery_sources
+        recovery_fixture_contract()
+        for path in recovery_sources():
+            info['inputs'][str(path)] = startup.digest(Path(path))
     if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
@@ -488,6 +495,7 @@ class ComposeHarness(startup.Harness):
         self.ssh_cache_captures = []
         self.runtime_audits = []
         self.registry_sessions = []
+        self.recovery_sessions, self.recovery_cycles, self.recovery_monitors = [], {}, []
         self.registry_controls = None
         self.registry_project = None
 
@@ -689,6 +697,12 @@ class ComposeHarness(startup.Harness):
         for session in getattr(self, 'limits_sessions', []):
             require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
                     'limits Session lacks completed cleanup; containers retained; cleanup withheld')
+        for session in getattr(self, 'recovery_sessions', []):
+            require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
+                    'recovery Session lacks completed cleanup; volumes/containers retained; cleanup withheld')
+        for retired in getattr(self, 'recovery_monitors', []):
+            require(not retired.thread.is_alive() and not retired.errors, 'retired recovery monitor live or failed; cleanup withheld')
+            require(not any(x["effects_uncertain"] for x in retired.record.receipts), 'uncertain retired-monitor command; cleanup withheld')
         require(all(getattr(self, "keep_proofs_verified", [])),
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
         recorders = [self.record, *(d.record for d in self.drivers)]
@@ -815,7 +829,7 @@ class ComposeHarness(startup.Harness):
                 self.monitor.check()
                 descriptor = machine["docker_context"]
                 scope, proof = bindings[machine["machine_id"]]
-                if suite in ('images', 'registry', 'handshake'):
+                if suite in ('images', 'registry', 'handshake', 'recovery'):
                     # Driver schema compatibility only: this recipe uses tiny
                     # source-selected archives, not the Python/Compose image.
                     # Never pull/build/execute those admission-only image pins.
@@ -823,7 +837,7 @@ class ComposeHarness(startup.Harness):
                     images = {'base': dict(base), 'compose': dict(base)}
                 else:
                     images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits"}:
+                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery"}:
                     if suite == "artifacts":
                         from linux_docker_build_artifacts import run_machine
                     elif suite == "parallel":
@@ -838,6 +852,8 @@ class ComposeHarness(startup.Harness):
                         from linux_docker_handshake_machine import run_machine
                     elif suite == 'limits':
                         from linux_docker_limits_machine import run_machine
+                    elif suite == 'recovery':
+                        from linux_docker_recovery_machine import run_machine
                     else:
                         from linux_docker_container_lifecycle import run_machine
                     begin = time.time_ns()
@@ -877,9 +893,18 @@ class ComposeHarness(startup.Harness):
                 require(len(self.registry_sessions) == 3 and all(s.cleanup_complete is True for s in self.registry_sessions),
                         'three completed registry Sessions required')
                 credential_controls['final'] = controls.final()
-            require(self.inspect(self.status(project, primary["environment_id"])) == primary_contexts and
-                    self.inspect(self.status(project, neighbor["environment_id"])) == neighbor_contexts,
-                    "topology identity changed during Docker fixture work")
+            if suite == 'recovery':
+                # Stop/Up cycles legitimately advance incarnations; stable identity must hold.
+                for environment, expected in ((primary, primary_contexts), (neighbor, neighbor_contexts)):
+                    live = self.inspect(self.status(project, environment["environment_id"]))
+                    require(len(live) == len(expected) and all(
+                        all(a[k] == b[k] for k in ("owner", "name", "endpoint", "config_dir", "engine_id")) and
+                        a["incarnation_generation"] > b["incarnation_generation"] for a, b in zip(live, expected)),
+                        "recovery changed stable Machine identity or failed to advance incarnation")
+            else:
+                require(self.inspect(self.status(project, primary["environment_id"])) == primary_contexts and
+                        self.inspect(self.status(project, neighbor["environment_id"])) == neighbor_contexts,
+                        "topology identity changed during Docker fixture work")
         finally:
             self.monitor.stop()
         result = {"machine_slices": observations, "continuous_sentinels": self.monitor.summary(),
@@ -1014,6 +1039,10 @@ def run(info):
                     "three completed registry Sessions required")
             require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
                     "registry archive changed during run")
+        if info["suite"] == "recovery":
+            sessions = harness.recovery_sessions
+            require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
+                    "three completed recovery Sessions required")
     except BaseException as error:
         result["error"] = f"{type(error).__name__}: {error}"
     finally:

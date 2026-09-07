@@ -111,8 +111,7 @@ class SyntheticEngine:
                 code = 37
                 stdout, stderr = (f"vz04|api|{self.owner}|exec-{stream}\n".encode() for stream in ("stdout", "stderr"))
             elif action == "logs":
-                assert tail == ["logs", "--follow", "--no-color"], tail
-                assert all(not item["State"]["Running"] for item in self.projects[project]["container"]), "follow on running services"
+                assert tail == ["logs", "--no-color"], tail
                 stdout = self.compose_logs(project)
             else:
                 self.install(project, failure="--exit-code-from" in tail)
@@ -373,7 +372,7 @@ class ComposeEvidenceTests(unittest.TestCase):
         self.assertEqual(len(value["owned_projects"]), 3)
 
     def logs_row(self, row):
-        return row["argv"][-3:] == evidence.LOGS
+        return row["argv"][5] == "compose" and row["argv"][-len(evidence.LOGS):] == evidence.LOGS
 
     def fresh(self):
         shutil.rmtree(self.directory)
@@ -392,16 +391,17 @@ class ComposeEvidenceTests(unittest.TestCase):
         result_path.write_bytes(data(result))
         self.refresh()
 
-    def test_compose_logs_recipe_is_readonly_follow_after_stop_and_before_restart(self):
+    def test_compose_logs_recipe_is_a_readonly_history_read_without_follow_or_mutation(self):
         rows = [row for _path, row in self.receipts()]
         index = next(i for i, row in enumerate(rows) if self.logs_row(row))
         self.assertIs(rows[index]["mutation"], False)
         self.assertEqual(rows[index]["exit_code"], 0)
-        self.assertEqual(rows[index]["argv"][5:9][:3], ["compose", "--project-name", driver.Inputs(self.raw_inputs(), suite="compose").owner + "-compose"])
-        before = [row["argv"][-1] for row in rows[:index] if row["argv"][5] == "compose"]
-        after = [row["argv"][-1] for row in rows[index + 1:] if row["argv"][5] == "compose"]
-        self.assertEqual(before[-1], "stop")
-        self.assertEqual(after[0], "30")  # up --wait --wait-timeout 30 restores the topology
+        self.assertNotIn("--follow", rows[index]["argv"])
+        self.assertEqual(rows[index]["argv"][5:8], ["compose", "--project-name", driver.Inputs(self.raw_inputs(), suite="compose").owner + "-compose"])
+        item = json.loads((self.directory / "result.json").read_bytes())["observations"][evidence.RECIPES.index("compose-logs")]
+        span = rows[item["first_command"] - 1:item["last_command"]]
+        self.assertTrue(all(row["mutation"] is False for row in span), "logs recipe must not mutate")
+        self.assertEqual([row["argv"][5] for row in span if row["argv"][5] == "compose"], ["compose"])
 
     def test_compose_logs_padding_and_full_container_name_prefixes_are_accepted(self):
         owner = driver.Inputs(self.raw_inputs(), suite="compose").owner
@@ -458,14 +458,14 @@ class ComposeEvidenceTests(unittest.TestCase):
         self.refresh()
         self.rejected()
 
-    def test_compose_logs_follow_requires_every_service_stopped_first(self):
+    def test_compose_logs_read_requires_exact_healthy_running_inventory(self):
         rows = [row for _path, row in self.receipts()]
         index = next(i for i, row in enumerate(rows) if self.logs_row(row))
         inspect = next(row for row in reversed(rows[:index]) if row["argv"][5:7] == ["container", "inspect"])
         def change(raw):
             items = json.loads(raw)
             next(item for item in items if item["Config"]["Labels"]["com.docker.compose.service"] == "worker")["State"].update(
-                Status="running", Running=True)
+                Status="exited", Running=False)
             return data(items)
         self.raw(lambda row: row["index"] == inspect["index"], change)
         self.rejected()

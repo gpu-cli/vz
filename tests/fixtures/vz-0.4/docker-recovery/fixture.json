@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "scope": "DEV_installed_Machine_persistence_stop_up_recovery_not_release_certification",
+  "persistence_sentinel": {
+    "path": "persistence-sentinel.txt",
+    "sha256": "e8bde1b5f95fce44ceaa03005051f8d2e01847f9e052f4ff00557a5a49c074aa",
+    "bytes": 43,
+    "volume_path": "/data/persistence-sentinel",
+    "writable_layer_path": "/vz-recovery-writable-sentinel",
+    "interpreter": ["/bin/busybox", "sh", "-c"]
+  },
+  "workload": {
+    "restart_policy": "always",
+    "always_command": ["/bin/busybox", "sleep", "7200"],
+    "network_mode": "none",
+    "image_scope": "harness_sentinel_developer_probe_rootfs_import_no_pull"
+  },
+  "readiness_poll": {
+    "condition": "docker info --format {{.ID}} through the same private context returns the pinned Engine ID and, where a Session exists, container inspect of the restart=always container reports State.Running true with a StartedAt later than before Stop",
+    "interval_seconds": 1,
+    "deadline_seconds": 60,
+    "clock": "host time_ns measured from the positive public Up terminal receipt"
+  },
+  "recovery_path": {
+    "kind": "public_stop_then_public_up_of_the_owning_environment",
+    "in_guest_dockerd_restart_supported": false,
+    "supervision_source": "crates/vz-guest-agent/src/docker.rs"
+  }
+}

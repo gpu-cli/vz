@@ -13,8 +13,8 @@ test infrastructure: the installed container-lifecycle lane is not yet complete.
 
 The executable subset currently covers:
 
-- Compose create, healthy up with Engine-event dependency ordering, bounded
-  `logs --follow` with exact per-service log bytes/order and owned-container
+- Compose create, healthy up with Engine-event dependency ordering, a read-only
+  `logs` history read with exact per-service log bytes/order and owned-container
   attribution, exact stdout/stderr/exit 37 exec, declared network membership and
   denial by name and actual IP, volume persistence across Compose stop/up,
   three-replica scale-up and exact scale-down identities, unhealthy-dependency
@@ -150,15 +150,17 @@ verify the acknowledgement and replay its proof, never treat host exit alone as
 daemon-side quiescence.
 
 The `compose-logs` recipe runs immediately after the healthy up, when every
-container holds exactly one startup sequence. It first runs `compose stop` and
-inspects all four containers as `exited`; only then does it dispatch
-`compose logs --follow --no-color`. The follow terminates deterministically for
-that reason alone: the Engine does not follow a non-running container's log
-stream and Compose has no running container left to watch. No `--until`,
-`--since`, `--timestamps` or wall-clock heuristic is used, and a follow that
-does not exit is a timed-out failure. The recipe then replays `up --wait`,
-requires unchanged resource identities and healthy state, and the later
-recipes proceed. Each stdout line must match Compose's `name | message`
+container holds exactly one startup sequence, and mutates nothing. It re-inspects
+the four containers as running and healthy, then dispatches the non-follow
+history read `compose logs --no-color`. `--follow` is deliberately not used:
+Compose v2 keeps watching the project for new containers regardless of running
+state, so even after `compose stop` a follow never terminates (installed
+candidate 5 hit the 40 s timeout with all containers exited). `--timestamps`,
+`--since` and `--until` are not used either, so the retained bytes are exactly
+the container output. The expectation is exact equality, not a prefix rule: the
+fixture servers silence HTTP request logging and health checks run as execs, so
+nothing is written after each service's `listening` line. Each stdout line must
+match Compose's `name | message`
 prefix form and resolve to one of the exact inspected owned containers
 (`<service>-1`, or its full `<project>-<service>-1` name); padding and
 cross-service interleaving are not deterministic and are not compared. The
@@ -167,9 +169,7 @@ this run/Machine owner token substituted, so a line from another project,
 Machine or replica cannot satisfy the inventory, and stderr must be empty.
 The observation records the raw stdout SHA-256 as an assertion, which the
 independent Compose replay recomputes from the retained stream. This is a
-history-through-follow observation and is not live running-container
-streaming; the physical Compose behavior on the installed clients still
-requires the installed harness run.
+history read, not live `--follow` streaming, which remains open.
 
 Compose admission and cleanup inspect exact generated volume/network names even
 without labels, reject collisions, and reconcile actual mounts/network IDs to
@@ -214,8 +214,8 @@ PYTHONDONTWRITEBYTECODE=1 uv run --offline --with jsonschema==4.23.0 \
 Physical execution; authenticated runtime/owner provenance; full cache export /
 fresh-builder import and cross-Machine tests; OCI metadata/layer comparisons;
 all-layer/decompressed-cache secret scans; complete SSH support; live
-running-container Compose log streaming; unrelated cleanup decoys and
-surviving-environment health; full
+`compose logs --follow` streaming (needs an external, bounded terminator);
+unrelated cleanup decoys and surviving-environment health; full
 registry/container/storage/network/resource-pressure/recovery coverage and the
 single aggregate release run remain open.
 

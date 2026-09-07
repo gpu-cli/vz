@@ -26,7 +26,7 @@ RELATED = (
 )
 ROLES = {"db", "api", "worker", "isolated"}
 UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
-LOGS = ["logs", "--follow", "--no-color"]
+LOGS = ["logs", "--no-color"]
 LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
 # One startup sequence per service, in order; every line carries the owner token.
 LOG_EVENTS = {"db": ("listening",), "api": ("dependency-healthy", "listening"),
@@ -443,19 +443,13 @@ class Replay:
                         and ready[role][0]["State"]["Running"] for role in ROLES), "wrong healthy service identity")
             self.events(project, ready)
         with self.observation("compose-logs"):
-            # Follow can only terminate because every container was stopped
-            # first; replay demands that stopped inventory before the follow.
-            self.compose(project, ["stop"])
-            stopped = self.services(self.inventory(project))
-            require(all(stopped[role][0]["Id"] == ready[role][0]["Id"] and stopped[role][0]["State"]["Status"] == "exited"
-                        and stopped[role][0]["State"]["Running"] is False for role in ROLES), "follow precondition: services not stopped")
+            # Read-only history of the running project; no stop/up mutation.
+            current = self.services(self.inventory(project))
+            require(all(current[role][0]["Id"] == ready[role][0]["Id"] and current[role][0]["State"]["Running"] is True
+                        and current[role][0]["State"]["Health"]["Status"] == "healthy" for role in ROLES),
+                    "logs read requires the exact healthy running inventory")
             row = self.compose(project, LOGS, mutation=False)
-            self.logs(project, row, {role: stopped[role][0] for role in ROLES})
-            self.compose(project, UP)
-            restarted = self.services(self.inventory(project))
-            require(all(restarted[role][0]["Id"] == ready[role][0]["Id"] and restarted[role][0]["State"]["Running"]
-                        and restarted[role][0]["State"]["Health"]["Status"] == "healthy" for role in ROLES),
-                    "restart after follow changed identity or health")
+            self.logs(project, row, {role: current[role][0] for role in ROLES})
         with self.observation("compose-exec"):
             row = self.compose(project, ["exec", "--no-TTY", "api", "python3", "/fixture/service.py", "exec"], code=37)
             require(row["_stdout"] == f"vz04|api|{self.owner}|exec-stdout\n".encode()
@@ -504,7 +498,7 @@ class Replay:
                 "release_scenarios_passed": []}
 
     def logs(self, project, row, containers):
-        """Every followed line must belong to an exact owned container and carry this owner's token."""
+        """Every line must belong to an exact owned container and carry this owner's token."""
         stdout = row["_stdout"]
         require(not row["_stderr"] and 0 < len(stdout) <= MAX and stdout.endswith(b"\n"),
                 "Compose logs diagnostics, empty or unterminated output")

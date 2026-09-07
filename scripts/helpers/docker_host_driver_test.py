@@ -166,6 +166,7 @@ class BoundaryTests(unittest.TestCase):
             return driver.Command(len(seen), argv, 0, b"", b"")
         item.record = type("Record", (), {"run": staticmethod(run)})()
         item.command(prefix + driver.COMPOSE_LOGS)
+        self.assertNotIn("--follow", driver.COMPOSE_LOGS)
         item.command(prefix + ["stop"])
         item.command(prefix + ["version"])
         item.command(["logs", "a" * 64])
