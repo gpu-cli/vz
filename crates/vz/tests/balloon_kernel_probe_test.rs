@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use vz::{NetworkConfig, VmConfigBuilder};
+use vz::VmConfigBuilder;
 
 fn linux_artifacts() -> Option<(PathBuf, PathBuf)> {
     let home = std::env::var_os("HOME")?;
@@ -65,7 +65,7 @@ async fn virtio_balloon_driver_loads_in_guest() {
             // Verbose loglevel + ignore_loglevel so every printk shows up.
             "console=hvc0 vz_idle=1",
         )
-        .network(NetworkConfig::None)
+        .nics([])
         .nested_virtualization(false)
         .serial_log_file(serial_log.clone())
         .build()

@@ -67,8 +67,8 @@ pub mod vsock;
 
 #[cfg(target_os = "macos")]
 pub use config::{
-    BootLoader, DiskConfig, FileHandleNetwork, MacPlatformConfig, NetworkConfig, SharedDirConfig,
-    VmConfigBuilder,
+    BootLoader, DiskConfig, FileHandleNetwork, MacPlatformConfig, NetworkConfig, Nic,
+    SharedDirConfig, VmConfigBuilder,
 };
 #[cfg(target_os = "macos")]
 pub use error::VzError;

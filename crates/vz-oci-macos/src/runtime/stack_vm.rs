@@ -1671,7 +1671,7 @@ esac
         }
 
         if !self.config.default_network_enabled {
-            vm_config.network = Some(NetworkConfig::None);
+            vm_config.nics = Some(Vec::new());
         }
 
         let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)

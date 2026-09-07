@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
-use vz::{NetworkConfig, VmConfigBuilder};
+use vz::VmConfigBuilder;
 
 const ONE_MB: u64 = 1024 * 1024;
 const ONE_GB: u64 = 1024 * ONE_MB;
@@ -144,7 +144,7 @@ async fn measure_n_vms(
             .cpus(1)
             .memory_bytes(memory_per_vm)
             .boot_linux(kernel.to_path_buf(), Some(initramfs.to_path_buf()), cmdline)
-            .network(NetworkConfig::None)
+            .nics([])
             .nested_virtualization(false)
             .build()
             .unwrap();
@@ -248,7 +248,7 @@ async fn balloon_reclaims_real_pages_under_load() {
             .cpus(1)
             .memory_bytes(memory_per_vm)
             .boot_linux(kernel.clone(), Some(initramfs.clone()), cmdline)
-            .network(NetworkConfig::None)
+            .nics([])
             .nested_virtualization(false)
             .build()
             .unwrap();
@@ -349,7 +349,7 @@ async fn measure_n_idle_vms_host_rss() {
                 Some(initramfs.clone()),
                 "console=hvc0 quiet",
             )
-            .network(NetworkConfig::None)
+            .nics([])
             .nested_virtualization(false)
             .build()
             .unwrap();

@@ -3,7 +3,7 @@ use anyhow::{Context, Result, ensure};
 use clap::Parser;
 use sha2::{Digest, Sha256};
 use std::{fs, io::Read, os::unix::fs::DirBuilderExt, path::PathBuf, sync::Arc, time::Duration};
-use vz::{DiskConfig, MacPlatformConfig, NetworkConfig, Vm, VmConfigBuilder, VmState};
+use vz::{DiskConfig, MacPlatformConfig, Vm, VmConfigBuilder, VmState};
 use vz_linux::grpc_client::GrpcAgentClient;
 use vz_macos_provision::toolchain::ToolchainManifest;
 
@@ -274,7 +274,7 @@ pub async fn run(args: Args) -> Result<()> {
             auxiliary_storage_path: args.output.join("auxiliary-storage"),
             machine_identifier_path: args.output.join("machine-identifier"),
         })
-        .network(NetworkConfig::None)
+        .nics([])
         .enable_vsock()
         .build()?;
     let vm = Arc::new(Vm::create(config).await?);

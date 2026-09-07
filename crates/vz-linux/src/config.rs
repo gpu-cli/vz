@@ -4,7 +4,7 @@ use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
 use vz::config::VmConfig;
-use vz::{DiskConfig, NetworkConfig, SharedDirConfig, VmConfigBuilder};
+use vz::{DiskConfig, Nic, SharedDirConfig, VmConfigBuilder};
 
 use crate::LinuxError;
 
@@ -36,8 +36,10 @@ pub struct LinuxVmConfig {
     pub machine_identifier: Option<Vec<u8>>,
     /// Enable vsock.
     pub vsock: bool,
-    /// Optional network config.
-    pub network: Option<NetworkConfig>,
+    /// Optional NIC list, replacing the builder's default single NAT NIC.
+    ///
+    /// An empty list leaves the Machine with no network at all.
+    pub nics: Option<Vec<Nic>>,
     /// Optional disk image to attach as a VirtioBlock device.
     ///
     /// Used for persistent named volumes — an ext4 filesystem image
@@ -217,8 +219,8 @@ impl LinuxVmConfig {
             builder = builder.enable_vsock();
         }
 
-        if let Some(network) = &self.network {
-            builder = builder.network(network.clone());
+        if let Some(nics) = &self.nics {
+            builder = builder.nics(nics.clone());
         }
 
         for disk in &self.disks {
@@ -294,7 +296,7 @@ impl Default for LinuxVmConfig {
             serial_log_file: None,
             machine_identifier: None,
             vsock: true,
-            network: None,
+            nics: None,
             disk_image: None,
             disks: Vec::new(),
             nested_virtualization: true,
@@ -318,7 +320,7 @@ mod tests {
         assert_eq!(cfg.cpus, 2);
         assert_eq!(cfg.memory_mb, 512);
         assert!(cfg.vsock);
-        assert!(cfg.network.is_none());
+        assert!(cfg.nics.is_none());
         assert!(cfg.rootfs_dir.is_none());
         assert!(cfg.serial_log_file.is_none());
     }

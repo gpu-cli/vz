@@ -12,7 +12,7 @@
 use std::path::PathBuf;
 
 use vz::{
-    BootLoader, DiskConfig, FileHandleNetwork, MacPlatformConfig, NetworkConfig, SharedDirConfig,
+    BootLoader, DiskConfig, FileHandleNetwork, MacPlatformConfig, Nic, SharedDirConfig,
     VmConfigBuilder, VzError,
 };
 
@@ -288,7 +288,9 @@ fn parse_mac_octets(mac: &str) -> [u8; 6] {
 #[test]
 fn builder_generates_locally_administered_mac_by_default() {
     let cfg = build_minimal_linux_config();
-    let mac = cfg.mac_address();
+    let macs = cfg.mac_addresses();
+    assert_eq!(macs.len(), 1, "the default is a single NAT NIC");
+    let mac = macs[0];
     assert_eq!(mac.split(':').count(), 6, "mac should be 6 octets: {mac}");
     let bytes = parse_mac_octets(mac);
     // Locally administered: second-LSB of first octet set.
@@ -308,10 +310,10 @@ fn two_vm_configs_get_different_macs() {
     let a = build_minimal_linux_config();
     let b = build_minimal_linux_config();
     assert_ne!(
-        a.mac_address(),
-        b.mac_address(),
-        "fresh VmConfigs must get distinct MACs (got {} for both)",
-        a.mac_address()
+        a.mac_addresses(),
+        b.mac_addresses(),
+        "fresh VmConfigs must get distinct MACs (got {:?} for both)",
+        a.mac_addresses()
     );
 }
 
@@ -319,10 +321,28 @@ fn two_vm_configs_get_different_macs() {
 fn explicit_mac_is_preserved() {
     let cfg = VmConfigBuilder::new()
         .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
-        .mac("aa:bb:cc:dd:ee:ff")
+        .nics([Nic::nat().with_mac("aa:bb:cc:dd:ee:ff")])
         .build()
         .unwrap();
-    assert_eq!(cfg.mac_address(), "aa:bb:cc:dd:ee:ff");
+    assert_eq!(cfg.mac_addresses(), ["aa:bb:cc:dd:ee:ff"]);
+}
+
+#[test]
+fn two_nics_on_one_vm_get_different_macs() {
+    // Two NICs on one VM reach the same host bridge, so an address collision
+    // between them is as fatal as one between two VMs.
+    let cfg = VmConfigBuilder::new()
+        .boot_linux("/boot/vmlinuz", None::<PathBuf>, "console=ttyS0")
+        .nics([Nic::nat(), Nic::nat()])
+        .build()
+        .unwrap();
+    let macs = cfg.mac_addresses();
+    assert_eq!(macs.len(), 2, "both declared NICs should be configured");
+    assert_ne!(
+        macs[0], macs[1],
+        "NICs on one VmConfig must get distinct MACs (got {} for both)",
+        macs[0]
+    );
 }
 
 #[test]
@@ -330,9 +350,9 @@ fn cloned_vmconfig_shares_mac() {
     // VmConfig is Clone — save/restore takes the same VmConfig and reuses it,
     // so the clone path must produce a config whose MAC matches the original.
     let cfg = build_minimal_linux_config();
-    let original = cfg.mac_address().to_string();
+    let original: Vec<String> = cfg.mac_addresses().iter().map(|m| m.to_string()).collect();
     let cloned = cfg.clone();
-    assert_eq!(cloned.mac_address(), original);
+    assert_eq!(cloned.mac_addresses(), original);
 }
 
 #[test]
@@ -575,12 +595,12 @@ fn file_handle_network_survives_the_config_clone_the_vm_performs() {
             None::<PathBuf>,
             "console=hvc0",
         )
-        .network(NetworkConfig::FileHandle(network))
+        .nics([Nic::file_handle(network)])
         .build()
         .unwrap();
     let cloned = config.clone();
     drop(config);
     // Reading the MAC through the clone proves the clone is usable after the
     // original is gone; the descriptor it shares is still open.
-    assert_eq!(cloned.mac_address().len(), 17);
+    assert_eq!(cloned.mac_addresses()[0].len(), 17);
 }

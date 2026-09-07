@@ -544,10 +544,10 @@ impl SandboxPool {
         // Network configuration
         match config.network {
             NetworkPolicy::Nat => {
-                builder = builder.network(vz::config::NetworkConfig::Nat);
+                builder = builder.nics([vz::config::Nic::nat()]);
             }
             NetworkPolicy::None => {
-                builder = builder.network(vz::config::NetworkConfig::None);
+                builder = builder.nics([]);
             }
         }
 

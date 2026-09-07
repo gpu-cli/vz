@@ -1,7 +1,7 @@
 //! Native VM ownership. Every execution lease retains an exact boot reader.
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, OwnedRwLockReadGuard, RwLock};
-use vz::{DiskConfig, MacPlatformConfig, NetworkConfig, Vm, VmConfigBuilder, VmState};
+use vz::{DiskConfig, MacPlatformConfig, Vm, VmConfigBuilder, VmState};
 use vz_linux::grpc_client::GrpcAgentClient;
 use vz_oci_macos::MacosOciError as Error;
 use vz_runtime_contract::{StackRuntimeIdentity, StackRuntimeShutdownRequest};
@@ -87,7 +87,7 @@ impl NativeMacosRuntime {
                 auxiliary_storage_path: self.directory.join("auxiliary-storage"),
                 machine_identifier_path: self.directory.join("machine-identifier"),
             })
-            .network(NetworkConfig::None)
+            .nics([])
             .enable_vsock()
             .build()
             .map_err(error)?;

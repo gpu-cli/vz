@@ -14,7 +14,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use vz::{NetworkConfig, VmConfigBuilder};
+use vz::VmConfigBuilder;
 
 fn linux_artifacts() -> Option<(PathBuf, PathBuf)> {
     let home = std::env::var_os("HOME")?;
@@ -79,7 +79,7 @@ async fn balloon_inflate_drops_guest_mem_available() {
         .cpus(1)
         .memory_bytes(memory_bytes)
         .boot_linux(kernel, Some(initramfs), "console=hvc0 vz_idle=1")
-        .network(NetworkConfig::None)
+        .nics([])
         .nested_virtualization(false)
         .serial_log_file(serial_log.clone())
         .build()

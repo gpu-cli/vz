@@ -291,7 +291,7 @@ impl Runtime {
             .network_enabled
             .unwrap_or(self.config.default_network_enabled);
         if !network_enabled {
-            vm_config.network = Some(NetworkConfig::None);
+            vm_config.nics = Some(Vec::new());
         }
 
         let vm = LinuxVm::create(vm_config).await?;
@@ -484,7 +484,7 @@ impl Runtime {
 
         let network_enabled = network_enabled.unwrap_or(self.config.default_network_enabled);
         if !network_enabled {
-            vm_config.network = Some(NetworkConfig::None);
+            vm_config.nics = Some(Vec::new());
         }
 
         let vm = Arc::new(LinuxVm::create(vm_config).await?);
@@ -667,7 +667,7 @@ impl Runtime {
 
         let network_enabled = network_enabled.unwrap_or(self.config.default_network_enabled);
         if !network_enabled {
-            vm_config.network = Some(NetworkConfig::None);
+            vm_config.nics = Some(Vec::new());
         }
 
         let registered_container_id = container_id.unwrap_or_else(new_container_id);

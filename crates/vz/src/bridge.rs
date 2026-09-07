@@ -422,73 +422,69 @@ pub(crate) fn build_objc_config(
         unsafe { vz_config.setStorageDevices(&storage_devices) };
     }
 
-    // Network
-    match &config.network {
-        NetworkConfig::Nat => {
-            // SAFETY: VZNATNetworkDeviceAttachment::new() creates a NAT attachment.
-            let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
-            // SAFETY: VZVirtioNetworkDeviceConfiguration::new() creates a default net config.
-            let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-            // SAFETY: setAttachment sets the network attachment on the config.
-            unsafe { net_config.setAttachment(Some(&nat_attachment)) };
-
-            // Pin the per-VM MAC stored on the VmConfig. Without this, two paths break:
-            // (1) VZVirtioNetworkDeviceConfiguration::new() randomizes the MAC on every
-            //     construction, so save/restore mismatches the saved guest's NIC; and
-            //     (2) two NAT-networked VMs in one process would otherwise share an
-            //     address and collide on the host bridge.
-            let mac = parse_mac(&config.network_mac)?;
-            unsafe { net_config.setMACAddress(&mac) };
-
-            let net_devices = NSArray::from_retained_slice(&[Retained::into_super(net_config)]);
-            // SAFETY: setNetworkDevices sets the VM's network configuration.
-            unsafe { vz_config.setNetworkDevices(&net_devices) };
+    // Network — one virtio NIC per declared entry, in declaration order.
+    let mut net_devices = Vec::with_capacity(config.nics.len());
+    for nic in &config.nics {
+        // SAFETY: VZVirtioNetworkDeviceConfiguration::new() creates a default net config.
+        let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
+        match &nic.attachment {
+            NetworkConfig::Nat => {
+                // SAFETY: VZNATNetworkDeviceAttachment::new() creates a NAT attachment.
+                let nat_attachment = unsafe { VZNATNetworkDeviceAttachment::new() };
+                // SAFETY: setAttachment sets the network attachment on the config.
+                unsafe { net_config.setAttachment(Some(&nat_attachment)) };
+            }
+            NetworkConfig::FileHandle(network) => {
+                // The switch owns the peer end of this socket, so the guest's frames
+                // never reach a shared host bridge. `closeOnDealloc: false` because
+                // the descriptor is owned by the OwnedFd on the VmConfig, which the
+                // VM retains for its whole life; letting NSFileHandle close it too
+                // would double-close a descriptor the host end may still be using.
+                let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
+                    NSFileHandle::alloc(),
+                    network.raw_fd(),
+                    false,
+                );
+                // SAFETY: initWithFileHandle takes the file handle constructed above.
+                // The socket was verified to be a connected datagram socket with
+                // buffers sized for the MTU when the caller built FileHandleNetwork.
+                let attachment = unsafe {
+                    VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
+                        VZFileHandleNetworkDeviceAttachment::alloc(),
+                        &handle,
+                    )
+                };
+                // SAFETY: the MTU was validated against Apple's documented range;
+                // an out-of-range value would make the whole VM configuration fail
+                // validation rather than being silently ignored.
+                unsafe {
+                    attachment.setMaximumTransmissionUnit(
+                        isize::try_from(network.mtu()).unwrap_or(isize::MAX),
+                    )
+                };
+                // SAFETY: setAttachment sets the network attachment on the config.
+                unsafe { net_config.setAttachment(Some(&attachment)) };
+            }
         }
-        NetworkConfig::FileHandle(network) => {
-            // The switch owns the peer end of this socket, so the guest's frames
-            // never reach a shared host bridge. `closeOnDealloc: false` because
-            // the descriptor is owned by the OwnedFd on the VmConfig, which the
-            // VM retains for its whole life; letting NSFileHandle close it too
-            // would double-close a descriptor the host end may still be using.
-            let handle = NSFileHandle::initWithFileDescriptor_closeOnDealloc(
-                NSFileHandle::alloc(),
-                network.raw_fd(),
-                false,
-            );
-            // SAFETY: initWithFileHandle takes the file handle constructed above.
-            // The socket was verified to be a connected datagram socket with
-            // buffers sized for the MTU when the caller built FileHandleNetwork.
-            let attachment = unsafe {
-                VZFileHandleNetworkDeviceAttachment::initWithFileHandle(
-                    VZFileHandleNetworkDeviceAttachment::alloc(),
-                    &handle,
-                )
-            };
-            // SAFETY: the MTU was validated against Apple's documented range;
-            // an out-of-range value would make the whole VM configuration fail
-            // validation rather than being silently ignored.
-            unsafe {
-                attachment.setMaximumTransmissionUnit(
-                    isize::try_from(network.mtu()).unwrap_or(isize::MAX),
-                )
-            };
-            // SAFETY: VZVirtioNetworkDeviceConfiguration::new() creates a default net config.
-            let net_config = unsafe { VZVirtioNetworkDeviceConfiguration::new() };
-            // SAFETY: setAttachment sets the network attachment on the config.
-            unsafe { net_config.setAttachment(Some(&attachment)) };
-            // The MAC is pinned for the same reasons as the NAT arm, and the
-            // switch additionally addresses this guest by it.
-            let mac = parse_mac(&config.network_mac)?;
-            unsafe { net_config.setMACAddress(&mac) };
 
-            let net_devices = NSArray::from_retained_slice(&[Retained::into_super(net_config)]);
-            // SAFETY: setNetworkDevices sets the VM's network configuration.
-            unsafe { vz_config.setNetworkDevices(&net_devices) };
-        }
-        NetworkConfig::None => {
-            // No network devices
-        }
+        // Pin the MAC resolved for this NIC. Without this, two paths break:
+        // (1) VZVirtioNetworkDeviceConfiguration::new() randomizes the MAC on every
+        //     construction, so save/restore mismatches the saved guest's NIC; and
+        //     (2) NICs sharing a host bridge — two NAT-networked VMs in one process,
+        //     or two NAT NICs on one VM — would otherwise share an address and
+        //     collide. A switch attachment additionally addresses this guest by it.
+        let mac = parse_mac(&nic.mac)?;
+        unsafe { net_config.setMACAddress(&mac) };
+
+        net_devices.push(Retained::into_super(net_config));
     }
+    // SAFETY: NSArray::from_retained_slice creates an array from a slice of retained objects.
+    let net_devices = NSArray::from_retained_slice(&net_devices);
+    // An empty `nics` passes an empty array rather than skipping the call, because
+    // that is exactly the framework's default of no network devices and keeps one
+    // code path instead of a special case.
+    // SAFETY: setNetworkDevices sets the VM's network configuration.
+    unsafe { vz_config.setNetworkDevices(&net_devices) };
 
     // Memory balloon — host-driven path to ask the guest to release pages.
     // Apple permits at most one balloon device per VM; we always wire up the

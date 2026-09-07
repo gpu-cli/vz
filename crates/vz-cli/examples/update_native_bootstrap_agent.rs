@@ -6,7 +6,7 @@ async fn main() -> anyhow::Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     use std::{path::PathBuf, sync::Arc, time::Duration};
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use vz::{DiskConfig, MacPlatformConfig, NetworkConfig, Vm, VmConfigBuilder, VmState};
+    use vz::{DiskConfig, MacPlatformConfig, Vm, VmConfigBuilder, VmState};
     use vz_linux::{ContainerExecDispatchGate, grpc_client::GrpcAgentClient};
     let args = std::env::args_os()
         .skip(1)
@@ -53,7 +53,7 @@ async fn main() -> anyhow::Result<()> {
             auxiliary_storage_path: directory.join("auxiliary-storage"),
             machine_identifier_path: directory.join("machine-identifier"),
         })
-        .network(NetworkConfig::None)
+        .nics([])
         .enable_vsock()
         .build()?;
     let vm = Arc::new(Vm::create(config).await?);

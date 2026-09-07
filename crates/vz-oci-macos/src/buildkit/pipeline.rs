@@ -21,7 +21,6 @@ use serde::Serialize;
 use sha2::{Digest as _, Sha256};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tracing::warn;
-use vz::NetworkConfig;
 use vz::SharedDirConfig;
 use vz::protocol::{ExecEvent, ExecOutput};
 use vz_image::ImageStore;
@@ -1659,7 +1658,7 @@ async fn start_buildkit_vm(
     });
 
     if !config.default_network_enabled {
-        vm_config.network = Some(NetworkConfig::None);
+        vm_config.nics = Some(Vec::new());
     }
 
     runtime_guard.preserve_on_drop();

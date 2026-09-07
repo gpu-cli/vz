@@ -13,7 +13,7 @@ use tokio::task::JoinSet;
 use tracing::{debug, warn};
 use vz::Vm;
 use vz::protocol::{ExecEvent, ExecOutput};
-use vz::{DiskConfig, NetworkConfig, SharedDirConfig};
+use vz::{DiskConfig, SharedDirConfig};
 use vz_image::{
     ImageConfigSummary, ImageId, ImagePuller, ImageStore, parse_image_config_summary_from_store,
 };

@@ -17,7 +17,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use vz::{NetworkConfig, VmConfigBuilder};
+use vz::VmConfigBuilder;
 
 const ONE_MB: u64 = 1024 * 1024;
 
@@ -82,7 +82,7 @@ async fn balloon_default_on_target_size_roundtrip() {
         .cpus(1)
         .memory_bytes(memory_bytes)
         .boot_linux(kernel, Some(initramfs), "console=hvc0 quiet")
-        .network(NetworkConfig::None)
+        .nics([])
         .nested_virtualization(false)
         .build()
         .unwrap();
@@ -135,7 +135,7 @@ async fn balloon_disabled_makes_runtime_calls_fail() {
         .cpus(1)
         .memory_bytes(512 * ONE_MB)
         .boot_linux(kernel, Some(initramfs), "console=hvc0 quiet")
-        .network(NetworkConfig::None)
+        .nics([])
         .nested_virtualization(false)
         .memory_balloon(false)
         .build()

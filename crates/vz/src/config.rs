@@ -47,13 +47,11 @@ pub struct SharedDirConfig {
     pub read_only: bool,
 }
 
-/// Network configuration for the VM.
+/// How one NIC attaches to the outside world.
 #[derive(Debug, Clone)]
 pub enum NetworkConfig {
     /// NAT networking — guest gets internet through host.
     Nat,
-    /// No network — fully isolated.
-    None,
     /// The guest NIC's Ethernet frames are carried over a host-side socket.
     ///
     /// This is the attachment an Environment-owned switch uses: the host end
@@ -233,6 +231,59 @@ fn require_connected(fd: std::os::fd::RawFd) -> Result<(), VzError> {
     Ok(())
 }
 
+/// One virtual NIC: how it attaches to the outside, and the address the guest
+/// presents on it.
+#[derive(Debug, Clone)]
+pub struct Nic {
+    attachment: NetworkConfig,
+    mac: Option<String>,
+}
+
+impl Nic {
+    /// A NAT-attached NIC with a generated address.
+    pub fn nat() -> Self {
+        Self {
+            attachment: NetworkConfig::Nat,
+            mac: None,
+        }
+    }
+
+    /// A NIC whose frames are carried over a host-side socket.
+    pub fn file_handle(network: FileHandleNetwork) -> Self {
+        Self {
+            attachment: NetworkConfig::FileHandle(network),
+            mac: None,
+        }
+    }
+
+    /// Pin this NIC's MAC to `"XX:XX:XX:XX:XX:XX"` (six hex bytes,
+    /// colon-separated).
+    ///
+    /// When unset, `build()` generates a fresh random locally-administered MAC.
+    /// Because an unpinned address is randomized on every construction, a
+    /// restored VM would not match the NIC its saved guest expects, and two VMs
+    /// in one process would collide on the host bridge. Pinning is what lets a
+    /// consumer derive a deterministic MAC from a stable VM identity (e.g., for
+    /// traffic correlation across restarts).
+    pub fn with_mac(mut self, mac: impl Into<String>) -> Self {
+        self.mac = Some(mac.into());
+        self
+    }
+
+    /// The attachment this NIC uses.
+    pub fn attachment(&self) -> &NetworkConfig {
+        &self.attachment
+    }
+}
+
+/// A NIC with its address resolved. `build()` fills a random
+/// locally-administered MAC for any NIC that did not pin one.
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedNic {
+    pub(crate) attachment: NetworkConfig,
+    pub(crate) mac: String,
+}
+
 /// One block device attached to the VM.
 ///
 /// Disks are presented to the guest as virtio-block devices in the order
@@ -263,8 +314,7 @@ pub struct VmConfigBuilder {
     shared_dirs: Vec<SharedDirConfig>,
     serial_log_file: Option<PathBuf>,
     generic_machine_identifier: Option<Vec<u8>>,
-    network: NetworkConfig,
-    network_mac: Option<String>,
+    nics: Vec<Nic>,
     vsock: bool,
     headless: bool,
     nested_virtualization: bool,
@@ -284,8 +334,7 @@ impl VmConfigBuilder {
             shared_dirs: Vec::new(),
             serial_log_file: None,
             generic_machine_identifier: None,
-            network: NetworkConfig::Nat,
-            network_mac: None,
+            nics: vec![Nic::nat()],
             vsock: false,
             headless: true,
             nested_virtualization: true,
@@ -388,20 +437,12 @@ impl VmConfigBuilder {
         self
     }
 
-    /// Set network configuration.
-    pub fn network(mut self, config: NetworkConfig) -> Self {
-        self.network = config;
-        self
-    }
-
-    /// Pin the VM's MAC address to a specific value.
+    /// Replace the VM's NICs, which the guest sees in declaration order.
     ///
-    /// Format is `"XX:XX:XX:XX:XX:XX"` (six hex bytes, colon-separated).
-    /// When unset, `build()` generates a fresh random locally-administered MAC.
-    /// Setting an explicit MAC is useful when the consumer derives a deterministic
-    /// MAC from a stable VM identity (e.g., for traffic correlation across restarts).
-    pub fn mac(mut self, mac: impl Into<String>) -> Self {
-        self.network_mac = Some(mac.into());
+    /// The default is a single NAT NIC; passing an empty list leaves the guest
+    /// with no network at all.
+    pub fn nics(mut self, nics: impl IntoIterator<Item = Nic>) -> Self {
+        self.nics = nics.into_iter().collect();
         self
     }
 
@@ -470,10 +511,17 @@ impl VmConfigBuilder {
             ));
         }
 
-        let network_mac = match self.network_mac {
-            Some(mac) => mac,
-            None => crate::bridge::random_locally_administered_mac_string(),
-        };
+        // Each NIC resolves its own address so two NICs on one VM never share one.
+        let nics = self
+            .nics
+            .into_iter()
+            .map(|nic| ResolvedNic {
+                attachment: nic.attachment,
+                mac: nic
+                    .mac
+                    .unwrap_or_else(crate::bridge::random_locally_administered_mac_string),
+            })
+            .collect();
 
         Ok(VmConfig {
             cpus: self.cpus,
@@ -484,8 +532,7 @@ impl VmConfigBuilder {
             shared_dirs: self.shared_dirs,
             serial_log_file: self.serial_log_file,
             generic_machine_identifier: self.generic_machine_identifier,
-            network: self.network,
-            network_mac,
+            nics,
             vsock: self.vsock,
             headless: self.headless,
             nested_virtualization: self.nested_virtualization,
@@ -513,12 +560,11 @@ pub struct VmConfig {
     pub(crate) shared_dirs: Vec<SharedDirConfig>,
     pub(crate) serial_log_file: Option<PathBuf>,
     pub(crate) generic_machine_identifier: Option<Vec<u8>>,
-    pub(crate) network: NetworkConfig,
-    /// MAC address in `"XX:XX:XX:XX:XX:XX"` form. Always populated by `build()`.
-    /// Persisting it here keeps save/restore correct (the restored VM's NIC must
-    /// match the MAC the saved guest expects) and gives every VM a unique address
-    /// when more than one runs in the same process.
-    pub(crate) network_mac: String,
+    /// NICs in declaration order, each with a MAC always populated by `build()`.
+    /// Persisting the addresses here keeps save/restore correct (a restored VM's
+    /// NIC must match the MAC the saved guest expects) and gives every NIC a
+    /// unique address, whether it shares a VM or a process with the others.
+    pub(crate) nics: Vec<ResolvedNic>,
     pub(crate) vsock: bool,
     /// Controls whether to attach a virtual display. Used by CLI layer.
     #[allow(dead_code)]
@@ -534,13 +580,13 @@ pub struct VmConfig {
 }
 
 impl VmConfig {
-    /// Read the MAC address assigned to this VM's primary NIC.
+    /// Read the MAC addresses of this VM's NICs, in declaration order.
     ///
-    /// Always returns a value: either what the caller passed via
-    /// `VmConfigBuilder::mac()`, or a fresh random locally-administered
-    /// address generated at `build()` time.
-    pub fn mac_address(&self) -> &str {
-        &self.network_mac
+    /// Every entry has a value: either what the caller pinned via
+    /// [`Nic::with_mac`], or a fresh random locally-administered address
+    /// generated at `build()` time.
+    pub fn mac_addresses(&self) -> Vec<&str> {
+        self.nics.iter().map(|nic| nic.mac.as_str()).collect()
     }
 
     /// Read the ordered list of disks attached to this VM.

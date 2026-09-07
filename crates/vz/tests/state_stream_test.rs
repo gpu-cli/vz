@@ -28,7 +28,7 @@ use std::path::PathBuf;
 use std::process::Command;
 use std::time::Duration;
 
-use vz::{NetworkConfig, Vm, VmConfigBuilder, VmState};
+use vz::{Vm, VmConfigBuilder, VmState};
 
 const ONE_MB: u64 = 1024 * 1024;
 
@@ -81,7 +81,7 @@ fn build_minimal_linux_config(kernel: PathBuf, initramfs: PathBuf) -> vz::config
         .cpus(1)
         .memory_bytes(256 * ONE_MB)
         .boot_linux(kernel, Some(initramfs), "console=hvc0 quiet")
-        .network(NetworkConfig::None)
+        .nics([])
         .nested_virtualization(false)
         .build()
         .unwrap()

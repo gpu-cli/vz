@@ -11,7 +11,7 @@ async fn main() -> anyhow::Result<()> {
     use std::sync::Arc;
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
-    use vz::{DiskConfig, MacPlatformConfig, NetworkConfig, Vm, VmConfigBuilder, VmState};
+    use vz::{DiskConfig, MacPlatformConfig, Vm, VmConfigBuilder, VmState};
     use vz_linux::{ExecOptions, grpc_client::GrpcAgentClient};
 
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -65,7 +65,7 @@ async fn main() -> anyhow::Result<()> {
             machine_identifier_path: machine.join("machine-identifier"),
             auxiliary_storage_path: machine.join("auxiliary-storage"),
         })
-        .network(NetworkConfig::None)
+        .nics([])
         .enable_vsock()
         .build()?;
     let vm = Arc::new(Vm::create(config).await?);
