@@ -102,7 +102,7 @@ class ParallelDriver(driver.Driver):
         with GUARD_LOCK:
             self.builder_guard()
 
-    def execute(self, operation):
+    def execute(self, operation, ready=None):
         require(self.record.count == 0, "parallel driver cannot be reused")
         require(operation == specification(operation["slot"], self.output, Path(operation["parallel_fixture"]),
                     operation["parallel_fixture_sha256"], self.inputs.raw["run_id"]), "parallel operation contract differs")
@@ -113,6 +113,14 @@ class ParallelDriver(driver.Driver):
         startup.document(self.output / "inputs.json", self.inputs.raw)
         startup.document(self.output / "operation.intent.json", operation)
         self.guarded()
+        # Rendezvous AFTER the guard, not before it. The guard is serialized, so
+        # a barrier ahead of it would let the first slot start building while the
+        # last was still waiting for the lock — and BuildKit forwards a shared
+        # vertex's progress into every solve that adopts it, so a slot would
+        # then see progress stamped before its own Engine clock lower bound.
+        # Guarding first and starting together keeps those bounds tight.
+        if ready is not None:
+            ready()
         result = self.command(build_arguments(self.inputs.raw, operation), timeout=300)
         self.guarded()
         require(not result.stdout and self.record.count == 9, "parallel command inventory/output differs")
@@ -138,11 +146,12 @@ def execute_slots(selected, operations):
     require(len(selected) == len(operations) == 4, "exactly four slot drivers required")
     require([op["slot"] for op in operations] == list(SLOTS), "parallel slot order differs")
     require(len({id(item) for item in selected}) == 4, "parallel recorder reused")
-    barrier = threading.Barrier(4, timeout=10)
+    # The guard is serialized, so the barrier allows for four of them in turn
+    # before the builds start together.
+    barrier = threading.Barrier(4, timeout=60)
 
     def run(index):
-        barrier.wait()
-        return selected[index].execute(operations[index])
+        return selected[index].execute(operations[index], ready=barrier.wait)
 
     results, failures = [None] * 4, []
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vz-parallel-build") as executor:

@@ -80,7 +80,9 @@ class ParallelTests(unittest.TestCase):
 
     def test_workers_are_dispatched_concurrently_and_results_ordered(self):
         rendezvous = threading.Barrier(4, timeout=2)
-        def execute(op):
+        def execute(op, ready=None):
+            if ready is not None:
+                ready()
             rendezvous.wait()
             return op["slot"]
         workers = [SimpleNamespace(execute=execute) for _ in range(4)]
@@ -89,7 +91,9 @@ class ParallelTests(unittest.TestCase):
     def test_failure_still_joins_every_started_worker(self):
         rendezvous, finished = threading.Barrier(4, timeout=2), []
         lock = threading.Lock()
-        def execute(op):
+        def execute(op, ready=None):
+            if ready is not None:
+                ready()
             rendezvous.wait()
             if op["slot"] != 0:
                 time.sleep(0.02)
@@ -108,7 +112,9 @@ class ParallelTests(unittest.TestCase):
         fail waiting for it. Reporting a prefix of the failures names the
         symptoms and drops the cause, which is what happened when slot 2 never
         dispatched its build and the run reported only slots 0 and 1."""
-        def execute(op):
+        def execute(op, ready=None):
+            if ready is not None:
+                ready()
             raise ValueError("slot %d cause" % op["slot"])
         workers = [SimpleNamespace(execute=execute) for _ in range(4)]
         with self.assertRaises(RuntimeError) as raised:
@@ -119,7 +125,9 @@ class ParallelTests(unittest.TestCase):
             self.assertIn("slot %d: ValueError: slot %d cause" % (slot, slot), message)
 
     def test_a_failing_slot_message_is_bounded(self):
-        def execute(op):
+        def execute(op, ready=None):
+            if ready is not None:
+                ready()
             raise ValueError("x" * 5000)
         workers = [SimpleNamespace(execute=execute) for _ in range(4)]
         with self.assertRaises(RuntimeError) as raised:
@@ -305,8 +313,11 @@ class GuardSerializationTests(ParallelTests):
 
             guarded = subject.ParallelDriver.guarded
 
-            def execute(self, operation):
+            def execute(self, operation, ready=None):
                 self.guarded()
+                # The real driver rendezvouses here, after its serialized guard.
+                if ready is not None:
+                    ready()
                 with lock:
                     build_depth[0] += 1
                     build_peak[0] = max(build_peak[0], build_depth[0])
@@ -321,3 +332,36 @@ class GuardSerializationTests(ParallelTests):
         self.assertEqual(results, [0, 1, 2, 3])
         self.assertEqual(guard_peak[0], 1, "two slots inspected the shared builder at once")
         self.assertEqual(build_peak[0], 4, "the builds must still all run together")
+
+    def test_no_build_starts_until_every_guard_is_done(self):
+        """The rendezvous sits after the guard, not before it.
+
+        Ahead of a serialized guard it would let the first slot build while the
+        last still waited for the lock, and BuildKit forwards a shared vertex's
+        progress into every solve that adopts it — so a late slot would see
+        progress stamped before its own Engine clock lower bound, which is what
+        `parallel progress outside client command clocks` rejects.
+        """
+        import linux_docker_build_parallel as subject
+        order, lock = [], threading.Lock()
+        started = threading.Barrier(4, timeout=5)
+
+        class Fake:
+            def builder_guard(self):
+                with lock:
+                    order.append("guard")
+
+            guarded = subject.ParallelDriver.guarded
+
+            def execute(self, operation, ready=None):
+                self.guarded()
+                ready()
+                with lock:
+                    order.append("build")
+                started.wait()
+                return operation["slot"]
+
+        parallel.execute_slots([Fake() for _ in range(4)], [self.operation(i) for i in range(4)])
+        first_build = order.index("build")
+        self.assertEqual(order[:first_build].count("guard"), 4,
+                         "a build started before every slot had inspected the builder")
