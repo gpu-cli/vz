@@ -22,12 +22,15 @@ from __future__ import annotations
 import http.client
 import json
 import socket
+import time
 
 # The daemon's declared minimum API version, so an observation never depends on
 # negotiation. The handshake suite proves the supported window separately.
 API_VERSION = "v1.40"
 MAX_RESPONSE_BYTES = 4 * 1024 * 1024
 MAX_FRAME_BYTES = 1 * 1024 * 1024
+# How long an exec may take to report its terminal state after its stream ends.
+EXEC_SETTLE_SECONDS = 5.0
 STDOUT_STREAM = 1
 
 
@@ -110,9 +113,20 @@ class EngineProbe:
         if not isinstance(exec_id, str) or not exec_id:
             raise ProbeError("exec create returned no id")
         stdout, stderr = self._start_exec(exec_id)
-        state = self.get_json(f"/exec/{exec_id}/json")
-        if state.get("Running") is not False or state.get("ExitCode") != 0:
-            raise ProbeError(f"exec did not complete cleanly: {state.get('Running')!r} {state.get('ExitCode')!r}")
+        # The stream closing means the output is complete, but the Engine can
+        # still report the exec as running for a moment afterwards. Wait for the
+        # terminal state within a bounded deadline; this observes one exec to
+        # completion, it never retries the observation.
+        deadline = time.monotonic() + EXEC_SETTLE_SECONDS
+        while True:
+            state = self.get_json(f"/exec/{exec_id}/json")
+            if state.get("Running") is False:
+                break
+            if time.monotonic() >= deadline:
+                raise ProbeError(f"exec never reached a terminal state: {state.get('Running')!r}")
+            time.sleep(0.01)
+        if state.get("ExitCode") != 0:
+            raise ProbeError(f"exec exited {state.get('ExitCode')!r}")
         if stderr:
             raise ProbeError(f"exec wrote stderr: {stderr[:200]!r}")
         return stdout

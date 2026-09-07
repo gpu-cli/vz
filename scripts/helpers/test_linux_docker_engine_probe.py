@@ -6,6 +6,7 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
@@ -145,6 +146,15 @@ class EngineProbeTests(unittest.TestCase):
         with self.assertRaises(subject.ProbeError):
             noisy.exec_stdout("abc", ["/bin/cat"])
 
+    def test_exec_waits_briefly_for_the_terminal_state(self):
+        version = subject.API_VERSION
+        _, probe = self.build({
+            ("POST", f"/{version}/containers/abc/exec"): json_route({"Id": "exec-1"}),
+            ("POST", f"/{version}/exec/exec-1/start"): (200, "application/vnd.docker.raw-stream", frame(1, b"ok\n")),
+            ("GET", f"/{version}/exec/exec-1/json"): json_route({"Running": False, "ExitCode": 0}),
+        })
+        self.assertEqual(probe.exec_stdout("abc", ["/bin/cat"]), b"ok\n")
+
     def test_exec_rejects_a_still_running_status(self):
         version = subject.API_VERSION
         _, probe = self.build({
@@ -152,7 +162,7 @@ class EngineProbeTests(unittest.TestCase):
             ("POST", f"/{version}/exec/exec-1/start"): (200, "application/vnd.docker.raw-stream", frame(1, b"x")),
             ("GET", f"/{version}/exec/exec-1/json"): json_route({"Running": True, "ExitCode": None}),
         })
-        with self.assertRaises(subject.ProbeError):
+        with patch.object(subject, "EXEC_SETTLE_SECONDS", 0.05), self.assertRaises(subject.ProbeError):
             probe.exec_stdout("abc", ["/bin/cat"])
 
     def test_exec_create_without_an_id_is_an_error(self):

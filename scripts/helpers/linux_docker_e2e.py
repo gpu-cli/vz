@@ -154,7 +154,14 @@ def preflight(args, require_host=True):
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
               "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
               "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
-    info.update(scope=scopes[args.suite], suite=args.suite,
+    machines = getattr(args, "machines", len(GATE_MACHINES))
+    require(machines in (1, 2, 3), "unsupported Machine selection")
+    scope = scopes[args.suite]
+    if machines != len(GATE_MACHINES):
+        # Say it in the scope itself: a reduced selection cannot prove the
+        # isolation family, so its evidence can never read as gate evidence.
+        scope = "DEV_LOOP_" + str(machines) + "_MACHINE_" + scope
+    info.update(scope=scope, suite=args.suite, machines=machines,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
                 public_ca=ca_pin)
@@ -988,6 +995,7 @@ class ComposeHarness(startup.Harness):
                                "  /etc/vz/ca-certificates.crt\n").encode() and not stderr,
                         "actual Machine public CA bytes differ from selected immutable input")
         selected_machines = [(primary, m) for m in primary["machines"]] + [(neighbor, neighbor["machines"][0])]
+        selected_machines = selected_machines[:self.info.get("machines", len(GATE_MACHINES))]
         self.prepare_suites(suites, contexts, selected_machines, neighbor, project)
         sentinels = [self.sentinel(descriptor) for descriptor in contexts]
         self.monitor = SentinelMonitor(self, sentinels)
