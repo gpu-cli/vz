@@ -131,9 +131,12 @@ def execute_slots(selected, operations):
             except BaseException as error:
                 failures.append((index, error))
     if failures:
-        # Name the first slot's actual cause: without it a composed run reports
-        # only which slots failed, and the retained evidence cannot say why.
-        detail = "; ".join(f"slot {index}: {type(error).__name__}: {error}" for index, error in failures[:2])
+        # Name every slot's actual cause, not the first two. These slots
+        # rendezvous, so when one never arrives the others fail waiting for it:
+        # reporting a prefix names the symptoms and drops the cause. Each
+        # message is bounded instead, because there are only ever four.
+        detail = "; ".join(f"slot {index}: {type(error).__name__}: {str(error)[:400]}"
+                           for index, error in failures)
         raise RuntimeError("parallel slots failed: " +
                            ",".join(str(index) for index, _ in failures) + " (" + detail + ")") from failures[0][1]
     return results

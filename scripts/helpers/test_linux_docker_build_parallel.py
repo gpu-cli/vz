@@ -103,6 +103,29 @@ class ParallelTests(unittest.TestCase):
             parallel.execute_slots(workers, [self.operation(i) for i in range(4)])
         self.assertEqual(sorted(finished), [0, 1, 2, 3])
 
+    def test_every_failing_slot_names_its_own_cause(self):
+        """These slots rendezvous, so one that never arrives makes the others
+        fail waiting for it. Reporting a prefix of the failures names the
+        symptoms and drops the cause, which is what happened when slot 2 never
+        dispatched its build and the run reported only slots 0 and 1."""
+        def execute(op):
+            raise ValueError("slot %d cause" % op["slot"])
+        workers = [SimpleNamespace(execute=execute) for _ in range(4)]
+        with self.assertRaises(RuntimeError) as raised:
+            parallel.execute_slots(workers, [self.operation(i) for i in range(4)])
+        message = str(raised.exception)
+        self.assertIn("slots failed: 0,1,2,3", message)
+        for slot in range(4):
+            self.assertIn("slot %d: ValueError: slot %d cause" % (slot, slot), message)
+
+    def test_a_failing_slot_message_is_bounded(self):
+        def execute(op):
+            raise ValueError("x" * 5000)
+        workers = [SimpleNamespace(execute=execute) for _ in range(4)]
+        with self.assertRaises(RuntimeError) as raised:
+            parallel.execute_slots(workers, [self.operation(i) for i in range(4)])
+        self.assertLess(len(str(raised.exception)), 4 * 500)
+
     def test_reused_recorder_and_missing_slot_rejected(self):
         one = SimpleNamespace(execute=Mock())
         with self.assertRaises(ValueError):
