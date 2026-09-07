@@ -27,7 +27,12 @@
 
 use std::collections::BTreeMap;
 
+use sha2::{Digest, Sha256};
 use thiserror::Error;
+
+/// Domain separator for derived addresses, so this derivation can never collide
+/// with another use of the same identifiers under a different hash purpose.
+const ADDRESS_DERIVATION_DOMAIN: &[u8] = b"vz.environment.network.attachment.mac.v1\n";
 
 /// Destination, source and ethertype: the fixed part of an Ethernet II header.
 /// VLAN tags are not accepted, so this length is exact rather than a minimum.
@@ -87,6 +92,42 @@ impl MacAddress {
     /// test rather than a broadcast comparison plus a multicast range check.
     pub const fn is_group(&self) -> bool {
         self.0[0] & 1 == 1
+    }
+
+    /// Whether the locally administered bit is set, as every derived address is.
+    pub const fn is_locally_administered(&self) -> bool {
+        self.0[0] & 2 == 2
+    }
+
+    /// The address a Machine presents on one network, derived from the identity
+    /// of that attachment.
+    ///
+    /// It has to be derived rather than generated, for two reasons that pull the
+    /// same way. The switch addresses a guest by its MAC and refuses any frame
+    /// whose source is not the address it assigned, so the address the guest
+    /// configures and the address the switch expects must agree without either
+    /// telling the other. And a restored VM's NIC must match the address its
+    /// saved guest already believes it has, which a fresh random address on every
+    /// boot cannot do.
+    ///
+    /// The two administered bits are then forced rather than taken from the hash:
+    /// the locally administered bit is set because no registered OUI was
+    /// assigned for these, and the group bit is cleared because a station address
+    /// is never a group address and the fabric refuses one as a source.
+    pub fn derive(environment_id: &str, machine_id: &str, network_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(ADDRESS_DERIVATION_DOMAIN);
+        // Length-prefixed, so no pair of identifiers can be re-split to produce
+        // the same input and hand two attachments one address.
+        for field in [environment_id, machine_id, network_id] {
+            hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 6];
+        bytes.copy_from_slice(&digest[..6]);
+        bytes[0] = (bytes[0] | 2) & 0xfe;
+        Self(bytes)
     }
 }
 

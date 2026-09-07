@@ -273,3 +273,81 @@ fn every_refused_frame_is_counted_under_exactly_one_reason() {
     assert_eq!(fabric.counters().unicast_forwarded, 0);
     assert_eq!(fabric.counters().group_forwarded, 0);
 }
+
+// --- Derived addressing ----------------------------------------------------
+
+#[test]
+fn a_derived_address_is_stable_for_one_attachment() {
+    // A restored VM's NIC has to match the address its saved guest already
+    // believes it has, and the switch has to expect the same address the guest
+    // configures without either telling the other.
+    let first = MacAddress::derive("env-a", "machine-1", "net-private");
+    let again = MacAddress::derive("env-a", "machine-1", "net-private");
+    assert_eq!(first, again);
+}
+
+#[test]
+fn a_derived_address_is_a_locally_administered_station_address() {
+    for (environment, machine, network) in [
+        ("env-a", "machine-1", "net-private"),
+        ("", "", ""),
+        ("e", "m", "n"),
+    ] {
+        let address = MacAddress::derive(environment, machine, network);
+        assert!(
+            address.is_locally_administered(),
+            "{address} must be locally administered; no OUI is registered for these"
+        );
+        assert!(
+            !address.is_group(),
+            "{address} must not be a group address; the fabric refuses one as a source"
+        );
+    }
+}
+
+#[test]
+fn attachments_differing_in_any_one_identifier_get_different_addresses() {
+    let base = MacAddress::derive("env-a", "machine-1", "net-private");
+    for (environment, machine, network) in [
+        ("env-b", "machine-1", "net-private"),
+        ("env-a", "machine-2", "net-private"),
+        ("env-a", "machine-1", "net-other"),
+    ] {
+        assert_ne!(
+            base,
+            MacAddress::derive(environment, machine, network),
+            "{environment}/{machine}/{network} collided with the base attachment"
+        );
+    }
+}
+
+#[test]
+fn identifiers_cannot_be_re_split_to_produce_one_address() {
+    // Concatenating without lengths would make ("ab", "c", "d") and
+    // ("a", "bc", "d") the same input, so two attachments would be handed one
+    // address and the fabric would refuse to attach the second.
+    assert_ne!(
+        MacAddress::derive("ab", "c", "d"),
+        MacAddress::derive("a", "bc", "d")
+    );
+    assert_ne!(
+        MacAddress::derive("a", "b", "cd"),
+        MacAddress::derive("a", "bc", "d")
+    );
+}
+
+#[test]
+fn derived_addresses_attach_to_one_fabric_without_collision() {
+    let mut fabric = Fabric::new();
+    for index in 1..=8_u32 {
+        let address = MacAddress::derive("env-a", &format!("machine-{index}"), "net-private");
+        assert_eq!(fabric.attach(PortId(index), address), Ok(()));
+    }
+    let sender = MacAddress::derive("env-a", "machine-1", "net-private");
+    let target = MacAddress::derive("env-a", "machine-5", "net-private");
+    let sent = frame(target, sender, IPV4);
+    assert_eq!(
+        fabric.forward(PortId(1), &sent),
+        Disposition::Unicast(PortId(5))
+    );
+}
