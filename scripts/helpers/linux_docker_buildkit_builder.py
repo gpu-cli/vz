@@ -176,17 +176,11 @@ class Builder:
                 "unsupported builder ownership role")
         self.harness, self.descriptor = harness, descriptor
         self.role = role
-        material = {"run_id": harness.info["run_id"], "owner": descriptor["owner"]}
-        # Keep the source builder's existing names byte-for-byte. Additional
-        # roles separate runtime/cache ownership, never workload inputs.
-        if role != "source":
-            material["role"] = role
         # A composed run walks several builder-using suites over one Machine with
         # one run ID, so the suite separates their objects too. Single-suite runs
         # are unaffected and keep their existing names.
-        if harness.info.get("suite") == "all":
-            material["suite"] = getattr(harness, "active_suite", None) or "all"
-        self.identity_bytes = json.dumps(material, sort_keys=True).encode()
+        self.suite = (getattr(harness, "active_suite", None) or "all") if harness.info.get("suite") == "all" else None
+        self.identity_bytes = json.dumps(self.identity_material(), sort_keys=True).encode()
         self.identity_sha256 = sha(self.identity_bytes)
         token = self.identity_sha256[:24]
         self.token = "vzbuild-" + token
@@ -229,10 +223,19 @@ class Builder:
         raw, _, _ = self.command(kind + "-absent", args)
         require(not raw.strip(), "candidate builder object preexists or remains after removal")
 
-    def engine_guard(self):
+    def identity_material(self):
+        """The exact material both construction and the drift guard hash. Keep the
+        source builder's existing names byte-for-byte; additional roles separate
+        runtime/cache ownership, never workload inputs."""
         material = {"run_id": self.harness.info["run_id"], "owner": self.descriptor["owner"]}
         if self.role != "source":
             material["role"] = self.role
+        if self.suite is not None:
+            material["suite"] = self.suite
+        return material
+
+    def engine_guard(self):
+        material = self.identity_material()
         require(self.role == self.ownership["role"] and
                 json.dumps(material, sort_keys=True).encode() == self.identity_bytes,
                 "builder role/run/owner identity changed")
