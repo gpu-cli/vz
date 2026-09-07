@@ -169,7 +169,7 @@ class AdmissionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             gate.arguments(['--suite', 'lifecycle', '--tmux=a', '--tmux=b'])
         with patch.object(gate.startup, 'preflight') as startup:
-            for suite, tmux in (('lifecycle', None), ('compose', '/owned/tmux'), ('all', '/owned/tmux')):
+            for suite, tmux in (('lifecycle', None), ('compose', '/owned/tmux'), ('all', None)):
                 with self.subTest(suite=suite), self.assertRaises(ValueError):
                     gate.preflight(types.SimpleNamespace(suite=suite, tmux=tmux), require_host=False)
             startup.assert_not_called()
@@ -261,13 +261,17 @@ class AdmissionTests(unittest.TestCase):
             with self.assertRaises(driver.Rejected):
                 gate.secure_registry_config(expected | bad)
 
-    def test_all_rejects_before_any_preflight_or_write(self):
+    def test_all_demands_every_suite_input_before_any_preflight_or_write(self):
+        """`all` composes every suite in one provisioning, so it carries every
+        suite's inputs; a bare invocation is still refused before any state."""
         with patch.object(gate, "preflight") as preflight, patch.object(gate, "run") as run:
             with contextlib.redirect_stderr(io.StringIO()) as errors:
                 self.assertEqual(gate.main(["--suite", "all"]), 2)
-            self.assertIn("63-scenario", errors.getvalue())
+            self.assertIn("--registry-archive is required", errors.getvalue())
             preflight.assert_not_called()
             run.assert_not_called()
+        self.assertEqual(set(gate.SUITE_ORDER), set(gate.SUITES))
+        self.assertEqual(gate.SUITE_ORDER[-1], "recovery", "recovery cycles Stop/Up and must run last")
 
     def test_duplicate_suite_rejected(self):
         with self.assertRaisesRegex(driver.Rejected, "duplicate"):
@@ -658,7 +662,7 @@ class PrePullTrustTests(unittest.TestCase):
                 harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
                 harness.docker = Mock(return_value=(json.dumps(engine).encode(), stderr, 0))
                 harness.mutate, harness.exact_absent = Mock(), Mock()
-                harness.owned = []
+                harness.owned, harness.prepared_images = [], {}
                 with self.assertRaises(driver.Rejected):
                     harness.prepare_image(descriptor)
                 harness.docker.assert_called_once_with("public-registry-policy", descriptor,
@@ -888,7 +892,7 @@ class BuildDispatchTests(unittest.TestCase):
         descriptor = {"engine_id": "exact-engine", "name": "exact-context"}
         pin = {"id": "sha256:" + "b" * 64, "reference": "docker.io/library/python@sha256:" + "c" * 64}
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
-        harness.info, harness.owned = {"python_image": pin}, []
+        harness.info, harness.owned, harness.prepared_images = {"python_image": pin}, [], {}
         harness.docker = Mock(side_effect=[
             (json.dumps({"ID": "exact-engine", "RegistryConfig": policy}).encode(), b"", 0), (b"", b"", 0)])
         harness.exact_absent = Mock()

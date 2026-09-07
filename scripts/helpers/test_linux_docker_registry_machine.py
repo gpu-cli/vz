@@ -38,26 +38,28 @@ class ArgumentTests(unittest.TestCase):
         self.assertTrue(args.run_id.startswith('registry-'))
         self.assertEqual((args.registry_archive, args.registry_layout), ('/owned/registry.tar', '/owned/layout'))
         for partial in (REGISTRY[:2], REGISTRY[2:], []):
-            with self.subTest(partial=partial), self.assertRaisesRegex(ValueError, 'required only for the registry suite'):
+            with self.subTest(partial=partial), self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
                 gate.arguments(['--suite', 'registry', *COMMON, *partial])
         for suite in ('images', 'compose'):
-            with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, 'required only for the registry suite'):
+            with self.subTest(suite=suite), self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
                 gate.arguments(['--suite', suite, *COMMON, *REGISTRY])
         with self.assertRaisesRegex(ValueError, 'duplicate'):
             gate.arguments(['--suite', 'registry', *COMMON, *REGISTRY, '--registry-layout=/other'])
 
-    def test_registry_rejects_builder_fixture_terminal_options_and_all_stays_rejected(self):
+    def test_registry_rejects_builder_fixture_terminal_options_and_all_carries_them(self):
         for option in FOREIGN:
             with self.subTest(option=option), self.assertRaises(ValueError):
                 gate.arguments(['--suite', 'registry', *COMMON, *REGISTRY, '--' + option, '/foreign/input'])
-        with self.assertRaisesRegex(ValueError, 'not implemented'):
+        # A composed run carries every suite's inputs, so the registry ones are
+        # required rather than rejected, and the other suites' remain required too.
+        with self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
             gate.arguments(['--suite', 'all', *COMMON])
-        with self.assertRaisesRegex(ValueError, 'not implemented'):
+        with self.assertRaisesRegex(ValueError, '--tmux is required'):
             gate.arguments(['--suite', 'all', *COMMON, *REGISTRY])
 
     def test_registry_rejection_precedes_provisioning_inputs(self):
         # Suite/option admission fails before required startup options are demanded.
-        with self.assertRaisesRegex(ValueError, 'required only for the registry suite'):
+        with self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
             gate.arguments(['--suite', 'registry'])
         with self.assertRaisesRegex(ValueError, 'required option'):
             gate.arguments(['--suite', 'registry', *REGISTRY])

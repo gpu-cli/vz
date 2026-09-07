@@ -10,6 +10,7 @@ Owned BuildKit builder cache volumes are removed by successful workload cleanup.
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 from pathlib import Path
@@ -35,6 +36,12 @@ REGISTRY_SCOPE = "DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTI
 HANDSHAKE_SCOPE = "DEV_INSTALLED_LINUX_ENGINE_HANDSHAKE_NOT_RELEASE_CERTIFICATION"
 LIMITS_SCOPE = "DEV_INSTALLED_LINUX_RESOURCE_LIMITS_OOM_NOT_RELEASE_CERTIFICATION"
 RECOVERY_SCOPE = "DEV_INSTALLED_LINUX_PERSISTENCE_STOP_UP_RECOVERY_NOT_RELEASE_CERTIFICATION"
+ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATION"
+# One provisioning, every suite once, in an order that leaves the topology
+# undisturbed until the end: `recovery` cycles Stop/Up and replaces the
+# sentinel monitor, so it always runs last.
+SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
+               "lifecycle", "images", "limits", "registry", "recovery")
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
@@ -71,37 +78,44 @@ def arguments(argv):
     parser.add_argument("--registry-archive")
     parser.add_argument("--registry-layout")
     args = parser.parse_args(argv)
-    require(args.suite in SUITES, "full 63-scenario --suite all is not implemented; no workload dispatched")
+    require(args.suite in (*SUITES, "all"), "unknown suite")
+    # `all` composes every suite in one provisioning, so it carries every
+    # suite's inputs at once; each option otherwise belongs to exactly one suite.
+    composed = args.suite == "all"
     for name in ("registry_archive", "registry_layout"):
-        require((getattr(args, name) is not None) == (args.suite == "registry"),
-                "--" + name.replace("_", "-") + " is required only for the registry suite")
-    require(args.container_fixture is None or args.suite == "lifecycle", "container-fixture requires the lifecycle suite")
-    require((args.tmux is not None) == (args.suite == "lifecycle"),
-            "--tmux is required only for the lifecycle suite")
-    require(args.parallel_fixture is None or args.suite == "parallel", "parallel-fixture requires the parallel suite")
-    require(args.suite == "ssh" or all(getattr(args, name) is None for name in ("ssh_fixture", "ssh_packages", "ssh_gpgv")),
-            "SSH options require the ssh suite")
-    require(args.suite != "ssh" or args.ssh_packages is not None, "--ssh-packages is required for the ssh suite")
+        require((getattr(args, name) is not None) == (args.suite == "registry" or composed),
+                "--" + name.replace("_", "-") + " is required for the registry suite and for --suite all")
+    require(args.container_fixture is None or args.suite == "lifecycle" or composed,
+            "container-fixture requires the lifecycle suite")
+    require((args.tmux is not None) == (args.suite == "lifecycle" or composed),
+            "--tmux is required for the lifecycle suite and for --suite all")
+    require(args.parallel_fixture is None or args.suite == "parallel" or composed,
+            "parallel-fixture requires the parallel suite")
+    require(args.suite == "ssh" or composed or all(getattr(args, name) is None
+            for name in ("ssh_fixture", "ssh_packages", "ssh_gpgv")), "SSH options require the ssh suite")
+    require(args.suite != "ssh" and not composed or args.ssh_packages is not None,
+            "--ssh-packages is required for the ssh suite and for --suite all")
     if args.run_id is None:
         args.run_id = args.suite + "-" + uuid.uuid4().hex[:24]
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
-    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel", "ssh"}),
+    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel", "ssh", "all"}),
             "--buildkit-archive is required only for Buildx suites")
     return args
 
 
 def preflight(args, require_host=True):
-    require(args.suite in SUITES, "full contract unavailable")
-    if args.suite in ('images', 'registry', 'handshake', 'limits', 'recovery'):
+    require(args.suite in (*SUITES, "all"), "full contract unavailable")
+    composed = args.suite == "all"
+    if not composed and args.suite in ('images', 'registry', 'handshake', 'limits', 'recovery'):
         require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
                 ('image' if args.suite == 'images' else args.suite) + ' suite rejects builder, foreign fixture and terminal options')
     for name in ('registry_archive', 'registry_layout'):
-        require((getattr(args, name, None) is not None) == (args.suite == 'registry'),
-                '--' + name.replace('_', '-') + ' is required only for the registry suite')
-    if args.suite == 'registry':
+        require((getattr(args, name, None) is not None) == (args.suite == 'registry' or composed),
+                '--' + name.replace('_', '-') + ' is required for the registry suite and for --suite all')
+    if composed or args.suite == 'registry':
         # Admit every registry input read-only before startup preflight touches
         # anything: pinned layout, exact archive bytes, unexecuted binary
         # metadata and the isolated Python dependencies behind the fixture.
@@ -109,9 +123,9 @@ def preflight(args, require_host=True):
         registry_archive = startup.canonical(args.registry_archive)
         registry_layout = startup.canonical(args.registry_layout)
         registry = registry_machine.admit_inputs(registry_archive, registry_layout)
-    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
-            "--tmux is required only for the lifecycle suite")
-    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
+    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle" or composed),
+            "--tmux is required for the lifecycle suite and for --suite all")
+    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" or composed else None
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
@@ -120,7 +134,7 @@ def preflight(args, require_host=True):
     ca_pin = public_ca_input(ca_path)
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
               "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
-              "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "recovery": RECOVERY_SCOPE}
+              "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
     info.update(scope=scopes[args.suite], suite=args.suite,
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
@@ -131,7 +145,7 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
-    if args.suite in {"build", "artifacts", "parallel", "ssh"}:
+    if composed or args.suite in {"build", "artifacts", "parallel", "ssh"}:
         import linux_docker_buildkit_builder as builder
         archive = startup.canonical(args.buildkit_archive)
         info["buildkit"] = builder.preflight_archive(archive)
@@ -143,12 +157,12 @@ def preflight(args, require_host=True):
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)
-    if args.suite in {"artifacts", "parallel", "ssh"}:
+    if composed or args.suite in {"artifacts", "parallel", "ssh"}:
         for name in ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                      "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py"):
             path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
-    if args.suite == "parallel":
+    if composed or args.suite == "parallel":
         from linux_docker_build_parallel import fixture_contract
         selected = startup.canonical(getattr(args, "parallel_fixture", None) or
                                      str(REPO / "tests/fixtures/vz-0.4/docker-parallel"))
@@ -160,7 +174,7 @@ def preflight(args, require_host=True):
         for path in selected.rglob("*"):
             if path.is_file():
                 info["inputs"][str(path)] = startup.digest(path)
-    if args.suite == "ssh":
+    if composed or args.suite == "ssh":
         from linux_docker_build_ssh import fixture_contract
         from linux_docker_ssh_agent import tool_inputs
         import linux_docker_ssh_input as ssh_input
@@ -185,18 +199,18 @@ def preflight(args, require_host=True):
         info["inputs"][str(ssh_input.PIN)] = startup.digest(ssh_input.PIN)
         for path in selected.iterdir():
             info["inputs"][str(path)] = startup.digest(path)
-    if args.suite == 'images':
+    if composed or args.suite == 'images':
         from linux_docker_image_machine import required_source_paths
         for path in required_source_paths():
             info['inputs'][str(path)] = startup.digest(Path(path))
-    if args.suite == 'registry':
+    if composed or args.suite == 'registry':
         info.update(registry=registry, registry_archive=str(registry_archive), registry_layout=str(registry_layout))
         info['inputs'][str(registry_archive)] = registry['archive_sha256']
         for path in registry_machine.required_source_paths():
             info['inputs'][str(path)] = startup.digest(Path(path))
         require(info['inputs'][str(registry_machine.PIN)] == startup.digest(registry_machine.PIN) and
                 startup.digest(registry_archive) == registry['archive_sha256'], 'registry pin or archive changed')
-    if args.suite == 'handshake':
+    if composed or args.suite == 'handshake':
         from linux_docker_handshake_machine import manifest_expectations, tool_inputs
         from linux_docker_handshake_machine import required_source_paths as handshake_sources
         # Manifest-versus-upstream pins are checked before any client execution.
@@ -205,7 +219,7 @@ def preflight(args, require_host=True):
             info['inputs'][str(path)] = startup.digest(Path(path))
         for row in tool_inputs().values():
             info['inputs'][row['path']] = row['sha256']
-    if args.suite == 'limits':
+    if composed or args.suite == 'limits':
         from linux_docker_limits_machine import fixture_contract as limits_fixture_contract
         from linux_docker_limits_machine import required_source_paths as limits_sources
         limits_fixture_contract()
@@ -217,13 +231,13 @@ def preflight(args, require_host=True):
         for path in selected.rglob("*"):
             if path.is_file():
                 info['inputs'][str(path)] = startup.digest(path)
-    if args.suite == 'recovery':
+    if composed or args.suite == 'recovery':
         from linux_docker_recovery_machine import fixture_contract as recovery_fixture_contract
         from linux_docker_recovery_machine import required_source_paths as recovery_sources
         recovery_fixture_contract()
         for path in recovery_sources():
             info['inputs'][str(path)] = startup.digest(Path(path))
-    if args.suite == "lifecycle":
+    if composed or args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
         from linux_docker_runtime_audit_evidence import required_source_paths as audit_source_paths
@@ -501,6 +515,7 @@ class ComposeHarness(startup.Harness):
         self.ssh_cache_captures = []
         self.runtime_audits = []
         self.registry_sessions = []
+        self.prepared_images = {}
         self.recovery_sessions, self.recovery_cycles, self.recovery_monitors = [], {}, []
         self.registry_controls = None
         self.registry_project = None
@@ -633,6 +648,11 @@ class ComposeHarness(startup.Harness):
         return row
 
     def prepare_image(self, descriptor):
+        """Prepared once per Machine: composed runs share one owned fixture image
+        rather than registering a second ownership row the first removal invalidates."""
+        cached = self.prepared_images.get(descriptor["name"])
+        if cached is not None:
+            return copy.deepcopy(cached)
         raw, stderr, _ = self.docker("public-registry-policy", descriptor, ["info", "--format", "{{json .}}"])
         require(not stderr, "registry policy emitted stderr")
         engine = image_input.parse(raw)
@@ -683,8 +703,10 @@ class ComposeHarness(startup.Harness):
         item = json.loads(raw)[0]
         require(item["Id"] == row["image_id"] and item["Architecture"] == "arm64" and item["Os"] == "linux" and
                 item["Config"]["Labels"][LABEL] == token, "fixture image ownership/content differs")
-        return {"base": {"reference": reference, "id": pin["id"], "platform": "linux/arm64"},
-                "compose": {"reference": row["image_id"], "id": row["image_id"], "platform": "linux/arm64"}}
+        images = {"base": {"reference": reference, "id": pin["id"], "platform": "linux/arm64"},
+                  "compose": {"reference": row["image_id"], "id": row["image_id"], "platform": "linux/arm64"}}
+        self.prepared_images[descriptor["name"]] = copy.deepcopy(images)
+        return images
 
     def assert_certain(self):
         # Final audit capture cannot be a prerequisite for Docker cleanup: those
@@ -782,9 +804,105 @@ class ComposeHarness(startup.Harness):
                 require(image_matches(json.loads(raw)[0], self.info["python_image"]) == row["base_reference"], "base reference drift")
                 self.mutate("owned-base-remove", descriptor, ["image", "rm", row["base_reference"]])
 
-    def scenario(self):
+    def suites(self):
+        """Suites this run executes, in composition order."""
         suite = self.info.get("suite", "compose")
-        project = self.project(suite, "developer", 2)
+        return list(SUITE_ORDER) if suite == "all" else [suite]
+
+    def prepare_suites(self, suites, contexts, selected_machines, neighbor, project):
+        """Everything a suite needs in place before any workload, including the
+        sentinels: runtime audits must journal every owned mutation, and the
+        registry controls must observe the Docker configs before they change."""
+        if 'lifecycle' in suites:
+            self.enroll_runtime_audits(contexts)
+        if 'registry' not in suites:
+            return
+        # Three selected Machines run the registry; the fourth is only a
+        # same-authority neighbor sentinel. Controls observe all four Docker
+        # config directories before, between and after every Session.
+        import linux_docker_registry_controls as registry_controls
+        require(len(self.registry_sessions) == 0 and self.registry_controls is None, 'registry controls already exist')
+        selected_descriptors = [machine["docker_context"] for _, machine in selected_machines]
+        sentinel_descriptor = neighbor["machines"][1]["docker_context"]
+        require(sentinel_descriptor not in selected_descriptors and
+                len({json.dumps(d, sort_keys=True) for d in selected_descriptors}) == 3, 'registry Machine selection')
+        self.registry_controls = registry_controls.Controls(self, contexts, selected_descriptors, sentinel_descriptor)
+        self.registry_project = str(project)
+
+    def machine_images(self, suite, descriptor):
+        if suite in ('images', 'registry', 'handshake', 'recovery'):
+            # Driver schema compatibility only: this recipe uses tiny
+            # source-selected archives, not the Python/Compose image.
+            # Never pull/build/execute those admission-only image pins.
+            base = {key: self.info['python_image'][key] for key in ('reference', 'id', 'platform')}
+            return {'base': dict(base), 'compose': dict(base)}
+        return self.prepare_image(descriptor)
+
+    def run_machine_suite(self, suite, selected_machines, bindings):
+        """One suite across its selected Machines; the caller owns the topology."""
+        observations = []
+        for index, (_environment, machine) in enumerate(selected_machines):
+            self.monitor.check()
+            descriptor = machine["docker_context"]
+            scope, proof = bindings[machine["machine_id"]]
+            images = self.machine_images(suite, descriptor)
+            if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery"}:
+                if suite == "artifacts":
+                    from linux_docker_build_artifacts import run_machine
+                elif suite == "parallel":
+                    from linux_docker_build_parallel import run_machine
+                elif suite == "ssh":
+                    from linux_docker_build_ssh import run_machine
+                elif suite == 'images':
+                    from linux_docker_image_machine import run_machine
+                elif suite == 'registry':
+                    from linux_docker_registry_machine import run_machine
+                elif suite == 'handshake':
+                    from linux_docker_handshake_machine import run_machine
+                elif suite == 'limits':
+                    from linux_docker_limits_machine import run_machine
+                elif suite == 'recovery':
+                    from linux_docker_recovery_machine import run_machine
+                else:
+                    from linux_docker_container_lifecycle import run_machine
+                begin = time.time_ns()
+                observation = run_machine(self, descriptor, scope, proof, images, index)
+                end = self.monitor.close_interval(begin, descriptor["name"])
+                self.monitor.check_interval(begin, end, descriptor["name"])
+                observations.append(observation)
+                continue
+            inputs = self.driver_inputs(descriptor, scope, proof, images)
+            admitted = driver.Inputs(inputs, suite=suite)
+            admitted.verify_runtime_evidence()
+            output = self.evidence / (suite + "-machine-" + str(index))
+            selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
+            self.drivers.append(selected)
+            self.driver_cleanup_verified.append(False)
+            begin = time.time_ns()
+            result = selected.run(suite)
+            end = self.monitor.close_interval(begin, descriptor["name"])
+            require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
+                    str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
+            require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
+            builder_runtime = None
+            if suite == "build":
+                builder = self.get_builder(descriptor)
+                builder_runtime = builder.verify(require_invocation=True)
+                from linux_docker_buildkit_keep import verify_worker_log
+                builder_runtime["post_workload_log"] = verify_worker_log(builder)
+            replay = self.validate_driver(output, inputs)
+            self.driver_cleanup_verified[-1] = True
+            self.monitor.check_interval(begin, end, descriptor["name"])
+            observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
+                           "independent_validation": replay}
+            if builder_runtime is not None:
+                observation["builder_runtime"] = builder_runtime
+            observations.append(observation)
+        return observations
+
+    def scenario(self):
+        suites = self.suites()
+        project = self.project(self.info.get("suite", "compose"), "developer", 2)
         primary = self.up(project, "primary")
         self.daemon_identity = self.daemon_fingerprint()
         neighbor = self.up(project, "neighbor")
@@ -806,100 +924,23 @@ class ComposeHarness(startup.Harness):
                 require(raw == (self.info["public_ca"]["bundle_sha256"] +
                                "  /etc/vz/ca-certificates.crt\n").encode() and not stderr,
                         "actual Machine public CA bytes differ from selected immutable input")
-        if suite == 'lifecycle':
-            self.enroll_runtime_audits(contexts)
         selected_machines = [(primary, m) for m in primary["machines"]] + [(neighbor, neighbor["machines"][0])]
-        controls = None
-        if suite == 'registry':
-            # Three selected Machines run the registry; the fourth is only a
-            # same-authority neighbor sentinel. Controls observe all four Docker
-            # config directories before, between and after every Session.
-            import linux_docker_registry_controls as registry_controls
-            require(len(self.registry_sessions) == 0 and self.registry_controls is None, 'registry controls already exist')
-            selected_descriptors = [machine["docker_context"] for _, machine in selected_machines]
-            sentinel_descriptor = neighbor["machines"][1]["docker_context"]
-            require(sentinel_descriptor not in selected_descriptors and
-                    len({json.dumps(d, sort_keys=True) for d in selected_descriptors}) == 3, 'registry Machine selection')
-            controls = registry_controls.Controls(self, contexts, selected_descriptors, sentinel_descriptor)
-            self.registry_controls = controls
-            self.registry_project = str(project)
+        self.prepare_suites(suites, contexts, selected_machines, neighbor, project)
         sentinels = [self.sentinel(descriptor) for descriptor in contexts]
         self.monitor = SentinelMonitor(self, sentinels)
-        observations = []
-        credential_controls = None
+        slices, credential_controls = {}, None
         try:
             self.monitor.start()
-            if controls is not None:
-                credential_controls = {'baseline': controls.baseline()}
-            for index, (environment, machine) in enumerate(selected_machines):
-                self.monitor.check()
-                descriptor = machine["docker_context"]
-                scope, proof = bindings[machine["machine_id"]]
-                if suite in ('images', 'registry', 'handshake', 'recovery'):
-                    # Driver schema compatibility only: this recipe uses tiny
-                    # source-selected archives, not the Python/Compose image.
-                    # Never pull/build/execute those admission-only image pins.
-                    base = {key: self.info['python_image'][key] for key in ('reference', 'id', 'platform')}
-                    images = {'base': dict(base), 'compose': dict(base)}
-                else:
-                    images = self.prepare_image(descriptor)
-                if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery"}:
-                    if suite == "artifacts":
-                        from linux_docker_build_artifacts import run_machine
-                    elif suite == "parallel":
-                        from linux_docker_build_parallel import run_machine
-                    elif suite == "ssh":
-                        from linux_docker_build_ssh import run_machine
-                    elif suite == 'images':
-                        from linux_docker_image_machine import run_machine
-                    elif suite == 'registry':
-                        from linux_docker_registry_machine import run_machine
-                    elif suite == 'handshake':
-                        from linux_docker_handshake_machine import run_machine
-                    elif suite == 'limits':
-                        from linux_docker_limits_machine import run_machine
-                    elif suite == 'recovery':
-                        from linux_docker_recovery_machine import run_machine
-                    else:
-                        from linux_docker_container_lifecycle import run_machine
-                    begin = time.time_ns()
-                    observation = run_machine(self, descriptor, scope, proof, images, index)
-                    end = self.monitor.close_interval(begin, descriptor["name"])
-                    self.monitor.check_interval(begin, end, descriptor["name"])
-                    observations.append(observation)
-                    continue
-                inputs = self.driver_inputs(descriptor, scope, proof, images)
-                admitted = driver.Inputs(inputs, suite=suite)
-                admitted.verify_runtime_evidence()
-                output = self.evidence / (suite + "-machine-" + str(index))
-                selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
-                self.drivers.append(selected)
-                self.driver_cleanup_verified.append(False)
-                begin = time.time_ns()
-                result = selected.run(suite)
-                end = self.monitor.close_interval(begin, descriptor["name"])
-                require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
-                        str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
-                require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
-                builder_runtime = None
-                if suite == "build":
-                    builder = self.get_builder(descriptor)
-                    builder_runtime = builder.verify(require_invocation=True)
-                    from linux_docker_buildkit_keep import verify_worker_log
-                    builder_runtime["post_workload_log"] = verify_worker_log(builder)
-                replay = self.validate_driver(output, inputs)
-                self.driver_cleanup_verified[-1] = True
-                self.monitor.check_interval(begin, end, descriptor["name"])
-                observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
-                               "independent_validation": replay}
-                if builder_runtime is not None:
-                    observation["builder_runtime"] = builder_runtime
-                observations.append(observation)
-            if controls is not None:
-                require(len(self.registry_sessions) == 3 and all(s.cleanup_complete is True for s in self.registry_sessions),
-                        'three completed registry Sessions required')
-                credential_controls['final'] = controls.final()
-            if suite == 'recovery':
+            for suite in suites:
+                controls = self.registry_controls if suite == 'registry' else None
+                if controls is not None:
+                    credential_controls = {'baseline': controls.baseline()}
+                slices[suite] = self.run_machine_suite(suite, selected_machines, bindings)
+                if controls is not None:
+                    require(len(self.registry_sessions) == 3 and all(s.cleanup_complete is True for s in self.registry_sessions),
+                            'three completed registry Sessions required')
+                    credential_controls['final'] = controls.final()
+            if 'recovery' in suites:
                 # Stop/Up cycles legitimately advance incarnations; stable identity must hold.
                 for environment, expected in ((primary, primary_contexts), (neighbor, neighbor_contexts)):
                     live = self.inspect(self.status(project, environment["environment_id"]))
@@ -913,9 +954,14 @@ class ComposeHarness(startup.Harness):
                         "topology identity changed during Docker fixture work")
         finally:
             self.monitor.stop()
-        result = {"machine_slices": observations, "continuous_sentinels": self.monitor.summary(),
+        composed = self.info.get("suite") == "all"
+        result = {"machine_slices": [row for suite in suites for row in slices.get(suite, [])],
+                  "continuous_sentinels": self.monitor.summary(),
                   "runtime_inventory_scope": "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit"}
-        if controls is not None:
+        if composed:
+            result["suite_slices"] = slices
+            result["suites_executed"] = list(suites)
+        if credential_controls is not None:
             result["credential_controls"] = credential_controls
         return result
 
@@ -1012,6 +1058,11 @@ class MonitorStopped(Exception):
     """Cooperative cancellation between bounded read-only commands."""
 
 
+def executes(info, suite):
+    """True when this run performs that suite, directly or as part of `all`."""
+    return info["suite"] == suite or info["suite"] == "all"
+
+
 def run(info):
     os.umask(0o077)
     harness = ComposeHarness(info)
@@ -1020,7 +1071,7 @@ def run(info):
               "cleanup_errors": [], "docker_parity_certified": False, "aggregate_release_certified": False,
               "release_scenarios_passed": [], "test_case_retries": 0, "retained_root": str(harness.root)}
     try:
-        if info["suite"] == "ssh":
+        if executes(info, "ssh"):
             import linux_docker_ssh_input as ssh_input
             result["ssh_input_verification"] = ssh_input.verify(Path(info["ssh_packages"]),
                 harness.evidence / "ssh-input-verification", info["ssh_gpgv"], image_path=Path(info["image_input"]))
@@ -1029,23 +1080,23 @@ def run(info):
         for path, expected in (info["inputs"] | harness.staged_inputs).items():
             require(startup.digest(Path(path)) == expected, "selected input changed during physical run")
         require(driver.tree_digest(Path(info["fixture"])) == info["fixture_sha256"], "fixture changed during run")
-        if info["suite"] in ("parallel", "limits"):
+        if executes(info, "parallel") or executes(info, "limits"):
             require(driver.tree_digest(Path(info["parallel_fixture"])) == info["parallel_fixture_sha256"],
                     "parallel fixture changed during run")
-        if info["suite"] == "ssh":
+        if executes(info, "ssh"):
             require(driver.tree_digest(Path(info["ssh_fixture"])) == info["ssh_fixture_sha256"], "SSH fixture changed during run")
-        if info["suite"] == "lifecycle":
+        if executes(info, "lifecycle"):
             from linux_docker_container_fixture import fixture_contract
             selected = Path(info["container_fixture"])
             fixture_contract(selected)
             require(driver.tree_digest(selected) == info["container_fixture_sha256"], "container fixture changed during run")
-        if info["suite"] == "registry":
+        if executes(info, "registry"):
             sessions = harness.registry_sessions
             require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
                     "three completed registry Sessions required")
             require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
                     "registry archive changed during run")
-        if info["suite"] == "recovery":
+        if executes(info, "recovery"):
             sessions = harness.recovery_sessions
             require(len(sessions) == 3 and all(s.cleanup_complete is True and s.failed is False for s in sessions),
                     "three completed recovery Sessions required")
@@ -1055,9 +1106,9 @@ def run(info):
         try:
             require(harness.monitor is None or not harness.monitor.thread.is_alive(), "live monitor prevents cleanup")
             harness.remove_owned()
-            if info['suite'] == 'lifecycle':
+            if executes(info, 'lifecycle'):
                 result['runtime_audit_validation'] = harness.capture_runtime_audits()
-            if info["suite"] == "ssh":
+            if executes(info, "ssh"):
                 require(len(harness.ssh_cache_proofs) == 3, "three stopped SSH worker-cache proofs required")
                 result["ssh_stopped_cache_validation"] = harness.ssh_cache_proofs
             result["cleanup"] = harness.cleanup() | {"owned_workload_objects_removed": True,

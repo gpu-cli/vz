@@ -265,3 +265,27 @@ warning, which is pinned rather than silenced. Installed candidate 2 passed on
 three Machines (`.artifacts/linux-docker-limits-candidate-2`).
 
 Both slices are DEV evidence; the 63-scenario `--suite all` remains rejected.
+
+## Composed `--suite all` (DEV, not release)
+
+`--suite all` no longer refuses. It provisions the two Environments once and
+runs every suite against that one topology, in an order that leaves the
+topology undisturbed until the end: handshake, compose, build, artifacts,
+parallel, ssh, lifecycle, images, limits, registry, then recovery last because
+it cycles Stop and Up and replaces the sentinel monitor.
+
+Because it composes every suite, it carries every suite's inputs at once: the
+BuildKit archive, the SSH packages and gpgv, tmux, and the registry archive and
+layout. A bare `--suite all` is still refused before any state is created, now
+because those inputs are missing rather than because the suite is unimplemented.
+
+The sentinels and the runtime-audit enrollment are created once, before any
+workload, so one continuous liveness record and one audit journal cover every
+suite. The fixture image is prepared once per Machine and shared, so a composed
+run registers one ownership row per Machine rather than one per suite.
+
+This composition is what lets the aggregate gate consume the lane: the run emits
+per-scenario results for the IDs its suites prove, and the scenario table names
+the remaining gaps (bind mounts, published ports, concurrency and isolation) so
+they are reported MISSING rather than silently absent. A composed pass is still
+DEV evidence, not release certification.
