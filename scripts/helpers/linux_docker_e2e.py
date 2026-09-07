@@ -576,16 +576,19 @@ class ComposeHarness(startup.Harness):
             self.keep_proofs_verified[-1] = True
         return builder
 
-    def driver_inputs(self, descriptor, scope, proof, images):
+    def driver_inputs(self, descriptor, scope, proof, images, suite=None):
+        """`suite` is the suite currently executing, which is not the run's own
+        suite when a composed run walks them in turn."""
+        suite = suite or self.info.get("suite", "compose")
         inputs = input_mapping(self, scope, proof, images)
-        if self.info.get("suite", "compose") == "build":
+        if suite == "build":
             inputs["builder"] = self.prepare_builder(descriptor).mapping
         return inputs
 
-    def validate_driver(self, output, inputs):
-        require(self.info.get("suite", "compose") in {"build", "compose"},
-                "artifact replay belongs to the artifact orchestrator")
-        if self.info.get("suite", "compose") == "build":
+    def validate_driver(self, output, inputs, suite=None):
+        suite = suite or self.info.get("suite", "compose")
+        require(suite in {"build", "compose"}, "artifact replay belongs to the artifact orchestrator")
+        if suite == "build":
             from linux_docker_build_evidence import validate
         else:
             from linux_docker_compose_evidence import validate
@@ -873,7 +876,7 @@ class ComposeHarness(startup.Harness):
                 self.monitor.check_interval(begin, end, descriptor["name"])
                 observations.append(observation)
                 continue
-            inputs = self.driver_inputs(descriptor, scope, proof, images)
+            inputs = self.driver_inputs(descriptor, scope, proof, images, suite)
             admitted = driver.Inputs(inputs, suite=suite)
             admitted.verify_runtime_evidence()
             output = self.evidence / (suite + "-machine-" + str(index))
@@ -892,7 +895,7 @@ class ComposeHarness(startup.Harness):
                 builder_runtime = builder.verify(require_invocation=True)
                 from linux_docker_buildkit_keep import verify_worker_log
                 builder_runtime["post_workload_log"] = verify_worker_log(builder)
-            replay = self.validate_driver(output, inputs)
+            replay = self.validate_driver(output, inputs, suite)
             self.driver_cleanup_verified[-1] = True
             self.monitor.check_interval(begin, end, descriptor["name"])
             observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
