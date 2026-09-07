@@ -276,3 +276,48 @@ class ParallelTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GuardSerializationTests(ParallelTests):
+    """The builds stay concurrent; only the shared-builder guard is serialized.
+
+    Inspecting the builder is an exec into the BuildKit container, and four at
+    once is `vz-mzs.7.4`: one comes back with a corrupted gRPC preface and that
+    slot never reaches the rendezvous. The scenario is parallel builds, so the
+    guard is the part that may be serialized without changing what it asserts.
+    """
+
+    def test_guards_never_overlap_but_builds_do(self):
+        import linux_docker_build_parallel as subject
+        guard_depth, guard_peak = [0], [0]
+        build_peak, build_depth = [0], [0]
+        lock = threading.Lock()
+        entered = threading.Barrier(4, timeout=5)
+
+        class Fake:
+            def builder_guard(self):
+                with lock:
+                    guard_depth[0] += 1
+                    guard_peak[0] = max(guard_peak[0], guard_depth[0])
+                time.sleep(0.01)
+                with lock:
+                    guard_depth[0] -= 1
+
+            guarded = subject.ParallelDriver.guarded
+
+            def execute(self, operation):
+                self.guarded()
+                with lock:
+                    build_depth[0] += 1
+                    build_peak[0] = max(build_peak[0], build_depth[0])
+                entered.wait()          # every build must be running at once
+                with lock:
+                    build_depth[0] -= 1
+                self.guarded()
+                return operation["slot"]
+
+        workers = [Fake() for _ in range(4)]
+        results = parallel.execute_slots(workers, [self.operation(i) for i in range(4)])
+        self.assertEqual(results, [0, 1, 2, 3])
+        self.assertEqual(guard_peak[0], 1, "two slots inspected the shared builder at once")
+        self.assertEqual(build_peak[0], 4, "the builds must still all run together")

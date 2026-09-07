@@ -79,7 +79,29 @@ def build_arguments(inputs, operation):
             "--network=none", str(fixture)]
 
 
+# The guard inspects the shared builder, and with the `docker-container` driver
+# that is an exec into the BuildKit container. Four slots inspecting at once are
+# four concurrent execs into one container, which is `vz-mzs.7.4`: one of them
+# comes back with a corrupted gRPC preface —
+#
+#   Error: listing workers: failed to list workers: Unavailable: connection
+#          error: desc = "error reading server preface: http2: frame too large"
+#
+# — and that slot never reaches the rendezvous, so the other three build and then
+# time out waiting for it. Candidates 27 and 29 both died that way.
+#
+# This scenario is `parallel BUILDS`. Serializing the guard keeps every build
+# concurrent and changes nothing the scenario asserts, while removing a
+# concurrency the scenario never meant to exercise. Concurrent exec is a real
+# product gap and is proved by `vz-mzs.7.1.18`, not smuggled in here.
+GUARD_LOCK = threading.Lock()
+
+
 class ParallelDriver(driver.Driver):
+    def guarded(self):
+        with GUARD_LOCK:
+            self.builder_guard()
+
     def execute(self, operation):
         require(self.record.count == 0, "parallel driver cannot be reused")
         require(operation == specification(operation["slot"], self.output, Path(operation["parallel_fixture"]),
@@ -90,9 +112,9 @@ class ParallelDriver(driver.Driver):
         require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed before solve")
         startup.document(self.output / "inputs.json", self.inputs.raw)
         startup.document(self.output / "operation.intent.json", operation)
-        self.builder_guard()
+        self.guarded()
         result = self.command(build_arguments(self.inputs.raw, operation), timeout=300)
-        self.builder_guard()
+        self.guarded()
         require(not result.stdout and self.record.count == 9, "parallel command inventory/output differs")
         require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed during solve")
         require(driver.tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "base fixture changed during parallel solve")
