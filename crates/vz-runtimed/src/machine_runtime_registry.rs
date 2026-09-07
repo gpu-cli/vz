@@ -1537,6 +1537,7 @@ fn publish_directory(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use std::fs;
     use std::os::unix::fs::{PermissionsExt, symlink};
     use std::sync::atomic::{AtomicUsize, Ordering};

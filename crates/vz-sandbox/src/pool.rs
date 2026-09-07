@@ -818,6 +818,7 @@ impl SandboxPool {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::time::{SystemTime, UNIX_EPOCH};
     use vz_runtime_contract::{

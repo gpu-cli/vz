@@ -456,6 +456,7 @@ fn internal_scheduler_machine_error(error: StackError, request_id: &str) -> Mach
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn baseline_candidate(backend_id: &str) -> BackendPlacementCandidate {

@@ -8,7 +8,7 @@
 //! question "does the host reclaim pages" — the former is provable from
 //! guest-side numbers alone.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -58,7 +58,7 @@ fn last_mem_available_kb(log: &str) -> Option<u64> {
             let num: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
             num.parse::<u64>().ok()
         })
-        .last()
+        .next_back()
 }
 
 #[tokio::test(flavor = "multi_thread")]

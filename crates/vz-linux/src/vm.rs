@@ -1527,7 +1527,7 @@ fn shutdown_filesystem_identity_valid(receipt: &vz_agent_proto::DockerShutdownCo
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
 

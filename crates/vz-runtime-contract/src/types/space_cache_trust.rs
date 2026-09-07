@@ -307,6 +307,7 @@ fn sha256_hex(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use ring::rand::SystemRandom;
     use ring::signature::{Ed25519KeyPair, KeyPair};

@@ -2,7 +2,7 @@
 //! ring buffer for "virtio_balloon" probe messages. Confirms the rebuilt
 //! kernel actually has the balloon driver compiled in and probed.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::print_stderr)]
 
 use std::path::PathBuf;
 use std::process::Command;

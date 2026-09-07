@@ -689,6 +689,7 @@ impl std::fmt::Debug for Vm {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::{Vm, VmState, vz_state_to_vm_state};
     use objc2_virtualization::VZVirtualMachineState;
     use std::path::PathBuf;

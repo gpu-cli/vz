@@ -1512,6 +1512,7 @@ impl runtime_v2::execution_service_server::ExecutionService for ExecutionService
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};

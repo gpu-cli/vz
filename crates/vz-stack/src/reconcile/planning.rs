@@ -80,6 +80,7 @@ fn replica_keys(svc: &ServiceSpec) -> Vec<ServiceReplicaKey> {
 /// would otherwise be empty and removals would happen in alphabetical
 /// order instead of reverse-dependency order.
 #[cfg(test)]
+#[expect(clippy::expect_used, reason = "test-only planning entry point")]
 pub(super) fn compute_actions(
     desired_services: &[ServiceSpec],
     observed: &[ServiceObservedState],

@@ -1021,7 +1021,7 @@ impl<R: ContainerRuntime> StackOrchestrator<R> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use crate::executor::tests_support::MockContainerRuntime;

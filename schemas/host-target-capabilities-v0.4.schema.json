@@ -1,0 +1,262 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://vz.dev/schemas/host-target-capabilities-v0.4.schema.json",
+  "title": "vz 0.4 host × Machine-target × profile capability matrix",
+  "description": "Authoritative ACTIVE/DEV/PLANNED/NA labels per host, Machine target and profile. Inputs and retained-evidence pointers only, never a release PASS receipt. Structural and per-entry status/evidence rules are expressed here; cross-entry rules (every machine capability listed exactly once per pair, alias tables covering the Rust enums) live in the Rust test and scripts/helpers/installed_capability_matrix.py.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "$schema",
+    "schema_version",
+    "target_release",
+    "contract_state",
+    "normative_source",
+    "source_head",
+    "status_definitions",
+    "unlisted_capability_status",
+    "vocabularies",
+    "hosts",
+    "targets",
+    "evidence_notes",
+    "generated_surfaces",
+    "pairs"
+  ],
+  "properties": {
+    "$schema": { "const": "../schemas/host-target-capabilities-v0.4.schema.json" },
+    "schema_version": { "const": 1 },
+    "target_release": { "const": "0.4.0" },
+    "contract_state": { "enum": ["draft_unverified", "inputs_frozen"] },
+    "normative_source": { "const": "planning/developer-environments/GOAL-0.4.0.md#versioned-gate-inputs" },
+    "source_head": { "$ref": "#/$defs/git_sha" },
+    "status_definitions": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ACTIVE", "DEV", "PLANNED", "NA"],
+      "properties": {
+        "ACTIVE": { "type": "string", "minLength": 1 },
+        "DEV": { "type": "string", "minLength": 1 },
+        "PLANNED": { "type": "string", "minLength": 1 },
+        "NA": { "type": "string", "minLength": 1 }
+      }
+    },
+    "unlisted_capability_status": { "const": "PLANNED" },
+    "vocabularies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["machine_capabilities", "topology_capabilities", "profiles", "backends"],
+      "properties": {
+        "machine_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 13,
+          "maxItems": 13,
+          "items": { "$ref": "#/$defs/machine_capability" }
+        },
+        "topology_capabilities": {
+          "type": "array",
+          "uniqueItems": true,
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/snake_name" }
+        },
+        "profiles": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wire_names", "aliases", "alias_sources"],
+          "properties": {
+            "wire_names": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/profile" }
+            },
+            "aliases": {
+              "type": "object",
+              "propertyNames": { "$ref": "#/$defs/snake_name" },
+              "additionalProperties": { "$ref": "#/$defs/profile" }
+            },
+            "alias_sources": { "$ref": "#/$defs/source_refs" }
+          }
+        },
+        "backends": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["wire_names", "aliases", "alias_sources"],
+          "properties": {
+            "wire_names": {
+              "type": "array",
+              "uniqueItems": true,
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/backend" }
+            },
+            "aliases": {
+              "type": "object",
+              "propertyNames": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+              "additionalProperties": { "$ref": "#/$defs/backend" }
+            },
+            "alias_sources": { "$ref": "#/$defs/source_refs" },
+            "note": { "type": "string" }
+          }
+        }
+      }
+    },
+    "hosts": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/host_id" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["os", "arch", "status"],
+        "properties": {
+          "os": { "$ref": "#/$defs/os" },
+          "arch": { "$ref": "#/$defs/arch" },
+          "status": { "$ref": "#/$defs/status" },
+          "minimum_os": { "type": "string", "pattern": "^[0-9]+(\\.[0-9]+){1,2}$" },
+          "minimum_os_source": { "$ref": "#/$defs/source_ref" },
+          "rejected_by": { "$ref": "#/$defs/source_refs" },
+          "note": { "type": "string" }
+        },
+        "if": { "properties": { "status": { "const": "NA" } } },
+        "then": { "required": ["rejected_by"], "properties": { "rejected_by": { "minItems": 1 } } }
+      }
+    },
+    "targets": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "$ref": "#/$defs/os" },
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["os"],
+        "properties": {
+          "os": { "$ref": "#/$defs/os" },
+          "note": { "type": "string" }
+        }
+      }
+    },
+    "evidence_notes": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "generated_surfaces": {
+      "type": "array",
+      "uniqueItems": true,
+      "minItems": 1,
+      "items": { "type": "string", "pattern": "^[A-Za-z0-9_./-]+$" }
+    },
+    "pairs": {
+      "type": "array",
+      "minItems": 1,
+      "items": { "$ref": "#/$defs/pair" }
+    }
+  },
+  "$defs": {
+    "git_sha": { "type": "string", "pattern": "^[0-9a-f]{7,40}$" },
+    "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+    "snake_name": { "type": "string", "pattern": "^[a-z][a-z0-9_]*$" },
+    "status": { "enum": ["ACTIVE", "DEV", "PLANNED", "NA"] },
+    "os": { "enum": ["linux", "macos", "windows"] },
+    "arch": { "enum": ["aarch64", "x86_64"] },
+    "host_id": { "type": "string", "pattern": "^(linux|macos|windows)-(arm64|x86_64)$" },
+    "profile": { "enum": ["developer", "hardened"] },
+    "backend": {
+      "enum": ["macos_virtualization_linux", "macos_native", "linux_native", "windows_linux", "windows_native"]
+    },
+    "machine_capability": {
+      "enum": [
+        "posix_exec", "posix_pty", "signals", "files", "ports", "docker_engine", "compose", "buildx",
+        "snapshot", "suspend", "checkpoint", "gui", "windows_console"
+      ]
+    },
+    "source_ref": {
+      "type": "string",
+      "description": "Repository-relative file path with a line or line range, e.g. crates/x/src/y.rs:12-20.",
+      "pattern": "^[A-Za-z0-9_./-]+\\.(rs|py|md|json|sh|toml):[0-9]+(-[0-9]+)?$"
+    },
+    "source_refs": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/$defs/source_ref" } },
+    "evidence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["lane", "suite", "run_id", "outcome", "result_path", "result_sha256", "checksums_sha256", "release_certified"],
+      "properties": {
+        "lane": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "suite": { "type": "string", "pattern": "^[a-z][a-z0-9_-]*$" },
+        "run_id": { "type": "string", "minLength": 1 },
+        "outcome": { "type": "string", "pattern": "^passed[a-z0-9_]*$" },
+        "result_path": { "type": "string", "pattern": "^[A-Za-z0-9_./-]+\\.json$" },
+        "result_sha256": { "$ref": "#/$defs/sha256" },
+        "checksums_sha256": { "oneOf": [{ "$ref": "#/$defs/sha256" }, { "type": "null" }] },
+        "release_certified": { "const": false },
+        "source_head": { "$ref": "#/$defs/git_sha" },
+        "checks_cited": { "type": "array", "minItems": 1, "items": { "type": "string", "minLength": 1 } }
+      }
+    },
+    "capability_entry": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "negotiated_by", "rejected_by", "evidence"],
+      "properties": {
+        "status": { "$ref": "#/$defs/status" },
+        "negotiated_by": { "$ref": "#/$defs/source_refs" },
+        "rejected_by": { "$ref": "#/$defs/source_refs" },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence" } },
+        "note": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "status": { "enum": ["ACTIVE", "DEV"] } } },
+          "then": { "properties": { "evidence": { "minItems": 1 }, "negotiated_by": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "NA" } } },
+          "then": { "properties": { "rejected_by": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "status": { "const": "PLANNED" } } },
+          "then": {
+            "properties": {
+              "negotiated_by": { "maxItems": 0 },
+              "rejected_by": { "maxItems": 0 },
+              "evidence": { "maxItems": 0 }
+            }
+          }
+        }
+      ]
+    },
+    "pair": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["host", "target", "profile", "pair_status", "backend", "note", "negotiated_by", "rejected_by", "machine_capabilities", "topology_capabilities"],
+      "properties": {
+        "host": { "$ref": "#/$defs/host_id" },
+        "target": { "$ref": "#/$defs/os" },
+        "profile": { "$ref": "#/$defs/profile" },
+        "pair_status": { "$ref": "#/$defs/status" },
+        "backend": { "oneOf": [{ "$ref": "#/$defs/backend" }, { "type": "null" }] },
+        "note": { "type": "string", "minLength": 1 },
+        "negotiated_by": { "$ref": "#/$defs/source_refs" },
+        "rejected_by": { "$ref": "#/$defs/source_refs" },
+        "machine_capabilities": {
+          "type": "object",
+          "minProperties": 13,
+          "maxProperties": 13,
+          "propertyNames": { "$ref": "#/$defs/machine_capability" },
+          "additionalProperties": { "$ref": "#/$defs/capability_entry" }
+        },
+        "topology_capabilities": {
+          "type": "object",
+          "minProperties": 1,
+          "propertyNames": { "$ref": "#/$defs/snake_name" },
+          "additionalProperties": { "$ref": "#/$defs/capability_entry" }
+        }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "pair_status": { "const": "NA" } } },
+          "then": { "properties": { "rejected_by": { "minItems": 1 } } }
+        },
+        {
+          "if": { "properties": { "pair_status": { "enum": ["ACTIVE", "DEV"] } } },
+          "then": { "properties": { "negotiated_by": { "minItems": 1 }, "backend": { "$ref": "#/$defs/backend" } } }
+        }
+      ]
+    }
+  }
+}

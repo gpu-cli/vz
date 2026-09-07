@@ -2206,6 +2206,7 @@ impl runtime_v2::checkpoint_service_server::CheckpointService for CheckpointServ
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     fn entry(path: &str, digest_sha256: &str, size: u64) -> CheckpointFileEntry {
@@ -2269,6 +2270,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the injected copy failure closure mirrors the tonic::Status result type of the restore hook"
+    )]
     fn test_snapshot_restore_copy_failure_preserves_workspace() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let workspace_root = tmp.path().join("workspace");

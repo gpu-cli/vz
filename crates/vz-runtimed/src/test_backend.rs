@@ -989,8 +989,36 @@ impl RuntimeBackend for TestRuntimeBackend {
     }
 }
 
+#[cfg(target_os = "macos")]
+impl TestRuntimeBackend {
+    pub async fn exec_container_streaming<F>(
+        &self,
+        container_id: &str,
+        config: ExecConfig,
+        mut on_event: F,
+    ) -> Result<ExecOutput, RuntimeError>
+    where
+        F: FnMut(InteractiveExecEvent),
+    {
+        let output = self.exec_container(container_id, config).await?;
+        if !output.stdout.is_empty() {
+            on_event(InteractiveExecEvent::Stdout(
+                output.stdout.as_bytes().to_vec(),
+            ));
+        }
+        if !output.stderr.is_empty() {
+            on_event(InteractiveExecEvent::Stderr(
+                output.stderr.as_bytes().to_vec(),
+            ));
+        }
+        on_event(InteractiveExecEvent::Exit(output.exit_code));
+        Ok(output)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[tokio::test]
@@ -1047,32 +1075,5 @@ mod tests {
             Some(replacement)
         );
         assert_eq!(backend.shared_vm_shutdown_count(), 1);
-    }
-}
-
-#[cfg(target_os = "macos")]
-impl TestRuntimeBackend {
-    pub async fn exec_container_streaming<F>(
-        &self,
-        container_id: &str,
-        config: ExecConfig,
-        mut on_event: F,
-    ) -> Result<ExecOutput, RuntimeError>
-    where
-        F: FnMut(InteractiveExecEvent),
-    {
-        let output = self.exec_container(container_id, config).await?;
-        if !output.stdout.is_empty() {
-            on_event(InteractiveExecEvent::Stdout(
-                output.stdout.as_bytes().to_vec(),
-            ));
-        }
-        if !output.stderr.is_empty() {
-            on_event(InteractiveExecEvent::Stderr(
-                output.stderr.as_bytes().to_vec(),
-            ));
-        }
-        on_event(InteractiveExecEvent::Exit(output.exit_code));
-        Ok(output)
     }
 }

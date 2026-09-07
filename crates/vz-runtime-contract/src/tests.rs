@@ -1,8 +1,10 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use super::*;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::future::{Future, ready};
-use std::sync::{Arc, Mutex};
-use std::task::{Context, Poll, Wake, Waker};
+use std::sync::Mutex;
+use std::task::{Context, Poll, Waker};
 
 fn unsupported(operation: &str) -> RuntimeError {
     RuntimeError::UnsupportedOperation {
@@ -11,18 +13,12 @@ fn unsupported(operation: &str) -> RuntimeError {
     }
 }
 
-struct NoopWaker;
-
-impl Wake for NoopWaker {
-    fn wake(self: Arc<Self>) {}
-}
-
 fn poll_immediate<F>(future: F) -> F::Output
 where
     F: Future,
 {
-    let waker = Waker::from(Arc::new(NoopWaker));
-    let mut cx = Context::from_waker(&waker);
+    let waker = Waker::noop();
+    let mut cx = Context::from_waker(waker);
     let mut future = std::pin::pin!(future);
 
     match Future::poll(future.as_mut(), &mut cx) {
@@ -3011,7 +3007,7 @@ fn workspace_runtime_manager_routes_claimed_parity_operations() {
         poll_immediate(manager.create_container("alpine:latest", RunConfig::default())).unwrap();
     let _ = poll_immediate(manager.exec_container("container-1", ExecConfig::default())).unwrap();
     let _ = poll_immediate(manager.stop_container("container-1", false, None, None));
-    let _ = poll_immediate(manager.remove_container("container-1")).unwrap();
+    poll_immediate(manager.remove_container("container-1")).unwrap();
     manager.container_logs("container-1").unwrap();
 
     assert_eq!(

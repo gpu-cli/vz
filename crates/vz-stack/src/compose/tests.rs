@@ -1916,8 +1916,10 @@ services:
     assert!(result.is_ok());
     let spec = result.unwrap();
     // Default replicas is 1 (not 0)
-    let mut expected = ResourcesSpec::default();
-    expected.replicas = 1;
+    let expected = ResourcesSpec {
+        replicas: 1,
+        ..ResourcesSpec::default()
+    };
     assert_eq!(spec.services[0].resources, expected);
 }
 

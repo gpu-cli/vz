@@ -38,7 +38,7 @@ fn running_delete() -> (EnvironmentInstance, EnvironmentLifecycleOperation) {
         EnvironmentLifecycleKind::Delete,
         "delete-request",
         "delete-idempotency",
-        &environment_delete_request_hash(
+        environment_delete_request_hash(
             &environment.project_id,
             &environment.environment_id,
             &selection(),

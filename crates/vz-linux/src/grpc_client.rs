@@ -1768,6 +1768,7 @@ fn buildctl_guest_command(args: Vec<String>) -> (String, Vec<String>) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

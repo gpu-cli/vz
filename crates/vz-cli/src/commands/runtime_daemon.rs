@@ -229,6 +229,7 @@ pub(crate) fn default_state_db_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::path::PathBuf;
     use std::process::Command;

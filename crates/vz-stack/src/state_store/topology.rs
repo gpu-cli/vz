@@ -909,6 +909,10 @@ pub(super) enum ReplicaV5MigrationFailpoint {
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "failpoints are named after the migration step they follow, matching sibling failpoint enums"
+)]
 pub(super) enum ReconcileV6MigrationFailpoint {
     AfterTerminalHistoryArchived,
     AfterDurableActionsRebuilt,

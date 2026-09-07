@@ -1,3 +1,10 @@
+#![allow(
+    clippy::unwrap_used,
+    clippy::expect_used,
+    clippy::print_stderr,
+    clippy::print_stdout
+)]
+
 use std::collections::{BTreeMap, HashMap, HashSet};
 #[cfg(target_os = "linux")]
 use std::path::PathBuf;
@@ -7253,8 +7260,6 @@ async fn maintenance_loop_compacts_checkpoints_and_receipts() {
                         record.event,
                         StackEvent::CheckpointGcCompacted {
                             deleted_by_age,
-                            deleted_by_count: _,
-                            deleted_by_lineage: _,
                             ..
                         } if deleted_by_age >= 1
                     )

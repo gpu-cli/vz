@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt, symlink};
 use std::task::{Context, Poll};
 

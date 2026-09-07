@@ -15,9 +15,9 @@
 //! Requirements: Apple Silicon, kernel artifacts at ~/.vz/linux, signed
 //! test binary with `com.apple.security.virtualization` entitlement.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -134,8 +134,8 @@ async fn measure_n_vms(
     memory_per_vm: u64,
     cmdline: &str,
     idle_secs: u64,
-    kernel: &PathBuf,
-    initramfs: &PathBuf,
+    kernel: &Path,
+    initramfs: &Path,
 ) -> (u64, usize, u64) {
     let baseline = helper_processes();
     let mut vms = Vec::with_capacity(n);
@@ -143,7 +143,7 @@ async fn measure_n_vms(
         let cfg = VmConfigBuilder::new()
             .cpus(1)
             .memory_bytes(memory_per_vm)
-            .boot_linux(kernel.clone(), Some(initramfs.clone()), cmdline)
+            .boot_linux(kernel.to_path_buf(), Some(initramfs.to_path_buf()), cmdline)
             .network(NetworkConfig::None)
             .nested_virtualization(false)
             .build()

@@ -995,6 +995,7 @@ fn default_shell_for_base_image(base_image_ref: Option<&str>) -> &'static str {
 
 #[cfg(all(test, not(target_os = "linux")))]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::ensure_cache_artifact_directory_layout;
 
     #[test]

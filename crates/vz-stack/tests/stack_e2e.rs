@@ -12,7 +12,7 @@
 //! Run with: `./scripts/run-sandbox-vm-e2e.sh --suite stack`
 
 #![cfg(target_os = "macos")]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::print_stderr)]
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::io::ErrorKind;
@@ -889,6 +889,10 @@ impl StackOwnershipE2eRuntime {
             .unwrap_or_else(|| panic!("stack '{stack_id}' did not return generation ownership"))
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "passes through the ContainerRuntime trait's OwnedCreateError result type"
+    )]
     fn observe_owned_create_result(
         &self,
         stack_id: &str,
@@ -1109,6 +1113,10 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the block_in_place closure returns the ContainerRuntime trait's OwnedCreateError result unchanged"
+    )]
     fn create_in_sandbox_owned(
         &self,
         sandbox_id: &str,
@@ -1166,6 +1174,10 @@ impl ContainerRuntime for OciContainerRuntime {
         })
     }
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "the block_in_place closure returns the ContainerRuntime trait's OwnedCreateError result unchanged"
+    )]
     fn activate_container_generation(
         &self,
         ownership: ContainerGenerationOwnership,
@@ -4490,7 +4502,7 @@ services:
         .expect("process.env should be an array");
     let env_strs: Vec<&str> = env_arr.iter().filter_map(|v| v.as_str()).collect();
     assert!(
-        env_strs.iter().any(|e| *e == "VERSION=2"),
+        env_strs.contains(&"VERSION=2"),
         "recreated container should have VERSION=2, got: {env_strs:?}"
     );
 

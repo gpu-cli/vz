@@ -223,6 +223,7 @@ fn trusted_metadata(path: &Path, directory: bool) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use sha2::{Digest, Sha256};
 

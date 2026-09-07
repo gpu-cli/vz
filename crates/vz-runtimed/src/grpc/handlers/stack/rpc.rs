@@ -2101,6 +2101,7 @@ impl runtime_v2::stack_service_server::StackService for StackServiceImpl {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use crate::RuntimedConfig;
     use prost::Message;
@@ -2263,11 +2264,11 @@ mod tests {
         assert!(response.metadata().get("x-receipt-id").is_none());
 
         let mut stream = response.into_inner();
-        let first = stream
-            .next()
-            .await
-            .unwrap_or_else(|| panic!("expected executing progress event"))
-            .unwrap_or_else(|error| panic!("expected progress before failure: {error}"));
+        let Some(first) = stream.next().await else {
+            panic!("expected executing progress event");
+        };
+        let first =
+            first.unwrap_or_else(|error| panic!("expected progress before failure: {error}"));
         assert!(matches!(
             first.payload,
             Some(runtime_v2::teardown_stack_event::Payload::Progress(_))

@@ -43,6 +43,7 @@ impl Drop for BoundSocket {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     #[tokio::test]
     async fn existing_socket_file_and_dangling_symlink_are_never_adopted() {

@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::topology::{ClaimV7MigrationFailpoint, TeardownFinalizerV8MigrationFailpoint};
 use super::*;
@@ -185,9 +185,9 @@ fn ownership_snapshot(
         .unwrap()
 }
 
-fn legacy_non_developer_rows(
-    path: &Path,
-) -> Vec<(String, String, String, String, String, String, i64, i64)> {
+type LegacyNonDeveloperRow = (String, String, String, String, String, String, i64, i64);
+
+fn legacy_non_developer_rows(path: &Path) -> Vec<LegacyNonDeveloperRow> {
     let conn = Connection::open(path).unwrap();
     let mut stmt = conn
         .prepare(
@@ -585,7 +585,7 @@ fn service_mount_digest_round_trip_and_delete() {
     store.delete_service_mount_digest("myapp", "db").unwrap();
     let digests = store.load_service_mount_digests("myapp").unwrap();
     assert_eq!(digests.len(), 1);
-    assert!(digests.get("db").is_none());
+    assert!(!digests.contains_key("db"));
 }
 
 #[test]
@@ -6540,7 +6540,7 @@ fn delete_supersedes_non_delete_and_resource_reservation_obeys_fence() {
     };
     assert!(store.reserve_owned_resource(&requested, 702).is_err());
     assert!(
-        store
+        !store
             .conn
             .query_row(
                 "SELECT EXISTS(
@@ -6550,7 +6550,6 @@ fn delete_supersedes_non_delete_and_resource_reservation_obeys_fence() {
                 |row| row.get::<_, bool>(0),
             )
             .unwrap()
-            == false
     );
 }
 

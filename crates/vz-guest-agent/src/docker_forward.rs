@@ -169,6 +169,10 @@ mod tests {
     use std::time::Duration;
     use tokio_stream::wrappers::ReceiverStream;
 
+    #[expect(
+        clippy::result_large_err,
+        reason = "mirrors the tonic stream item type the forwarder consumes"
+    )]
     fn packet(frame: Frame) -> Result<DockerForwardFrame, Status> {
         Ok(DockerForwardFrame { frame: Some(frame) })
     }

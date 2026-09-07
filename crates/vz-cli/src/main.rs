@@ -177,6 +177,7 @@ fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use clap::CommandFactory;
 

@@ -595,6 +595,10 @@ impl Drop for PendingPin {
 
 // Compiled only into library test drivers, never the installed daemon.
 #[cfg(test)]
+#[expect(
+    clippy::print_stderr,
+    reason = "crash-phase checkpoints are read from the test driver's captured stderr"
+)]
 fn pin_checkpoint(phase: &str) {
     eprintln!("VZ_ARTIFACT_PIN_CHECKPOINT={phase}");
     if std::env::var("VZ_ARTIFACT_PIN_CRASH_PHASE").as_deref() == Ok(phase) {

@@ -211,6 +211,7 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use crate::machine_runtime_registry::MachineRuntimeAdmission;
     use vz_runtime_contract::{EnvironmentId, MachineId, ProjectId};

@@ -40,6 +40,7 @@ pub(in crate::grpc) fn status_from_machine_error(error: MachineError) -> Status 
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use std::collections::BTreeMap;
     use vz_runtime_proto::runtime_v2;

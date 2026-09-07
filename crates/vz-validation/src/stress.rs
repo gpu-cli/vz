@@ -608,11 +608,7 @@ mod tests {
         // The key property: avg_duration * iterations ~= total_duration.
         let reconstructed = result.avg_duration * result.iterations as u32;
         // Allow small rounding difference from integer division.
-        let diff = if reconstructed > result.total_duration {
-            reconstructed - result.total_duration
-        } else {
-            result.total_duration - reconstructed
-        };
+        let diff = reconstructed.abs_diff(result.total_duration);
         // Rounding error at most 1 tick per iteration.
         assert!(
             diff < Duration::from_nanos(result.iterations as u64 + 1),

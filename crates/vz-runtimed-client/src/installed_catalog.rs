@@ -45,6 +45,7 @@ fn invalid(reason: &str) -> DaemonClientError {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     #[test]
     fn explicit_invalid_does_not_fall_back_and_no_ambient_default() {

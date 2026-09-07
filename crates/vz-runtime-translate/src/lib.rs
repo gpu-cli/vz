@@ -2935,7 +2935,7 @@ fn hash_to_btree_map(
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::*;
     use prost::Message;

@@ -841,6 +841,7 @@ pub fn normalized_exit_status(status: std::process::ExitStatus) -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

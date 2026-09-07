@@ -1374,6 +1374,7 @@ pub fn find_guest_agent_binary() -> Option<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     #[test]

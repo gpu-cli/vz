@@ -602,6 +602,7 @@ fn map_owned_runtime_error(
 
 #[cfg(test)]
 mod runtime_error_mapping_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use vz_runtime_contract::{
         Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentLifecycleKind,
@@ -1137,6 +1138,10 @@ mod runtime_error_mapping_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    #[expect(
+        clippy::result_large_err,
+        reason = "the scoped-thread closure returns the ContainerRuntime trait's OwnedCreateError result unchanged"
+    )]
     async fn daemon_activation_adapter_runs_from_plain_worker_without_losing_owned_error() {
         let temp = tempfile::tempdir().unwrap();
         let daemon = Arc::new(

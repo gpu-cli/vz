@@ -248,6 +248,7 @@ pub fn import_subvolume_receive_stream(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
 
     #[test]

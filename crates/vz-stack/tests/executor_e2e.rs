@@ -4,7 +4,7 @@
 //! execute via mock runtime → verify container state, health checks,
 //! restart policies, and port allocation.
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::collections::HashMap;
 use std::sync::Mutex;

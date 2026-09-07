@@ -22,7 +22,7 @@
 //! - Test binary signed with `com.apple.security.virtualization` entitlement
 //!   (use `./scripts/run-sandbox-vm-e2e.sh`).
 
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::print_stderr)]
 
 use std::path::PathBuf;
 use std::process::Command;

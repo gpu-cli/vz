@@ -1061,7 +1061,7 @@ async fn read_kernel_paths(dir: &Path) -> Result<KernelPaths, LinuxError> {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use sha2::{Digest, Sha256};
     use tempfile::tempdir;

@@ -198,6 +198,7 @@ pub(crate) fn set_test_action_stack(stack_id: &str) {
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn install_test_planning_authority(store: &StateStore, stack_id: &str) {
     use vz_runtime_contract::{
         Architecture, CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSpec,
@@ -331,6 +332,7 @@ pub(crate) fn install_test_planning_authority(store: &StateStore, stack_id: &str
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn test_planning_scope(store: &StateStore, stack_id: &str) -> MachineWorkloadScope {
     install_test_planning_authority(store, stack_id);
     let owner = store.load_stack_workload_owner(stack_id).unwrap().unwrap();
@@ -359,6 +361,7 @@ pub(crate) fn test_planning_scope(store: &StateStore, stack_id: &str) -> Machine
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 fn test_create_selector(
     store: &StateStore,
     stack_id: &str,
@@ -406,6 +409,7 @@ fn test_create_selector(
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn begin_test_container_create(
     store: &StateStore,
     stack_id: &str,
@@ -422,6 +426,7 @@ pub(crate) fn begin_test_container_create(
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn publish_test_container_unbound_failure(
     store: &StateStore,
     stack_id: &str,
@@ -449,6 +454,7 @@ pub(crate) fn publish_test_container_running(
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn publish_test_container_running_with_ready(
     store: &StateStore,
     stack_id: &str,
@@ -484,6 +490,7 @@ pub(crate) fn publish_test_container_running_with_ready(
 }
 
 #[cfg(test)]
+#[expect(clippy::unwrap_used, reason = "test-only fixture helper")]
 pub(crate) fn test_replica_precondition_for_stack(stack_id: &str) -> ReplicaPrecondition {
     let workload = MachineWorkloadScope {
         schema_version: vz_runtime_contract::MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION,

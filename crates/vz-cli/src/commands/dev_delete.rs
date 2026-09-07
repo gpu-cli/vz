@@ -228,6 +228,7 @@ pub async fn cmd_dev_delete(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use super::*;
     use clap::Parser;
 

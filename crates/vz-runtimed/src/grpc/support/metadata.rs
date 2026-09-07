@@ -97,6 +97,7 @@ pub(in crate::grpc) fn insert_health_headers(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use tonic::Request;
     use vz_runtime_proto::runtime_v2;
 

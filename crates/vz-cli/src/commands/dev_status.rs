@@ -656,6 +656,7 @@ fn print_text_status(output: &StatusOutput) {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
     use vz_runtime_contract::{
         Architecture, CapabilitySet, EnvironmentSpec, EnvironmentState, MachineInstance,

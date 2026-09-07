@@ -304,6 +304,7 @@ impl Default for LinuxVmConfig {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::expect_used)]
     use std::fs;
 
     use tempfile::tempdir;
@@ -538,25 +539,27 @@ mod tests {
 
     #[test]
     fn ordered_shared_dirs_places_rootfs_first_and_sorts_remaining() {
-        let mut cfg = LinuxVmConfig::default();
-        cfg.rootfs_dir = Some(PathBuf::from("/tmp/rootfs"));
-        cfg.shared_dirs = vec![
-            SharedDirConfig {
-                tag: "mount-z".to_string(),
-                source: PathBuf::from("/tmp/z"),
-                read_only: false,
-            },
-            SharedDirConfig {
-                tag: "mount-a".to_string(),
-                source: PathBuf::from("/tmp/b"),
-                read_only: false,
-            },
-            SharedDirConfig {
-                tag: "mount-a".to_string(),
-                source: PathBuf::from("/tmp/a"),
-                read_only: true,
-            },
-        ];
+        let cfg = LinuxVmConfig {
+            rootfs_dir: Some(PathBuf::from("/tmp/rootfs")),
+            shared_dirs: vec![
+                SharedDirConfig {
+                    tag: "mount-z".to_string(),
+                    source: PathBuf::from("/tmp/z"),
+                    read_only: false,
+                },
+                SharedDirConfig {
+                    tag: "mount-a".to_string(),
+                    source: PathBuf::from("/tmp/b"),
+                    read_only: false,
+                },
+                SharedDirConfig {
+                    tag: "mount-a".to_string(),
+                    source: PathBuf::from("/tmp/a"),
+                    read_only: true,
+                },
+            ],
+            ..LinuxVmConfig::default()
+        };
 
         let ordered = cfg.ordered_shared_dirs();
         assert_eq!(ordered.len(), 4);
@@ -572,24 +575,26 @@ mod tests {
 
     #[test]
     fn ordered_shared_dirs_sorts_by_tag_source_and_access_mode() {
-        let mut cfg = LinuxVmConfig::default();
-        cfg.shared_dirs = vec![
-            SharedDirConfig {
-                tag: "mount-b".to_string(),
-                source: PathBuf::from("/tmp/share"),
-                read_only: false,
-            },
-            SharedDirConfig {
-                tag: "mount-a".to_string(),
-                source: PathBuf::from("/tmp/share"),
-                read_only: false,
-            },
-            SharedDirConfig {
-                tag: "mount-a".to_string(),
-                source: PathBuf::from("/tmp/share"),
-                read_only: true,
-            },
-        ];
+        let cfg = LinuxVmConfig {
+            shared_dirs: vec![
+                SharedDirConfig {
+                    tag: "mount-b".to_string(),
+                    source: PathBuf::from("/tmp/share"),
+                    read_only: false,
+                },
+                SharedDirConfig {
+                    tag: "mount-a".to_string(),
+                    source: PathBuf::from("/tmp/share"),
+                    read_only: false,
+                },
+                SharedDirConfig {
+                    tag: "mount-a".to_string(),
+                    source: PathBuf::from("/tmp/share"),
+                    read_only: true,
+                },
+            ],
+            ..LinuxVmConfig::default()
+        };
 
         let ordered = cfg.ordered_shared_dirs();
         assert_eq!(ordered.len(), 3);

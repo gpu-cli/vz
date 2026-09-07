@@ -910,7 +910,7 @@ fn replace_rootfs_link(link_path: &Path, target: &Path) -> Result<(), OciError> 
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use std::env;
     use std::process;
@@ -1624,7 +1624,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1667,7 +1667,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1715,7 +1715,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1763,7 +1763,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1805,7 +1805,7 @@ mod tests {
         params.insert("net.core.somaxconn".to_string(), "1024".to_string());
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1847,7 +1847,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1888,7 +1888,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1936,7 +1936,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],
@@ -1978,7 +1978,7 @@ mod tests {
         fs::create_dir_all(&rootfs).unwrap();
 
         write_oci_bundle(
-            &temp.join("bundle"),
+            temp.join("bundle"),
             &rootfs,
             BundleSpec {
                 cmd: vec!["/bin/sh".to_string()],

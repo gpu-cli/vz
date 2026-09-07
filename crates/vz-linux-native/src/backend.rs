@@ -1112,6 +1112,7 @@ fn uuid_short() -> String {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
     fn stack_state(identity: contract::StackRuntimeIdentity) -> StackState {

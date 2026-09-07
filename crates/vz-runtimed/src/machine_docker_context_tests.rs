@@ -1,5 +1,6 @@
 //! Offline ownership tests; the opt-in native Docker case does not start a VM
 //! or claim Engine availability, Developer readiness, or compatibility parity.
+#![allow(clippy::expect_used, clippy::print_stdout)]
 use super::*;
 use crate::machine_runtime_registry::{MachineRuntimeAdmission, MachineRuntimeRegistry};
 use serde_json::json;

@@ -324,6 +324,7 @@ fn resolve_exec_user(user: Option<&str>) -> &str {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     fn make_session() -> SandboxSession {

@@ -1,6 +1,6 @@
 #![cfg(target_os = "macos")]
 #![cfg(feature = "e2e-test-hooks")]
-#![allow(clippy::expect_used)]
+#![allow(clippy::expect_used, clippy::print_stdout)]
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

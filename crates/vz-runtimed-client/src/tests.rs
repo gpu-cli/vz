@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
@@ -1965,9 +1967,7 @@ async fn linux_vm_patch_apply_and_rollback_rpc_methods_are_covered() {
     let bundle_path = tmp.path().join("patch-1.json");
     std::fs::write(
         &bundle_path,
-        format!(
-            "{{\"schema_version\":1,\"patch_id\":\"patch-1\",\"base_id\":\"patch-base\",\"set\":{{\"description\":\"after\"}}}}"
-        ),
+        r#"{"schema_version":1,"patch_id":"patch-1","base_id":"patch-base","set":{"description":"after"}}"#,
     )
     .expect("write bundle");
 

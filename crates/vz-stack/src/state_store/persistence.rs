@@ -1187,6 +1187,14 @@ impl StateStore {
         Ok(action)
     }
 
+    #[cfg_attr(
+        test,
+        expect(
+            clippy::too_many_arguments,
+            clippy::explicit_counter_loop,
+            reason = "test-only failpoint parameters and the audit-insert counter exist solely to inject crash points"
+        )
+    )]
     fn start_reconcile_batch_inner(
         &self,
         session_id: &str,
@@ -2117,6 +2125,10 @@ impl StateStore {
     }
 
     #[cfg(test)]
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "test-only entry point mirrors commit_reconcile_batch plus an injected failpoint"
+    )]
     pub(crate) fn commit_reconcile_batch_with_failpoint(
         &self,
         session_id: &str,

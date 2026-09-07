@@ -740,6 +740,7 @@ pub(crate) async fn connect_port_forward_target(
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]

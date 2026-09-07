@@ -207,6 +207,7 @@ mod platform {
 
     #[cfg(test)]
     mod tests {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
         use std::fs;
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};

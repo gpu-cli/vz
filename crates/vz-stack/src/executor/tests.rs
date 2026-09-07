@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::dispatch::{compute_topo_levels, parse_subnet_base, parse_subnet_prefix};
 use super::tests_support::MockContainerRuntime;
@@ -249,10 +249,10 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
     )
 }
 
-fn make_scoped_executor<'a>(
+fn make_scoped_executor(
     runtime: MockContainerRuntime,
     store: StateStore,
-    dir: &'a Path,
+    dir: &Path,
     scope: vz_runtime_contract::MachineWorkloadScope,
 ) -> StackExecutor<MockContainerRuntime> {
     if dir.exists() {
@@ -633,7 +633,7 @@ fn environment_secret_source_is_staged_and_mounted() {
     let mount = app_config
         .mounts
         .iter()
-        .find(|mount| mount.target == std::path::PathBuf::from("/run/secrets/runtime_secret"))
+        .find(|mount| mount.target == Path::new("/run/secrets/runtime_secret"))
         .unwrap();
     assert_eq!(mount.access, vz_runtime_contract::MountAccess::ReadOnly);
     let staged_dir = mount.source.as_ref().unwrap();
@@ -2147,7 +2147,7 @@ fn shared_vm_not_rebooted_on_second_execute() {
 fn topo_levels_independent_services_same_level() {
     // Three services with no deps → all at level 0.
     let spec = three_service_stack();
-    let actions = vec![
+    let actions = [
         Action::ServiceCreate {
             precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("web".to_string()).unwrap(),
@@ -2184,7 +2184,7 @@ fn topo_levels_chain_dependency() {
             },
         ],
     );
-    let actions = vec![
+    let actions = [
         Action::ServiceCreate {
             precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),
@@ -2223,7 +2223,7 @@ fn topo_levels_diamond_dependency() {
             },
         ],
     );
-    let actions = vec![
+    let actions = [
         Action::ServiceCreate {
             precondition: crate::reconcile::test_replica_precondition(),
             target: crate::state_store::ServiceReplicaKey::first("db".to_string()).unwrap(),

@@ -1058,6 +1058,7 @@ fn closed_for(owner: &OwnerRecord, bytes: &[u8]) -> ClosedRecord {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use std::collections::BTreeMap;
     use std::fs;
     use std::os::unix::fs::{OpenOptionsExt, PermissionsExt, symlink};

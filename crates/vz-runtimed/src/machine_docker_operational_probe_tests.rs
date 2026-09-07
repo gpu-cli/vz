@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used)]
+
 use super::*;
 
 fn journal_fixture() -> Result<(tempfile::TempDir, Arc<MachineRuntimeStoreLease>, Journal)> {

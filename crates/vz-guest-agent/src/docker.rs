@@ -741,6 +741,7 @@ async fn remove_stale_socket(path: &Path) -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used)]
     use super::*;
 
     #[test]
