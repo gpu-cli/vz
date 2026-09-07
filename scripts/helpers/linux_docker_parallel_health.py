@@ -3,6 +3,7 @@ import hashlib
 import json
 from pathlib import Path
 import threading
+import time
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
@@ -16,6 +17,9 @@ TIMING = {'samples': 60, 'interval_ns': 1_000_000_000, 'max_lateness_ns': 250_00
 # same cadence, which is strictly more evidence, never less: only the sample
 # count and the observer bound that follows from it may differ.
 MAX_SAMPLES = 600
+# The allowance this suite already gives a python process to become ready inside
+# the health container; reused so the probe's start is bounded by one number.
+PROCESS_START_ALLOWANCE_SECONDS = 5.0
 OBSERVER_SLACK_NS = TIMING['observer_bound_ns'] - TIMING['samples'] * TIMING['interval_ns']
 
 
@@ -266,22 +270,37 @@ class Health:
                 self.error = error
         self.thread = threading.Thread(target=observe, name='vz-parallel-http-health', daemon=False)
         self.thread.start()
-        # Return only once the probe has finished its first sample. The validator
-        # requires every workload envelope to open after that moment, and the
-        # caller cannot see the probe's stream until it exits, so without this the
-        # caller can only assume enough time has passed. That assumption held while
-        # the workload's first command was slow and stopped holding when it was
-        # not: a bracket once opened 21 ms early and the run was rejected. This is
-        # a bounded wait on a condition the probe announces, not a retry.
-        first_sample = ('import time\nfrom pathlib import Path\n'
-                        'p=Path("/tmp/vz-parallel-health-sampling")\n'
-                        'end=time.monotonic()+15\n'
-                        'while not p.exists() and time.monotonic()<end: time.sleep(.01)\n'
-                        'assert p.read_bytes()==' + repr((self.token + '\n').encode()) + '\n')
-        raw, error, _ = self.harness.docker('health-first-sample', self.descriptor,
-                                            ['exec', self.container_id, 'python3', '-c', first_sample],
-                                            timeout=25)
-        require(not raw and not error, 'health probe did not complete its first sample')
+        # Do not bracket a workload command until the probe's first sample has
+        # finished; the validator rejects an envelope that opens earlier, and a
+        # composed run once lost that by 21 ms because the suite assumed its
+        # first command was slow.
+        #
+        # This is a wait derived from the probe's own contract, not an observed
+        # condition, because the observable one is not available. The probe's
+        # samples reach the host only when the process exits, since the recorder
+        # buffers the stream; and having the probe announce the sample from
+        # inside the container requires a second exec into a container that is
+        # already running the probe, which the OCI runtime refuses outright with
+        # "failed to bind notify socket".
+        #
+        # Every term below comes from the contract the probe enforces on itself.
+        # Sample zero is planned at the probe's start, must begin within
+        # max_lateness of that, and must finish within request_timeout of
+        # beginning. The process-start allowance is the same five seconds this
+        # suite already gives a python process to become ready in this exact
+        # container. The validator remains the authority: a probe slower than
+        # this fails the run loudly rather than yielding weaker evidence.
+        deadline = (PROCESS_START_ALLOWANCE_SECONDS +
+                    (self.timing['max_lateness_ns'] + self.timing['request_timeout_ns']) / 10 ** 9)
+        settled = time.monotonic() + deadline
+        # Leaving early when the observer is no longer running is not a shortcut:
+        # a real 180-sample probe cannot finish inside this window, so a thread
+        # that has already stopped has either failed, which is raised here, or
+        # completed, which finish() judges against the full record.
+        while time.monotonic() < settled and self.thread.is_alive():
+            require(self.error is None, 'health observer failed before its first sample: ' + repr(self.error))
+            time.sleep(0.05)
+        require(self.error is None, 'health observer failed before its first sample: ' + repr(self.error))
         self.started = True
 
     def finish(self, run_intervals):
