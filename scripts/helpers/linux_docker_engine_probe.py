@@ -142,26 +142,43 @@ class EngineProbe:
             raise ProbeError(f"POST {path} returned invalid JSON") from None
 
     def _start_exec(self, exec_id: str):
-        """Start an exec and demultiplex its hijacked stream."""
+        """Start an exec and read its stream straight from the socket.
+
+        Docker hijacks this connection, so the multiplexed output follows the
+        response headers on the same socket. `http.client` reports an upgraded
+        response as having no body, so the exchange is written and read here
+        directly and the connection is never reused.
+        """
         body = json.dumps({"Detach": False, "Tty": False}).encode("utf-8")
-        connection = _UnixConnection(self.path, self.timeout)
+        request = (
+            f"POST /{API_VERSION}/exec/{exec_id}/start HTTP/1.1\r\n"
+            "Host: localhost\r\nContent-Type: application/json\r\n"
+            "Connection: Upgrade\r\nUpgrade: tcp\r\n"
+            f"Content-Length: {len(body)}\r\n\r\n").encode("ascii") + body
+        connection = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        connection.settimeout(self.timeout)
         try:
-            connection.request("POST", f"/{API_VERSION}/exec/{exec_id}/start", body=body,
-                               headers={"Host": "localhost", "Content-Type": "application/json",
-                                        "Connection": "Upgrade", "Upgrade": "tcp"})
-            response = connection.getresponse()
-            if response.status not in (200, 101):
-                raise ProbeError(f"exec start returned {response.status}")
-            raw = response.read(MAX_RESPONSE_BYTES + 1)
-        except ProbeError:
-            raise
+            connection.connect(self.path)
+            connection.sendall(request)
+            raw = b""
+            while len(raw) <= MAX_RESPONSE_BYTES:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                raw += chunk
         except Exception as error:
             raise ProbeError(f"exec start failed: {type(error).__name__}: {error}") from None
         finally:
             connection.close()
         if len(raw) > MAX_RESPONSE_BYTES:
             raise ProbeError("exec output exceeded the response bound")
-        return demultiplex(raw)
+        if b"\r\n\r\n" not in raw:
+            raise ProbeError("exec start returned no complete response head")
+        head, stream = raw.split(b"\r\n\r\n", 1)
+        status = head.split(b"\r\n", 1)[0].split(b" ")
+        if len(status) < 2 or status[1] not in (b"200", b"101"):
+            raise ProbeError(f"exec start returned {head.split(chr(13).encode(), 1)[0]!r}")
+        return demultiplex(stream)
 
 
 def demultiplex(raw: bytes):

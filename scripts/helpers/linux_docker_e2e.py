@@ -1053,19 +1053,22 @@ class SentinelMonitor:
         self.probes = {}
         self.thread = threading.Thread(target=self.loop, name="vz-compose-sibling-liveness", daemon=False)
 
-    def command(self, descriptor, args):
-        if self.finished.is_set():
+    def command(self, descriptor, args, *, after_stop=False):
+        # The guard exists so a sampling thread stops dispatching the moment the
+        # monitor is finished. The closing route check runs deliberately after
+        # that point, once the thread has been joined.
+        if self.finished.is_set() and not after_stop:
             raise MonitorStopped()
         return self.record.run("sentinel", ["docker", "--config", descriptor["config_dir"], "--context", descriptor["name"], *args],
                                executable=self.harness.info["clients"]["docker"]["canonical"], cwd=self.harness.root, timeout=8)
 
-    def route_check(self, row):
+    def route_check(self, row, *, after_stop=False):
         """The context still names this Machine's endpoint. This is a property of
         the CLI's own configuration, so it is the one observation that must go
         through the client; it cannot change without the harness changing it, so
         it is checked when the monitor starts and again when it stops."""
         descriptor = row["descriptor"]
-        raw, _, _ = self.command(descriptor, ["context", "inspect", descriptor["name"]])
+        raw, _, _ = self.command(descriptor, ["context", "inspect", descriptor["name"]], after_stop=after_stop)
         require(json.loads(raw)[0]["Endpoints"]["docker"]["Host"] == descriptor["endpoint"], "sentinel context rerouted")
 
     def probe_for(self, descriptor):
@@ -1095,7 +1098,8 @@ class SentinelMonitor:
                 item["State"]["StartedAt"] == row["started_at"] and item["RestartCount"] == 0 and
                 item["Config"]["Labels"][LABEL] == row["token"], "sentinel stopped/restarted/replaced")
         raw = probe.exec_stdout(row["container_id"], ["/bin/cat", "/sentinel"])
-        require(raw == (row["token"] + "\n").encode(), "host-written sentinel changed")
+        require(raw == (row["token"] + "\n").encode(),
+                "host-written sentinel changed: " + repr(raw[:120]))
         self.samples.append({"context": descriptor["name"], "unix_ns": time.time_ns(), "container_id": row["container_id"]})
 
     def loop(self):
@@ -1153,7 +1157,7 @@ class SentinelMonitor:
             probe.close()
         if not self.errors:
             for row in self.rows:
-                self.route_check(row)
+                self.route_check(row, after_stop=True)
         startup.document(self.output / "samples.json", self.summary())
         require(not self.errors, "sibling liveness failed: " + repr(self.errors))
 
