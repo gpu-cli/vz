@@ -23,8 +23,8 @@ SLOTS = tuple(range(4))
 CONTRACT = {"schema_version": 1, "scenario": "parallel_builds", "cache_id": "vz04-parallel-barrier-v1",
             "network": "none", "payload_template": "vz04-parallel-v1\nslot=N\n", "payload_mode": 420,
             "transcript_prefix": "VZ_PARALLEL_BARRIER=",
-            "barrier": {"workers": 4, "timeout_ns": 60_000_000_000, "poll_interval_ns": 100_000_000,
-                        "release_dwell_ns": 1_000_000_000, "max_samples": 602, "max_record_bytes": 1024},
+            "barrier": {"workers": 4, "timeout_ns": 180_000_000_000, "poll_interval_ns": 100_000_000,
+                        "release_dwell_ns": 1_000_000_000, "max_samples": 1802, "max_record_bytes": 1024},
             "health": {"samples": 60, "interval_ns": 1_000_000_000, "max_lateness_ns": 250_000_000,
                        "request_timeout_ns": 500_000_000, "observer_bound_ns": 70_000_000_000}}
 

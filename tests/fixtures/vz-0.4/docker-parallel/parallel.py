@@ -13,10 +13,15 @@ import sys
 import time
 
 WORKERS = 4
-TIMEOUT_NS = 60_000_000_000
+# The barrier proves the four builds were present simultaneously; it is not a
+# bound on how evenly their builders start. On a Machine that has already run
+# other suites, preparing the fourth builder can lag the first build by more
+# than a minute, so the admission window is generous while the proof, that all
+# four are at the barrier at once, is unchanged.
+TIMEOUT_NS = 180_000_000_000
 POLL_INTERVAL_NS = 100_000_000
 RELEASE_DWELL_NS = 1_000_000_000
-MAX_SAMPLES = 602
+MAX_SAMPLES = 1802
 MAX_RECORD_BYTES = 1024
 PREFIX = "VZ_PARALLEL_BARRIER="
 PHASES = ("started", "ready", "all_ready", "released", "completed")
