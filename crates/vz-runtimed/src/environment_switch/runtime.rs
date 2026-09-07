@@ -1,0 +1,211 @@
+//! The running switch: one task per network, owning both ends of every port.
+//!
+//! A port is a connected `AF_UNIX` datagram socket pair. The runtime keeps the
+//! host end and hands the guest end to that Machine's NIC, so a network is a set
+//! of sockets this process forwards between. That is what makes an Environment's
+//! fabric unreachable from another Environment: there is no shared segment, and
+//! a frame can only enter a fabric through a socket the runtime handed out.
+//!
+//! Datagrams carry exactly one Ethernet frame, which is what the file-handle
+//! attachment requires and also what makes the forwarding decision total: a read
+//! yields one whole frame or nothing.
+//!
+//! Delivery is lossy by construction. A port whose receive buffer is full has
+//! its frame dropped and counted rather than blocking the forwarder, because
+//! blocking would let one slow Machine stall every other Machine on the network,
+//! and Ethernet does not promise delivery in the first place.
+
+use std::collections::BTreeMap;
+use std::os::fd::OwnedFd;
+use std::sync::Arc;
+
+use rustix::net::sockopt;
+use tokio::net::UnixDatagram;
+use tokio::sync::{mpsc, oneshot};
+use tokio::task::{JoinHandle, JoinSet};
+
+use super::{Counters, Disposition, Fabric, FabricError, MacAddress, PortId};
+
+/// The largest datagram a port will read. The file-handle attachment allows an
+/// MTU up to 65535, and a read shorter than the frame truncates it silently, so
+/// the buffer is that maximum rather than the configured MTU.
+const MAX_FRAME_BYTES: usize = 65535;
+/// Frames in flight between the readers and the forwarder. Bounded, so a burst
+/// is dropped at a counted point rather than growing memory without limit.
+const QUEUE_DEPTH: usize = 1024;
+/// One mebibyte of send buffer and four of receive: the ratio the file-handle
+/// attachment requires and the multiple it recommends. The host end is sized the
+/// same way, because a buffer too small to hold whole frames loses whole frames.
+const SEND_BUFFER_BYTES: usize = 1024 * 1024;
+const RECEIVE_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+#[derive(Debug, thiserror::Error)]
+pub enum SwitchError {
+    #[error("switch port setup: {0}")]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Fabric(#[from] FabricError),
+    #[error("switch supervisor: {0}")]
+    Task(#[from] tokio::task::JoinError),
+    #[error("switch already stopped")]
+    AlreadyStopped,
+}
+
+/// What one switch did, reported once its task has been joined.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SwitchShutdown {
+    pub frames_read: u64,
+    pub frames_delivered: u64,
+    /// Why the fabric refused frames, by rule.
+    pub counters: Counters,
+    /// Frames a port could not accept because its receive buffer was full.
+    pub undeliverable: u64,
+}
+
+/// The guest end of one port, to be handed to that Machine's NIC.
+#[derive(Debug)]
+pub struct GuestPort {
+    pub port: PortId,
+    pub address: MacAddress,
+    pub socket: OwnedFd,
+}
+
+/// One Environment network's running switch.
+///
+/// Explicit shutdown joins the task before the caller may release the Machines.
+/// Drop requests the same bounded teardown rather than leaving it running.
+#[must_use = "retain the switch and await shutdown before stopping its Machines"]
+#[derive(Debug)]
+pub struct NetworkSwitch {
+    shutdown: Option<oneshot::Sender<()>>,
+    task: Option<JoinHandle<SwitchShutdown>>,
+    ports: BTreeMap<PortId, MacAddress>,
+}
+
+impl NetworkSwitch {
+    /// Create every port, start forwarding, and return the guest ends.
+    ///
+    /// The fabric is built before any socket, so a duplicate port or a repeated
+    /// address is refused without first creating descriptors that would then
+    /// need unwinding.
+    pub fn start(
+        members: impl IntoIterator<Item = (PortId, MacAddress)>,
+    ) -> Result<(Self, Vec<GuestPort>), SwitchError> {
+        let members: Vec<(PortId, MacAddress)> = members.into_iter().collect();
+        let mut fabric = Fabric::new();
+        for (port, address) in &members {
+            fabric.attach(*port, *address)?;
+        }
+
+        let mut hosts = BTreeMap::new();
+        let mut guests = Vec::with_capacity(members.len());
+        for (port, address) in &members {
+            let (host, guest) = UnixDatagram::pair()?;
+            size_buffers(&host)?;
+            let guest = OwnedFd::from(guest.into_std()?);
+            size_buffers(&guest)?;
+            hosts.insert(*port, Arc::new(host));
+            guests.push(GuestPort {
+                port: *port,
+                address: *address,
+                socket: guest,
+            });
+        }
+
+        let (stop, mut stopped) = oneshot::channel();
+        let (sender, mut received) = mpsc::channel::<(PortId, Vec<u8>)>(QUEUE_DEPTH);
+        let mut readers = JoinSet::new();
+        for (port, socket) in &hosts {
+            let (port, socket, sender) = (*port, Arc::clone(socket), sender.clone());
+            readers.spawn(async move {
+                let mut buffer = vec![0_u8; MAX_FRAME_BYTES];
+                loop {
+                    let Ok(read) = socket.recv(&mut buffer).await else {
+                        return;
+                    };
+                    if sender.send((port, buffer[..read].to_vec())).await.is_err() {
+                        return;
+                    }
+                }
+            });
+        }
+        drop(sender);
+
+        let ports: BTreeMap<PortId, MacAddress> = members.into_iter().collect();
+        let task = tokio::spawn(async move {
+            let mut receipt = SwitchShutdown::default();
+            loop {
+                let frame = tokio::select! {
+                    biased;
+                    _ = &mut stopped => break,
+                    frame = received.recv() => frame,
+                };
+                let Some((ingress, frame)) = frame else { break };
+                receipt.frames_read += 1;
+                let targets = match fabric.forward(ingress, &frame) {
+                    Disposition::Unicast(port) => vec![port],
+                    Disposition::Group(ports) => ports,
+                    Disposition::Drop(_) => continue,
+                };
+                for target in targets {
+                    // A full receive buffer means that Machine is not keeping up.
+                    // The frame is dropped and counted, never retried, so one slow
+                    // Machine cannot stall the network.
+                    match hosts.get(&target).map(|socket| socket.try_send(&frame)) {
+                        Some(Ok(_)) => receipt.frames_delivered += 1,
+                        Some(Err(_)) | None => receipt.undeliverable += 1,
+                    }
+                }
+            }
+            readers.abort_all();
+            while readers.join_next().await.is_some() {}
+            receipt.counters = fabric.counters().clone();
+            receipt
+        });
+
+        Ok((
+            Self {
+                shutdown: Some(stop),
+                task: Some(task),
+                ports,
+            },
+            guests,
+        ))
+    }
+
+    /// The address assigned to each attached port.
+    pub fn ports(&self) -> &BTreeMap<PortId, MacAddress> {
+        &self.ports
+    }
+
+    /// Stop forwarding and join the task, returning what it did.
+    pub async fn shutdown(&mut self) -> Result<SwitchShutdown, SwitchError> {
+        let stop = self.shutdown.take().ok_or(SwitchError::AlreadyStopped)?;
+        // A closed channel means the task already exited on its own, which is
+        // not a failure to stop.
+        let _ = stop.send(());
+        let task = self.task.take().ok_or(SwitchError::AlreadyStopped)?;
+        Ok(task.await?)
+    }
+}
+
+impl Drop for NetworkSwitch {
+    fn drop(&mut self) {
+        if let Some(stop) = self.shutdown.take() {
+            let _ = stop.send(());
+        }
+        // The task observes the stop and drains its readers. Aborting it here
+        // would skip that joined teardown.
+    }
+}
+
+/// Size a port's buffers for whole frames, on either end.
+fn size_buffers<Fd: rustix::fd::AsFd>(socket: &Fd) -> std::io::Result<()> {
+    sockopt::set_socket_send_buffer_size(socket, SEND_BUFFER_BYTES)?;
+    sockopt::set_socket_recv_buffer_size(socket, RECEIVE_BUFFER_BYTES)?;
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "runtime_tests.rs"]
+mod tests;

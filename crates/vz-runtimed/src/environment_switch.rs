@@ -308,6 +308,8 @@ impl Fabric {
     }
 }
 
+pub mod runtime;
+
 #[cfg(test)]
 #[path = "environment_switch_tests.rs"]
 mod tests;
