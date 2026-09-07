@@ -1717,7 +1717,7 @@ esac
                 boot_complete: false,
                 docker_shutdown: Arc::new(Mutex::new(None)),
                 boot_ports: ports.clone(),
-                boot_attachments: boot_attachments.clone(),
+                boot_attachments,
                 boot_resources: resources.clone(),
                 vm: Arc::clone(&vm),
             },
