@@ -16,7 +16,7 @@ pinned Python dependencies; no global install) with the installed
 OrbStack's Docker CLI 29.4.0 under Machine-private `--config`/`--context`, the
 pinned `registry-3.1.1-load-candidate-1.tar` and the admitted
 `registry-3.1.1-bounded-replay-1/layout`. Evidence:
-`.artifacts/linux-docker-registry-candidate-6` (1,480 files, `evidence.sha256`
+`.artifacts/linux-docker-registry-candidate-6` (1,480 files, `checksums.sha256`
 verifies), outcome `passed_dev_installed_registry_slice`, zero retries.
 
 Two Environments × two Linux Machines; the registry ran on three selected
@@ -48,10 +48,14 @@ was dispositioned by exact positive-inspection cleanup, public Stop and
 graceful daemon termination (`linux-docker-registry-candidate-disposition.py`);
 their runtime roots and evidence are retained.
 
+Candidate 7 (`.artifacts/linux-docker-registry-candidate-7`) repeated the
+identical pass with a CLI/daemon built and signed from HEAD `c019b4a0`
+(`.artifacts/topology-cli-installed-yp2Cum`, clean tracked state, all eight
+control-plane drivers passing) and the same guest bundles.
+
 Not closed by this pass: the literal raw `/auth` route witness (see "Route
 witness boundary"), `vz-mzs.7.1.9` credential recovery/migration across
-Stop/Up, a candidate built from HEAD (the installed CLI predates the native
-macOS bootstrap merge), Docker-63 and the 0.4 aggregate.
+Stop/Up, Docker-63 and the 0.4 aggregate.
 
 The earlier checkpoints below are historical.
 
