@@ -131,7 +131,8 @@ def validate_record(output, expected, token, timing, run_intervals):
             all(result[k] == intent[k] for k in set(intent) - {'effects_uncertain', 'capture_complete'}) and
             result['effects_uncertain'] is False and result['capture_complete'] is True and
             type(result['exit_code']) is int and result['exit_code'] == 0 and result['error'] is None and
-            type(result['elapsed_ns']) is int and 0 < result['elapsed_ns'] <= 75 * 10**9 and
+            type(result['elapsed_ns']) is int and
+            0 < result['elapsed_ns'] <= observer_timeout_seconds(timing) * 10**9 and
             result['hashes_cover'] == 'complete_streams', 'health command did not complete exactly')
     raw, error = read('001-http-health.stdout'), read('001-http-health.stderr')
     for name, content in (('stdout', raw), ('stderr', error)):
