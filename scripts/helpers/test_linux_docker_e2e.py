@@ -270,8 +270,13 @@ class AdmissionTests(unittest.TestCase):
             self.assertIn("--registry-archive is required", errors.getvalue())
             preflight.assert_not_called()
             run.assert_not_called()
-        self.assertEqual(set(gate.SUITE_ORDER), set(gate.SUITES))
         self.assertEqual(gate.SUITE_ORDER[-1], "recovery", "recovery cycles Stop/Up and must run last")
+        # `lifecycle` needs its own bounded runtime-audit window, so a composed
+        # run does not perform it and must not claim its scenarios.
+        self.assertEqual(set(gate.SUITES) - set(gate.SUITE_ORDER), {"lifecycle"})
+        self.assertFalse(gate.executes({"suite": "all"}, "lifecycle"))
+        self.assertTrue(gate.executes({"suite": "all"}, "registry"))
+        self.assertTrue(gate.executes({"suite": "lifecycle"}, "lifecycle"))
 
     def test_duplicate_suite_rejected(self):
         with self.assertRaisesRegex(driver.Rejected, "duplicate"):

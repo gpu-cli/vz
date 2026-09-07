@@ -54,7 +54,7 @@ class ArgumentTests(unittest.TestCase):
         # required rather than rejected, and the other suites' remain required too.
         with self.assertRaisesRegex(ValueError, 'is required for the registry suite'):
             gate.arguments(['--suite', 'all', *COMMON])
-        with self.assertRaisesRegex(ValueError, '--tmux is required'):
+        with self.assertRaisesRegex(ValueError, '--ssh-packages is required'):
             gate.arguments(['--suite', 'all', *COMMON, *REGISTRY])
 
     def test_registry_rejection_precedes_provisioning_inputs(self):

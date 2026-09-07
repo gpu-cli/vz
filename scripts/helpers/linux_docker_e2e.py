@@ -42,8 +42,17 @@ ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATIO
 # One provisioning, every suite once, in an order that leaves the topology
 # undisturbed until the end: `recovery` cycles Stop/Up and replaces the
 # sentinel monitor, so it always runs last.
+#
+# `lifecycle` is deliberately absent. Its evidence is a youki runtime-audit
+# journal bounded at 2048 records per Machine, and it must be enrolled before
+# any owned mutation and captured only once the monitor has stopped. A composed
+# run's sentinel sampling alone exceeds that bound, so youki correctly marks the
+# journal incomplete. Composing it needs its own enrolled window with the
+# monitor paused around it; until then `--suite all` reports the lifecycle
+# scenario IDs missing rather than proving them with a broken journal, and
+# `--suite lifecycle` remains the way to prove them.
 SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
-               "lifecycle", "images", "limits", "registry", "recovery")
+               "images", "limits", "registry", "recovery")
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
@@ -87,10 +96,10 @@ def arguments(argv):
     for name in ("registry_archive", "registry_layout"):
         require((getattr(args, name) is not None) == (args.suite == "registry" or composed),
                 "--" + name.replace("_", "-") + " is required for the registry suite and for --suite all")
-    require(args.container_fixture is None or args.suite == "lifecycle" or composed,
+    require(args.container_fixture is None or args.suite == "lifecycle",
             "container-fixture requires the lifecycle suite")
-    require((args.tmux is not None) == (args.suite == "lifecycle" or composed),
-            "--tmux is required for the lifecycle suite and for --suite all")
+    require((args.tmux is not None) == (args.suite == "lifecycle"),
+            "--tmux is required only for the lifecycle suite")
     require(args.parallel_fixture is None or args.suite == "parallel" or composed,
             "parallel-fixture requires the parallel suite")
     require(args.suite == "ssh" or composed or all(getattr(args, name) is None
@@ -125,9 +134,9 @@ def preflight(args, require_host=True):
         registry_archive = startup.canonical(args.registry_archive)
         registry_layout = startup.canonical(args.registry_layout)
         registry = registry_machine.admit_inputs(registry_archive, registry_layout)
-    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle" or composed),
-            "--tmux is required for the lifecycle suite and for --suite all")
-    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" or composed else None
+    require((getattr(args, "tmux", None) is not None) == (args.suite == "lifecycle"),
+            "--tmux is required only for the lifecycle suite")
+    terminal = tmux_input(args.tmux) if args.suite == "lifecycle" else None
     info = startup.preflight(args, require_host=require_host)
     fixture = startup.canonical(args.fixture)
     pin_path = startup.canonical(args.image_input)
@@ -239,7 +248,7 @@ def preflight(args, require_host=True):
         recovery_fixture_contract()
         for path in recovery_sources():
             info['inputs'][str(path)] = startup.digest(Path(path))
-    if composed or args.suite == "lifecycle":
+    if args.suite == "lifecycle":
         from linux_docker_container_fixture import fixture_contract
         from linux_docker_container_process_evidence import required_source_paths
         from linux_docker_runtime_audit_evidence import required_source_paths as audit_source_paths
@@ -1069,8 +1078,11 @@ class MonitorStopped(Exception):
 
 
 def executes(info, suite):
-    """True when this run performs that suite, directly or as part of `all`."""
-    return info["suite"] == suite or info["suite"] == "all"
+    """True when this run performs that suite, directly or as part of `all`.
+
+    A composed run performs exactly SUITE_ORDER, which is not every suite.
+    """
+    return info["suite"] == suite or (info["suite"] == "all" and suite in SUITE_ORDER)
 
 
 def run(info):

@@ -270,14 +270,24 @@ Both slices are DEV evidence; the 63-scenario `--suite all` remains rejected.
 ## Composed `--suite all` (DEV, not release)
 
 `--suite all` no longer refuses. It provisions the two Environments once and
-runs every suite against that one topology, in an order that leaves the
+runs ten suites against that one topology, in an order that leaves the
 topology undisturbed until the end: handshake, compose, build, artifacts,
-parallel, ssh, lifecycle, images, limits, registry, then recovery last because
-it cycles Stop and Up and replaces the sentinel monitor.
+parallel, ssh, images, limits, registry, then recovery last because it cycles
+Stop and Up and replaces the sentinel monitor.
 
-Because it composes every suite, it carries every suite's inputs at once: the
-BuildKit archive, the SSH packages and gpgv, tmux, and the registry archive and
-layout. A bare `--suite all` is still refused before any state is created, now
+`lifecycle` is deliberately not composed. Its evidence is a youki runtime-audit
+journal bounded at 2,048 records per Machine, enrolled before any owned mutation
+and captured only once the monitor has stopped. A composed run's sentinel
+sampling alone exceeds that bound, and youki then correctly marks the journal
+incomplete and warns on every exec. Composing it needs its own enrolled window
+with the monitor paused around it; until that exists, `--suite all` reports the
+sixteen `docker.container.*` scenario IDs missing rather than proving them with
+a broken journal, and `--suite lifecycle` remains the way to prove them.
+
+Because it composes those suites, it carries their inputs at once: the BuildKit
+archive, the SSH packages and gpgv, and the registry archive and layout. The
+lifecycle suite's own inputs, tmux and the container fixture, belong to that
+suite alone. A bare `--suite all` is still refused before any state is created, now
 because those inputs are missing rather than because the suite is unimplemented.
 
 The sentinels and the runtime-audit enrollment are created once, before any
