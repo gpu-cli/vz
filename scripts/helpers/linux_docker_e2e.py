@@ -994,7 +994,14 @@ class ComposeHarness(startup.Harness):
         """
         composed = suite == 'lifecycle' and len(suites) > 1
         if composed:
-            self.enroll_runtime_audits(contexts)
+            # Enrollment creates the session journal and snapshots it, and the
+            # snapshot must show it empty. A sibling sample is a `docker exec`,
+            # which is a youki invocation, which writes a record — so one
+            # landing between those two steps enrolls a journal that is already
+            # not fresh. Same requirement as the capture below, for the same
+            # reason: this window has to be quiet on every Machine.
+            with self.monitor.paused():
+                self.enroll_runtime_audits(contexts)
         observations = self.run_machine_suite(suite, selected_machines, bindings)
         if composed:
             # Capture snapshots the journal and requires an independent replay

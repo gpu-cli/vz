@@ -744,7 +744,13 @@ class BuildDispatchTests(unittest.TestCase):
         harness.registry_controls, harness.registry_sessions = None, []
         harness.live_cleanup = False
         order = []
-        harness.enroll_runtime_audits = Mock(side_effect=lambda contexts: order.append(("enroll", tuple(contexts))))
+        def enroll(contexts):
+            # Enrollment snapshots a journal that must be empty, so it has to
+            # run with every Machine unobserved, exactly like the capture.
+            self.assertEqual([edge for edge, _ in paused], ["enter"],
+                             "enrollment must run under the pause")
+            order.append(("enroll", tuple(contexts)))
+        harness.enroll_runtime_audits = Mock(side_effect=enroll)
         def capture():
             # Mid-run capture must run under the live-cleanup window, or
             # `assert_certain` refuses it because the monitor is still alive.
@@ -773,10 +779,13 @@ class BuildDispatchTests(unittest.TestCase):
                 self.assertEqual(order, [("suite", "registry"), ("enroll", ("c0", "c1")),
                                          ("suite", "lifecycle"), "capture", ("suite", "recovery")])
                 self.assertEqual(harness.runtime_audit_validation, ["four sessions"])
-                # Paused for the capture and nothing else.
-                self.assertEqual([edge for edge, _ in paused], ["enter", "exit"])
-                self.assertEqual(paused[0][1][-1], ("suite", "lifecycle"))
-                self.assertEqual(paused[1][1][-1], "capture")
+                # Paused twice and only twice: once around enrollment, once
+                # around the capture. The suite itself runs observed, so the
+                # Machines that are not under test keep their liveness record.
+                self.assertEqual([edge for edge, _ in paused], ["enter", "exit", "enter", "exit"])
+                self.assertEqual(paused[1][1][-1], ("enroll", ("c0", "c1")))
+                self.assertEqual(paused[2][1][-1], ("suite", "lifecycle"))
+                self.assertEqual(paused[3][1][-1], "capture")
                 self.assertFalse(harness.live_cleanup, "the live-cleanup window must close")
             else:
                 # A lifecycle-only run keeps the whole-run window `prepare_suites`
