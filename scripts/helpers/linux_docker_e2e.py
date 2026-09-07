@@ -774,7 +774,7 @@ class ComposeHarness(startup.Harness):
         require(len(self.driver_cleanup_verified) == len(self.drivers) and all(self.driver_cleanup_verified),
                 "Docker fixture cleanup lacks successful independent replay; resources retained")
 
-    def remove_builders(self):
+    def remove_builders(self, *, final=True):
         """Remove every owned BuildKit builder and capture its worker-cache proof.
 
         A composed run calls this before `recovery` cycles Stop and Up: a builder
@@ -783,9 +783,23 @@ class ComposeHarness(startup.Harness):
         """
         if getattr(self, "builders_removed", False):
             return
-        self.assert_certain()
+        # `assert_certain` is the final-cleanup guard and requires a stopped
+        # monitor, so a composed run's mid-scenario removal uses the live-run
+        # equivalent: the sentinels must still be healthy and no dispatched
+        # command may have uncertain effects.
+        def certain():
+            if final:
+                self.assert_certain()
+                return
+            if self.monitor is not None:
+                self.monitor.check()
+            require(not self.effects_uncertain, "uncertain harness mutation prevents builder removal")
+            for record in (self.record, *(item.record for item in self.drivers)):
+                require(all(row.get("effects_uncertain") is False for row in record.receipts),
+                        "uncertain command prevents builder removal")
+        certain()
         for builder in reversed(getattr(self, "builders", [])):
-            self.assert_certain()
+            certain()
             jobs = [job for job in self.ssh_cache_requests if job["builder"] is builder]
             require(len(jobs) <= 1, "ambiguous SSH worker-cache ownership")
             if jobs:
@@ -979,7 +993,7 @@ class ComposeHarness(startup.Harness):
                 if suite == 'recovery' and len(suites) > 1:
                     # Stop/Up replaces the Machine a builder lives in, so owned
                     # builders are reconciled and removed before that cycle.
-                    self.remove_builders()
+                    self.remove_builders(final=False)
                 controls = self.registry_controls if suite == 'registry' else None
                 if controls is not None:
                     credential_controls = {'baseline': controls.baseline()}
