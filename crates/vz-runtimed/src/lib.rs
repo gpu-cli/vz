@@ -10,6 +10,7 @@ pub mod environment_delete;
 pub mod environment_runtime_controller;
 #[cfg(target_os = "macos")]
 pub mod environment_stop;
+pub mod environment_switch;
 #[cfg(target_os = "macos")]
 pub mod environment_up;
 mod execution_sessions;
