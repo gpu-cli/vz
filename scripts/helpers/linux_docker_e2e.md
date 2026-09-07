@@ -265,38 +265,62 @@ with `CONFIG_SWAP=n`, so every `--memory` run carries Moby's exact swap-limit
 warning, which is pinned rather than silenced. Installed candidate 2 passed on
 three Machines (`.artifacts/linux-docker-limits-candidate-2`).
 
-Both slices are DEV evidence; the 63-scenario `--suite all` remains rejected.
+Both slices are DEV evidence.
 
 ## Composed `--suite all` (DEV, not release)
 
 `--suite all` no longer refuses. It provisions the two Environments once and
-runs ten suites against that one topology, in an order that leaves the
+runs every suite against that one topology, in an order that leaves the
 topology undisturbed until the end: handshake, compose, build, artifacts,
-parallel, ssh, images, limits, registry, then recovery last because it cycles
-Stop and Up and replaces the sentinel monitor.
+parallel, ssh, images, limits, registry, lifecycle, then recovery last because
+it cycles Stop and Up and replaces the sentinel monitor.
 
-`lifecycle` is deliberately not composed. Its evidence is a youki runtime-audit
-journal bounded at 2,048 records per Machine, enrolled before any owned mutation
-and captured only once the monitor has stopped. A composed run's sentinel
-sampling alone exceeds that bound, and youki then correctly marks the journal
-incomplete and warns on every exec. Composing it needs its own enrolled window
-with the monitor paused around it; until that exists, `--suite all` reports the
-sixteen `docker.container.*` scenario IDs missing rather than proving them with
-a broken journal, and `--suite lifecycle` remains the way to prove them.
+`lifecycle` is second to last because its evidence is a youki runtime-audit
+journal bounded at 2,048 records per Machine. A whole-run window overruns that
+on sentinel sampling alone — about 1,488 records per Machine in 25 minutes —
+and youki then correctly marks the journal incomplete and warns on every exec.
+Two things make it composable:
 
-Because it composes those suites, it carries their inputs at once: the BuildKit
-archive, the SSH packages and gpgv, and the registry archive and layout. The
-lifecycle suite's own inputs, tmux and the container fixture, belong to that
-suite alone. A bare `--suite all` is still refused before any state is created, now
-because those inputs are missing rather than because the suite is unimplemented.
+- The monitor does not sample the Machine running the workload. Both liveness
+  assertions already excluded that Machine, so the per-second exec into it
+  produced evidence no check read while spending the journal lifecycle needs.
+  Sampling resumes as soon as another Machine is active, so no sibling liveness
+  is lost anywhere in the run.
+- A composed run opens the audit window immediately before the lifecycle suite
+  and closes it immediately after, under the same live-cleanup window
+  `remove_builders(final=False)` uses, with the monitor paused for the capture
+  alone because capture requires an independent replay of a journal nothing is
+  writing to. That is complete evidence for the suite: it removes its own
+  containers and image before it returns. Everything earlier in the run is
+  proved by its own suite evidence, not by this journal.
 
-The sentinels and the runtime-audit enrollment are created once, before any
-workload, so one continuous liveness record and one audit journal cover every
-suite. The fixture image is prepared once per Machine and shared, so a composed
-run registers one ownership row per Machine rather than one per suite.
+A `--suite lifecycle` run keeps the whole-run window it always had, enrolled
+before the sentinels and captured after owned removal.
 
-This composition is what lets the aggregate gate consume the lane: the run emits
-per-scenario results for the IDs its suites prove, and the scenario table names
-the remaining gaps (bind mounts, published ports, concurrency and isolation) so
-they are reported MISSING rather than silently absent. A composed pass is still
-DEV evidence, not release certification.
+Because it composes every suite, it carries their inputs at once: the BuildKit
+archive, the SSH packages and gpgv, the registry archive and layout, and tmux;
+it may also pin the container fixture. A bare `--suite all` is still refused
+before any state is created, now because those inputs are missing rather than
+because the suite is unimplemented.
+
+The sentinels are created once, before any workload, so one continuous liveness
+record covers every suite. The fixture image is prepared once per Machine and
+shared, so a composed run registers one ownership row per Machine rather than
+one per suite.
+
+This composition is what will let the aggregate gate consume the lane: the run
+emits per-scenario results for the IDs its suites prove, and the scenario table
+names the remaining gaps (bind mounts, published ports, concurrency and
+isolation) so they are reported MISSING rather than silently absent. A composed
+pass is still DEV evidence, not release certification.
+
+The gate cannot invoke this lane yet. `config/vz-0.4-e2e-contract.json` gives it
+`["--suite", "all"]`, and `vz04_lanes.lane_argv` appends only the gate identity
+options plus the Docker client paths, which `arguments()` rejects: a composed
+run also requires `--registry-archive`, `--registry-layout`,
+`--buildkit-archive`, `--ssh-packages`, `--release-version`,
+`--developer-bundle`, `--hardened-bundle` and `--tmux`. Only `--dry-lanes` runs
+have taken that path, and a dry lane substitutes its result without starting the
+process, so the rejection had never been observed. `vz-ao8` tracks it; until it
+is fixed, every gate run records this lane `not_implemented` however many
+composed candidates pass directly.
