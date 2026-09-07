@@ -31,15 +31,27 @@ def fake_codesign_verifier(_path: Path) -> tuple:
 
 
 def build_fake_release_dir(root: Path, *, signing_class: str = "local-test-signed", source_commit: str = FAKE_COMMIT,
-                           tree_sha256: str = None, copy_real_binary: bool = False) -> Path:
+                           tree_sha256: str = None, copy_real_binary: bool = False,
+                           with_lane_inputs: bool = False) -> Path:
     """Create a read-only fake release dir at `root` and return it.
 
     `copy_real_binary=True` copies /usr/bin/true as every host binary so the
     real `codesign --verify --strict` succeeds (dry smoke only).
+
+    `with_lane_inputs=True` also creates the guest bundle directories and the
+    BuildKit archive that a real candidate carries, which the Docker lane reads
+    off the candidate rather than having restated in the contract. Off by
+    default so every existing fixture keeps its exact tree.
     """
     root.mkdir(parents=True)
     (root / "bin").mkdir()
     (root / "codesign").mkdir()
+    if with_lane_inputs:
+        for profile in ("developer", "container"):
+            (root / "linux" / profile).mkdir(parents=True)
+            (root / "linux" / profile / "version.json").write_bytes(b'{"note":"fake guest bundle"}\n')
+        (root / "buildkit").mkdir()
+        (root / "buildkit" / "vz-buildkit-v0.19.0-linux-arm64.tar").write_bytes(b"fake buildkit archive\n")
     components = {}
     for relative in COMPONENTS:
         path = root / relative

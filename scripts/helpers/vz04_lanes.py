@@ -59,20 +59,60 @@ def entry_point_record(repo_root: Path, lane: dict, argv: list) -> dict:
     return {"path": lane["entry_point"], "sha256": digest, "argv": [str(item) for item in argv]}
 
 
+def release_components(release_dir: Path) -> dict:
+    """The release inputs a candidate directory already holds, by its own layout.
+
+    `scripts/build-vz-0.4-release-candidate.sh` writes `bin/`, `linux/developer`,
+    `linux/container`, one `buildkit/vz-buildkit-*.tar` and the manifest that
+    names the version. A lane that needs them should read them off the candidate
+    it was pointed at rather than have them restated in the contract, where they
+    could disagree with the artifacts they claim to describe.
+    """
+    manifest = release_dir / "release-manifest.json"
+    require(manifest.is_file() and not manifest.is_symlink(),
+            f"release candidate manifest missing: {manifest}")
+    version = load_json(manifest).get("release_version")
+    require(isinstance(version, str) and version, "release manifest names no release_version")
+    archives = sorted(path for path in (release_dir / "buildkit").glob("vz-buildkit-*.tar")
+                      if path.is_file() and not path.is_symlink())
+    require(len(archives) == 1, f"exactly one BuildKit archive required, found {len(archives)}")
+    components = {"release-version": version, "release-dir": release_dir / "bin",
+                  "developer-bundle": release_dir / "linux" / "developer",
+                  "hardened-bundle": release_dir / "linux" / "container",
+                  "buildkit-archive": archives[0]}
+    for name, path in components.items():
+        if name != "release-version":
+            require(Path(path).exists(), f"release candidate is missing {name}: {path}")
+    return components
+
+
 def lane_argv(lane: dict, ctx: LaneContext, phase: str, evidence_dir: Path, handoff) -> list:
     """The lane's contract argv plus the gate identity options every lane receives.
 
     `legacy_sandbox` additionally names the harness's own artifact root
     (`--output-dir`), where `run-sandbox-vm-e2e.sh` keeps its timestamped run
     directory; its native `lane-result.json` is written into `--evidence-dir`.
+
+    `linux_docker` receives the release inputs its harness requires, derived from
+    the candidate directory rather than restated in the contract, and is pointed
+    at `bin/` because `installed_developer_startup` resolves `vz` and
+    `vz-runtimed` directly under `--release-dir`.
     """
     argv = list(lane["argv"])
-    argv += ["--run-id", ctx.run_id, "--phase", phase, "--release-dir", str(ctx.release_dir),
+    release_dir = ctx.release_dir
+    extra = []
+    if lane["argv_contract"] == "linux_docker":
+        components = release_components(ctx.release_dir)
+        release_dir = components.pop("release-dir")
+        for name, value in sorted(components.items()):
+            extra += ["--" + name, str(value)]
+    argv += ["--run-id", ctx.run_id, "--phase", phase, "--release-dir", str(release_dir),
              "--evidence-dir", str(evidence_dir), "--state-root", str(ctx.state_root),
              "--contract", str(ctx.contract_path), "--candidate-tuple", ctx.candidate_tuple_sha256,
              "--fixture-sha256", ctx.fixture_sha256, "--handoff", handoff if handoff else "none"]
     for key in ("docker", "compose_plugin", "buildx_plugin"):
         argv += ["--" + key.replace("_", "-"), ctx.clients.get(key) or "none"]
+    argv += extra
     if lane["argv_contract"] == "legacy_sandbox":
         argv += ["--output-dir", str(ctx.state_root / "sandbox-vm-output")]
     return argv
@@ -154,9 +194,18 @@ def invoke_lane(lane: dict, phase: str, ctx: LaneContext, evidence_dir: Path, ha
     any process (DEV only; the gate records the override and can never PASS).
     """
     evidence_dir.mkdir(parents=True, exist_ok=False)
-    argv = lane_argv(lane, ctx, phase, evidence_dir, handoff)
-    entry = entry_point_record(ctx.repo_root, lane, argv)
     result_path = evidence_dir / "lane-result.json"
+    try:
+        argv = lane_argv(lane, ctx, phase, evidence_dir, handoff)
+    except GateError as error:
+        # A lane whose argv depends on the candidate can be unbuildable, and a
+        # release candidate that cannot supply an input is a finding, not a
+        # crash. Account for it the way any other rejected input is accounted.
+        result = failed_result(lane["name"], phase, ctx, entry_point_record(ctx.repo_root, lane, []),
+                               "input_rejected", str(error), 2)
+        document(result_path, result)
+        return result
+    entry = entry_point_record(ctx.repo_root, lane, argv)
     if dry:
         result = failed_result(lane["name"], phase, ctx, entry, "not_implemented",
                                "dry-lanes developer substitution: lane not invoked", STUB_EXIT)

@@ -132,7 +132,7 @@
       "argv": ["--suite", "all"],
       "role": "acceptance",
       "phases": ["clean-provision", "persisted-recovery/pre-sleep", "persisted-recovery/post-wake", "final-cleanup"],
-      "argv_contract": "vz04",
+      "argv_contract": "linux_docker",
       "result_adapter": null,
       "native_result_required": true
     },

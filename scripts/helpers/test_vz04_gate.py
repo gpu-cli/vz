@@ -21,7 +21,8 @@ class GateDryRunTests(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.TemporaryDirectory(prefix="vz04-gate-")
         cls.root = Path(cls.tmp.name).resolve()
-        cls.release = fixtures.build_fake_release_dir(cls.root / "release", source_commit=common.git_head(common.REPO_ROOT))
+        cls.release = fixtures.build_fake_release_dir(cls.root / "release", source_commit=common.git_head(common.REPO_ROOT),
+                                                      with_lane_inputs=True)
         cls.evidence_root = cls.root / "evidence"
         cls.previous_verifier = gate.CODESIGN_VERIFIER
         gate.CODESIGN_VERIFIER = fixtures.fake_codesign_verifier

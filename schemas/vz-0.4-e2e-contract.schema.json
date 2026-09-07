@@ -807,7 +807,8 @@
           "argv_contract": {
             "enum": [
               "legacy_sandbox",
-              "vz04"
+              "vz04",
+              "linux_docker"
             ]
           },
           "result_adapter": {

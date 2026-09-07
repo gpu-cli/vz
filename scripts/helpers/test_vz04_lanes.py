@@ -62,6 +62,121 @@ class LaneTests(unittest.TestCase):
         self.assertEqual(sandbox[:4], ["--suite", "all", "--profile", "release"])
         self.assertIn("--output-dir", sandbox)
 
+    def test_the_docker_lane_receives_the_release_inputs_its_harness_requires(self):
+        """The contract gives this lane `["--suite", "all"]`, and its harness
+        rejects that: a composed run needs the release version, both guest
+        bundles and the BuildKit archive, and resolves `vz`/`vz-runtimed`
+        directly under `--release-dir`. All four are facts about the candidate
+        the gate was pointed at, so the lane reads them off it.
+        """
+        release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
+        try:
+            ctx = _ctx(self.root)
+            ctx.release_dir = release
+            argv = lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+            flags = dict(zip(argv, argv[1:]))
+            self.assertEqual(flags["--release-dir"], str(release / "bin"),
+                             "the harness resolves vz and vz-runtimed directly under --release-dir")
+            self.assertEqual(flags["--release-version"], "0.4.0-faketest")
+            self.assertEqual(flags["--developer-bundle"], str(release / "linux" / "developer"))
+            self.assertEqual(flags["--hardened-bundle"], str(release / "linux" / "container"))
+            self.assertEqual(flags["--buildkit-archive"],
+                             str(release / "buildkit" / "vz-buildkit-v0.19.0-linux-arm64.tar"))
+            # Other lanes are untouched and still receive the candidate root.
+            topology = lanes.lane_argv(self.lanes["topology"], ctx, "clean-provision", self.root / "e2", None)
+            self.assertEqual(dict(zip(topology, topology[1:]))["--release-dir"], str(release))
+            for flag in ("--release-version", "--developer-bundle", "--hardened-bundle", "--buildkit-archive"):
+                self.assertNotIn(flag, topology)
+        finally:
+            fixtures.make_writable(release)
+
+    def test_a_candidate_missing_a_lane_input_is_named_not_guessed(self):
+        """A candidate that cannot supply an input must say which one. Deriving
+        these from the candidate is only safe if a candidate that lacks them
+        fails loudly rather than passing an empty or invented path along."""
+        release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
+        fixtures.make_writable(release)
+        ctx = _ctx(self.root)
+        ctx.release_dir = release
+        for removed, expected in ((release / "linux" / "developer", "missing developer-bundle"),
+                                  (release / "linux" / "container", "missing hardened-bundle"),
+                                  (release / "buildkit" / "vz-buildkit-v0.19.0-linux-arm64.tar",
+                                   "exactly one BuildKit archive required, found 0"),
+                                  (release / "release-manifest.json", "manifest missing")):
+            backup = removed.with_name(removed.name + ".moved")
+            removed.rename(backup)
+            try:
+                with self.assertRaisesRegex(Exception, expected):
+                    lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+            finally:
+                backup.rename(removed)
+        # With everything back it resolves again, so each failure was the removal.
+        lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+
+    def test_the_docker_harness_no_longer_rejects_the_lane_for_release_inputs(self):
+        """The point of deriving them: the harness's own admission must accept
+        them. Anything it still refuses must be a run-frozen input, never one
+        the candidate already holds.
+
+        This is the half of `vz-ao8` the candidate can supply. The registry
+        archive and layout, the SSH package set and tmux are acquired inputs
+        and are still missing here; that is the remaining half, and this test
+        pins which options are in which half so the split cannot blur.
+        """
+        import linux_docker_e2e as harness
+        release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
+        try:
+            ctx = _ctx(self.root)
+            ctx.release_dir = release
+            ctx.clients = {"docker": "/d", "compose_plugin": "/c", "buildx_plugin": "/b"}
+            argv = lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
+            supplied, rejections = set(argv), []
+            for _ in range(8):
+                try:
+                    harness.arguments(list(argv))
+                    break
+                except Exception as error:
+                    rejections.append(str(error))
+                    flag = next((f"--{name}" for name in
+                                 ("registry-archive", "registry-layout", "ssh-packages", "tmux")
+                                 if f"--{name}" in str(error)), None)
+                    self.assertIsNotNone(flag, f"harness refused for a non-acquired input: {error}")
+                    self.assertNotIn(flag, supplied)
+                    argv += [flag, "/acquired" + flag]
+                    supplied.add(flag)
+            else:
+                self.fail("harness kept refusing: " + "; ".join(rejections))
+            self.assertEqual(sorted(supplied & {"--registry-archive", "--registry-layout",
+                                                "--ssh-packages", "--tmux"}),
+                             ["--registry-archive", "--registry-layout", "--ssh-packages", "--tmux"],
+                             "exactly the acquired inputs remained")
+            # And nothing the candidate holds was ever the reason.
+            for release_option in ("--release-version", "--developer-bundle", "--hardened-bundle",
+                                   "--buildkit-archive", "--release-dir"):
+                self.assertFalse(any(release_option in text for text in rejections),
+                                 f"{release_option} still refused: {rejections}")
+        finally:
+            fixtures.make_writable(release)
+
+    def test_a_candidate_that_cannot_supply_a_lane_input_is_accounted_not_crashed(self):
+        """The gate must survive a deficient candidate. A lane whose argv cannot
+        be built records `input_rejected` with the reason, so the aggregate
+        still counts it rather than the run dying while building a command."""
+        release = fixtures.build_fake_release_dir(self.root / "release")
+        try:
+            ctx = _ctx(self.root)
+            ctx.release_dir = release
+            directory = self.root / "linux-docker" / "clean-provision"
+            result = lanes.invoke_lane(self.lanes["linux-docker"], "clean-provision", ctx, directory)
+            self.assertEqual(result["outcome"], "failed")
+            self.assertEqual(result["failure"]["reason"], "input_rejected")
+            self.assertIn("BuildKit archive", result["failure"]["detail"])
+            self.assertEqual(schema.validate("lane-result", result), [])
+            self.assertEqual(common.load_json(directory / "lane-result.json"), result)
+            self.assertFalse((directory / "lane.stdout").exists(), "nothing may be run")
+        finally:
+            fixtures.make_writable(release)
+
     def test_stub_script_writes_valid_result_and_exits_3(self):
         """The native-macOS lane is still a stub: it must account for itself rather
         than be absent. The topology lane is a real lane and is covered by
