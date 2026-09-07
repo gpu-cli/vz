@@ -108,6 +108,9 @@
   .tag-active { color: var(--blue); border-color: var(--blue); background: rgba(15,76,129,.06); }
   .tag-dev { color: var(--amber); border-color: var(--amber); background: rgba(122,96,21,.06); }
   .tag-planned { color: var(--red); border-color: var(--red); background: rgba(163,51,39,.05); }
+  .tag-na { color: var(--ink-60); border-color: var(--ink-60); background: rgba(90,83,71,.06); }
+  .desc .vocab { list-style: none; padding: 0; margin: 14px 0 0; font-size: 12.5px; color: var(--ink-60); }
+  .desc .vocab li { margin-top: 6px; }
 
   /* ── two-col intro: features / description ───────── */
   .intro {
@@ -374,8 +377,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <li><span class="tick">▪</span><span><b>Native where it matters.</b> macOS-on-macOS now; Windows-on-Windows follows Linux-on-Windows</span></li>
         <li><span class="tick">▪</span><span><b>Docker is implicit for Linux development.</b> Each Developer-profile Linux Machine owns a private Engine, context, state, and cache</span></li>
         <li><span class="tick">▪</span><span><b>Parallel on both axes.</b> Many isolated Environments per project; many cooperating Machines per Environment</span></li>
-        <li><span class="tick">▪</span><span><b>Public-like, still local.</b> Declared DNS, TLS, ingress, NAT, firewall, and network faults without accidental exposure</span></li>
-        <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×Machine-target support is ACTIVE, DEV, or PLANNED</span></li>
+        <li><span class="tick">▪</span><span><b>Public-like, still local.</b> Declared DNS, TLS, ingress, NAT, firewall, and network faults without accidental exposure (<span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer split_dns,tls_ingress,nat_firewall,faults,network_simulated_public">PLANNED</span>)</span></li>
+        <li><span class="tick">▪</span><span><b>Honest capabilities.</b> Host×Machine-target support is ACTIVE, DEV, PLANNED, or NA, exactly as the checked-in capability matrix says</span></li>
         <li><span class="tick">▪</span><span><b>Hardened when requested.</b> Lockdown remains a secondary profile, not the product center</span></li>
       </ul>
     </div>
@@ -386,7 +389,14 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <p><span class="none-em">Linux is the universal Machine target.</span> Linux and native macOS Machines can coexist in one Environment on macOS; Linux moves next to Linux hosts and later Windows, with native Windows last.</p>
         <p>Every Developer-profile Linux Machine includes private Docker readiness: its own Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and managed context. There is no Environment-wide/global socket and no fallback to Docker Desktop, a sibling Machine, or another Environment.</p>
         <p>Current runtime and VM mechanisms are real; the five-verb <code>vz up/exec/status/stop/delete</code> lifecycle, topology fabric, and full host-Docker-CLI parity remain in development.</p>
-        <p class="foot">Status vocabulary: <span class="tag tag-active">ACTIVE</span> shipped in v0.3.20 · <span class="tag tag-dev">DEV</span> in development · <span class="tag tag-planned">PLANNED</span> committed roadmap, subject to change.</p>
+        <!-- capability-matrix: definitions -->
+        <ul class="vocab" aria-label="Status vocabulary">
+          <li><span class="tag tag-active">ACTIVE</span> Shipped in the published target release AND retained installed evidence exists for the exact host×target×profile pair. Requires non-empty evidence.</li>
+          <li><span class="tag tag-dev">DEV</span> Implemented and demonstrated by an installed local-Mac slice that is not release certified. Requires non-empty evidence.</li>
+          <li><span class="tag tag-planned">PLANNED</span> Committed direction with no negotiation path. Requires empty negotiated_by, rejected_by and evidence.</li>
+          <li><span class="tag tag-na">NA</span> Explicitly rejected by validation as an unsupported pairing or declaration. Requires non-empty rejected_by.</li>
+        </ul>
+        <p class="foot">Source of truth: <code>config/host-target-capabilities-v0.4.json</code> in the repository. No entry is labelled shipped until a 0.4 release is published.</p>
       </div>
     </div>
   </section>
@@ -426,7 +436,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="92" y="262" width="406" height="58" fill="none" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="108" y="286" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#a33327">MANAGED DOCKER CONTEXT</text>
-          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one endpoint per Developer Linux Machine · DEV</text>
+          <!-- capability-matrix: macos-arm64/linux/developer docker_context -->
+          <text x="108" y="305" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">one managed context per Developer Linux Machine · DEV</text>
 
           <rect x="92" y="340" width="406" height="120" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
           <text x="108" y="364" font-family="IBM Plex Sans" font-weight="700" font-size="13.5" fill="#1f1c18">STATE</text>
@@ -465,6 +476,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <rect x="724" y="298" width="372" height="46" fill="rgba(163,51,39,0.05)" stroke="#a33327" stroke-width="1.2" stroke-dasharray="5 4"/>
           <text x="740" y="318" font-family="IBM Plex Sans" font-weight="700" font-size="13" fill="#a33327">dockerd + containerd</text>
+          <!-- capability-matrix: macos-arm64/linux/developer docker_engine -->
           <text x="740" y="335" font-family="IBM Plex Mono" font-size="10.5" fill="#a33327">PRIVATE DOCKER PER MACHINE · DEV §5</text>
 
           <rect x="724" y="362" width="372" height="44" fill="none" stroke="#1f1c18" stroke-width="1.2"/>
@@ -476,6 +488,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <path d="M 1074 438 L 1080 428 L 1086 438" stroke="#5a5347" stroke-width="1.3" fill="none"/>
           <ellipse cx="1080" cy="412" rx="52" ry="20" fill="none" stroke="#5a5347" stroke-width="1.3"/>
           <text x="1080" y="416" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" fill="#5a5347">NAT</text>
+          <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer egress_policy -->
           <text x="1080" y="452" text-anchor="middle" font-family="IBM Plex Mono" font-size="9.6" fill="#a33327">EGRESS POLICY · PLANNED §6</text>
         </svg>
       </div>
@@ -550,8 +563,8 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
 
           <!-- pin status dots -->
           <g>
-            <rect x="292" y="102" width="7" height="7" fill="#0f4c81"/><rect x="283" y="102" width="7" height="7" fill="#7a6015"/><rect x="274" y="102" width="7" height="7" fill="#7a6015"/>
-            <rect x="292" y="162" width="7" height="7" fill="#0f4c81"/>
+            <rect x="292" y="102" width="7" height="7" fill="#7a6015"/><rect x="283" y="102" width="7" height="7" fill="#7a6015"/><rect x="274" y="102" width="7" height="7" fill="#7a6015"/>
+            <rect x="292" y="162" width="7" height="7" fill="#7a6015"/>
             <rect x="292" y="222" width="7" height="7" fill="#7a6015"/>
             <rect x="292" y="282" width="7" height="7" fill="#7a6015"/>
             <rect x="292" y="342" width="7" height="7" fill="#7a6015"/>
@@ -564,13 +577,17 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <text x="590" y="215" text-anchor="middle" font-family="Archivo" font-weight="800" font-size="84" fill="#1f1c18" letter-spacing="-2">vz</text>
           <text x="590" y="252" text-anchor="middle" font-family="IBM Plex Mono" font-size="12" letter-spacing="2.0" fill="#5a5347">DEVELOPER ENVIRONMENT</text>
           <text x="590" y="272" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#5a5347">VZ-FS-2026-001 · REV F</text>
+          <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->
           <text x="590" y="346" text-anchor="middle" font-family="IBM Plex Mono" font-size="10.5" letter-spacing="1.4" fill="#a33327">UNIFIED LIFECYCLE · DEV</text>
 
           <!-- status legend -->
           <g font-family="IBM Plex Mono" font-size="11.5">
-            <rect x="480" y="396" width="7" height="7" fill="#0f4c81"/><text x="494" y="404" fill="#1f1c18">primitive ACTIVE</text>
-            <rect x="640" y="396" width="7" height="7" fill="#7a6015"/><text x="654" y="404" fill="#1f1c18">primitive DEV</text>
-            <rect x="790" y="396" width="7" height="7" fill="#a33327"/><text x="804" y="404" fill="#1f1c18">primitive PLANNED</text>
+            <!-- capability-matrix: vocabulary -->
+            <rect x="480" y="396" width="7" height="7" fill="#7a6015"/><text x="494" y="404" fill="#1f1c18">primitive DEV</text>
+            <!-- capability-matrix: vocabulary -->
+            <rect x="640" y="396" width="7" height="7" fill="#a33327"/><text x="654" y="404" fill="#1f1c18">primitive PLANNED</text>
+            <!-- capability-matrix: vocabulary -->
+            <rect x="790" y="396" width="7" height="7" fill="#5a5347"/><text x="804" y="404" fill="#1f1c18">primitive NA</text>
           </g>
         </svg>
       </div>
@@ -583,16 +600,16 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
           <tr><th>Pin</th><th>Tool</th><th>Function</th><th>Primitive</th><th>Status</th></tr>
         </thead>
         <tbody>
-          <tr><td class="t-num">1</td><td class="t-mono">environment_create</td><td>Persist Project/Environment identity, topology digest, ownership, and reproducible inputs</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">2</td><td class="t-mono">environment_start</td><td>Reconcile Machines, dependencies, networks, and standard capabilities</td><td class="t-dim">environment supervisor</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">3</td><td class="t-mono">machine_exec</td><td>Stream command I/O, PTY, signals, cancellation, and exit status on one Machine</td><td class="t-dim">guest agent / native adapter</td><td><span class="tag tag-active">ACTIVE</span> <span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">4</td><td class="t-mono">machine_read_file</td><td>Read selected Machine file bytes or text within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">5</td><td class="t-mono">machine_write_file</td><td>Write a selected Machine file atomically within policy</td><td class="t-dim">files API</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">6</td><td class="t-mono">environment_checkpoint</td><td>Snapshot state where the target reports support</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span> primitive · <span class="tag tag-dev">DEV</span> aggregate</td></tr>
-          <tr><td class="t-num">7</td><td class="t-mono">environment_restore</td><td>Restore or fork with target-qualified portability</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-active">ACTIVE</span> primitive · <span class="tag tag-dev">DEV</span> aggregate</td></tr>
-          <tr><td class="t-num">8</td><td class="t-mono">topology_reconcile</td><td>Apply segments, paths, DNS, ingress, policy, faults, and peer grants</td><td class="t-dim">network fabric</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">9</td><td class="t-mono">environment_inspect</td><td>Report topology, Machines, targets, lifecycle, ownership, and capabilities</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
-          <tr><td class="t-num">10</td><td class="t-mono">environment_delete</td><td>Remove only the selected environment's owned state and endpoints</td><td class="t-dim">environment service</td><td><span class="tag tag-dev">DEV</span></td></tr>
+          <tr><td class="t-num">1</td><td class="t-mono">environment_create</td><td>Persist Project/Environment identity, topology digest, ownership, and reproducible inputs</td><td class="t-dim">environment service</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td></tr>
+          <tr><td class="t-num">2</td><td class="t-mono">environment_start</td><td>Reconcile Machines, dependencies, networks, and standard capabilities</td><td class="t-dim">environment supervisor</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span> Machines · <span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer network_private">PLANNED</span> networks</td></tr>
+          <tr><td class="t-num">3</td><td class="t-mono">machine_exec</td><td>Stream command I/O, PTY, signals, cancellation, and exit status on one Machine</td><td class="t-dim">guest agent / native adapter</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer posix_exec">DEV</span> exec · <span class="tag tag-dev" vz-capability="macos-arm64/macos/developer posix_pty">DEV</span> PTY on native macOS · <span class="tag tag-planned" vz-capability="macos-arm64/linux/* posix_pty,signals">PLANNED</span> Linux PTY and signals</td></tr>
+          <tr><td class="t-num">4</td><td class="t-mono">machine_read_file</td><td>Read selected Machine file bytes or text within policy</td><td class="t-dim">files API</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer files">PLANNED</span></td></tr>
+          <tr><td class="t-num">5</td><td class="t-mono">machine_write_file</td><td>Write a selected Machine file atomically within policy</td><td class="t-dim">files API</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer files">PLANNED</span></td></tr>
+          <tr><td class="t-num">6</td><td class="t-mono">environment_checkpoint</td><td>Snapshot state where the target reports support</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer snapshot,checkpoint">PLANNED</span></td></tr>
+          <tr><td class="t-num">7</td><td class="t-mono">environment_restore</td><td>Restore or fork with target-qualified portability</td><td class="t-dim">checkpoint adapter</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer snapshot,checkpoint">PLANNED</span></td></tr>
+          <tr><td class="t-num">8</td><td class="t-mono">topology_reconcile</td><td>Apply segments, paths, DNS, ingress, policy, faults, and peer grants</td><td class="t-dim">network fabric</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering">PLANNED</span></td></tr>
+          <tr><td class="t-num">9</td><td class="t-mono">environment_inspect</td><td>Report topology, Machines, targets, lifecycle, ownership, and capabilities</td><td class="t-dim">environment service</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td></tr>
+          <tr><td class="t-num">10</td><td class="t-mono">environment_delete</td><td>Remove only the selected environment's owned state and endpoints</td><td class="t-dim">environment service</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td></tr>
         </tbody>
       </table>
     </div>
@@ -612,7 +629,7 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="clause-h"><span class="cno">5.1</span>Project, Environment &amp; Machine identity</div>
         <div class="clause-b">
           <p>A ProjectDefinition may create many Environment instances, including several for one worktree. Each Environment owns a topology of Machines; each Machine owns its immutable target specification and target-native state. Unsupported host/Machine-target pairs fail explicitly.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> backend primitives · <span class="tag tag-dev">DEV</span> unified environment aggregate</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span> Linux and native macOS Developer Machines on Apple silicon · <span class="tag tag-na" vz-capability="macos-arm64/macos/hardened pair">NA</span> Hardened native macOS</div>
         </div>
       </article>
 
@@ -620,12 +637,13 @@ FINISH: unreviewed and undocumented is unfinished; this build ends with the fini
         <div class="clause-h"><span class="cno">5.2</span>Machine targets &amp; topology</div>
         <div class="clause-b">
           <p>On macOS, Linux and native macOS Machines can form one Environment through declared private or simulated-public paths. Linux OCI execution uses pinned <b>youki</b>; the same Linux Machine contract moves next to Linux and Windows hosts.</p>
+          <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->
           <pre class="cmdline"><span class="cmt"># 0.4 Developer Environment lifecycle (DEV)</span>
 vz up --environment demo
 vz status --environment demo --json
 vz exec --environment demo --machine api -- make test
 vz stop --environment demo</pre>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> youki in-guest · <span class="tag tag-active">ACTIVE</span> deterministic stacks · <span class="tag tag-dev">DEV</span> deny-first Environment networking</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="macos-arm64/linux/developer youki_only_runtime">DEV</span> youki-only runtime in Developer Linux Machines · <span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public">PLANNED</span> deny-first Environment networking</div>
         </div>
       </article>
 
@@ -637,7 +655,7 @@ vz stop --environment demo</pre>
 docker --context vz-agent-a-api ps
 docker --context vz-agent-a-api compose up
 docker --context vz-agent-a-api build -t app .</pre>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> guarded vz Docker shim primitives · <span class="tag tag-dev">DEV</span> implicit Engine + context + full host-client parity</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="macos-arm64/linux/developer docker_engine,compose,buildx,docker_context">DEV</span> implicit Engine, Compose, buildx and managed context per Developer Linux Machine; full host-client parity is not release certified</div>
         </div>
       </article>
 
@@ -645,7 +663,7 @@ docker --context vz-agent-a-api build -t app .</pre>
         <div class="clause-h"><span class="cno">5.4</span>Native macOS Machine</div>
         <div class="clause-b">
           <p>Native macOS Machines reuse pinned images, provisioning, guest-agent execution, patching, and save/restore. They can communicate with declared Linux Machines but never inherit their Docker capability.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> native VM mechanisms · <span class="tag tag-dev">DEV</span> unified Developer Environment lifecycle</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="macos-arm64/macos/developer pair,posix_pty">DEV</span> native macOS Developer Machine lifecycle, exec and PTY · <span class="tag tag-na" vz-capability="macos-arm64/macos/developer docker_engine">NA</span> Docker on native macOS</div>
         </div>
       </article>
 
@@ -653,7 +671,7 @@ docker --context vz-agent-a-api build -t app .</pre>
         <div class="clause-h"><span class="cno">5.5</span>Parallelism, network &amp; persistence</div>
         <div class="clause-b">
           <p>Many Environment instances and many Machines run concurrently. Separate Environments share no mutable state or routes. Machines use declared paths, including a local public-like DNS/TLS/ingress/NAT edge. Stop preserves declared state; delete removes only the selected ownership graph.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> checkpoint foundations · <span class="tag tag-dev">DEV</span> durable unified ownership and isolation gates</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span> Environment ownership, Stop and Delete · <span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer network_simulated_public,snapshot,checkpoint">PLANNED</span> public-like edge, snapshots and checkpoints</div>
         </div>
       </article>
 
@@ -661,7 +679,7 @@ docker --context vz-agent-a-api build -t app .</pre>
         <div class="clause-h"><span class="cno">5.6</span>Platform expansion</div>
         <div class="clause-b">
           <p>The ordered Machine-target matrix is Linux-on-macOS and macOS-on-macOS now; Linux-on-Linux next; Linux-on-Windows later; Windows-on-Windows finally. Linux remains portable; native Machines preserve their operating-system semantics.</p>
-          <div class="statusline">Status: <span class="tag tag-active">ACTIVE</span> Mac backend primitives · <span class="tag tag-dev">DEV</span> Linux-host parity · <span class="tag tag-planned">PLANNED</span> Windows host/targets</div>
+          <div class="statusline">Status: <span class="tag tag-dev" vz-capability="host:macos-arm64">DEV</span> Apple-silicon macOS host · <span class="tag tag-planned" vz-capability="host:linux-*">PLANNED</span> Linux hosts · <span class="tag tag-planned" vz-capability="host:windows-*">PLANNED</span> Windows hosts</div>
         </div>
       </article>
 
@@ -735,11 +753,11 @@ docker --context vz-agent-a-api build -t app .</pre>
           <tr><th>Host</th><th>Target</th><th>Status and contract</th></tr>
         </thead>
         <tbody>
-          <tr><td class="t-mono">macOS</td><td>Linux</td><td><span class="tag tag-active">ACTIVE</span> VM/OCI/BuildKit primitives · <span class="tag tag-dev">DEV</span> unified lifecycle and private Docker</td></tr>
-          <tr><td class="t-mono">macOS</td><td>macOS</td><td><span class="tag tag-active">ACTIVE</span> native VM flows · <span class="tag tag-dev">DEV</span> unified lifecycle</td></tr>
-          <tr><td class="t-mono">Linux</td><td>Linux</td><td><span class="tag tag-dev">DEV</span> partial native backend; parity gate pending</td></tr>
-          <tr><td class="t-mono">Windows</td><td>Linux</td><td><span class="tag tag-planned">PLANNED</span> universal Linux contract through a Windows virtualization backend</td></tr>
-          <tr><td class="t-mono">Windows</td><td>Windows</td><td><span class="tag tag-planned">PLANNED</span> native Windows target after Linux-on-Windows</td></tr>
+          <tr><td class="t-mono">macOS</td><td>Linux</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/* pair">DEV</span> lifecycle, exec and private Developer-profile Docker · <span class="tag tag-planned" vz-capability="macos-arm64/linux/* network_private">PLANNED</span> topology networking</td></tr>
+          <tr><td class="t-mono">macOS</td><td>macOS</td><td><span class="tag tag-dev" vz-capability="macos-arm64/macos/developer pair">DEV</span> Developer Machines with exec and PTY · <span class="tag tag-na" vz-capability="macos-arm64/macos/hardened pair">NA</span> Hardened profile</td></tr>
+          <tr><td class="t-mono">Linux</td><td>Linux</td><td><span class="tag tag-planned" vz-capability="linux-*/linux/* pair">PLANNED</span> partial native backend in the tree; no Machine target resolves on a Linux host</td></tr>
+          <tr><td class="t-mono">Windows</td><td>Linux</td><td><span class="tag tag-planned" vz-capability="windows-*/linux/* pair">PLANNED</span> universal Linux contract through a Windows virtualization backend</td></tr>
+          <tr><td class="t-mono">Windows</td><td>Windows</td><td><span class="tag tag-planned" vz-capability="windows-*/windows/developer pair">PLANNED</span> native Windows Developer Machines after Linux-on-Windows</td></tr>
         </tbody>
         <tfoot>
           <tr><td colspan="3">Docker is implicit only for Developer-profile Linux Machines. Each owns a private Engine, containerd, BuildKit cache, images, volumes, networks, endpoint, and context. Hardened Linux Machines omit Docker; native macOS/Windows Machines do not receive a hidden Linux sidecar or Docker service.</td></tr>
@@ -766,36 +784,36 @@ docker --context vz-agent-a-api build -t app .</pre>
             <td class="t-mono">vz-prebuilt</td>
             <td>Signed + notarized CLI, guest kernel (both profiles), guest agent</td>
             <td class="t-mono">curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh | sh</td>
-            <td><span class="tag tag-active">ACTIVE</span></td>
+            <td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td>
           </tr>
           <tr>
             <td class="t-mono">vz-source</td>
             <td>Crate build; apply Virtualization.framework entitlements</td>
-            <td class="t-mono">cargo install --git https://github.com/gpu-cli/vz.git vz-cli<br>&amp;&amp; vz self-sign</td>
-            <td><span class="tag tag-active">ACTIVE</span></td>
+            <td class="t-mono">cargo build --manifest-path crates/Cargo.toml --locked --release -p vz-cli -p vz-runtimed<br>&amp;&amp; ./scripts/sign-dev.sh</td>
+            <td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td>
           </tr>
           <tr>
             <td class="t-mono">kernel-developer</td>
             <td>Broad dev kernel: nested virt, TUN/TAP for Firecracker hosts</td>
             <td class="t-mono">make -C linux docker-build</td>
-            <td><span class="tag tag-active">ACTIVE</span></td>
+            <td><span class="tag tag-dev" vz-capability="macos-arm64/linux/developer pair">DEV</span></td>
           </tr>
           <tr>
             <td class="t-mono">kernel-hardened</td>
             <td>Hardened restricted profile (legacy build alias: container)</td>
             <td class="t-mono">make -C linux docker-build KERNEL_PROFILE=container</td>
-            <td><span class="tag tag-active">ACTIVE</span></td>
+            <td><span class="tag tag-dev" vz-capability="macos-arm64/linux/container pair">DEV</span></td>
           </tr>
           <tr>
             <td class="t-mono">vz-agent-skill</td>
-            <td>Claude plugin + skill for the shipped 0.3 legacy run workflow</td>
+            <td>Claude plugin + skill for the five-verb Developer Environment workflow</td>
             <td class="t-mono">.claude-plugin/ (in repo)</td>
-            <td><span class="tag tag-active">ACTIVE</span></td>
+            <td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p class="order-note"><b>0.4 Developer workflow (DEV):</b> check in a schema-valid <code>vz.json</code>, then run <code>cd your-project &amp;&amp; vz up</code>. The first unqualified use creates the <code>default</code> Environment; named parallel instances use <code>vz up --environment &lt;name&gt;</code>. The shipped 0.3 <code>vz init/vz run</code> workflow is documented as legacy in the repository README.<sup class="fn">2</sup></p>
+    <p class="order-note"><b>0.4 Developer workflow (<span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span>):</b> check in a schema-valid <code>vz.json</code>, then run <code>cd your-project &amp;&amp; vz up</code>. The first unqualified use creates the <code>default</code> Environment; named parallel instances use <code>vz up --environment &lt;name&gt;</code>. The retired 0.3 init/run command family is rejected with a structured error; see the repository README.<sup class="fn">2</sup></p>
   </section>
 
   <hr class="rule">
@@ -813,25 +831,25 @@ docker --context vz-agent-a-api build -t app .</pre>
         </thead>
         <tbody>
           <tr>
-            <td class="t-mono">0.3.20</td><td class="t-dim">shipped</td><td><span class="tag tag-active">ACTIVE</span></td>
-            <td>youki OCI runtime in-guest · deterministic Compose stacks · BuildKit builds in guest VM · fs_quick checkpoints · macOS VM flows + signed patch bundles + delta patches · gRPC daemon + HTTP API · vz.json / vz run</td>
+            <td class="t-mono">0.3.20</td><td class="t-dim">shipped</td><td class="t-dim">legacy</td>
+            <td>youki OCI runtime in-guest · deterministic Compose stacks · BuildKit builds in guest VM · fs_quick checkpoints · macOS VM flows + signed patch bundles + delta patches · gRPC daemon + HTTP API · vz.json with the legacy run workflow, retired in 0.4</td>
           </tr>
           <tr>
-            <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev">DEV</span></td>
-            <td>Project/Environment/Machine identity; five-verb lifecycle; mixed targets; per-Developer-Linux-Machine Docker; isolated private and public-like topology networking</td>
+            <td class="t-mono">F.1</td><td class="t-dim">in dev</td><td><span class="tag tag-dev" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer pair">DEV</span></td>
+            <td>Project/Environment/Machine identity; five-verb lifecycle for Linux and native macOS Machines on Apple silicon; per-Developer-Linux-Machine Docker with managed contexts</td>
           </tr>
           <tr>
-            <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
-            <td>Linux, native macOS, and aggregate topology gates; private per-Machine Docker contexts; full Mac Docker CLI/Compose/buildx compatibility</td>
+            <td class="t-mono">F.2</td><td class="t-dim">planned</td><td><span class="tag tag-planned" vz-capability="macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,workspace_read_write,snapshot,checkpoint">PLANNED</span></td>
+            <td>Isolated private and public-like topology networking; workspace projections; snapshots and checkpoints; release-certified Linux, native macOS, and aggregate topology gates</td>
           </tr>
           <tr>
-            <td class="t-mono">F.3</td><td class="t-dim">planned</td><td><span class="tag tag-planned">PLANNED</span></td>
+            <td class="t-mono">F.3</td><td class="t-dim">planned</td><td><span class="tag tag-planned" vz-capability="linux-*/linux/*,windows-*/linux/*,windows-*/windows/developer pair">PLANNED</span></td>
             <td>Linux-on-Linux parity, then Linux-on-Windows, then native Windows-on-Windows; each pairing earns separate release-built evidence</td>
           </tr>
         </tbody>
       </table>
     </div>
-    <p class="note">Features marked PLANNED describe the committed roadmap this document specifies, not shipped capability. Production behavior is defined by the ACTIVE rows and the repository, gpu-cli/vz on GitHub.</p>
+    <p class="note"><!-- capability-matrix: vocabulary -->Rows marked PLANNED describe the committed roadmap this document specifies, not shipped capability; no row is labelled shipped until a 0.4 release is published. Every label is checked against <code>config/host-target-capabilities-v0.4.json</code> in the repository, gpu-cli/vz on GitHub.</p>
   </section>
 
   <!-- ─────────────── notes ─────────────── -->
@@ -841,7 +859,7 @@ docker --context vz-agent-a-api build -t app .</pre>
       <li>The current Linux-on-macOS backend uses a Linux VM on Apple Virtualization.framework; native macOS environments use macOS VMs. macOS 14+ (Sonoma) is required for VM state save/restore.</li>
       <li>Boot and reuse behavior as stated in the vz repository documentation (v0.3.20): ~3 s typical cold boot to first command; setup cached by hash; warm reuse instant. Subject to the project's measured-claims policy; no independent benchmark is claimed here.</li>
       <li>For Linux-on-macOS, Linux workloads—including each Developer-profile Linux Machine's future private dockerd—execute in that Machine's backend. Hardened Machines do not gain implicit Docker. Declared host clients and bridges remain visible parts of the contract.</li>
-      <li>The typed API register in §4 is proposed. The shipped 0.3 skill uses legacy command names; 0.4 replaces them with the five-verb surface while convergence is DEV.</li>
+      <li>The typed API register in §4 is proposed. The repository skill documents the five-verb surface; convergence is <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->DEV.</li>
       <li>Guest kernel 6.12.85 currently builds <code>developer</code> and legacy <code>container</code> profiles; the public restricted profile becomes <code>Hardened</code>.</li>
     </ol>
   </section>

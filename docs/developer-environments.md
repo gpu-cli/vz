@@ -45,19 +45,34 @@ Linux where the host permits them.
 
 ## Host and Machine-target matrix
 
-Status labels describe backend availability, not complete feature parity:
+The machine-readable matrix
+[`config/host-target-capabilities-v0.4.json`](../config/host-target-capabilities-v0.4.json)
+is the source of truth for every host×Machine-target×profile capability label.
+Its `status_definitions` are the only status vocabulary; every surface that
+defines the vocabulary repeats them verbatim, and
+`python3 -B scripts/check-capability-claims.py` verifies that generated
+surfaces match the matrix (see [capability claim markers](#capability-claim-markers)).
 
-- **ACTIVE**: working backend capabilities exist in the repository today.
-- **DEV**: implementation exists or is being unified, but the 0.4 contract is
-  not complete.
-- **PLANNED**: committed direction with no complete implementation claim.
-- **N/A**: not a supported host/Machine-target pairing.
+<!-- capability-matrix: definitions -->
+- **ACTIVE**: Shipped in the published target release AND retained installed
+  evidence exists for the exact host×target×profile pair. Requires non-empty
+  evidence.
+- **DEV**: Implemented and demonstrated by an installed local-Mac slice that is
+  not release certified. Requires non-empty evidence.
+- **PLANNED**: Committed direction with no negotiation path. Requires empty
+  `negotiated_by`, `rejected_by` and evidence.
+- **NA**: Explicitly rejected by validation as an unsupported pairing or
+  declaration. Requires non-empty `rejected_by`.
+
+No entry is labelled shipped until a 0.4 release is published; capabilities the
+matrix does not list are <!-- capability-matrix: vocabulary -->PLANNED by definition. Labels describe the matrix
+entry, not complete feature parity.
 
 | Host | Linux Machine target | macOS Machine target | Windows Machine target |
 |---|---|---|---|
-| macOS on Apple silicon | **ACTIVE** primitives; unified lifecycle, per-Machine Docker, and topology are **DEV** | **ACTIVE** VM flows; unified Machine lifecycle and mixed topology are **DEV** | N/A |
-| Linux | **DEV** native backend; contract parity remains in progress | N/A | N/A |
-| Windows | **PLANNED** using the selected Windows virtualization backend | N/A | **PLANNED**, after Linux-on-Windows |
+| macOS on Apple silicon | <!-- capability-matrix: macos-arm64/linux/* pair -->**DEV** lifecycle, exec and private Developer-profile Docker; topology networking and workspace projections are <!-- capability-matrix: macos-arm64/linux/* network_private,workspace_read_write -->**PLANNED** | <!-- capability-matrix: macos-arm64/macos/developer pair -->**DEV** Developer Machines with exec and PTY; the Hardened profile is <!-- capability-matrix: macos-arm64/macos/hardened pair -->**NA** | <!-- capability-matrix: macos-arm64/windows/* pair -->**NA** |
+| Linux | <!-- capability-matrix: linux-*/linux/* pair -->**PLANNED**; the partial `linux-native` backend in the tree has no Machine target resolver on a Linux host | <!-- capability-matrix: linux-*/macos/* pair -->**NA** | <!-- capability-matrix: linux-*/windows/* pair -->**NA** |
+| Windows | <!-- capability-matrix: windows-*/linux/* pair -->**PLANNED** using the selected Windows virtualization backend | <!-- capability-matrix: windows-*/macos/* pair -->**NA** | <!-- capability-matrix: windows-*/windows/developer pair -->**PLANNED** Developer Machines, after Linux-on-Windows; Hardened is <!-- capability-matrix: windows-*/windows/hardened pair -->**NA** |
 
 Delivery order is Linux-on-macOS and macOS-on-macOS, Linux-on-Linux,
 Linux-on-Windows, then Windows-on-Windows. Linux being universal does not require
@@ -107,7 +122,7 @@ mutation. Project identity is stored in the definition and never derived from
 the checkout path; authoring uses
 `schemas/vz-project-definition-v1.schema.json`,
 `examples/developer-environment/vz.json`, or the typed authoring API rather than
-a second `vz init` lifecycle.
+a second `init` lifecycle.
 
 An Environment exclusively owns its Machines, disks, shares, credentials,
 networks, DNS view, ingress, NAT state, ports, faults, events, and endpoints.
@@ -120,6 +135,9 @@ ownership graph.
 Workspace projection is explicit per Machine: read-write, read-only, or
 snapshot. Shared-writer and shared-volume semantics require a declared
 consistency contract. vz never silently multi-attaches a writable block disk.
+Every workspace projection is
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer workspace_read_write,workspace_read_only,workspace_snapshot -->**PLANNED**;
+Up currently rejects Machines that declare one.
 
 ## Machine contract
 
@@ -136,8 +154,14 @@ combinations. Legacy migration assigns the profile from provenance and never
 silently converts a Hardened/generic record into Developer.
 
 Every supported Machine provides target-native execution, streaming stdin and
-stdout/stderr, PTY where supported, cancellation, exit status, inspectable
-state, and lifecycle behavior. Unsupported host/Machine-target pairs or capabilities
+stdout/stderr, PTY where negotiated, cancellation, exit status, inspectable
+state, and lifecycle behavior. Today `posix_pty` is negotiated only by native
+macOS Machines
+(<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**);
+Linux Machines negotiate `posix_exec` without a PTY, so `vz exec -t` against a
+Linux Machine is
+<!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED**.
+Unsupported host/Machine-target pairs or capabilities
 fail explicitly and never substitute another Machine or target.
 
 ### Linux Machines and Docker
@@ -163,7 +187,8 @@ Linux Machines also own OCI execution and Linux checkpoint capabilities. On
 macOS they execute inside vz-managed Linux VMs. The pinned, verified youki
 binary is the only OCI runtime allowed in the guest; runc/crun installation,
 override, or fallback fails the release gate. Full host-Docker compatibility is
-**DEV** until the dedicated release-built local-Mac lane passes.
+<!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx,docker_context -->**DEV**
+until the dedicated release-built local-Mac lane passes.
 
 ### Native macOS and Windows Machines
 
@@ -171,8 +196,11 @@ A native macOS Machine runs macOS workloads in a macOS VM and supports Xcode,
 Swift, Darwin processes, launchd, APFS, and other target-native behavior. It
 does not advertise Docker or silently create a Linux sidecar; a Linux Machine is
 declared in the same or another Environment when Linux containers are required.
-Existing macOS VM primitives are **ACTIVE**; their integration into the shared
-topology contract is **DEV**.
+Native macOS Developer Machines are
+<!-- capability-matrix: macos-arm64/macos/developer pair -->**DEV**: the
+installed local bundle passes Up/exec/PTY/Stop/Delete, but no published
+authenticated base/patch/catalog exists. The Hardened profile on a native macOS
+Machine is <!-- capability-matrix: macos-arm64/macos/hardened pair -->**NA**.
 
 The 0.4 native macOS release gate requires at least one exact macOS 26+ guest
 version/build prepared locally from pinned Apple IPSW bytes. The explicit host
@@ -191,7 +219,8 @@ validated template. Existing Environments retain their original pins.
 `vz-macos-setup` is an installation utility, separate from the five Environment
 lifecycle verbs. It reports preparation progress and accepts the selected Xcode
 license only with explicit operator authorization. This local setup path is
-**DEV** until its fresh installed-user gate passes. Public redistribution of
+<!-- capability-matrix: macos-arm64/macos/developer pair -->**DEV** until its
+fresh installed-user gate passes. Public redistribution of
 macOS/Xcode disk images is not a 0.4 dependency. The `vz-macos-provision::image_delta`
 API and version-1 exact-base/patch format remain available for optional artifact
 workflows; local setup uses a version-2 complete local-image manifest and never
@@ -199,9 +228,18 @@ creates or applies a block patch.
 
 Linux-on-Windows precedes Windows-on-Windows. Native Windows Machines will expose
 Windows process, service, console, NTFS, and isolation capabilities without
-inheriting Linux OCI/youki assumptions. Both Windows pairings are **PLANNED**.
+inheriting Linux OCI/youki assumptions. Both Windows pairings are
+<!-- capability-matrix: windows-*/linux/*,windows-*/windows/developer pair -->**PLANNED**.
 
 ## Network topology contract
+
+Every topology capability in this section—private networks, the simulated-public
+edge, endpoints, split DNS, TLS ingress, NAT/firewall, host imports and exports,
+egress policy, faults and peering—is
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering -->**PLANNED**
+for every pair in the matrix. Up currently rejects declared networks and
+endpoints without admission; the typed contract below is the committed
+direction, not shipped behavior.
 
 Every Environment owns a distinct route domain, DNS view, gateway/NAT state,
 firewall, port registry, ingress, impairment state, and network credentials.
@@ -301,5 +339,55 @@ Product, planning, CLI, API, site, skill, and architecture documents use
 **Developer Environment** for the topology instance and **Machine** for a
 target-native compute member. Use `sandbox`, `container`, `VM`, and `process`
 only for a current compatibility command, protocol entity, security boundary,
-or backend. Claims carry **ACTIVE**, **DEV**, or **PLANNED** whenever direction
-could be mistaken for shipped behavior.
+or backend. Claims carry **ACTIVE**, **DEV**, **PLANNED**, or **NA** whenever
+direction could be mistaken for shipped behavior, and every such claim on a
+generated surface is bound to the matrix as described below.
+
+### Capability claim markers
+
+`generated_surfaces` in
+[`config/host-target-capabilities-v0.4.json`](../config/host-target-capabilities-v0.4.json)
+lists the public surfaces (README, docs, site, skill, CLI help source) that
+`python3 -B scripts/check-capability-claims.py` lints. The linter treats every
+occurrence of a status token in those files as a claim and requires an explicit
+marker to bind it to matrix entries; nothing is inferred from table headers or
+prose. A token with no marker is a violation unless it is a vocabulary mention
+(two or more distinct tokens joined only by commas, slashes, `or`, or `and`) or
+sits inside a definitions block.
+
+Marker forms share one grammar:
+
+```text
+<!-- capability-matrix: <selectors> <capabilities> -->   markdown and HTML
+vz-capability="<selectors> <capabilities>"               HTML attribute
+// capability-matrix: <selectors> <capabilities>         Rust help source
+```
+
+`<selectors>` is a comma-separated list of `host/target/profile` pair ids
+(segments may be globs, such as `macos-arm64/linux/*`; profile aliases such as
+`container` and backend aliases such as `macos-vz` from the matrix
+`vocabularies` are accepted), `host:<host-glob>` items (host status, no
+capability), or `backend:<wire-name-or-alias>` items (every pair on that
+backend). `<capabilities>` is a comma-separated list of `pair` (the pair
+status), a machine capability, or a topology capability (optionally prefixed
+`topology:`). The claim must equal the matrix status of every selected entry.
+
+A marker binds the next status token after it on its own line, or on the next
+line with non-marker content when the marker line has none; several marker-only
+lines stack and bind that content line's tokens in order. Put markers inline
+inside table cells and list items (directly before the bold label) and on their
+own line before headings and paragraphs. A marker followed by a blank line or by
+a line without a claim is a violation. In markdown, inline code spans are
+literal text (neither markers nor claims) and fenced blocks cannot carry
+markers, so keep status claims outside fenced blocks. A definitions block ends
+at a blank line or a closing list tag. Two special markers exist:
+`<!-- capability-matrix: vocabulary -->` exempts the tokens in its window (a
+legend or vocabulary list), and `<!-- capability-matrix: definitions -->`
+starts a definitions block whose items must repeat `status_definitions`
+verbatim, one status per item, all four present. The linter also rejects any
+removed CLI root from `config/cli-removal-v0.4.json` presented as a command
+(`vz <root>` in a code span, fenced block, `<code>`/`<pre>` element, or Rust
+help text). The examples above are bound like any other claim:
+<!-- capability-matrix: macos-arm64/linux/developer posix_exec -->**DEV** for
+Linux Developer exec on Apple silicon and
+<!-- capability-matrix: linux-*/linux/* pair -->**PLANNED** for Linux hosts.

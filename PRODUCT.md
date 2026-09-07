@@ -66,18 +66,25 @@ contract.
 
 ## Current status
 
-- **ACTIVE:** Apple-silicon macOS host support; local Linux VM and OCI/BuildKit
-  primitives; native macOS VM flows; deterministic stacks; checkpoint
-  primitives; gRPC/HTTP runtime services; current sandbox/run/vm command
-  surfaces.
-- **DEV:** Project/Environment/Machine topology lifecycle; implicit per-Linux-
-  Machine Docker driven by the local Mac's Docker/Compose/buildx clients;
-  realistic network topology, full isolation, and conformance evidence.
-- **PLANNED:** Linux Developer Environments on Windows, followed by native
-  Windows Developer Environments; hosted placement may reuse the contract later.
+Labels follow the `status_definitions` in
+[`config/host-target-capabilities-v0.4.json`](config/host-target-capabilities-v0.4.json);
+nothing is labelled shipped until a 0.4 release is published.
 
-These labels describe implementation maturity. They do not turn a partial
-backend into a full-product parity claim.
+- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV:** Apple-silicon macOS host support with Linux and
+  native macOS Developer Machines; the five-verb Project/Environment/Machine
+  lifecycle; receipts; implicit per-Linux-Machine Docker driven by the local
+  Mac's Docker/Compose/buildx clients
+  (<!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV**). Evidence is installed
+  local-Mac slices, not a certified release.
+- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering,workspace_read_write,snapshot,checkpoint -->**PLANNED:** realistic
+  network topology, workspace projections, snapshots/checkpoints, full
+  isolation, and conformance evidence;
+  <!-- capability-matrix: linux-*/linux/*,windows-*/linux/*,windows-*/windows/developer pair -->**PLANNED:**
+  Linux hosts, then Linux Developer Environments on Windows, then native Windows
+  Developer Environments; hosted placement may reuse the contract later.
+
+These labels describe the matrix entry. They do not turn a partial backend into
+a full-product parity claim.
 
 ## Operating context
 
@@ -87,10 +94,10 @@ may have multiple Environments. Every Developer-profile Linux Machine starts wit
 and a Machine-specific context. Environment instances may repeat Machine names,
 ports, DNS aliases, and CIDRs without sharing identity or mutable state.
 
-Existing commands such as `vz run`, `vz stack`, `vz build`, `vz docker`, and
-`vz vm` describe ACTIVE legacy mechanisms. Their replacement by the five-verb
-`vz up/exec/status/stop/delete` surface is DEV; proposed spelling must not be
-presented as already shipped.
+The retired `run`, `stack`, `build`, `docker`, and `vm` command families are
+removed, not legacy alternatives. The five-verb `vz up/exec/status/stop/delete`
+surface is <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV**; proposed spelling must not be presented as
+already shipped.
 
 ## Product principles
 

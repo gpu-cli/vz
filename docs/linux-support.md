@@ -5,9 +5,11 @@ Machines inside Developer Environment topologies on macOS, Linux, and Windows:
 
 | Host | Linux Machine status | Backend direction |
 | --- | --- | --- |
-| Apple Silicon macOS | **ACTIVE** Linux VM/OCI/BuildKit primitives; unified lifecycle and private Docker are **DEV** | Apple Virtualization.framework |
-| Linux | **DEV:** the partial `linux-native` OCI backend exists, but complete Developer Environment parity is not shipped | Native namespaces and cgroup v2 |
-| Windows | **PLANNED:** no shipped backend yet | Windows virtualization appropriate for a Linux guest |
+| Apple Silicon macOS | <!-- capability-matrix: macos-arm64/linux/* pair -->**DEV** Linux Machines with installed local-Mac evidence; private Developer-profile Docker is <!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV**; topology networking is <!-- capability-matrix: macos-arm64/linux/* network_private -->**PLANNED** | Apple Virtualization.framework |
+| Linux | <!-- capability-matrix: linux-*/linux/* pair -->**PLANNED:** the partial `linux-native` OCI backend exists in the tree, but no Machine target resolves on a Linux host | Native namespaces and cgroup v2 |
+| Windows | <!-- capability-matrix: windows-*/linux/* pair -->**PLANNED:** no backend yet | Windows virtualization appropriate for a Linux guest |
+
+Labels follow `config/host-target-capabilities-v0.4.json`.
 
 Native macOS Machine integration is also part of the immediate macOS roadmap;
 native Windows Machines come later. Native Machines do not inherit Docker: it
@@ -96,7 +98,7 @@ supported fallback.
 
 | Feature | macOS host, Linux target (`macos-vz`) | Linux host, Linux target (`linux-native`) |
 | --- | --- | --- |
-| Status | ACTIVE backend primitives; unified lifecycle and Docker parity are DEV | Experimental/partial |
+| Status | <!-- capability-matrix: backend:macos-vz pair -->DEV (installed local-Mac slices, not release certified) | <!-- capability-matrix: backend:linux_native pair -->PLANNED (experimental code, no Machine target resolver) |
 | Isolation | Full VM (Virtualization.framework) | Namespaces + cgroups |
 | Container runtime | Pinned youki inside VM | youki on host today; pinned artifact integration planned |
 | Networking | Guest agent + vsock bridge | Linux bridge + veth pairs |
@@ -134,12 +136,13 @@ authenticated import relay.
 4. **No persistent stack state** -- if the vz process exits, in-memory stack state
    (bridge names, netns tracking) is lost. Containers remain running but port forwarding
    rules and bridge interfaces may become orphaned. Teardown through the topology-scoped
-   typed API before exiting; the legacy `vz stack down` CLI is retired.
+   typed API before exiting; the legacy stack CLI is retired.
 
 5. **Developer Environment parity is incomplete on Linux hosts** -- the current
-   topology CLI exposes all five DEV lifecycle verbs, including `delete`, but
-   complete Up reconciliation remains unfinished. Physical Up, execution, Stop
-   and Delete adapters currently target Linux-on-macOS, not the Linux host backend.
+   topology CLI exposes all five <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV** lifecycle verbs,
+   including `delete`, but complete Up reconciliation remains unfinished.
+   Physical Up, execution, Stop and Delete adapters currently target Linux and
+   native macOS Machines on Apple silicon, not the Linux host backend.
    An unsupported backend fails explicitly. Retired `init`, `run`, VM, image,
    and debug families are absent on all hosts, not macOS-only alternatives.
 

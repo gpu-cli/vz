@@ -1,6 +1,6 @@
 {
   "name": "vz",
-  "description": "Run reproducible vz Developer Environments; current commands target Linux on macOS",
+  "description": "Run reproducible vz Developer Environments through the five-verb CLI; Linux and native macOS Machines on Apple-silicon macOS",
   "version": "0.3.0",
   "author": {
     "name": "gpu-cli"

@@ -11,13 +11,17 @@ use clap::{CommandFactory, Parser};
 use tracing::error;
 use vz_cli::legacy_cli::{LEGACY_COMMAND_REMOVED_EXIT_CODE, rejection_for_args};
 
-const CLI_WORKFLOW_EXAMPLES: &str = "\
-Examples:
-  vz                  Show this help without touching runtime state
-  vz status --json    Inspect the selected Environment topology
-  vz exec -- uname -s  Execute in the selected Ready Machine
-
-Implementation status: DEV. All five lifecycle verbs are present; complete 0.4 topology support is not yet shipped.";
+// Status labels below are bound to config/host-target-capabilities-v0.4.json by
+// `capability-matrix:` comments and checked by scripts/check-capability-claims.py.
+const CLI_WORKFLOW_EXAMPLES: &str = concat!(
+    "Examples:\n",
+    "  vz                  Show this help without touching runtime state\n",
+    "  vz status --json    Inspect the selected Environment topology\n",
+    "  vz exec -- uname -s  Execute in the selected Ready Machine\n",
+    "\n",
+    // capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair
+    "Implementation status: DEV. All five lifecycle verbs are present; complete 0.4 topology support is not yet shipped.",
+);
 
 /// vz — reproducible, parallel Developer Environments.
 ///
@@ -51,6 +55,7 @@ struct Cli {
 #[derive(clap::Subcommand, Debug)]
 #[allow(clippy::large_enum_variant)]
 enum Commands {
+    // capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair
     /// Create/reconcile the selected Environment (Linux and native macOS on Apple silicon; DEV).
     ///
     /// Linux Developer readiness requires Docker/Compose/buildx. Native macOS
@@ -59,9 +64,11 @@ enum Commands {
     /// Stop the selected Developer Environment, preserving identities and state.
     Stop(commands::dev_stop::DevStopArgs),
 
+    // capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair
     /// Delete the selected Environment and its owned resources (Linux and native macOS on Apple silicon; DEV).
     Delete(commands::dev_delete::DevDeleteArgs),
 
+    // capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair
     /// Execute in one selected Ready Machine (Linux and native macOS on Apple silicon; DEV).
     ///
     /// Run Up first. Unknown runtime ownership fails closed.

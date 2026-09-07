@@ -58,7 +58,8 @@ curl -sSf https://raw.githubusercontent.com/gpu-cli/vz/main/scripts/install.sh |
 The installer selects published binaries and Linux artifacts for Apple-silicon
 macOS. A published release can have a different CLI from this development
 checkout; always inspect the installed `vz --help`. This README describes the
-current **DEV** surface, not a completed or certified 0.4 distribution.
+current <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV** surface, not a
+completed or certified 0.4 distribution.
 
 Options:
 
@@ -87,44 +88,75 @@ pinned youki runtime, with verified source/artifact provenance.
 
 ## Host and Machine-target roadmap
 
-Status describes backend maturity, not complete product parity.
+Status labels use the vocabulary of the machine-readable capability matrix,
+[`config/host-target-capabilities-v0.4.json`](config/host-target-capabilities-v0.4.json).
+`python3 -B scripts/check-capability-claims.py` checks every label in this file
+against that matrix; see the
+[marker convention](docs/developer-environments.md#capability-claim-markers).
+
+<!-- capability-matrix: definitions -->
+- **ACTIVE**: Shipped in the published target release AND retained installed
+  evidence exists for the exact host×target×profile pair. Requires non-empty
+  evidence.
+- **DEV**: Implemented and demonstrated by an installed local-Mac slice that is
+  not release certified. Requires non-empty evidence.
+- **PLANNED**: Committed direction with no negotiation path. Requires empty
+  `negotiated_by`, `rejected_by` and evidence.
+- **NA**: Explicitly rejected by validation as an unsupported pairing or
+  declaration. Requires non-empty `rejected_by`.
+
+No pair carries the shipped-release label until a 0.4 release is published.
+Labels describe the matrix entry, not complete product parity.
 
 | Host | Linux target | Native macOS target | Native Windows target |
 | --- | --- | --- | --- |
-| macOS (Apple Silicon) | **ACTIVE** Virtualization.framework Linux VM/OCI/BuildKit primitives; unified lifecycle and private Docker are **DEV** | **ACTIVE** provisioning/automation primitives; unified Machine lifecycle is **DEV** | Not applicable |
-| Linux | **DEV:** partial `linux-native` backend; complete Developer Environment parity remains in progress | Not applicable | Not applicable |
-| Windows | **PLANNED:** Linux Machines using the selected Windows virtualization backend | Not applicable | **PLANNED later:** native Windows Machines |
+| macOS (Apple Silicon) | <!-- capability-matrix: macos-arm64/linux/* pair -->**DEV** lifecycle, exec and private Developer-profile Docker; topology networking is <!-- capability-matrix: macos-arm64/linux/* network_private -->**PLANNED** | <!-- capability-matrix: macos-arm64/macos/developer pair -->**DEV** Developer Machines; the Hardened profile is <!-- capability-matrix: macos-arm64/macos/hardened pair -->**NA** | <!-- capability-matrix: macos-arm64/windows/* pair -->**NA** |
+| Linux | <!-- capability-matrix: linux-*/linux/* pair -->**PLANNED**; a partial `linux-native` backend exists in the tree, but no Machine target resolves on a Linux host | <!-- capability-matrix: linux-*/macos/* pair -->**NA** | <!-- capability-matrix: linux-*/windows/* pair -->**NA** |
+| Windows | <!-- capability-matrix: windows-*/linux/* pair -->**PLANNED** Linux Machines using the selected Windows virtualization backend | <!-- capability-matrix: windows-*/macos/* pair -->**NA** | <!-- capability-matrix: windows-*/windows/developer pair -->**PLANNED** native Windows Developer Machines, after Linux-on-Windows |
 
 Linux is the universal target; native targets complement it. Mixed Linux/macOS
 Environment topology is part of the 0.4 goal, not a completed CLI capability.
 
-## Current CLI: DEV, not the complete five-verb lifecycle
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->
+## Current CLI: the five-verb lifecycle is DEV
 
 The implemented topology CLI currently exposes:
 
-- `vz up`: streamed whole-Environment admission and retained Linux-on-macOS
-  startup, discovering a verified installed artifact catalog or using an exact
-  operator override. Developer readiness requires measured host Engine, Compose
-  and buildx operations through each Machine's managed context and digest-bound
-  offline probe. This DEV path does not certify full Docker compatibility; see
+- `vz up`: streamed whole-Environment admission and retained startup for Linux
+  and native macOS Machines on Apple silicon, discovering a verified installed
+  artifact catalog or using an exact operator override. Linux Developer
+  readiness requires measured host Engine, Compose and buildx operations through
+  each Machine's managed context and digest-bound offline probe. This
+  <!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV**
+  path does not certify full Docker compatibility; see
   [startup readiness](docs/developer-startup-readiness.md).
 - `vz status`: read-only persisted Project/Environment/Machine state, definition
   drift, recorded capabilities and Machine-specific Docker contexts. It does not
   turn persisted data into a live health probe or infer Docker readiness from a
   Developer profile.
-- `vz exec`: streamed execution in an already Ready, exactly owned Linux Machine
-  through the Linux-on-macOS DEV adapter. Automatic startup/dependency
-  reconciliation and native-target execution are still unfinished.
+- `vz exec`: streamed execution in an already Ready, exactly owned Linux or
+  native macOS Machine on Apple silicon
+  (<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer posix_exec -->**DEV**).
+  An interactive terminal (`-t`) is negotiated only by native macOS Machines
+  (<!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV**);
+  Linux Machine PTY is
+  <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED**.
+  Automatic startup/dependency reconciliation is still unfinished.
 - `vz stop`: selected-Environment Stop with exact ownership and positive
   execution reaping. Unsupported resources and unknown live ownership fail
   closed; it is not the former single-VM Stop path.
 - `vz delete`: streamed ownership-safe removal of the selected Environment's
-  Linux-on-macOS Machines, managed Docker contexts and private stores. Positive
-  quiescence and exact ownership are required; native targets and other topology
-  cleanup adapters remain unsupported.
+  Linux and native macOS Machines on Apple silicon, managed Docker contexts and
+  private stores
+  (<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV**).
+  Positive quiescence and exact ownership are required; other topology cleanup
+  adapters remain unsupported.
 
-All five lifecycle verbs are present as DEV adapters. Complete Up reconciliation,
-mixed-target topology and the full physical lifecycle release gate remain open.
+All five lifecycle verbs are present as
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV** adapters
+with installed local-Mac evidence that is not release certified. Complete Up
+reconciliation, mixed-target topology and the full physical lifecycle release
+gate remain open.
 
 Bare `vz` prints static help, exits zero, and performs no project/state discovery
 or mutation. All 16 retired infrastructure roots—including `run`, `vm`,
@@ -132,13 +164,13 @@ or mutation. All 16 retired infrastructure roots—including `run`, `vm`,
 mutation flags return structured `legacy_command_removed` errors before state
 or transport access. No hidden old parser or fallback binary remains. See the
 [removal inventory](planning/developer-environments/legacy-cli-removal.md) and
-[machine-readable DEV inventory](config/cli-removal-v0.4.json).
+[machine-readable removal inventory](config/cli-removal-v0.4.json).
 
 ### Work with an existing Developer Environment
 
 These commands require a valid nearest `vz.json`, an already-running runtime
 daemon, and an existing, exactly owned topology. Execution additionally requires
-a Ready Linux Machine; this is **not** a clean-install bootstrap sequence.
+a Ready Machine; this is **not** a clean-install bootstrap sequence.
 
 ```bash
 vz status --environment dev --json
@@ -151,7 +183,8 @@ Author definitions using the repository's
 [example](examples/developer-environment/vz.json), or the typed authoring API.
 The example does not invent a downloadable appliance digest. Definition
 authoring does not create a Machine, and there is no mutating `init` fallback.
-The DEV Up path requires a daemon configured with a verified target catalog;
+The <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV** Up path
+requires a daemon configured with a verified target catalog;
 automatic installed-catalog discovery and the complete bootstrap gate remain work.
 
 Host Docker, Compose, and buildx must select the exact Developer Linux Machine's
@@ -166,7 +199,10 @@ An explicit Environment/Machine-owned import authorizes one host-loopback
 protocol/port through a private authenticated relay. An undeclared Machine must
 not receive `host.vz.internal` or another implicit host gateway. External
 egress does not authorize host access, and wildcard/LAN binding is not a
-substitute. The complete network contract remains **DEV**; see
+substitute. The network contract (private networks, the simulated-public edge,
+host imports/exports, egress policy, faults and peering) is
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering -->**PLANNED**
+for every pair; Up currently rejects declared networks and endpoints. See
 [Developer Environments](docs/developer-environments.md).
 
 ## Runtime daemon connectivity
@@ -188,10 +224,12 @@ They connect only to an already-running daemon and do not autostart one.
 ```text
 vz lifecycle CLI → typed daemon API → Environment/Machine ownership
                                       ├─ Linux-on-macOS backend
-                                      ├─ native macOS integration (DEV)
+                                      ├─ native macOS backend
                                       └─ later host/target backends
 ```
 
+Both Apple-silicon backends are
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV**.
 Identity, authorization, execution, lifecycle, and evidence stay scoped to the
 selected Environment and Machine. A backend primitive is not a second public
 product lifecycle.

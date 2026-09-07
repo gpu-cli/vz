@@ -33,18 +33,22 @@ powerful local hardware.
 
 Linux is the universal Machine target:
 
-- **ACTIVE on macOS:** Linux VM, OCI, BuildKit, and environment primitives exist;
-  the unified experience and full Docker workflow are **DEV**.
-- **DEV on Linux:** a native backend exists and is converging on the same
-  contract.
-- **PLANNED on Windows:** Linux-on-Windows follows the established Linux target
-  contract.
+- <!-- capability-matrix: macos-arm64/linux/* pair -->**DEV on macOS:** Linux Machines on Apple silicon run
+  through Virtualization.framework with installed local-Mac evidence; the private
+  Docker workflow for Developer Machines is
+  <!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx -->**DEV** and topology networking
+  is <!-- capability-matrix: macos-arm64/linux/* network_private -->**PLANNED**.
+- <!-- capability-matrix: linux-*/linux/* pair -->**PLANNED on Linux:** a partial native backend
+  exists in the tree, but no Machine target resolves on a Linux host yet.
+- <!-- capability-matrix: windows-*/linux/* pair -->**PLANNED on Windows:** Linux-on-Windows follows
+  the established Linux target contract.
 
 Native targets complement Linux rather than fragmenting its contract:
 
-- **ACTIVE on macOS:** native macOS VM flows exist; their unified Developer
-  Environment surface is **DEV**.
-- **PLANNED on Windows:** native Windows-on-Windows follows Linux-on-Windows.
+- <!-- capability-matrix: macos-arm64/macos/developer pair -->**DEV on macOS:** native macOS Developer Machines pass
+  installed Up/exec/PTY/Stop/Delete locally; no published release exists.
+- <!-- capability-matrix: windows-*/windows/developer pair -->**PLANNED on Windows:** native
+  Windows-on-Windows follows Linux-on-Windows.
 
 The backend is intentionally platform-specific. Apple Virtualization.framework,
 Linux namespaces/cgroups or VM backends, and the future Windows virtualization
@@ -71,8 +75,9 @@ rather than hiding a shared Linux service inside a native Machine.
 The current youki substrate remains central to the Linux implementation. The
 committed runtime invariant is one pinned, verified OCI runtime in the guest,
 with Docker/containerd and BuildKit invoking youki and no undeclared runc/crun
-fallback. Full host-Docker-CLI parity remains **DEV** until the dedicated real-Mac
-end-to-end contract passes.
+fallback. Full host-Docker-CLI parity remains
+<!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx,docker_context -->**DEV** until the
+dedicated real-Mac end-to-end contract passes.
 
 ## The durable product advantage
 
@@ -106,29 +111,38 @@ a Linux VM or that nothing executes natively on any host.
 
 ## Status and roadmap
 
-### ACTIVE
+Labels follow the `status_definitions` of
+[`config/host-target-capabilities-v0.4.json`](../config/host-target-capabilities-v0.4.json);
+nothing is labelled shipped until a 0.4 release is published.
 
-- Linux VM/container/BuildKit foundations on Apple-silicon macOS.
-- Native macOS VM flows.
-- Current `run`, `stack`, `build`, `docker`, `sandbox`, and `vm` mechanisms.
-- Runtime daemon/API and checkpoint foundations documented elsewhere in the repo.
-
-### DEV
-
-- A Project/Environment/Machine topology identity and lifecycle.
-- Implicit, per-Developer-Linux-Machine Docker, driven end to end by the local Mac's
-  Docker/Compose/buildx clients.
-- Private/public-like topology networking, per-Machine endpoints, persistence,
-  isolation, recovery, and comprehensive real-VM evidence.
-- Linux-host conformance with the Linux target contract.
-- Agent data-plane and filesystem surfaces required for a complete environment.
-
-### PLANNED
-
-- Linux Machines and Environment topologies on Windows.
-- Native Windows Machines in those topologies on Windows.
-- Additional placement, collaboration, policy, and hosted capabilities that
-  preserve the same explicit target and identity model.
+- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer pair -->**DEV** — Project/Environment/Machine identity and the
+  five-verb lifecycle for Linux and native macOS Machines on Apple-silicon
+  macOS, with receipts, demonstrated by installed local-Mac slices.
+- <!-- capability-matrix: macos-arm64/linux/developer docker_engine,compose,buildx,docker_context,image_roundtrip,registry_login_pull_push,container_lifecycle_io,youki_only_runtime -->**DEV**
+  — implicit, per-Developer-Linux-Machine Docker driven end to end by the local
+  Mac's Docker/Compose/buildx clients: private Engine, managed context, image
+  round trip, registry login/pull/push, container lifecycle I/O, youki-only
+  runtime.
+- <!-- capability-matrix: macos-arm64/macos/developer posix_pty -->**DEV** — interactive PTY execution on native macOS
+  Machines.
+- <!-- capability-matrix: macos-arm64/linux/* posix_pty -->**PLANNED** — Linux Machine PTY;
+  <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer signals,files,ports,snapshot,suspend,checkpoint -->**PLANNED** —
+  signals, files, ports, snapshot, suspend and checkpoint capabilities on every
+  live pair.
+- <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering,workspace_read_write,workspace_read_only,workspace_snapshot,secret_bindings -->**PLANNED**
+  — private/public-like topology networking, per-Machine endpoints, host
+  imports/exports, egress policy, faults, peering, workspace projections and
+  secret bindings; <!-- capability-matrix: macos-arm64/linux/developer volumes -->**PLANNED** — declared volumes for
+  Linux Developer Machines.
+- <!-- capability-matrix: linux-*/linux/*,windows-*/linux/*,windows-*/windows/developer pair -->**PLANNED**
+  — Linux hosts, then Linux Machines and Environment topologies on Windows, then
+  native Windows Developer Machines. Additional placement, collaboration, policy,
+  and hosted capabilities preserve the same explicit target and identity model.
+- <!-- capability-matrix: host:macos-x86_64 -->**NA** — Intel Macs;
+  <!-- capability-matrix: macos-arm64/macos/hardened,windows-*/windows/hardened pair -->**NA** —
+  Hardened native macOS and native Windows Machines;
+  <!-- capability-matrix: macos-arm64/windows/*,linux-*/macos/*,linux-*/windows/*,windows-*/macos/* pair -->**NA**
+  — native targets on hosts that cannot provide them.
 
 ## How we talk about vz
 
@@ -141,7 +155,8 @@ a Linux VM or that nothing executes natively on any host.
 - Say Docker is implicit for Developer-profile Linux Machines, not a global socket or optional
   facade.
 - State the host and target when describing a capability.
-- Tag capabilities **ACTIVE**, **DEV**, or **PLANNED** and require real
+- Tag capabilities **ACTIVE**, **DEV**, **PLANNED**, or **NA** exactly as
+  `config/host-target-capabilities-v0.4.json` does and require real
   host×Machine-target end-to-end evidence before declaring parity.
 - Lead with reproducibility and parallel environments; describe lockdown as one
   selectable security posture, not the entire reason the product exists.
