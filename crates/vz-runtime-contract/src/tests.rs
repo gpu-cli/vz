@@ -350,7 +350,7 @@ fn contract_types_are_constructible() {
         host: 8080,
         container: 80,
         protocol: PortProtocol::Tcp,
-        target_host: None,
+        target_service: None,
     };
     let _mount = MountSpec {
         source: None,

@@ -1183,11 +1183,14 @@ impl LinuxVm {
     }
 
     /// Open a dedicated port-forward stream to a guest-local target port.
+    ///
+    /// `target_service` names a service the guest configured, or `None` for the
+    /// guest's loopback; the guest resolves the address itself.
     pub async fn open_port_forward_stream(
         &self,
         target_port: u16,
         protocol_name: &str,
-        target_host: Option<&str>,
+        target_service: Option<&str>,
     ) -> Result<GrpcPortForwardStream, LinuxError> {
         self.ensure_grpc().await?;
         let mut grpc = self.grpc.lock().await;
@@ -1195,7 +1198,7 @@ impl LinuxVm {
             .as_mut()
             .ok_or_else(|| LinuxError::Protocol("gRPC client not connected".to_string()))?;
         client
-            .port_forward(target_port, protocol_name, target_host)
+            .port_forward(target_port, protocol_name, target_service)
             .await
     }
 

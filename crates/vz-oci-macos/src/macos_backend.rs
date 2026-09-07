@@ -981,7 +981,7 @@ fn port_mapping_from_contract(p: contract::PortMapping) -> oci_config::PortMappi
             contract::PortProtocol::Tcp => oci_config::PortProtocol::Tcp,
             contract::PortProtocol::Udp => oci_config::PortProtocol::Udp,
         },
-        target_host: p.target_host,
+        target_service: p.target_service,
     }
 }
 

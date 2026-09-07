@@ -31,8 +31,10 @@
 //!   `crates/vz-oci-macos/src/runtime/networking.rs::start_port_forwarding`.
 //!   For each `PortMapping`, the host spawns a TCP listener on
 //!   `127.0.0.1:<host_port>`. Accepted connections are tunneled over a gRPC
-//!   `port_forward` stream (vsock port 7424) to the guest agent, which then
-//!   opens a TCP socket to `target_host:container_port` inside the guest.
+//!   `port_forward` stream (vsock port 7424) to the guest agent. The open
+//!   frame names the mapping's `target_service`, never an address; the guest
+//!   resolves that name against the service networks it created and opens a
+//!   TCP socket to `<resolved address>:container_port` inside the guest.
 //!   Bytes flow via `tokio::io::copy_bidirectional`. Limitations: TCP only;
 //!   host listener bound to loopback only (no LAN exposure).
 //!

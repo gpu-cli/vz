@@ -227,8 +227,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             service_name.to_string()
         };
 
-        // Override ports with resolved allocations.
-        let service_target_host = self.service_ips.get(&target).cloned();
+        // Override ports with resolved allocations. The mapping names the
+        // service; only the runtime that created its network knows the address.
+        let service_target = self
+            .service_ips
+            .contains_key(&target)
+            .then(|| replica_qualified_name.clone());
         run_config.ports = published
             .iter()
             .map(|p| {
@@ -240,7 +244,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                     host: p.host_port,
                     container: p.container_port,
                     protocol,
-                    target_host: service_target_host.clone(),
+                    target_service: service_target.clone(),
                 }
             })
             .collect();

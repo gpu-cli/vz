@@ -1185,7 +1185,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             // For each (network, service) pair, assign an IP within that
             // network's subnet. Gateway is .1, services start at .2.
             // `service_primary_ip` maps service_name -> first assigned IP
-            // (used for port forwarding target_host).
+            // (used to resolve port forwarding destinations).
             let mut service_primary_ip: HashMap<ServiceReplicaKey, String> = HashMap::new();
             let mut service_network_ips: HashMap<ServiceReplicaKey, HashMap<String, String>> =
                 HashMap::new();
@@ -1246,9 +1246,12 @@ impl<R: ContainerRuntime> StackExecutor<R> {
             let mut all_ports = Vec::new();
             for svc in &spec.services {
                 let primary = ServiceReplicaKey::first(&svc.name)?;
-                let Some(service_ip) = service_primary_ip.get(&primary) else {
+                // The address table only says whether this service has a
+                // network; the mapping names the service, and the runtime that
+                // created that network resolves the address.
+                if !service_primary_ip.contains_key(&primary) {
                     continue;
-                };
+                }
                 for port in &svc.ports {
                     let Some(host_port) = port.host_port else {
                         // host publish requires explicit opt-in.
@@ -1262,7 +1265,7 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                         host: host_port,
                         container: port.container_port,
                         protocol,
-                        target_host: Some(service_ip.clone()),
+                        target_service: Some(svc.name.clone()),
                     });
                 }
             }

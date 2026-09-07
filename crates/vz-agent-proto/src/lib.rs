@@ -18,7 +18,11 @@ pub use vz::agent::v1::*;
 ///
 /// Increment this when startup-time host assumptions require a newer guest
 /// agent capability/behavior, even if crate semver remains unchanged.
-pub const AGENT_PROTOCOL_REVISION: u32 = 9;
+///
+/// 10: `PortForwardOpen` names a forwarding grant (`target_service`) instead of
+/// a destination host. A revision-9 guest reads field 3 as a host and would dial
+/// the service name; the revision check refuses that pairing at startup.
+pub const AGENT_PROTOCOL_REVISION: u32 = 10;
 
 #[cfg(test)]
 mod tests {
@@ -327,7 +331,7 @@ mod tests {
             frame: Some(port_forward_frame::Frame::Open(PortForwardOpen {
                 target_port: 8080,
                 protocol: "tcp".to_string(),
-                target_host: "172.20.0.2".to_string(),
+                target_service: "db".to_string(),
                 metadata: Some(TransportMetadata {
                     request_id: "req_pf_1".to_string(),
                     idempotency_key: String::new(),
@@ -337,6 +341,36 @@ mod tests {
         let encoded = msg.encode_to_vec();
         let decoded = PortForwardFrame::decode(encoded.as_slice()).unwrap();
         assert_eq!(msg, decoded);
+    }
+
+    /// The relay's open frame must not be able to carry a destination.
+    ///
+    /// Rust would not compile a `target_host` field, but a field removed from
+    /// the message and left in the `.proto` would still be on the wire for any
+    /// other client. Read the message out of the schema itself.
+    #[test]
+    fn port_forward_open_carries_no_destination_host() {
+        const SCHEMA: &str = include_str!("../proto/agent.proto");
+        let message = SCHEMA
+            .split_once("message PortForwardOpen {")
+            .and_then(|(_, rest)| rest.split_once('}'))
+            .map(|(body, _)| body)
+            .expect("agent.proto declares message PortForwardOpen");
+        let fields: Vec<&str> = message
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty() && !line.starts_with("//"))
+            .collect();
+        assert_eq!(
+            fields,
+            vec![
+                "uint32 target_port = 1;",
+                "string protocol = 2;       // \"tcp\" or \"udp\"",
+                "string target_service = 3;",
+                "TransportMetadata metadata = 4;",
+            ],
+            "PortForwardOpen must name a grant, never a destination"
+        );
     }
 
     #[test]

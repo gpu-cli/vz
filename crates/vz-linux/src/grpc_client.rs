@@ -865,6 +865,10 @@ impl GrpcAgentClient {
 
     /// Open a bidirectional port forward stream to a guest-local target.
     ///
+    /// `target_service` names a service whose network the guest configured, or
+    /// `None` for the guest's own loopback. The destination address is the
+    /// guest's to resolve; this side cannot name one.
+    ///
     /// Returns a [`GrpcPortForwardStream`] that implements
     /// [`tokio::io::AsyncRead`] + [`tokio::io::AsyncWrite`], suitable for
     /// use with [`tokio::io::copy_bidirectional`].
@@ -872,7 +876,7 @@ impl GrpcAgentClient {
         &mut self,
         target_port: u16,
         protocol: &str,
-        target_host: Option<&str>,
+        target_service: Option<&str>,
     ) -> Result<GrpcPortForwardStream, LinuxError> {
         let (tx, rx) = mpsc::channel::<PortForwardFrame>(64);
 
@@ -882,7 +886,7 @@ impl GrpcAgentClient {
             frame: Some(port_forward_frame::Frame::Open(PortForwardOpen {
                 target_port: u32::from(target_port),
                 protocol: protocol.to_string(),
-                target_host: target_host.unwrap_or_default().to_string(),
+                target_service: target_service.unwrap_or_default().to_string(),
                 metadata: Some(metadata),
             })),
         };

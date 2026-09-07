@@ -199,6 +199,15 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
                 )?;
             }
 
+            // The first address a service is given is the one the host relays
+            // to. Record it as this service's forwarding grant; the relay has
+            // no other source for a destination.
+            if *iface_idx == 0 {
+                crate::forward_grants::grants()
+                    .grant(&svc.name, svc_ip)
+                    .map_err(|error| io::Error::new(io::ErrorKind::AlreadyExists, error))?;
+            }
+
             *iface_idx += 1;
 
             info!(
@@ -221,6 +230,11 @@ pub fn setup_stack_network(stack_id: &str, services: &[NetworkServiceConfig]) ->
 /// bridges created for the stack (one per network, named
 /// `br-<stack_id>-<network_name>`).
 pub fn teardown_stack_network(stack_id: &str, service_names: &[String]) -> io::Result<()> {
+    // Withdraw the forwarding grants first: once teardown has begun the
+    // addresses are going away, and a relay opened against them would dial a
+    // destination this guest no longer owns.
+    crate::forward_grants::grants().revoke(service_names);
+
     // Remove network namespaces (deletes veth pairs automatically).
     for name in service_names {
         let ns_path = Path::new(NETNS_RUN_DIR).join(name);

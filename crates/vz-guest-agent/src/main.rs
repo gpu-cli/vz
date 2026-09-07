@@ -10,6 +10,7 @@
 mod container_exec;
 mod docker;
 mod docker_forward;
+mod forward_grants;
 mod grpc_server;
 mod listener;
 #[cfg(target_os = "macos")]
@@ -716,25 +717,56 @@ fn get_process_count() -> u32 {
         .unwrap_or(0)
 }
 
+/// A port forward could not reach the service it named.
+pub(crate) enum PortForwardTargetError {
+    /// The name is not a service this guest configured.
+    NoGrant(crate::forward_grants::NoGrant),
+    /// The granted address never accepted a connection in time.
+    Connect(std::net::Ipv4Addr, std::io::Error),
+}
+
+impl std::fmt::Display for PortForwardTargetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoGrant(error) => write!(f, "{error}"),
+            Self::Connect(address, error) => {
+                write!(f, "failed to connect to {address}: {error}")
+            }
+        }
+    }
+}
+
+/// Connect to the service a port forward named.
+///
+/// The name is only ever looked up, never parsed, so a caller that sends an
+/// address gets no grant and no connection.
+///
+/// Resolution and connection share one budget. A host listener is published
+/// before the guest finishes building the service networks behind it, so a
+/// connection arriving in that window waits for the grant exactly as it
+/// previously waited for the address to start listening.
 pub(crate) async fn connect_port_forward_target(
-    target_host: &str,
+    target_service: &str,
     target_port: u16,
-) -> std::io::Result<tokio::net::TcpStream> {
+) -> Result<tokio::net::TcpStream, PortForwardTargetError> {
     let started = Instant::now();
     let port_forward_connect_timeout = Duration::from_secs(5);
     let port_forward_connect_retry_interval = Duration::from_millis(100);
 
     loop {
-        match tokio::net::TcpStream::connect((target_host, target_port)).await {
-            Ok(stream) => return Ok(stream),
-            Err(error) => {
-                if started.elapsed() >= port_forward_connect_timeout {
-                    return Err(error);
-                }
+        let error = match crate::forward_grants::grants().destination(target_service) {
+            Err(no_grant) => PortForwardTargetError::NoGrant(no_grant),
+            Ok(address) => match tokio::net::TcpStream::connect((address, target_port)).await {
+                Ok(stream) => return Ok(stream),
+                Err(error) => PortForwardTargetError::Connect(address, error),
+            },
+        };
 
-                tokio::time::sleep(port_forward_connect_retry_interval).await;
-            }
+        if started.elapsed() >= port_forward_connect_timeout {
+            return Err(error);
         }
+
+        tokio::time::sleep(port_forward_connect_retry_interval).await;
     }
 }
 

@@ -481,9 +481,11 @@ pub struct PortForwardOpen {
     /// "tcp" or "udp"
     #[prost(string, tag = "2")]
     pub protocol: ::prost::alloc::string::String,
-    /// empty = "127.0.0.1"
+    /// Names a destination the guest itself configured, never an address. The
+    /// guest resolves it against the service network state it created; an
+    /// unregistered name is refused. Empty selects the guest's own loopback.
     #[prost(string, tag = "3")]
-    pub target_host: ::prost::alloc::string::String,
+    pub target_service: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<TransportMetadata>,
 }
@@ -1060,8 +1062,9 @@ pub mod agent_service_client {
             self.inner.streaming(req, path, codec).await
         }
         /// Bidirectional TCP relay through the guest.
-        /// Client sends PortForwardOpen as the first frame, then raw data
-        /// flows in both directions.
+        /// No caller-selected destination; the open frame names a service the guest
+        /// configured, and the guest resolves the address. Client sends
+        /// PortForwardOpen as the first frame, then raw data flows in both directions.
         pub async fn port_forward(
             &mut self,
             request: impl tonic::IntoStreamingRequest<Message = super::PortForwardFrame>,
@@ -1628,8 +1631,9 @@ pub mod agent_service_server {
             + std::marker::Send
             + 'static;
         /// Bidirectional TCP relay through the guest.
-        /// Client sends PortForwardOpen as the first frame, then raw data
-        /// flows in both directions.
+        /// No caller-selected destination; the open frame names a service the guest
+        /// configured, and the guest resolves the address. Client sends
+        /// PortForwardOpen as the first frame, then raw data flows in both directions.
         async fn port_forward(
             &self,
             request: tonic::Request<tonic::Streaming<super::PortForwardFrame>>,

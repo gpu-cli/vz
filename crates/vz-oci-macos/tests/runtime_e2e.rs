@@ -4042,7 +4042,7 @@ async fn port_forwarding_tcp() {
                     host: 18080,
                     container: 8080,
                     protocol: vz_oci_macos::PortProtocol::Tcp,
-                    target_host: None,
+                    target_service: None,
                 }],
                 ..RunConfig::default()
             },

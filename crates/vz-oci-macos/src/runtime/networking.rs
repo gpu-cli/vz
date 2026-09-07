@@ -279,7 +279,7 @@ async fn relay_port_forward_connection(
         .port_forward(
             mapping.container,
             mapping.protocol.as_str(),
-            mapping.target_host.as_deref(),
+            mapping.target_service.as_deref(),
         )
         .await?;
 
@@ -543,7 +543,7 @@ mod tests {
             host: 12345,
             container: 80,
             protocol: PortProtocol::Tcp,
-            target_host: None,
+            target_service: None,
         };
         let mut failures = Vec::new();
 

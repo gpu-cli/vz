@@ -3186,16 +3186,21 @@ impl agent_service_server::AgentService for AgentServiceImpl {
             )));
         }
 
-        let host = if open.target_host.is_empty() {
-            "127.0.0.1"
-        } else {
-            &open.target_host
-        };
+        // The caller names a grant, never a destination. An empty name is the
+        // guest's own loopback; anything else must be a service this guest
+        // configured, and a name it never configured is refused rather than
+        // silently redirected.
         let port = open.target_port as u16;
-
-        let target = crate::connect_port_forward_target(host, port)
+        let target = crate::connect_port_forward_target(&open.target_service, port)
             .await
-            .map_err(|e| Status::unavailable(format!("failed to connect to {host}:{port}: {e}")))?;
+            .map_err(|error| match error {
+                crate::PortForwardTargetError::NoGrant(_) => {
+                    Status::failed_precondition(error.to_string())
+                }
+                crate::PortForwardTargetError::Connect(..) => {
+                    Status::unavailable(format!("{error} on port {port}"))
+                }
+            })?;
 
         let (mut target_reader, mut target_writer) = target.into_split();
         let (tx, rx) = tokio::sync::mpsc::channel::<Result<PortForwardFrame, Status>>(64);

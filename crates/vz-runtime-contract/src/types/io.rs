@@ -34,11 +34,14 @@ pub struct PortMapping {
     pub container: u16,
     /// Forwarding protocol.
     pub protocol: PortProtocol,
-    /// Target host/IP inside the runtime for port forwarding.
+    /// The service this mapping forwards to, named rather than addressed.
     ///
-    /// In stack mode with per-service networking, this is the service IP
-    /// (e.g., `172.20.0.2`). When `None`, defaults to `127.0.0.1`.
-    pub target_host: Option<String>,
+    /// In stack mode with per-service networking this is the service's
+    /// replica-qualified name (e.g. `db`, `web-2`); the runtime that created
+    /// that service's network resolves it to an address. `None` means the
+    /// runtime's own loopback. An address never crosses this boundary: a
+    /// caller that could name the destination could name any destination.
+    pub target_service: Option<String>,
 }
 
 // ── Mount specification ───────────────────────────────────────────

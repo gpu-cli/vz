@@ -65,8 +65,9 @@ service AgentService {
   rpc DockerForward(stream DockerForwardFrame) returns (stream DockerForwardFrame);
 
   // Bidirectional TCP relay through the guest.
-  // Client sends PortForwardOpen as the first frame, then raw data
-  // flows in both directions.
+  // No caller-selected destination; the open frame names a service the guest
+  // configured, and the guest resolves the address. Client sends
+  // PortForwardOpen as the first frame, then raw data flows in both directions.
   rpc PortForward(stream PortForwardFrame) returns (stream PortForwardFrame);
 }
 
@@ -364,7 +365,10 @@ message PortForwardFrame {
 message PortForwardOpen {
   uint32 target_port = 1;
   string protocol = 2;       // "tcp" or "udp"
-  string target_host = 3;    // empty = "127.0.0.1"
+  // Names a destination the guest itself configured, never an address. The
+  // guest resolves it against the service network state it created; an
+  // unregistered name is refused. Empty selects the guest's own loopback.
+  string target_service = 3;
   TransportMetadata metadata = 4;
 }
 

@@ -917,7 +917,7 @@ async fn boot_runtime_sandbox_resources(
                 "udp" => PortProtocol::Udp,
                 _ => PortProtocol::Tcp,
             },
-            target_host: None,
+            target_service: None,
         })
         .collect();
     tracing::info!(

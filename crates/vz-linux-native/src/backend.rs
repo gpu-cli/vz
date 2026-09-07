@@ -41,16 +41,22 @@ struct StackState {
     identity: contract::StackRuntimeIdentity,
     bridge_name: String,
     services: HashMap<String, ServiceNetState>,
+    /// Published mappings whose service network does not exist yet. A mapping
+    /// names a service, not an address, so it cannot be installed until this
+    /// backend has assigned that service its address.
+    pending_port_forwards: Vec<contract::PortMapping>,
     port_forwards: Vec<PortForwardRule>,
 }
 
 struct ServiceNetState {
     netns_name: String,
     veth_host: String,
-    _addr: String,
 }
 
 struct PortForwardRule {
+    /// The service whose address this rule points at. A rule belongs to its
+    /// service, not to the address that service currently happens to hold.
+    service: String,
     host_port: u16,
     dest_ip: String,
     container_port: u16,
@@ -913,25 +919,14 @@ impl RuntimeBackend for LinuxNativeBackend {
             .await
             .map_err(native_err)?;
 
-        // Set up port forwarding (DNAT) for each published port.
-        let mut port_forwards = Vec::new();
-        for pm in &ports {
-            if let Some(ref dest_ip) = pm.target_host {
-                let proto = match pm.protocol {
-                    contract::PortProtocol::Udp => "udp",
-                    contract::PortProtocol::Tcp => "tcp",
-                };
-                network::setup_port_forward(pm.host, dest_ip, pm.container, proto)
-                    .await
-                    .map_err(native_err)?;
-                port_forwards.push(PortForwardRule {
-                    host_port: pm.host,
-                    dest_ip: dest_ip.clone(),
-                    container_port: pm.container,
-                    protocol: proto.to_string(),
-                });
-            }
-        }
+        // Published ports name a service, and its network does not exist
+        // until `network_setup` runs. Hold them until the address is this
+        // backend's own to resolve rather than DNAT to a name.
+        let pending_port_forwards = ports
+            .iter()
+            .filter(|pm| pm.target_service.is_some())
+            .cloned()
+            .collect();
 
         stacks.insert(
             stack_id.to_string(),
@@ -939,7 +934,8 @@ impl RuntimeBackend for LinuxNativeBackend {
                 identity,
                 bridge_name,
                 services: HashMap::new(),
-                port_forwards,
+                pending_port_forwards,
+                port_forwards: Vec::new(),
             },
         );
 
@@ -1005,14 +1001,43 @@ impl RuntimeBackend for LinuxNativeBackend {
             .await
             .map_err(native_err)?;
 
+            // `svc.addr` is a CIDR; DNAT takes the address alone.
+            let addr = match svc.addr.split_once('/') {
+                Some((address, _prefix)) => address.to_string(),
+                None => svc.addr.clone(),
+            };
+
             stack.services.insert(
                 svc.name.clone(),
                 ServiceNetState {
                     netns_name,
                     veth_host,
-                    _addr: svc.addr.clone(),
                 },
             );
+
+            // Any published mapping naming this service can now be installed,
+            // against the address this backend just assigned it.
+            let (ready, still_pending): (Vec<_>, Vec<_>) =
+                std::mem::take(&mut stack.pending_port_forwards)
+                    .into_iter()
+                    .partition(|pm| pm.target_service.as_deref() == Some(svc.name.as_str()));
+            stack.pending_port_forwards = still_pending;
+            for pm in ready {
+                let proto = match pm.protocol {
+                    contract::PortProtocol::Udp => "udp",
+                    contract::PortProtocol::Tcp => "tcp",
+                };
+                network::setup_port_forward(pm.host, &addr, pm.container, proto)
+                    .await
+                    .map_err(native_err)?;
+                stack.port_forwards.push(PortForwardRule {
+                    service: svc.name.clone(),
+                    host_port: pm.host,
+                    dest_ip: addr.clone(),
+                    container_port: pm.container,
+                    protocol: proto.to_string(),
+                });
+            }
         }
 
         Ok(())
@@ -1030,6 +1055,22 @@ impl RuntimeBackend for LinuxNativeBackend {
 
         for name in &service_names {
             if let Some(svc) = stack.services.remove(name) {
+                // The address is going away, so the rules that point at it go
+                // first; a rule outliving its service would forward host
+                // traffic to whatever is assigned that address next.
+                let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut stack.port_forwards)
+                    .into_iter()
+                    .partition(|pf| &pf.service == name);
+                stack.port_forwards = kept;
+                for pf in removed {
+                    let _ = network::teardown_port_forward(
+                        pf.host_port,
+                        &pf.dest_ip,
+                        pf.container_port,
+                        &pf.protocol,
+                    )
+                    .await;
+                }
                 let _ = network::delete_veth(&svc.veth_host).await;
                 let _ = ns::delete_netns(&svc.netns_name).await;
             }
@@ -1120,6 +1161,7 @@ mod tests {
             identity,
             bridge_name: "vz-test".to_string(),
             services: HashMap::new(),
+            pending_port_forwards: Vec::new(),
             port_forwards: Vec::new(),
         }
     }

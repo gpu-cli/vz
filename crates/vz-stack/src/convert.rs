@@ -230,7 +230,7 @@ fn convert_ports(ports: &[PortSpec]) -> Result<Vec<vz_runtime_contract::PortMapp
             host: host_port,
             container: port.container_port,
             protocol,
-            target_host: None,
+            target_service: None,
         });
     }
     Ok(mappings)

@@ -187,7 +187,7 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         host: 8042,
         container: 42,
         protocol: PortProtocol::Tcp,
-        target_host: Some("172.30.0.2".to_string()),
+        target_service: Some("db".to_string()),
     }];
     let resources = vz_runtime_contract::StackResourceHint {
         cpus: Some(4),
@@ -5546,7 +5546,7 @@ fn resolve_run_config_preserves_ports() {
             host: 8080,
             container: 80,
             protocol: PortProtocol::Tcp,
-            target_host: None,
+            target_service: None,
         }],
         ..RunConfig::default()
     };
@@ -5558,7 +5558,7 @@ fn resolve_run_config_preserves_ports() {
             host: 8080,
             container: 80,
             protocol: PortProtocol::Tcp,
-            target_host: None,
+            target_service: None,
         }],
     );
 }

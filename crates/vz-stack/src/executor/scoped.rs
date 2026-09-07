@@ -1319,7 +1319,11 @@ fn hash_run_config(
         hash_field(hasher, b"port_host", &port.host.to_le_bytes());
         hash_field(hasher, b"port_container", &port.container.to_le_bytes());
         hash_field(hasher, b"port_protocol", port.protocol.as_str().as_bytes());
-        hash_optional_string(hasher, b"port_target_host", port.target_host.as_deref());
+        hash_optional_string(
+            hasher,
+            b"port_target_service",
+            port.target_service.as_deref(),
+        );
     }
     hash_field(
         hasher,

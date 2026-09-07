@@ -25,12 +25,20 @@ Tracked under `vz-mzs.5`.
   requires silently: a datagram socket, a connected peer, and buffers sized from
   the MTU with receive at least twice send, read back because macOS may grant
   less than requested. No Machine's behaviour changed; there is no switch yet.
-- **One defect found while surveying the substrate.** The guest `PortForward`
-  handler dials whatever `target_host` the caller names
-  (`crates/vz-guest-agent/src/grpc_server.rs:3189-3197`). It is contained only
-  because Machines do not use that path and the host listener is loopback-bound.
-  Steps 3 and 4 route real traffic through it, so `vz-mzs.5.10` pins the
-  destination server-side first, the way `DockerForward` already does.
+- **The relay's destination is now the guest's to choose** (`vz-mzs.5.10`).
+  Surveying the substrate found the guest `PortForward` handler dialling
+  whatever `target_host` the caller named, contained only because Machines do
+  not use that path and the host listener is loopback-bound — and steps 3 and 4
+  route real traffic through it. `PortForwardOpen` now carries
+  `target_service`, a name, and `crates/vz-guest-agent/src/forward_grants.rs`
+  resolves it against the addresses the guest assigned in
+  `setup_stack_network`; a name it never configured is refused, and an empty
+  name is the guest's own loopback. `PortMapping.target_host` became
+  `target_service` end to end, so no host-side caller has an address to send;
+  `vz-linux-native` correspondingly defers its DNAT until it has assigned the
+  service its address, and withdraws those rules when the service is torn down.
+  `AGENT_PROTOCOL_REVISION` is 10, so a revision-9 guest image is refused at
+  startup rather than reading field 3 as a host.
 
 ## Current state (verified)
 

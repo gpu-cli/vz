@@ -2688,7 +2688,8 @@ services:
 ///
 /// Service "echo" runs `nc -l -p 8080` mapped to a dynamically reserved
 /// loopback port with
-/// `target_host` pointing at its per-service netns IP. The host connects
+/// `target_service` naming it, which the guest resolves to the per-service
+/// netns IP it assigned. The host connects
 /// and reads the response, proving the full port-forwarding path works:
 /// host → vsock → guest agent → netns bridge → container.
 #[tokio::test(flavor = "multi_thread")]
