@@ -544,6 +544,7 @@ class ComposeHarness(startup.Harness):
         # Set when a composed run closes its own audit window; the run's final
         # cleanup must publish that capture rather than attempt a second one.
         self.runtime_audit_validation = None
+        self.runtime_audit_retirement = None
         self.registry_sessions = []
         self.prepared_images = {}
         self.active_suite = None
@@ -576,6 +577,18 @@ class ComposeHarness(startup.Harness):
         self.assert_certain()
         require(len(self.runtime_audits) == 4, 'all four Machine audit sessions required')
         return [session.capture() for session in self.runtime_audits]
+
+    def retire_runtime_audits(self):
+        """Close every window this run opened.
+
+        The capture reads a journal; it does not end the session. Until the
+        enrollment is removed the runtime keeps journaling into it, passes its
+        record bound and then warns on every invocation — which fails the next
+        operation that requires clean stderr. A run that opens a window owns
+        closing it, including the run that opened one only to fail.
+        """
+        require(len(self.runtime_audits) == 4, 'all four Machine audit sessions required')
+        return [session.retire() for session in self.runtime_audits]
 
     def builder_key(self, descriptor, role):
         """Keyed by the executing suite as well as owner and role: a composed run
@@ -1015,6 +1028,11 @@ class ComposeHarness(startup.Harness):
             try:
                 with self.monitor.paused():
                     self.runtime_audit_validation = self.capture_runtime_audits()
+                    # Close it here, not at the end of the run: everything after
+                    # this suite keeps invoking the runtime, and a window left
+                    # open fills past its bound and then warns on every
+                    # invocation, which is what fails the next Up.
+                    self.runtime_audit_retirement = self.retire_runtime_audits()
             finally:
                 self.live_cleanup = False
         return observations
@@ -1329,8 +1347,15 @@ def run(info):
                 # A composed run closed its own window right after the suite;
                 # a lifecycle-only run closes it here, after owned removal.
                 captured = getattr(harness, 'runtime_audit_validation', None)
-                result['runtime_audit_validation'] = (
-                    captured if captured is not None else harness.capture_runtime_audits())
+                if captured is None:
+                    captured = harness.capture_runtime_audits()
+                    # A lifecycle-only run closes its window here, after owned
+                    # removal, for the same reason a composed one closes its own
+                    # right after the suite: an enrollment left behind keeps
+                    # journaling into the Machine that is about to be stopped.
+                    harness.runtime_audit_retirement = harness.retire_runtime_audits()
+                result['runtime_audit_validation'] = captured
+                result['runtime_audit_retirement'] = harness.runtime_audit_retirement
             if executes(info, "ssh"):
                 require(len(harness.ssh_cache_proofs) == 3, "three stopped SSH worker-cache proofs required")
                 result["ssh_stopped_cache_validation"] = harness.ssh_cache_proofs

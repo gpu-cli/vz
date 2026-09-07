@@ -106,6 +106,59 @@ snapshot
 '''
 
 
+def retire_script(session_id, runtime_sha256, journal_sha256):
+    """Close the window by removing the enrollment.
+
+    Reading the journal does not end the session. The runtime treats the root
+    as an active enrollment for as long as it exists, so a window that is only
+    read keeps filling from every later invocation, passes the record bound and
+    then warns on every invocation after that — which is a clean-stderr
+    precondition failure for whatever runs next. Removal is the close.
+
+    It is pinned to the exact journal the capture retained, so this can never
+    discard records nobody read.
+    """
+    pins(session_id, runtime_sha256)
+    require(type(journal_sha256) is str and re.fullmatch('[0-9a-f]{64}', journal_sha256), 'journal pin')
+    return _common(session_id, runtime_sha256) + r'''
+parents
+directory "$root"
+for name in enrollment.json events.jsonl status; do regular "$root/$name"; done
+boot=$("$bb" cat /proc/sys/kernel/random/boot_id)
+enrolled=$("$bb" head -c 513 "$root/enrollment.json" | "$bb" base64 -w 0)
+digest=$("$bb" sha256sum "$root/events.jsonl"); digest=${digest%% *}
+test "$digest" = 'JOURNAL_PIN' || fail
+"$bb" rm -f "$root/enrollment.json" "$root/events.jsonl" "$root/status"
+"$bb" rmdir "$root"
+"$bb" sync /var/lib/docker
+parents
+test ! -e "$root" && test ! -L "$root" || fail
+test "$boot" = "$("$bb" cat /proc/sys/kernel/random/boot_id)" || fail
+printf 'VZ_RUNTIME_AUDIT_RETIRE_V1\n%s\n%s\n%s\n%s\nabsent\nEND\n' "$boot" "$runtime_pin" "$enrolled" "$digest"
+'''.replace('JOURNAL_PIN', journal_sha256)
+
+
+def parse_retirement(raw, *, session_id, runtime_sha256, expected_boot_id, expected_enrollment, expected_journal_sha256):
+    """The window closed on the exact session and journal that were captured."""
+    pins(session_id, runtime_sha256)
+    rows = _lines(raw, SNAPSHOT_LIMIT, 7, b'VZ_RUNTIME_AUDIT_RETIRE_V1')
+    try:
+        boot = rows[1].decode('ascii')
+    except UnicodeError:
+        raise ValueError('runtime audit capture: boot encoding') from None
+    require(audit.boot_id(boot) and boot == expected_boot_id, 'boot binding')
+    require(rows[2] == runtime_sha256.encode(), 'runtime binding')
+    enrollment = _base64(rows[3], 512)
+    audit.enrollment(enrollment, expected_session_id=session_id, expected_boot_id=boot)
+    require(rows[3].decode('ascii') == expected_enrollment, 'retired a different enrollment')
+    require(re.fullmatch(b'[0-9a-f]{64}', rows[4]) and
+            rows[4].decode('ascii') == expected_journal_sha256, 'retired a different journal')
+    require(rows[5] == b'absent', 'enrollment still present after retirement')
+    return {'schema_version': 1, 'session_id': session_id, 'boot_id': boot,
+            'runtime_sha256': runtime_sha256, 'journal_sha256': expected_journal_sha256,
+            'enrollment_base64': expected_enrollment, 'enrollment_absent': True}
+
+
 def snapshot_script(session_id, runtime_sha256):
     return _common(session_id, runtime_sha256) + '\nsnapshot\n'
 

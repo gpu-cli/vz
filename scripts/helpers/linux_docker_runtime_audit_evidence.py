@@ -144,6 +144,8 @@ class Session:
         self.enrollment_uncertain = True
         self.enrolled = None
         self.capture_attempted = self.capture_complete = False
+        self.retire_attempted = self.retire_complete = False
+        self.retired = None
         self.validated_journal = None
         startup.document(self.output / 'inputs.json', self.inputs)
 
@@ -155,7 +157,8 @@ class Session:
     def command(self, label, script):
         self.verify_inputs()
         index = len(self.record.receipts) + 1
-        maximum = 3 + (audit.JOURNAL_LIMIT + probe.CHUNK_SIZE - 1) // probe.CHUNK_SIZE
+        # enroll, snapshot-before, every chunk, snapshot-after, retire.
+        maximum = 4 + (audit.JOURNAL_LIMIT + probe.CHUNK_SIZE - 1) // probe.CHUNK_SIZE
         require(index <= maximum, 'audit command ledger exceeds bound')
         self.record.run(label, argv(self.inputs, script), cwd=Path(self.inputs['project_binding']['project_path']),
                         executable=self.inputs['cli'], timeout=TIMEOUT, observer_only=True)
@@ -185,6 +188,8 @@ class Session:
                 'audit enrollment mutation unresolved; cleanup withheld')
         require(not self.capture_attempted or self.capture_complete,
                 'audit final capture unresolved; cleanup withheld')
+        require(not self.retire_attempted or self.retire_complete,
+                'audit retirement unresolved; cleanup withheld')
         self.verify_inputs()
         require(all(row['effects_uncertain'] is False and row['capture_complete'] is True and
                     type(row['exit_code']) is int and row['exit_code'] == 0 for row in self.record.receipts),
@@ -207,6 +212,39 @@ class Session:
         self.verify_inputs()
         self.validated_journal = replayed_journal
         self.capture_complete = True
+        return proof
+
+    def retire(self):
+        """Close the window this session opened.
+
+        The capture reads the journal; it does not end the session. Until the
+        enrollment is removed the runtime keeps journaling into it, so a window
+        that is only captured goes on filling until it passes the record bound,
+        after which every invocation warns and the next operation that requires
+        clean stderr fails. Retirement is the other half of the capture and is
+        pinned to the journal the capture retained.
+        """
+        require(self.capture_complete and self.validated_journal is not None,
+                'audit retirement requires a completed capture')
+        require(not self.retire_attempted, 'audit retirement cannot be retried')
+        self.retire_attempted = True
+        raw, receipt = self.command('retire', probe.retire_script(
+            self.inputs['session_id'], self.inputs['runtime_sha256'],
+            self.validated_journal['journal_sha256']))
+        proof = probe.parse_retirement(
+            raw, session_id=self.inputs['session_id'], runtime_sha256=self.inputs['runtime_sha256'],
+            expected_boot_id=self.enrolled['boot_id'],
+            expected_enrollment=self.enrolled['snapshot']['enrollment_base64'],
+            expected_journal_sha256=self.validated_journal['journal_sha256'])
+        proof = {'schema_version': 1, 'scope': SCOPE, 'session_id': proof['session_id'],
+                 'boot_id': proof['boot_id'], 'runtime_sha256': proof['runtime_sha256'],
+                 'journal_sha256': proof['journal_sha256'],
+                 'enrollment_absent': proof['enrollment_absent'], 'command': receipt,
+                 'inputs_sha256': self.enrolled['inputs_sha256'], 'owner': clone(self.enrolled['owner'])}
+        startup.document(self.output / 'retirement.json', proof)
+        self.verify_inputs()
+        self.retired = proof
+        self.retire_complete = True
         return proof
 
     def replay(self):

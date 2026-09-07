@@ -460,6 +460,8 @@ class ResultScopeTests(unittest.TestCase):
                 harness = types.SimpleNamespace(evidence=Path('/owned/evidence'), root=Path('/owned/root'),
                     staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
                     remove_owned=Mock(), capture_runtime_audits=Mock(return_value=['four replayed sessions']),
+                    runtime_audit_validation=None, runtime_audit_retirement=None,
+                    retire_runtime_audits=Mock(return_value=['four closed windows']),
                     cleanup=Mock(return_value={}))
                 with patch.object(gate, 'ComposeHarness', return_value=harness), \
                         patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
@@ -597,6 +599,8 @@ class RuntimeAuditIntegrationTests(unittest.TestCase):
                     staged_inputs={}, monitor=None, stage=Mock(), scenario=Mock(return_value={}),
                     remove_owned=Mock(side_effect=lambda: order.append('remove')),
                     capture_runtime_audits=Mock(side_effect=capture),
+                    runtime_audit_validation=None, runtime_audit_retirement=None,
+                    retire_runtime_audits=Mock(return_value=['four closed windows']),
                     cleanup=Mock(side_effect=lambda: order.append('stop') or {}))
                 with patch.object(gate, 'ComposeHarness', return_value=h), \
                         patch.object(gate.os, 'umask'), patch.object(gate.startup, 'document'), \
@@ -741,6 +745,7 @@ class BuildDispatchTests(unittest.TestCase):
         """
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
         harness.runtime_audits, harness.runtime_audit_validation = [], None
+        harness.runtime_audit_retirement = None
         harness.registry_controls, harness.registry_sessions = None, []
         harness.live_cleanup = False
         order = []
@@ -758,6 +763,13 @@ class BuildDispatchTests(unittest.TestCase):
             order.append("capture")
             return ["four sessions"]
         harness.capture_runtime_audits = Mock(side_effect=capture)
+        def retire():
+            # The window must close inside the same pause that read it.
+            self.assertEqual([edge for edge, _ in paused][-1], "enter",
+                             "retirement must run under the pause")
+            order.append("retire")
+            return ["four closed windows"]
+        harness.retire_runtime_audits = Mock(side_effect=retire)
         harness.run_machine_suite = Mock(side_effect=lambda suite, *_: order.append(("suite", suite)) or [suite])
         paused = []
         @contextlib.contextmanager
@@ -773,19 +785,22 @@ class BuildDispatchTests(unittest.TestCase):
             order.clear(); paused.clear()
             harness.runtime_audit_validation = None
             harness.enroll_runtime_audits.reset_mock(); harness.capture_runtime_audits.reset_mock()
+            harness.retire_runtime_audits.reset_mock(); harness.runtime_audit_retirement = None
             for suite in suites:
                 gate.ComposeHarness.run_suite_with_audit_window(harness, suite, suites, ("c0", "c1"), None, None)
             if composed:
                 self.assertEqual(order, [("suite", "registry"), ("enroll", ("c0", "c1")),
-                                         ("suite", "lifecycle"), "capture", ("suite", "recovery")])
+                                         ("suite", "lifecycle"), "capture", "retire",
+                                         ("suite", "recovery")])
                 self.assertEqual(harness.runtime_audit_validation, ["four sessions"])
+                self.assertEqual(harness.runtime_audit_retirement, ["four closed windows"])
                 # Paused twice and only twice: once around enrollment, once
                 # around the capture. The suite itself runs observed, so the
                 # Machines that are not under test keep their liveness record.
                 self.assertEqual([edge for edge, _ in paused], ["enter", "exit", "enter", "exit"])
                 self.assertEqual(paused[1][1][-1], ("enroll", ("c0", "c1")))
                 self.assertEqual(paused[2][1][-1], ("suite", "lifecycle"))
-                self.assertEqual(paused[3][1][-1], "capture")
+                self.assertEqual(paused[3][1][-1], "retire")
                 self.assertFalse(harness.live_cleanup, "the live-cleanup window must close")
             else:
                 # A lifecycle-only run keeps the whole-run window `prepare_suites`
@@ -793,6 +808,7 @@ class BuildDispatchTests(unittest.TestCase):
                 self.assertEqual(order, [("suite", "lifecycle")])
                 harness.enroll_runtime_audits.assert_not_called()
                 harness.capture_runtime_audits.assert_not_called()
+                harness.retire_runtime_audits.assert_not_called()
                 self.assertIsNone(harness.runtime_audit_validation)
                 self.assertEqual(paused, [])
 

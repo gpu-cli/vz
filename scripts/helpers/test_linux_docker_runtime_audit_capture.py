@@ -206,3 +206,76 @@ class CaptureTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+def retirement_raw(*, boot=BOOT, runtime=RUNTIME, enrollment=ENROLLMENT, digest=None, absent=b'absent'):
+    digest = digest if digest is not None else hashlib.sha256(journal()).hexdigest().encode()
+    return b'\n'.join((b'VZ_RUNTIME_AUDIT_RETIRE_V1', boot.encode(), runtime.encode(),
+                       encoded(enrollment), digest, absent, b'END', b''))
+
+
+class RetirementTests(unittest.TestCase):
+    """Closing the window is the other half of reading it.
+
+    A captured window that is never closed keeps journaling into the Machine,
+    passes the record bound and then warns on every runtime invocation, which
+    fails the next operation that requires clean stderr. So retirement is
+    verified as strictly as the capture: the same session, the same journal,
+    and the enrollment provably gone.
+    """
+
+    def retire(self, raw, **kwargs):
+        options = {'session_id': SESSION, 'runtime_sha256': RUNTIME, 'expected_boot_id': BOOT,
+                   'expected_enrollment': encoded(ENROLLMENT).decode(),
+                   'expected_journal_sha256': hashlib.sha256(journal()).hexdigest()}
+        options.update(kwargs)
+        return capture.parse_retirement(raw, **options)
+
+    def test_a_closed_window_names_its_session_journal_and_absence(self):
+        proof = self.retire(retirement_raw())
+        self.assertEqual(proof['session_id'], SESSION)
+        self.assertEqual(proof['boot_id'], BOOT)
+        self.assertEqual(proof['journal_sha256'], hashlib.sha256(journal()).hexdigest())
+        self.assertIs(proof['enrollment_absent'], True)
+
+    def test_a_window_that_is_still_present_is_not_retired(self):
+        with self.assertRaisesRegex(ValueError, 'enrollment still present'):
+            self.retire(retirement_raw(absent=b'present'))
+
+    def test_retiring_a_different_journal_than_the_one_captured_is_refused(self):
+        # The whole point of the pin: closing may never discard records that
+        # nothing read.
+        with self.assertRaisesRegex(ValueError, 'retired a different journal'):
+            self.retire(retirement_raw(digest=hashlib.sha256(b'other').hexdigest().encode()))
+
+    def test_retiring_a_different_enrollment_is_refused(self):
+        other = json.dumps({'schema_version': 1, 'session_id': 'd' * 64, 'boot_id': BOOT},
+                           separators=(',', ':')).encode() + b'\n'
+        with self.assertRaises(ValueError):
+            self.retire(retirement_raw(enrollment=other))
+
+    def test_a_reboot_between_capture_and_retirement_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'boot binding'):
+            self.retire(retirement_raw(boot='c1234567-1111-2222-3333-0123456789ac'))
+
+    def test_a_different_runtime_is_refused(self):
+        with self.assertRaisesRegex(ValueError, 'runtime binding'):
+            self.retire(retirement_raw(runtime='e' * 64))
+
+    def test_framing_is_exact(self):
+        good = retirement_raw()
+        for bad in (good[:-1], good + b'extra\n', good.replace(b'END\n', b''),
+                    good.replace(b'VZ_RUNTIME_AUDIT_RETIRE_V1', b'VZ_RUNTIME_AUDIT_SNAPSHOT_V1')):
+            with self.assertRaises(ValueError):
+                self.retire(bad)
+
+    def test_the_script_pins_the_journal_and_removes_every_file(self):
+        script = capture.retire_script(SESSION, RUNTIME, hashlib.sha256(journal()).hexdigest())
+        self.assertIn(hashlib.sha256(journal()).hexdigest(), script)
+        for name in ('enrollment.json', 'events.jsonl', 'status'):
+            self.assertIn(name, script)
+        self.assertIn('rmdir "$root"', script)
+        self.assertIn('test ! -e "$root"', script)
+        for bad in ('', 'z' * 64, 'a' * 63):
+            with self.assertRaises(ValueError):
+                capture.retire_script(SESSION, RUNTIME, bad)
