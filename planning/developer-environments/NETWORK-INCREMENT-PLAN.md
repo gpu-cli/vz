@@ -58,11 +58,11 @@ Tracked under `vz-mzs.5`.
   (`crates/vz-runtime-contract/src/types/topology.rs:233-274, 537-552`), with
   state-store tables (`crates/vz-stack/src/state_store/topology.rs:647-672`).
   Step 1 added the attachment, host relay and egress records beside them; no
-  `PeerGrant` type exists yet. One inconsistency to resolve while building the
-  switch: `instantiate` appends an `OwnershipRecord` for every new kind except
-  egress, because there is no `OwnedResourceKind::Egress`. Decide whether egress
-  is an owned resource or deliberately only a Machine attribute, and say which
-  in the type.
+  `PeerGrant` type exists yet. Egress deliberately has no `OwnedResourceKind`,
+  because unlike an attachment, an export or an import it names no resource the
+  runtime reconciles on its own: it is a property of the Machine's VM, created
+  and destroyed with it, so an ownership record would put a second owner on what
+  the Machine record already owns. The type says so and a test asserts it.
 - Docker traffic already relays Mac to guest over vsock
   (`machine_docker_endpoint.rs:128-146, 214-226` to
   `crates/vz-guest-agent/src/docker_forward.rs:58-163`), and a general TCP relay

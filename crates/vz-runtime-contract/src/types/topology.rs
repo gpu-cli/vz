@@ -656,6 +656,17 @@ pub struct HostImportInstance {
 }
 
 /// Persisted external-reachability decision for one Machine.
+///
+/// Deliberately not an owned resource, and so there is no
+/// `OwnedResourceKind::Egress`. Every other network record names something the
+/// runtime creates and must later reconcile on its own: an attachment is a port
+/// on a switch, a host export is a listener, a host import is a relay. Egress is
+/// a property of the Machine's own VM, created and destroyed with it, so giving
+/// it an ownership record would put a second owner on something the Machine
+/// record already owns.
+///
+/// A record exists only for a non-Offline Machine, because Offline is the
+/// absence of an external attachment rather than a filter applied to one.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EgressInstance {
     pub schema_version: u32,
@@ -7744,9 +7755,22 @@ mod tests {
         assert_eq!(environment.network_attachments.len(), 1);
         assert_eq!(environment.host_exports.len(), 1);
         assert_eq!(environment.host_imports.len(), 1);
-        // Only the Allowed Machine owns an egress record; Offline is absence.
+        // Only the Allowed Machine gets an egress record; Offline is absence.
         assert_eq!(environment.egress.len(), 1);
         assert_eq!(environment.egress[0].policy, EgressPolicy::Allowed);
+        // Egress is deliberately not an owned resource: it is a property of the
+        // Machine's own VM, created and destroyed with it, so an ownership record
+        // would put a second owner on what the Machine record already owns. This
+        // asserts the decision rather than leaving it to be re-derived from the
+        // absence of an OwnedResourceKind variant.
+        let egress_id = environment.egress[0].egress_id.to_string();
+        assert!(
+            !environment
+                .ownership
+                .iter()
+                .any(|record| record.resource_id == egress_id),
+            "egress must not appear in the ownership graph"
+        );
 
         let attachment = &environment.network_attachments[0];
         assert_eq!(attachment.machine_id, environment.machines[0].machine_id);
