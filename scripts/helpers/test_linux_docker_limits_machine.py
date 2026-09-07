@@ -209,11 +209,19 @@ class Machine(unittest.TestCase):
                 def prepare(self):
                     events.append('health-prepare')
                     self_case.assertNotIn('limits-run-limited', events)
+                    self_case.assertNotIn('health-start', events)
                     self.prepared = True
                 def start(self):
                     events.append('health-start')
-                    self_case.assertIn('limits-run-control', events)
-                    self_case.assertNotIn('limits-run-oom', events)
+                    # The probe must be sampling before the suite creates any
+                    # workload container, so its window covers the sibling
+                    # containers and the pre-OOM snapshot as well as the OOM
+                    # sequence, and so no bracketed command can open before the
+                    # probe's first sample. Ordering it after the sibling
+                    # containers left that second property to luck and lost it.
+                    for label in ('limits-image-baseline', 'limits-run-limited',
+                                  'limits-run-control', 'limits-run-oom'):
+                        self_case.assertNotIn(label, events)
                     self.started_at = subject.time.time_ns()
                 def finish(self, intervals):
                     events.append('health-finish')
@@ -260,7 +268,9 @@ class Machine(unittest.TestCase):
             ordered = [e for e in case.events if e in ('health-prepare', 'limits-run-limited', 'health-start', 'limits-run-oom',
                                                        'limits-oom-wait', 'limits-oom-events', 'health-finish',
                                                        'limits-remove-oom', 'limits-image-final')]
-            self.assertEqual(ordered, ['health-prepare', 'limits-run-limited', 'health-start', 'limits-run-oom',
+            # The probe starts before any workload container and stops after the
+            # last bracketed command, so its window brackets the whole suite.
+            self.assertEqual(ordered, ['health-prepare', 'health-start', 'limits-run-limited', 'limits-run-oom',
                                        'limits-oom-wait', 'limits-oom-events', 'health-finish', 'limits-remove-oom',
                                        'limits-image-final'])
             self.assertEqual(case.events.count('absent:limited'), 2)

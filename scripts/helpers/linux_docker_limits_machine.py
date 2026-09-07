@@ -311,6 +311,14 @@ def run_machine(harness, descriptor, scope, proof, images, index):
         health = parallel_health.Health(harness, descriptor, images, index,
                                         samples=HEALTH['sibling_health_probe_seconds'])
         health.prepare()
+        # The probe covers the sibling containers and the pre-OOM snapshot too,
+        # not just the OOM sequence, which is strictly more evidence for the same
+        # window. What guarantees the validator's precondition is start() itself:
+        # it returns only once the probe has announced a completed first sample,
+        # so every envelope bracketed below necessarily opens after it. Relying on
+        # the workload being slow instead is what failed here, by 21 ms.
+        health.start()
+        health_started = time.time_ns()
         baseline = image_baseline(harness, descriptor, 'limits-image-baseline')
         require(image_id in baseline and images['compose']['id'] in baseline, 'baseline lacks owned images')
         session.run('limited', ['--memory', str(MEMORY_BYTES), '--cpus', CPUS, '--pids-limit', str(PIDS_LIMIT)],
@@ -320,11 +328,8 @@ def run_machine(harness, descriptor, scope, proof, images, index):
         require(before['limited']['host_config'] == {'Memory': MEMORY_BYTES, 'NanoCpus': 1_000_000_000, 'PidsLimit': PIDS_LIMIT} and
                 before['control']['host_config'] == {'Memory': 0, 'NanoCpus': 0, 'PidsLimit': None},
                 'HostConfig limits differ from request')
-        health.start()
-        health_started = time.time_ns()
         # Envelopes handed to the health validator are host-clock brackets of
-        # commands dispatched after the OOM container started, each of which
-        # begins at least two Engine round trips after the first health sample.
+        # commands dispatched after the OOM container started.
         envelopes = []
         def bracket(call, *args, **kwargs):
             begin = time.time_ns()

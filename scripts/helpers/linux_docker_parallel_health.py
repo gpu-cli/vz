@@ -266,6 +266,22 @@ class Health:
                 self.error = error
         self.thread = threading.Thread(target=observe, name='vz-parallel-http-health', daemon=False)
         self.thread.start()
+        # Return only once the probe has finished its first sample. The validator
+        # requires every workload envelope to open after that moment, and the
+        # caller cannot see the probe's stream until it exits, so without this the
+        # caller can only assume enough time has passed. That assumption held while
+        # the workload's first command was slow and stopped holding when it was
+        # not: a bracket once opened 21 ms early and the run was rejected. This is
+        # a bounded wait on a condition the probe announces, not a retry.
+        first_sample = ('import time\nfrom pathlib import Path\n'
+                        'p=Path("/tmp/vz-parallel-health-sampling")\n'
+                        'end=time.monotonic()+15\n'
+                        'while not p.exists() and time.monotonic()<end: time.sleep(.01)\n'
+                        'assert p.read_bytes()==' + repr((self.token + '\n').encode()) + '\n')
+        raw, error, _ = self.harness.docker('health-first-sample', self.descriptor,
+                                            ['exec', self.container_id, 'python3', '-c', first_sample],
+                                            timeout=25)
+        require(not raw and not error, 'health probe did not complete its first sample')
         self.started = True
 
     def finish(self, run_intervals):

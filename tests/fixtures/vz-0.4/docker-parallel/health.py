@@ -9,6 +9,11 @@ import time
 
 MARKER = Path('/tmp/vz-parallel-health-marker')
 READY = Path('/tmp/vz-parallel-health-ready')
+# The probe's samples reach the host only when the process exits, so the host has
+# no way to see that sampling has begun. It must know, because every workload
+# envelope it brackets has to open after the first sample finished. This file
+# announces exactly that moment.
+SAMPLING = Path('/tmp/vz-parallel-health-sampling')
 PORT = 8080
 
 
@@ -71,6 +76,12 @@ def probe(token, timing):
               'started_monotonic_ns': began, 'finished_monotonic_ns': ended,
               'started_unix_ns': wall, 'finished_unix_ns': finished_wall,
               'status': status, 'body': body.decode()})
+        if sequence == 0:
+            # Exclusive creation, so a stale file can never stand in for a sample
+            # this probe actually took. The write is to tmpfs and completes far
+            # inside the next sample's lateness bound.
+            with SAMPLING.open('x') as sampling:
+                sampling.write(token + '\n')
     emit({'type': 'end', 'samples': timing['samples'], 'monotonic_ns': time.monotonic_ns(),
           'unix_ns': time.time_ns()})
 

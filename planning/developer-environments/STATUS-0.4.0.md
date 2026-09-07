@@ -18,9 +18,9 @@ as separate focused passes.
 
 | State | Count |
 |---|---|
-| Closed | 38 |
-| In progress | 31 |
-| Open | 68 |
+| Closed | 63 |
+| In progress | 48 |
+| Open | 100 |
 
 ## What is proven today
 
@@ -30,7 +30,7 @@ record carries `aggregate_release_certified: false`.
 
 **Rust gates.** `cargo fmt --check`, `cargo clippy --workspace --all-targets
 --all-features -- -D warnings` and `cargo nextest run --workspace
---all-features` all pass (2,895 tests). The clippy gate is the exact command the
+--all-features` all pass (2,914 tests). The clippy gate is the exact command the
 release contract names, and it went from 2,733 findings to zero.
 
 **Docker slices.** Installed candidates pass compose, build, artifacts, parallel,
@@ -61,7 +61,12 @@ The dry run's 109 findings are all correct:
 
 - **85 scenarios missing.** The topology lane proves six sub-checks of the CLI
   criteria and honestly reports the rest not implemented; the native-macOS lane
-  is still a stub; the Docker lane has fourteen uncovered scenario IDs.
+  is still a stub; the Docker lane has ten uncovered scenario IDs, needing four
+  gap-suites: `mounts` for the five storage IDs, `netpolicy` for published ports
+  and network cleanup, `concurrency` for concurrent clients, and `isolation` for
+  the two cross-Environment IDs. Only the first two are blocked on product
+  features; concurrency and isolation need a three-Environment topology and
+  nothing else.
 - **Inputs are drafts.** Four frozen-input files are `draft_unverified` and
   eleven contract values are still null, mostly native-macOS pins that are not
   yet knowable.
@@ -75,8 +80,13 @@ The dry run's 109 findings are all correct:
    Environment-owned switch, host imports and exports, published ports, egress
    policy, split DNS, TLS ingress, faults with numeric tolerances, peering with
    expiry, and the exhaustive denial matrix. Today `vz up` rejects any declared
-   network, endpoint or workspace projection. The increment is designed in
-   [`NETWORK-INCREMENT-PLAN.md`](NETWORK-INCREMENT-PLAN.md).
+   network, endpoint or workspace projection, and now also refuses declared host
+   relays and non-offline egress rather than admitting a boundary it cannot
+   apply. Step 1 of [`NETWORK-INCREMENT-PLAN.md`](NETWORK-INCREMENT-PLAN.md) has
+   landed, with its typed records, state-store schema v10 and both migration
+   barriers, and so has the first half of step 2's substrate: the file-handle
+   network attachment and a VM that can hold a list of NICs instead of one. The
+   switch itself, the guest addressing, and the three admission gates remain.
 2. **Native macOS Machines.** Ownership adaptation, workspace, exec and
    services, mixed Linux and macOS topologies, and the release gate for them.
    The local setup path is in progress and its evidence still records a failure.
@@ -95,7 +105,7 @@ The dry run's 109 findings are all correct:
 ## Composing the Docker lane
 
 `--suite all` now provisions the topology once and walks the suites in order.
-Sixteen installed candidates took it from refusing outright to a run that
+Twenty-one installed candidates took it from refusing outright to a run that
 executed all ten composed suites, handshake through recovery, with no workload
 error. Every candidate exposed exactly one real cross-suite coupling, each fixed
 and committed with its reason:
@@ -118,19 +128,33 @@ and committed with its reason:
   Machine they live in, and the final-cleanup certainty guard, which requires a
   stopped monitor, was being applied to that mid-run removal.
 
-Two couplings remain, both tracked and both honest about what they cost:
+Candidates 17 to 21 continued the same pattern, each exposing one real coupling:
 
-- **lifecycle** cannot be composed, because its evidence is a youki
-  runtime-audit journal bounded at 2,048 records per Machine that must be
-  enrolled before any owned mutation and captured only after the monitor stops.
-  A composed run's sentinel sampling alone exceeds that bound. It is excluded,
-  its sixteen scenario IDs are reported missing rather than proven with a broken
-  journal, and `--suite lifecycle` still proves them.
-- **limits** runs a fixed sixty one-second health samples, giving a 57 second
-  bracket that its workload outgrows on a Machine which has already run eight
-  other suites, though it fits standalone. The gate requires at least sixty
-  seconds of probes with zero failures, so a window that covers the workload is
-  strictly more evidence; making it so is tracked rather than rushed.
+- The recovery module's monitor subclass builds its own state and predated the
+  probe cache the fast path added, and a non-idempotent `stop()` then masked that
+  real failure behind an exclusive write. Candidate 20 executed all ten suites
+  before failing there, so the fast path holds across the whole composition.
+- Candidate 21 failed in **limits** on a 21 millisecond race. The validator
+  requires every workload envelope to open after the health probe's first sample
+  has finished, and the suite satisfied that only by assuming its first command
+  was slow. On a warm Engine it was not, and the first bracket opened 21 ms
+  early. The probe now announces its first completed sample and the suite waits
+  for it, so the precondition is checked rather than assumed. Candidate 20 had
+  won the same coin flip.
+
+One coupling remains. **lifecycle** cannot be composed, because its evidence is a
+youki runtime-audit journal bounded at 2,048 records per Machine that must be
+enrolled before any owned mutation and captured only after the monitor stops.
+Measured on candidate 21, the sentinel monitor alone reaches about 1,488 records
+per Machine in 25 minutes. It is excluded, its sixteen scenario IDs are reported
+missing rather than proven with a broken journal, and `--suite lifecycle` still
+proves them. The fix is identified: the monitor executes into the Machine
+currently running a suite, but both liveness assertions exclude that Machine's
+samples, so that execution is burning the exact resource lifecycle needs and
+proving nothing.
+
+The limits window coupling recorded here earlier is closed: the suite now runs
+180 one-second samples, and the reasoning is recorded beside the constant.
 
 ## How to run what exists
 

@@ -101,6 +101,15 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(proof['guest_run_envelopes'], [list(inside)] * 4)
 
 
+# start() issues exactly one Engine command of its own, waiting for the probe's
+# first sample. Assertions about what a suite did should not count it.
+FIRST_SAMPLE = 'health-first-sample'
+
+
+def workload_calls(h):
+    return [call.args[0] for call in h.docker.call_args_list if call.args[0] != FIRST_SAMPLE]
+
+
 class LifecycleTests(unittest.TestCase):
     def setUp(self):
         previous = os.umask(0o077)
@@ -139,6 +148,12 @@ class LifecycleTests(unittest.TestCase):
         selected, h, row, item = self.fixture()
         selected.prepared, selected.before = True, item
         h.docker.return_value = (json.dumps([item]).encode(), b'', 0)
+        def docker(label, *args, **kwargs):
+            # start() now blocks until the probe announces its first completed
+            # sample; that exec writes nothing. Everything else keeps whatever
+            # return_value the individual test installed.
+            return (b'', b'', 0) if label == FIRST_SAMPLE else h.docker.return_value
+        h.docker.side_effect = docker
         original = selected.record.run
         def record_run(*args, **kwargs):
             with patch.object(health.startup, 'execute', return_value=subprocess.CompletedProcess([], 0, encode(rows()), b'')):
@@ -157,7 +172,7 @@ class LifecycleTests(unittest.TestCase):
                          ['docker', '--config', selected.descriptor['config_dir'], '--context', 'owned-context'])
         self.assertNotEqual(selected.descriptor['config_dir'], str(h.config))
         self.assertEqual(proof['container_id'], selected.container_id)
-        self.assertEqual(h.docker.call_count, 1)
+        self.assertEqual(len(workload_calls(h)), 1)
         with self.assertRaises(ValueError):
             selected.start()
 
@@ -167,7 +182,7 @@ class LifecycleTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'four authenticated'):
             selected.finish([])
         self.assertFalse(selected.thread.is_alive())
-        h.docker.assert_not_called()
+        self.assertEqual(workload_calls(h), [])
         self.assertFalse((selected.output / 'health-validation.json').exists())
 
     def test_capture_failure_never_produces_success_or_leaves_thread(self):
@@ -186,7 +201,7 @@ class LifecycleTests(unittest.TestCase):
             with self.subTest(result=result), self.assertRaises(ValueError):
                 selected.finish(INTERVALS)
             self.assertFalse(selected.thread.is_alive())
-            h.docker.assert_not_called()
+            self.assertEqual(workload_calls(h), [])
 
     def test_restart_or_foreign_image_rejected_after_capture(self):
         for key, value in (('Pid', 124), ('StartedAt', 'later')):
@@ -276,14 +291,14 @@ class LifecycleTests(unittest.TestCase):
             path.write_text(json.dumps(changed))
             with self.subTest(filename=filename, key=key), self.assertRaises(ValueError):
                 selected.finish(INTERVALS)
-            h.docker.assert_not_called()
+            self.assertEqual(workload_calls(h), [])
         selected, h, _, _ = self.ready()
         selected.start()
         selected.thread.join(2)
         (selected.output / '001-http-health.stdout').write_bytes(encode(rows()).replace(b'owned-health', b'other-health'))
         with self.assertRaisesRegex(ValueError, 'digest/size'):
             selected.finish(INTERVALS)
-        h.docker.assert_not_called()
+        self.assertEqual(workload_calls(h), [])
 
 
 class GuestProbeTests(unittest.TestCase):
@@ -300,9 +315,16 @@ class GuestProbeTests(unittest.TestCase):
             def sleep(self, seconds): self.current += round(seconds * 10**9)
         connection = Mock()
         connection.getresponse.return_value = types.SimpleNamespace(status=200, read=Mock(return_value=(TOKEN + '\n').encode()))
-        with patch.object(module, 'time', Clock()), patch.object(module.http.client, 'HTTPConnection', return_value=connection) as client, \
+        # The probe announces its first completed sample by exclusive file
+        # creation, so each invocation gets its own path; in the guest the
+        # container is fresh and the path is the fixed one the harness waits on.
+        sampling = Path(tempfile.mkdtemp()) / 'sampling'
+        with patch.object(module, 'time', Clock()), patch.object(module, 'SAMPLING', sampling), \
+                patch.object(module.http.client, 'HTTPConnection', return_value=connection) as client, \
                 contextlib.redirect_stdout(io.StringIO()) as output:
             module.probe(TOKEN, health.TIMING)
+        self.assertEqual(sampling.read_bytes(), (TOKEN + '\n').encode(),
+                         'the first completed sample must be announced to the host')
         self.assertEqual(client.call_count, 60)
         for call in client.call_args_list:
             self.assertEqual(call.args, ('127.0.0.1', 8080))
@@ -310,9 +332,13 @@ class GuestProbeTests(unittest.TestCase):
         proof = health.validate(output.getvalue().encode(), b'', TOKEN, health.TIMING, INTERVALS)
         self.assertEqual(proof['samples'], 60)
         connection.getresponse.return_value.status = 503
-        with patch.object(module, 'time', Clock()), patch.object(module.http.client, 'HTTPConnection', return_value=connection) as client, \
+        failing = Path(tempfile.mkdtemp()) / 'sampling'
+        with patch.object(module, 'time', Clock()), patch.object(module, 'SAMPLING', failing), \
+                patch.object(module.http.client, 'HTTPConnection', return_value=connection) as client, \
                 contextlib.redirect_stdout(io.StringIO()), self.assertRaisesRegex(ValueError, 'HTTP health'):
             module.probe(TOKEN, health.TIMING)
+        self.assertFalse(failing.exists(),
+                         'a probe that never completed a sample must announce nothing')
         self.assertEqual(client.call_count, 1)
 
 
