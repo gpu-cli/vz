@@ -1,0 +1,59 @@
+{
+  "schema_version": 1,
+  "source": {
+    "repository": "docker.io/library/registry",
+    "tag": "3.1.1",
+    "index": {
+      "mediaType": "application/vnd.oci.image.index.v1+json",
+      "digest": "sha256:1be55279f18a2fe1a74edf2664cac61c1bea305b7b4642dab412e7affdcb3e33",
+      "size": 8980
+    },
+    "platform_manifest": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:bc68ba48dae0e0423bb885c8d07d20c3210febbe996d38d54d32c574fda690ae",
+      "size": 1918
+    },
+    "platform": {"os": "linux", "architecture": "arm64", "variant": "v8"}
+  },
+  "layout_index": {
+    "sha256": "2efedca4615ee4556c72c6e19ffedc5b7125e25cb417b4ef2275380230a0ea0b",
+    "size": 428
+  },
+  "config": {
+    "mediaType": "application/vnd.oci.image.config.v1+json",
+    "digest": "sha256:d26a873d9c1c357f6f3be92297c4a68bbd39ab9d5ab84f47e57536e6085fbfbb",
+    "size": 3611
+  },
+  "layers": [
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:14a4754c352fba4c6c0da8e4f01bb990463c19f7ff63e090073c385bd2bc5046",
+      "size": 4181860,
+      "diff_id": "sha256:91d5cf66444f05b8c72e1b9d725c1752b9b015b68a7918125fc46ecdb7cc46d5"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:07b7518a8a2c3c1bed624e92a35486bb1e8285483cbf07acacca0055e663b88a",
+      "size": 247486,
+      "diff_id": "sha256:b1f5355b0683ccad6fa5daa24c8b619c702c92e6aceb3944fc7a53d02a005601"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:bfa447a3f3472696dd72ce5d846c0a3320427a4b66a4d145c0f75b3b6b9efb8a",
+      "size": 14393623,
+      "diff_id": "sha256:086c351020c5ad34966592b5dbe253a8c4090e966fc4159c90f928bf5b932a10"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:c9820381a21377d6acd037d614614166730498838c3c7ae002ed45187f57f41b",
+      "size": 398,
+      "diff_id": "sha256:6edc7d831b49153debf10f757b92743ad37501f423873d608c31d7f812f1e443"
+    },
+    {
+      "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+      "digest": "sha256:11a64b0fc2c8b91f063efa410bddd7f87c333f50483558199043f4cf937c2701",
+      "size": 213,
+      "diff_id": "sha256:8a96eafebde16c39dd2b17455aae9c2ed57600566ec0db623ac41be3e17bc185"
+    }
+  ]
+}

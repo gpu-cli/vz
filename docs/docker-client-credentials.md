@@ -140,6 +140,8 @@ recreation to recover their contents.
 
 Neither run performs a real registry login or proves credential persistence
 through daemon restart, migration, or fault recovery. Authenticated TLS registry
-login/push/pull is tracked in `vz-mzs.7.1.10` and must supply the remaining actual
+login/push/pull is tracked in `vz-mzs.7.1.10`; its
+[fixture, private transport and acceptance boundaries](docker-registry-acceptance.md)
+must supply the remaining actual
 credential-isolation evidence for `vz-mzs.7.1.9`. Both that issue and the full
 Docker-63/0.4 aggregate remain open.
