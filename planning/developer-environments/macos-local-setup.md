@@ -6,7 +6,8 @@ and public cleanup after a rejected start at the host VM limit. The earlier
 Xcode setup passed signature/license/Swift validation and warm reuse. Fresh
 optional-Xcode setup preserving the clean selection has also passed provisioning,
 signature/license/compiler checks, Swift build/test/run, and graceful shutdown.
-Its image publication, warm reuse, and installed lifecycle remain in progress.
+Image publication and warm reuse (1.85 seconds) passed, preserving the clean
+channel. Its installed lifecycle gate is running.
 See the [current evidence](macos-local-setup-evidence.json).
 Tracked by `vz-mzs.11.4.2`, on `feat/macos26-bootstrap`. Main remains reserved
 for other work; no runtime merge before installed-user verification.
@@ -116,5 +117,6 @@ state to become Stopped. Failed starts now retain their exact activation in live
 sessions. Stop queries the original framework VM under its lifecycle fence and
 retires stopped or irrecoverably errored objects; unknown states remain uncertain.
 The regression passed rejected-start Stop/Delete while both running VMs remained
-usable. Fresh optional-Xcode coexistence testing remains in progress. No main
+usable. Fresh optional-Xcode setup now also passed cache publication and warm reuse,
+preserving the clean channel. Its final installed lifecycle gate is running. No main
 merge or aggregate 0.4 conformance is claimed.

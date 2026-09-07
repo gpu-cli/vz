@@ -4,7 +4,7 @@
   "source_commit": "de356312f5bd09122f1a755c2f0f42f7923017ad",
   "branch": "feat/macos26-bootstrap",
   "passed": false,
-  "pending": "Fresh optional Xcode setup passed administrator provisioning, guest signature/license/compiler validation, Swift build/test/run and graceful shutdown; prepared image verification/cache publication, warm reuse and installed lifecycle remain in progress.",
+  "pending": "Fresh optional Xcode setup, cache publication, clean/Xcode catalog coexistence and warm reuse passed; the installed Xcode lifecycle gate is running.",
   "host": {
     "os": "macos",
     "architecture": "aarch64",
@@ -55,8 +55,8 @@
     "final_installed_linux_hardened_lifecycle": true
   },
   "remaining": [
-    "fresh optional Xcode setup and lifecycle preserving clean catalog selection",
-    "final signed binary evidence reconciliation"
+    "finish installed optional-Xcode lifecycle and clone isolation",
+    "reconcile final signed-binary lifecycle evidence"
   ],
   "attempts": [
     {
@@ -117,7 +117,7 @@
     {
       "path": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
       "scope": "fresh optional Xcode setup preserving validated clean template, final signed runtime",
-      "result": "license-required and cancellation/retry checks, local Xcode archive, cached IPSW verification and fresh macOS installation passed; administrator provisioning, guest Xcode signature/license/compiler identity, Swift build/test/run and graceful shutdown passed; verifying and caching prepared image"
+      "result": "PASS: license-required and cancellation/retry checks, local Xcode packaging, cached IPSW verification, fresh macOS installation, administrator provisioning, guest signature/license/compiler identity, Swift build/test/run, graceful shutdown, template publication, preserved clean channel and warm setup reuse; installed Xcode lifecycle running"
     }
   ],
   "regression_evidence": ".artifacts/macos-local-setup-2/linux-terminal-regression",
@@ -147,5 +147,19 @@
     "capacity_delete_seconds": 0.18151579098775983,
     "all_test_environments_publicly_deleted": true,
     "owned_daemon_exited": true
+  },
+  "xcode": {
+    "evidence": ".artifacts/macos-local-setup-2/xcode-serial-evidence",
+    "manifest_sha256": "c373e732f41546de017d026df5f191e94303277de119b80d8a62d748f89a9373",
+    "binary_sha256": {
+      "vz": "320d3102ad542c34a84fcacdf443a226979fbdbc0d5c4373a1ee32a2dd386974",
+      "vz-runtimed": "82ade2fc2d767f2b241cfd8f47a887a2040998cdb5ba1a228b2627b15392a344",
+      "vz-macos-setup": "e4e37a0d1a0696e263d7ccf721e0d927bd7f714117a12d43ba90baad1290b1ab",
+      "vz-agent-loader": "6db9504152bf24f00a69d1b64ba9be994047d53edfb92d380d3ed4b65e4679f8",
+      "vz-guest-agent": "d7283c69d15276a6e18fad36205e6f583bde96d36df34a2a9d09d2bdb755e994"
+    },
+    "warm_setup_seconds": 1.8538199589820579,
+    "clean_channel_preserved": true,
+    "installed_lifecycle_passed": false
   }
 }
