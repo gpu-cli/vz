@@ -92,6 +92,30 @@ The dry run's 109 findings are all correct:
    are stable, and last of all the staged clean-provision, persisted-recovery
    with a real hardware sleep, and final-cleanup run against one candidate.
 
+## Composing the Docker lane
+
+`--suite all` now provisions the topology once and walks the suites in order.
+Ten installed candidates took it from refusing outright to running handshake,
+compose, build and artifacts cleanly; candidate 8 also proved ssh, images and
+limits compose. Each candidate exposed exactly one real cross-suite coupling,
+all fixed: the executing suite was not threaded through the driver helpers; the
+builder registry and the BuildKit object names collided across suites; builder
+identity was hashed in two places that then disagreed; the health probe's
+evidence directory collided between two suites; and Compose recipe timeouts had
+no margin over the fixture's own health intervals.
+
+Two couplings remain, both tracked and both honest about what they cost:
+
+- **lifecycle** cannot be composed, because its evidence is a youki
+  runtime-audit journal bounded at 2,048 records per Machine that must be
+  enrolled before any owned mutation and captured only after the monitor stops.
+  A composed run's sentinel sampling alone exceeds that bound. It is excluded,
+  its sixteen scenario IDs are reported missing rather than proven with a broken
+  journal, and `--suite lifecycle` still proves them.
+- **parallel** fails slot evidence on a Machine that has already run other
+  suites, because BuildKit's progress rows for shared base and context vertices
+  do not match the shape the validator requires.
+
 ## How to run what exists
 
 ```bash
