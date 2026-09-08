@@ -84,10 +84,19 @@ if [ -n "$verb" ]; then
   fi
   if [ "$verb" = status ] && [ -f "$topology" ]; then
     # The real success payload is a pretty-printed document, not one line, and
-    # it names its own state source and per-Environment state.
-    printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$(cat "$topology")"
-    printf ' "environments": [\n  {\n   "name": "default",\n   "state": "ready",\n'
-    printf '   "machines": [{"name": "machine-0", "state": "ready"}]\n  }\n ]\n}\n'
+    # it names its own state source and per-Environment state. Every identity
+    # below is derived from this project's own id, so two projects declaring
+    # identical names still report distinct Environment, Machine, context and
+    # endpoint identities -- which is what the no-collision check reads.
+    pid=$(cat "$topology")
+    sfx=${pid#prj_}
+    printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$pid"
+    printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
+    printf '   "machines": [{"name": "machine-0", "state": "ready", "docker_context": {\n'
+    printf '     "owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s"},\n' "$pid" "$sfx" "$sfx"
+    printf '     "name": "vzr1-ctx-%s",\n     "endpoint": "unix:///tmp/vz-%s.sock",\n' "$sfx" "$sfx"
+    printf '     "engine_id": "eng-%s"}, "machine_id": "mch_%s"}]\n' "$sfx" "$sfx"
+    printf '  }\n ]\n}\n'
     exit 0
   fi
   if [ ! -f vz.json ]; then

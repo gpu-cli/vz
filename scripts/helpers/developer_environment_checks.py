@@ -26,6 +26,7 @@ is not schema-valid). Every assertion is recorded from raw receipts.
 """
 from __future__ import annotations
 
+import copy
 import json
 import shutil
 import os
@@ -422,6 +423,111 @@ GIT = "/usr/bin/git"
 SOCKET_PATH_LIMIT = 103
 
 
+CONCURRENT = 3
+
+
+def provision(ctx: CheckContext, check: SubCheck, name: str, definition: dict, *, timeout: int = UP_TIMEOUT) -> dict:
+    """Bring one Environment up in its own isolated project; never clean up here."""
+    data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+    iso = ctx.isolated(name, project_files={"vz.json": data}, provision=True)
+    env, project = iso["env"], iso["project"]
+    socket = Path(env["VZ_RUNTIME_DAEMON_SOCKET"])
+    length = len(str(socket).encode())
+    check.check(length <= SOCKET_PATH_LIMIT,
+                f"{name}: socket path is {length} bytes (limit {SOCKET_PATH_LIMIT})")
+    if check.status != "PASS":
+        return {"env": env, "project": project, "status": None}
+    for label, argv in ((name + "-git-init", [GIT, "init", "--quiet", "--initial-branch", "main"]),
+                        (name + "-git-add", [GIT, "add", "vz.json"]),
+                        (name + "-git-commit", [GIT, "-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                                                "commit", "--quiet", "-m", "definition"])):
+        receipt = ctx.run_tool(check, label, argv, cwd=project, env=env)
+        check.check(receipt.exit_code == 0, f"{label}: exit {receipt.exit_code} (expected 0)")
+    if check.status != "PASS":
+        return {"env": env, "project": project, "status": None}
+    up = ctx.run(check, name + "-up", ["--json", "up"], cwd=project, env=env, timeout=timeout)
+    check.check(up.exit_code == 0, f"{name}: vz --json up exit {up.exit_code} (expected 0)")
+    if up.exit_code != 0:
+        return {"env": env, "project": project, "status": None}
+    return {"env": env, "project": project,
+            "status": read_status(ctx, check, name, project=project, env=env)}
+
+
+def read_status(ctx: CheckContext, check: SubCheck, name: str, *, project: Path, env: dict):
+    row = ctx.run(check, name + "-status", ["--json", "status"], cwd=project, env=env, timeout=60)
+    if row.exit_code != 0:
+        return None
+    try:
+        return json.loads(row.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        check.fail(f"{name}: status is not a JSON document")
+        return None
+
+
+def check_three_concurrent_environments(ctx: CheckContext, top: str) -> SubCheck:
+    """Three Environments alive at once, every declared name deliberately repeated.
+
+    Each project declares the same Machine name and the same resources, so any
+    identity the Engine hands out must be its own doing. Collision would show as
+    a shared project, Environment, Machine, Docker context or endpoint. They are
+    brought up one at a time but all three are required to be ready together,
+    which is what `concurrent` means for this criterion.
+    """
+    check = SubCheck(top, "three_concurrent_no_collision")
+    try:
+        base = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    instances = []
+    for index in range(CONCURRENT):
+        definition = copy.deepcopy(base)
+        # Only the project id differs; the name, Machine name and resources are
+        # deliberately identical across all three.
+        definition["project_id"] = "prj_" + uuid.uuid4().hex
+        instances.append(provision(ctx, check, f"concurrent-{index}", definition))
+        if check.status != "PASS":
+            break
+    live = [row for row in instances if row["status"]]
+    check.check(len(live) == CONCURRENT, f"{len(live)} of {CONCURRENT} Environments reached a readable status")
+    if len(live) == CONCURRENT:
+        identities = {"project": [], "environment": [], "machine": [], "context": [], "endpoint": [], "engine": []}
+        for row in live:
+            payload = row["status"]
+            environments = payload.get("environments") or []
+            check.check(len(environments) == 1, f"each project reports exactly one Environment (observed {len(environments)})")
+            if len(environments) != 1:
+                break
+            environment = environments[0]
+            machines = environment.get("machines") or []
+            check.check(len(machines) == 1 and environment.get("state") == "ready",
+                        f"one ready Machine per Environment (observed {len(machines)}, state {environment.get('state')!r})")
+            if len(machines) != 1:
+                break
+            context = machines[0].get("docker_context") or {}
+            identities["project"].append(payload.get("project_id"))
+            identities["environment"].append(environment.get("environment_id"))
+            identities["machine"].append(machines[0].get("machine_id"))
+            identities["context"].append(context.get("name"))
+            identities["endpoint"].append(context.get("endpoint"))
+            # A shared Engine would be the most direct collision of all.
+            identities["engine"].append(context.get("engine_id"))
+            # The repeated declarations are the point: names collide by design.
+            check.check(environment.get("name") == "default" and machines[0].get("name") == "machine-0",
+                        f"declared names repeat across instances (observed {environment.get('name')!r}/{machines[0].get('name')!r})")
+        for kind, values in identities.items():
+            present = [value for value in values if value]
+            check.check(len(present) == CONCURRENT and len(set(present)) == CONCURRENT,
+                        f"{kind} identities are distinct across the three Environments ({len(set(present))} of {CONCURRENT})")
+    if check.status == "PASS":
+        for index, row in enumerate(instances):
+            removed = ctx.run(check, f"concurrent-{index}-delete",
+                              ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                              cwd=row["project"], env=row["env"], timeout=DELETE_TIMEOUT)
+            check.check(removed.exit_code == 0, f"concurrent-{index}: delete exit {removed.exit_code} (expected 0)")
+    return check.finish()
+
+
 def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
     """A real `vz up` from a bare definition must create the `default` Environment.
 
@@ -597,5 +703,9 @@ def check_status_field_set(top: str) -> SubCheck:
 
 def check_grpc_agreement(top: str) -> SubCheck:
     check = SubCheck(top, "grpc_api_live_agreement")
-    check.not_implemented = "CLI vs typed gRPC/API agreement over a live topology (identities, transitions, events, receipts) needs Machines."
+    # The lane provisions now, so Machines are no longer what blocks this. What
+    # is missing is a typed gRPC client: agreement must be observed over the
+    # daemon's own channel, not inferred from the CLI's JSON of the same state.
+    check.not_implemented = ("CLI vs typed gRPC/API agreement (identities, transitions, events, receipts) needs a pinned "
+                             "gRPC client for the daemon channel; the lane provisions Machines but speaks only the CLI.")
     return check.finish()
