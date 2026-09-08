@@ -242,6 +242,19 @@ impl RuntimeDaemon {
             Ok(())
         })
         .map_err(state_error)?;
+        // Every switch is started and every port minted here, before the first
+        // boot. `NetworkSwitch::start` fixes a network's membership when it is
+        // constructed and a guest descriptor must exist before `LinuxVm::create`,
+        // so a port cannot be minted inside the loop that boots the Machine
+        // holding it.
+        let mut fabric = self
+            .install_environment_fabric(
+                prepared.lease(),
+                &environment,
+                &existing.keys().cloned().collect(),
+            )
+            .await
+            .map_err(|error| backend_error(error.to_string()))?;
         let mut first_error = None;
         let mut uncertain = false;
         for step in operation.machine_steps.clone() {
@@ -253,6 +266,9 @@ impl RuntimeDaemon {
                 .iter()
                 .find(|machine| machine.machine_id == step.machine_id)
                 .ok_or_else(|| backend_error("Up sibling vanished".into()))?;
+            // Taken, not borrowed: a guest end handed to a boot that does not
+            // happen must not be usable again.
+            let attachments = fabric.remove(&step.machine_id).unwrap_or_default();
             let result:Result<MachineActivationEvidence,MachineError>=async {
                 if tokio::time::Instant::now()>=deadline { return Err(failure(&metadata,MachineErrorCode::Timeout,"Up deadline elapsed; no further Machine effects admitted")); }
                 self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
@@ -275,7 +291,7 @@ impl RuntimeDaemon {
                     }
                     self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                     self.with_state_store(|store|store.consume_machine_boot_non_dispatch(&operation,&step.machine_id)).map_err(state_error)?;
-                    let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,vec![],StackResourceHint {
+                    let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,vec![],attachments,StackResourceHint {
                         cpus:Some(cpus),memory_mb:Some(memory_mb),..Default::default()
                     }).await {
                         Ok(activation)=>(Arc::new(activation),None),
