@@ -336,13 +336,25 @@ message MachineInstance {
   optional MachineDockerContextDescriptor docker_context = 16;
 }
 
+// Persisted network identity and its declared L2/L3 shape.
+//
+// `kind` and `cidr` are carried verbatim from the declaration because the
+// runtime derives per-attachment host addresses from `cidr` and decides
+// external reachability from `kind`; neither can be recovered from identity.
 message NetworkInstance {
   uint32 schema_version = 1;
   string network_id = 2;
   string environment_id = 3;
   string name = 4;
+  NetworkKind kind = 5;
+  optional string cidr = 6;
 }
 
+// Persisted endpoint identity and the exact service coordinate it names.
+//
+// `protocol`, `port` and `hostname` are persisted so resolution and
+// reconciliation can answer which port an endpoint names without re-reading
+// the project definition.
 message EndpointInstance {
   uint32 schema_version = 1;
   string endpoint_id = 2;
@@ -350,6 +362,9 @@ message EndpointInstance {
   string machine_id = 4;
   string network_id = 5;
   string name = 6;
+  EndpointProtocol protocol = 7;
+  uint32 port = 8;
+  optional string hostname = 9;
 }
 
 message NetworkAttachmentInstance {

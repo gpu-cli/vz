@@ -810,6 +810,8 @@ pub fn network_instance_to_proto(network: &NetworkInstance) -> runtime_v2::Netwo
         network_id: network.network_id.to_string(),
         environment_id: network.environment_id.to_string(),
         name: network.name.clone(),
+        kind: network_kind_to_proto(network.kind) as i32,
+        cidr: network.cidr.clone(),
     }
 }
 
@@ -822,6 +824,8 @@ pub fn network_instance_from_proto(
         network_id: NetworkId::new(network.network_id.clone())?,
         environment_id: EnvironmentId::new(network.environment_id.clone())?,
         name: network.name.clone(),
+        kind: network_kind_from_proto(network.kind)?,
+        cidr: network.cidr.clone(),
     })
 }
 
@@ -834,10 +838,13 @@ pub fn endpoint_instance_to_proto(endpoint: &EndpointInstance) -> runtime_v2::En
         machine_id: endpoint.machine_id.to_string(),
         network_id: endpoint.network_id.to_string(),
         name: endpoint.name.clone(),
+        protocol: endpoint_protocol_to_proto(endpoint.protocol) as i32,
+        port: u32::from(endpoint.port),
+        hostname: endpoint.hostname.clone(),
     }
 }
 
-/// Decode a persisted endpoint identity.
+/// Decode a persisted endpoint identity, rejecting ports outside the domain width.
 pub fn endpoint_instance_from_proto(
     endpoint: &runtime_v2::EndpointInstance,
 ) -> Result<EndpointInstance, TranslationError> {
@@ -848,6 +855,12 @@ pub fn endpoint_instance_from_proto(
         machine_id: MachineId::new(endpoint.machine_id.clone())?,
         network_id: NetworkId::new(endpoint.network_id.clone())?,
         name: endpoint.name.clone(),
+        protocol: endpoint_protocol_from_proto(endpoint.protocol)?,
+        port: u16::try_from(endpoint.port).map_err(|_| TranslationError::InvalidValue {
+            field: "endpoint_instance.port",
+            value: endpoint.port.to_string(),
+        })?,
+        hostname: endpoint.hostname.clone(),
     })
 }
 
@@ -3566,12 +3579,16 @@ mod tests {
                     network_id: private_network_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "private".to_string(),
+                    kind: NetworkKind::Private,
+                    cidr: Some("10.44.0.0/24".to_string()),
                 },
                 NetworkInstance {
                     schema_version: V,
                     network_id: public_network_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "public-like".to_string(),
+                    kind: NetworkKind::SimulatedPublic,
+                    cidr: Some("198.18.44.0/24".to_string()),
                 },
             ],
             endpoints: vec![EndpointInstance {
@@ -3581,6 +3598,9 @@ mod tests {
                 machine_id: linux_id.clone(),
                 network_id: public_network_id.clone(),
                 name: "web".to_string(),
+                protocol: EndpointProtocol::Https,
+                port: 8443,
+                hostname: Some("web.test".to_string()),
             }],
             ownership: vec![
                 OwnershipRecord {

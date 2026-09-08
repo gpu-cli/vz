@@ -260,6 +260,22 @@
       "receipt_field": "receipts.schema.environment_network_v10"
     },
     {
+      "id": "mig.schema.environment_addressing_v11",
+      "domain": "schema",
+      "component": "vz-stack state store Environment addressing v11 migration",
+      "source_reference": "crates/vz-stack/src/state_store/topology.rs migrate_environment_addressing_v10_to_v11, EnvironmentAddressingV11MigrationStage::PreV11RecordsRefused, EnvironmentAddressingV11MigrationFailpoint::AfterPreV11RecordsRefused",
+      "pre_state": "user_version 10; environment_networks records only network identity and environment_endpoints only endpoint identity, so persisted state cannot answer which kind, CIDR, protocol or port a declaration named",
+      "post_state": "user_version advanced to 11 in one immediate transaction after proving no environment_networks or environment_endpoints row carries a pre-v11 record; the SQL shape is unchanged because v11 widens the persisted instance_json rather than the table, so validate_v11_schema still holds and no row is rewritten",
+      "failure_injection": "abort at EnvironmentAddressingV11MigrationFailpoint::AfterPreV11RecordsRefused, after the pre-v11 record scan passes and before the schema is validated and the version advanced",
+      "expected_failure_state": "the transaction rolls back, so the application schema snapshot is byte-identical to the pre-migration one and user_version is still 10; reopening the store migrates it to 11 and the pre-v11 project aggregate loads unchanged",
+      "rollback_assertion": "restoring the backup returns user_version to 10 with every row byte-identical, since the migration writes no row and refuses outright when it finds one whose kind, protocol or port it cannot honestly supply",
+      "state_schema_step": {
+        "from": 10,
+        "to": 11
+      },
+      "receipt_field": "receipts.schema.environment_addressing_v11"
+    },
+    {
       "id": "mig.filesystem.legacy_checkpoint_archive",
       "domain": "filesystem",
       "component": "vz-runtimed legacy checkpoint artifact archival",
