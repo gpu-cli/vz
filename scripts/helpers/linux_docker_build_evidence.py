@@ -11,6 +11,7 @@ import json
 from pathlib import Path
 import re
 
+import linux_docker_artifact_layout as layout
 from linux_docker_compose_evidence import (
     Invalid, MAX, Replay as ComposeReplay, decode, fixture_digest, hex64,
     manifest, read, require, runtime_proof, sha, unique,
@@ -30,6 +31,19 @@ REMAINING = [
 ]
 EXPORTS = {"alpha": "payload.txt", "alpha-reuse": "payload.txt", "beta": "payload.txt",
            "cache-cold": "cache.txt", "cache-warm": "cache.txt", "secret": "secret.txt"}
+# The digest-addressed export of the same alpha content, and the alpha solves
+# BuildKit is expected to serve from cache rather than re-execute.
+OCI_EXPORTS = {"alpha-oci": "payload.txt"}
+OCI_OPTIONS = ",tar=false,oci-mediatypes=true,compression=gzip,force-compression=true"
+CACHED_ALPHA = {"alpha-reuse", "alpha-oci"}
+
+
+def _layout_files(root, prefix):
+    """Every retained file of an OCI layout, relative to the evidence directory."""
+    if not root.is_dir():
+        return []
+    return sorted(prefix + "/" + path.relative_to(root).as_posix()
+                  for path in root.rglob("*") if path.is_file() and not path.is_symlink())
 
 
 def progress_timestamp(value):
@@ -241,10 +255,14 @@ class Replay:
         self.owner = "vz04-" + sha(json.dumps([inputs["run_id"], self.scope], sort_keys=True).encode())[:24]
         self.rows, self.acknowledged, self.i, self.fixture = [], set(), 0, None
         self.builder_process = None
-        require(type(result["command_count"]) is int and result["command_count"] == 39,
-                "expected four initial observations and seven five-command builds")
+        require(type(result["command_count"]) is int and result["command_count"] == 44,
+                "expected four initial observations and eight five-command builds")
         expected = {"inputs.json", "result.json", "compose-owner.json"}
         expected.update("export-" + suffix + "/" + name for suffix, name in EXPORTS.items())
+        # The OCI layout is a tree of digest-named blobs, walked by validate_oci
+        # rather than named file by file here.
+        expected.update(path for suffix in OCI_EXPORTS
+                        for path in _layout_files(self.directory / ("export-" + suffix), "export-" + suffix))
         previous = 0
         for index in range(1, result["command_count"] + 1):
             stem = f"command-{index:05d}"
@@ -357,7 +375,7 @@ class Replay:
         require(self.builder_process is None or self.builder_process == identity, "builder process changed between recipes")
         self.builder_process = identity
 
-    def build(self, suffix, dockerfile, arguments, extra=None, code=0):
+    def build(self, suffix, dockerfile, arguments, extra=None, code=0, oci=False):
         self.builder_guard()
         actual = self.rows[self.i]["_args"]
         require(len(actual) > 10 and actual[8] == "--file", "missing Dockerfile")
@@ -378,7 +396,9 @@ class Replay:
         require(fixture == self.fixture, "mixed fixture roots")
         require(fixture_digest(fixture) == self.inputs["fixture_sha256"], "fixture changed between builds")
         args = ["buildx", "build", "--builder", self.builder["name"], "--platform", "linux/arm64", "--progress", "rawjson",
-                "--file", str(fixture / "build" / dockerfile), "--output", "type=local,dest=" + str(self.directory / ("export-" + suffix)),
+                "--file", str(fixture / "build" / dockerfile), "--output",
+                ("type=oci,dest=" + str(self.directory / ("export-" + suffix)) + OCI_OPTIONS) if oci
+                else ("type=local,dest=" + str(self.directory / ("export-" + suffix))),
                 "--build-arg", "FIXTURE_BASE=" + self.inputs["images"]["base"]["reference"]]
         for key, value in sorted(arguments.items()):
             args += ["--build-arg", key + "=" + value]
@@ -388,13 +408,16 @@ class Replay:
         require(self.secret not in logs, "secret leaked into decoded BuildKit logs")
         if code == 0:
             require(all(not x.get("error") for x in vertices), "successful build contains error")
-        if dockerfile == "Dockerfile":
-            proof = payload_graph(row["_stderr"], self.inputs["images"]["base"]["reference"], suffix == "alpha-reuse")
+        # The payload graph describes the local exporter's stages; the digest
+        # exporter emits its own, so its solve is bound by argv and secret scan
+        # only, and `oci_export` proves what it produced.
+        if dockerfile == "Dockerfile" and not oci:
+            proof = payload_graph(row["_stderr"], self.inputs["images"]["base"]["reference"], suffix in CACHED_ALPHA)
             require(proof["solve_started_ns"] >= self.build_engine_ns, "payload predates authenticated Engine clock")
             binding = list(row["_args"])
             # Exact argv was checked above; normalize only its known output
             # destination. Fixture bytes and all other arguments remain bound.
-            binding[11] = "type=local,dest=<selected-export>"
+            binding[11] = ("type=oci,dest=<selected-export>" + OCI_OPTIONS) if oci else "type=local,dest=<selected-export>"
             prior = getattr(self, "payload_proof", None)
             if prior is not None:
                 require(proof["normalized"] == prior["normalized"] and proof["base_digest"] == prior["base_digest"],
@@ -402,7 +425,12 @@ class Replay:
                 require(proof["solve_started_ns"] >= prior["solve_last_observed_ns"], "stale cross-solve payload progress")
                 if suffix == "alpha-reuse":
                     require(binding == self.payload_binding, "cache reuse command/source changed")
-            self.payload_proof, self.payload_binding = proof, binding
+            self.payload_proof = proof
+            # The reuse build is compared to the local alpha dispatch; the OCI
+            # export of the same content differs only in its exporter, so it must
+            # not become the baseline for that comparison.
+            if not oci:
+                self.payload_binding = binding
             self.payload_completed_ns = proof["solve_last_observed_ns"]
         return vertices
 
@@ -422,6 +450,21 @@ class Replay:
                 "invalid RUN completion timestamp")
         progress_timestamp(value["completed"])
         return value["digest"]
+
+    def oci_export(self, suffix, payload):
+        """Re-validate the digest-addressed layout from the retained bytes.
+
+        The driver's own `validate_oci` proof is not taken on trust: the layout
+        is walked again here, so the manifest, config and layer digests are
+        recomputed from the retained blobs by a second reader.
+        """
+        root = self.directory / ("export-" + suffix)
+        proof = layout.validate_oci(root, expected_path=OCI_EXPORTS[suffix],
+                                    expected_sha256=sha(payload), expected_size=len(payload))
+        require(proof["manifest"]["mediaType"] == layout.MANIFEST, "OCI export is not an image manifest")
+        require(proof["config"]["digest"].startswith("sha256:") and proof["manifest"]["digest"].startswith("sha256:"),
+                "OCI export is not digest-addressed")
+        return proof
 
     def export(self, suffix, payload):
         name = "export-" + suffix + "/" + EXPORTS[suffix]
@@ -444,6 +487,8 @@ class Replay:
             rows = self.build("alpha", "Dockerfile", args)
             self.export("alpha", b"vz04-build-v1\nvariant=alpha\n")
             self.vertex(rows, "python3 /fixture/tools.py payload")
+            self.build("alpha-oci", "Dockerfile", args, ["--provenance=false", "--sbom=false"], oci=True)
+            self.oci_export("alpha-oci", b"vz04-build-v1\nvariant=alpha\n")
         with self.observation(1):
             rows = self.build("alpha-reuse", "Dockerfile", args)
             self.export("alpha-reuse", b"vz04-build-v1\nvariant=alpha\n")
@@ -467,7 +512,7 @@ class Replay:
             require(any(isinstance(x.get("error"), str) and "secret" in x["error"] and "fixture" in x["error"]
                         and ("not found" in x["error"] or "required" in x["error"]) for x in rows), "negative secret failed for another reason")
             require(not (self.directory / "export-secret-missing").exists(), "failed build exported output")
-        require(self.i == len(self.rows) and self.acknowledged == {39}, "unconsumed commands or unreconciled mutation")
+        require(self.i == len(self.rows) and self.acknowledged == {44}, "unconsumed commands or unreconciled mutation")
         return {"schema_version": 1, "kind": "installed_build_raw_evidence", "outcome": "fixture_assertions_passed",
                 "scope": self.scope, "builder": self.builder, "recipes_validated": list(RECIPES), "command_count": self.i,
                 "compatibility_certified": False, "release_scenarios_passed": [], "owned_projects": {},

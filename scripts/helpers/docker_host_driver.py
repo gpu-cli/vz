@@ -34,6 +34,8 @@ import sys
 import time
 from typing import Any
 
+import linux_docker_artifact_layout as layout
+
 
 MAX_STREAM_BYTES = 4 * 1024 * 1024
 BUILD_RECIPES = ("build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount")
@@ -55,6 +57,10 @@ COMPOSE_UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wa
 # project for new containers regardless of running state (observed on the
 # installed clients, candidate 5), so follow never terminates deterministically.
 # No timestamps: the fixture services print exactly their startup lines.
+# A digest-addressed export needs the same exporter options the artifact suite
+# pins, and no attestation blobs: `validate_oci` fails closed on those.
+OCI_OPTIONS = ",tar=false,oci-mediatypes=true,compression=gzip,force-compression=true"
+OCI_FLAGS = ["--provenance=false", "--sbom=false"]
 COMPOSE_LOGS = ["logs", "--no-color"]
 COMPOSE_LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
 COMPOSE_GLOBAL_OPTIONS = {"--project-name", "--file", "--profile"}
@@ -1221,7 +1227,7 @@ class Driver:
         self._builder_process = identity
 
     def build(self, suffix: str, dockerfile: str, arguments: dict[str, str], *,
-              extra: list[str] | None = None, expected: int | None = 0) -> tuple[Command, Path]:
+              extra: list[str] | None = None, expected: int | None = 0, oci: bool = False) -> tuple[Command, Path]:
         self.builder_guard()
         require(isinstance(getattr(self, "_engine_system_time", None), str), "missing build Engine clock")
         engine_ns = build_timestamp(self._engine_system_time)
@@ -1231,9 +1237,10 @@ class Driver:
         require(tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "fixture changed")
         dest = self.output / ("export-" + suffix)
         require(not dest.exists(), "build destination already exists")
+        output = ("type=oci,dest=" + str(dest) + OCI_OPTIONS) if oci else ("type=local,dest=" + str(dest))
         args = ["buildx", "build", "--builder", self.inputs.raw["builder"]["name"], "--platform", "linux/arm64",
                 "--progress", "rawjson", "--file", str(self.fixture / "build" / dockerfile),
-                "--output", "type=local,dest=" + str(dest), "--build-arg",
+                "--output", output, "--build-arg",
                 "FIXTURE_BASE=" + self.inputs.raw["images"]["base"]["reference"]]
         for key, value in sorted(arguments.items()):
             args.extend(["--build-arg", key + "=" + value])
@@ -1259,7 +1266,16 @@ class Driver:
             require(result.build_engine_ns <= first_graph[0]["solve_started_ns"], "payload predates authenticated Engine observation")
             self._last_payload_graph = first_graph[0]
             first_result.append(result)
-            return ["local final stage contains only exact alpha payload", "payload vertex actually executed"]
+            # The same content again as a digest-addressed OCI layout: the local
+            # export proves the bytes, only this proves they are addressed by a
+            # digest that the layout itself recomputes to.
+            _, oci_dest = self.build("alpha-oci", "Dockerfile", arguments, extra=OCI_FLAGS, oci=True)
+            payload = expected["build_alpha"].encode()
+            proof = layout.validate_oci(oci_dest, expected_path=self.fixture_spec["expected"]["final_stage_files"]["multi_stage"][0],
+                                        expected_sha256=sha256(payload), expected_size=len(payload))
+            return ["local final stage contains only exact alpha payload", "payload vertex actually executed",
+                    "OCI export addresses the same payload by manifest digest " + proof["manifest"]["digest"] +
+                    " over config " + proof["config"]["digest"]]
 
         self.observe("build-multi-stage", ["docker.build.multi_stage", "docker.build.output_export"], stage)
 
@@ -1614,8 +1630,12 @@ def bind_build_command(argv: list[str], expected: list[str], destination: Path,
     require(argv.count("--output") == 1, "ambiguous build output")
     normalized = list(argv)
     index = normalized.index("--output") + 1
-    require(normalized[index] == "type=local,dest=" + str(destination), "foreign build destination")
-    normalized[index] = "type=local,dest=<owned-export>"
+    # Both exporters write into the run's own destination; only the kind differs,
+    # and the digest-addressed one keeps its exporter options bound.
+    accepted = {"type=local,dest=" + str(destination): "type=local,dest=<owned-export>",
+                "type=oci,dest=" + str(destination) + OCI_OPTIONS: "type=oci,dest=<owned-export>" + OCI_OPTIONS}
+    require(normalized[index] in accepted, "foreign build destination")
+    normalized[index] = accepted[normalized[index]]
     checked_text(fixture_digest, r"[0-9a-f]{64}", "fixture digest")
     return {"argv": normalized, "fixture_sha256": fixture_digest, "dockerfile_sha256": sha256(dockerfile)}
 

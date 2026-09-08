@@ -15,6 +15,7 @@ from unittest.mock import patch
 
 import docker_host_driver as driver
 import linux_docker_build_evidence as evidence
+from test_linux_docker_artifact_layout import Fixture as _OciFixture
 from test_linux_docker_compose_evidence import SyntheticEngine, data
 
 
@@ -45,7 +46,9 @@ class SyntheticBuilder(SyntheticEngine):
             return subprocess.CompletedProcess(argv, 0, out, b"")
         if args[:2] != ["buildx", "build"]:
             return super().__call__(argv, **kwargs)
-        dest = Path(args[args.index("--output") + 1].removeprefix("type=local,dest="))
+        output = args[args.index("--output") + 1]
+        oci = output.startswith("type=oci,")
+        dest = Path(output.split("dest=", 1)[1].split(",", 1)[0] if oci else output.removeprefix("type=local,dest="))
         suffix = dest.name.removeprefix("export-")
         seconds = getattr(self, "solve_count", 0) * 10
         self.solve_count = getattr(self, "solve_count", 0) + 1
@@ -59,10 +62,10 @@ class SyntheticBuilder(SyntheticEngine):
             error = vertex("--mount=type=secret,id=fixture,required=true python3 /fixture/tools.py secret", "secret")
             error["error"] = "secret fixture: not found"
             return subprocess.CompletedProcess(argv, 1, b"", data({"vertexes": [error]}) + b"\nERROR: failed to build: failed to solve: secret fixture: not found\n")
-        if suffix in {"alpha", "alpha-reuse", "beta"}:
+        if suffix in {"alpha", "alpha-reuse", "alpha-oci", "beta"}:
             variant = "beta" if suffix == "beta" else "alpha"
             payload = f"vz04-build-v1\nvariant={variant}\n".encode()
-            hit = suffix == "alpha-reuse"
+            hit = suffix in {"alpha-reuse", "alpha-oci"}
             ids = {role: "sha256:" + self.identity("base" if role == "base" else suffix + role)
                    for role in ("base", "context", "copy", "run", "output")}
             names = {"base": "[build 1/3] FROM " + self.inputs.raw["images"]["base"]["reference"],
@@ -85,7 +88,12 @@ class SyntheticBuilder(SyntheticEngine):
         else:
             payload = b"vz04-secret-mount-ok-v1\n"
             vertices = [vertex("python3 /fixture/tools.py secret", "secret"), vertex("test ! -e /run/secrets/fixture", "secret-absent")]
-        dest.mkdir(); (dest / evidence.EXPORTS[suffix]).write_bytes(payload)
+        dest.mkdir()
+        if oci:
+            # A real digest-addressed layout: validate_oci recomputes every blob.
+            _OciFixture(dest, payload=payload).write()
+        else:
+            (dest / evidence.EXPORTS[suffix]).write_bytes(payload)
         batch = {"vertexes": vertices}
         if suffix in ("alpha", "beta"):
             batch["logs"] = [{"vertex": ids["run"], "stream": 1, "timestamp": self.stamp(seconds + 3.5),
@@ -171,7 +179,7 @@ class BuildEvidenceTests(unittest.TestCase):
 
     def test_complete_synthetic_suite_is_scoped_not_certified(self):
         report = evidence.validate(self.directory, self.inputs)
-        self.assertEqual(report["command_count"], 39)
+        self.assertEqual(report["command_count"], 44)
         self.assertEqual(report["recipes_validated"], list(evidence.RECIPES))
         self.assertFalse(report["compatibility_certified"])
         self.assertEqual(report["builder_cleanup_scope"], "parent_harness_required")
@@ -234,11 +242,11 @@ class BuildEvidenceTests(unittest.TestCase):
                 self.raw(8, "stdout", lambda _, value=changed: data(value)); self.rejected()
 
     def test_resealed_builder_process_replacement_between_recipes(self):
-        original = json.loads((self.directory / "command-00013.stdout").read_bytes())
+        original = json.loads((self.directory / "command-00018.stdout").read_bytes())
         for key, value in (("Pid", 738), ("StartedAt", "2026-09-06T05:50:58.314727448Z")):
             with self.subTest(key=key):
                 changed = copy.deepcopy(original); changed[0]["State"][key] = value
-                self.raw(13, "stdout", lambda _, value=changed: data(value)); self.rejected()
+                self.raw(18, "stdout", lambda _, value=changed: data(value)); self.rejected()
 
     def test_intent_drift(self):
         self.change("command-00009.intent.json", lambda x: x["argv"].append("--load")); self.rejected()
@@ -259,13 +267,13 @@ class BuildEvidenceTests(unittest.TestCase):
         self.raw(9, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"cached": True}]})); self.rejected()
 
     def test_cache_reuse_wrong_vertex(self):
-        self.raw(14, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"digest": "sha256:" + "9" * 64}]})); self.rejected()
+        self.raw(19, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"digest": "sha256:" + "9" * 64}]})); self.rejected()
 
     def test_cache_boolean_not_integer(self):
-        self.raw(14, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"cached": 1}]})); self.rejected()
+        self.raw(19, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"cached": 1}]})); self.rejected()
 
     def test_beta_did_not_execute(self):
-        self.raw(19, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"cached": True}]})); self.rejected()
+        self.raw(24, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"cached": True}]})); self.rejected()
 
     def test_export_marker_corruption(self):
         (self.directory / "export-beta/payload.txt").write_bytes(b"alpha"); self.refresh(); self.rejected()
@@ -277,17 +285,17 @@ class BuildEvidenceTests(unittest.TestCase):
         p = self.directory / "export-cache-warm/cache.txt"; p.write_bytes(p.read_bytes().replace(b"owner=vz04-", b"owner=foreign-")); self.refresh(); self.rejected()
 
     def test_secret_mount_next_run_missing(self):
-        self.raw(34, "stderr", lambda b: data({"vertexes": json.loads(b)["vertexes"][:1]})); self.rejected()
+        self.raw(39, "stderr", lambda b: data({"vertexes": json.loads(b)["vertexes"][:1]})); self.rejected()
 
     def test_secret_leak_rehashed_raw(self):
         secret = (self.fixture / "inputs/secret.txt").read_bytes().decode().strip()
-        self.raw(34, "stderr", lambda b: b + data({"name": secret}) + b"\n"); self.rejected()
+        self.raw(39, "stderr", lambda b: b + data({"name": secret}) + b"\n"); self.rejected()
 
     def test_secret_leak_split_base64_logs(self):
         secret = (self.fixture / "inputs/secret.txt").read_bytes().strip()
         half = len(secret) // 2
         logs = [data({"logs": [{"data": base64.b64encode(part).decode()}]}) for part in (secret[:half], secret[half:])]
-        self.raw(34, "stderr", lambda b: b + b"\n".join(logs) + b"\n"); self.rejected()
+        self.raw(39, "stderr", lambda b: b + b"\n".join(logs) + b"\n"); self.rejected()
 
     def test_copy_named_like_payload_cannot_replace_run(self):
         self.raw(9, "stderr", lambda b: data({"vertexes": [json.loads(b)["vertexes"][0] | {"name": "COPY python3 /fixture/tools.py payload"}]})); self.rejected()
@@ -314,7 +322,7 @@ class BuildEvidenceTests(unittest.TestCase):
 
     def test_distinct_solve_ids_preserve_content_operation_identity(self):
         a = json.loads((self.directory / "command-00009.stderr").read_bytes())
-        b = json.loads((self.directory / "command-00014.stderr").read_bytes())
+        b = json.loads((self.directory / "command-00019.stderr").read_bytes())
         self.assertNotEqual(a["vertexes"][0]["digest"], b["vertexes"][0]["digest"])
         evidence.validate(self.directory, self.inputs)
 
@@ -362,33 +370,33 @@ class BuildEvidenceTests(unittest.TestCase):
                 self.raw(9, "stderr", lambda _, value=value: data(value)); self.rejected()
 
     def test_cached_run_cannot_replay_execution_logs(self):
-        value = json.loads((self.directory / "command-00014.stderr").read_bytes())
+        value = json.loads((self.directory / "command-00019.stderr").read_bytes())
         value["logs"] = [{"vertex": value["vertexes"][0]["digest"], "stream": 1,
                           "timestamp": value["vertexes"][0]["started"],
                           "data": base64.b64encode(b"vz04-payload-step-executed\n").decode()}]
-        self.raw(14, "stderr", lambda _: data(value)); self.rejected()
+        self.raw(19, "stderr", lambda _: data(value)); self.rejected()
 
     def test_resealed_cached_graph_cannot_predate_its_engine_clock(self):
-        value = json.loads((self.directory / "command-00014.stderr").read_bytes())
+        value = json.loads((self.directory / "command-00019.stderr").read_bytes())
         for vertex in value["vertexes"]:
             for key in ("started", "completed"):
                 vertex[key] = (evidence.progress_timestamp(vertex[key]) - timedelta(seconds=10)).isoformat()
-        self.raw(14, "stderr", lambda _: data(value)); self.rejected()
+        self.raw(19, "stderr", lambda _: data(value)); self.rejected()
 
     def test_resealed_base_digest_drift_rejected_despite_connected_graph(self):
-        value = json.loads((self.directory / "command-00014.stderr").read_bytes())
+        value = json.loads((self.directory / "command-00019.stderr").read_bytes())
         value["vertexes"][1]["digest"] = "sha256:" + "8" * 64
         value["vertexes"][3]["inputs"][0] = "sha256:" + "8" * 64
-        self.raw(14, "stderr", lambda _: data(value)); self.rejected()
+        self.raw(19, "stderr", lambda _: data(value)); self.rejected()
 
     def test_resealed_same_input_command_cannot_change_variant(self):
-        for name in ("command-00014.json", "command-00014.intent.json"):
+        for name in ("command-00019.json", "command-00019.intent.json"):
             self.change(name, lambda value: value.update(argv=[x.replace("FIXTURE_VARIANT=alpha", "FIXTURE_VARIANT=beta")
                                                              for x in value["argv"]]))
         self.rejected()
 
     def test_resealed_engine_clock_cannot_precede_previous_run_end(self):
-        self.raw(11, "stdout", lambda raw: data(dict(json.loads(raw), SystemTime="2026-09-06T06:00:03Z")))
+        self.raw(16, "stdout", lambda raw: data(dict(json.loads(raw), SystemTime="2026-09-06T06:00:03Z")))
         self.rejected()
 
     def test_future_output_stage_rejected_by_next_engine_clock(self):
@@ -407,10 +415,10 @@ class BuildEvidenceTests(unittest.TestCase):
         self.raw(9, "stderr", lambda _: data(value)); self.rejected()
 
     def test_cached_progress_cannot_regress_then_recover(self):
-        value = json.loads((self.directory / "command-00014.stderr").read_bytes())
+        value = json.loads((self.directory / "command-00019.stderr").read_bytes())
         early = dict(value["vertexes"][0]); early.pop("completed")
         value["vertexes"] = [early, dict(early, cached=False)] + value["vertexes"]
-        self.raw(14, "stderr", lambda _: data(value)); self.rejected()
+        self.raw(19, "stderr", lambda _: data(value)); self.rejected()
 
     def test_future_unfinished_source_update_is_bounded_by_next_engine_clock(self):
         value = json.loads((self.directory / "command-00009.stderr").read_bytes())
@@ -437,22 +445,22 @@ class BuildEvidenceTests(unittest.TestCase):
                 self.raw(9, "stderr", lambda _, value=changed: data(value)); self.rejected()
 
     def test_negative_error_wrong_reason(self):
-        self.raw(39, "stderr", lambda b: data({"error": "network unavailable"})); self.rejected()
+        self.raw(44, "stderr", lambda b: data({"error": "network unavailable"})); self.rejected()
 
     def test_known_required_secret_source_excerpt_accepted(self):
         source = (self.fixture / "build/Dockerfile.secret").read_text().splitlines()
         excerpt = ["Dockerfile.secret:6", "--------------------"]
         excerpt += [f" {n:3d} | {'>>>' if n == 6 else '   '} {source[n - 1]}" for n in range(4, 9)]
         excerpt += ["--------------------", "ERROR: failed to build: failed to solve: secret fixture: not found"]
-        self.raw(39, "stderr", lambda b: b.splitlines()[0] + b"\n" + "\n".join(excerpt).encode() + b"\n")
+        self.raw(44, "stderr", lambda b: b.splitlines()[0] + b"\n" + "\n".join(excerpt).encode() + b"\n")
         evidence.validate(self.directory, self.inputs)
 
     def test_negative_plain_footer_is_not_vertex_proof(self):
-        self.raw(39, "stderr", lambda b: b.splitlines()[-1] + b"\n"); self.rejected()
+        self.raw(44, "stderr", lambda b: b.splitlines()[-1] + b"\n"); self.rejected()
 
     def test_negative_requires_exact_pinned_build_wrapper(self):
         footer = b"ERROR: failed to build: failed to solve: secret fixture: not found\n"
-        original = (self.directory / "command-00039.stderr").read_bytes()
+        original = (self.directory / "command-00044.stderr").read_bytes()
         self.assertTrue(original.endswith(footer))
         for replacement in (
                 b"ERROR: failed to solve: secret fixture: not found\n",
@@ -460,14 +468,14 @@ class BuildEvidenceTests(unittest.TestCase):
                 b"ERROR: unrelated failure: failed to solve: secret fixture: not found\n",
                 footer + footer, footer + b"unexpected trailing diagnostic\n"):
             with self.subTest(replacement=replacement):
-                self.raw(39, "stderr", lambda _, value=replacement: original[:-len(footer)] + value)
+                self.raw(44, "stderr", lambda _, value=replacement: original[:-len(footer)] + value)
                 self.rejected()
 
     def test_negative_missing_cli_footer(self):
-        self.raw(39, "stderr", lambda b: b.splitlines()[0] + b"\n"); self.rejected()
+        self.raw(44, "stderr", lambda b: b.splitlines()[0] + b"\n"); self.rejected()
 
     def test_negative_unrecognized_trailer(self):
-        self.raw(39, "stderr", lambda b: b + b"Unexpected unrelated failure\n"); self.rejected()
+        self.raw(44, "stderr", lambda b: b + b"Unexpected unrelated failure\n"); self.rejected()
 
     def test_negative_unrelated_structured_failure(self):
         def alter(b):
@@ -475,13 +483,13 @@ class BuildEvidenceTests(unittest.TestCase):
             vertex.update(name="[other 1/1] RUN false", error="network unavailable")
             value['vertexes'].append(vertex)
             return data(value) + b"\n" + b.splitlines()[-1] + b"\n"
-        self.raw(39, "stderr", alter); self.rejected()
+        self.raw(44, "stderr", alter); self.rejected()
 
     def test_negative_duplicate_terminal_error(self):
         def alter(b):
             value = json.loads(b.splitlines()[0]); value['vertexes'] *= 2
             return data(value) + b"\n" + b.splitlines()[-1] + b"\n"
-        self.raw(39, "stderr", alter); self.rejected()
+        self.raw(44, "stderr", alter); self.rejected()
 
     def test_flat_progress_shape_rejected(self):
         self.raw(9, "stderr", lambda b: data(json.loads(b)['vertexes'][0])); self.rejected()
@@ -496,10 +504,10 @@ class BuildEvidenceTests(unittest.TestCase):
         self.raw(9, "stderr", lambda b: b.replace(b"RUN --network=none python3", b"RUN --network=none echo python3")); self.rejected()
 
     def test_negative_failure_not_acknowledged(self):
-        (self.directory / "command-00039.acknowledgement.json").unlink(); self.refresh(); self.rejected()
+        (self.directory / "command-00044.acknowledgement.json").unlink(); self.refresh(); self.rejected()
 
     def test_negative_timeout_cannot_pass(self):
-        self.change("command-00039.json", lambda x: x.update(timed_out=True)); self.rejected()
+        self.change("command-00044.json", lambda x: x.update(timed_out=True)); self.rejected()
 
     def test_negative_export_cannot_pass(self):
         (self.directory / "export-secret-missing").mkdir(); self.rejected()

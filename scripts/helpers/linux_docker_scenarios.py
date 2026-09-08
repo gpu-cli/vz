@@ -146,7 +146,7 @@ TABLE = (
     # build: driver recipes on the embedded builder.
     _c("docker.build.cache_reuse", "build", "build-cache-reuse"),
     _c("docker.build.cache_isolation", "build", ("build-cache-mount", "verify_cache_isolation")),
-    _c("docker.build.output_export", "build", "build-multi-stage", "partial", ("oci_export_digest",)),
+    _c("docker.build.output_export", "build", ("build-multi-stage", "validate_oci")),
     _c("docker.build.multi_stage", "build", "build-multi-stage", "secondary"),
     _c("docker.build.build_arguments", "build", "build-arguments", "secondary"),
     _c("docker.build.secrets", "build", "build-secret-mount", "secondary"),
