@@ -1,0 +1,38 @@
+{
+  "bind": {
+    "container_to_host_bytes": 65,
+    "container_to_host_sha256": "c3700c93de3acbdf0602e91d3148af7b43a6d4dc2be9068ad988b1adc74da771",
+    "host_to_container_bytes": 4096,
+    "host_to_container_sha256": "c8f5d0341d54d951a71b136e6e2afcb14d11ed8489a7ae126a8fee0df6ecf193",
+    "input_name": "input",
+    "only_declared_workspace_visible": true,
+    "output_name": "output",
+    "undeclared_sibling": "undeclared"
+  },
+  "image": "developer-probe-rootfs.tar imported by the harness sentinel; no registry pull",
+  "ownership": {
+    "forbidden_write": "refused",
+    "gid": 10001,
+    "uid": 10001,
+    "writable_mount_write": "written"
+  },
+  "probe": {
+    "bytes": 2848,
+    "cases": ["bind", "ownership", "readonly", "tmpfs_recreate", "tmpfs_write", "volume_read", "volume_write"],
+    "interpreter": ["/bin/busybox", "sh", "-c"],
+    "path": "probe.sh",
+    "sha256": "ab68ad96992b947c66b1e7b134401c0b875f799bbd93d00934e21e6577487e4c"
+  },
+  "read_only": {
+    "declared_writable_mount_write": "written",
+    "readonly_mount_write": "refused",
+    "root_write": "refused"
+  },
+  "schema_version": 1,
+  "scope": "DEV_DOCKER_MOUNTS_FIXTURE_NOT_DOCKER_CERTIFICATION",
+  "tmpfs": {
+    "data_absent_after_recreate": true,
+    "filesystem_magic": "1021994",
+    "filesystem_type": "tmpfs"
+  }
+}

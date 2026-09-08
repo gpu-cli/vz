@@ -48,7 +48,7 @@ class TableTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.CoverageError, "neither claimed nor uncovered"):
             subject.check(uncovered=subject.UNCOVERED[1:], rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "both claimed and uncovered"):
-            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "mounts"),), rows=rows)
+            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "isolation"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "unknown gap suite"):
             subject.check(uncovered=subject.UNCOVERED[:-1] + ((subject.UNCOVERED[-1][0], "later"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "distinct manifest expected fields"):
@@ -58,8 +58,9 @@ class TableTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.CoverageError, "two primary"):
             subject.check(table=subject.TABLE + (subject._c("docker.engine.info", "limits", "x", "partial", ("default_runtime",)),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "secondary claim without a primary"):
-            subject.check(table=subject.TABLE + (subject._c("docker.storage.tmpfs", "limits", "x", "secondary"),),
-                          uncovered=tuple(u for u in subject.UNCOVERED if u[0] != "docker.storage.tmpfs"), rows=rows)
+            subject.check(table=subject.TABLE + (subject._c("docker.operation.concurrent_clients", "limits", "x", "secondary"),),
+                          uncovered=tuple(u for u in subject.UNCOVERED if u[0] != "docker.operation.concurrent_clients"),
+                          rows=rows)
 
     def test_module_declarations_come_from_the_table(self):
         self.assertEqual(subject.for_suite("limits"), ("docker.operation.resource_limits", "docker.operation.oom"))
@@ -75,8 +76,10 @@ class TableTests(unittest.TestCase):
         self.assertEqual(subject.for_recipe("build", "build-multi-stage"), ("docker.build.output_export", "docker.build.multi_stage"))
         with self.assertRaises(subject.CoverageError):
             subject.for_recipe("build", "compose-create")
+        # A planned gap suite has no claims until it is actually built.
         with self.assertRaises(subject.CoverageError):
-            subject.for_suite("mounts")
+            subject.for_suite("isolation")
+        self.assertEqual(len(subject.for_suite("mounts")), 5)
         for suite in subject.SUITES.values():
             self.assertIn(suite.process_scenario, subject.for_suite(suite.name))
         for suite in ("compose", "build"):
