@@ -79,30 +79,8 @@ def build_arguments(inputs, operation):
             "--network=none", str(fixture)]
 
 
-# The guard inspects the shared builder, and with the `docker-container` driver
-# that is an exec into the BuildKit container. Four slots inspecting at once are
-# four concurrent execs into one container, which is `vz-mzs.7.4`: one of them
-# comes back with a corrupted gRPC preface —
-#
-#   Error: listing workers: failed to list workers: Unavailable: connection
-#          error: desc = "error reading server preface: http2: frame too large"
-#
-# — and that slot never reaches the rendezvous, so the other three build and then
-# time out waiting for it. Candidates 27 and 29 both died that way.
-#
-# This scenario is `parallel BUILDS`. Serializing the guard keeps every build
-# concurrent and changes nothing the scenario asserts, while removing a
-# concurrency the scenario never meant to exercise. Concurrent exec is a real
-# product gap and is proved by `vz-mzs.7.1.18`, not smuggled in here.
-GUARD_LOCK = threading.Lock()
-
-
 class ParallelDriver(driver.Driver):
-    def guarded(self):
-        with GUARD_LOCK:
-            self.builder_guard()
-
-    def execute(self, operation, ready=None):
+    def execute(self, operation):
         require(self.record.count == 0, "parallel driver cannot be reused")
         require(operation == specification(operation["slot"], self.output, Path(operation["parallel_fixture"]),
                     operation["parallel_fixture_sha256"], self.inputs.raw["run_id"]), "parallel operation contract differs")
@@ -112,17 +90,9 @@ class ParallelDriver(driver.Driver):
         require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed before solve")
         startup.document(self.output / "inputs.json", self.inputs.raw)
         startup.document(self.output / "operation.intent.json", operation)
-        self.guarded()
-        # Rendezvous AFTER the guard, not before it. The guard is serialized, so
-        # a barrier ahead of it would let the first slot start building while the
-        # last was still waiting for the lock — and BuildKit forwards a shared
-        # vertex's progress into every solve that adopts it, so a slot would
-        # then see progress stamped before its own Engine clock lower bound.
-        # Guarding first and starting together keeps those bounds tight.
-        if ready is not None:
-            ready()
+        self.builder_guard()
         result = self.command(build_arguments(self.inputs.raw, operation), timeout=300)
-        self.guarded()
+        self.builder_guard()
         require(not result.stdout and self.record.count == 9, "parallel command inventory/output differs")
         require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed during solve")
         require(driver.tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "base fixture changed during parallel solve")
@@ -146,12 +116,11 @@ def execute_slots(selected, operations):
     require(len(selected) == len(operations) == 4, "exactly four slot drivers required")
     require([op["slot"] for op in operations] == list(SLOTS), "parallel slot order differs")
     require(len({id(item) for item in selected}) == 4, "parallel recorder reused")
-    # The guard is serialized, so the barrier allows for four of them in turn
-    # before the builds start together.
-    barrier = threading.Barrier(4, timeout=60)
+    barrier = threading.Barrier(4, timeout=10)
 
     def run(index):
-        return selected[index].execute(operations[index], ready=barrier.wait)
+        barrier.wait()
+        return selected[index].execute(operations[index])
 
     results, failures = [None] * 4, []
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vz-parallel-build") as executor:
