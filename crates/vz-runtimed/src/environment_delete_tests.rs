@@ -891,6 +891,53 @@ fn fabric_ownership_and_instances_must_correspond_exactly() {
     );
 }
 
+/// The expected-ownership comparison is only exact while `expected` holds no
+/// duplicate, and that property is enforced rather than assumed. Two persisted
+/// instances minting one identical record would otherwise let the length match
+/// an ownership list that carries an unaccounted resource in the spare slot.
+#[test]
+fn a_duplicated_expected_record_cannot_absorb_an_unaccounted_resource() {
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    let mut environment = fixture.first().clone();
+    // Two NetworkInstances with one identity: `expected` gains a second,
+    // identical Network record without the ownership list growing.
+    let duplicate = environment.networks[0].clone();
+    environment.networks.push(duplicate);
+    // The slot that duplicate would otherwise account for, filled by a kind
+    // Delete has no adapter for.
+    environment.ownership.push(OwnershipRecord {
+        schema_version: 1,
+        resource_kind: OwnedResourceKind::Fault,
+        resource_id: "unaccounted-behind-a-duplicate".into(),
+        environment_id: environment.environment_id.clone(),
+        machine_id: Some(environment.machines[0].machine_id.clone()),
+    });
+    let error = validate_supported(&fixture.input(), &environment)
+        .expect_err("a duplicated expected record must never admit an unaccounted resource");
+    assert_eq!(error.code, MachineErrorCode::StateConflict);
+}
+
+/// A duplicate in the persisted ownership list is state corruption, not a
+/// resource Delete may reclaim twice.
+#[test]
+fn a_duplicated_ownership_record_is_refused() {
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    let mut environment = fixture.first().clone();
+    let duplicate = environment
+        .ownership
+        .iter()
+        .find(|record| record.resource_kind == OwnedResourceKind::Network)
+        .unwrap()
+        .clone();
+    environment.ownership.push(duplicate);
+    assert_eq!(
+        validate_supported(&fixture.input(), &environment)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+}
+
 /// Seed only genuine lifecycle transitions. Cleanup acknowledgements here are
 /// fixture inputs for replay tests, not evidence that any VM or disk was removed.
 fn acknowledge_delete_fixture(fixture: &Fixture, finish: bool) -> EnvironmentLifecycleOperation {

@@ -1,7 +1,7 @@
 //! Exact-owner Environment deletion. Admission prepares every resource before
 //! effects; a retained controller drives quiescence, cleanup and tombstoning.
 //! Disconnect ends observation, never the admitted deletion.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -771,18 +771,25 @@ fn validate_supported(
             machine_id: Some(attachment.machine_id.clone()),
         });
     }
-    // Exact set equality, unchanged in kind: `expected` never repeats a record,
-    // so equal lengths plus total membership still means every owned resource is
-    // one this Delete knows how to reclaim, and any other one is a hard refusal.
-    if expected.len() != environment.ownership.len()
-        || expected
-            .iter()
-            .any(|record| !environment.ownership.contains(record))
-    {
+    // Exact set equality, compared as sets rather than inferred from a length
+    // and a membership test. `expected` is minted from the persisted instances,
+    // so two instances sharing one identity would emit one record twice; that is
+    // state corruption, and it is refused rather than deduplicated, because a
+    // silent dedup would leave the slot the duplicate vacated free for an
+    // unaccounted resource to occupy without ever being refused.
+    let expected_set = expected.iter().collect::<BTreeSet<_>>();
+    if expected_set.len() != expected.len() {
+        return Err(conflict(
+            input,
+            "Delete ownership plan minted one resource identity twice; no effects admitted",
+        ));
+    }
+    let owned_set = environment.ownership.iter().collect::<BTreeSet<_>>();
+    if owned_set.len() != environment.ownership.len() || owned_set != expected_set {
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Delete ownership graph contains missing, unknown, or unsupported physical resources; no effects admitted",
+            "Delete ownership graph contains missing, unknown, unsupported, or repeated physical resources; no effects admitted",
         ));
     }
     Ok(())

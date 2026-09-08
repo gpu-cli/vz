@@ -438,6 +438,44 @@ async fn declared_fabric_ownership_is_accounted_and_stop_completes() {
     assert_eq!(stopped.network_attachments, environment.network_attachments);
 }
 
+/// Stop's accounting is a per-record kind whitelist, not an expected-set
+/// comparison, so it has no length arithmetic a duplicate could unbalance: a
+/// repeated record is simply tested twice and an unaccounted one still refused.
+#[test]
+fn a_duplicated_record_cannot_absorb_an_unaccounted_resource() {
+    let fixture = Fixture::networked(true);
+    let mut environment = fixture
+        .project
+        .environments
+        .iter()
+        .find(|candidate| candidate.name == "first")
+        .unwrap()
+        .clone();
+    let duplicate = environment
+        .ownership
+        .iter()
+        .find(|record| record.resource_kind == OwnedResourceKind::Network)
+        .unwrap()
+        .clone();
+    environment.ownership.push(duplicate);
+    validate_supported_topology(&fixture.input(), &environment).unwrap();
+    environment
+        .ownership
+        .push(vz_runtime_contract::OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Fault,
+            resource_id: "unaccounted-behind-a-duplicate".into(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: None,
+        });
+    assert_eq!(
+        validate_supported_topology(&fixture.input(), &environment)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+}
+
 /// The accounting is a fixed set, not a widening: a kind outside it is still a
 /// hard refusal even though three kinds were added to that set.
 #[test]
