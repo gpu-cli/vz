@@ -1,0 +1,75 @@
+{
+  "base_reference": "docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9",
+  "selected_entries": [
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "etc/group",
+      "sha256": "74842904631a5088b134a25257b8180367913d2b64cf1e3fed061db5fcbd8379",
+      "size": 434
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "etc/nsswitch.conf",
+      "sha256": "eec30745bade42a3f3f792e4d4192e57d2bcfe8e472433b1de426fe39a39cddb",
+      "size": 494
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "etc/passwd",
+      "sha256": "21352194cc533bc5878721507450d867d28ccb1c2f5cd773c792251fa1e63185",
+      "size": 839
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "usr/lib/os-release",
+      "sha256": "59a77b5f2666d9c85c489bd1911a6eebbd91ef22fe48b90a3b75f1b21f3844d4",
+      "size": 267
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "usr/share/keyrings/debian-archive-bookworm-automatic.gpg",
+      "sha256": "59dbde1397f8edc4e4aa24829ba36f9583ea5b4480091c34b89dad9e56360a19",
+      "size": 8700
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "usr/share/keyrings/debian-archive-bookworm-security-automatic.gpg",
+      "sha256": "8bdddebd345030721f22d0f6a7291a4791a2183621bd444cc6a683d7ade73a6e",
+      "size": 8709
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "usr/share/keyrings/debian-archive-bookworm-stable.gpg",
+      "sha256": "1891e84fa2e1ff6db0acfbc0e398824379b415534dd0154ecb1d21e70fe2ac62",
+      "size": 280
+    },
+    {
+      "compressed": "sha256:75782e20ea1f4a9d9259bc20a5ecbbea8d5943bf5370bf0f5727900728f1cc9a",
+      "diff_id": "sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "path": "var/lib/dpkg/status",
+      "sha256": "437c37c0391ace1b7376ad3ae9cae0ab55e81d111ccc72fca8f5d0f4226992c8",
+      "size": 77182
+    },
+    {
+      "compressed": "sha256:8662a60b808caf0f481c858e870db63699ac351820bd1577fb560dc553e72c38",
+      "diff_id": "sha256:811200da0061220a3e28b9142728f858e7618bade93ea61d53c34f3f2aa629d5",
+      "path": "var/lib/dpkg/status",
+      "sha256": "33e77c890d8a320bb0df0b2ca1998e58377b5feabc9a3632fead23ca4a08a32c",
+      "size": 80327
+    },
+    {
+      "compressed": "sha256:4e1d2fc0dabb6394acabd86d1fd491fb5ed1dbec8818a32cd064357348bb1323",
+      "diff_id": "sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "path": "var/lib/dpkg/status",
+      "sha256": "c592c612133cd614b9109f5b526d4deb35ef8733a68048a893b8184a66882cd4",
+      "size": 90464
+    }
+  ]
+}

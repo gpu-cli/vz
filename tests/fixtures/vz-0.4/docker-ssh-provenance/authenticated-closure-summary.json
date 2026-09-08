@@ -1,0 +1,109 @@
+{
+  "keyring_sha256": "506b815cbb32d9b6066b4a2aa524071e071761e7e7f68c3ac74f3061ba852017",
+  "package_data_tar_bytes": 9830400,
+  "packages": [
+    {
+      "Architecture": "arm64",
+      "Depends": "adduser, passwd, libc6 (>= 2.36), libedit2 (>= 2.11-20080614-0), libfido2-1 (>= 1.8.0), libgssapi-krb5-2 (>= 1.17), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/o/openssh/openssh-client_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-client",
+      "SHA256": "72f7cb7eb432038a62cd89e0552b352a514e880fe3907e73dc50ca2ef6d088d7",
+      "Size": "934580",
+      "Version": "1:9.2p1-2+deb12u10",
+      "data_tar_uncompressed_bytes": 6522880
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "adduser, libpam-modules, libpam-runtime, lsb-base, openssh-client (= 1:9.2p1-2+deb12u10), openssh-sftp-server, procps, ucf, debconf (>= 0.5) | debconf-2.0, runit-helper (>= 2.14.0~), libaudit1 (>= 1:2.2.1), libc6 (>= 2.36), libcom-err2 (>= 1.43.9), libcrypt1 (>= 1:4.1.0), libgssapi-krb5-2 (>= 1.17), libkrb5-3 (>= 1.13~alpha1+dfsg), libpam0g (>= 0.99.7.1), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), libsystemd0, libwrap0 (>= 7.6-4~), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/o/openssh/openssh-server_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-server",
+      "SHA256": "63ea95107e522de7a8da9a841f3b9442875f9d064087d6ef8e5b4d21291016a9",
+      "Size": "412488",
+      "Version": "1:9.2p1-2+deb12u10",
+      "data_tar_uncompressed_bytes": 1976320
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "openssh-client (= 1:9.2p1-2+deb12u10), libc6 (>= 2.34)",
+      "Filename": "pool/main/o/openssh/openssh-sftp-server_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-sftp-server",
+      "SHA256": "d2a4eb41629bbc929318cdccac043f2f5934c2e4c12f72d7f9c73b3668feab6f",
+      "Size": "60252",
+      "Version": "1:9.2p1-2+deb12u10",
+      "data_tar_uncompressed_bytes": 276480
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libbsd0 (>= 0.1.3), libc6 (>= 2.33), libtinfo6 (>= 6)",
+      "Filename": "pool/main/libe/libedit/libedit2_3.1-20221030-2_arm64.deb",
+      "Package": "libedit2",
+      "SHA256": "6ca1e355586ebfcfe8122b4d317fcaad4a9a10ca455c6a9bbd36f55bf4be85d3",
+      "Size": "88140",
+      "Version": "3.1-20221030-2",
+      "data_tar_uncompressed_bytes": 307200
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.34), libmd0 (>= 1.0.3-2)",
+      "Filename": "pool/main/libb/libbsd/libbsd0_0.11.7-2_arm64.deb",
+      "Package": "libbsd0",
+      "SHA256": "ef00f132ddd268ee67d756998723ee18543db27ab34930c0a9f1cff75cf55382",
+      "Size": "115116",
+      "Version": "0.11.7-2",
+      "data_tar_uncompressed_bytes": 245760
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.36), libcbor0.8 (>= 0.8.0), libssl3 (>= 3.0.0), libudev1 (>= 183), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/libf/libfido2/libfido2-1_1.12.0-2+b1_arm64.deb",
+      "Package": "libfido2-1",
+      "SHA256": "fc5373ec91102e4dac0f1d8fca5943c230fe9abbf348362f8956cda556dd22fd",
+      "Size": "72644",
+      "Version": "1.12.0-2+b1",
+      "data_tar_uncompressed_bytes": 286720
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.17)",
+      "Filename": "pool/main/libc/libcbor/libcbor0.8_0.8.0-2+b1_arm64.deb",
+      "Package": "libcbor0.8",
+      "SHA256": "6a4b71cbcb9fe1aa289aea983c7af80bef53bc63b217e39e24fef31c7491325f",
+      "Size": "26012",
+      "Version": "0.8.0-2+b1",
+      "data_tar_uncompressed_bytes": 92160
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.33), libnsl2 (>= 1.0)",
+      "Filename": "pool/main/t/tcp-wrappers/libwrap0_7.6.q-32_arm64.deb",
+      "Package": "libwrap0",
+      "SHA256": "c5f02a234b481e7016d10188822b8d84420cc5978db19c0d253eb222452cffe7",
+      "Size": "54652",
+      "Version": "7.6.q-32",
+      "data_tar_uncompressed_bytes": 122880
+    }
+  ],
+  "signature_checks": [
+    {
+      "exit_code": 0,
+      "release": "bookworm.InRelease",
+      "sha256": "77737fa4b34f2693e982cc9ee35736816c35a7778fc2d326cc1bbf5b301fe1aa",
+      "size": 151075,
+      "valid_signatures": [
+        "[GNUPG:] VALIDSIG 4CB50190207B4758A3F73A796ED0E7B82643E131 2026-07-11 1783765031 0 4 0 1 8 01 B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8",
+        "[GNUPG:] VALIDSIG B8E5F13176D2A7A75220028078DBA3BC47EF2265 2026-07-11 1783765032 0 4 0 1 8 01 04B54C3CDCA79751B16BC6B5225629DF75B188BD",
+        "[GNUPG:] VALIDSIG 4D64FEC119C2029067D6E791F8D2585B8783D481 2026-07-11 1783765141 0 4 0 22 8 01 4D64FEC119C2029067D6E791F8D2585B8783D481"
+      ]
+    },
+    {
+      "exit_code": 0,
+      "release": "bookworm-security.InRelease",
+      "sha256": "6d12b591dde8841119e7e66de94b2af438681faebffabe08ea364290f7aaee1c",
+      "size": 34770,
+      "valid_signatures": [
+        "[GNUPG:] VALIDSIG ED541312A33F1128F10B1C6C54404762BBB6E853 2026-08-31 1788210785 0 4 0 1 8 01 AC530D520F2F3269F5E98313A48449044AAD5C5D",
+        "[GNUPG:] VALIDSIG B0CAB9266E8C3929798B3EEEBDE6D2B9216EC7A8 2026-08-31 1788210785 0 4 0 1 8 01 05AB90340C0C5E797F44A8C8254CF3B5AEC0A8F0"
+      ]
+    }
+  ]
+}

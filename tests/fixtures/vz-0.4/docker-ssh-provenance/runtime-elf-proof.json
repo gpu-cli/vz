@@ -1,0 +1,893 @@
+{
+  "base_dpkg_deb": {
+    "elf": {
+      "interpreter": "/lib/ld-linux-aarch64.so.1",
+      "needed": [
+        "libmd.so.0",
+        "libz.so.1",
+        "liblzma.so.5",
+        "libzstd.so.1",
+        "libbz2.so.1.0",
+        "libc.so.6",
+        "ld-linux-aarch64.so.1"
+      ],
+      "soname": null
+    },
+    "mode": 493,
+    "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+    "sha256": "b85e5cbe3dbb1cb9af9319994fdedf00d3dfac6234191e8b2e5ba0e90f5fa197",
+    "size": 199120
+  },
+  "base_reference": "docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9",
+  "closure_paths": [
+    "usr/bin/scp",
+    "usr/bin/sftp",
+    "usr/bin/ssh",
+    "usr/bin/ssh-add",
+    "usr/bin/ssh-agent",
+    "usr/bin/ssh-keygen",
+    "usr/bin/ssh-keyscan",
+    "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1",
+    "usr/lib/aarch64-linux-gnu/libaudit.so.1.0.0",
+    "usr/lib/aarch64-linux-gnu/libbsd.so.0.11.7",
+    "usr/lib/aarch64-linux-gnu/libc.so.6",
+    "usr/lib/aarch64-linux-gnu/libcap-ng.so.0.0.0",
+    "usr/lib/aarch64-linux-gnu/libcap.so.2.66",
+    "usr/lib/aarch64-linux-gnu/libcbor.so.0.8.0",
+    "usr/lib/aarch64-linux-gnu/libcom_err.so.2.1",
+    "usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0",
+    "usr/lib/aarch64-linux-gnu/libcrypto.so.3",
+    "usr/lib/aarch64-linux-gnu/libedit.so.2.0.70",
+    "usr/lib/aarch64-linux-gnu/libfido2.so.1.12.0",
+    "usr/lib/aarch64-linux-gnu/libgcrypt.so.20.4.1",
+    "usr/lib/aarch64-linux-gnu/libgpg-error.so.0.33.1",
+    "usr/lib/aarch64-linux-gnu/libgssapi_krb5.so.2.2",
+    "usr/lib/aarch64-linux-gnu/libk5crypto.so.3.1",
+    "usr/lib/aarch64-linux-gnu/libkeyutils.so.1.10",
+    "usr/lib/aarch64-linux-gnu/libkrb5.so.3.3",
+    "usr/lib/aarch64-linux-gnu/libkrb5support.so.0.1",
+    "usr/lib/aarch64-linux-gnu/liblz4.so.1.9.4",
+    "usr/lib/aarch64-linux-gnu/liblzma.so.5.4.1",
+    "usr/lib/aarch64-linux-gnu/libmd.so.0.0.5",
+    "usr/lib/aarch64-linux-gnu/libnsl.so.2.0.1",
+    "usr/lib/aarch64-linux-gnu/libpam.so.0.85.1",
+    "usr/lib/aarch64-linux-gnu/libpcre2-8.so.0.11.2",
+    "usr/lib/aarch64-linux-gnu/libresolv.so.2",
+    "usr/lib/aarch64-linux-gnu/libselinux.so.1",
+    "usr/lib/aarch64-linux-gnu/libsystemd.so.0.35.0",
+    "usr/lib/aarch64-linux-gnu/libtinfo.so.6.4",
+    "usr/lib/aarch64-linux-gnu/libtirpc.so.3.0.0",
+    "usr/lib/aarch64-linux-gnu/libudev.so.1.7.5",
+    "usr/lib/aarch64-linux-gnu/libwrap.so.0.7.6",
+    "usr/lib/aarch64-linux-gnu/libz.so.1.2.13",
+    "usr/lib/aarch64-linux-gnu/libzstd.so.1.5.4",
+    "usr/lib/openssh/sftp-server",
+    "usr/lib/openssh/ssh-keysign",
+    "usr/lib/openssh/ssh-pkcs11-helper",
+    "usr/lib/openssh/ssh-sk-helper",
+    "usr/sbin/sshd"
+  ],
+  "elf_closure": {
+    "usr/bin/scp": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "7a49a65d650f56619cb7758f0f618b709cb06c2957d9fcfdb33fa81c13fbc0c9",
+      "size": 330224
+    },
+    "usr/bin/sftp": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libedit.so.2",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "0d53d635c9b854dccbc71f3ccd00f911aef724ec4d7ff3b9774b5bbfc7cdf239",
+      "size": 330200
+    },
+    "usr/bin/ssh": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libselinux.so.1",
+          "libgssapi_krb5.so.2",
+          "libcrypto.so.3",
+          "libz.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "78e7a4963fe15f37f40b5e700bbfcda1831e1978ac32bf3a2ee4d200cce255fe",
+      "size": 1182656
+    },
+    "usr/bin/ssh-add": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libselinux.so.1",
+          "libcrypto.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "265f00d9c611a124200efe86ea8d37ec5559dd05692829ca676dedeb386bb7a0",
+      "size": 592184
+    },
+    "usr/bin/ssh-agent": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libcrypto.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "22d8527e1ecb96dd7d2db4cb4058bfe85bda2f7b3f5869828afdfa91271db092",
+      "size": 526568
+    },
+    "usr/bin/ssh-keygen": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libselinux.so.1",
+          "libcrypto.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "6fc50fe603c9e2ba36fbbecb81601d938160d16b96e146901f75b1b18578b0c7",
+      "size": 723368
+    },
+    "usr/bin/ssh-keyscan": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libselinux.so.1",
+          "libcrypto.so.3",
+          "libz.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "94d75d14207aefee285e300f59553d7a75a4bd7bf8f10efbd5e867f77c3c0590",
+      "size": 723408
+    },
+    "usr/lib/aarch64-linux-gnu/ld-linux-aarch64.so.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [],
+        "soname": "ld-linux-aarch64.so.1"
+      },
+      "mode": 493,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "17538b8f9889a470c061f69a8fea8124da89627311cd16546c133a89f09056df",
+      "size": 202912
+    },
+    "usr/lib/aarch64-linux-gnu/libaudit.so.1.0.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libcap-ng.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libaudit.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "5a22c8b2977c4e5d32688e5c1e2d8af3620c1798f94b64f7cd6a22c005abb5bd",
+      "size": 132984
+    },
+    "usr/lib/aarch64-linux-gnu/libbsd.so.0.11.7": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libmd.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libbsd.so.0"
+      },
+      "mode": 420,
+      "origin": "libbsd0",
+      "sha256": "24f2bb08fed31a04a80f4d0d0145f4cc5f42543af07a364b1fafdd3d2dcbe137",
+      "size": 133944
+    },
+    "usr/lib/aarch64-linux-gnu/libc.so.6": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libc.so.6"
+      },
+      "mode": 493,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "e4ac8ae1d81e4865e3aadedb962879cf9415903b3f2ba81ec75e9962b86ab8b0",
+      "size": 1651408
+    },
+    "usr/lib/aarch64-linux-gnu/libcap-ng.so.0.0.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcap-ng.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "c84ade3b16a3af69ab562f49fd1269c1d6438280909b41a9185caa9e359cec0f",
+      "size": 67504
+    },
+    "usr/lib/aarch64-linux-gnu/libcap.so.2.66": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcap.so.2"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "dcb3587efc518852f7a1430594526ee9d7334126a9afb46f23cfa60f1b2d1927",
+      "size": 67552
+    },
+    "usr/lib/aarch64-linux-gnu/libcbor.so.0.8.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcbor.so.0.8"
+      },
+      "mode": 420,
+      "origin": "libcbor0.8",
+      "sha256": "aad9e185b97611f9892a5e80ec0903e5ec23d696bc9e1caa5159ca447bac0e9f",
+      "size": 69120
+    },
+    "usr/lib/aarch64-linux-gnu/libcom_err.so.2.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcom_err.so.2"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "da3488ef5ec0962c5b7ac5a22108c1f4259fe0ecb1cbe0014dcfb83700493c56",
+      "size": 67432
+    },
+    "usr/lib/aarch64-linux-gnu/libcrypt.so.1.1.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcrypt.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "3c70a152ded3b0eab8f2f3b3d2a80e2ce0808909e8c6828a8dcfc6b883ff30fb",
+      "size": 198584
+    },
+    "usr/lib/aarch64-linux-gnu/libcrypto.so.3": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libcrypto.so.3"
+      },
+      "mode": 420,
+      "origin": "base:sha256:811200da0061220a3e28b9142728f858e7618bade93ea61d53c34f3f2aa629d5",
+      "sha256": "6ca49d148cc9fff2ee82e46019f508d736cef6b3f15f2f5cbbc86457df9b05ce",
+      "size": 4532392
+    },
+    "usr/lib/aarch64-linux-gnu/libedit.so.2.0.70": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libtinfo.so.6",
+          "libbsd.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libedit.so.2"
+      },
+      "mode": 420,
+      "origin": "libedit2",
+      "sha256": "28f84ddeeab3945456e400c929f0393a9f9a6ddf88a0cdfe45062008fc3f1334",
+      "size": 265800
+    },
+    "usr/lib/aarch64-linux-gnu/libfido2.so.1.12.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libcbor.so.0.8",
+          "libcrypto.so.3",
+          "libudev.so.1",
+          "libz.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libfido2.so.1"
+      },
+      "mode": 420,
+      "origin": "libfido2-1",
+      "sha256": "5923ae7a5dab03af586433f325eac850f448a9a786ce57f9c2d50c5c283ca255",
+      "size": 264160
+    },
+    "usr/lib/aarch64-linux-gnu/libgcrypt.so.20.4.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libgpg-error.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libgcrypt.so.20"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "01c8f6929c4c5853f8204a727e2be5fc3f7cef3f850e2818558800aa5f78c80e",
+      "size": 1000296
+    },
+    "usr/lib/aarch64-linux-gnu/libgpg-error.so.0.33.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libgpg-error.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "44c67a9e7a5cfc227e84dcb8f96463103c12415286a8e003bc66abebc4b1f6bd",
+      "size": 198640
+    },
+    "usr/lib/aarch64-linux-gnu/libgssapi_krb5.so.2.2": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libkrb5.so.3",
+          "libk5crypto.so.3",
+          "libcom_err.so.2",
+          "libkrb5support.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libgssapi_krb5.so.2"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "9d35dc9f4a4ad1b3e2a97412ae1147c78a2ba28729c0eba07f2c4e52ba254153",
+      "size": 334904
+    },
+    "usr/lib/aarch64-linux-gnu/libk5crypto.so.3.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libkrb5support.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libk5crypto.so.3"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "3b52aaddb3db517a635e711ba055b2a86adccacab4186a444ab4ae398cdffba5",
+      "size": 199352
+    },
+    "usr/lib/aarch64-linux-gnu/libkeyutils.so.1.10": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libkeyutils.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "8364aac5e87ae71e5f659163f7672d8ae7d936f2ccb45d0aaec645a006952ed1",
+      "size": 67432
+    },
+    "usr/lib/aarch64-linux-gnu/libkrb5.so.3.3": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libk5crypto.so.3",
+          "libcom_err.so.2",
+          "libkrb5support.so.0",
+          "libkeyutils.so.1",
+          "libresolv.so.2",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libkrb5.so.3"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "9521937afd55582d7714f7e20b5bf1ba53016221cb069edec49a3c2d58cdbe60",
+      "size": 928752
+    },
+    "usr/lib/aarch64-linux-gnu/libkrb5support.so.0.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libkrb5support.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "cb761561cbf732abfbeeb105bda4a8c28685b6da3ebe1be066430c1fe564a8db",
+      "size": 68576
+    },
+    "usr/lib/aarch64-linux-gnu/liblz4.so.1.9.4": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "liblz4.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "43109ed13afa34ff991ed73c4d520c5056378949b17d77c50d5773c5aa851439",
+      "size": 199056
+    },
+    "usr/lib/aarch64-linux-gnu/liblzma.so.5.4.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "liblzma.so.5"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "530e774de0f3fd8754351f387f52db6a0cb134b350e43d80044dea7109400f17",
+      "size": 198584
+    },
+    "usr/lib/aarch64-linux-gnu/libmd.so.0.0.5": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libmd.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "be8d151f2f06935db812859f575ec818af7fd93eaab0ec4e7dae9e5ad7ca38bb",
+      "size": 67704
+    },
+    "usr/lib/aarch64-linux-gnu/libnsl.so.2.0.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libtirpc.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libnsl.so.2"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "fd644fad65d2142e5a4c532ca7c9e1ed874d97cf9f1e65dc089d42d440e6238b",
+      "size": 89376
+    },
+    "usr/lib/aarch64-linux-gnu/libpam.so.0.85.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libaudit.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libpam.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "cb005bb0077bba0ed3b66cc7936c0ee5ecc72c7813e5ec813f442bb484f7fc43",
+      "size": 67512
+    },
+    "usr/lib/aarch64-linux-gnu/libpcre2-8.so.0.11.2": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libpcre2-8.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "cabf859fab34e77fba3ab3485878cc19014327246a7c6aa21ac0d2d1a32dcc81",
+      "size": 592440
+    },
+    "usr/lib/aarch64-linux-gnu/libresolv.so.2": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libresolv.so.2"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "5f3769c75e5eca6ff14f2c7a22bcc8cfeeef31da9545434a281a5fdd1f66d6f0",
+      "size": 68232
+    },
+    "usr/lib/aarch64-linux-gnu/libselinux.so.1": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libpcre2-8.so.0",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libselinux.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "6f51339a6f92f88785dfcfdb13194c3d10cb10ccee1d0ddb5b3e3445145c761c",
+      "size": 198800
+    },
+    "usr/lib/aarch64-linux-gnu/libsystemd.so.0.35.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libcap.so.2",
+          "libgcrypt.so.20",
+          "liblzma.so.5",
+          "libzstd.so.1",
+          "liblz4.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libsystemd.so.0"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "e38e0c11131d330c9a49a4a7f9437f8cf9d6a198355a47ecff02bc4aabe52171",
+      "size": 923696
+    },
+    "usr/lib/aarch64-linux-gnu/libtinfo.so.6.4": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libtinfo.so.6"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "3486c8bf9712132d1834a4800d5002e37d4edc670daa9652b3d470eb813aec55",
+      "size": 199896
+    },
+    "usr/lib/aarch64-linux-gnu/libtirpc.so.3.0.0": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libgssapi_krb5.so.2",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libtirpc.so.3"
+      },
+      "mode": 420,
+      "origin": "base:sha256:b739482d4a4cf250868e13640bca1d6d54ddc6ae5a3676a2986d5f08ed226f61",
+      "sha256": "33cb81d22a00ece4f9d82f7c399237a6fd36269f2f9181041b3dc7b83e74bafb",
+      "size": 198960
+    },
+    "usr/lib/aarch64-linux-gnu/libudev.so.1.7.5": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libudev.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "215857660d2d9ff00d8d653188fc9bd77b25cb2492d275be4b25fe500981da95",
+      "size": 199104
+    },
+    "usr/lib/aarch64-linux-gnu/libwrap.so.0.7.6": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libnsl.so.2",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libwrap.so.0"
+      },
+      "mode": 420,
+      "origin": "libwrap0",
+      "sha256": "71c83d44da8319ee9bd5e682072bc07621660372802e6762c339a52551ee3664",
+      "size": 68344
+    },
+    "usr/lib/aarch64-linux-gnu/libz.so.1.2.13": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libz.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "ffb1ab496e6eced03ab679075f9f2c415c7728a145cc7f63d614497102d73822",
+      "size": 133520
+    },
+    "usr/lib/aarch64-linux-gnu/libzstd.so.1.5.4": {
+      "elf": {
+        "interpreter": null,
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": "libzstd.so.1"
+      },
+      "mode": 420,
+      "origin": "base:sha256:13a56b6535801be2adde694dabaf1c2df1d862a390661907dac821c42cd565cc",
+      "sha256": "63ff891e4316be1d30a8e551ded6cbb0283772105b352103608e60c06c95ac15",
+      "size": 657352
+    },
+    "usr/lib/openssh/sftp-server": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-sftp-server",
+      "sha256": "3a7abd067d44f071e40c509edebd19f432cd4eb6898a7c15b54bbf4091badc44",
+      "size": 264256
+    },
+    "usr/lib/openssh/ssh-keysign": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libcrypto.so.3",
+          "libz.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 2541,
+      "origin": "openssh-client",
+      "sha256": "d7f976c46d9045902a33bb8e31f12a7791544d4d851dd679578cea78055e386f",
+      "size": 723392
+    },
+    "usr/lib/openssh/ssh-pkcs11-helper": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libcrypto.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "f80afe47f80b3dbde24aaaa8bc5161c4718423d5402a68741a8490db9c4c97bf",
+      "size": 526552
+    },
+    "usr/lib/openssh/ssh-sk-helper": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libfido2.so.1",
+          "libcrypto.so.3",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-client",
+      "sha256": "174893a608cb1b91d0fe666e5a29f5b8eece971153e5d1912595573293db448c",
+      "size": 526552
+    },
+    "usr/sbin/sshd": {
+      "elf": {
+        "interpreter": "/lib/ld-linux-aarch64.so.1",
+        "needed": [
+          "libcrypt.so.1",
+          "libwrap.so.0",
+          "libaudit.so.1",
+          "libpam.so.0",
+          "libsystemd.so.0",
+          "libselinux.so.1",
+          "libgssapi_krb5.so.2",
+          "libkrb5.so.3",
+          "libcom_err.so.2",
+          "libcrypto.so.3",
+          "libz.so.1",
+          "libc.so.6",
+          "ld-linux-aarch64.so.1"
+        ],
+        "soname": null
+      },
+      "mode": 493,
+      "origin": "openssh-server",
+      "sha256": "8852e4c929b6fd4d28e2009605eeba51e25e6d47b323785d6bf1f007227ff0ae",
+      "size": 1314416
+    }
+  },
+  "packages": [
+    {
+      "Architecture": "arm64",
+      "Depends": "adduser, passwd, libc6 (>= 2.36), libedit2 (>= 2.11-20080614-0), libfido2-1 (>= 1.8.0), libgssapi-krb5-2 (>= 1.17), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/o/openssh/openssh-client_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-client",
+      "SHA256": "72f7cb7eb432038a62cd89e0552b352a514e880fe3907e73dc50ca2ef6d088d7",
+      "Size": "934580",
+      "Version": "1:9.2p1-2+deb12u10",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 931276
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "adduser, libpam-modules, libpam-runtime, lsb-base, openssh-client (= 1:9.2p1-2+deb12u10), openssh-sftp-server, procps, ucf, debconf (>= 0.5) | debconf-2.0, runit-helper (>= 2.14.0~), libaudit1 (>= 1:2.2.1), libc6 (>= 2.36), libcom-err2 (>= 1.43.9), libcrypt1 (>= 1:4.1.0), libgssapi-krb5-2 (>= 1.17), libkrb5-3 (>= 1.13~alpha1+dfsg), libpam0g (>= 0.99.7.1), libselinux1 (>= 3.1~), libssl3 (>= 3.0.19), libsystemd0, libwrap0 (>= 7.6-4~), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/o/openssh/openssh-server_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-server",
+      "SHA256": "63ea95107e522de7a8da9a841f3b9442875f9d064087d6ef8e5b4d21291016a9",
+      "Size": "412488",
+      "Version": "1:9.2p1-2+deb12u10",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 402564
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "openssh-client (= 1:9.2p1-2+deb12u10), libc6 (>= 2.34)",
+      "Filename": "pool/main/o/openssh/openssh-sftp-server_9.2p1-2+deb12u10_arm64.deb",
+      "Package": "openssh-sftp-server",
+      "SHA256": "d2a4eb41629bbc929318cdccac043f2f5934c2e4c12f72d7f9c73b3668feab6f",
+      "Size": "60252",
+      "Version": "1:9.2p1-2+deb12u10",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 58900
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libbsd0 (>= 0.1.3), libc6 (>= 2.33), libtinfo6 (>= 6)",
+      "Filename": "pool/main/libe/libedit/libedit2_3.1-20221030-2_arm64.deb",
+      "Package": "libedit2",
+      "SHA256": "6ca1e355586ebfcfe8122b4d317fcaad4a9a10ca455c6a9bbd36f55bf4be85d3",
+      "Size": "88140",
+      "Version": "3.1-20221030-2",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 85508
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.34), libmd0 (>= 1.0.3-2)",
+      "Filename": "pool/main/libb/libbsd/libbsd0_0.11.7-2_arm64.deb",
+      "Package": "libbsd0",
+      "SHA256": "ef00f132ddd268ee67d756998723ee18543db27ab34930c0a9f1cff75cf55382",
+      "Size": "115116",
+      "Version": "0.11.7-2",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 113256
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.36), libcbor0.8 (>= 0.8.0), libssl3 (>= 3.0.0), libudev1 (>= 183), zlib1g (>= 1:1.1.4)",
+      "Filename": "pool/main/libf/libfido2/libfido2-1_1.12.0-2+b1_arm64.deb",
+      "Package": "libfido2-1",
+      "SHA256": "fc5373ec91102e4dac0f1d8fca5943c230fe9abbf348362f8956cda556dd22fd",
+      "Size": "72644",
+      "Version": "1.12.0-2+b1",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 70040
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.17)",
+      "Filename": "pool/main/libc/libcbor/libcbor0.8_0.8.0-2+b1_arm64.deb",
+      "Package": "libcbor0.8",
+      "SHA256": "6a4b71cbcb9fe1aa289aea983c7af80bef53bc63b217e39e24fef31c7491325f",
+      "Size": "26012",
+      "Version": "0.8.0-2+b1",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 23660
+    },
+    {
+      "Architecture": "arm64",
+      "Depends": "libc6 (>= 2.33), libnsl2 (>= 1.0)",
+      "Filename": "pool/main/t/tcp-wrappers/libwrap0_7.6.q-32_arm64.deb",
+      "Package": "libwrap0",
+      "SHA256": "c5f02a234b481e7016d10188822b8d84420cc5978db19c0d253eb222452cffe7",
+      "Size": "54652",
+      "Version": "7.6.q-32",
+      "ar_members": [
+        "debian-binary",
+        "control.tar.xz",
+        "data.tar.xz"
+      ],
+      "data_tar_xz_size": 52396
+    }
+  ],
+  "staged_deb_bytes": 1763884
+}

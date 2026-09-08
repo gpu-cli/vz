@@ -21,6 +21,8 @@ import sys
 from vz04_common import GateError, digest_file, read_regular, require
 
 REGISTRY_PIN = "config/docker-registry-artifact-v3.1.1.json"
+SSH_PIN = "config/docker-ssh-packages-bookworm-arm64.json"
+SSH_PROVENANCE = "tests/fixtures/vz-0.4/docker-ssh-provenance"
 HELPERS = Path(__file__).resolve().parent
 
 
@@ -75,15 +77,65 @@ def registry_inputs(repo_root: Path, cache_root: Path) -> dict:
     return {"registry-layout": layout, "registry-archive": archive}
 
 
+def ssh_inputs(repo_root: Path, cache_root: Path) -> dict:
+    """The Debian input directory the SSH suite verifies.
+
+    Two halves, and the pin decides which is which. Everything it gives a
+    `repository_path` is fetched by digest and kept out of the tree — the
+    Release, the index, the packages and the source archives, about 23 MB.
+    Everything it does not is a record of the admission that produced the pin,
+    has no generator here, and is retained beside the pin instead.
+
+    Composing them is not verification: `linux_docker_ssh_input.verify` still
+    performs the whole offline trust chain over the result, and checks every one
+    of these bytes against the digest already in the pin.
+    """
+    _helpers_on_path()
+    import linux_docker_ssh_acquire as acquire_module
+    import linux_docker_ssh_input as ssh_input
+
+    repo_root = Path(repo_root)
+    pin_path = repo_root / SSH_PIN
+    require(pin_path.is_file() and not pin_path.is_symlink(), f"SSH pin missing: {pin_path}")
+    entry = cache_entry(cache_root, "ssh", digest_file(pin_path))
+    inputs = entry / "inputs"
+    pin = ssh_input.load(pin_path)
+    retained = repo_root / SSH_PROVENANCE
+    expected = {row["filename"] for row in
+                [pin["base"]["keyring"], pin["release"], pin["packages_index"],
+                 *pin["packages"], *pin["source_proofs"]]}
+    if inputs.is_dir() and expected <= {path.name for path in inputs.iterdir()}:
+        return {"ssh-packages": inputs}
+
+    if entry.exists():
+        shutil.rmtree(entry)
+    entry.mkdir(mode=0o700, parents=True)
+    try:
+        acquire_module.acquire(inputs, pin)
+    except (ValueError, OSError) as error:
+        raise GateError(f"SSH input acquisition failed: {error}") from error
+    for row in [pin["base"]["keyring"], *pin["source_proofs"]]:
+        if row.get("repository_path"):
+            continue
+        source = retained / row["filename"]
+        require(source.is_file() and not source.is_symlink(),
+                f"retained SSH provenance missing: {source}")
+        raw = read_regular(source)
+        require(len(raw) == row["size"], f"retained {row['filename']} has the wrong size")
+        (inputs / row["filename"]).write_bytes(raw)
+    missing = sorted(expected - {path.name for path in inputs.iterdir()})
+    require(not missing, "SSH input directory is incomplete: " + ", ".join(missing))
+    return {"ssh-packages": inputs}
+
+
 def acquired_inputs(repo_root: Path, cache_root: Path) -> dict:
     """Every run-frozen input the Docker lane needs, by option name.
 
-    `ssh-packages` is absent: its pin does not yet carry a repository path for
-    each source-proof row, so an acquirer would have to guess where those bytes
-    came from, which is exactly the mutable-source hazard the gate forbids. See
-    `vz-ao8`.
+    Each is acquired from a checked-in pin, so a fresh checkout plus the pins
+    reproduces every one of them.
     """
     inputs = registry_inputs(Path(repo_root), Path(cache_root))
+    inputs.update(ssh_inputs(Path(repo_root), Path(cache_root)))
     for name, path in inputs.items():
         require(Path(path).exists(), f"acquired input missing after acquisition: {name}")
     return inputs

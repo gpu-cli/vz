@@ -19,7 +19,8 @@ DIGEST = "a" * 64
 def _ctx(root, **overrides):
     options = dict(tmux="/usr/bin/true",
                    acquired_inputs={"registry-archive": "/acquired/registry.tar",
-                                    "registry-layout": "/acquired/layout"})
+                                    "registry-layout": "/acquired/layout",
+                                    "ssh-packages": "/acquired/ssh-inputs"})
     options.update(overrides)
     return lanes.LaneContext(run_id="gate-test-run-1", release_dir=root, release_dir_sha256=DIGEST, state_root=root / "state",
                              contract_path=root / "c.json", contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST, fixture_sha256=DIGEST,
@@ -118,15 +119,16 @@ class LaneTests(unittest.TestCase):
         # With everything back it resolves again, so each failure was the removal.
         lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
 
-    def test_the_docker_harness_no_longer_rejects_the_lane_for_release_inputs(self):
-        """The point of deriving them: the harness's own admission must accept
-        them. Anything it still refuses must be a run-frozen input, never one
-        the candidate already holds.
+    def test_the_docker_harness_admits_the_lane_argv(self):
+        """`vz-ao8` closed. The contract gives this lane `["--suite", "all"]`,
+        which the harness rejected until eight further options were supplied:
+        five derived from the candidate, `--tmux` resolved by the gate, and
+        three acquired from checked-in pins. This feeds the lane's own argv to
+        the harness's own admission and requires it to be accepted outright.
 
-        This is the half of `vz-ao8` the candidate can supply. The registry
-        archive and layout, the SSH package set and tmux are acquired inputs
-        and are still missing here; that is the remaining half, and this test
-        pins which options are in which half so the split cannot blur.
+        Assembling the argv is what this asserts; whether the acquired paths
+        hold real bytes is `linux_docker_ssh_input.verify`'s job and the
+        acquisition helpers' own tests.
         """
         import linux_docker_e2e as harness
         release = fixtures.build_fake_release_dir(self.root / "release", with_lane_inputs=True)
@@ -135,31 +137,13 @@ class LaneTests(unittest.TestCase):
             ctx.release_dir = release
             ctx.clients = {"docker": "/d", "compose_plugin": "/c", "buildx_plugin": "/b"}
             argv = lanes.lane_argv(self.lanes["linux-docker"], ctx, "clean-provision", self.root / "e", None)
-            supplied, rejections = set(argv), []
-            for _ in range(8):
-                try:
-                    harness.arguments(list(argv))
-                    break
-                except Exception as error:
-                    rejections.append(str(error))
-                    flag = next((f"--{name}" for name in
-                                 ("registry-archive", "registry-layout", "ssh-packages", "tmux")
-                                 if f"--{name}" in str(error)), None)
-                    self.assertIsNotNone(flag, f"harness refused for a non-acquired input: {error}")
-                    self.assertNotIn(flag, supplied)
-                    argv += [flag, "/acquired" + flag]
-                    supplied.add(flag)
-            else:
-                self.fail("harness kept refusing: " + "; ".join(rejections))
-            self.assertEqual(sorted(supplied & {"--registry-archive", "--registry-layout",
-                                                "--ssh-packages", "--tmux"}),
-                             ["--registry-archive", "--registry-layout", "--ssh-packages", "--tmux"],
-                             "exactly the acquired inputs remained")
-            # And nothing the candidate holds was ever the reason.
-            for release_option in ("--release-version", "--developer-bundle", "--hardened-bundle",
-                                   "--buildkit-archive", "--release-dir"):
-                self.assertFalse(any(release_option in text for text in rejections),
-                                 f"{release_option} still refused: {rejections}")
+            admitted = harness.arguments(list(argv))
+            self.assertEqual(admitted.suite, "all")
+            self.assertEqual(admitted.release_version, "0.4.0-faketest")
+            self.assertEqual(admitted.tmux, "/usr/bin/true")
+            self.assertEqual(admitted.ssh_packages, "/acquired/ssh-inputs")
+            self.assertEqual(admitted.registry_archive, "/acquired/registry.tar")
+            self.assertEqual(admitted.developer_bundle, str(release / "linux" / "developer"))
         finally:
             fixtures.make_writable(release)
 
@@ -196,7 +180,8 @@ class LaneTests(unittest.TestCase):
             flags = dict(zip(argv, argv[1:]))
             self.assertEqual(flags["--registry-archive"], "/acquired/registry.tar")
             self.assertEqual(flags["--registry-layout"], "/acquired/layout")
-            for missing in ("registry-archive", "registry-layout"):
+            self.assertEqual(flags["--ssh-packages"], "/acquired/ssh-inputs")
+            for missing in ("registry-archive", "registry-layout", "ssh-packages"):
                 partial = _ctx(self.root, acquired_inputs={k: v for k, v in ctx.acquired_inputs.items()
                                                            if k != missing})
                 partial.release_dir = release
@@ -204,7 +189,7 @@ class LaneTests(unittest.TestCase):
                     lanes.lane_argv(self.lanes["linux-docker"], partial, "clean-provision", self.root / "e2", None)
             # Other lanes neither need them nor receive them.
             topology = lanes.lane_argv(self.lanes["topology"], ctx, "clean-provision", self.root / "e3", None)
-            for flag in ("--registry-archive", "--registry-layout"):
+            for flag in ("--registry-archive", "--registry-layout", "--ssh-packages"):
                 self.assertNotIn(flag, topology)
         finally:
             fixtures.make_writable(release)
@@ -337,24 +322,26 @@ class RunInputTests(unittest.TestCase):
             with self.assertRaises(Exception):
                 run_inputs.cache_entry(root, "registry", bad)
 
-    def test_only_what_was_really_acquired_is_offered(self):
-        """The SSH package set is deliberately absent: its pin does not carry a
-        repository path for every source-proof row, so an acquirer would have to
-        guess where those bytes came from. Offering it here would hand the lane
-        a path to something nothing fetched, and the lane would then run."""
+    def test_every_run_frozen_input_is_offered(self):
+        """All three come from checked-in pins, so a fresh checkout plus the
+        pins reproduces them. Nothing may be offered that was not produced:
+        handing the lane a path to something nothing acquired would let it
+        run on bytes no one verified."""
         import vz04_run_inputs as run_inputs
         with tempfile.TemporaryDirectory() as cache:
             with unittest.mock.patch.object(run_inputs, "registry_inputs",
                                             return_value={"registry-archive": Path(cache),
-                                                          "registry-layout": Path(cache)}):
+                                                          "registry-layout": Path(cache)}), \
+                    unittest.mock.patch.object(run_inputs, "ssh_inputs",
+                                               return_value={"ssh-packages": Path(cache)}):
                 acquired = run_inputs.acquired_inputs(common.REPO_ROOT, Path(cache))
-        self.assertEqual(sorted(acquired), ["registry-archive", "registry-layout"])
-        self.assertNotIn("ssh-packages", acquired)
+        self.assertEqual(sorted(acquired), ["registry-archive", "registry-layout", "ssh-packages"])
 
     def test_an_input_that_vanished_after_acquisition_is_refused(self):
         import vz04_run_inputs as run_inputs
         with tempfile.TemporaryDirectory() as cache:
             with unittest.mock.patch.object(run_inputs, "registry_inputs",
-                                            return_value={"registry-archive": Path(cache) / "gone"}):
+                                            return_value={"registry-archive": Path(cache) / "gone"}), \
+                    unittest.mock.patch.object(run_inputs, "ssh_inputs", return_value={}):
                 with self.assertRaisesRegex(Exception, "missing after acquisition"):
                     run_inputs.acquired_inputs(common.REPO_ROOT, Path(cache))

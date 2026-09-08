@@ -117,7 +117,7 @@ def lane_argv(lane: dict, ctx: LaneContext, phase: str, evidence_dir: Path, hand
             extra += ["--" + name, str(value)]
         require(ctx.tmux, "the composed Docker lane drives a terminal and requires --tmux")
         extra += ["--tmux", str(ctx.tmux)]
-        for name in ("registry-archive", "registry-layout"):
+        for name in ("registry-archive", "registry-layout", "ssh-packages"):
             value = ctx.acquired_inputs.get(name)
             require(value, f"the composed Docker lane requires an acquired --{name}")
             extra += ["--" + name, str(value)]
