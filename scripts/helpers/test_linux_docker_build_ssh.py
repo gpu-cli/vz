@@ -5,12 +5,11 @@ import json
 import os
 from pathlib import Path
 import tempfile
-from types import MethodType, SimpleNamespace
+from types import SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import linux_docker_build_ssh as ssh
-import linux_docker_e2e as gate
 
 
 class SSHBuildTests(unittest.TestCase):
@@ -220,10 +219,6 @@ class SSHMachineTests(unittest.TestCase):
             driver_cleanup_verified=[True], ssh_cache_requests=[], sensitive_canaries=[],
             record=SimpleNamespace(canaries=[]),
             monitor=SimpleNamespace(check=Mock(), record=SimpleNamespace(canaries=[])))
-        # The real registrar, so this suite keeps proving that a Driver and its
-        # cleanup flag are reserved together and never by list position.
-        self.harness.register_driver = MethodType(gate.ComposeHarness.register_driver, self.harness)
-        self.harness.fence = MethodType(gate.ComposeHarness.fence, self.harness)
         self.canaries = (b"disposable-test-private-canary-123456789",)
         public = self.root / "public-key"
         public.write_bytes(b"ssh-ed25519 public-placeholder disposable-comment\n")

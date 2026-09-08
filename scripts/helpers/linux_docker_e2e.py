@@ -65,32 +65,6 @@ SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
 GATE_MACHINES = (0, 1, 2)
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
           "mounts", "netpolicy", "isolation", "concurrency", "recovery")
-# Suites whose per-Machine slices run concurrently. Every Machine owns a private
-# Engine on a private socket, and mutual isolation is what this lane asserts, so
-# these slices share nothing but the harness's own bookkeeping — which
-# `slice_lock`, `mutation_lock` and the per-slice `Recorder` below make safe.
-#
-# A suite is NOT here when running two more Machines at once would change what it
-# measures, or when its own claim is ordered:
-#   limits       asserts resource limits and OOM behaviour on a loaded Machine;
-#                two more busy Machines is a different experiment.
-#   concurrency  measures a sixty-second readiness window and mutually
-#                overlapping registry service windows on one Machine; two more
-#                busy Machines changes exactly what it measures.
-#   parallel     brackets a one-second in-guest health cadence with a 250 ms
-#                lateness bound; host oversubscription perturbs exactly that,
-#                and its slots now fail a shared barrier fast on a sibling death.
-#   lifecycle    runs inside a bounded youki runtime-audit window that must stay
-#                quiet, and drives a tmux server.
-#   recovery     cycles Stop/Up, which replaces the Machines the slices run on.
-#   registry     `Controls` observes all four Docker config directories before,
-#                between and after each Session, in Session order.
-#   images       asserts that a failing Machine is never followed by a dispatch
-#                to the next one, which concurrent dispatch cannot preserve.
-#   handshake, mounts, netpolicy, isolation
-#                seconds each, or hold live resources until the cross-Machine
-#                claim is decided; parallelising them buys nothing measurable.
-PARALLEL_SUITES = frozenset({"compose", "build", "artifacts", "ssh"})
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -619,74 +593,6 @@ class ComposeHarness(startup.Harness):
         self.builders_removed, self.live_cleanup = False, False
         self.registry_controls = None
         self.registry_project = None
-        # Concurrent per-Machine slices.
-        self.slice_records = []
-        self.slice_concurrency_records = {}
-        self._local = threading.local()
-
-    def fence(self, name):
-        """The named reentrant lock, created on first use.
-
-        `slice_lock` pairs the two lists that are one ownership registry
-        (`drivers`/`driver_cleanup_verified`) and the builder inventories;
-        `mutation_lock` keeps `mutate` to one owned mutation at a time run-wide,
-        so the uncertainty fence keeps meaning exactly what it meant when the
-        run was serial. Created here rather than in `__init__` because a harness
-        assembled field by field for an offline test never runs `__init__`, and
-        a fence that silently disappears there is a fence that can silently
-        disappear anywhere. `setdefault` decides the winner when two slices
-        reach an unbuilt fence at once.
-        """
-        require(name in ("slice_lock", "mutation_lock"), "unknown harness fence")
-        return self.__dict__.get(name) or self.__dict__.setdefault(name, threading.RLock())
-
-    @property
-    def record(self):
-        """The Recorder this thread must use.
-
-        `Recorder` numbers a receipt by the length of its list and then appends,
-        so two threads sharing one would overwrite each other's indices and each
-        other's files. A concurrent slice therefore records into a Recorder of
-        its own, exactly as `parallel_health` gives its concurrent client one,
-        and everything outside a slice keeps the run's single shared Recorder.
-        """
-        local = getattr(self, "_local", None)
-        selected = getattr(local, "record", None) if local is not None else None
-        return self.shared_record if selected is None else selected
-
-    @record.setter
-    def record(self, value):
-        self.shared_record = value
-
-    def slice_recorder(self, suite, index):
-        """One concurrent slice's own Recorder, beside that slice's evidence.
-
-        The canary list is deliberately the run's one list object: a secret a
-        slice admits must still be refused by every command of every other
-        slice, and by every command the run makes after they all finish.
-        """
-        output = startup.private(self.evidence / (suite + "-machine-" + str(index) + "-commands"))
-        record = startup.Recorder(output, self.env)
-        record.canaries = self.shared_record.canaries
-        with self.fence("slice_lock"):
-            self.slice_records.append(record)
-        return record
-
-    def register_driver(self, item):
-        """Reserve one Driver's ownership slot and return its position.
-
-        `drivers` and `driver_cleanup_verified` are one registry kept in two
-        lists, and `assert_certain` demands they stay the same length; two
-        slices appending to them independently would pair a Driver with another
-        slice's cleanup flag.
-        """
-        with self.fence("slice_lock"):
-            index = len(self.drivers)
-            self.drivers.append(item)
-            self.driver_cleanup_verified.append(False)
-            require(len(self.drivers) == len(self.driver_cleanup_verified),
-                    "Driver ownership registry differs")
-            return index
 
     def enroll_runtime_audits(self, contexts):
         """Fresh diagnostic sessions before this candidate's Docker mutations.
@@ -743,25 +649,18 @@ class ComposeHarness(startup.Harness):
     def prepare_builder(self, descriptor, role="source", keep_probe=True):
         key = self.builder_key(descriptor, role)
         require(type(keep_probe) is bool, "invalid keep probe selection")
+        require(key not in self.builder_by_owner_role, "builder owner/role already registered")
         from linux_docker_buildkit_builder import Builder
-        # Both inventories retain exact ownership before any partial effects,
-        # and concurrent slices register into them one at a time: the key is
-        # per owner and role, but the two inventories must agree.
-        with self.fence("slice_lock"):
-            require(key not in self.builder_by_owner_role, "builder owner/role already registered")
-            builder = Builder(self, json.loads(json.dumps(descriptor)), role=role)
-            self.builders.append(builder)
-            self.builder_by_owner_role[key] = builder
+        builder = Builder(self, json.loads(json.dumps(descriptor)), role=role)
+        # Both inventories retain exact ownership before any partial effects.
+        self.builders.append(builder)
+        self.builder_by_owner_role[key] = builder
         builder.prepare()
         if role == "source" and keep_probe:
             from linux_docker_buildkit_keep import run as verify_keep
-            # Reserve this proof's own position: `[-1]` would resolve a
-            # concurrent slice's reservation, not this one's.
-            with self.fence("slice_lock"):
-                position = len(self.keep_proofs_verified)
-                self.keep_proofs_verified.append(False)
+            self.keep_proofs_verified.append(False)
             verify_keep(builder)
-            self.keep_proofs_verified[position] = True
+            self.keep_proofs_verified[-1] = True
         return builder
 
     def driver_inputs(self, descriptor, scope, proof, images, suite=None):
@@ -783,15 +682,6 @@ class ComposeHarness(startup.Harness):
         return validate(output, inputs)
 
     def mutate(self, label, descriptor, args, **kwargs):
-        # One owned mutation at a time, run-wide, even when per-Machine slices
-        # run concurrently: `effects_uncertain` is a single fence over every
-        # Machine, so a mutation whose effects are unknown must still stop the
-        # next mutation on any other Machine, and the sequence numbering that
-        # names the retained intent/result documents must stay unique.
-        with self.fence("mutation_lock"):
-            return self.mutate_once(label, descriptor, args, **kwargs)
-
-    def mutate_once(self, label, descriptor, args, **kwargs):
         # A failed mutation is never presumed rolled back merely because the
         # host process returned a normal nonzero code.
         require(not self.effects_uncertain, "previous mutation remains uncertain")
@@ -946,9 +836,7 @@ class ComposeHarness(startup.Harness):
             require(not any(x["effects_uncertain"] for x in retired.record.receipts), 'uncertain retired-monitor command; cleanup withheld')
         require(all(getattr(self, "keep_proofs_verified", [])),
                 "unresolved direct-youki keep fixture; resources retained; cleanup withheld")
-        # Every Recorder the run created, including the one each concurrent
-        # slice recorded into: a slice's uncertainty is the run's uncertainty.
-        recorders = [self.record, *getattr(self, "slice_records", []), *(d.record for d in self.drivers)]
+        recorders = [self.record, *(d.record for d in self.drivers)]
         if self.monitor is not None:
             if getattr(self, "live_cleanup", False):
                 self.monitor.check()
@@ -1094,216 +982,79 @@ class ComposeHarness(startup.Harness):
         return self.prepare_image(descriptor)
 
     def run_machine_suite(self, suite, selected_machines, bindings):
-        """One suite across its selected Machines; the caller owns the topology.
-
-        `PARALLEL_SUITES` run their slices concurrently. Cross-Machine
-        verification is defined over completed slices and stays where it was:
-        after every slice, however they were scheduled.
-        """
+        """One suite across its selected Machines; the caller owns the topology."""
         self.active_suite = suite
-        if suite in PARALLEL_SUITES and len(selected_machines) > 1:
-            observations = self.run_concurrent_slices(suite, selected_machines, bindings)
-        else:
-            observations = self.run_serial_slices(suite, selected_machines, bindings)
+        observations = []
+        for index, (_environment, machine) in enumerate(selected_machines):
+            self.monitor.check()
+            descriptor = machine["docker_context"]
+            scope, proof = bindings[machine["machine_id"]]
+            images = self.machine_images(suite, descriptor)
+            if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
+                         "mounts", "netpolicy", "isolation", "concurrency", "recovery"}:
+                if suite == "artifacts":
+                    from linux_docker_build_artifacts import run_machine
+                elif suite == "parallel":
+                    from linux_docker_build_parallel import run_machine
+                elif suite == "ssh":
+                    from linux_docker_build_ssh import run_machine
+                elif suite == 'images':
+                    from linux_docker_image_machine import run_machine
+                elif suite == 'registry':
+                    from linux_docker_registry_machine import run_machine
+                elif suite == 'handshake':
+                    from linux_docker_handshake_machine import run_machine
+                elif suite == 'limits':
+                    from linux_docker_limits_machine import run_machine
+                elif suite == 'mounts':
+                    from linux_docker_mounts_machine import run_machine
+                elif suite == 'netpolicy':
+                    from linux_docker_netpolicy_machine import run_machine
+                elif suite == 'isolation':
+                    from linux_docker_isolation_machine import run_machine
+                elif suite == 'concurrency':
+                    from linux_docker_concurrency_machine import run_machine
+                elif suite == 'recovery':
+                    from linux_docker_recovery_machine import run_machine
+                else:
+                    from linux_docker_container_lifecycle import run_machine
+                with self.monitor.excluding(descriptor["name"]):
+                    begin = time.time_ns()
+                    observation = run_machine(self, descriptor, scope, proof, images, index)
+                    end = self.monitor.close_interval(begin, descriptor["name"])
+                    self.monitor.check_interval(begin, end, descriptor["name"])
+                observations.append(observation)
+                continue
+            inputs = self.driver_inputs(descriptor, scope, proof, images, suite)
+            admitted = driver.Inputs(inputs, suite=suite)
+            admitted.verify_runtime_evidence()
+            output = self.evidence / (suite + "-machine-" + str(index))
+            selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
+            self.drivers.append(selected)
+            self.driver_cleanup_verified.append(False)
+            with self.monitor.excluding(descriptor["name"]):
+                begin = time.time_ns()
+                result = selected.run(suite)
+                end = self.monitor.close_interval(begin, descriptor["name"])
+                require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
+                        str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
+                require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
+                builder_runtime = None
+                if suite == "build":
+                    builder = self.get_builder(descriptor)
+                    builder_runtime = builder.verify(require_invocation=True)
+                    from linux_docker_buildkit_keep import verify_worker_log
+                    builder_runtime["post_workload_log"] = verify_worker_log(builder)
+                replay = self.validate_driver(output, inputs, suite)
+                self.driver_cleanup_verified[-1] = True
+                self.monitor.check_interval(begin, end, descriptor["name"])
+            observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
+                           "independent_validation": replay}
+            if builder_runtime is not None:
+                observation["builder_runtime"] = builder_runtime
+            observations.append(observation)
         self.verify_across_machines(suite, observations, [machine["docker_context"] for _, machine in selected_machines])
         return observations
-
-    def run_serial_slices(self, suite, selected_machines, bindings):
-        """Every slice in Machine order, each the only Machine under workload."""
-        observations, rows = [], []
-        started = time.time_ns()
-        for index, (_environment, machine) in enumerate(selected_machines):
-            descriptor = machine["docker_context"]
-            begin = time.time_ns()
-            observations.append(self.run_machine_slice(suite, index, machine, bindings, own_exclusion=True))
-            rows.append({"index": index, "context": descriptor["name"], "thread": threading.current_thread().name,
-                         "started_unix_ns": begin, "ended_unix_ns": time.time_ns(), "failed": False})
-        self.slice_concurrency(suite, rows, started, time.time_ns(), execution="serial")
-        return observations
-
-    def run_concurrent_slices(self, suite, selected_machines, bindings):
-        """Every slice at once, one thread and one Recorder per Machine.
-
-        Each Machine owns a private Engine on a private socket, so the slices
-        themselves are independent by construction; what has to be arranged is
-        the harness's own shared state. Three things carry the whole difference
-        from the serial path:
-
-        * Owned image preparation happens first, serially. It mutates a Machine
-          and every mutation queues behind one run-wide fence, so warming it
-          here is the same work in the same order rather than three threads
-          taking turns inside their timed regions.
-        * Nothing is excluded from sampling. A serial slice stops the monitor
-          watching the Machine under test, because the liveness assertions
-          subtract that Machine anyway and the sample would only spend its
-          bounded youki journal. Here the opposite holds: every Machine in the
-          window is a witness for the other two, so every one of them is
-          sampled throughout and each slice's interval carries exactly the
-          sibling and neighbour observations a serial slice carries. A
-          parallelised suite must not prove less than the serial one it
-          replaces. (No runtime-audit window is open during these suites; only
-          `lifecycle` reads that journal, and it runs serially.)
-        * Every thread is joined before anything is raised. A slice that fails
-          does not stop its siblings — they were already dispatched — so the
-          run waits for all of them and then raises the failure of the
-          lowest-numbered Machine, leaving the ownership registries complete.
-        """
-        names = [machine["docker_context"]["name"] for _, machine in selected_machines]
-        require(len(set(names)) == len(names) == len(selected_machines),
-                "concurrent slices require distinct Machines")
-        self.monitor.check()
-        for _environment, machine in selected_machines:
-            self.machine_images(suite, machine["docker_context"])
-        count = len(selected_machines)
-        observations, errors, rows = [None] * count, [None] * count, [None] * count
-        threads = []
-
-        local = self.__dict__.setdefault("_local", threading.local())
-
-        def run_slice(index, machine):
-            begin = time.time_ns()
-            try:
-                # Inside the guard: a slice that cannot even open its own
-                # Recorder is a failed slice, not a missing one.
-                local.record = self.slice_recorder(suite, index)
-                observations[index] = self.run_machine_slice(suite, index, machine, bindings,
-                                                             own_exclusion=False)
-            except BaseException as error:
-                errors[index] = error
-            finally:
-                local.record = None
-                rows[index] = {"index": index, "context": names[index],
-                               "thread": threading.current_thread().name, "started_unix_ns": begin,
-                               "ended_unix_ns": time.time_ns(), "failed": errors[index] is not None}
-
-        started = time.time_ns()
-        for index, (_environment, machine) in enumerate(selected_machines):
-            thread = threading.Thread(target=run_slice, args=(index, machine),
-                                      name="vz-slice-" + suite + "-" + str(index), daemon=False)
-            threads.append(thread)
-            thread.start()
-        for thread in threads:
-            # No timeout: every command a slice runs is already bounded by its
-            # own recorded timeout, and a thread abandoned here would be a live
-            # thread the cleanup fence must then refuse.
-            thread.join()
-        ended = time.time_ns()
-        require(all(not thread.is_alive() for thread in threads), "slice thread did not positively terminate")
-        self.slice_concurrency(suite, rows, started, ended, execution="concurrent")
-        for error in errors:
-            if error is not None:
-                raise error
-        return observations
-
-    def slice_concurrency(self, suite, rows, started, ended, *, execution):
-        """Retain when each Machine's slice actually ran, and whether they overlapped.
-
-        A run that claimed to parallelise and silently serialised would
-        otherwise still pass and never be noticed, so the overlap is a recorded
-        number and not an assumption: `min_pairwise_overlap_ns` is positive only
-        if every pair of slices was in flight at the same moment. A window whose
-        slices all succeeded must show that overlap; a window with a failed
-        slice records what happened without hiding the failure behind it.
-        """
-        require(execution in ("serial", "concurrent"), "unknown slice execution mode")
-        overlaps = [{"machines": [left["index"], right["index"]],
-                     "overlap_ns": min(left["ended_unix_ns"], right["ended_unix_ns"]) -
-                                   max(left["started_unix_ns"], right["started_unix_ns"])}
-                    for position, left in enumerate(rows) for right in rows[position + 1:]]
-        minimum = min((row["overlap_ns"] for row in overlaps), default=0)
-        record = {"schema_version": 1, "suite": suite, "execution": execution,
-                  "scope": "HARNESS_SLICE_SCHEDULING_OBSERVATION_NOT_ENGINE_CONFORMANCE",
-                  "slices": rows, "started_unix_ns": started, "ended_unix_ns": ended,
-                  "wall_ns": ended - started,
-                  "summed_slice_ns": sum(row["ended_unix_ns"] - row["started_unix_ns"] for row in rows),
-                  "pairwise_overlap": overlaps, "min_pairwise_overlap_ns": minimum,
-                  "observed_concurrent": bool(overlaps) and minimum > 0}
-        startup.document(self.evidence / (suite + "-machine-concurrency.json"), record)
-        self.__dict__.setdefault("slice_concurrency_records", {})[suite] = record
-        if execution == "concurrent" and not any(row["failed"] for row in rows):
-            require(record["observed_concurrent"],
-                    "parallel " + suite + " slices did not overlap: " + repr(overlaps))
-        return record
-
-    def run_machine_slice(self, suite, index, machine, bindings, *, own_exclusion):
-        """One Machine's slice of one suite.
-
-        The interval this slice closes and checks is about its own Machine, and
-        every other Machine witnesses it — a concurrently running sibling
-        included, so a concurrent slice's liveness evidence is the same evidence
-        a serial slice's is. `own_exclusion` stops the monitor sampling this
-        Machine for the duration; a serial slice takes it, because the
-        assertions subtract this Machine anyway and the sample would only spend
-        its bounded youki journal. A concurrent slice does not, because its
-        Machine is a witness for the others running beside it.
-        """
-        self.monitor.check()
-        descriptor = machine["docker_context"]
-        active = descriptor["name"]
-        scope, proof = bindings[machine["machine_id"]]
-        images = self.machine_images(suite, descriptor)
-        exclusion = self.monitor.excluding(active) if own_exclusion else contextlib.nullcontext()
-        if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
-                     "mounts", "netpolicy", "isolation", "concurrency", "recovery"}:
-            if suite == "artifacts":
-                from linux_docker_build_artifacts import run_machine
-            elif suite == "parallel":
-                from linux_docker_build_parallel import run_machine
-            elif suite == "ssh":
-                from linux_docker_build_ssh import run_machine
-            elif suite == 'images':
-                from linux_docker_image_machine import run_machine
-            elif suite == 'registry':
-                from linux_docker_registry_machine import run_machine
-            elif suite == 'handshake':
-                from linux_docker_handshake_machine import run_machine
-            elif suite == 'limits':
-                from linux_docker_limits_machine import run_machine
-            elif suite == 'mounts':
-                from linux_docker_mounts_machine import run_machine
-            elif suite == 'netpolicy':
-                from linux_docker_netpolicy_machine import run_machine
-            elif suite == 'isolation':
-                from linux_docker_isolation_machine import run_machine
-            elif suite == 'concurrency':
-                from linux_docker_concurrency_machine import run_machine
-            elif suite == 'recovery':
-                from linux_docker_recovery_machine import run_machine
-            else:
-                from linux_docker_container_lifecycle import run_machine
-            with exclusion:
-                begin = time.time_ns()
-                observation = run_machine(self, descriptor, scope, proof, images, index)
-                end = self.monitor.close_interval(begin, active)
-                self.monitor.check_interval(begin, end, active)
-            return observation
-        inputs = self.driver_inputs(descriptor, scope, proof, images, suite)
-        admitted = driver.Inputs(inputs, suite=suite)
-        admitted.verify_runtime_evidence()
-        output = self.evidence / (suite + "-machine-" + str(index))
-        selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
-        position = self.register_driver(selected)
-        with exclusion:
-            begin = time.time_ns()
-            result = selected.run(suite)
-            end = self.monitor.close_interval(begin, active)
-            require(result["outcome"] == "fixture_assertions_passed", suite + " slice failed: " +
-                    str({"failure": result.get("failure"), "cleanup_errors": result.get("cleanup_errors")}))
-            require(result["cleanup_errors"] == [], "Docker fixture cleanup failed semantically")
-            builder_runtime = None
-            if suite == "build":
-                builder = self.get_builder(descriptor)
-                builder_runtime = builder.verify(require_invocation=True)
-                from linux_docker_buildkit_keep import verify_worker_log
-                builder_runtime["post_workload_log"] = verify_worker_log(builder)
-            replay = self.validate_driver(output, inputs, suite)
-            self.driver_cleanup_verified[position] = True
-            self.monitor.check_interval(begin, end, active)
-        observation = {"scope": scope, "started_unix_ns": begin, "ended_unix_ns": end,
-                       "independent_validation": replay}
-        if builder_runtime is not None:
-            observation["builder_runtime"] = builder_runtime
-        return observation
 
     def verify_across_machines(self, suite, observations, descriptors):
         """Claims one Machine cannot prove alone, checked once the suite's slices exist.
@@ -1453,11 +1204,6 @@ class ComposeHarness(startup.Harness):
         result = {"machine_slices": [row for suite in suites for row in slices.get(suite, [])],
                   "continuous_sentinels": self.monitor.summary(),
                   "runtime_inventory_scope": "startup_executable_paths_and_pinned_daemon_mounts_not_release_cache_audit"}
-        if getattr(self, "slice_concurrency_records", None):
-            # How each suite's Machine slices were actually scheduled, so a run
-            # that claimed to parallelise and did not is visible in the result
-            # rather than only in the wall clock.
-            result["suite_concurrency"] = copy.deepcopy(self.slice_concurrency_records)
         if composed:
             result["suite_slices"] = slices
             result["suites_executed"] = list(suites)
@@ -1499,11 +1245,6 @@ class SentinelMonitor:
         Sampling resumes the moment the block ends, including on failure, so a
         Machine is unobserved only while it is the one under test or while its
         journal is being captured.
-
-        Save-and-restore is deliberately not thread-safe, and concurrent slices
-        never take it: two threads entering this independently would each
-        restore a set captured before the other joined. A concurrent window
-        excludes nothing, because every Machine in it witnesses the others.
         """
         previous = self.excluded
         self.excluded = previous | frozenset(names)
@@ -1601,17 +1342,6 @@ class SentinelMonitor:
     def check(self):
         require(not self.errors and self.thread.is_alive(), "sibling liveness failed: " + repr(self.errors))
 
-    def observers(self, active):
-        """The Machines whose liveness this interval asserts: every one but `active`.
-
-        Concurrent slices do not narrow this. Their Machines keep being sampled
-        while they work, so a slice's siblings witness it whether they are busy
-        or idle, and a parallelised suite's liveness claim is the serial one.
-        """
-        observers = {row["descriptor"]["name"] for row in self.rows} - {active}
-        require(observers, "no unobserved Machine remains to witness this interval")
-        return observers
-
     def close_interval(self, begin, active, deadline_seconds=5.0):
         """Return an interval end only once every sibling has a sample at or after begin.
 
@@ -1620,23 +1350,21 @@ class SentinelMonitor:
         liveness evidence, not a retry, and it never relaxes check_interval.
         """
         deadline = time.monotonic() + deadline_seconds
-        names = self.observers(active)
         while True:
             self.check()
-            # One snapshot per pass: the sampling thread keeps appending, and a
-            # name must not be judged against two different sample lists.
-            samples = list(self.samples)
-            if all(any(x["context"] == name and x["unix_ns"] >= begin for x in samples) for name in names):
+            names = {row["descriptor"]["name"] for row in self.rows} - {active}
+            if all(any(x["context"] == name and x["unix_ns"] >= begin for x in self.samples) for name in names):
                 return time.time_ns()
             require(time.monotonic() < deadline, "sibling liveness sample did not arrive within the interval deadline")
             self.finished.wait(0.05)
 
     def check_interval(self, begin, end, active):
         self.check()
-        samples = list(self.samples)
-        for name in self.observers(active):
-            require(any(x["context"] == name and begin <= x["unix_ns"] <= end for x in samples),
-                    "no contemporaneous sibling/neighbor liveness observation")
+        for row in self.rows:
+            name = row["descriptor"]["name"]
+            if name != active:
+                require(any(x["context"] == name and begin <= x["unix_ns"] <= end for x in self.samples),
+                        "no contemporaneous sibling/neighbor liveness observation")
 
     def stop(self):
         # Stopping twice must not raise: a caller that already stopped this
