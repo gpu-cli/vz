@@ -83,7 +83,10 @@ if [ -n "$verb" ]; then
     # Runtime identities are minted per Up, not derived from the definition:
     # recreating one pinned definition must hand out entirely new ones.
     inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
-    printf '%s %s' "$pid" "$inc" > "$topology"
+    # Status must reflect the Machines the definition declares, not a fixed one.
+    names=$(grep -o '"name": *"machine-[^"]*"' vz.json | sed 's/.*"\(machine-[^"]*\)"/\1/' | sort -u | tr '\n' ' ')
+    [ -n "$names" ] || names="machine-0 "
+    printf '%s %s %s' "$pid" "$inc" "$names" > "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
   fi
@@ -92,7 +95,9 @@ if [ -n "$verb" ]; then
     # rewritten into this isolated runtime dir, so a recreated Environment with
     # a fresh state directory genuinely has none of it.
     printf '%s' "$command_tail" \
-      | sed "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" > "$VZ_RUNTIME_DATA_DIR/script.sh"
+      | sed -e "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" \
+            -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
+            -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$VZ_RUNTIME_DATA_DIR/script.sh"
     /bin/sh "$VZ_RUNTIME_DATA_DIR/script.sh"
     exit $?
   fi
@@ -107,13 +112,20 @@ if [ -n "$verb" ]; then
     # endpoint identities -- which is what the no-collision check reads.
     pid=$(cut -d' ' -f1 < "$topology")
     sfx=$(cut -d' ' -f2 < "$topology")
+    names=$(cut -d' ' -f3- < "$topology")
     printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$pid"
     printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
-    printf '   "machines": [{"name": "machine-0", "state": "ready", "docker_context": {\n'
-    printf '     "owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s"},\n' "$pid" "$sfx" "$sfx"
-    printf '     "name": "vzr1-ctx-%s",\n     "endpoint": "unix:///tmp/vz-%s.sock",\n' "$sfx" "$sfx"
-    printf '     "engine_id": "eng-%s"}, "machine_id": "mch_%s",\n' "$sfx" "$sfx"
-    printf '     "incarnation_id": "inc_%s", "incarnation_generation": 1}]\n' "$sfx"
+    printf '   "machines": ['
+    sep=""
+    for m in $names; do
+      printf '%s{"name": "%s", "state": "ready", "docker_context": {' "$sep" "$m"
+      printf '"owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
+      printf '"name": "vzr1-ctx-%s-%s", "endpoint": "unix:///tmp/vz-%s-%s.sock",' "$sfx" "$m" "$sfx" "$m"
+      printf '"engine_id": "eng-%s-%s"}, "machine_id": "mch_%s_%s",' "$sfx" "$m" "$sfx" "$m"
+      printf '"incarnation_id": "inc_%s_%s", "incarnation_generation": 1}' "$sfx" "$m"
+      sep=", "
+    done
+    printf ']\n'
     printf '  }\n ]\n}\n'
     exit 0
   fi
@@ -219,6 +231,42 @@ int main(int argc, char **argv) {
 """
 
 
+BUSYBOX_SHIM = r'''#!/bin/sh
+# Stand-in for the guest BusyBox. Applets that only touch files delegate to the
+# host; `httpd`, `wget` and `ip` model one Environment's private reachability:
+# an address belongs to the project whose runtime directory serves it, so a
+# probe from another project's directory cannot reach it. That is the property
+# under test, modelled at the granularity this fake has (project == Environment).
+state="$VZ_RUNTIME_DATA_DIR"
+applet=$1
+shift
+case "$applet" in
+  httpd)
+    root=""
+    while [ $# -gt 0 ]; do case "$1" in -h) root=$2; shift 2 ;; *) shift ;; esac; done
+    printf '%s' "$root" > "$state/httpd-root"
+    exit 0 ;;
+  ip)
+    # A deterministic private address per project runtime directory.
+    n=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
+    # `ip -o -4 addr show` field layout, so the caller parses the shim exactly
+    # the way it parses the real tool.
+    printf '2: eth0    inet 10.%s.%s.2/24 brd 10.%s.%s.255 scope global eth0\n' \
+      "$(( (n / 256) % 254 + 1 ))" "$(( n % 254 + 1 ))" "$(( (n / 256) % 254 + 1 ))" "$(( n % 254 + 1 ))"
+    exit 0 ;;
+  wget)
+    url=""
+    while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done
+    host=${url#http://}; host=${host%%:*}
+    mine=$("$0" ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
+    if [ "$host" != "$mine" ] || [ ! -f "$state/httpd-root" ]; then exit 1; fi
+    cat "$(cat "$state/httpd-root")/index.html"
+    exit 0 ;;
+  *) exec "$applet" "$@" ;;
+esac
+'''
+
+
 def build_fake_daemon(destination: Path) -> None:
     """Compile the daemon stand-in, or skip the caller when no compiler exists."""
     compiler = shutil.which("cc") or shutil.which("clang")
@@ -245,6 +293,9 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     (root / "bin/vz").chmod(0o755)
     build_fake_daemon(root / "bin/vz-runtimed")
     (root / "bin/vz-runtimed").chmod(0o755)
+    # The guest BusyBox stand-in every `vz exec` script addresses.
+    (root / "bin/busybox-shim").write_text(BUSYBOX_SHIM)
+    (root / "bin/busybox-shim").chmod(0o755)
     catalog = json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n"
     (root / "machine-target-catalog.json").write_bytes(catalog)
     manifest = json.loads(read_regular(root / "release-manifest.json"))

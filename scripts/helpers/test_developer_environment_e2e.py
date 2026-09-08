@@ -31,10 +31,12 @@ RUN_ID = "topology-unit-run-1"
 TOP21 = e2e.CRITERION_21
 TOP15 = e2e.CRITERION_15
 TOP1 = "gate.instances.three_concurrent_no_collision"
+TOP5 = "gate.network.private_topology_paths"
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
-               "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision"}
+               "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
+               "private_topology_paths"}
 # Both remaining sub-checks belong to criterion 15 and need a live typed API,
 # so criterion 21 is the first topology scenario the lane can actually pass.
 NOT_IMPLEMENTED = {"status_json_field_set", "grpc_api_live_agreement"}
@@ -141,11 +143,15 @@ class TopologyLaneTests(unittest.TestCase):
         # typed API for its remaining two.
         self.assertEqual(self.top(result, TOP21)["status"], "PASS")
         self.assertEqual(self.top(result, TOP1)["status"], "PASS")
+        # The fake applies declared networks, so the check completes here. The
+        # installed 0.4 runtime refuses them and the check reports
+        # not_implemented instead; see check_private_topology_paths.
+        self.assertEqual(self.top(result, TOP5)["status"], "PASS")
         self.assertEqual(self.top(result, TOP15)["status"], "FAIL")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
-        for identifier in assigned - {TOP21, TOP15, TOP1}:
+        for identifier in assigned - {TOP21, TOP15, TOP1, TOP5}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
         cli_removal = common.load_json(common.REPO_ROOT / self.contract["pins"]["cli_removal"])
@@ -161,7 +167,8 @@ class TopologyLaneTests(unittest.TestCase):
                                        if s in ("bare_help", "legacy_rejection", "clean_up_refuses",
                                                 "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement",
-                          f"{TOP1}__three_concurrent_no_collision"})
+                          f"{TOP1}__three_concurrent_no_collision",
+                          f"{TOP5}__private_topology_paths"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:

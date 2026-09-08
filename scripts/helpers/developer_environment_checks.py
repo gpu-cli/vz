@@ -30,6 +30,7 @@ import copy
 import json
 import shutil
 import os
+import re
 from pathlib import Path
 import socket
 import stat
@@ -461,9 +462,19 @@ def provision(ctx: CheckContext, check: SubCheck, name: str, definition: dict, *
     if check.status != "PASS":
         return {"env": env, "project": project, "status": None}
     up = ctx.run(check, name + "-up", ["--json", "up"], cwd=project, env=env, timeout=timeout)
-    check.check(up.exit_code == 0, f"{name}: vz --json up exit {up.exit_code} (expected 0)")
     if up.exit_code != 0:
+        # A refusal naming an unimplemented adapter is reported to the caller
+        # rather than asserted against: it is a statement about the runtime.
+        detail = ""
+        try:
+            detail = json.loads(up.stderr.decode("utf-8")).get("error", {}).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            detail = ""
+        if "adapters remain required" in detail:
+            return {"env": env, "project": project, "status": None, "unsupported": detail}
+        check.check(False, f"{name}: vz --json up exit {up.exit_code} (expected 0)")
         return {"env": env, "project": project, "status": None}
+    check.check(True, f"{name}: vz --json up exit 0 (expected 0)")
     return {"env": env, "project": project,
             "status": read_status(ctx, check, name, project=project, env=env)}
 
@@ -711,6 +722,112 @@ def check_delete_single_environment_safety(ctx: CheckContext, top: str) -> SubCh
         final = ctx.run(check, "del-b-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
                         cwd=survivor["project"], env=survivor["env"], timeout=DELETE_TIMEOUT)
         check.check(final.exit_code == 0, f"the other Environment deleted afterwards (exit {final.exit_code})")
+    return check.finish()
+
+
+PRIVATE_NETWORK = "backend"
+PRIVATE_PORT = 8080
+WGET_TIMEOUT = 5
+
+
+def two_machine_definition(release_dir: Path) -> dict:
+    """One Environment, two Machines on one declared private network."""
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    second = copy.deepcopy(first)
+    second["name"] = "machine-1"
+    for machine in (first, second):
+        machine["networks"] = [PRIVATE_NETWORK]
+    environment["machines"] = [first, second]
+    environment["networks"] = [{"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "private"}]
+    environment["endpoints"] = [{"schema_version": 1, "name": "probe", "machine": first["name"],
+                                 "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
+    return definition
+
+
+def machine_exec(ctx, check, label, instance, machine, script, *, timeout=120):
+    return ctx.run(check, label, ["exec", "--environment", "default", "--machine", machine, "--",
+                                  "/bin/busybox", "sh", "-c", script],
+                   cwd=instance["project"], env=instance["env"], timeout=timeout)
+
+
+def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
+    """A declared private path serves inside its Environment and nowhere else.
+
+    One Machine serves a token on a declared private network; its sibling in the
+    same Environment must read exactly that token, and a Machine in a different
+    Environment must fail to reach the very same address. The foreign probe uses
+    the address rather than a name, so its failure is a routing fact and not an
+    unresolved hostname.
+    """
+    check = SubCheck(top, "private_topology_paths")
+    try:
+        definition = two_machine_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if schema_path.is_file():
+        problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                          key=lambda e: list(map(str, e.absolute_path)))
+        check.check(not problems, "the two-Machine private-network definition validates"
+                    if not problems else f"definition invalid: {problems[0].message[:200]}")
+        if problems:
+            return check.finish()
+    token = "vznet-" + uuid.uuid4().hex[:16]
+    inside = provision(ctx, check, "net-a", definition)
+    # vz 0.4 refuses a definition that declares networks, endpoints or workspace
+    # projections: the adapters that would apply them are not implemented, and
+    # Up performs no admission at all. That is a runtime gap, not a gap in this
+    # check, so it is reported as not_implemented with the runtime's own words.
+    # The check is otherwise complete and starts passing when the adapters land.
+    if inside.get("unsupported"):
+        check.not_implemented = ("declared networks and endpoints are not applied by this runtime: " +
+                                 inside["unsupported"][:300])
+        return check.finish()
+    if check.status != "PASS" or not inside["status"]:
+        return check.finish()
+    names = [m.get("name") for e in inside["status"]["environments"] for m in e.get("machines") or []]
+    check.check(sorted(names) == ["machine-0", "machine-1"], f"both declared Machines are present (observed {names})")
+    if check.status != "PASS":
+        return check.finish()
+    served = machine_exec(ctx, check, "net-serve", inside, "machine-0",
+                          f"/bin/busybox mkdir -p /www; printf %s {token} > /www/index.html; "
+                          f"/bin/busybox httpd -p {PRIVATE_PORT} -h /www; printf STARTED")
+    check.check(served.exit_code == 0 and served.stdout.strip().endswith(b"STARTED"),
+                f"the private endpoint is serving on machine-0 (exit {served.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+    # The address comes from the serving Machine itself: the foreign probe must
+    # target the same address, so its refusal is about routing and not a name.
+    addressed = machine_exec(ctx, check, "net-address", inside, "machine-0",
+                             "/bin/busybox ip -o -4 addr show | /bin/busybox awk '$2!=\"lo\"{print $4}' "
+                             "| /bin/busybox cut -d/ -f1 | /bin/busybox head -1")
+    address = addressed.stdout.decode("ascii", "replace").strip()
+    check.check(addressed.exit_code == 0 and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", address or ""),
+                f"machine-0 reported its private address (observed {address!r})")
+    if check.status != "PASS":
+        return check.finish()
+    sibling = machine_exec(ctx, check, "net-sibling", inside, "machine-1",
+                           f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/")
+    check.check(sibling.exit_code == 0 and sibling.stdout.strip() == token.encode(),
+                f"the sibling Machine reads the declared private path (exit {sibling.exit_code})")
+    outside = provision(ctx, check, "net-b", minimal_definition(ctx.release_dir))
+    if check.status != "PASS" or not outside["status"]:
+        return check.finish()
+    foreign = machine_exec(ctx, check, "net-foreign", outside, "machine-0",
+                           f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/; "
+                           "printf ':%s' $?")
+    check.check(foreign.exit_code == 0 and token.encode() not in foreign.stdout and
+                not foreign.stdout.strip().endswith(b":0"),
+                f"a Machine in another Environment cannot reach that address (observed {foreign.stdout[:80]!r})")
+    if check.status == "PASS":
+        for name, instance in (("net-a", inside), ("net-b", outside)):
+            removed = ctx.run(check, name + "-delete",
+                              ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                              cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+            check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
     return check.finish()
 
 
