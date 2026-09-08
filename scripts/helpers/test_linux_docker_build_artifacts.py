@@ -5,12 +5,13 @@ import json
 from pathlib import Path
 import tempfile
 import sys
-from types import ModuleType, SimpleNamespace
+from types import MethodType, ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
 import docker_host_driver as driver
 import linux_docker_build_artifacts as artifacts
+import linux_docker_e2e as gate
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"
 
@@ -154,6 +155,10 @@ class ArtifactTests(unittest.TestCase):
         events, operation_proofs, builders = [], {}, {}
         harness = SimpleNamespace(evidence=self.root, info={"fixture": str(FIXTURE),
             "fixture_sha256": self.fixture_digest}, drivers=[object()], driver_cleanup_verified=[True])
+        # The real registrar: a Driver and its cleanup flag are reserved
+        # together, never paired by list position after the fact.
+        harness.register_driver = MethodType(gate.ComposeHarness.register_driver, harness)
+        harness.fence = MethodType(gate.ComposeHarness.fence, harness)
 
         def prepare(selected, *, role, keep_probe):
             self.assertEqual(selected, descriptor)

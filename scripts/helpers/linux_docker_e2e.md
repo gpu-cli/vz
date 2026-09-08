@@ -297,6 +297,57 @@ Two things make it composable:
 A `--suite lifecycle` run keeps the whole-run window it always had, enrolled
 before the sentinels and captured after owned removal.
 
+### Concurrent per-Machine slices
+
+`compose`, `build`, `artifacts` and `ssh` run their per-Machine slices at the
+same time; every other suite still runs one Machine after another. Each Machine
+has a private Engine on a private socket, which is the isolation this lane
+already asserts, so those slices are independent by construction. What is not
+independent is the harness's own bookkeeping, and three things carry it:
+
+- Each concurrent slice records into a `Recorder` of its own, under
+  `<suite>-machine-<index>-commands/`. A `Recorder` numbers a receipt by the
+  length of its list and then appends, so a shared one would let two threads
+  overwrite each other's indices and files. The canary list stays the run's one
+  list: a secret one slice admits is refused by every command of every other.
+- One owned mutation runs at a time, run-wide. `effects_uncertain` is a single
+  fence over every Machine, so a mutation whose effects are unknown still stops
+  the next mutation on any other Machine. Owned image preparation, which is all
+  mutations, therefore happens once before the threads start.
+- A concurrent window excludes nothing from sampling. A serial slice stops the
+  monitor watching the Machine under test, because the liveness assertions
+  subtract that Machine anyway and the sample would only spend its bounded
+  youki journal; here the opposite holds, because every Machine in the window
+  witnesses the other two. So each concurrent slice's interval carries the same
+  sibling and neighbour observations a serial slice's does — a parallelised
+  suite proves no less than the serial one it replaces, and in fact observes
+  each Machine while it is itself under workload. No runtime-audit window is
+  open during these suites; only `lifecycle` reads that journal, and it runs
+  serially. `excluding` stays non-thread-safe by construction and concurrent
+  slices never take it.
+
+Cross-Machine verification is unchanged: `verify_across_machines` runs after
+every slice completes, however they were scheduled. A failing slice no longer
+prevents its siblings from being dispatched — they had already started — so the
+window joins all of them and then raises the lowest-numbered Machine's failure.
+
+`<suite>-machine-concurrency.json` records, for every suite, when each Machine's
+slice started and ended, in which thread, and the pairwise overlap between them;
+the same block appears in the run result under `scenario.suite_concurrency`. A
+concurrent window whose slices all passed must show a positive overlap for every
+pair, so a run that claimed to parallelise and silently serialised fails rather
+than passing quietly at the old wall time.
+
+Left serial deliberately: `limits` and `concurrency` measure a Machine's own
+readiness, resource and concurrent-client behaviour, and two more busy Machines
+is a different experiment; `parallel` brackets a one-second in-guest health
+cadence with a 250 ms lateness bound that host oversubscription would perturb,
+and its slots fail a shared barrier fast when a sibling dies; `lifecycle`
+needs its runtime-audit window quiet; `recovery` replaces the Machines;
+`registry` observes all four Docker config directories in Session order; and
+`images` asserts that a failing Machine is never followed by a dispatch to the
+next one.
+
 Because it composes every suite, it carries their inputs at once: the BuildKit
 archive, the SSH packages and gpgv, the registry archive and layout, and tmux;
 it may also pin the container fixture. A bare `--suite all` is still refused
