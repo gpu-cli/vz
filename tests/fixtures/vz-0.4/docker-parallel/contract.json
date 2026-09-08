@@ -20,5 +20,11 @@
   "payload_template": "vz04-parallel-v1\nslot=N\n",
   "scenario": "parallel_builds",
   "schema_version": 1,
+  "tombstone": {
+    "error_code": "participant_died",
+    "payload_template": "vz04-parallel-tombstone-v1\nslot=N\n",
+    "target": "tombstone",
+    "transcript_prefix": "VZ_PARALLEL_TOMBSTONE="
+  },
   "transcript_prefix": "VZ_PARALLEL_BARRIER="
 }

@@ -5,7 +5,7 @@ slot has an independent command recorder; a thread or client lifetime alone is
 never evidence that the guest RUN workers overlapped.
 """
 import copy
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import json
 import os
 from pathlib import Path
@@ -20,13 +20,17 @@ from linux_docker_build_artifacts import OCI_OPTIONS
 
 require = driver.require
 SLOTS = tuple(range(4))
+TOMBSTONE_TARGET = "tombstone"
 CONTRACT = {"schema_version": 1, "scenario": "parallel_builds", "cache_id": "vz04-parallel-barrier-v1",
             "network": "none", "payload_template": "vz04-parallel-v1\nslot=N\n", "payload_mode": 420,
             "transcript_prefix": "VZ_PARALLEL_BARRIER=",
             "barrier": {"workers": 4, "timeout_ns": 180_000_000_000, "poll_interval_ns": 100_000_000,
                         "release_dwell_ns": 1_000_000_000, "max_samples": 1802, "max_record_bytes": 1024},
             "health": {"samples": 60, "interval_ns": 1_000_000_000, "max_lateness_ns": 250_000_000,
-                       "request_timeout_ns": 500_000_000, "observer_bound_ns": 70_000_000_000}}
+                       "request_timeout_ns": 500_000_000, "observer_bound_ns": 70_000_000_000},
+            "tombstone": {"target": TOMBSTONE_TARGET, "error_code": "participant_died",
+                          "payload_template": "vz04-parallel-tombstone-v1\nslot=N\n",
+                          "transcript_prefix": "VZ_PARALLEL_TOMBSTONE="}}
 
 
 def fixture_contract(fixture):
@@ -68,6 +72,40 @@ def specification(slot, output, fixture, fixture_sha256, run_id):
             "run_id": run_id}
 
 
+def tombstone_specification(slot, output, fixture, fixture_sha256, run_id):
+    """The parent's signal to the guest barrier that this slot is already dead.
+
+    It is deliberately not a slot operation: a different target, a different
+    export, and a payload no participant can produce. Nothing here can publish
+    a claim, so the four-participant release proof is untouched.
+    """
+    require(type(slot) is int and slot in SLOTS, "invalid parallel slot")
+    output, fixture = Path(output), Path(fixture)
+    require(output.is_absolute() and output.parent == output.parent.resolve(), "canonical tombstone directory required")
+    require(fixture.is_absolute() and fixture == fixture.resolve(), "canonical parallel fixture required")
+    require(all(not any(c in str(p) for c in (",", "\x00", "\n", "\r")) for p in (output, fixture)),
+            "parallel path contains exporter delimiters")
+    require(isinstance(fixture_sha256, str) and re.fullmatch(r"[0-9a-f]{64}", fixture_sha256), "invalid parallel fixture digest")
+    driver.checked_text(run_id, r"[a-z0-9][a-z0-9-]{7,39}", "parallel run ID")
+    payload = f"vz04-parallel-tombstone-v1\nslot={slot}\n".encode()
+    return {"schema_version": 1, "slot": slot, "parallel_fixture": str(fixture),
+            "parallel_fixture_sha256": fixture_sha256, "output": str(output / "local"),
+            "payload": {"path": "tombstone.txt", "sha256": driver.sha256(payload), "size": len(payload)},
+            "run_id": run_id, "target": TOMBSTONE_TARGET}
+
+
+def tombstone_arguments(inputs, operation):
+    fixture = Path(operation["parallel_fixture"])
+    return ["buildx", "build", "--builder", inputs["builder"]["name"], "--platform", "linux/arm64",
+            "--progress", "rawjson", "--file", str(fixture / "Dockerfile.parallel"),
+            "--target", operation["target"], "--provenance=false", "--sbom=false",
+            "--output", "type=local,dest=" + operation["output"],
+            "--build-arg", "FIXTURE_BASE=" + inputs["images"]["base"]["reference"],
+            "--build-arg", "FIXTURE_RUN=" + operation["run_id"],
+            "--build-arg", "FIXTURE_SLOT=" + str(operation["slot"]),
+            "--network=none", str(fixture)]
+
+
 def build_arguments(inputs, operation):
     fixture = Path(operation["parallel_fixture"])
     return ["buildx", "build", "--builder", inputs["builder"]["name"], "--platform", "linux/arm64",
@@ -107,38 +145,102 @@ class ParallelDriver(driver.Driver):
         return operation, proofs
 
 
-def execute_slots(selected, operations):
-    """Join every dispatched observer, including when another slot fails.
+class TombstoneDriver(driver.Driver):
+    """Tells the guest barrier that one slot the parent found dead cannot arrive.
+
+    Only a solve can reach that storage. The barrier lives in a BuildKit cache
+    mount inside the builder container's own `/var/lib/buildkit` volume in the
+    Machine, and this Apple-silicon parent reaches that Engine solely through
+    the Docker client, so it has no path to write there itself. The mount is
+    declared `sharing=shared`, which is what lets this solve write while the
+    surviving slots are still holding it open and polling.
+
+    This is the failure path only: it runs after a slot has already failed, and
+    it can never publish a claim, release a barrier, or make a run pass.
+    """
+    def execute(self, operation):
+        require(self.record.count == 0, "tombstone driver cannot be reused")
+        require(operation == tombstone_specification(operation["slot"], self.output,
+                    Path(operation["parallel_fixture"]), operation["parallel_fixture_sha256"],
+                    self.inputs.raw["run_id"]), "tombstone operation contract differs")
+        operation = copy.deepcopy(operation)
+        require(not os.path.lexists(operation["output"]), "tombstone export already exists")
+        fixture = Path(operation["parallel_fixture"])
+        require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed before tombstone")
+        startup.document(self.output / "operation.intent.json", operation)
+        self.builder_guard()
+        self.command(tombstone_arguments(self.inputs.raw, operation), timeout=300)
+        require(driver.tree_digest(fixture) == operation["parallel_fixture_sha256"], "parallel fixture changed during tombstone")
+        payload = operation["payload"]
+        exported = driver.regular(Path(operation["output"]) / payload["path"])
+        require(driver.sha256(exported) == payload["sha256"] and len(exported) == payload["size"],
+                "tombstone payload differs")
+        startup.document(self.output / "operation.json", operation)
+        return {"schema_version": 1, "slot": operation["slot"], "run_id": operation["run_id"],
+                "target": operation["target"], "payload": payload, "command_count": self.record.count}
+
+
+def execute_slots(selected, operations, signal):
+    """Join every dispatched observer, and tell the barrier about the first death.
 
     Each bounded command retains its own uncertainty state. No failure causes a
     retry, client restart, repair, or premature cleanup admission.
+
+    The join is completion-ordered, not slot-ordered. Waiting on slot 0 first
+    is what let a run keep three builds parked at the barrier for its full
+    180 s timeout after slot 3 died 9.3 s in: the parent already knew, and did
+    not look. On the first failure the parent signals the guest barrier, which
+    is the only participant that can distinguish "not yet arrived" from "gone".
+    A signal only shortens a failure: it is reachable solely from this except
+    branch, and a run that raises nothing must never have produced one.
     """
     require(len(selected) == len(operations) == 4, "exactly four slot drivers required")
     require([op["slot"] for op in operations] == list(SLOTS), "parallel slot order differs")
     require(len({id(item) for item in selected}) == 4, "parallel recorder reused")
+    require(callable(signal), "parallel tombstone signal required")
     barrier = threading.Barrier(4, timeout=10)
 
     def run(index):
         barrier.wait()
         return selected[index].execute(operations[index])
 
-    results, failures = [None] * 4, []
+    results, failures, signalled = [None] * 4, [], []
     with ThreadPoolExecutor(max_workers=4, thread_name_prefix="vz-parallel-build") as executor:
-        futures = [executor.submit(run, index) for index in SLOTS]
-        for index, future in enumerate(futures):
-            try:
-                results[index] = future.result()
-            except BaseException as error:
-                failures.append((index, error))
+        futures = {executor.submit(run, index): index for index in SLOTS}
+        pending = set(futures)
+        while pending:
+            done, pending = wait(pending, return_when=FIRST_COMPLETED)
+            for future in sorted(done, key=lambda item: futures[item]):
+                index = futures[future]
+                try:
+                    results[index] = future.result()
+                except BaseException as error:
+                    failures.append((index, error))
+                    if not signalled:
+                        # The first death is the cause; every later failure is a
+                        # sibling that waited for it. One tombstone aborts them
+                        # all, so a second signal would add nothing.
+                        signalled.append({"slot": index, "outcome": "unrecorded", "proof": None, "error": None})
+                        try:
+                            signalled[0].update(outcome="recorded", proof=signal(index))
+                        except BaseException as refused:
+                            # Never let signalling hide the failure it reports.
+                            signalled[0]["error"] = f"{type(refused).__name__}: {str(refused)[:400]}"
     if failures:
         # Name every slot's actual cause, not the first two. These slots
         # rendezvous, so when one never arrives the others fail waiting for it:
         # reporting a prefix names the symptoms and drops the cause. Each
         # message is bounded instead, because there are only ever four.
+        cause = failures[0][1]
+        failures.sort(key=lambda item: item[0])
         detail = "; ".join(f"slot {index}: {type(error).__name__}: {str(error)[:400]}"
                            for index, error in failures)
+        signal_detail = (f"; tombstone for slot {signalled[0]['slot']} {signalled[0]['outcome']}"
+                         + (f": {signalled[0]['error']}" if signalled[0]["error"] else "")) if signalled else ""
         raise RuntimeError("parallel slots failed: " +
-                           ",".join(str(index) for index, _ in failures) + " (" + detail + ")") from failures[0][1]
+                           ",".join(str(index) for index, _ in failures) +
+                           " (" + detail + ")" + signal_detail) from cause
+    require(not signalled, "parallel tombstone recorded without a failed slot")
     return results
 
 
@@ -166,6 +268,18 @@ def run_machine(harness, descriptor, scope, proof, images, index):
         harness.driver_cleanup_verified.append(False)
         selected.append(item)
         operations.append(operation)
+    # Provisioned with the slots, never during the failure it reports: a
+    # constructor that failed while a slot was dying would mask the cause.
+    tombstone = TombstoneDriver(admitted, Path(harness.info["fixture"]), root / "tombstone")
+    positions.append(len(harness.drivers))
+    harness.drivers.append(tombstone)
+    harness.driver_cleanup_verified.append(False)
+
+    def signal(slot):
+        return tombstone.execute(tombstone_specification(slot, root / "tombstone",
+                                 Path(harness.info["parallel_fixture"]),
+                                 harness.info["parallel_fixture_sha256"], inputs["run_id"]))
+
     health = Health(harness, descriptor, images, index)
     positions.append(len(harness.drivers))
     harness.drivers.append(health)
@@ -176,7 +290,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
     work_error = None
     try:
         health.start()
-        solved = execute_slots(selected, operations)
+        solved = execute_slots(selected, operations, signal)
         rows = []
         for item, (operation, artifact_proof) in zip(selected, solved):
             replay = validate_slot(item.output, inputs, operation)

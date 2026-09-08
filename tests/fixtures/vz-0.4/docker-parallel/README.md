@@ -30,6 +30,19 @@ adopted successful edge are bound to an unaliased winner in this same four-slot
 group. Warnings, arbitrary cancellations, cached RUNs, and unresolved foreign
 origins still fail. No host networking or implicit host service is involved.
 
+A participant that is cancelled cannot record its own death, so its siblings
+could only ever discover it by waiting out the whole timeout: three builds once
+sat at the barrier for 189 s after the fourth was cancelled 9 s in. The parent
+already knows, and the `tombstone` target is how it says so. That build claims
+`dead-<slot>` in the same shared cache mount and writes one atomic run-scoped
+record; every waiting participant reads tombstones on the same poll as records
+and fails immediately with `participant_died`, naming the dead slot, which is a
+distinct outcome from `barrier_timeout`. A tombstone can only shorten a failure:
+it never creates a slot claim, never counts as a participant, and never
+releases anything, so release still requires all four records observed at once.
+A tombstone from another run is refused, never obeyed. Only a solve can write
+that cache mount; the parent has no other path into it.
+
 Failure leaves claims and other artifacts intact: no retry, repair, or worker
 cleanup occurs. Reusing a successful or failed barrier cache is an error; the
 parent owns authenticated builder disposition. The timeout includes the dwell.

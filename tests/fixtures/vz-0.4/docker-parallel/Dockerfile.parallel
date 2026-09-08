@@ -1,4 +1,12 @@
 ARG FIXTURE_BASE=docker.io/library/python@sha256:d04f49f5882f49a3b91f874e75e19f0c265f7222da8659741a9d7eab148f22a9
+FROM ${FIXTURE_BASE} AS tombstone-record
+ARG FIXTURE_BASE
+ARG FIXTURE_RUN
+ARG FIXTURE_SLOT
+COPY parallel.py /tombstone/parallel.py
+RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /tombstone/parallel.py tombstone
+FROM scratch AS tombstone
+COPY --from=tombstone-record /out/tombstone.txt /tombstone.txt
 FROM ${FIXTURE_BASE} AS build
 ARG FIXTURE_BASE
 ARG FIXTURE_RUN
