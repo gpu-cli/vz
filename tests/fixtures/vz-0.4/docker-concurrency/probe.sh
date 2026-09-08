@@ -8,6 +8,9 @@ arrived() { "$BB" ls "$RENDEZVOUS" | "$BB" wc -l | "$BB" tr -d ' '; }
 case "${1:-}" in
 ready)
 	# $2 container marker, $3 idle seconds
+	# The sentinel image has no /run, and `set -e` turns that into an exit
+	# before the marker is ever written, so create the directory first.
+	"$BB" mkdir -p "$("$BB" dirname "$READY")"
 	printf 'VZREADY %s\n' "$2" > "$READY"
 	exec "$BB" sleep "$3"
 	;;

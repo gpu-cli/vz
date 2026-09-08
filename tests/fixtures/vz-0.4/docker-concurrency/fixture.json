@@ -9,19 +9,27 @@
   },
   "image": "developer-probe-rootfs.tar imported by the harness sentinel; the pull recipe uses its own owned private registry",
   "probe": {
-    "bytes": 841,
-    "cases": ["ready", "report"],
+    "bytes": 1026,
+    "cases": [
+      "ready",
+      "report"
+    ],
     "exec_template": "VZEXEC {marker} {slot} {arrived} {waited}",
     "health_command_template": "/bin/busybox grep -qx 'VZREADY {marker}' /run/vz-concurrency-ready",
-    "interpreter": ["/bin/busybox", "sh", "-c"],
+    "interpreter": [
+      "/bin/busybox",
+      "sh",
+      "-c"
+    ],
     "path": "probe.sh",
     "ready_path": "/run/vz-concurrency-ready",
     "ready_template": "VZREADY {marker}",
     "rendezvous_path": "/vz-rendezvous",
-    "sha256": "8398eb05435f7df4e8cd5299a8fa5514d94c17502da3fdefd593f75c073007c9"
+    "sha256": "4da8a15ffc67d092644ef7565478de89417fcccce9ddcde6e8b747a031c1e7fb"
   },
   "pull_registry": {
     "accesslog_disabled": false,
+    "accesslog_stream": "stdout (Apache combined); JSON application log with http.response.duration on stderr",
     "container_port": 5000,
     "insecure_by_default_cidr": "127.0.0.0/8",
     "layer_bytes": 2097152,

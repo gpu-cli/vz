@@ -615,3 +615,60 @@ class WiringTests(unittest.TestCase):
 
 if __name__ == '__main__':
     unittest.main()
+
+
+class NameGuardTests(unittest.TestCase):
+    """The launch guard runs after the registry exists, by design."""
+
+    def session(self, inventory, registry_id=None):
+        session = object.__new__(subject.Session)
+        session.names = ['vzconc-tok-ready-0', 'vzconc-tok-ready-1']
+        session.registry_name = 'vzconc-tok-registry'
+        session.registry_id = registry_id
+        session.container_inventory = lambda label: list(inventory)
+        return session
+
+    def test_the_sessions_own_registry_is_not_a_collision(self):
+        # run_machine publishes images and starts the registry before the twenty
+        # containers, so by 'before-launch' our own registry is already running.
+        self.session(['vzconc-tok-registry'], registry_id='a' * 64).names_absent('before-launch')
+
+    def test_a_registry_name_present_before_we_create_it_is_a_collision(self):
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            self.session(['vzconc-tok-registry']).names_absent('before-launch')
+
+    def test_a_name_we_are_about_to_use_is_a_collision(self):
+        with self.assertRaisesRegex(ValueError, 'already exists'):
+            self.session(['vzconc-tok-ready-1'], registry_id='a' * 64).names_absent('before-launch')
+
+
+class UnreadyLogTests(unittest.TestCase):
+    """A readiness failure has to explain itself without a retained Engine."""
+
+    def session(self, behaviour):
+        session = object.__new__(subject.Session)
+        session.descriptor = object()
+
+        class Harness:
+            def docker(self, label, descriptor, args):
+                return behaviour(args[-1])
+
+        session.harness = Harness()
+        return session
+
+    def test_logs_are_captured_for_the_unready_containers(self):
+        session = self.session(lambda identity: (b"can't create /run/x: nonexistent directory\n", b'', 0))
+        logs = session.unready_logs({'a': {}, 'b': {}})
+        self.assertEqual(sorted(logs), ['a', 'b'])
+        self.assertIn('nonexistent directory', logs['a'])
+
+    def test_capture_is_bounded(self):
+        session = self.session(lambda identity: (b'x', b'', 0))
+        self.assertEqual(len(session.unready_logs({str(n): {} for n in range(10)})), subject.UNREADY_LOG_LIMIT)
+
+    def test_a_failing_log_command_does_not_mask_the_readiness_failure(self):
+        def explode(identity):
+            raise RuntimeError('engine gone')
+        logs = self.session(explode).unready_logs({'a': {}})
+        self.assertIn('unavailable', logs['a'])
+

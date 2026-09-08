@@ -86,8 +86,16 @@ HELPERS = Path(__file__).resolve().parent
 FIXTURE = REPO / 'tests/fixtures/vz-0.4/docker-concurrency'
 LABEL = 'dev.vz.concurrency-proof'
 BUSYBOX = '/bin/busybox'
-PROBE_SHA256 = '8398eb05435f7df4e8cd5299a8fa5514d94c17502da3fdefd593f75c073007c9'
-PROBE_BYTES = 841
+PROBE_SHA256 = '4da8a15ffc67d092644ef7565478de89417fcccce9ddcde6e8b747a031c1e7fb'
+PROBE_BYTES = 1026
+# Enough containers to show whether they failed for one reason or many.
+UNREADY_LOG_LIMIT = 3
+# Observed on hardware: `formatter: json` selects the application log's formatter,
+# not the access log's. Distribution v3 writes the access log to stdout in Apache
+# combined format and the JSON application log -- the only stream carrying
+# http.response.duration -- to stderr.
+ACCESSLOG_STREAM = ('stdout (Apache combined); JSON application log with '
+                    'http.response.duration on stderr')
 
 # The manifest `expected` block of docker.operation.concurrent_clients, repeated
 # here and again in the fixture contract so a silent edit to either fails.
@@ -210,7 +218,8 @@ def fixture_contract(root=FIXTURE):
         'ready_window_seconds': READY_WINDOW_SECONDS,
         'all_results_exact_owner_correlated': True}, 'concurrent-clients contract differs from pin')
     require(contract['pull_registry'] == {
-        'accesslog_disabled': False, 'container_port': REGISTRY_PORT,
+        'accesslog_disabled': False, 'accesslog_stream': ACCESSLOG_STREAM,
+        'container_port': REGISTRY_PORT,
         'insecure_by_default_cidr': '127.0.0.0/8', 'layer_bytes': LAYER_BYTES,
         'listen': '0.0.0.0:' + str(REGISTRY_PORT), 'published_host_ip': LOOPBACK,
         'repositories': PARALLEL_PULLS, 'scheme': 'http',
@@ -686,7 +695,13 @@ class Session:
 
     def names_absent(self, label):
         inventory = set(self.container_inventory(label))
-        collisions = sorted(inventory & (set(self.names) | {self.registry_name}))
+        owned = set(self.names)
+        # The registry is launched before the twenty containers so their lifetime
+        # stays short, so its own name is a collision only while this Session has
+        # not created it -- otherwise the guard would refuse our own registry.
+        if self.registry_id is None:
+            owned.add(self.registry_name)
+        collisions = sorted(inventory & owned)
         require(not collisions, 'owned container name already exists: ' + ', '.join(collisions))
 
     # ---- recipe 1: twenty ready containers ----
@@ -731,9 +746,27 @@ class Session:
             rows = health_rows(raw, identities)
             if all_ready(rows):
                 return rows, observed
-            require(observed < deadline, 'twenty containers were not all healthy inside the window: ' +
-                    canonical({identity: row for identity, row in sorted(rows.items()) if row['health'] != 'healthy'}))
+            if observed >= deadline:
+                # Status alone does not say why. Without the container's own
+                # output a readiness failure means reaching into a retained
+                # Engine by hand, so record it here while the Engine is live.
+                unready = {identity: row for identity, row in sorted(rows.items()) if row['health'] != 'healthy'}
+                require(False, 'twenty containers were not all healthy inside the window: ' +
+                        canonical(unready) + ' logs: ' + canonical(self.unready_logs(unready)))
             time.sleep(READY_POLL_INTERVAL_SECONDS)
+
+    def unready_logs(self, unready):
+        """Last output of each container that never became healthy."""
+        logs = {}
+        for identity in list(unready)[:UNREADY_LOG_LIMIT]:
+            try:
+                raw, stderr, _ = self.harness.docker('concurrency-unready-logs', self.descriptor,
+                                                     ['container', 'logs', '--tail', '5', identity])
+                text = (raw + stderr).decode('utf-8', 'replace').strip()
+            except Exception as error:  # diagnosis must never mask the failure it explains
+                text = 'unavailable: ' + type(error).__name__ + ': ' + str(error)[:200]
+            logs[identity] = text[-400:]
+        return logs
 
     # ---- recipe 2: eight parallel execs ----
 
@@ -782,7 +815,14 @@ class Session:
     def registry_logs(self):
         raw, stderr, _ = self.harness.docker('concurrency-registry-logs', self.descriptor,
                                              ['logs', self.registry_id])
-        require(raw == b'' and len(stderr) <= MAX_LOG_BYTES, 'registry writes JSON to stderr only')
+        # Distribution v3 uses BOTH streams: the Apache-combined access log goes
+        # to stdout, and the structured JSON application log -- the one carrying
+        # http.response.duration, which is what the service windows are computed
+        # from -- goes to stderr. `formatter: json` selects the application log's
+        # formatter, not the access log's, so stdout is never JSON and requiring
+        # it to be empty could never hold.
+        require(len(raw) <= MAX_LOG_BYTES and len(stderr) <= MAX_LOG_BYTES, 'registry log volume')
+        require(stderr.strip().startswith(b'{'), 'registry application log is not JSON on stderr')
         return stderr
 
     def start_registry(self):
