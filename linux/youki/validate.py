@@ -70,6 +70,11 @@ REQUIRED_AUDIT_TESTS = tuple("test_vz_runtime_audit_" + name for name in (
     "enrollment_disabled_and_identity", "unsafe_paths_and_quota", "concurrent_pairs_and_sequences",
     "incomplete_and_corrupt_tail", "typed_operations_and_secret_exclusion", "explicit_exit_and_error_routing",
 ))
+REQUIRED_NOTIFY_TESTS = tuple("test_vz_notify_socket_" + name for name in (
+    "draw_only_name_repeats_under_equal_seeds", "name_separates_equally_seeded_invocations",
+    "name_separates_attempts", "bind_unique_reserves_under_identical_candidates",
+    "failed_bind_restores_working_directory",
+))
 AUDIT_NATIVE_CASES = (("version", "ok", 0), ("create", "error", 1),
                       ("exec", "error", 255), ("run", "error", 255))
 AUDIT_NATIVE_SESSION = "a" * 64
@@ -132,7 +137,8 @@ def validate(candidate, source):
              "executable-permissions.patch", "executable-permissions-tests.txt",
              "tenant-cgroup.patch", "tenant-cgroup-tests.txt", "run-keep.patch", "run-keep-tests.txt",
              "foreground-wait.patch", "foreground-wait-tests.txt", "console-size.patch", "console-size-tests.txt",
-             "executable-errors.patch", "executable-errors-tests.txt", "runtime-audit.patch", "runtime-audit-tests.txt"} | set(AUDIT_NATIVE_FILES)
+             "executable-errors.patch", "executable-errors-tests.txt", "runtime-audit.patch", "runtime-audit-tests.txt",
+             "notify-socket.patch", "notify-socket-tests.txt"} | set(AUDIT_NATIVE_FILES)
     require({path.name for path in candidate.iterdir()} == names | {"evidence.sha256"}, "unexpected candidate inventory")
     checksums = {}
     for line in read_regular(candidate / "evidence.sha256", 16384).decode().splitlines():
@@ -147,7 +153,7 @@ def validate(candidate, source):
     require(stat.S_IMODE((candidate / "youki").lstat().st_mode) == 0o755, "candidate youki must have mode 0755")
     for name, digest in checksums.items():
         require(hashlib.sha256(contents[name]).hexdigest() == digest, f"youki evidence mismatch: {name}")
-    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "runtime-audit-probe.sh"):
+    for name in ("inputs.env", "apk.sha256", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "notify-socket.patch", "runtime-audit-probe.sh"):
         require(contents[name] == read_regular(source / name), f"stale build input: {name}")
     parser_path = source / "../../scripts/helpers/linux_docker_runtime_audit.py"
     require(contents["runtime-audit-parser.py"] == read_regular(parser_path), "stale build input: runtime audit parser")
@@ -170,6 +176,8 @@ def validate(candidate, source):
     validate_executable_errors(contents["executable-errors-tests.txt"])
     require(checksums["runtime-audit.patch"] == inputs["YOUKI_AUDIT_PATCH_SHA256"], "pinned local runtime audit patch mismatch")
     validate_runtime_audit(contents["runtime-audit-tests.txt"])
+    require(checksums["notify-socket.patch"] == inputs["YOUKI_NOTIFY_PATCH_SHA256"], "pinned local notify socket patch mismatch")
+    validate_notify_socket(contents["notify-socket-tests.txt"])
     require(checksums["runtime-audit-parser.py"] == inputs["YOUKI_AUDIT_PARSER_SHA256"], "pinned runtime audit parser mismatch")
     require(checksums["runtime-audit-probe.sh"] == inputs["YOUKI_AUDIT_PROBE_SHA256"], "pinned runtime audit native probe mismatch")
     keep_tests = contents["run-keep-tests.txt"].decode()
@@ -208,7 +216,7 @@ def validate(candidate, source):
     require("libbpf-sys v1.7.0+v1.7.0" in tree and "libseccomp v0.4.0" in tree, "missing locked device-filter or seccomp dependencies")
     version = contents["version.txt"].decode().splitlines()
     require("youki version: " + inputs["YOUKI_VERSION"] in version, "wrong youki version")
-    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] in version, "wrong youki commit or local patch identity")
+    require("commit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] + "+" + inputs["YOUKI_NOTIFY_PATCH_ID"] in version, "wrong youki commit or local patch identity")
     validate_runtime_audit_native(contents, parser_path)
     validate_elf(contents["youki"])
     return checksums["youki"]
@@ -310,6 +318,17 @@ def validate_console_size(raw):
             len(summaries) == 1 and re.fullmatch(
                 r"test result: ok\. 4 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
                 summaries[0]), "missing or failed console size regressions")
+
+
+def validate_notify_socket(raw):
+    tests = raw.decode("utf-8")
+    actual = [line for line in tests.splitlines() if line.startswith("test ") and not line.startswith("test result:")]
+    expected = {"test notify_socket::test::" + name + " ... ok" for name in REQUIRED_NOTIFY_TESTS}
+    summaries = [line for line in tests.splitlines() if line.startswith("test result:")]
+    require(len(actual) == len(expected) and set(actual) == expected and "FAILED" not in tests and
+            len(summaries) == 1 and re.fullmatch(
+                r"test result: ok\. 5 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in [0-9.]+s",
+                summaries[0]), "missing or failed notify socket regressions")
 
 
 def validate_foreground_wait(raw):

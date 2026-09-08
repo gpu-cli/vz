@@ -8,7 +8,7 @@ import subprocess
 import tempfile
 import unittest
 
-from validate import AUDIT_NATIVE_CASES, AUDIT_NATIVE_CID, AUDIT_NATIVE_FILES, AUDIT_NATIVE_SESSION, EXEC_PROBE_PREFIX, REQUIRED_AUDIT_TESTS, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_ERROR_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, audit_native_argv, validate, validate_elf
+from validate import AUDIT_NATIVE_CASES, AUDIT_NATIVE_CID, AUDIT_NATIVE_FILES, AUDIT_NATIVE_SESSION, EXEC_PROBE_PREFIX, REQUIRED_AUDIT_TESTS, REQUIRED_CGROUP_TESTS, REQUIRED_CONSOLE_TESTS, REQUIRED_EXEC_ERROR_TESTS, REQUIRED_EXEC_TESTS, REQUIRED_KEEP_TESTS, REQUIRED_LOCAL_TESTS, REQUIRED_LOG_TESTS, REQUIRED_NOTIFY_TESTS, REQUIRED_ROOT_TESTS, REQUIRED_TESTS, REQUIRED_WAIT_TESTS, RUNTIME_LOG_MESSAGE, WAIT_PROBE_PREFIX, audit_native_argv, validate, validate_elf
 
 
 def elf(kind=1, dynamic_tag=0):
@@ -96,7 +96,7 @@ class CandidateTests(unittest.TestCase):
             "youki": elf(),
             "features.json": json.dumps({"linux": {"cgroup": {"v2": True, "v1": False, "systemd": False}}}).encode(),
             "elf.txt": b"ELF64 AArch64",
-            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] + "\n").encode(),
+            "version.txt": ("youki version: " + inputs["YOUKI_VERSION"] + "\ncommit: " + inputs["YOUKI_VERSION"] + "-" + inputs["YOUKI_COMMIT"] + "+" + inputs["YOUKI_PATCH_ID"] + "+" + inputs["YOUKI_ROOT_PATCH_ID"] + "+" + inputs["YOUKI_LOG_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_PATCH_ID"] + "+" + inputs["YOUKI_CGROUP_PATCH_ID"] + "+" + inputs["YOUKI_KEEP_PATCH_ID"] + "+" + inputs["YOUKI_WAIT_PATCH_ID"] + "+" + inputs["YOUKI_CONSOLE_PATCH_ID"] + "+" + inputs["YOUKI_EXEC_ERROR_PATCH_ID"] + "+" + inputs["YOUKI_AUDIT_PATCH_ID"] + "+" + inputs["YOUKI_NOTIFY_PATCH_ID"] + "\n").encode(),
             "inputs.env": (self.source / "inputs.env").read_bytes(),
             "apk.sha256": (self.source / "apk.sha256").read_bytes(),
             "source-lock.sha256": (inputs["YOUKI_LOCK_SHA256"] + "  Cargo.lock\n").encode(),
@@ -131,6 +131,10 @@ class CandidateTests(unittest.TestCase):
             "runtime-audit.patch": (self.source / "runtime-audit.patch").read_bytes(),
             "runtime-audit-tests.txt": ("\n".join("test runtime_audit::tests::" + name + " ... ok" for name in REQUIRED_AUDIT_TESTS)
                 + "\ntest result: ok. " + str(len(REQUIRED_AUDIT_TESTS)) +
+                " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
+            "notify-socket.patch": (self.source / "notify-socket.patch").read_bytes(),
+            "notify-socket-tests.txt": ("\n".join("test notify_socket::test::" + name + " ... ok" for name in REQUIRED_NOTIFY_TESTS)
+                + "\ntest result: ok. " + str(len(REQUIRED_NOTIFY_TESTS)) +
                 " passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n").encode(),
         }
         self.files.update(audit_native_files(self.source, self.files["version.txt"]))
@@ -309,7 +313,7 @@ class CandidateTests(unittest.TestCase):
                 validate(self.root, self.source)
 
     def test_cached_install_needs_no_docker_and_repairs_mode_without_modifying_aliases(self):
-        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "runtime-audit-probe.sh", "../../scripts/helpers/linux_docker_runtime_audit.py")
+        recipe_files = ("Dockerfile", "inputs.env", "apk.sha256", "build.sh", "validate.py", "lock.py", "seccomp-exec.patch", "tenant-root.patch", "runtime-log.patch", "executable-permissions.patch", "tenant-cgroup.patch", "run-keep.patch", "foreground-wait.patch", "console-size.patch", "executable-errors.patch", "runtime-audit.patch", "notify-socket.patch", "runtime-audit-probe.sh", "../../scripts/helpers/linux_docker_runtime_audit.py")
         digest = hashlib.sha256("".join(f"{hashlib.sha256((self.source / name).read_bytes()).hexdigest()}  {name}\n" for name in recipe_files).encode()).hexdigest()
         cache = self.root / "cache"
         candidate = cache / "builds" / digest
@@ -483,8 +487,8 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
         self.assertIn('tty::tests::test_vz_console_size_', recipe)
         self.assertIn('/inputs/console-size.patch /inputs/console-size-tests.txt /result/', recipe)
-        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
-        self.assertIn('foreground-wait.patch console-size.patch executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
+        self.assertIn('foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt notify-socket.patch notify-socket-tests.txt > evidence.sha256', recipe)
+        self.assertIn('foreground-wait.patch console-size.patch executable-errors.patch runtime-audit.patch notify-socket.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
         self.assertIn('cp "$recipe_dir/console-size.patch" "$context/"', build)
 
     def test_executable_errors_patch_and_each_native_regression_are_required(self):
@@ -538,8 +542,8 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', recipe)
         self.assertIn('workload::default::tests::test_vz_executable_errors_', recipe)
         self.assertIn('/inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/', recipe)
-        self.assertIn('console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
-        self.assertIn('console-size.patch executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
+        self.assertIn('console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt notify-socket.patch notify-socket-tests.txt > evidence.sha256', recipe)
+        self.assertIn('console-size.patch executable-errors.patch runtime-audit.patch notify-socket.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
         self.assertIn('cp "$recipe_dir/executable-errors.patch" "$context/"', build)
 
     def test_runtime_audit_patch_and_each_native_regression_are_required(self):
@@ -631,9 +635,51 @@ class CandidateTests(unittest.TestCase):
         self.assertIn('-- --test-threads=1 > /inputs/runtime-audit-tests.txt 2>&1', selected)
         self.assertIn('{ cat /inputs/runtime-audit-tests.txt; exit 1; }', selected)
         self.assertIn('/inputs/runtime-audit.patch /inputs/runtime-audit-tests.txt /result/', recipe)
-        self.assertIn('executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256', recipe)
-        self.assertIn('executable-errors.patch runtime-audit.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
+        self.assertIn('executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt notify-socket.patch notify-socket-tests.txt > evidence.sha256', recipe)
+        self.assertIn('executable-errors.patch runtime-audit.patch notify-socket.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
         self.assertIn('cp "$recipe_dir/runtime-audit.patch" "$context/"', build)
+
+    def test_notify_socket_patch_and_all_regressions_required(self):
+        original = self.files["notify-socket-tests.txt"]
+        for name in REQUIRED_NOTIFY_TESTS:
+            self.files["notify-socket-tests.txt"] = original.replace((name + " ... ok").encode(),
+                                                                    (name + " ... FAILED").encode())
+            self.publish()
+            with self.subTest(test=name), self.assertRaisesRegex(ValueError, "notify socket regressions"):
+                validate(self.root, self.source)
+        for bad in (original.replace(b"5 passed", b"4 passed"),
+                    original.replace(b"0 failed", b"1 failed"),
+                    original + b"test notify_socket::test::test_vz_notify_socket_extra ... ok\n"):
+            self.files["notify-socket-tests.txt"] = bad
+            self.publish()
+            with self.subTest(raw=bad), self.assertRaisesRegex(ValueError, "notify socket regressions"):
+                validate(self.root, self.source)
+        self.files["notify-socket-tests.txt"] = original
+        self.files.pop("notify-socket.patch")
+        self.publish()
+        with self.assertRaisesRegex(ValueError, "incomplete youki evidence manifest"):
+            validate(self.root, self.source)
+
+    def test_notify_socket_recipe_context_and_frozen_test_target(self):
+        recipe = (self.source / "Dockerfile").read_text()
+        build = (self.source / "build.sh").read_text()
+        self.assertIn('COPY notify-socket.patch /inputs/notify-socket.patch', recipe)
+        self.assertIn('patch --batch --forward --fuzz=0 -p1 -i /inputs/notify-socket.patch', recipe)
+        self.assertIn('"$YOUKI_NOTIFY_PATCH_SHA256  /inputs/notify-socket.patch"', recipe)
+        self.assertIn('+$YOUKI_NOTIFY_PATCH_ID', recipe)
+        commands = [line.replace('\\\n', ' ') for line in recipe.split('RUN ') if
+                    'notify_socket::test::test_vz_notify_socket_' in line]
+        self.assertEqual(len(commands), 1)
+        selected = commands[0]
+        self.assertIn('--network=none cargo +1.96.0 test --frozen --release --locked', selected)
+        self.assertIn('--target aarch64-unknown-linux-musl -p libcontainer --lib', selected)
+        self.assertIn('--no-default-features --features v2,cgroupsv2_devices,libseccomp', selected)
+        self.assertIn('-- --test-threads=1 > /inputs/notify-socket-tests.txt 2>&1', selected)
+        self.assertIn('{ cat /inputs/notify-socket-tests.txt; exit 1; }', selected)
+        self.assertIn('/inputs/notify-socket.patch /inputs/notify-socket-tests.txt /result/', recipe)
+        self.assertIn('runtime-audit-tests.txt notify-socket.patch notify-socket-tests.txt > evidence.sha256', recipe)
+        self.assertIn('runtime-audit.patch notify-socket.patch runtime-audit-probe.sh ../../scripts/helpers/linux_docker_runtime_audit.py | shasum', build)
+        self.assertIn('cp "$recipe_dir/notify-socket.patch" "$context/"', build)
 
     def test_native_runtime_audit_artifacts_and_source_selected_inputs_required(self):
         for name in AUDIT_NATIVE_FILES:

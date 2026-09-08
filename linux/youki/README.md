@@ -26,7 +26,7 @@ when omitted; a process.json with omitted NNP retains omission. The installation
 phase test independently covers all three actual process values.
 The patch SHA256 and identifier are pinned in `inputs.env`, applied offline with
 zero fuzz, and included in candidate evidence. The runtime's commit string has
-the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1+vz-executable-errors-v1+vz-runtime-audit-v1`
+the `+vz-seccomp-exec-v2+vz-tenant-root-v1+vz-runtime-log-v1+vz-executable-permissions-v1+vz-tenant-cgroup-v1+vz-run-keep-v1+vz-foreground-wait-v1+vz-console-size-v1+vz-executable-errors-v1+vz-runtime-audit-v1+vz-notify-socket-v1`
 suffix so it cannot be mistaken for vanilla upstream.
 The original upstream source archive and Cargo.lock pins are unchanged.
 
@@ -193,6 +193,30 @@ The parser does not certify protected-file acquisition, Machine binding, complet
 Docker-operation mapping or process absence. Exact-Machine enrollment/retrieval,
 reboot/session transition behavior and fresh installed-Mac/aggregate acceptance
 remain required before claiming runtime-invocation coverage.
+
+`notify-socket.patch` is an eleventh **locally authored vz patch**, applied last.
+An exec named its per-invocation notify socket from one `fastrand` draw and took
+the name if no file held it yet. `fastrand`'s global generator seeds from a hash
+of `Instant::now()` and the thread id with no OS entropy, so two runtime
+processes started in the same instant - a container healthcheck and a
+`docker exec` - seed alike, draw alike, both find the name free, and the second
+bind fails `EADDRINUSE` as `failed to bind notify socket: tenant-notify-<hex>.sock`.
+Measured on the previous pinned binary at 21 failures in 480 execs at 8-way
+concurrency with the container directory emptied between rounds, so a concurrent
+collision is the only thing that could have produced them.
+
+The name now carries the reserving process's id, which two live invocations
+cannot share, and the reservation is the bind itself rather than an existence
+test followed by a later bind, so no window remains between them. Both builders
+bind before entering `ContainerBuilderImpl::create`, which is earlier than the
+pivot root, mount-namespace entry and user-namespace entry that constrain it.
+An exec now removes its notify socket once the start notification is delivered
+and its console socket link once that connection stands; both used to accumulate
+one entry per exec for the container's lifetime. A failed bind no longer leaves
+the process parked in the container directory. Five naming, reservation and
+working-directory regressions are mandatory candidate evidence; concurrent
+`docker exec` against a healthchecked container still requires the physical
+host-Docker gate.
 
 The Rust 1.96.0 native ARM64 Alpine 3.22 builder is pinned by its platform manifest
 digest. All additional APKs, including transitive native-library dependencies,

@@ -15,6 +15,7 @@ COPY foreground-wait.patch /inputs/foreground-wait.patch
 COPY console-size.patch /inputs/console-size.patch
 COPY executable-errors.patch /inputs/executable-errors.patch
 COPY runtime-audit.patch /inputs/runtime-audit.patch
+COPY notify-socket.patch /inputs/notify-socket.patch
 COPY runtime-audit-parser.py /inputs/runtime-audit-parser.py
 COPY runtime-audit-probe.sh /inputs/runtime-audit-probe.sh
 RUN . /inputs/inputs.env && \
@@ -45,6 +46,8 @@ RUN --network=none . /inputs/inputs.env && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/executable-errors.patch && \
     echo "$YOUKI_AUDIT_PATCH_SHA256  /inputs/runtime-audit.patch" | sha256sum -c - && \
     patch --batch --forward --fuzz=0 -p1 -i /inputs/runtime-audit.patch && \
+    echo "$YOUKI_NOTIFY_PATCH_SHA256  /inputs/notify-socket.patch" | sha256sum -c - && \
+    patch --batch --forward --fuzz=0 -p1 -i /inputs/notify-socket.patch && \
     echo "$YOUKI_LOCK_SHA256  /source/Cargo.lock" | sha256sum -c -
 ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     LIBBPF_SYS_LIBRARY_PATH=/usr/lib PKG_CONFIG_ALL_STATIC=1 \
@@ -52,7 +55,7 @@ ENV LIBSECCOMP_LINK_TYPE=static LIBSECCOMP_LIB_PATH=/usr/lib \
     RUSTFLAGS="-C target-feature=+crt-static -C link-arg=-Wl,-Bstatic -C link-arg=-lzstd -C link-arg=-lgcc -C link-arg=-lc"
 RUN cargo +1.96.0 fetch --locked --target aarch64-unknown-linux-musl
 RUN --network=none . /inputs/inputs.env && \
-    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID+$YOUKI_EXEC_ERROR_PATCH_ID+$YOUKI_AUDIT_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
+    VERGEN_GIT_SHA="$YOUKI_COMMIT+$YOUKI_PATCH_ID+$YOUKI_ROOT_PATCH_ID+$YOUKI_LOG_PATCH_ID+$YOUKI_EXEC_PATCH_ID+$YOUKI_CGROUP_PATCH_ID+$YOUKI_KEEP_PATCH_ID+$YOUKI_WAIT_PATCH_ID+$YOUKI_CONSOLE_PATCH_ID+$YOUKI_EXEC_ERROR_PATCH_ID+$YOUKI_AUDIT_PATCH_ID+$YOUKI_NOTIFY_PATCH_ID" cargo +1.96.0 build --frozen --release --locked \
       --target aarch64-unknown-linux-musl -p youki --bin youki \
       --no-default-features --features "$YOUKI_FEATURES"
 RUN --network=none cargo +1.96.0 test --frozen --release --locked \
@@ -140,6 +143,13 @@ RUN --network=none cargo +1.96.0 test --frozen --release --locked \
       -- --test-threads=1 > /inputs/runtime-audit-tests.txt 2>&1 || \
       { cat /inputs/runtime-audit-tests.txt; exit 1; }
 RUN cat /inputs/runtime-audit-tests.txt
+RUN --network=none cargo +1.96.0 test --frozen --release --locked \
+      --target aarch64-unknown-linux-musl -p libcontainer --lib \
+      --no-default-features --features v2,cgroupsv2_devices,libseccomp \
+      notify_socket::test::test_vz_notify_socket_ \
+      -- --test-threads=1 > /inputs/notify-socket-tests.txt 2>&1 || \
+      { cat /inputs/notify-socket-tests.txt; exit 1; }
+RUN cat /inputs/notify-socket-tests.txt
 RUN --network=none set -eux; . /inputs/inputs.env; \
     mkdir /result && cp target/aarch64-unknown-linux-musl/release/youki /result/youki && \
     readelf -h -l -d /result/youki > /result/elf.txt && cat /result/elf.txt && \
@@ -158,10 +168,11 @@ RUN --network=none set -eux; . /inputs/inputs.env; \
     cp /inputs/console-size.patch /inputs/console-size-tests.txt /result/ && \
     cp /inputs/executable-errors.patch /inputs/executable-errors-tests.txt /result/ && \
     cp /inputs/runtime-audit.patch /inputs/runtime-audit-tests.txt /result/ && \
+    cp /inputs/notify-socket.patch /inputs/notify-socket-tests.txt /result/ && \
     sha256sum Cargo.lock > /result/source-lock.sha256 && \
     cargo +1.96.0 tree --frozen --target aarch64-unknown-linux-musl -p youki \
       --no-default-features --features "$YOUKI_FEATURES" -e features > /result/cargo-features.txt && \
-    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt > evidence.sha256
+    cd /result && sha256sum youki features.json elf.txt version.txt inputs.env apk.sha256 source-lock.sha256 cargo-features.txt upstream-tests.txt seccomp-exec.patch seccomp-exec-tests.txt tenant-root.patch tenant-root-tests.txt runtime-log.patch runtime-log-tests.txt executable-permissions.patch executable-permissions-tests.txt tenant-cgroup.patch tenant-cgroup-tests.txt run-keep.patch run-keep-tests.txt foreground-wait.patch foreground-wait-tests.txt console-size.patch console-size-tests.txt executable-errors.patch executable-errors-tests.txt runtime-audit.patch runtime-audit-tests.txt notify-socket.patch notify-socket-tests.txt > evidence.sha256
 RUN --network=none set -eu; \
     mkdir /inputs/runtime-log-root; \
     set +e; \
