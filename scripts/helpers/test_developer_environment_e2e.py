@@ -36,10 +36,12 @@ TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
-               "private_topology_paths"}
+               "private_topology_paths", "status_json_field_set"}
 # Both remaining sub-checks belong to criterion 15 and need a live typed API,
 # so criterion 21 is the first topology scenario the lane can actually pass.
-NOT_IMPLEMENTED = {"status_json_field_set", "grpc_api_live_agreement"}
+# Criterion 15's last blocker: agreement must be observed over the daemon's own
+# gRPC channel, which needs a pinned client this lane does not have.
+NOT_IMPLEMENTED = {"grpc_api_live_agreement"}
 
 
 class TopologyLaneTests(unittest.TestCase):
@@ -168,7 +170,7 @@ class TopologyLaneTests(unittest.TestCase):
                                                 "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement",
                           f"{TOP1}__three_concurrent_no_collision",
-                          f"{TOP5}__private_topology_paths"})
+                          f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:

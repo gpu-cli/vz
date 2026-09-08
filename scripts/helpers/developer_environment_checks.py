@@ -996,11 +996,58 @@ def check_error_envelope(ctx: CheckContext, top: str) -> SubCheck:
     return check.finish()
 
 
-def check_status_field_set(top: str) -> SubCheck:
+# The exact success-payload field set of `vz status --json` over a live
+# topology, observed on the installed 0.4 binaries.
+STATUS_FIELDS = {"schema_version", "request_id", "topology_state_source", "definition_path", "project_id",
+                 "project_name", "host", "daemon", "desired_definition_digest", "persisted_definition_digest",
+                 "definition_drift", "selection_source", "environments"}
+
+
+def check_status_field_set(ctx: CheckContext, top: str) -> SubCheck:
+    """`vz status --json` over a live topology emits exactly its declared fields.
+
+    Extra fields are as much a contract break as missing ones, so the set is
+    compared exactly rather than by presence. The digests must agree with each
+    other and with an undrifted definition, which is what makes them evidence
+    rather than two unrelated strings.
+    """
     check = SubCheck(top, "status_json_field_set")
-    check.not_implemented = ("`vz status --json` success output (schema_version 1, request_id, topology_state_source, definition_path, "
-                             "project_id, project_name, host, daemon, digests, definition_drift, environments[]) requires persisted "
-                             "topology from a real Up; a fresh daemon answers project_not_found. Not provisioned by this skeleton.")
+    try:
+        definition = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    instance = provision(ctx, check, "stat", definition)
+    if instance.get("unsupported"):
+        check.not_implemented = "this runtime refused the definition: " + instance["unsupported"][:200]
+        return check.finish()
+    if check.status != "PASS" or not instance["status"]:
+        return check.finish()
+    payload = instance["status"]
+    check.check(set(payload) == STATUS_FIELDS,
+                "status emits exactly its declared field set" if set(payload) == STATUS_FIELDS else
+                f"field set differs: missing {sorted(STATUS_FIELDS - set(payload))}, "
+                f"unexpected {sorted(set(payload) - STATUS_FIELDS)}")
+    check.check(payload.get("schema_version") == 1 and isinstance(payload.get("request_id"), str) and
+                payload["request_id"], "schema_version 1 and a request_id")
+    check.check(payload.get("definition_path", "").endswith("/vz.json"),
+                f"definition_path names the read definition (observed {payload.get('definition_path')!r})")
+    check.check(isinstance(payload.get("host"), dict) and set(payload["host"]) == {"os", "arch"},
+                f"host carries exactly os and arch (observed {sorted(payload.get('host') or {})})")
+    check.check(isinstance(payload.get("daemon"), dict) and {"backend_name", "version"} <= set(payload["daemon"]),
+                f"daemon names its backend and version (observed {sorted(payload.get('daemon') or {})})")
+    desired, persisted = payload.get("desired_definition_digest"), payload.get("persisted_definition_digest")
+    check.check(isinstance(desired, str) and desired.startswith("sha256:") and desired == persisted and
+                payload.get("definition_drift") is False,
+                "an undrifted topology reports one digest as both desired and persisted "
+                f"(desired {str(desired)[:16]}, persisted {str(persisted)[:16]}, drift {payload.get('definition_drift')})")
+    check.check(payload.get("topology_state_source") == "persisted" and payload.get("selection_source") == "workspace",
+                f"state and selection sources are named (observed {payload.get('topology_state_source')!r}, "
+                f"{payload.get('selection_source')!r})")
+    if check.status == "PASS":
+        removed = ctx.run(check, "stat-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                          cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+        check.check(removed.exit_code == 0, f"deleted (exit {removed.exit_code})")
     return check.finish()
 
 

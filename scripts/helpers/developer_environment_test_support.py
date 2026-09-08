@@ -113,7 +113,15 @@ if [ -n "$verb" ]; then
     pid=$(cut -d' ' -f1 < "$topology")
     sfx=$(cut -d' ' -f2 < "$topology")
     names=$(cut -d' ' -f3- < "$topology")
-    printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$pid"
+    dg="sha256:$(printf '%s' "$pid" | shasum -a 256 | cut -c1-64)"
+    # The full declared success-payload field set, so an exact comparison of it
+    # is exercised here and not only against the installed binaries.
+    printf '{\n "schema_version": 1,\n "request_id": "req-%s",\n "topology_state_source": "persisted",\n' "$sfx"
+    printf ' "definition_path": "%s/vz.json",\n "project_name": "vz04-topology-bootstrap",\n' "$PWD"
+    printf ' "host": {"os": "macos", "arch": "aarch64"},\n' 
+    printf ' "daemon": {"backend_name": "macos-vz", "version": "0.1.0"},\n'
+    printf ' "desired_definition_digest": "%s",\n "persisted_definition_digest": "%s",\n' "$dg" "$dg"
+    printf ' "definition_drift": false,\n "selection_source": "workspace",\n "project_id": "%s",\n' "$pid"
     printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
     printf '   "machines": ['
     sep=""
