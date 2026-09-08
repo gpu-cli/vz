@@ -42,7 +42,10 @@ SCOPE = 'DEV_installed_Machine_engine_version_api_handshake_not_release_certific
 REPO = Path(__file__).resolve().parents[2]
 HELPERS = Path(__file__).resolve().parent
 MANIFEST = REPO / 'config/docker-compatibility-v0.4.json'
-SCENARIOS = ('docker.engine.version', 'docker.engine.api_negotiation')
+# `docker.engine.info` and `docker.engine.context` are proven by the per-Machine
+# checks together with the run-level `verify_machines` (and, for the context's
+# global default, the run's own cleanup); the other two are per-Machine alone.
+SCENARIOS = ('docker.engine.version', 'docker.engine.info', 'docker.engine.context', 'docker.engine.api_negotiation')
 
 # Upstream pins. The daemon values come from moby/moby at the manifest's exact
 # Engine source commit; the client values come from the moby client module that
@@ -160,6 +163,17 @@ def parse(raw):
     return value
 
 
+def parse_one(raw):
+    """`context inspect` answers with a one-element array, not an object."""
+    require(type(raw) is bytes and 0 < len(raw) <= LIMIT, 'bounded JSON stream required')
+    try:
+        value = json.loads(raw.decode('utf-8'), object_pairs_hook=unique)
+    except (UnicodeError, ValueError) as error:
+        raise ValueError('handshake: malformed JSON output') from error
+    require(type(value) is list and len(value) == 1 and type(value[0]) is dict, 'single JSON object array required')
+    return value[0]
+
+
 def canonical(value):
     return json.dumps(value, sort_keys=True, separators=(',', ':'), ensure_ascii=True, allow_nan=False)
 
@@ -197,6 +211,12 @@ def manifest_expectations():
          {'server_default_min_api': SERVER['DefaultMinAPIVersion'], 'server_max_api': SERVER['MaxAPIVersion'],
           'automatic_negotiation': 'highest_mutually_supported', 'api_1_39': 'reject', 'api_1_56': 'reject',
           'min_api_override_absent': True}, 'docker.engine.api_negotiation expectation differs')
+    same(scenarios['docker.engine.info']['expected'],
+         {'default_runtime': 'youki', 'engine_identity': 'selected_machine', 'daemon_unique_per_machine': True},
+         'docker.engine.info expectation differs')
+    same(scenarios['docker.engine.context']['expected'],
+         {'endpoint_owner': 'selected_environment_and_machine', 'global_default_unchanged': True,
+          'stale_or_foreign_context': 'reject'}, 'docker.engine.context expectation differs')
     for version in REJECTED:
         require(version not in ACCEPTED and not (SERVER['DefaultMinAPIVersion'] <= version <= SERVER['MaxAPIVersion']),
                 'rejected probe version lies inside the server window')
@@ -262,7 +282,83 @@ def check_info(info, descriptor):
             'Engine default runtime is not youki')
     require(info.get('CgroupVersion') == '2', 'cgroup v2 Engine required')
     return {'default_runtime': 'youki', 'runtimes': sorted(runtimes), 'server_version': info['ServerVersion'],
-            'cgroup_version': info['CgroupVersion'], 'warnings': list(info.get('Warnings') or [])}
+            'engine_id': info['ID'], 'cgroup_version': info['CgroupVersion'],
+            'warnings': list(info.get('Warnings') or [])}
+
+
+STALE_SUFFIX = '-retired'
+UNRESOLVED = 'Failed to initialize: unable to resolve docker endpoint: context "%s": context not found:'
+
+
+def context_probe(harness, descriptor, name, kind):
+    """One Machine's client refusing a context name its own `--config` does not hold.
+
+    `info` is the probe because it is the first command that must resolve an
+    endpoint: a zero exit would mean this Machine's configuration reached an
+    Engine it does not own. The CLI is pinned, so the refusal text is pinned too.
+    """
+    raw, stderr, code = harness.command('handshake-context-' + kind,
+        ['docker', '--config', descriptor['config_dir'], '--context', name, 'info'],
+        executable=harness.info['clients']['docker']['canonical'], success=False)
+    require(code != 0 and not raw.strip(), kind + ' context did not fail closed: ' + repr((code, raw[:200])))
+    text = stderr.decode('utf-8', 'replace')
+    require(text.startswith(UNRESOLVED % name), kind + ' context failed for another reason: ' + repr(text[:300]))
+    return {'kind': kind, 'context': name, 'config_dir': descriptor['config_dir'], 'exit_code': code,
+            'stdout_bytes': len(raw), 'stderr_sha256': sha256(stderr), 'resolved': False}
+
+
+def context_boundaries(harness, descriptor, foreign):
+    """`stale_or_foreign_context: reject` for one Machine.
+
+    The foreign name is a sibling Machine's real context, so the probe separates
+    "this name does not exist anywhere" from "this configuration does not hold
+    it": the same name resolves in the sibling's own `--config`, which is the
+    positive control, and is refused here.
+    """
+    rows = [context_probe(harness, descriptor, foreign['name'], 'foreign'),
+            context_probe(harness, descriptor, descriptor['name'] + STALE_SUFFIX, 'stale')]
+    raw, _, _ = harness.docker('handshake-context-owner', foreign, ['context', 'inspect', foreign['name']])
+    endpoint = parse_one(raw)['Endpoints']['docker']['Host']
+    require(endpoint == foreign['endpoint'], 'the foreign context does not resolve in its own Machine configuration')
+    rows[0]['resolves_in_owning_config'] = True
+    return rows
+
+
+def verify_machines(harness, observations, descriptors):
+    """Cross-Machine proof of `daemon_unique_per_machine` and `stale_or_foreign_context`.
+
+    `check_info` binds one Machine's `info` to that Machine's own descriptor,
+    which is all a single slice can show: it cannot rule out that a second
+    Machine was answered by the same daemon. The run's retained scopes can, and
+    they need no further host command -- distinct Engine IDs reached over
+    distinct private endpoints, one per Machine, none shared.
+    """
+    require(type(observations) is list and len(observations) >= 2,
+            'daemon uniqueness needs at least two Machines, observed ' + str(len(observations or [])))
+    columns = {}
+    for name, path in (('engine ID', ('machine_scope', 'engine_id')), ('endpoint', ('machine_scope', 'docker_endpoint')),
+                       ('context', ('machine_scope', 'docker_context')), ('Machine', ('machine_scope', 'machine_id')),
+                       ('answering daemon', ('info', 'engine_id'))):
+        values = [row.get(path[0], {}).get(path[1]) for row in observations]
+        require(all(type(value) is str and value for value in values), 'handshake slice without a ' + name)
+        require(len(set(values)) == len(values), 'Machines share a Docker ' + name + ': ' + repr(sorted(values)))
+        columns[name] = values
+    require(columns['answering daemon'] == columns['engine ID'],
+            'the daemon that answered a Machine is not the Engine that Machine owns')
+    require(type(descriptors) is list and len(descriptors) == len(observations),
+            'one descriptor per handshake slice required')
+    boundaries = [row for index, descriptor in enumerate(descriptors)
+                  for row in context_boundaries(harness, descriptor, descriptors[(index + 1) % len(descriptors)])]
+    require(len(boundaries) == 2 * len(descriptors) and not any(row['resolved'] for row in boundaries),
+            'a foreign or stale context resolved')
+    return {'schema_version': 1, 'scope': SCOPE, 'machines': len(observations),
+            'distinct_engine_ids': len(set(columns['engine ID'])),
+            'distinct_endpoints': len(set(columns['endpoint'])),
+            'engine_ids': sorted(columns['engine ID']), 'daemon_unique_per_machine': True,
+            'context_boundaries': boundaries, 'stale_or_foreign_context': 'reject',
+            'scenarios': {'docker.engine.info': 'dev_observed_not_release_certified',
+                          'docker.engine.context': 'dev_observed_not_release_certified'},
+            'docker_parity_certified': False, 'release_certified': False}
 
 
 def parse_flags(raw):

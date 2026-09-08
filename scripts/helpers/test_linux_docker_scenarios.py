@@ -64,7 +64,8 @@ class TableTests(unittest.TestCase):
     def test_module_declarations_come_from_the_table(self):
         self.assertEqual(subject.for_suite("limits"), ("docker.operation.resource_limits", "docker.operation.oom"))
         self.assertEqual(subject.for_suite("recovery"), ("docker.storage.persistence", "docker.operation.daemon_restart_recovery"))
-        self.assertEqual(subject.for_suite("handshake", include_partial=False), ("docker.engine.version", "docker.engine.api_negotiation"))
+        self.assertEqual(subject.for_suite("handshake", include_partial=False),
+                         ("docker.engine.version", "docker.engine.info", "docker.engine.context", "docker.engine.api_negotiation"))
         self.assertEqual(len(subject.for_suite("handshake")), 4)
         self.assertEqual(len(subject.for_suite("lifecycle")), 16)
         self.assertEqual(subject.for_recipe("compose", "compose-up-order"),
@@ -102,8 +103,14 @@ class LaneScenarioTests(unittest.TestCase):
         handshake = subject.lane_scenarios("handshake", [{"started_unix_ns": 1, "ended_unix_ns": 2}], phase="clean-provision", passed=True)
         by_id = {e["id"]: e for e in handshake}
         self.assertEqual(by_id["docker.engine.version"]["status"], "PASS")
-        self.assertEqual(by_id["docker.engine.info"]["status"], "FAIL")
-        self.assertIn("UNPROVEN expected.daemon_unique_per_machine (no assertion in handshake)", by_id["docker.engine.info"]["assertions"])
+        self.assertEqual(by_id["docker.engine.info"]["status"], "PASS")
+        self.assertEqual(by_id["docker.engine.context"]["status"], "PASS")
+        partial = subject.lane_scenarios("compose", [{"started_unix_ns": 1, "ended_unix_ns": 2}], phase="clean-provision", passed=True)
+        volumes = next(e for e in partial if e["id"] == "docker.compose.volumes")
+        self.assertEqual(volumes["status"], "FAIL")
+        self.assertIn("UNPROVEN expected.restart_data_sha256 (no assertion in compose)", volumes["assertions"])
+        # The cross-Machine document is cited once for the whole suite.
+        self.assertEqual(by_id["docker.engine.info"]["evidence"].count("harness/handshake-cross-machine.json"), 1)
         self.assertEqual(by_id["docker.engine.version"]["readiness_polls"], [])
 
     def test_failed_run_reports_every_suite_id_as_fail_with_the_error(self):

@@ -40,7 +40,9 @@ GAP_SUITES = ("mounts", "netpolicy", "concurrency", "isolation")
 STATUSES = ("proven", "partial", "secondary")
 
 Claim = namedtuple("Claim", "id suite sources status unproven")
-Suite = namedtuple("Suite", "name module evidence polls process_scenario")
+# `evidence` is per-Machine and formatted with the slice index; `suite_evidence`
+# is the run-level document a cross-Machine claim rests on, cited once.
+Suite = namedtuple("Suite", "name module evidence polls process_scenario suite_evidence", defaults=((),))
 Poll = namedtuple("Poll", "id deadline_seconds samples")
 
 
@@ -79,7 +81,7 @@ SUITES = {suite.name: suite for suite in (
     Suite("registry", "linux_docker_registry_machine.py", ("registry-machine-{index}/machine-registry-validation.json",), (),
           "docker.image.registry_login"),
     Suite("handshake", "linux_docker_handshake_machine.py", ("handshake-machine-{index}/machine-handshake-validation.json",), (),
-          "docker.engine.version"),
+          "docker.engine.version", ("handshake-cross-machine.json",)),
     Suite("limits", "linux_docker_limits_machine.py", ("limits-machine-{index}/machine-limits-validation.json",),
           (Poll("poll.service.health_probe", 60, _limits_samples),), "docker.operation.resource_limits"),
     Suite("recovery", "linux_docker_recovery_machine.py", ("recovery-machine-{index}/machine-recovery-validation.json",),
@@ -94,8 +96,8 @@ def _c(identifier, suite, sources, status="proven", unproven=()):
 TABLE = (
     # handshake: one Machine, Engine version/API handshake, no mutation.
     _c("docker.engine.version", "handshake", "run_machine"),
-    _c("docker.engine.info", "handshake", "run_machine", "partial", ("daemon_unique_per_machine",)),
-    _c("docker.engine.context", "handshake", "run_machine", "partial", ("global_default_unchanged", "stale_or_foreign_context")),
+    _c("docker.engine.info", "handshake", ("run_machine", "verify_machines")),
+    _c("docker.engine.context", "handshake", ("run_machine", "verify_machines", "cleanup")),
     _c("docker.engine.api_negotiation", "handshake", "run_machine"),
     # registry: owned private registry Session per Machine.
     _c("docker.image.registry_login", "registry", "Session.authenticate"),
@@ -314,6 +316,7 @@ def lane_scenarios(suite, slices, *, phase, passed, error=None, evidence_prefix=
     started = _timing(slices, "started_unix_ns", min, started_fallback)
     ended = _timing(slices, "ended_unix_ns", max, ended_fallback)
     evidence = [evidence_prefix + "/" + pattern.format(index=index) for index in range(len(slices)) for pattern in descriptor.evidence]
+    evidence += [evidence_prefix + "/" + pattern for pattern in descriptor.suite_evidence] if slices else []
     polls = []
     for poll in descriptor.polls:
         samples = 0

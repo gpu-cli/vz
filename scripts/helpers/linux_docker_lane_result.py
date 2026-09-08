@@ -398,6 +398,12 @@ def from_run(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT, 
         passed, error = False, "no retained Engine runtime guard proof (info DefaultRuntime/Runtimes) in harness evidence"
     if passed and any(flags.values()):
         passed, error = False, "prohibited component observed: " + ", ".join(sorted(k for k, v in flags.items() if v))
+    # `docker.engine.context` cites the run's own cleanup for its
+    # `global_default_unchanged` half, so a pass has to carry that proof.
+    cleanup = result.get("cleanup") if isinstance(result.get("cleanup"), dict) else {}
+    unchanged = [name for name in ("daily_default_unchanged", "isolated_default_unchanged") if cleanup.get(name) is not True]
+    if passed and unchanged:
+        passed, error = False, "run does not prove the Docker default configuration unchanged: " + ", ".join(unchanged)
     manifest_rows, window = scenarios.manifest(), run_window(rows)
     lane["scenarios"] = [entry for suite, slices in covered
                          for entry in scenarios.lane_scenarios(suite, slices, phase=lane["phase"], passed=passed, error=error,

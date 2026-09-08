@@ -379,5 +379,98 @@ class Machine(unittest.TestCase):
                 case.invoke()
 
 
+class DaemonUniquenessTests(unittest.TestCase):
+    """`verify_machines`: the cross-Machine half of docker.engine.info/context."""
+
+    class Harness:
+        """Serves the two boundary probes and the owning-config positive control."""
+        def __init__(self, descriptors):
+            self.info = {'clients': {'docker': {'canonical': '/owned/docker'}}}
+            self.by_name = {d['name']: d for d in descriptors}
+            self.probes = []
+
+        def command(self, label, argv, *, executable=None, success=True):
+            self.probes.append((label, list(argv)))
+            name = argv[argv.index('--context') + 1]
+            message = subject.UNRESOLVED % name + ' open /owned/meta.json: no such file or directory\n'
+            return b'', message.encode(), 1
+
+        def docker(self, label, descriptor, args):
+            self.probes.append((label, list(args)))
+            return json.dumps([{'Endpoints': {'docker': {'Host': descriptor['endpoint']}}}]).encode(), b'', 0
+
+    def descriptors(self, count=3):
+        return [{'name': 'context-' + str(index), 'config_dir': '/owned/config-' + str(index),
+                 'endpoint': 'unix:///r/' + str(index) + '.sock'} for index in range(count)]
+
+    def slices(self, count=3):
+        return [{'machine_scope': {'engine_id': 'engine-' + str(index), 'docker_endpoint': 'unix:///r/' + str(index) + '.sock',
+                                   'docker_context': 'context-' + str(index), 'machine_id': 'mch_' + str(index)},
+                 'info': {'engine_id': 'engine-' + str(index)}} for index in range(count)]
+
+    def verify(self, count=3, *, slices=None, descriptors=None):
+        rows = self.slices(count) if slices is None else slices
+        given = self.descriptors(count) if descriptors is None else descriptors
+        harness = self.Harness(given)
+        return harness, subject.verify_machines(harness, rows, given)
+
+    def test_distinct_engines_and_refused_foreign_contexts_prove_the_claims(self):
+        harness, record = self.verify()
+        self.assertEqual(record['daemon_unique_per_machine'], True)
+        self.assertEqual(record['stale_or_foreign_context'], 'reject')
+        self.assertEqual((record['machines'], record['distinct_engine_ids'], record['distinct_endpoints']), (3, 3, 3))
+        self.assertEqual(record['release_certified'], False)
+        # One foreign and one stale probe per Machine, each refused.
+        self.assertEqual([row['kind'] for row in record['context_boundaries']], ['foreign', 'stale'] * 3)
+        self.assertEqual({row['resolved'] for row in record['context_boundaries']}, {False})
+        # The foreign name is a sibling's real context, resolved in its owning config.
+        self.assertEqual([row['context'] for row in record['context_boundaries'][:2]],
+                         ['context-1', 'context-0' + subject.STALE_SUFFIX])
+        self.assertTrue(all(row['resolves_in_owning_config'] for row in record['context_boundaries'] if row['kind'] == 'foreign'))
+        self.assertEqual(sum(1 for label, _ in harness.probes if label == 'handshake-context-owner'), 3)
+
+    def test_one_machine_cannot_prove_uniqueness(self):
+        with self.assertRaisesRegex(ValueError, 'at least two Machines'):
+            self.verify(1)
+
+    def test_a_shared_daemon_endpoint_or_context_is_rejected(self):
+        for field in ('engine_id', 'docker_endpoint', 'docker_context', 'machine_id'):
+            with self.subTest(field=field):
+                rows = self.slices()
+                rows[1]['machine_scope'][field] = rows[0]['machine_scope'][field]
+                if field == 'engine_id':
+                    rows[1]['info']['engine_id'] = rows[0]['machine_scope']['engine_id']
+                with self.assertRaisesRegex(ValueError, 'share a Docker'):
+                    self.verify(slices=rows)
+
+    def test_a_foreign_daemon_answering_a_machine_is_rejected(self):
+        rows = self.slices()
+        rows[1]['info']['engine_id'] = 'engine-elsewhere'
+        with self.assertRaisesRegex(ValueError, 'not the Engine that Machine owns'):
+            self.verify(slices=rows)
+
+    def test_a_slice_without_a_scope_field_is_rejected(self):
+        rows = self.slices()
+        del rows[2]['machine_scope']['engine_id']
+        with self.assertRaisesRegex(ValueError, 'without a engine ID'):
+            self.verify(slices=rows)
+
+    def test_a_resolving_foreign_context_fails_the_claim(self):
+        class Resolving(self.Harness):
+            def command(self, label, argv, *, executable=None, success=True):
+                return b'{"ID":"engine-1"}', b'', 0
+        harness = Resolving(self.descriptors())
+        with self.assertRaisesRegex(ValueError, 'did not fail closed'):
+            subject.verify_machines(harness, self.slices(), self.descriptors())
+
+    def test_a_refusal_for_another_reason_fails_the_claim(self):
+        class Unreachable(self.Harness):
+            def command(self, label, argv, *, executable=None, success=True):
+                return b'', b'Cannot connect to the Docker daemon\n', 1
+        harness = Unreachable(self.descriptors())
+        with self.assertRaisesRegex(ValueError, 'failed for another reason'):
+            subject.verify_machines(harness, self.slices(), self.descriptors())
+
+
 if __name__ == '__main__':
     unittest.main()

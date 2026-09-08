@@ -992,7 +992,20 @@ class ComposeHarness(startup.Harness):
             if builder_runtime is not None:
                 observation["builder_runtime"] = builder_runtime
             observations.append(observation)
+        self.verify_across_machines(suite, observations, [machine["docker_context"] for _, machine in selected_machines])
         return observations
+
+    def verify_across_machines(self, suite, observations, descriptors):
+        """Claims one Machine cannot prove alone, checked once the suite's slices exist.
+
+        The record is retained beside the per-Machine evidence and is what the
+        lane result cites for the cross-Machine part of the claim.
+        """
+        if suite != "handshake":
+            return
+        from linux_docker_handshake_machine import verify_machines
+        startup.document(self.evidence / "handshake-cross-machine.json",
+                         verify_machines(self, observations, descriptors))
 
     def run_suite_with_audit_window(self, suite, suites, contexts, selected_machines, bindings):
         """One suite, inside its runtime-audit window when it needs its own.

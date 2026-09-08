@@ -1,6 +1,7 @@
 """Lane-result translation for the linux-docker lane; offline, never Docker evidence."""
 import json
 import os
+import shutil
 from pathlib import Path
 import tempfile
 import unittest
@@ -112,6 +113,11 @@ class ResultShapeTests(Scratch):
         self.assertEqual(subject.failure_reason("Rejected: sibling limits changed", [])[0], "assertion")
         self.assertEqual(subject.failure_reason(None, [])[0], "assertion")
 
+    def lane_dir_reset(self):
+        """A fresh lane directory so a subTest can build a second synthetic harness."""
+        shutil.rmtree(self.lane_dir)
+        self.lane_dir.mkdir(parents=True)
+
     def synthetic_harness(self, *, passed=True, guard=True, runc=False):
         harness = self.lane_dir / "harness"
         harness.mkdir()
@@ -129,6 +135,7 @@ class ResultShapeTests(Scratch):
         result = {"suite": "limits", "outcome": "passed_dev_installed_limits_slice" if passed else "failed",
                   "error": None if passed else "Rejected: sibling limits changed", "cleanup_errors": [],
                   "retained_root": "/private/tmp/vzdev-x", "release_scenarios_passed": [],
+                  "cleanup": {"daily_default_unchanged": True, "isolated_default_unchanged": True},
                   "scenario": {"machine_slices": [{"started_unix_ns": 1500, "ended_unix_ns": 2500,
                                                    "workload": {"sibling_health": {"samples": 60}}}]}}
         return harness, result, {"suite": "limits"}
@@ -159,7 +166,7 @@ class ResultShapeTests(Scratch):
         for suite in suites:
             slices[suite] = [{"started_unix_ns": 1500, "ended_unix_ns": 2500,
                               "workload": {"sibling_health": {"samples": 60}}, "health": {"samples": 60}}]
-            for pattern in scenarios.SUITES[suite].evidence:
+            for pattern in scenarios.SUITES[suite].evidence + scenarios.SUITES[suite].suite_evidence:
                 relative = pattern.format(index=0)
                 path = harness / relative
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -188,6 +195,19 @@ class ResultShapeTests(Scratch):
         self.assertEqual(len(set(starts)), len(starts))
         self.assertIn("harness/limits-machine-0/machine-limits-validation.json", lane["evidence_files"])
         self.assertIn("harness/handshake-machine-0/machine-handshake-validation.json", lane["evidence_files"])
+        # The cross-Machine document is cited once, not once per Machine.
+        self.assertEqual(lane["evidence_files"].count("harness/handshake-cross-machine.json"), 1)
+
+    def test_pass_requires_the_docker_default_configuration_unchanged(self):
+        for name in ("daily_default_unchanged", "isolated_default_unchanged"):
+            with self.subTest(missing=name):
+                harness, result, info = self.synthetic_harness()
+                result["cleanup"] = dict(result["cleanup"], **{name: False})
+                ctx = subject.gate_context(self.argv()).validate()
+                lane = subject.from_run(ctx, result, info, harness, 0)
+                self.assertEqual(lane["outcome"], "failed")
+                self.assertIn(name, lane["failure"]["detail"])
+                self.lane_dir_reset()
 
     def test_composed_run_without_per_suite_slices_is_rejected(self):
         harness, result, info = self.composed_harness()
