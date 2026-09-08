@@ -280,3 +280,44 @@ class RetainedCandidateTests(Scratch):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranslationFallbackTests(Scratch):
+    """A composed run that fails early must still produce a lane result.
+
+    Two composed gate runs failed before every suite had Machine slices; the
+    translation then raised and the gate was left with raw logs only, the
+    reporting error standing in place of the harness's real failure.
+    """
+
+    def context(self):
+        return subject.gate_context(self.argv(suite="all"))
+
+    def composed_failure(self):
+        # Shape the harness actually produced: a real error, and a scenario
+        # block with no per-suite slices because compose died first.
+        return {"schema_version": 1, "suite": "all", "outcome": "failed",
+                "error": "Rejected: compose slice failed: command 141 exit 128, expected 0",
+                "cleanup_errors": [], "scenario": {}}
+
+    def test_untranslatable_composed_result_still_yields_a_lane_result(self):
+        ctx = self.context()
+        with self.assertRaises(Exception):
+            subject.from_run(ctx, self.composed_failure(), {"suite": "all"}, self.lane_dir, 1)
+        lane = subject.translate_or_failure(ctx, self.composed_failure(), {"suite": "all"}, self.lane_dir, 1)
+        self.assertEqual(lane["outcome"], "failed")
+        self.validate(lane)
+
+    def test_the_harness_failure_survives_and_is_not_replaced(self):
+        lane = subject.translate_or_failure(ctx := self.context(), self.composed_failure(),
+                                            {"suite": "all"}, self.lane_dir, 1)
+        detail = lane["failure"]["detail"]
+        self.assertIn("command 141 exit 128", detail)
+        self.assertIn("lane translation failed", detail)
+        self.assertIsNotNone(ctx)
+
+    def test_an_unreadable_result_does_not_raise(self):
+        lane = subject.translate_or_failure(self.context(), None, {"suite": "all"}, self.lane_dir, 1)
+        self.assertEqual(lane["outcome"], "failed")
+        self.validate(lane)
+

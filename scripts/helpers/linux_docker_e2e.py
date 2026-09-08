@@ -1510,8 +1510,12 @@ def main(argv):
         return 2
     if ctx is not None:
         harness = ctx.harness_dir()
-        result = lane_result.load_result(harness)
-        lane_result.write(ctx, lane_result.from_run(ctx, result, info, harness, code))
+        result = None
+        try:
+            result = lane_result.load_result(harness)
+        except (Exception, KeyboardInterrupt):
+            result = None
+        lane_result.write(ctx, lane_result.translate_or_failure(ctx, result, info, harness, code))
     return code
 
 

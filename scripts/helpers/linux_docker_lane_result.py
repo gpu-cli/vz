@@ -385,6 +385,28 @@ def executed_suites(result, info):
     return tuple(covered)
 
 
+def translate_or_failure(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT):
+    """`from_run`, or a lane result naming the harness failure if translation fails.
+
+    A composed run that fails before every suite has Machine slices cannot be
+    translated per suite. Raising here would leave the gate with only raw logs
+    and would report the translation problem in place of the harness's own
+    failure, so the harness failure is what the lane result carries; the
+    translation problem rides along as detail.
+    """
+    try:
+        return from_run(ctx, result, info, harness_dir, exit_code, repo_root=repo_root)
+    except (Exception, KeyboardInterrupt) as error:
+        try:
+            reason, detail = failure_reason((result or {}).get("error"),
+                                            (result or {}).get("cleanup_errors") or [])
+        except Exception:  # noqa: BLE001 -- an unreadable result must not replace the failure
+            reason, detail = "input_rejected", "harness result unreadable"
+        return failed(ctx, reason,
+                      detail + " [lane translation failed: " + type(error).__name__ + ": " + str(error) + "]",
+                      exit_code or 1, repo_root=repo_root)
+
+
 def from_run(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT, prefix=HARNESS_SUBDIR):
     """Translate one DEV run (`result.json` + `info`) into a lane result."""
     harness_dir = Path(harness_dir)
