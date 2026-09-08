@@ -39,8 +39,13 @@ reject() {
   printf '{"error":{"code":"legacy_command_removed","command":"%s","message":"`vz %s` was removed from the 0.4 public CLI","migration":"%s","typed_api_migration":"__TYPED__"}}\n' "$1" "$1" "$mig" >&2
   exit 2
 }
-verb=""; sawhelp=0; version=0; all=0
+verb=""; sawhelp=0; version=0; all=0; endopts=0; command_tail=""
 for arg in "$@"; do
+  # Only `exec` takes a command payload after `--`, so a `-c` there is the
+  # shell's flag rather than one of this CLI's removed ones. Everywhere else
+  # `--` is just a separator and a removed root after it is still rejected.
+  if [ "$endopts" = 1 ]; then command_tail=$arg; continue; fi
+  if [ "$arg" = "--" ] && [ "$verb" = exec ]; then endopts=1; continue; fi
   case "$arg" in
     create|ls|rm|inspect|attach|close-shell|init|run|logs|stack|image|diff|checkpoint|vm|self-sign|debug)
       if [ "$mode" = alias ] && [ "$arg" = create ]; then echo created; exit 0; fi
@@ -75,9 +80,21 @@ if [ -n "$verb" ]; then
   if [ "$verb" = up ] && [ -f vz.json ]; then
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
     mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"
-    printf '%s' "$pid" > "$topology"
+    # Runtime identities are minted per Up, not derived from the definition:
+    # recreating one pinned definition must hand out entirely new ones.
+    inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
+    printf '%s %s' "$pid" "$inc" > "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
+  fi
+  if [ "$verb" = exec ] && [ -f "$topology" ]; then
+    # Model Machine-local mutable state: run the script with the sentinel path
+    # rewritten into this isolated runtime dir, so a recreated Environment with
+    # a fresh state directory genuinely has none of it.
+    printf '%s' "$command_tail" \
+      | sed "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" > "$VZ_RUNTIME_DATA_DIR/script.sh"
+    /bin/sh "$VZ_RUNTIME_DATA_DIR/script.sh"
+    exit $?
   fi
   if [ "$verb" = delete ] && [ -f "$topology" ]; then
     rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
@@ -88,14 +105,15 @@ if [ -n "$verb" ]; then
     # below is derived from this project's own id, so two projects declaring
     # identical names still report distinct Environment, Machine, context and
     # endpoint identities -- which is what the no-collision check reads.
-    pid=$(cat "$topology")
-    sfx=${pid#prj_}
+    pid=$(cut -d' ' -f1 < "$topology")
+    sfx=$(cut -d' ' -f2 < "$topology")
     printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$pid"
     printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
     printf '   "machines": [{"name": "machine-0", "state": "ready", "docker_context": {\n'
     printf '     "owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s"},\n' "$pid" "$sfx" "$sfx"
     printf '     "name": "vzr1-ctx-%s",\n     "endpoint": "unix:///tmp/vz-%s.sock",\n' "$sfx" "$sfx"
-    printf '     "engine_id": "eng-%s"}, "machine_id": "mch_%s"}]\n' "$sfx" "$sfx"
+    printf '     "engine_id": "eng-%s"}, "machine_id": "mch_%s",\n' "$sfx" "$sfx"
+    printf '     "incarnation_id": "inc_%s", "incarnation_generation": 1}]\n' "$sfx"
     printf '  }\n ]\n}\n'
     exit 0
   fi

@@ -43,6 +43,7 @@ GATE_OWNED_FILES = frozenset(("lane-result.json", "lane-result.rejected.json", "
 CRITERION_21 = "gate.cli.legacy_removal_and_bootstrap"
 CRITERION_15 = "gate.cli_api.agreement"
 CRITERION_1 = "gate.instances.three_concurrent_no_collision"
+CRITERION_16 = "gate.reproducibility.recreate_from_definition"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
 
 
@@ -226,6 +227,25 @@ class Lane:
     def run_final_cleanup(self) -> int:
         moment = now_ns()
         state = LaneState(self.ctx.state_root, self.ctx.release_dir / "bin")
+        # Reproducibility is a final-cleanup claim: it recreates the pinned
+        # definition from fresh state and must run before the state root is
+        # removed. In the gate the earlier phases already created that root; a
+        # standalone final-cleanup makes its own.
+        if not state.root.exists():
+            state.create()
+        recorder = Recorder(self.evidence_dir, self.ctx.run_id)
+        ctx = checks.CheckContext(repo_root=self.repo_root, release_dir=self.ctx.release_dir, state=state,
+                                  recorder=recorder, evidence_dir=self.evidence_dir, cli_removal=self.cli_removal,
+                                  docker_client=self.options.get("docker", "none"),
+                                  plugins={"compose": self.options.get("compose-plugin"),
+                                           "buildx": self.options.get("buildx-plugin")})
+        subchecks = {CRITERION_16: []}
+        crash = None
+        try:
+            subchecks[CRITERION_16].append(checks.check_recreate_from_definition(ctx, CRITERION_16))
+        except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
+            crash = traceback.format_exc()
+            write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
         rows, path = write_inventory(self.evidence_dir, "lane-state-root-before-cleanup", state.root)
         cleanup_errors, leaks, notes = [], [], [f"lane state root: {state.root}", f"entries before cleanup: {len(rows)}"]
         try:
@@ -246,7 +266,28 @@ class Lane:
             leaks.append({"kind": kind, "identifier": f"{state.root}/{relative}"})
         notes.append(f"entries after cleanup: {len(remaining)}")
         write_exclusive(self.evidence_dir / "cleanup.txt", ("\n".join(notes + cleanup_errors) + "\n").encode())
-        scenarios = [self.not_implemented_scenario(s, moment) for s in self.assigned()]
+        scenarios, summary = [], {"PASS": [], "FAIL": [], "not_implemented": []}
+        for scenario in self.assigned():
+            subs = subchecks.get(scenario["id"])
+            if not subs:
+                scenarios.append(self.not_implemented_scenario(scenario, moment))
+                continue
+            status = "PASS" if all(sub.status == "PASS" for sub in subs) and not crash else "FAIL"
+            assertions = [f"{sub.id}: {sub.status}" + (" (not_implemented)" if sub.not_implemented else "") for sub in subs]
+            if crash:
+                assertions.append("lane crashed before every sub-check completed; see crash.txt")
+                status = "FAIL"
+            scenarios.append({"id": scenario["id"], "status": status,
+                              "started_unix_ns": min(sub.started for sub in subs),
+                              "ended_unix_ns": max(sub.ended or now_ns() for sub in subs), "assertions": assertions,
+                              "evidence": sorted({item for sub in subs for item in sub.evidence}), "readiness_polls": []})
+        (self.evidence_dir / "checks").mkdir(mode=0o700)
+        for subs in subchecks.values():
+            for sub in subs:
+                scenarios.append(sub.scenario())
+                text = "\n".join([f"{sub.id}: {sub.status}", *sub.scenario()["assertions"]]) + "\n"
+                write_exclusive(self.evidence_dir / "checks" / f"{sub.slug}.txt", text.encode())
+                summary["not_implemented" if sub.not_implemented else sub.status].append(sub.slug)
         if cleanup_errors or leaks:
             result = self.failed("cleanup", "final-cleanup could not positively remove the lane state root: " +
                                  "; ".join(cleanup_errors or [f"{len(leaks)} survivors"]), EXIT_FAILED, scenarios=scenarios,
@@ -254,10 +295,23 @@ class Lane:
                                         "retained_root": str(state.root) if state.root.exists() else None, "evidence_files": self.evidence_files()})
             self.write_result(result)
             return EXIT_FAILED
-        result = self.failed("not_implemented", "topology lane final-cleanup: scenarios not implemented; lane state root removed, "
-                             "nothing of this lane remains outside the retained evidence directory", EXIT_NOT_IMPLEMENTED,
-                             scenarios=scenarios, extra={"handoff": self.handoff_record(), "retained_root": None,
-                                                        "evidence_files": self.evidence_files()})
+        detail = (f"sub-checks PASS={summary['PASS']} FAIL={summary['FAIL']} not_implemented={summary['not_implemented']}; "
+                  "lane state root removed, nothing of this lane remains outside the retained evidence directory")
+        extra = {"handoff": self.handoff_record(), "retained_root": None, "evidence_files": self.evidence_files()}
+        if crash:
+            result = self.failed("crash", "topology lane final-cleanup crashed; see crash.txt: " + detail,
+                                 EXIT_FAILED, scenarios=scenarios, extra=extra)
+            self.write_result(result)
+            return EXIT_FAILED
+        if summary["FAIL"]:
+            result = self.failed("assertion", "topology lane final-cleanup: " + detail, EXIT_FAILED,
+                                 scenarios=scenarios, extra=extra)
+            self.write_result(result)
+            return EXIT_FAILED
+        # Scenarios this lane still does not implement keep the phase honest even
+        # when every implemented one passed.
+        result = self.failed("not_implemented", "topology lane final-cleanup: " + detail, EXIT_NOT_IMPLEMENTED,
+                             scenarios=scenarios, extra=extra)
         self.write_result(result)
         return EXIT_NOT_IMPLEMENTED
 

@@ -143,8 +143,12 @@ class CheckContext:
         """
         root = self.state.root / name
         root.mkdir(mode=0o700)
-        state_dir = root / "state"
-        state_dir.mkdir(mode=0o700)
+        # Provisioning isolates keep the shallowest layout that still separates
+        # them: every AF_UNIX path underneath has a 103-byte budget, and the
+        # Docker endpoint name alone spends 45 of it.
+        state_dir = root if provision else root / "state"
+        if not provision:
+            state_dir.mkdir(mode=0o700)
         project = root / "project"
         project.mkdir(mode=0o700)
         overrides = {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon if provision else self.state.absent_daemon}
@@ -155,7 +159,7 @@ class CheckContext:
             # after it has already admitted the request and allocated
             # identities. A Developer Machine also cannot reach `ready` without
             # a Docker client, and vz will not guess a path for one.
-            for directory in ("runtime", "docker"):
+            for directory in (RUNTIME_DIR, "docker"):
                 (state_dir / directory).mkdir(mode=0o700)
             if self.docker_client and self.docker_client != "none":
                 overrides["VZ_DOCKER_CLIENT"] = self.docker_client
@@ -168,9 +172,9 @@ class CheckContext:
                     destination.chmod(0o500)
         for filename, data in project_files.items():
             write_exclusive(project / filename, data)
+        runtime = state_dir / (RUNTIME_DIR if provision else "runtime")
         env = self.state.env(HOME=root / "absent-home", VZ_RUNTIME_STATE_DB=state_dir / "stack-state.db",
-                             VZ_RUNTIME_DATA_DIR=state_dir / "runtime",
-                             VZ_RUNTIME_DAEMON_SOCKET=state_dir / "runtime" / "runtimed.sock",
+                             VZ_RUNTIME_DATA_DIR=runtime, VZ_RUNTIME_DAEMON_SOCKET=runtime / "d.sock",
                              VZ_DOCKER_CONFIG=state_dir / "docker", **overrides)
         return {"root": root, "state": state_dir, "project": project, "env": env}
 
@@ -421,6 +425,10 @@ UP_TIMEOUT = 900
 DELETE_TIMEOUT = 300
 GIT = "/usr/bin/git"
 SOCKET_PATH_LIMIT = 103
+# `vzr1-ot-` + 32 hex + `.sock`, the longest endpoint name observed.
+ENDPOINT_NAME_BYTES = 45
+# One character: the runtime directory of a provisioning isolate.
+RUNTIME_DIR = "r"
 
 
 CONCURRENT = 3
@@ -435,6 +443,13 @@ def provision(ctx: CheckContext, check: SubCheck, name: str, definition: dict, *
     length = len(str(socket).encode())
     check.check(length <= SOCKET_PATH_LIMIT,
                 f"{name}: socket path is {length} bytes (limit {SOCKET_PATH_LIMIT})")
+    # Each Machine's Docker endpoint is another AF_UNIX socket in the runtime
+    # directory, named `vzr1-ot-<32 hex>.sock`. Over budget, Up reports a
+    # state_conflict about a "bounded absolute path" that says nothing about
+    # length, so the budget is asserted here instead.
+    endpoint = len(str(Path(env["VZ_RUNTIME_DATA_DIR"]) / ("x" * ENDPOINT_NAME_BYTES)).encode())
+    check.check(endpoint <= SOCKET_PATH_LIMIT,
+                f"{name}: Docker endpoint path would be {endpoint} bytes (limit {SOCKET_PATH_LIMIT})")
     if check.status != "PASS":
         return {"env": env, "project": project, "status": None}
     for label, argv in ((name + "-git-init", [GIT, "init", "--quiet", "--initial-branch", "main"]),
@@ -485,7 +500,7 @@ def check_three_concurrent_environments(ctx: CheckContext, top: str) -> SubCheck
         # Only the project id differs; the name, Machine name and resources are
         # deliberately identical across all three.
         definition["project_id"] = "prj_" + uuid.uuid4().hex
-        instances.append(provision(ctx, check, f"concurrent-{index}", definition))
+        instances.append(provision(ctx, check, f"c{index}", definition))
         if check.status != "PASS":
             break
     live = [row for row in instances if row["status"]]
@@ -528,6 +543,100 @@ def check_three_concurrent_environments(ctx: CheckContext, top: str) -> SubCheck
     return check.finish()
 
 
+SENTINEL_PATH = "/run/vz-reproducibility-sentinel"
+
+
+def resolved_shape(payload: dict) -> dict:
+    """The configuration a definition resolves to, with identities removed.
+
+    Two Ups of one pinned definition must agree here exactly, which is only
+    meaningful because every runtime identity is deliberately excluded.
+    """
+    environments = payload.get("environments") or []
+    shape = {"definition_digest": payload.get("desired_definition_digest"),
+             "project_name": payload.get("project_name"), "environments": []}
+    for environment in environments:
+        machines = []
+        for machine in environment.get("machines") or []:
+            machines.append({"name": machine.get("name"), "profile": machine.get("profile"),
+                             "target": machine.get("target"), "state": machine.get("state")})
+        shape["environments"].append({"name": environment.get("name"), "state": environment.get("state"),
+                                      "machines": machines})
+    return shape
+
+
+def runtime_identities(payload: dict) -> dict:
+    identities = {"environment": [], "machine": [], "incarnation": [], "engine": []}
+    for environment in payload.get("environments") or []:
+        identities["environment"].append(environment.get("environment_id"))
+        for machine in environment.get("machines") or []:
+            identities["machine"].append(machine.get("machine_id"))
+            identities["incarnation"].append(machine.get("incarnation_id"))
+            identities["engine"].append((machine.get("docker_context") or {}).get("engine_id"))
+    return identities
+
+
+def check_recreate_from_definition(ctx: CheckContext, top: str) -> SubCheck:
+    """The pinned definition, recreated from fresh state, resolves the same.
+
+    One Up writes a mutable sentinel into its Machine. After deletion a second
+    Up of the very same definition bytes must resolve the same configuration and
+    artifact digests, hand out entirely new runtime identities, and carry none
+    of the sentinel data the first one left behind.
+    """
+    check = SubCheck(top, "recreate_from_definition")
+    try:
+        definition = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    token = "vzrepro-" + uuid.uuid4().hex[:16]
+    first = provision(ctx, check, "rep-a", definition)
+    if check.status != "PASS" or not first["status"]:
+        return check.finish()
+    written = ctx.run(check, "rep-sentinel-write",
+                      ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
+                       f"printf %s {token} > {SENTINEL_PATH}; cat {SENTINEL_PATH}"],
+                      cwd=first["project"], env=first["env"], timeout=120)
+    check.check(written.exit_code == 0 and written.stdout.strip() == token.encode(),
+                f"mutable sentinel written into the first Machine (exit {written.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+    removed = ctx.run(check, "rep-a-delete",
+                      ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                      cwd=first["project"], env=first["env"], timeout=DELETE_TIMEOUT)
+    check.check(removed.exit_code == 0, f"first Environment deleted (exit {removed.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+    # Same definition bytes, fresh state directory: nothing of the first Up's
+    # runtime survives except what the definition itself pins.
+    second = provision(ctx, check, "rep-b", definition)
+    if check.status != "PASS" or not second["status"]:
+        return check.finish()
+    before, after = resolved_shape(first["status"]), resolved_shape(second["status"])
+    check.check(before == after, "the recreated definition resolves the same topology, configuration and artifact digests"
+                if before == after else f"resolved configuration differs: {json.dumps(before)[:200]} vs {json.dumps(after)[:200]}")
+    old_identities, new_identities = runtime_identities(first["status"]), runtime_identities(second["status"])
+    for kind in sorted(old_identities):
+        old_values = [value for value in old_identities[kind] if value]
+        new_values = [value for value in new_identities[kind] if value]
+        check.check(old_values and new_values and not (set(old_values) & set(new_values)),
+                    f"{kind} identities are entirely new after recreation "
+                    f"({len(old_values)} before, {len(new_values)} after, {len(set(old_values) & set(new_values))} shared)")
+    survivor = ctx.run(check, "rep-sentinel-absent",
+                       ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
+                        f"cat {SENTINEL_PATH} 2>/dev/null; printf END"],
+                       cwd=second["project"], env=second["env"], timeout=120)
+    check.check(survivor.exit_code == 0 and survivor.stdout.strip() == b"END",
+                f"no deleted sentinel data survives into the recreated Machine (observed {survivor.stdout[:60]!r})")
+    if check.status == "PASS":
+        final = ctx.run(check, "rep-b-delete",
+                        ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                        cwd=second["project"], env=second["env"], timeout=DELETE_TIMEOUT)
+        check.check(final.exit_code == 0, f"second Environment deleted (exit {final.exit_code})")
+    return check.finish()
+
+
 def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
     """A real `vz up` from a bare definition must create the `default` Environment.
 
@@ -548,7 +657,7 @@ def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
     check.check("environments" not in definition["environment"] and "name" not in definition["environment"],
                 "the bootstrap definition names no Environment, so `default` can only come from Up")
     data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
-    iso = ctx.isolated("bootstrap-up", project_files={"vz.json": data}, provision=True)
+    iso = ctx.isolated("boot", project_files={"vz.json": data}, provision=True)
     env, project = iso["env"], iso["project"]
     # AF_UNIX truncates silently past 103 bytes, and the daemon then reports a
     # bare daemon_unavailable that looks like a provisioning defect. Say what it
