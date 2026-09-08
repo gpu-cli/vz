@@ -1012,7 +1012,8 @@ def parallel_builds(harness, descriptor, scope, proof, images, index, root):
     this suite reads only the four slot results it needs for its own correlation.
     """
     from linux_docker_e2e import input_mapping
-    from linux_docker_build_parallel import SLOTS, ParallelDriver, execute_slots, specification
+    from linux_docker_build_parallel import (SLOTS, ParallelDriver, TombstoneDriver, execute_slots,
+                                              specification, tombstone_specification)
     from linux_docker_parallel_evidence import validate_group, validate_slot
     require(len(SLOTS) == PARALLEL_BUILDS, 'the parallel suite no longer builds four slots')
     require(not os.path.lexists(root), 'concurrency build evidence directory preexists')
@@ -1031,8 +1032,22 @@ def parallel_builds(harness, descriptor, scope, proof, images, index, root):
         harness.driver_cleanup_verified.append(False)
         selected.append(item)
         operations.append(operation)
+    # The barrier signal is mandatory: a dying slot is the only thing that can
+    # tell its siblings to stop waiting, and this suite delegates to the same
+    # four-worker barrier the parallel suite uses. Provisioned with the slots,
+    # never during the failure it reports.
+    tombstone = TombstoneDriver(admitted, Path(harness.info['fixture']), root / 'tombstone')
+    positions.append(len(harness.drivers))
+    harness.drivers.append(tombstone)
+    harness.driver_cleanup_verified.append(False)
+
+    def signal(slot):
+        return tombstone.execute(tombstone_specification(slot, root / 'tombstone',
+                                 Path(harness.info['parallel_fixture']),
+                                 harness.info['parallel_fixture_sha256'], inputs['run_id']))
+
     started = time.time_ns()
-    solved = execute_slots(selected, operations)
+    solved = execute_slots(selected, operations, signal)
     replays = [validate_slot(item.output, inputs, operation) for item, (operation, _) in zip(selected, solved)]
     group = validate_group(replays)
     runtime = builder.verify(require_invocation=True)
