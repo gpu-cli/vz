@@ -1,8 +1,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::topology::{
-    ClaimV7MigrationFailpoint, EnvironmentNetworkV10MigrationFailpoint,
-    TeardownFinalizerV8MigrationFailpoint,
+    ClaimV7MigrationFailpoint, EnvironmentAddressingV11MigrationFailpoint,
+    EnvironmentNetworkV10MigrationFailpoint, TeardownFinalizerV8MigrationFailpoint,
 };
 use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
@@ -355,6 +355,8 @@ fn topology_project_state(
                     network_id: network_id.clone(),
                     environment_id: environment_id.clone(),
                     name: "private".to_string(),
+                    kind: NetworkKind::Private,
+                    cidr: Some("10.20.0.0/24".to_string()),
                 }],
                 endpoints: vec![EndpointInstance {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -363,6 +365,9 @@ fn topology_project_state(
                     machine_id: machine_id.clone(),
                     network_id: network_id.clone(),
                     name: "web".to_string(),
+                    protocol: EndpointProtocol::Https,
+                    port: 443,
+                    hostname: Some("web.shop.test".to_string()),
                 }],
                 ownership: vec![
                     OwnershipRecord {
@@ -3530,7 +3535,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 10);
+    assert_eq!(version, 11);
 }
 
 #[test]
@@ -4631,7 +4636,7 @@ fn phase2_validation_schema_version_survives_reopen() {
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
     }
 }
 
@@ -5233,7 +5238,7 @@ fn environment_network_topology_round_trips_through_normalized_projections() {
 
     {
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         store.save_project_state(&expected).unwrap();
         for (table, column) in [
             ("environment_network_attachments", "attachment_id"),
@@ -5324,8 +5329,8 @@ fn v9_to_v10_environment_network_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
-    reopened.validate_v10_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 11);
+    reopened.validate_v11_schema().unwrap();
     for object in [
         "environment_network_attachments",
         "environment_host_exports",
@@ -5371,6 +5376,164 @@ fn v9_to_v10_environment_network_migration_rolls_back_then_reopens() {
 }
 
 #[test]
+fn declared_addressing_round_trips_through_the_state_store() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("declared-addressing.db");
+    let mut expected = network_topology_project_state("prj_addressing", "agent");
+    // Values chosen so that a record which dropped them could not pass: a
+    // non-default kind, a present CIDR, and a port that is not the declared
+    // protocol's well-known one.
+    expected.definition.environment.networks[0].kind = NetworkKind::SimulatedPublic;
+    expected.definition.environment.networks[0].cidr = Some("198.18.7.0/24".to_string());
+    expected.definition.environment.endpoints[0].protocol = EndpointProtocol::Http;
+    expected.definition.environment.endpoints[0].port = 8080;
+    expected.definition.environment.endpoints[0].hostname = Some("web.agent.test".to_string());
+    expected.environments[0].networks[0].kind = NetworkKind::SimulatedPublic;
+    expected.environments[0].networks[0].cidr = Some("198.18.7.0/24".to_string());
+    expected.environments[0].endpoints[0].protocol = EndpointProtocol::Http;
+    expected.environments[0].endpoints[0].port = 8080;
+    expected.environments[0].endpoints[0].hostname = Some("web.agent.test".to_string());
+    expected.environments[0].definition_digest = expected.definition.digest().unwrap();
+
+    {
+        let store = StateStore::open(&path).unwrap();
+        store.save_project_state(&expected).unwrap();
+    }
+
+    let reopened = StateStore::open(&path).unwrap();
+    let loaded = reopened
+        .load_project_state("prj_addressing")
+        .unwrap()
+        .expect("saved project must reload");
+    assert_eq!(loaded, expected);
+
+    // Assert the individual values as well as the aggregate, so a record that
+    // silently defaulted one of them cannot pass by comparing equal to an
+    // expectation built the same wrong way.
+    let network = &loaded.environments[0].networks[0];
+    assert_eq!(network.kind, NetworkKind::SimulatedPublic);
+    assert_eq!(network.cidr.as_deref(), Some("198.18.7.0/24"));
+    let endpoint = &loaded.environments[0].endpoints[0];
+    assert_eq!(endpoint.protocol, EndpointProtocol::Http);
+    assert_eq!(endpoint.port, 8080);
+    assert_eq!(endpoint.hostname.as_deref(), Some("web.agent.test"));
+
+    // The persisted row itself must carry the coordinate, so durable state can
+    // answer "which port is endpoint `web` on" without the project definition.
+    let port: i64 = reopened
+        .conn
+        .query_row(
+            "SELECT json_extract(instance_json, '$.port') FROM environment_endpoints
+             WHERE environment_id = 'env_agent' AND name = 'web'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(port, 8080);
+    let cidr: String = reopened
+        .conn
+        .query_row(
+            "SELECT json_extract(instance_json, '$.cidr') FROM environment_networks
+             WHERE environment_id = 'env_agent' AND name = 'private'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(cidr, "198.18.7.0/24");
+}
+
+#[test]
+fn v10_to_v11_refuses_a_record_that_predates_declared_addressing() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v10-pre-addressing.db");
+    let store = StateStore::open(&path).unwrap();
+    store
+        .save_project_state(&network_topology_project_state("prj_pre_v11", "agent"))
+        .unwrap();
+    // Strip the declared addressing from the persisted record, reproducing what
+    // a v10 store wrote: identity only, with the kind and CIDR nowhere on disk.
+    store
+        .conn
+        .execute(
+            "UPDATE environment_networks
+             SET instance_json = json_remove(instance_json, '$.kind', '$.cidr')",
+            [],
+        )
+        .unwrap();
+    downgrade_environment_addressing_fixture_to_v10(&store);
+    let before = application_schema_snapshot(&store.conn);
+    drop(store);
+
+    let error = StateStore::open(&path)
+        .err()
+        .expect("a pre-v11 record must not be migrated")
+        .to_string();
+    assert!(
+        error.contains("environment_networks")
+            && error.contains("predates declared addressing")
+            && error.contains("explicit recovery"),
+        "unexpected refusal: {error}"
+    );
+
+    // Refusing must leave the store exactly as it was, so recovery has the same
+    // database to work on.
+    let conn = Connection::open(&path).unwrap();
+    let version: String = conn
+        .query_row(
+            "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(version, "10");
+    assert_eq!(application_schema_snapshot(&conn), before);
+    let stripped: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM environment_networks
+             WHERE json_extract(instance_json, '$.kind') IS NULL",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(stripped, 1);
+}
+
+#[test]
+fn v10_to_v11_addressing_migration_rolls_back_then_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v10-to-v11-addressing.db");
+    let store = StateStore::open(&path).unwrap();
+    let expected = network_topology_project_state("prj_v10_addressing", "agent");
+    store.save_project_state(&expected).unwrap();
+    downgrade_environment_addressing_fixture_to_v10(&store);
+    let before = application_schema_snapshot(&store.conn);
+
+    let error = store
+        .migrate_environment_addressing_v10_to_v11_with_failpoint(
+            EnvironmentAddressingV11MigrationFailpoint::AfterPreV11RecordsRefused,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected v10-to-v11 migration failure"));
+    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(application_schema_snapshot(&store.conn), before);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 11);
+    reopened.validate_v11_schema().unwrap();
+    let loaded = reopened
+        .load_project_state("prj_v10_addressing")
+        .unwrap()
+        .expect("the aggregate must survive the retried migration");
+    assert_eq!(loaded, expected);
+    assert_eq!(
+        loaded.environments[0].endpoints[0].port,
+        expected.environments[0].endpoints[0].port
+    );
+}
+
+#[test]
 fn topology_complete_aggregate_round_trips_after_database_relocation() {
     let first_dir = tempfile::tempdir().unwrap();
     let second_dir = tempfile::tempdir().unwrap();
@@ -5383,7 +5546,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         let definition_json: String = store
             .conn
             .query_row(
@@ -8051,7 +8214,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 10);
+    assert_eq!(retried.schema_version().unwrap(), 11);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -8109,7 +8272,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         assert_eq!(
             store
                 .conn
@@ -8344,7 +8507,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 10);
+    assert_eq!(retried.schema_version().unwrap(), 11);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -8491,7 +8654,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v10 shape mismatch"));
+    assert!(error.contains("state schema v11 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -8520,7 +8683,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v10 shape mismatch"));
+    assert!(error.contains("state schema v11 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -8625,7 +8788,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v10 shape mismatch"),
+            error.contains("state schema v11 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -8996,10 +9159,10 @@ fn migration_v4_schema_detectable() {
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "10");
+    assert_eq!(version_str, "11");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
 
     // created_at must also be set.
     assert!(
@@ -9059,7 +9222,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -9141,7 +9304,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
 }
 
 fn journal_fixture(
@@ -9598,7 +9761,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -9641,7 +9804,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -10298,7 +10461,7 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
 #[test]
 fn fresh_store_uses_v7_reconcile_claim_schema_and_replica_claim_index() {
     let store = StateStore::in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 10);
+    assert_eq!(store.schema_version().unwrap(), 11);
 
     for table in ["reconcile_sessions", "reconcile_progress"] {
         let sql: String = store
@@ -10587,7 +10750,7 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 10);
+        assert_eq!(reopened.schema_version().unwrap(), 11);
         assert_eq!(
             reopened
                 .conn
@@ -10617,7 +10780,20 @@ fn downgrade_claim_fixture_to_v6(store: &StateStore) {
     store.validate_v6_schema().unwrap();
 }
 
+/// Return a current-schema fixture to v10.
+///
+/// v11 widened the persisted network and endpoint records rather than the SQL
+/// shape, so the table definitions are identical at both versions and the
+/// downgrade is only the version marker. The rows keep their v11 records, which
+/// is what a store written by this build actually holds; a genuinely pre-v11
+/// record is produced explicitly by the tests that exercise the refusal.
+fn downgrade_environment_addressing_fixture_to_v10(store: &StateStore) {
+    store.set_schema_version(10).unwrap();
+    store.validate_v10_schema().unwrap();
+}
+
 fn downgrade_environment_network_fixture_to_v9(store: &StateStore) {
+    downgrade_environment_addressing_fixture_to_v10(store);
     store
         .conn
         .execute_batch(
@@ -10673,8 +10849,8 @@ fn v7_to_v8_teardown_finalizer_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
-    reopened.validate_v10_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 11);
+    reopened.validate_v11_schema().unwrap();
     for object in [
         "teardown_finalizers",
         "teardown_one_active_workload",
@@ -10746,7 +10922,7 @@ fn v7_to_v8_preserves_terminal_claimed_teardown_history() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     let session = reopened
         .load_reconcile_session(session_id)
         .unwrap()
@@ -10763,8 +10939,8 @@ fn v8_to_v9_adds_exact_runtime_identity_projection() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
-    reopened.validate_v10_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 11);
+    reopened.validate_v11_schema().unwrap();
     let column_count: i64 = reopened
         .conn
         .query_row(
@@ -11327,7 +11503,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     for trigger in [
         "reconcile_session_identity_immutable",
         "reconcile_audit_identity_immutable",
@@ -11345,7 +11521,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
             1
         );
     }
-    reopened.validate_v10_schema().unwrap();
+    reopened.validate_v11_schema().unwrap();
 }
 
 #[test]
@@ -11418,7 +11594,7 @@ fn v6_to_v7_preserves_effect_free_active_session_and_terminal_history() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 10);
+        assert_eq!(reopened.schema_version().unwrap(), 11);
         assert_eq!(
             reopened
                 .load_reconcile_session_actions(&session_id)
@@ -11489,7 +11665,7 @@ fn v6_to_v7_preserves_terminal_history_beside_one_effect_free_active_session() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     assert_eq!(
         reopened
             .load_audit_log_for_session("rs-v6-terminal")
@@ -11611,7 +11787,7 @@ fn v6_to_v7_preserves_length_framed_whitespace_ids_for_atomic_claim() {
     };
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     assert_eq!(
         crate::reconcile::ReconcileActionExecutionKey::new(
             session_id,
@@ -11676,7 +11852,7 @@ fn v7_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 10);
+    assert_eq!(reopened.schema_version().unwrap(), 11);
     assert_eq!(
         reopened
             .load_reconcile_session_actions(&session.session_id)
@@ -13390,7 +13566,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v10_schema().unwrap();
+    store.validate_v11_schema().unwrap();
 }
 
 #[test]

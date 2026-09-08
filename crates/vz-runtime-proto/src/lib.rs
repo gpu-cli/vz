@@ -991,6 +991,8 @@ mod tests {
                     ("network_id", 2),
                     ("environment_id", 3),
                     ("name", 4),
+                    ("kind", 5),
+                    ("cidr", 6),
                 ],
             ),
             (
@@ -1002,6 +1004,9 @@ mod tests {
                     ("machine_id", 4),
                     ("network_id", 5),
                     ("name", 6),
+                    ("protocol", 7),
+                    ("port", 8),
+                    ("hostname", 9),
                 ],
             ),
             (
@@ -1749,6 +1754,8 @@ mod tests {
                 network_id: "net_public".into(),
                 environment_id: "env_agent_a".into(),
                 name: "public-edge".into(),
+                kind: NetworkKind::SimulatedPublic as i32,
+                cidr: Some("10.42.0.0/24".into()),
             }],
             endpoints: vec![EndpointInstance {
                 schema_version: 1,
@@ -1757,6 +1764,9 @@ mod tests {
                 machine_id: "mac_api".into(),
                 network_id: "net_public".into(),
                 name: "api-https".into(),
+                protocol: EndpointProtocol::Https as i32,
+                port: 8443,
+                hostname: Some("api.internal".into()),
             }],
             ownership: vec![OwnershipRecord {
                 schema_version: 1,
