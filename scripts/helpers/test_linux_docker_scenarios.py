@@ -48,7 +48,7 @@ class TableTests(unittest.TestCase):
         with self.assertRaisesRegex(subject.CoverageError, "neither claimed nor uncovered"):
             subject.check(uncovered=subject.UNCOVERED[1:], rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "both claimed and uncovered"):
-            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "isolation"),), rows=rows)
+            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "concurrency"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "unknown gap suite"):
             subject.check(uncovered=subject.UNCOVERED[:-1] + ((subject.UNCOVERED[-1][0], "later"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "distinct manifest expected fields"):
@@ -76,10 +76,15 @@ class TableTests(unittest.TestCase):
         self.assertEqual(subject.for_recipe("build", "build-multi-stage"), ("docker.build.output_export", "docker.build.multi_stage"))
         with self.assertRaises(subject.CoverageError):
             subject.for_recipe("build", "compose-create")
-        # A planned gap suite has no claims until it is actually built.
+        # A planned gap suite has no claims until it is actually built. A suite
+        # may also be partly built: `isolation` covers one of its two ids, so it
+        # is both a real suite and still a gap suite.
         with self.assertRaises(subject.CoverageError):
-            subject.for_suite("isolation")
+            subject.for_suite("concurrency")
         self.assertEqual(len(subject.for_suite("mounts")), 5)
+        self.assertEqual(len(subject.for_suite("netpolicy")), 2)
+        self.assertEqual(len(subject.for_suite("isolation")), 1)
+        self.assertIn("isolation", subject.GAP_SUITES)
         for suite in subject.SUITES.values():
             self.assertIn(suite.process_scenario, subject.for_suite(suite.name))
         for suite in ("compose", "build"):

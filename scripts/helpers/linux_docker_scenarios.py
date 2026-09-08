@@ -90,6 +90,9 @@ SUITES = {suite.name: suite for suite in (
           "docker.storage.bind_mounts", ("mounts-cross-machine.json",)),
     Suite("netpolicy", "linux_docker_netpolicy_machine.py",
           ("netpolicy-machine-{index}/machine-netpolicy-validation.json",), (), "docker.network.published_ports"),
+    Suite("isolation", "linux_docker_isolation_machine.py",
+          ("isolation-machine-{index}/machine-isolation-validation.json",), (),
+          "docker.operation.same_environment_isolation", ("isolation-cross-machine.json",)),
     Suite("recovery", "linux_docker_recovery_machine.py", ("recovery-machine-{index}/machine-recovery-validation.json",),
           (Poll("poll.docker.engine_ready", 60, _recovery_samples),), "docker.operation.daemon_restart_recovery"),
 )}
@@ -140,6 +143,8 @@ TABLE = (
     # netpolicy: loopback-only publication and the cleanup of what it created.
     _c("docker.network.published_ports", "netpolicy", ("run_machine", "published_ports")),
     _c("docker.network.cleanup", "netpolicy", ("run_machine", "network_cleanup")),
+    # isolation: two Machines of one Environment share nothing.
+    _c("docker.operation.same_environment_isolation", "isolation", ("run_machine", "verify_machines")),
     # recovery: public Stop/Up of the owning Environment (not an in-place daemon restart).
     _c("docker.storage.persistence", "recovery", "run_machine"),
     _c("docker.operation.daemon_restart_recovery", "recovery", "run_machine"),
@@ -179,7 +184,6 @@ TABLE = (
 
 UNCOVERED = (
     ("docker.operation.concurrent_clients", "concurrency"),
-    ("docker.operation.same_environment_isolation", "isolation"),
     ("docker.operation.sibling_environment_isolation", "isolation"),
 )
 
