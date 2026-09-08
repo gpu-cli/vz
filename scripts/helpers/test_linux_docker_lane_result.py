@@ -147,8 +147,9 @@ class ResultShapeTests(Scratch):
         self.validate(lane)
         self.assertEqual(lane["outcome"], "passed")
         self.assertIsNone(lane["failure"])
-        self.assertEqual([s["id"] for s in lane["scenarios"]], ["docker.operation.resource_limits", "docker.operation.oom"])
-        self.assertEqual({s["status"] for s in lane["scenarios"]}, {"PASS"})
+        docker_rows = [s for s in lane["scenarios"] if s["id"].startswith("docker.")]
+        self.assertEqual([s["id"] for s in docker_rows], ["docker.operation.resource_limits", "docker.operation.oom"])
+        self.assertEqual({s["status"] for s in docker_rows}, {"PASS"})
         self.assertEqual(lane["scenarios"][0]["evidence"], ["harness/limits-machine-0/machine-limits-validation.json"])
         self.assertEqual(lane["scenarios"][0]["readiness_polls"][0]["samples"], 60)
         # One row per accounting scenario, not one per receipt: the validator rejects a scenario started twice.
@@ -187,7 +188,10 @@ class ResultShapeTests(Scratch):
         self.validate(lane)
         self.assertEqual(lane["outcome"], "passed", lane["failure"])
         identifiers = [entry["id"] for entry in lane["scenarios"]]
-        self.assertEqual(identifiers, list(scenarios.for_suite("handshake")) + list(scenarios.for_suite("limits")))
+        self.assertEqual(identifiers, list(scenarios.for_suite("handshake")) + list(scenarios.for_suite("limits"))
+                         + ["gate.docker.machine_scoped_contexts"])
+        # handshake ran here, so the gate row it backs is a real PASS.
+        self.assertEqual([e["status"] for e in lane["scenarios"] if e["id"].startswith("gate.")], ["PASS"])
         self.assertEqual({entry["status"] for entry in lane["scenarios"] if entry["id"].startswith("docker.operation.")}, {"PASS"})
         # Each suite accounts for its host work exactly once; duplicates are a validator finding.
         starts = [entry["scenario_id"] for entry in lane["process_starts"]]
@@ -244,12 +248,17 @@ class ResultShapeTests(Scratch):
         self.assertEqual(lane["outcome"], "failed")
         self.assertIn("prohibited component observed: runc", lane["failure"]["detail"])
 
-    def test_other_phase_yields_no_scenarios_but_stays_valid(self):
+    def test_other_phase_yields_only_its_gate_row_and_stays_valid(self):
+        # A phase with no matching manifest claims still owes the lane's gate.*
+        # row for that phase, and it must not pass on absent evidence.
         harness, result, info = self.synthetic_harness()
         ctx = subject.gate_context(self.argv(phase="final-cleanup")).validate()
         lane = subject.from_run(ctx, result, info, harness, 0)
         self.validate(lane)
-        self.assertEqual(lane["scenarios"], [])
+        self.assertEqual([entry["id"] for entry in lane["scenarios"]],
+                         ["gate.runtime.youki_only_provenance"])
+        self.assertEqual(lane["scenarios"][0]["status"], "FAIL")
+        self.assertTrue(any("no evidence" in a for a in lane["scenarios"][0]["assertions"]))
         self.assertEqual(lane["outcome"], "passed")
 
 
@@ -262,9 +271,10 @@ class RetainedCandidateTests(Scratch):
         lane = subject.from_run(ctx, result, info, CANDIDATE, 0, prefix="harness")
         self.assertEqual(schema.validate("lane-result", lane), [])
         self.assertEqual(lane["outcome"], "passed", lane["failure"])
-        self.assertEqual([s["id"] for s in lane["scenarios"]], list(scenarios.for_suite("limits")))
-        self.assertEqual({s["status"] for s in lane["scenarios"]}, {"PASS"})
-        for entry in lane["scenarios"]:
+        retained = [s for s in lane["scenarios"] if s["id"].startswith("docker.")]
+        self.assertEqual([s["id"] for s in retained], list(scenarios.for_suite("limits")))
+        self.assertEqual({s["status"] for s in retained}, {"PASS"})
+        for entry in retained:
             self.assertEqual(len(entry["evidence"]), 3)
             self.assertEqual(entry["readiness_polls"], [{"id": "poll.service.health_probe", "samples": 180, "deadline_seconds": 60, "satisfied": True}])
             self.assertLess(entry["started_unix_ns"], entry["ended_unix_ns"])

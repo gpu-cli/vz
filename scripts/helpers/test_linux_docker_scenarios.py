@@ -156,3 +156,50 @@ class LaneScenarioTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GateScenarioTests(unittest.TestCase):
+    """The three gate.* rows this lane owes, one per phase."""
+
+    def test_each_gate_row_belongs_to_exactly_one_phase(self):
+        seen = {}
+        for claim in subject.GATE_CLAIMS:
+            self.assertNotIn(claim.id, seen)
+            seen[claim.id] = claim.phase
+        self.assertEqual(len(seen), 3)
+        self.assertEqual(len({c.phase for c in subject.GATE_CLAIMS}), 3)
+
+    def test_a_row_passes_only_when_its_backing_suite_ran(self):
+        claim = subject.GATE_CLAIMS[0]
+        ran = subject.gate_scenarios(claim.phase, {claim.suites[0]: [1, 2]}, passed=True)
+        self.assertEqual([e["status"] for e in ran], ["PASS"])
+
+    def test_an_absent_backing_suite_is_never_a_pass(self):
+        # The failure mode this guards: a gate row satisfied by the absence of
+        # evidence rather than by evidence.
+        claim = subject.GATE_CLAIMS[0]
+        for executed in ({}, {"compose": [1]}, {claim.suites[0]: []}):
+            entries = subject.gate_scenarios(claim.phase, executed, passed=True)
+            self.assertEqual([e["status"] for e in entries], ["FAIL"], executed)
+            self.assertTrue(any("no evidence" in a for a in entries[0]["assertions"]), executed)
+
+    def test_a_failed_run_never_passes_a_gate_row(self):
+        claim = subject.GATE_CLAIMS[0]
+        entries = subject.gate_scenarios(claim.phase, {claim.suites[0]: [1]}, passed=False, error="boom")
+        self.assertEqual([e["status"] for e in entries], ["FAIL"])
+        self.assertTrue(any("boom" in a for a in entries[0]["assertions"]))
+
+    def test_only_the_matching_phase_emits(self):
+        for claim in subject.GATE_CLAIMS:
+            entries = subject.gate_scenarios(claim.phase, {s: [1] for s in claim.suites}, passed=True)
+            self.assertEqual([e["id"] for e in entries], [claim.id])
+
+    def test_the_gate_rows_match_the_contract(self):
+        # These ids and phases come from config/vz-0.4-e2e-contract.json; drift
+        # would silently orphan a required row.
+        self.assertEqual(
+            sorted((c.id, c.phase) for c in subject.GATE_CLAIMS),
+            [("gate.docker.machine_scoped_contexts", "clean-provision"),
+             ("gate.pressure.resource_pressure", "persisted-recovery/pre-sleep"),
+             ("gate.runtime.youki_only_provenance", "final-cleanup")])
+

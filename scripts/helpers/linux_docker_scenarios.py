@@ -291,6 +291,57 @@ def for_recipe(suite, recipe):
     return ids
 
 
+GateClaim = namedtuple("GateClaim", "id phase suites title")
+
+# The gate contract assigns three `gate.*` rows to this lane. They are not in the
+# frozen docker manifest and carry no `expected` block, so they are emitted from
+# here rather than pushed through the manifest loader, whose 63-id inventory is
+# cross-checked and should stay exactly that.
+#
+# Each row names the suites whose passing run is its evidence. A gate row is PASS
+# only when every named suite actually ran in this composed run and the run
+# passed: a row that reported PASS because its backing suite was absent would be
+# an assertion satisfied by the absence of evidence.
+GATE_CLAIMS = (
+    GateClaim("gate.docker.machine_scoped_contexts", "clean-provision", ("handshake",),
+              "Machine-scoped Docker: independent engines driven by the Mac's unmodified clients"),
+    GateClaim("gate.pressure.resource_pressure", "persisted-recovery/pre-sleep", ("concurrency",),
+              "Resource pressure: 20 containers in 60 s, 4 pulls, 4 builds, 8 execs"),
+    GateClaim("gate.runtime.youki_only_provenance", "final-cleanup", ("recovery",),
+              "youki is the only OCI runtime binary and every invocation is proven"),
+)
+
+
+def gate_scenarios(phase, executed, *, passed, error=None, window=None):
+    """Lane-result `scenarios[]` for the `gate.*` rows this lane owes at `phase`.
+
+    `executed` is {suite: slices} for the composed run. A row is emitted only for
+    the matching phase, and is PASS only when the run passed AND every suite that
+    backs it ran with at least one Machine slice.
+    """
+    require(isinstance(executed, dict), "gate scenarios need the executed suite map")
+    # A gate row spans the whole composed run rather than one suite, so it carries
+    # the run window when the caller knows it.
+    started, ended = window if window else (0, 0)
+    entries = []
+    for claim in GATE_CLAIMS:
+        if claim.phase != phase:
+            continue
+        missing = [name for name in claim.suites if not executed.get(name)]
+        assertions = [claim.title]
+        if missing:
+            assertions.append("no evidence: " + ", ".join(missing) + " did not run in this composed run")
+        else:
+            for name in claim.suites:
+                assertions.append("asserted by " + name + " on " + str(len(executed[name])) + " Machine(s)")
+        if not passed:
+            assertions.append("run failed: " + (error or "harness reported failure"))
+        entries.append({"id": claim.id, "status": "PASS" if passed and not missing else "FAIL",
+                        "assertions": assertions, "evidence": [], "readiness_polls": [],
+                        "started_unix_ns": started, "ended_unix_ns": ended})
+    return tuple(entries)
+
+
 def claims(suite):
     return tuple(claim for claim in TABLE if claim.suite == suite and claim.status in ("proven", "partial"))
 

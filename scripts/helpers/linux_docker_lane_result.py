@@ -430,6 +430,10 @@ def from_run(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT, 
     lane["scenarios"] = [entry for suite, slices in covered
                          for entry in scenarios.lane_scenarios(suite, slices, phase=lane["phase"], passed=passed, error=error,
                                                                evidence_prefix=prefix, window=window, rows=manifest_rows)]
+    # The three `gate.*` rows this lane owes are not in the docker manifest and
+    # carry no `expected` block, so they are emitted from the whole-run view of
+    # which suites actually executed rather than per suite.
+    lane["scenarios"] += list(scenarios.gate_scenarios(lane["phase"], dict(covered), passed=passed, error=error, window=window))
     lane["process_starts"] = process_starts(rows, [suite for suite, _ in covered])
     lane["prohibited_observed"] = flags
     lane["cleanup_errors"] = [] if passed else cleanup_errors
