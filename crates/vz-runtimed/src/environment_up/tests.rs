@@ -184,6 +184,62 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
     }
 }
 
+/// Stop and Delete now account for Network/Endpoint/NetworkAttachment ownership
+/// (vz-9vv.1), but Up is a second, independent guard and must keep refusing the
+/// declarations until the rest of the network adapter epic lands (vz-9vv.7).
+#[tokio::test]
+async fn declared_networks_and_endpoints_still_reject_before_project_creation() {
+    for mutate in [
+        (|request: &mut EnvironmentUpRequest| {
+            request.definition.environment.networks.push(NetworkSpec {
+                schema_version: 1,
+                name: "private".into(),
+                kind: NetworkKind::Private,
+                cidr: None,
+            });
+        }) as fn(&mut EnvironmentUpRequest),
+        |request: &mut EnvironmentUpRequest| {
+            request.definition.environment.networks.push(NetworkSpec {
+                schema_version: 1,
+                name: "private".into(),
+                kind: NetworkKind::Private,
+                cidr: None,
+            });
+            request.definition.environment.machines[0]
+                .networks
+                .push("private".into());
+            request.definition.environment.endpoints.push(EndpointSpec {
+                schema_version: 1,
+                name: "api".into(),
+                machine: request.definition.environment.machines[0].name.clone(),
+                network: "private".into(),
+                protocol: EndpointProtocol::Tcp,
+                port: 8080,
+                hostname: None,
+            });
+        },
+    ] {
+        let (_root, daemon, mut request, metadata) = fixture();
+        mutate(&mut request);
+        assert_eq!(
+            daemon
+                .up_environment(request.clone(), metadata)
+                .await
+                .unwrap_err()
+                .code,
+            MachineErrorCode::UnsupportedOperation
+        );
+        assert!(
+            daemon
+                .with_state_store(
+                    |store| store.load_project_state(request.definition.project_id.as_str())
+                )
+                .unwrap()
+                .is_none()
+        );
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     let (_root, daemon, mut request, mut metadata) = fixture();

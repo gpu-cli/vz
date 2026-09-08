@@ -4,9 +4,10 @@ use super::*;
 use crate::RuntimedConfig;
 use tempfile::TempDir;
 use vz_runtime_contract::{
-    CapabilitySet, EnvironmentSelector, EnvironmentSpec, EnvironmentState, MachineProfile,
-    MachineResources, MachineSpec, MachineState, ProjectDefinition, ProjectState, RuntimeOperation,
-    RuntimePolicyHook, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    CapabilitySet, EndpointProtocol, EndpointSpec, EnvironmentSelector, EnvironmentSpec,
+    EnvironmentState, MachineProfile, MachineResources, MachineSpec, MachineState, NetworkKind,
+    NetworkSpec, ProjectDefinition, ProjectState, RuntimeOperation, RuntimePolicyHook,
+    TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 
 struct Fixture {
@@ -17,6 +18,17 @@ struct Fixture {
 
 impl Fixture {
     fn new(stopped: bool, hook: Option<Arc<dyn RuntimePolicyHook>>) -> Self {
+        Self::build(stopped, hook, false)
+    }
+
+    /// A fixture whose definition declares one network, one endpoint and one
+    /// attachment per Machine, so `instantiate_environment` emits the three
+    /// fabric ownership kinds Stop must account for.
+    fn networked(stopped: bool) -> Self {
+        Self::build(stopped, None, true)
+    }
+
+    fn build(stopped: bool, hook: Option<Arc<dyn RuntimePolicyHook>>, networked: bool) -> Self {
         let root = tempfile::tempdir().unwrap();
         let config = RuntimedConfig {
             state_store_path: root.path().join("state.db"),
@@ -34,7 +46,11 @@ impl Fixture {
                 default_machine: None,
                 machines: ["app", "worker"]
                     .map(|name| MachineSpec {
-                        networks: Vec::new(),
+                        networks: if networked {
+                            vec!["private".to_string()]
+                        } else {
+                            Vec::new()
+                        },
                         egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: name.into(),
@@ -52,8 +68,29 @@ impl Fixture {
                         workspace: None,
                     })
                     .to_vec(),
-                networks: vec![],
-                endpoints: vec![],
+                networks: if networked {
+                    vec![NetworkSpec {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        name: "private".into(),
+                        kind: NetworkKind::Private,
+                        cidr: None,
+                    }]
+                } else {
+                    vec![]
+                },
+                endpoints: if networked {
+                    vec![EndpointSpec {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        name: "api".into(),
+                        machine: "app".into(),
+                        network: "private".into(),
+                        protocol: EndpointProtocol::Tcp,
+                        port: 8080,
+                        hostname: None,
+                    }]
+                } else {
+                    vec![]
+                },
             },
         };
         let mut environments = ["first", "sibling"]
@@ -293,6 +330,154 @@ fn unsupported_live_resource_handler_fails_before_any_transition() {
             .code,
         MachineErrorCode::UnsupportedOperation
     );
+}
+
+/// The three declared-fabric ownership kinds are accounted for rather than
+/// refused, and a Stop of an Environment carrying them completes.
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_fabric_ownership_is_accounted_and_stop_completes() {
+    let fixture = Fixture::networked(true);
+    let environment = fixture
+        .project
+        .environments
+        .iter()
+        .find(|candidate| candidate.name == "first")
+        .unwrap();
+    let kinds = environment
+        .ownership
+        .iter()
+        .map(|record| record.resource_kind.clone())
+        .collect::<Vec<_>>();
+    for kind in [
+        OwnedResourceKind::Network,
+        OwnedResourceKind::Endpoint,
+        OwnedResourceKind::NetworkAttachment,
+    ] {
+        assert!(kinds.contains(&kind), "fixture must emit {kind:?}");
+    }
+    validate_supported_topology(&fixture.input(), environment).unwrap();
+
+    // A switch this daemon owns for the selected Environment must be joined and
+    // released by the Stop, leaving no task or port behind.
+    let environment_id = environment.environment_id.clone();
+    let owner = vz_runtime_contract::ResourceOwner {
+        project_id: fixture.project.definition.project_id.clone(),
+        environment_id: environment_id.clone(),
+        machine_id: None,
+    };
+    let lease = fixture
+        .daemon
+        .acquire_environment_controller(&owner.project_id, &environment_id)
+        .await
+        .unwrap();
+    let members = environment
+        .machines
+        .iter()
+        .enumerate()
+        .map(|(index, machine)| {
+            (
+                crate::environment_switch::PortId(index as u32 + 1),
+                crate::environment_switch::MacAddress::derive(
+                    environment_id.as_str(),
+                    machine.machine_id.as_str(),
+                    "private",
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (switch, guests) =
+        crate::environment_switch::runtime::NetworkSwitch::start(members).unwrap();
+    drop(guests);
+    fixture
+        .daemon
+        .environment_switches()
+        .install(&lease, &owner, "private", switch)
+        .await
+        .unwrap();
+    drop(lease);
+    assert_eq!(
+        fixture
+            .daemon
+            .environment_switches()
+            .networks(&environment_id)
+            .await,
+        vec!["private".to_string()]
+    );
+
+    let events = collect(
+        fixture
+            .daemon
+            .stop_environment(fixture.input())
+            .await
+            .unwrap(),
+    )
+    .await;
+    let last = events.last().unwrap();
+    assert!(last.terminal && last.error.is_none());
+    assert_eq!(last.operation.status, EnvironmentLifecycleStatus::Succeeded);
+    assert!(
+        fixture
+            .daemon
+            .environment_switches()
+            .networks(&environment_id)
+            .await
+            .is_empty(),
+        "Stop must reclaim every switch it owned"
+    );
+    // Stop reclaims the runtime switch, never the declared identity, so the
+    // fabric records survive for the next Up to rebind.
+    let stopped = fixture
+        .snapshot()
+        .environments
+        .into_iter()
+        .find(|candidate| candidate.name == "first")
+        .unwrap();
+    assert_eq!(stopped.ownership, environment.ownership);
+    assert_eq!(stopped.networks, environment.networks);
+    assert_eq!(stopped.endpoints, environment.endpoints);
+    assert_eq!(stopped.network_attachments, environment.network_attachments);
+}
+
+/// The accounting is a fixed set, not a widening: a kind outside it is still a
+/// hard refusal even though three kinds were added to that set.
+#[test]
+fn ownership_kinds_outside_the_accounted_set_remain_refused() {
+    let fixture = Fixture::networked(true);
+    let selected = fixture
+        .project
+        .environments
+        .iter()
+        .find(|candidate| candidate.name == "first")
+        .unwrap()
+        .clone();
+    for kind in [
+        OwnedResourceKind::HostExport,
+        OwnedResourceKind::HostImport,
+        OwnedResourceKind::PortRange,
+        OwnedResourceKind::Credential,
+        OwnedResourceKind::Fault,
+        OwnedResourceKind::Socket,
+        OwnedResourceKind::LegacySandbox,
+        OwnedResourceKind::Other("unimplemented-adapter".into()),
+    ] {
+        let mut environment = selected.clone();
+        environment
+            .ownership
+            .push(vz_runtime_contract::OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: kind.clone(),
+                resource_id: "unaccounted".into(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: None,
+            });
+        assert_eq!(
+            validate_supported_topology(&fixture.input(), &environment)
+                .unwrap_err()
+                .code,
+            MachineErrorCode::UnsupportedOperation,
+            "{kind:?} must remain unsupported by Stop"
+        );
+    }
 }
 
 #[tokio::test]

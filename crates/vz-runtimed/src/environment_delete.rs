@@ -430,6 +430,38 @@ impl RuntimeDaemon {
         sender: &watch::Sender<Progress>,
     ) -> Result<(), MachineError> {
         let mut sequence = 0;
+        self.authorize_delete_operation(input, &operation)?;
+        // A switch owns both ends of every port it minted, so it is joined
+        // before any Machine is retired; retiring a Machine first would leave it
+        // holding the guest end of a socket whose forwarder is already gone.
+        self.reclaim_environment_switches(lease, &operation.project_id, &operation.environment_id)
+            .await
+            .map_err(|error| conflict(input, error))?;
+        // That teardown is the whole physical reclamation of a declared network,
+        // which is the only Environment-scoped owned resource Delete accepts, so
+        // its cleanup steps are acknowledged here. Endpoint and attachment
+        // records are Machine-scoped and are acknowledged with that Machine's
+        // store below, after the store itself is positively removed.
+        for step in operation
+            .cleanup_steps
+            .clone()
+            .into_iter()
+            .filter(|step| step.ownership.resource_kind == OwnedResourceKind::Network)
+        {
+            operation = self
+                .with_state_store(|store| {
+                    store.acknowledge_environment_cleanup_step(
+                        &OwnershipCleanupStepAcknowledgement {
+                            operation_id: operation.operation_id.clone(),
+                            generation: operation.generation,
+                            ownership: step.ownership,
+                            result: LifecycleStepResult::Succeeded,
+                        },
+                        crate::current_unix_secs(),
+                    )
+                })
+                .map_err(|e| e.to_machine_error(&input.metadata))?;
+        }
         for machine in &mut machines {
             self.authorize_delete_operation(input, &operation)?;
             let step = operation
@@ -620,8 +652,6 @@ fn validate_supported(
         || environment.machines.len() > 128
         || environment.ownership.len() > 4096
         || environment.legacy_migration.is_some()
-        || !environment.networks.is_empty()
-        || !environment.endpoints.is_empty()
         || environment.machines.iter().any(|m| {
             !matches!(m.target.os, OperatingSystem::Linux | OperatingSystem::Macos)
                 || m.target.arch != Architecture::Aarch64
@@ -682,6 +712,68 @@ fn validate_supported(
             });
         }
     }
+    // Declared fabric is Environment-scoped topology, so its records are
+    // derived from the persisted instances rather than from the ownership list
+    // being checked; a record without an instance is exactly the unaccounted
+    // resource this check exists to refuse.
+    for network in &environment.networks {
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::Network,
+            resource_id: network.network_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: None,
+        });
+    }
+    let known_networks = environment
+        .networks
+        .iter()
+        .map(|network| &network.network_id)
+        .collect::<Vec<_>>();
+    let known_machines = environment
+        .machines
+        .iter()
+        .map(|machine| &machine.machine_id)
+        .collect::<Vec<_>>();
+    for endpoint in &environment.endpoints {
+        // An endpoint attributed to an absent Machine or network could never be
+        // reclaimed: its cleanup step is dispatched with that Machine's store.
+        if !known_machines.contains(&&endpoint.machine_id)
+            || !known_networks.contains(&&endpoint.network_id)
+        {
+            return Err(conflict(
+                input,
+                "Delete endpoint references absent topology",
+            ));
+        }
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::Endpoint,
+            resource_id: endpoint.endpoint_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(endpoint.machine_id.clone()),
+        });
+    }
+    for attachment in &environment.network_attachments {
+        if !known_machines.contains(&&attachment.machine_id)
+            || !known_networks.contains(&&attachment.network_id)
+        {
+            return Err(conflict(
+                input,
+                "Delete network attachment references absent topology",
+            ));
+        }
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::NetworkAttachment,
+            resource_id: attachment.attachment_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(attachment.machine_id.clone()),
+        });
+    }
+    // Exact set equality, unchanged in kind: `expected` never repeats a record,
+    // so equal lengths plus total membership still means every owned resource is
+    // one this Delete knows how to reclaim, and any other one is a hard refusal.
     if expected.len() != environment.ownership.len()
         || expected
             .iter()

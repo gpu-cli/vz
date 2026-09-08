@@ -10,9 +10,10 @@ use std::sync::Mutex;
 use crate::RuntimedConfig;
 use crate::machine_runtime_registry::MachineRuntimeAdmission;
 use vz_runtime_contract::{
-    CapabilitySet, EnvironmentSelector, EnvironmentSpec, EnvironmentState, MachineProfile,
-    MachineResources, MachineSpec, MachineState, ProjectDefinition, ProjectState, RuntimeOperation,
-    RuntimePolicyHook, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
+    CapabilitySet, EndpointProtocol, EndpointSpec, EnvironmentSelector, EnvironmentSpec,
+    EnvironmentState, MachineProfile, MachineResources, MachineSpec, MachineState, NetworkKind,
+    NetworkSpec, ProjectDefinition, ProjectState, RuntimeOperation, RuntimePolicyHook,
+    TOPOLOGY_SCHEMA_VERSION, TargetSpec,
 };
 
 #[derive(Default)]
@@ -67,10 +68,21 @@ struct Fixture {
 
 impl Fixture {
     fn new(policy: Arc<dyn RuntimePolicyHook>) -> Self {
-        Self::with_extra_ownership(policy, false)
+        Self::build(policy, false, false)
     }
 
     fn with_extra_ownership(policy: Arc<dyn RuntimePolicyHook>, extra: bool) -> Self {
+        Self::build(policy, extra, false)
+    }
+
+    /// A fixture whose definition declares one network, one endpoint and one
+    /// attachment per Machine, so `instantiate_environment` emits the three
+    /// fabric ownership kinds Delete must expect and reclaim.
+    fn networked(policy: Arc<dyn RuntimePolicyHook>) -> Self {
+        Self::build(policy, false, true)
+    }
+
+    fn build(policy: Arc<dyn RuntimePolicyHook>, extra: bool, networked: bool) -> Self {
         let root = tempfile::Builder::new()
             .prefix("vz-del-")
             .tempdir_in("/private/tmp")
@@ -94,11 +106,20 @@ impl Fixture {
                 default_machine: None,
                 machines: ["app", "worker"]
                     .map(|name| MachineSpec {
-                        networks: Vec::new(),
+                        networks: if networked {
+                            vec!["private".to_string()]
+                        } else {
+                            Vec::new()
+                        },
                         egress: Default::default(),
                         schema_version: TOPOLOGY_SCHEMA_VERSION,
                         name: name.into(),
-                        profile: MachineProfile::Hardened,
+                        // Hardened Machines may not declare network attachments.
+                        profile: if networked {
+                            MachineProfile::Developer
+                        } else {
+                            MachineProfile::Hardened
+                        },
                         target: TargetSpec {
                             os: OperatingSystem::Linux,
                             arch: Architecture::Aarch64,
@@ -112,8 +133,29 @@ impl Fixture {
                         workspace: None,
                     })
                     .to_vec(),
-                networks: vec![],
-                endpoints: vec![],
+                networks: if networked {
+                    vec![NetworkSpec {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        name: "private".into(),
+                        kind: NetworkKind::Private,
+                        cidr: None,
+                    }]
+                } else {
+                    vec![]
+                },
+                endpoints: if networked {
+                    vec![EndpointSpec {
+                        schema_version: TOPOLOGY_SCHEMA_VERSION,
+                        name: "api".into(),
+                        machine: "app".into(),
+                        network: "private".into(),
+                        protocol: EndpointProtocol::Tcp,
+                        port: 8080,
+                        hostname: None,
+                    }]
+                } else {
+                    vec![]
+                },
             },
         };
         let mut project = ProjectState {
@@ -627,6 +669,225 @@ async fn stopped_controller_deletes_only_owned_stores_and_preserves_sibling() {
                 && scope.environment_id == fixture.first().environment_id
                 && scope.machine_ids == expected
                 && scope.definition_digest == fixture.first().definition_digest)
+    );
+}
+
+/// Every declared-fabric ownership kind belongs to Delete's expected set, so a
+/// networked Environment is admitted, its switch is reclaimed, and every cleanup
+/// step -- including the Environment-scoped network -- is acknowledged.
+#[tokio::test(flavor = "multi_thread")]
+async fn declared_fabric_is_expected_and_delete_reclaims_switches_and_records() {
+    if isolated("declared_fabric_is_expected_and_delete_reclaims_switches_and_records") {
+        return;
+    }
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    let selected = fixture.first().clone();
+    let sibling = fixture
+        .initial
+        .environments
+        .iter()
+        .find(|environment| environment.name == "sibling")
+        .unwrap()
+        .clone();
+    let kinds = selected
+        .ownership
+        .iter()
+        .map(|record| record.resource_kind.clone())
+        .collect::<Vec<_>>();
+    for kind in [
+        OwnedResourceKind::Network,
+        OwnedResourceKind::Endpoint,
+        OwnedResourceKind::NetworkAttachment,
+    ] {
+        assert!(kinds.contains(&kind), "fixture must emit {kind:?}");
+    }
+    validate_supported(&fixture.input(), &selected).unwrap();
+
+    let owner = ResourceOwner {
+        project_id: selected.project_id.clone(),
+        environment_id: selected.environment_id.clone(),
+        machine_id: None,
+    };
+    let lease = fixture
+        .daemon
+        .acquire_environment_controller(&owner.project_id, &owner.environment_id)
+        .await
+        .unwrap();
+    let members = selected
+        .machines
+        .iter()
+        .enumerate()
+        .map(|(index, machine)| {
+            (
+                crate::environment_switch::PortId(index as u32 + 1),
+                crate::environment_switch::MacAddress::derive(
+                    selected.environment_id.as_str(),
+                    machine.machine_id.as_str(),
+                    "private",
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+    let (switch, guests) =
+        crate::environment_switch::runtime::NetworkSwitch::start(members).unwrap();
+    drop(guests);
+    fixture
+        .daemon
+        .environment_switches()
+        .install(&lease, &owner, "private", switch)
+        .await
+        .unwrap();
+    drop(lease);
+
+    let outcome = terminal(
+        fixture
+            .daemon
+            .delete_environment(fixture.input())
+            .await
+            .unwrap(),
+    )
+    .await
+    .unwrap();
+    assert!(outcome.terminal && outcome.error.is_none());
+    assert_eq!(
+        outcome.operation.status,
+        EnvironmentLifecycleStatus::Succeeded
+    );
+    // The Environment-scoped network step has no Machine to be acknowledged
+    // with, so a Delete that never acknowledged it would hang here instead.
+    assert!(
+        outcome
+            .operation
+            .cleanup_steps
+            .iter()
+            .any(
+                |step| step.ownership.resource_kind == OwnedResourceKind::Network
+                    && step.ownership.machine_id.is_none()
+            )
+    );
+    assert!(
+        outcome
+            .operation
+            .cleanup_steps
+            .iter()
+            .all(|step| step.status == LifecycleStepStatus::Succeeded)
+    );
+    outcome
+        .tombstone
+        .as_ref()
+        .unwrap()
+        .validate_for_operation(&outcome.operation)
+        .unwrap();
+    assert!(
+        fixture
+            .daemon
+            .environment_switches()
+            .networks(&selected.environment_id)
+            .await
+            .is_empty(),
+        "Delete must reclaim every switch it owned"
+    );
+    assert_eq!(fixture.snapshot().environments, vec![sibling]);
+}
+
+/// Adding three kinds to the expected set is not a widening of it: every kind
+/// outside the set is still an unaccounted resource and a hard refusal.
+#[test]
+fn ownership_outside_the_expected_set_is_still_refused() {
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    for kind in [
+        OwnedResourceKind::Disk,
+        OwnedResourceKind::Socket,
+        OwnedResourceKind::HostExport,
+        OwnedResourceKind::HostImport,
+        OwnedResourceKind::PortRange,
+        OwnedResourceKind::Credential,
+        OwnedResourceKind::Fault,
+        OwnedResourceKind::LegacySandbox,
+        OwnedResourceKind::Other("unimplemented-adapter".into()),
+    ] {
+        let mut environment = fixture.first().clone();
+        environment.ownership.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: kind.clone(),
+            resource_id: "unaccounted".into(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(environment.machines[0].machine_id.clone()),
+        });
+        assert_eq!(
+            validate_supported(&fixture.input(), &environment)
+                .unwrap_err()
+                .code,
+            MachineErrorCode::UnsupportedOperation,
+            "{kind:?} must remain unaccounted for by Delete"
+        );
+    }
+}
+
+/// The expected set is derived from the persisted instances, so a fabric
+/// ownership record without its instance, and an instance without its record,
+/// are both refused rather than silently reclaimed.
+#[test]
+fn fabric_ownership_and_instances_must_correspond_exactly() {
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    validate_supported(&fixture.input(), fixture.first()).unwrap();
+
+    // One Network ownership record with no NetworkInstance to justify it: the
+    // set no longer balances, so nothing is admitted.
+    let mut orphan_record = fixture.first().clone();
+    orphan_record.networks.clear();
+    orphan_record.endpoints.clear();
+    orphan_record.network_attachments.clear();
+    orphan_record.ownership.retain(|record| {
+        !matches!(
+            record.resource_kind,
+            OwnedResourceKind::Endpoint | OwnedResourceKind::NetworkAttachment
+        )
+    });
+    assert_eq!(
+        validate_supported(&fixture.input(), &orphan_record)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+
+    // An endpoint left pointing at a network that is gone is refused before the
+    // set is even compared, because its cleanup could never be attributed.
+    let mut dangling_network = fixture.first().clone();
+    dangling_network.networks.clear();
+    assert_eq!(
+        validate_supported(&fixture.input(), &dangling_network)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::StateConflict
+    );
+
+    let mut orphan_instance = fixture.first().clone();
+    orphan_instance
+        .ownership
+        .retain(|record| record.resource_kind != OwnedResourceKind::NetworkAttachment);
+    assert_eq!(
+        validate_supported(&fixture.input(), &orphan_instance)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+
+    // An endpoint attributed to a Machine outside this Environment could never
+    // have its cleanup step dispatched, so it is refused before any effect.
+    let mut foreign_endpoint = fixture.first().clone();
+    let foreign = MachineId::generate();
+    foreign_endpoint.endpoints[0].machine_id = foreign.clone();
+    for record in &mut foreign_endpoint.ownership {
+        if record.resource_kind == OwnedResourceKind::Endpoint {
+            record.machine_id = Some(foreign.clone());
+        }
+    }
+    assert_eq!(
+        validate_supported(&fixture.input(), &foreign_endpoint)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::StateConflict
     );
 }
 
