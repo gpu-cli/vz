@@ -11,7 +11,9 @@ never drift between a module and the lane result. Statuses per (suite, id):
             another suite's primary (proven/partial) claim; never emitted
 
 IDs no suite exercises are listed in `UNCOVERED` with the gap-suite that the
-2026-09-07 coverage audit assigned (mounts, netpolicy, concurrency, isolation).
+2026-09-07 coverage audit assigned. Every one of those four suites now exists, so
+both `UNCOVERED` and `GAP_SUITES` are empty; `check` must keep rejecting a new
+uncovered ID rather than treating emptiness as a permanent property.
 Import-time validation (`check`) rejects: an ID outside the required inventory,
 an ID `proven` by two suites, more than one primary claim per ID, a secondary
 without a primary, a `partial` without unproven fields, an unproven field that
@@ -36,8 +38,8 @@ MANIFEST_LIMIT = 4 * 1024 * 1024
 ID_PATTERN = re.compile(r"^docker\.[a-z_]+\.[a-z_]+$")
 PHASES = {"clean-provision": "clean-provision", "persisted-recovery": "persisted-recovery/pre-sleep",
           "final-cleanup": "final-cleanup"}
-# `mounts` and `netpolicy` graduated to real suites on 2026-09-08.
-GAP_SUITES = ("concurrency", "isolation")
+# mounts, netpolicy, concurrency and isolation all graduated on 2026-09-08.
+GAP_SUITES = ()
 STATUSES = ("proven", "partial", "secondary")
 
 Claim = namedtuple("Claim", "id suite sources status unproven")
@@ -90,6 +92,9 @@ SUITES = {suite.name: suite for suite in (
           "docker.storage.bind_mounts", ("mounts-cross-machine.json",)),
     Suite("netpolicy", "linux_docker_netpolicy_machine.py",
           ("netpolicy-machine-{index}/machine-netpolicy-validation.json",), (), "docker.network.published_ports"),
+    Suite("concurrency", "linux_docker_concurrency_machine.py",
+          ("concurrency-machine-{index}/machine-concurrency-validation.json",), (),
+          "docker.operation.concurrent_clients"),
     Suite("isolation", "linux_docker_isolation_machine.py",
           ("isolation-machine-{index}/machine-isolation-validation.json",), (),
           "docker.operation.same_environment_isolation", ("isolation-cross-machine.json",)),
@@ -143,8 +148,12 @@ TABLE = (
     # netpolicy: loopback-only publication and the cleanup of what it created.
     _c("docker.network.published_ports", "netpolicy", ("run_machine", "published_ports")),
     _c("docker.network.cleanup", "netpolicy", ("run_machine", "network_cleanup")),
+    # concurrency: twenty ready containers, then eight execs, four builds and
+    # four pulls from one rendezvous each, all owner-correlated.
+    _c("docker.operation.concurrent_clients", "concurrency", ("run_machine", "correlate")),
     # isolation: two Machines of one Environment share nothing.
     _c("docker.operation.same_environment_isolation", "isolation", ("run_machine", "verify_machines")),
+    _c("docker.operation.sibling_environment_isolation", "isolation", ("sibling_environment", "verify_siblings")),
     # recovery: public Stop/Up of the owning Environment (not an in-place daemon restart).
     _c("docker.storage.persistence", "recovery", "run_machine"),
     _c("docker.operation.daemon_restart_recovery", "recovery", "run_machine"),
@@ -182,10 +191,7 @@ TABLE = (
     _c("docker.operation.oom", "limits", "run_machine"),
 )
 
-UNCOVERED = (
-    ("docker.operation.concurrent_clients", "concurrency"),
-    ("docker.operation.sibling_environment_isolation", "isolation"),
-)
+UNCOVERED = ()
 
 
 def _read(path, limit):
@@ -257,8 +263,11 @@ def check(table=TABLE, uncovered=UNCOVERED, rows=None):
     gaps = {}
     for identifier, gap in uncovered:
         require(identifier in required, "unknown uncovered id: " + identifier)
-        require(gap in GAP_SUITES, "unknown gap suite for " + identifier)
+        # An id that is both claimed and uncovered is a contradiction whatever
+        # suite it names, so it is rejected before the gap-suite membership
+        # check -- otherwise an empty GAP_SUITES would mask it.
         require(identifier not in primaries and identifier not in gaps, identifier + " is both claimed and uncovered")
+        require(gap in GAP_SUITES, "unknown gap suite for " + identifier)
         gaps[identifier] = gap
     missing = sorted(required - set(primaries) - set(gaps))
     require(not missing, "required ids neither claimed nor uncovered: " + ", ".join(missing))

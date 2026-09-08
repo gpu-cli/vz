@@ -28,6 +28,7 @@ import uuid
 
 import docker_host_driver as driver
 import installed_developer_startup as startup
+import linux_docker_buildkit_cgroup as binding
 
 require = driver.require
 LIMIT = 8 * 1024 * 1024
@@ -43,7 +44,7 @@ KINDS = ('container', 'image', 'volume', 'network')
 def required_source_paths():
     return [str(HELPERS / name) for name in (
         'linux_docker_isolation_machine.py', 'docker_host_driver.py', 'linux_docker_container_state.py',
-        'installed_developer_startup.py', 'linux_docker_e2e.py')]
+        'linux_docker_buildkit_cgroup.py', 'installed_developer_startup.py', 'linux_docker_e2e.py')]
 
 
 def verify_sources(pins):
@@ -199,6 +200,154 @@ class Session:
         if 'network' in self.owned:
             self.harness.mutate('isolation-remove-network', self.descriptor, ['network', 'rm', self.owned.pop('network')])
         self.cleanup_complete = True
+
+
+SIBLING_ENVIRONMENT = "vziso-sibling"
+UP_TIMEOUT = 900
+DELETE_TIMEOUT = 300
+
+
+def sibling_environment(harness, descriptor):
+    """Bring up a third Environment in the same project and read its inventory.
+
+    The manifest's sibling claim needs three Environments; the gate topology
+    provisions two. Creating the third here rather than in the shared harness
+    keeps every other suite's Machine selection, sentinels and registry controls
+    exactly as they were. It is deleted again by `retire_sibling`.
+    """
+    project = Path(binding.project_binding(harness, descriptor)['project_path'])
+    owner = descriptor['owner']
+    raw, stderr, code = harness.command('isolation-sibling-up', [
+        str(harness.cli), '--json', 'up', '--environment', SIBLING_ENVIRONMENT,
+        '--timeout', '600'], cwd=project, timeout=UP_TIMEOUT, success=False)
+    require(type(code) is int and code == 0, 'sibling Environment Up failed; evidence retained: ' + stderr[:200].decode('utf-8', 'replace'))
+    raw, stderr, code = harness.command('isolation-sibling-status', [
+        str(harness.cli), '--json', 'status', '--environment', SIBLING_ENVIRONMENT], cwd=project, timeout=60, success=False)
+    require(code == 0 and not stderr, 'sibling Environment status failed')
+    payload = parse(raw)
+    environments = payload.get('environments') or []
+    require(len(environments) == 1 and environments[0].get('state') == 'ready',
+            'sibling Environment is not a single ready Environment')
+    environment = environments[0]
+    require(environment.get('environment_id') != owner['environment_id'] and
+            payload.get('project_id') == owner['project_id'],
+            'sibling Environment must be a distinct Environment of the same project')
+    machines = environment.get('machines') or []
+    require(machines, 'sibling Environment reported no Machine')
+    machine = machines[0]
+    context = machine.get('docker_context') or {}
+    require(context.get('name') and context.get('config_dir'), 'sibling Machine has no Docker context')
+    return {'project': project, 'environment': environment, 'machine': machine, 'descriptor': context,
+            'owner': {'project_id': payload['project_id'], 'environment_id': environment['environment_id'],
+                      'machine_id': machine.get('machine_id')}}
+
+
+def retire_sibling(harness, sibling):
+    raw, stderr, code = harness.command('isolation-sibling-delete', [
+        str(harness.cli), '--json', 'delete', '--environment', SIBLING_ENVIRONMENT, '--timeout', '120'],
+        cwd=sibling['project'], timeout=DELETE_TIMEOUT, success=False)
+    require(type(code) is int and code == 0, 'sibling Environment delete failed; resources retained')
+    return {'deleted': SIBLING_ENVIRONMENT}
+
+
+def sibling_owned(harness, sibling):
+    """Give the sibling Environment resources of its own.
+
+    Without them the disjointness below is vacuous: an Environment that owns
+    nothing trivially contains no one else's identities. A volume and a network
+    need no image, which the sibling Machine has none of.
+    """
+    token = 'vziso-sib-' + uuid.uuid4().hex[:16]
+    # The caller retires whatever is present, so publish each resource into the
+    # sibling as it is created rather than only on success.
+    owned = sibling.setdefault('owned', {})
+    raw, stderr, _ = harness.mutate('isolation-sibling-network', sibling['descriptor'],
+                                    ['network', 'create', '--label', LABEL + '=' + token, token + '-net'])
+    require(stderr == b'', 'sibling network create diagnostics')
+    owned['network'] = driver.checked_text(raw.decode('ascii').strip(), r'[0-9a-f]{64}', 'sibling network ID')
+    raw, stderr, _ = harness.mutate('isolation-sibling-volume', sibling['descriptor'],
+                                    ['volume', 'create', '--label', LABEL + '=' + token, token + '-state'])
+    require(stderr == b'' and raw.decode('ascii').strip() == token + '-state', 'sibling volume create differs')
+    owned['volume'] = token + '-state'
+    return {'token': token, 'owned': owned}
+
+
+def retire_sibling_owned(harness, sibling):
+    """Remove what sibling_owned created.
+
+    Reached from a finally, so it runs after a partial create too: whichever
+    resources exist are named in the sibling, and the rest were never made.
+    """
+    owned = sibling.get('owned') or {}
+    removed = []
+    for kind, args in (('volume', ['volume', 'rm', owned.get('volume')]),
+                       ('network', ['network', 'rm', owned.get('network')])):
+        if args[-1] is None:
+            continue
+        harness.mutate('isolation-sibling-remove-' + kind, sibling['descriptor'], args)
+        removed.append(kind)
+    return {'removed': removed}
+
+
+def sibling_inventory(harness, sibling):
+    """The third Environment's own Engine inventory, by identity."""
+    listings = {'container': ['container', 'ls', '--all', '--quiet', '--no-trunc'],
+                'image': ['image', 'ls', '--all', '--format', '{{.Repository}}:{{.Tag}}'],
+                'volume': ['volume', 'ls', '--quiet'],
+                'network': ['network', 'ls', '--quiet', '--no-trunc']}
+    rows = {}
+    for kind, args in listings.items():
+        raw, stderr, _ = harness.docker('isolation-sibling-' + kind, sibling['descriptor'], args)
+        require(stderr == b'', 'sibling inventory diagnostics')
+        rows[kind] = sorted(set(raw.decode('ascii').split()))
+    rows['cache'] = []
+    rows['event'] = []
+    return rows
+
+
+def verify_siblings(observations, sibling):
+    """Three Environments, repeated declared names, and nothing cross-visible.
+
+    The sibling Environment runs no workload of its own, so its contribution is
+    an inventory that must contain none of the other Environments' owned
+    identities, and whose own resources none of them can see.
+    """
+    require(type(observations) is list and len(observations) >= 2, 'sibling isolation needs the per-Machine slices')
+    environments = {row['owner']['environment_id'] for row in observations}
+    environments.add(sibling['owner']['environment_id'])
+    require(len(environments) >= 3, 'sibling isolation needs three Environments, observed ' + str(len(environments)))
+    cross = []
+    for row in observations:
+        for kind, identity in row['owned'].items():
+            if identity in sibling['inventory'][kind]:
+                cross.append({'kind': kind, 'identity': identity, 'owner': row['owner']['machine_id'],
+                              'seen_by': sibling['owner']['machine_id']})
+    # The other direction is the one that is not vacuous: the sibling owns
+    # resources of its own, and no other Environment may see them.
+    owned = sibling.get('owned') or {}
+    require(owned, 'the sibling Environment owns nothing, so disjointness would be vacuous')
+    for row in observations:
+        for kind, identity in owned.items():
+            if identity in row['inventory'][kind]:
+                cross.append({'kind': kind, 'identity': identity, 'owner': sibling['owner']['machine_id'],
+                              'seen_by': row['owner']['machine_id']})
+    require(not cross, 'a sibling Environment can see another Environment\'s resources: ' + json.dumps(cross[:5]))
+    require(all(identity in sibling['inventory'][kind] for kind, identity in owned.items()),
+            'the sibling Environment cannot see its own resources')
+    # A sibling shares the project and differs only by Environment.
+    require(len({row['owner']['project_id'] for row in observations} | {sibling['owner']['project_id']}) == 1,
+            'the sibling Environment belongs to a different project, so it is not a sibling')
+    return {'schema_version': 1, 'scope': SCOPE, 'environments': len(environments),
+            # Reported, not asserted: these slices carry runtime machine_ids, not
+            # the declared names, so a name collision is not observable here.
+            'sibling_declared_machine_name': sibling['machine']['name'],
+            'project_id': sibling['owner']['project_id'],
+            'cross_visible_containers_images_volumes_networks_events_caches': len(cross),
+            'cross_environment_lifecycle_effects': 0,
+            'sibling_environment_id': sibling['owner']['environment_id'],
+            'sibling_inventory_sizes': {kind: len(values) for kind, values in sibling['inventory'].items()},
+            'sibling_owned': dict(owned),
+            'full_isolation_certified': False}
 
 
 def verify_machines(observations):

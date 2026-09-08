@@ -1,0 +1,36 @@
+{
+  "concurrent_clients": {
+    "all_results_exact_owner_correlated": true,
+    "parallel_builds": 4,
+    "parallel_execs": 8,
+    "parallel_pulls": 4,
+    "ready_containers": 20,
+    "ready_window_seconds": 60
+  },
+  "image": "developer-probe-rootfs.tar imported by the harness sentinel; the pull recipe uses its own owned private registry",
+  "probe": {
+    "bytes": 841,
+    "cases": ["ready", "report"],
+    "exec_template": "VZEXEC {marker} {slot} {arrived} {waited}",
+    "health_command_template": "/bin/busybox grep -qx 'VZREADY {marker}' /run/vz-concurrency-ready",
+    "interpreter": ["/bin/busybox", "sh", "-c"],
+    "path": "probe.sh",
+    "ready_path": "/run/vz-concurrency-ready",
+    "ready_template": "VZREADY {marker}",
+    "rendezvous_path": "/vz-rendezvous",
+    "sha256": "8398eb05435f7df4e8cd5299a8fa5514d94c17502da3fdefd593f75c073007c9"
+  },
+  "pull_registry": {
+    "accesslog_disabled": false,
+    "container_port": 5000,
+    "insecure_by_default_cidr": "127.0.0.0/8",
+    "layer_bytes": 2097152,
+    "listen": "0.0.0.0:5000",
+    "published_host_ip": "127.0.0.1",
+    "repositories": 4,
+    "scheme": "http",
+    "storage_rootdirectory": "/var/lib/registry"
+  },
+  "schema_version": 1,
+  "scope": "DEV_DOCKER_CONCURRENCY_FIXTURE_NOT_DOCKER_CERTIFICATION"
+}

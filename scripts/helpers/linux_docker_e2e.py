@@ -42,6 +42,7 @@ LIMITS_SCOPE = "DEV_INSTALLED_LINUX_RESOURCE_LIMITS_OOM_NOT_RELEASE_CERTIFICATIO
 MOUNTS_SCOPE = "DEV_INSTALLED_LINUX_STORAGE_MOUNTS_NOT_RELEASE_CERTIFICATION"
 NETPOLICY_SCOPE = "DEV_INSTALLED_LINUX_PUBLISHED_PORTS_NETWORK_CLEANUP_NOT_RELEASE_CERTIFICATION"
 ISOLATION_SCOPE = "DEV_INSTALLED_LINUX_SAME_ENVIRONMENT_MACHINE_ISOLATION_NOT_RELEASE_CERTIFICATION"
+CONCURRENCY_SCOPE = "DEV_INSTALLED_LINUX_CONCURRENT_CLIENTS_NOT_RELEASE_CERTIFICATION"
 RECOVERY_SCOPE = "DEV_INSTALLED_LINUX_PERSISTENCE_STOP_UP_RECOVERY_NOT_RELEASE_CERTIFICATION"
 ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATION"
 # One provisioning, every suite once, in an order that leaves the topology
@@ -57,12 +58,13 @@ ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATIO
 # its own suite evidence, not by this journal. `--suite lifecycle` keeps the
 # whole-run window it always had.
 SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
-               "images", "mounts", "netpolicy", "isolation", "limits", "registry", "lifecycle", "recovery")
+               "images", "mounts", "netpolicy", "isolation", "limits", "concurrency", "registry",
+               "lifecycle", "recovery")
 # The gate's selection: both primary Machines and the neighbour's first, with
 # the neighbour's second left as an untouched sentinel.
 GATE_MACHINES = (0, 1, 2)
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
-          "mounts", "netpolicy", "isolation", "recovery")
+          "mounts", "netpolicy", "isolation", "concurrency", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -106,9 +108,12 @@ def arguments(argv):
     # `all` composes every suite in one provisioning, so it carries every
     # suite's inputs at once; each option otherwise belongs to exactly one suite.
     composed = args.suite == "all"
+    # The concurrency suite proves four parallel pulls, which needs a real
+    # registry; it serves the same offline-admitted Distribution image the
+    # registry suite admits, so it carries the same two inputs.
     for name in ("registry_archive", "registry_layout"):
-        require((getattr(args, name) is not None) == (args.suite == "registry" or composed),
-                "--" + name.replace("_", "-") + " is required for the registry suite and for --suite all")
+        require((getattr(args, name) is not None) == (args.suite in ("registry", "concurrency") or composed),
+                "--" + name.replace("_", "-") + " is required for the registry suite, for the concurrency suite and for --suite all")
     require(args.container_fixture is None or args.suite == "lifecycle" or composed,
             "container-fixture requires the lifecycle suite")
     require((args.tmux is not None) == (args.suite == "lifecycle" or composed),
@@ -124,7 +129,8 @@ def arguments(argv):
     for name in startup.OPTIONS:
         require(getattr(args, name.replace("-", "_")) is not None, "required option: --" + name)
     driver.checked_text(args.run_id, r"[a-z0-9][a-z0-9-]{7,39}", "run ID")
-    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel", "ssh", "all"}),
+    require((args.buildkit_archive is not None) == (args.suite in {"build", "artifacts", "parallel", "ssh",
+                                                                   "concurrency", "all"}),
             "--buildkit-archive is required only for Buildx suites")
     return args
 
@@ -138,9 +144,9 @@ def preflight(args, require_host=True):
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
                 ('image' if args.suite == 'images' else args.suite) + ' suite rejects builder, foreign fixture and terminal options')
     for name in ('registry_archive', 'registry_layout'):
-        require((getattr(args, name, None) is not None) == (args.suite == 'registry' or composed),
-                '--' + name.replace('_', '-') + ' is required for the registry suite and for --suite all')
-    if composed or args.suite == 'registry':
+        require((getattr(args, name, None) is not None) == (args.suite in ('registry', 'concurrency') or composed),
+                '--' + name.replace('_', '-') + ' is required for the registry suite, for the concurrency suite and for --suite all')
+    if composed or args.suite in ('registry', 'concurrency'):
         # Admit every registry input read-only before startup preflight touches
         # anything: pinned layout, exact archive bytes, unexecuted binary
         # metadata and the isolated Python dependencies behind the fixture.
@@ -161,6 +167,7 @@ def preflight(args, require_host=True):
               "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
               "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "mounts": MOUNTS_SCOPE,
               "netpolicy": NETPOLICY_SCOPE, "isolation": ISOLATION_SCOPE,
+              "concurrency": CONCURRENCY_SCOPE,
               "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
     machines = getattr(args, "machines", len(GATE_MACHINES))
     require(machines in (1, 2, 3), "unsupported Machine selection")
@@ -179,7 +186,7 @@ def preflight(args, require_host=True):
                  REPO / "scripts/helpers/linux_docker_image_input.py",
                  REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
         info["inputs"][str(path)] = startup.digest(path)
-    if composed or args.suite in {"build", "artifacts", "parallel", "ssh"}:
+    if composed or args.suite in {"build", "artifacts", "parallel", "ssh", "concurrency"}:
         import linux_docker_buildkit_builder as builder
         archive = startup.canonical(args.buildkit_archive)
         info["buildkit"] = builder.preflight_archive(archive)
@@ -191,12 +198,12 @@ def preflight(args, require_host=True):
                      REPO / "scripts/helpers/linux_docker_build_evidence.py",
                      REPO / "config/buildkit-artifact-v0.19.0.json"):
             info["inputs"][str(path)] = startup.digest(path)
-    if composed or args.suite in {"artifacts", "parallel", "ssh"}:
+    if composed or args.suite in {"artifacts", "parallel", "ssh", "concurrency"}:
         for name in ("linux_docker_artifact_stream.py", "linux_docker_artifact_layout.py",
                      "linux_docker_build_artifacts.py", "linux_docker_artifact_evidence.py"):
             path = REPO / "scripts/helpers" / name
             info["inputs"][str(path)] = startup.digest(path)
-    if composed or args.suite == "parallel":
+    if composed or args.suite in {"parallel", "concurrency"}:
         from linux_docker_build_parallel import fixture_contract
         selected = startup.canonical(getattr(args, "parallel_fixture", None) or
                                      str(REPO / "tests/fixtures/vz-0.4/docker-parallel"))
@@ -237,7 +244,7 @@ def preflight(args, require_host=True):
         from linux_docker_image_machine import required_source_paths
         for path in required_source_paths():
             info['inputs'][str(path)] = startup.digest(Path(path))
-    if composed or args.suite == 'registry':
+    if composed or args.suite in ('registry', 'concurrency'):
         info.update(registry=registry, registry_archive=str(registry_archive), registry_layout=str(registry_layout))
         info['inputs'][str(registry_archive)] = registry['archive_sha256']
         for path in registry_machine.required_source_paths():
@@ -262,6 +269,16 @@ def preflight(args, require_host=True):
         from linux_docker_netpolicy_machine import required_source_paths as netpolicy_sources
         netpolicy_fixture_contract()
         for path in netpolicy_sources():
+            info['inputs'][str(path)] = startup.digest(Path(path))
+    if composed or args.suite == 'concurrency':
+        from linux_docker_concurrency_machine import fixture_contract as concurrency_fixture_contract
+        from linux_docker_concurrency_machine import manifest_expectations as concurrency_expectations
+        from linux_docker_concurrency_machine import required_source_paths as concurrency_sources
+        # Fixture bytes and the manifest `expected` block are both checked
+        # before any client runs, so a drifted pin fails without provisioning.
+        concurrency_fixture_contract()
+        concurrency_expectations()
+        for path in concurrency_sources():
             info['inputs'][str(path)] = startup.digest(Path(path))
     if composed or args.suite == 'mounts':
         from linux_docker_mounts_machine import fixture_contract as mounts_fixture_contract
@@ -569,6 +586,7 @@ class ComposeHarness(startup.Harness):
         self.runtime_audit_validation = None
         self.runtime_audit_retirement = None
         self.registry_sessions = []
+        self.concurrency_sessions = []
         self.prepared_images = {}
         self.active_suite = None
         self.recovery_sessions, self.recovery_cycles, self.recovery_monitors = [], {}, []
@@ -805,6 +823,11 @@ class ComposeHarness(startup.Harness):
         for session in getattr(self, 'limits_sessions', []):
             require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
                     'limits Session lacks completed cleanup; containers retained; cleanup withheld')
+        # A concurrency Session holds twenty containers, four pulled images and
+        # a running private registry until its own exact removal completes.
+        for session in getattr(self, 'concurrency_sessions', []):
+            require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
+                    'concurrency Session lacks completed cleanup; containers/registry retained; cleanup withheld')
         for session in getattr(self, 'recovery_sessions', []):
             require(getattr(session, 'cleanup_complete', None) is True and getattr(session, 'failed', True) is False,
                     'recovery Session lacks completed cleanup; volumes/containers retained; cleanup withheld')
@@ -968,7 +991,7 @@ class ComposeHarness(startup.Harness):
             scope, proof = bindings[machine["machine_id"]]
             images = self.machine_images(suite, descriptor)
             if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
-                         "mounts", "netpolicy", "isolation", "recovery"}:
+                         "mounts", "netpolicy", "isolation", "concurrency", "recovery"}:
                 if suite == "artifacts":
                     from linux_docker_build_artifacts import run_machine
                 elif suite == "parallel":
@@ -989,6 +1012,8 @@ class ComposeHarness(startup.Harness):
                     from linux_docker_netpolicy_machine import run_machine
                 elif suite == 'isolation':
                     from linux_docker_isolation_machine import run_machine
+                elif suite == 'concurrency':
+                    from linux_docker_concurrency_machine import run_machine
                 elif suite == 'recovery':
                     from linux_docker_recovery_machine import run_machine
                 else:
@@ -1051,10 +1076,24 @@ class ComposeHarness(startup.Harness):
             startup.document(self.evidence / "mounts-cross-machine.json",
                              verify_volume_isolation(observations))
         elif suite == "isolation":
-            from linux_docker_isolation_machine import retire, verify_machines as verify_machine_isolation
+            from linux_docker_isolation_machine import (retire, retire_sibling, retire_sibling_owned,
+                                                        sibling_environment, sibling_inventory,
+                                                        sibling_owned, verify_siblings,
+                                                        verify_machines as verify_machine_isolation)
             proof = verify_machine_isolation(observations)
-            # Only a decided claim retires the owned sets: a failure leaves every
-            # resource in place for inspection.
+            # The sibling claim needs a third Environment the gate topology does
+            # not provision. It is created here, read, and deleted again, so no
+            # other suite's Machine selection or sentinels change.
+            sibling = sibling_environment(self, descriptors[0])
+            try:
+                # Give the sibling resources of its own first: disjointness from an
+                # Environment that owns nothing is true for the wrong reason.
+                sibling = sibling | sibling_owned(self, sibling)
+                sibling["inventory"] = sibling_inventory(self, sibling)
+                proof = proof | {"siblings": verify_siblings(observations, sibling)}
+            finally:
+                proof = proof | {"sibling_owned_retired": retire_sibling_owned(self, sibling),
+                                 "sibling_retired": retire_sibling(self, sibling)}
             startup.document(self.evidence / "isolation-cross-machine.json", proof | {"retired": retire(self)})
 
     def run_suite_with_audit_window(self, suite, suites, contexts, selected_machines, bindings):
@@ -1379,7 +1418,7 @@ def run(info):
         for path, expected in (info["inputs"] | harness.staged_inputs).items():
             require(startup.digest(Path(path)) == expected, "selected input changed during physical run")
         require(driver.tree_digest(Path(info["fixture"])) == info["fixture_sha256"], "fixture changed during run")
-        if executes(info, "parallel") or executes(info, "limits"):
+        if executes(info, "parallel") or executes(info, "limits") or executes(info, "concurrency"):
             require(driver.tree_digest(Path(info["parallel_fixture"])) == info["parallel_fixture_sha256"],
                     "parallel fixture changed during run")
         if executes(info, "ssh"):
@@ -1394,6 +1433,12 @@ def run(info):
             sessions = harness.registry_sessions
             require(len(sessions) == selected and all(s.cleanup_complete is True and s.failed is False for s in sessions),
                     "every selected Machine needs a completed registry Session")
+            require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
+                    "registry archive changed during run")
+        if executes(info, "concurrency"):
+            sessions = harness.concurrency_sessions
+            require(len(sessions) == selected and all(s.cleanup_complete is True and s.failed is False for s in sessions),
+                    "every selected Machine needs a completed concurrency Session")
             require(startup.digest(Path(info["registry_archive"])) == info["registry"]["archive_sha256"],
                     "registry archive changed during run")
         if executes(info, "recovery"):

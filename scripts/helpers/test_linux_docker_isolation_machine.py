@@ -98,15 +98,94 @@ class VerifyTests(unittest.TestCase):
         self.assertEqual(sorted(proof['observed_cache_records']), ['m1', 'm2', 'm3'])
 
 
+class SiblingTests(unittest.TestCase):
+    def sibling(self, inventory=None, owned=None):
+        owned = {'network': 'sib' + 'n' * 61, 'volume': 'sib-state'} if owned is None else owned
+        rows = {kind: [] for kind in ('container', 'image', 'volume', 'network', 'cache', 'event')}
+        # A sibling must be able to see what it owns, or the comparison below
+        # would be measuring an empty inventory.
+        for kind, identity in owned.items():
+            rows[kind] = sorted(set(rows[kind]) | {identity})
+        rows.update(inventory or {})
+        return {'owner': {'project_id': 'p', 'environment_id': 'env-c', 'machine_id': 'm9'},
+                'machine': {'name': 'machine-0'}, 'inventory': rows, 'owned': owned}
+
+    def test_a_sibling_that_cannot_see_its_own_resources_is_rejected(self):
+        sibling = self.sibling()
+        sibling['inventory']['volume'] = []
+        with self.assertRaisesRegex(ValueError, 'cannot see its own'):
+            subject.verify_siblings([slice_for('m1'), slice_for('m2', 'env-b')], sibling)
+
+    def test_retirement_after_a_partial_create_removes_only_what_exists(self):
+        # sibling_owned publishes each resource as it is made, so a failure
+        # between the two leaves one to remove and one that never existed.
+        calls = []
+
+        class Harness:
+            def mutate(self, label, descriptor, args):
+                calls.append(args[:2])
+                return b'', b'', 0
+
+        sibling = self.sibling(owned={'network': 'n' * 64}) | {'descriptor': object()}
+        self.assertEqual(subject.retire_sibling_owned(Harness(), sibling), {'removed': ['network']})
+        self.assertEqual(calls, [['network', 'rm']])
+
+    def test_three_environments_sharing_nothing(self):
+        rows = [slice_for('m1'), slice_for('m2', 'env-b')]
+        proof = subject.verify_siblings(rows, self.sibling())
+        self.assertEqual(proof['environments'], 3)
+        self.assertEqual(proof['cross_visible_containers_images_volumes_networks_events_caches'], 0)
+        self.assertEqual(proof['cross_environment_lifecycle_effects'], 0)
+        self.assertEqual(proof['sibling_declared_machine_name'], 'machine-0')
+        self.assertEqual(proof['project_id'], 'p')
+        self.assertEqual(proof['sibling_owned'], self.sibling()['owned'])
+        self.assertFalse(proof['full_isolation_certified'])
+
+    def test_an_environment_of_another_project_is_not_a_sibling(self):
+        sibling = self.sibling()
+        sibling['owner'] = sibling['owner'] | {'project_id': 'other'}
+        with self.assertRaisesRegex(ValueError, 'different project'):
+            subject.verify_siblings([slice_for('m1'), slice_for('m2', 'env-b')], sibling)
+
+    def test_a_sibling_that_can_see_another_environment_is_rejected(self):
+        rows = [slice_for('m1'), slice_for('m2', 'env-b')]
+        for kind in subject.KINDS:
+            sibling = self.sibling({kind: [rows[0]['owned'][kind]]})
+            with self.subTest(kind=kind), self.assertRaisesRegex(ValueError, 'can see another'):
+                subject.verify_siblings(rows, sibling)
+
+    def test_an_environment_that_can_see_the_siblings_own_resources_is_rejected(self):
+        # The direction that is not vacuous: the sibling owns something, and no
+        # other Environment may have it in view.
+        sibling = self.sibling()
+        rows = [slice_for('m1'), slice_for('m2', 'env-b')]
+        rows[1]['inventory']['volume'] = sorted(set(rows[1]['inventory']['volume']) | {sibling['owned']['volume']})
+        with self.assertRaisesRegex(ValueError, 'can see another'):
+            subject.verify_siblings(rows, sibling)
+
+    def test_a_sibling_owning_nothing_is_refused_as_vacuous(self):
+        rows = [slice_for('m1'), slice_for('m2', 'env-b')]
+        with self.assertRaisesRegex(ValueError, 'vacuous'):
+            subject.verify_siblings(rows, self.sibling(owned={}))
+
+    def test_fewer_than_three_environments_is_rejected(self):
+        rows = [slice_for('m1'), slice_for('m2')]
+        sibling = self.sibling()
+        sibling['owner']['environment_id'] = 'env-a'
+        with self.assertRaisesRegex(ValueError, 'three Environments'):
+            subject.verify_siblings(rows, sibling)
+
+
 class CoverageTests(unittest.TestCase):
-    def test_the_reachable_isolation_id_is_claimed_and_the_sibling_stays_uncovered(self):
+    def test_both_isolation_ids_are_claimed_and_the_suite_has_graduated(self):
         import linux_docker_scenarios as scenarios
         self.assertEqual([claim.id for claim in scenarios.claims('isolation')],
-                         ['docker.operation.same_environment_isolation'])
+                         ['docker.operation.same_environment_isolation',
+                          'docker.operation.sibling_environment_isolation'])
         uncovered = {identifier for identifier, _ in scenarios.UNCOVERED}
-        # The sibling row needs a third Environment the harness does not build.
-        self.assertIn('docker.operation.sibling_environment_isolation', uncovered)
-        self.assertNotIn('docker.operation.same_environment_isolation', uncovered)
+        self.assertFalse(uncovered & {'docker.operation.same_environment_isolation',
+                                      'docker.operation.sibling_environment_isolation'})
+        self.assertNotIn('isolation', scenarios.GAP_SUITES)
 
 
 if __name__ == '__main__':

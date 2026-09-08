@@ -45,22 +45,28 @@ class TableTests(unittest.TestCase):
             subject.check(table=bad, rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "unknown scenario id"):
             subject.check(table=subject.TABLE + (subject._c("docker.engine.made_up", "limits", "x"),), rows=rows)
+        # UNCOVERED is empty now that every audited gap suite is built, so these
+        # two cases construct a gap instead of slicing one away: dropping an
+        # entry from an empty tuple would assert nothing at all.
+        dropped = tuple(c for c in subject.TABLE if c.id != "docker.engine.version")
         with self.assertRaisesRegex(subject.CoverageError, "neither claimed nor uncovered"):
-            subject.check(uncovered=subject.UNCOVERED[1:], rows=rows)
+            subject.check(table=dropped, uncovered=(), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "both claimed and uncovered"):
-            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "concurrency"),), rows=rows)
+            subject.check(uncovered=subject.UNCOVERED + (("docker.engine.version", "isolation"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "unknown gap suite"):
-            subject.check(uncovered=subject.UNCOVERED[:-1] + ((subject.UNCOVERED[-1][0], "later"),), rows=rows)
+            subject.check(table=dropped, uncovered=(("docker.engine.version", "later"),), rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "distinct manifest expected fields"):
             table = tuple(c for c in subject.TABLE if c.id != "docker.engine.info") + (
                 subject._c("docker.engine.info", "handshake", "run_machine", "partial", ("no_such_field",)),)
             subject.check(table=table, rows=rows)
         with self.assertRaisesRegex(subject.CoverageError, "two primary"):
             subject.check(table=subject.TABLE + (subject._c("docker.engine.info", "limits", "x", "partial", ("default_runtime",)),), rows=rows)
+        # Every id now carries a primary claim, so a secondary needs one removed
+        # first; previously this leaned on sibling_environment_isolation being
+        # uncovered, which it no longer is.
         with self.assertRaisesRegex(subject.CoverageError, "secondary claim without a primary"):
-            subject.check(table=subject.TABLE + (subject._c("docker.operation.concurrent_clients", "limits", "x", "secondary"),),
-                          uncovered=tuple(u for u in subject.UNCOVERED if u[0] != "docker.operation.concurrent_clients"),
-                          rows=rows)
+            subject.check(table=dropped + (subject._c("docker.engine.version", "limits", "x", "secondary"),),
+                          uncovered=(), rows=rows)
 
     def test_module_declarations_come_from_the_table(self):
         self.assertEqual(subject.for_suite("limits"), ("docker.operation.resource_limits", "docker.operation.oom"))
@@ -76,15 +82,16 @@ class TableTests(unittest.TestCase):
         self.assertEqual(subject.for_recipe("build", "build-multi-stage"), ("docker.build.output_export", "docker.build.multi_stage"))
         with self.assertRaises(subject.CoverageError):
             subject.for_recipe("build", "compose-create")
-        # A planned gap suite has no claims until it is actually built. A suite
-        # may also be partly built: `isolation` covers one of its two ids, so it
-        # is both a real suite and still a gap suite.
+        # A suite the table does not know has no claims at all. Every audited
+        # gap suite is now built, so GAP_SUITES is empty -- but `check` still
+        # has to reject a newly uncovered id rather than assume it stays empty.
         with self.assertRaises(subject.CoverageError):
-            subject.for_suite("concurrency")
+            subject.for_suite("not-a-suite")
+        self.assertEqual(len(subject.for_suite("concurrency")), 1)
         self.assertEqual(len(subject.for_suite("mounts")), 5)
         self.assertEqual(len(subject.for_suite("netpolicy")), 2)
-        self.assertEqual(len(subject.for_suite("isolation")), 1)
-        self.assertIn("isolation", subject.GAP_SUITES)
+        self.assertEqual(len(subject.for_suite("isolation")), 2)
+        self.assertNotIn("isolation", subject.GAP_SUITES)
         for suite in subject.SUITES.values():
             self.assertIn(suite.process_scenario, subject.for_suite(suite.name))
         for suite in ("compose", "build"):
