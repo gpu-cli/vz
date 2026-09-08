@@ -108,8 +108,12 @@ class Lifecycle(driver.Driver):
         self.process_live = {}
         self.process_observations = []
         self.process_boot_id = None
+        self.witness_pids = ()
+        self.witness_generation = None
+        self.witness_proof = None
+        self.term_stopped_proof = None
 
-    def observe_process(self, role, label, phase, expected):
+    def observe_process(self, role, label, phase, expected, *, witness=()):
         """Bracket one external guest observation with exact Docker ownership.
 
         Running snapshots bind a kernel birth identity; removal without such a
@@ -140,7 +144,8 @@ class Lifecycle(driver.Driver):
         previous = None if phase == 'running' else self.process_live.get(role)
         require(phase != 'stopped' or previous is not None, 'stopped birth identity was never observed')
         proof = self.process_observer.capture(before, phase=phase, previous=previous,
-            engine_policy=self.engine_policy, label=label, expected_boot_id=self.process_boot_id)
+            engine_policy=self.engine_policy, label=label, expected_boot_id=self.process_boot_id,
+            witness_pids=witness)
         if phase == 'removed':
             absent('after')
         else:
@@ -321,7 +326,7 @@ class Lifecycle(driver.Driver):
         args = ['attach', row['cid']]
         result = self.step('attach-stream', args, expected=37, plan=plan)
         proof = self.verify_interaction(result, args, plan, 37)
-        semantic = fixture.validate_stream(result.stdout, result.stderr, 37, self.token)
+        semantic = fixture.validate_stream(result.stdout, result.stderr, 37, self.token, capture=proof)
         from linux_docker_container_state import stopped
         attached = self.inspect('attach', 'exited')
         stopped(attached, 37)
@@ -357,7 +362,7 @@ class Lifecycle(driver.Driver):
             from linux_docker_container_state import stopped
             stopped(self.inspect(role, 'exited'), expected)
             if role == 'stdin':
-                fixture.validate_stream(result.stdout, result.stderr, 37, self.token)
+                fixture.validate_stream(result.stdout, result.stderr, 37, self.token, capture=captured)
             elif role == 'sigint':
                 fixture.validate_tty(result.stdout, 130, self.token, mode='sigint')
                 require(not result.stderr, 'PTY run cannot have separate stderr')
@@ -456,17 +461,59 @@ class Lifecycle(driver.Driver):
         require(wait.stdout == b'143\n' and not wait.stderr, 'TERM guest exit differs')
         final = self.inspect('term', 'exited')
         stopped(final, 143)
-        self.observe_process('term', 'term-stopped', 'stopped', final)
+        self.term_stopped_proof = self.observe_process('term', 'term-stopped', 'stopped', final,
+                                                       witness=self.witness_pids)
         self.term_started = self.record.receipts[result.index - 1]['started_unix_ns']
         return {'command_index': result.index, 'started_unix_ns': self.term_started}
 
+    def start_witness(self):
+        """Start the unrelated container whose exact identity brackets the signal.
+
+        It is named here, from this suite's own Docker state, so both guest
+        observations record those exact processes. It is never signalled and
+        never shares the owned cgroup subtree or private namespaces.
+        """
+        row = self.create('witness', ['service', self.token])
+        self.step('start-witness', ['container', 'start', row['cid']])
+        self.witness_generation = self.inspect('witness', 'running')
+        pid = self.witness_generation['State']['Pid']
+        require(type(pid) is int and 1 < pid < 2**31, 'witness container lacks a live host PID')
+        # Guest PID 1 additionally shows the signal never reached Machine init.
+        self.witness_pids = tuple(sorted({1, pid}))
+        return self.witness_generation
+
+    def verify_witness(self):
+        """Unrelated Docker generation and guest process identity across the signal.
+
+        This certifies the named processes only. Processes nobody named, and any
+        born or reaped inside the interval, remain outside the claim.
+        """
+        from linux_docker_container_state import same_generation, stopped
+        before, after = self.process_live.get('term'), self.term_stopped_proof
+        require(before is not None and after is not None and self.witness_pids,
+                'owned signal was not bracketed by named process observations')
+        witnesses = [proof['observation']['witnesses'] for proof in (before, after)]
+        require(witnesses[0] == witnesses[1] and
+                [row['pid'] for row in witnesses[0]] == list(self.witness_pids),
+                'unrelated process identity changed across the owned signal')
+        same_generation(self.witness_generation, self.inspect('witness', 'running'))
+        self.step('stop-witness', ['container', 'stop', '--timeout', '10', self.containers['witness']['cid']])
+        stopped(self.inspect('witness', 'exited'), 143)
+        return {'schema_version': 1, 'witness_pids': list(self.witness_pids), 'witnesses': witnesses[0],
+                'unrelated_processes_unchanged': True,
+                'scope': 'named_unrelated_container_and_machine_init_only_not_full_process_certification'}
+
     def follow_term(self):
         self.events_since = self.engine_clock('events-clock-start')
+        self.start_witness()
         row = self.create('term', ['service', self.token])
         self.step('start-term', ['container', 'start', row['cid']])
         self.term_generation = self.inspect('term', 'running')
-        self.observe_process('term', 'term-running', 'running', self.term_generation)
-        return self.follow_service(row)
+        self.observe_process('term', 'term-running', 'running', self.term_generation,
+                             witness=self.witness_pids)
+        proof = self.follow_service(row)
+        self.witness_proof = self.verify_witness()
+        return proof
 
     def follow_service(self, row):
         from linux_docker_container_follow import run_follow
@@ -579,7 +626,8 @@ class Lifecycle(driver.Driver):
         self.workload_complete = True
         return {'scope': 'DEV_CONTAINER_LIFECYCLE_WORKLOAD_NOT_RELEASE_CERTIFICATION',
                 'health': health, 'exec_io': self.io_observations, 'attach': attached, 'stdin': stdin, 'exits': exits,
-                'follow': followed, 'tmux': terminal, 'process_observations': list(self.process_observations),
+                'follow': followed, 'unrelated_processes': self.witness_proof, 'tmux': terminal,
+                'process_observations': list(self.process_observations),
                 'remaining_acceptance': ['full-process-runtime-inventory', 'aggregate-release-integration']}
 
     def cleanup(self):
@@ -685,6 +733,8 @@ class ReplayLifecycle(Lifecycle):
         self.terminal_owner = self.tmux_proof = None
         self.process_observer = live.process_observer.replay() if live.process_observer is not None else None
         self.process_live, self.process_observations, self.process_boot_id = {}, [], None
+        self.witness_pids, self.witness_generation = (), None
+        self.witness_proof = self.term_stopped_proof = None
         self.record = ReplayRecord(self.output)
         self.expected_count = live.record.count
         require(json.loads(driver.regular(self.output / 'inputs.json')) == self.inputs.raw, 'foreign lifecycle inputs')

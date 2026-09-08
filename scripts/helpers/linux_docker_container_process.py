@@ -7,6 +7,8 @@ never treated as private absence targets. No process is signalled or adopted.
 Stable same-birth Z/X records may lack mount/cgroup namespaces after nsproxy
 release; they remain recorded processes, never disappearance evidence. Namespace
 membership checks do not certify destruction of namespace objects or FD refs.
+Witness processes are named by the caller from its own Docker state; they record
+those exact processes and never certify unnamed ones.
 """
 from __future__ import annotations
 
@@ -212,7 +214,39 @@ def events(value):
     return {k: int(v) for k, v in (line.split(' ') for line in value.splitlines())}
 
 
-def validate(raw, *, inspected, engine_policy, phase, previous=None, expected_boot_id=None):
+WITNESS_LIMIT = 8
+
+
+def witness_records(processes, vanished, requested, *, owned, target):
+    """Record externally named unrelated processes; the caller chooses them.
+
+    A witness comes from the caller's own Docker state, never from discovery
+    here. Byte equality of these records between two bracketing observations is
+    the only unchanged claim they support: processes nobody named, and processes
+    born or reaped inside the interval, stay uncertified either way.
+    """
+    require(type(requested) in (tuple, list) and len(requested) <= WITNESS_LIMIT and
+            list(requested) == sorted(set(requested)) and
+            all(type(pid) is int and 0 < pid < 2**31 for pid in requested),
+            'invalid externally named witness process set')
+    recorded = {row['pid']: row for row in processes}
+    witnesses = []
+    for pid in requested:
+        require(pid not in vanished and pid in recorded, 'named witness process was not recorded')
+        row = recorded[pid]
+        require(row['state'] not in ('Z', 'X', 'x') and row['state_after'] not in ('Z', 'X', 'x') and
+                not row['kernel_thread'], 'named witness process is terminal or a kernel thread')
+        require(row['cgroup'] != owned and not row['cgroup'].startswith(owned + '/'),
+                'named witness process lies inside the owned cgroup subtree')
+        require(target is None or all(row['namespaces'][n] != target['namespaces'][n] for n in ('pid', 'mnt')),
+                'named witness process shares the owned private namespaces')
+        witnesses.append({'pid': pid, 'starttime_ticks': row['starttime_ticks'],
+                          'kernel_thread': row['kernel_thread'], 'namespaces': row['namespaces'],
+                          'nspid': row['nspid'], 'cgroup': row['cgroup']})
+    return witnesses
+
+
+def validate(raw, *, inspected, engine_policy, phase, previous=None, expected_boot_id=None, witness_pids=()):
     """Replay a source-fixed observation, with externally supplied inspect/policy.
 
     Stopped/removed without a running predecessor proves only owned cgroup
@@ -368,6 +402,8 @@ def validate(raw, *, inspected, engine_policy, phase, previous=None, expected_bo
                     all(p['namespaces'][n] != old['namespaces'][n] for n in ('pid', 'mnt'))
                     for p in processes), 'old process birth or private namespace remains')
         require(old['pid'] not in vanished, 'old PID disappearance raced observation')
+    named = target if target is not None else (previous or {}).get('target')
+    witnesses = witness_records(processes, vanished, witness_pids, owned=owned, target=named)
     return {'schema_version': 1, 'scope': 'bounded_interval_not_historical_runtime_or_full_process_certification',
             'phase': phase, 'container_id': cid, 'started_at': state.get('StartedAt'), 'boot_id': boot.strip(),
             'uptime_centiseconds': uptime, 'guest_namespaces': guest, 'target': target,
@@ -377,14 +413,14 @@ def validate(raw, *, inspected, engine_policy, phase, previous=None, expected_bo
             'process_count': len(processes),
             'process_inventory_sha256': hashlib.sha256(json.dumps(processes, sort_keys=True,
                 separators=(',', ':'), ensure_ascii=True).encode('ascii')).hexdigest(),
-            'vanished_pids': vanished, 'groups': groups,
+            'vanished_pids': vanished, 'groups': groups, 'witnesses': witnesses,
             'owned_cgroup_absent': group_state == 'absent',
             'recorded_birth_and_private_namespace_members_absent': previous is not None,
             'full_process_absence_certified': False, 'stdout_sha256': hashlib.sha256(raw).hexdigest()}
 
 
 def capture(harness, descriptor, inspected, *, engine_policy, phase='running', previous=None,
-            expected_boot_id=None, label='container-process'):
+            expected_boot_id=None, witness_pids=(), label='container-process'):
     """One exact-Machine public Exec; caller must bracket with ownership guards."""
     cid = policy(engine_policy, inspected)
     project = binding.project_binding(harness, descriptor)
@@ -395,6 +431,6 @@ def capture(harness, descriptor, inspected, *, engine_policy, phase='running', p
     require(type(code) is int and code == 0 and stderr == b'', 'public Exec failed; retain raw evidence')
     require(binding.project_binding(harness, descriptor) == project, 'Machine/project binding changed')
     proof = validate(raw, inspected=inspected, engine_policy=engine_policy, phase=phase, previous=previous,
-                     expected_boot_id=expected_boot_id)
+                     expected_boot_id=expected_boot_id, witness_pids=witness_pids)
     proof.update(owner=dict(owner), command_label=label, **project)
     return proof

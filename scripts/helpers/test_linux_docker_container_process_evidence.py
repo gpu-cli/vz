@@ -51,11 +51,13 @@ class BridgeTests(unittest.TestCase):
             return_value=SimpleNamespace(returncode=0, stdout=b'raw guest frames\n', stderr=b'')))
         self.parser = stack.enter_context(patch.object(bridge.process, 'validate', side_effect=lambda raw, **kwargs:
             {'container_id': kwargs['inspected']['Id'], 'phase': kwargs['phase'], 'boot_id': BOOT,
-             'raw_sha256': bridge.driver.sha256(raw), 'previous_seen': kwargs['previous'] is not None}))
+             'raw_sha256': bridge.driver.sha256(raw), 'previous_seen': kwargs['previous'] is not None,
+             'witnesses': [{'pid': pid} for pid in kwargs['witness_pids']]}))
 
-    def capture(self, observer=None, *, phase='running', previous=None, label='service-running', expected_boot_id=None):
+    def capture(self, observer=None, *, phase='running', previous=None, label='service-running',
+                expected_boot_id=None, witness_pids=()):
         return (observer or self.observer).capture(self.inspected, phase=phase, previous=previous,
-            engine_policy=self.policy, label=label, expected_boot_id=expected_boot_id)
+            engine_policy=self.policy, label=label, expected_boot_id=expected_boot_id, witness_pids=witness_pids)
 
     def replace(self, name, change):
         path = self.output / name
@@ -77,6 +79,16 @@ class BridgeTests(unittest.TestCase):
         self.assertEqual(proof['finished_unix_ns'], row['started_unix_ns'] + row['elapsed_ns'])
         self.assertEqual(proof['owner'], self.descriptor['owner'])
         self.assertEqual(proof['observation']['boot_id'], BOOT)
+
+    def test_named_witnesses_are_part_of_the_recorded_request(self):
+        proof = self.capture(witness_pids=(1,))
+        self.assertEqual([row['pid'] for row in proof['observation']['witnesses']], [1])
+        self.assertEqual(bridge.document(self.output / 'request-001.json')['witness_pids'], [1])
+        # A replay may not rename the witnesses the original observation chose.
+        for pids in ((), (1, 2)):
+            with self.subTest(pids=pids), self.assertRaises(ValueError):
+                self.capture(self.observer.replay(), witness_pids=pids)
+        self.assertEqual(self.capture(self.observer.replay(), witness_pids=[1]), proof)
 
     def test_replay_does_not_dispatch_or_write(self):
         proof = self.capture()

@@ -39,6 +39,8 @@ def bare():
     value.observe_process = Mock(return_value={})
     value.process_live, value.process_observations, value.process_boot_id = {}, [], None
     value.process_observer = None
+    value.witness_pids, value.witness_generation = (), None
+    value.witness_proof = value.term_stopped_proof = None
     return value
 
 
@@ -81,7 +83,7 @@ class SourcePlanTests(unittest.TestCase):
         self.assertEqual(value.process_observations, [proof | {
             'guard_first_command': 1, 'guard_last_command': 6, 'role': 'service'}])
         arguments = value.process_observer.capture.call_args.kwargs
-        self.assertEqual(arguments, {'phase': 'running', 'previous': None,
+        self.assertEqual(arguments, {'phase': 'running', 'previous': None, 'witness_pids': (),
             'engine_policy': value.engine_policy, 'label': 'service-running', 'expected_boot_id': None})
         for changed in ({'started_unix_ns': 309}, {'finished_unix_ns': 401},
                         {'started_unix_ns': True}, {'finished_unix_ns': 319}):
@@ -248,6 +250,92 @@ class SourcePlanTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             value.create('attach', ['exit', '0'])
 
+    def witness_actor(self, *, term_ns=None, witness_ns=None, term_cgroup='/docker/term', pid=4321):
+        """A live unrelated container bracketing the owned SIGTERM."""
+        def record(namespaces, cgroup, pid_value):
+            return {'pid': pid_value, 'starttime_ticks': 77, 'kernel_thread': False,
+                    'nspid': [pid_value, 1], 'cgroup': cgroup, 'namespaces': namespaces}
+        witness = [record({'pid': 'pid:[1]', 'mnt': 'mnt:[1]'}, '/init.scope', 1),
+                   record(witness_ns or {'pid': 'pid:[9]', 'mnt': 'mnt:[9]'}, '/docker/witness', pid)]
+        value = bare()
+        value.containers = {'witness': {'cid': CID, 'name': TOKEN + '-witness'},
+                            'term': {'cid': 'd' * 64, 'name': TOKEN + '-term'}}
+        value.witness_pids = tuple(sorted({1, pid}))
+        value.witness_generation = {'State': {'Status': 'running', 'Running': True, 'Pid': pid,
+                                              'StartedAt': '2026-09-06T12:00:00Z'}}
+        for key in ('Id', 'Name', 'Image', 'Created', 'Path', 'Args', 'Mounts'):
+            value.witness_generation[key] = key
+        value.witness_generation.update(Config={}, HostConfig={})
+        value.process_live['term'] = {'observation': {'witnesses': witness}}
+        value.term_stopped_proof = {'observation': {'witnesses':
+            witness if term_ns is None else term_ns}}
+        exited = json.loads(json.dumps(value.witness_generation))
+        exited['State'] = {'Status': 'exited', 'Running': False, 'Pid': 0, 'ExitCode': 143,
+                           'StartedAt': '2026-09-06T12:00:00Z', 'FinishedAt': '2026-09-06T12:00:09Z'}
+        value.inspect = Mock(side_effect=[json.loads(json.dumps(value.witness_generation)), exited])
+        value.step = Mock(return_value=SimpleNamespace(index=9, stdout=b'', stderr=b''))
+        return value
+
+    def test_witness_records_must_be_identical_on_both_sides_of_the_signal(self):
+        value = self.witness_actor()
+        proof = value.verify_witness()
+        self.assertTrue(proof['unrelated_processes_unchanged'])
+        self.assertEqual(proof['witness_pids'], [1, 4321])
+        self.assertIn('not_full_process_certification', proof['scope'])
+        label, args = value.step.call_args.args
+        self.assertEqual((label, args), ('stop-witness', ['container', 'stop', '--timeout', '10', CID]))
+
+    def test_changed_reordered_or_unobserved_witness_rejected(self):
+        after = self.witness_actor().term_stopped_proof['observation']['witnesses']
+        for change in ([dict(after[0]), dict(after[1], starttime_ticks=78)],
+                       [dict(after[0]), dict(after[1], cgroup='/docker/other')],
+                       [dict(after[0]), dict(after[1], namespaces={'pid': 'pid:[10]', 'mnt': 'mnt:[9]'})],
+                       [after[1], after[0]], [after[0]], []):
+            value = self.witness_actor(term_ns=change)
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'unrelated process identity'):
+                value.verify_witness()
+            value.step.assert_not_called()
+
+    def test_witness_verification_requires_both_bracketing_observations(self):
+        for missing in ('process_live', 'term_stopped_proof', 'witness_pids'):
+            value = self.witness_actor()
+            setattr(value, 'process_live', {}) if missing == 'process_live' else setattr(
+                value, missing, () if missing == 'witness_pids' else None)
+            with self.subTest(missing=missing), self.assertRaisesRegex(ValueError, 'not bracketed'):
+                value.verify_witness()
+
+    def test_witness_generation_change_or_late_exit_rejected(self):
+        value = self.witness_actor()
+        restarted = json.loads(json.dumps(value.witness_generation))
+        restarted['State']['StartedAt'] = '2026-09-06T12:30:00Z'
+        value.inspect = Mock(return_value=restarted)
+        with self.assertRaises(ValueError):
+            value.verify_witness()
+        value.step.assert_not_called()
+        value = self.witness_actor()
+        running = json.loads(json.dumps(value.witness_generation))
+        value.inspect = Mock(side_effect=[running, json.loads(json.dumps(running))])
+        with self.assertRaises(ValueError):
+            value.verify_witness()
+
+    def test_started_witness_names_machine_init_and_its_own_live_pid(self):
+        value = bare()
+        value.create = Mock(return_value={'cid': CID})
+        value.step = Mock(return_value=SimpleNamespace(index=2, stdout=b'', stderr=b''))
+        value.inspect = Mock(return_value={'State': {'Pid': 4321}})
+        value.start_witness()
+        self.assertEqual(value.witness_pids, (1, 4321))
+        self.assertEqual(value.create.call_args.args, ('witness', ['service', TOKEN]))
+        self.assertEqual(value.step.call_args.args, ('start-witness', ['container', 'start', CID]))
+        for pid in (0, 1, True, None, 2**31):
+            value = bare()
+            value.create = Mock(return_value={'cid': CID})
+            value.step = Mock()
+            value.inspect = Mock(return_value={'State': {'Pid': pid}})
+            with self.subTest(pid=pid), self.assertRaisesRegex(ValueError, 'live host PID'):
+                value.start_witness()
+            self.assertEqual(value.witness_pids, ())
+
     def test_partial_create_retains_owned_unresolved_row(self):
         value = bare(); value.absent = Mock(); value.inspect = Mock()
         value.step = Mock(side_effect=RuntimeError('uncertain dispatch'))
@@ -266,7 +354,11 @@ class SourcePlanTests(unittest.TestCase):
         stdout = fixture.marker(TOKEN, 'stdout-begin') + fixture.INPUT + b'\n' + fixture.marker(TOKEN, 'stdout-end')
         stderr = fixture.marker(TOKEN, 'stderr-begin') + fixture.marker(TOKEN, 'stderr-end')
         value.step = Mock(return_value=SimpleNamespace(stdout=stdout, stderr=stderr, index=3))
-        value.verify_interaction = Mock(return_value={'delegated': True})
+        value.verify_interaction = Mock(return_value={'mode': 'pipes', 'exit_code': 37,
+            'stdin_eof_count': 1, 'plan_sha256': 'a' * 64,
+            'stdin_half_close': {'action_index': 2, 'observed_bytes': {
+                'stdout': 0, 'stderr': len(fixture.marker(TOKEN, 'stderr-begin')), 'tty': 0}},
+            'stdout_sha256': fixture.sha(stdout), 'stderr_sha256': fixture.sha(stderr)})
         value.attach()
         label, args = value.step.call_args.args
         plan = value.step.call_args.kwargs['plan']

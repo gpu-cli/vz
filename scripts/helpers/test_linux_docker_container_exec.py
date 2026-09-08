@@ -73,8 +73,28 @@ class Exec(unittest.TestCase):
         for name, data in (('stdout', stdout), ('stderr', stderr)):
             (self.output / ('command-%05d.%s' % (index, name))).write_bytes(data)
         self.raw[index] = (stdout, stderr)
-        self.receipts[index] = {'command_index': index, 'terminal_receipt_sha256': str(index) * 64}
+        self.receipts[index] = dict(self.capture(operation, stdout, stderr),
+                                    command_index=index, terminal_receipt_sha256=str(index) * 64)
         return SimpleNamespace(index=index, stdout=stdout, stderr=stderr, returncode=operation['exit'])
+
+    def capture(self, operation, stdout, stderr):
+        """What validate_capture would return for this plan and these bytes."""
+        plan = operation['plan']
+        actions = plan['actions']
+        half_close, seen = None, {'stdout': 0, 'stderr': 0, 'tty': 0}
+        for index, action in enumerate(actions):
+            if 'after' in action:
+                stream = action['after']['stream']
+                source = stdout if stream in ('stdout', 'tty') else stderr
+                seen[stream] = source.find(action['after']['marker']) + len(action['after']['marker'])
+            if action['kind'] == 'close_stdin':
+                half_close = {'action_index': index, 'observed_bytes': dict(seen)}
+        return {'scope': 'host_interactive_capture_only_not_docker_semantics_or_release_acceptance',
+                'plan_sha256': fixture.sha(subject.interactive.encode_plan(plan)), 'mode': plan['mode'],
+                'action_count': len(actions), 'exit_code': operation['exit'],
+                'stdin_eof_count': sum(a['kind'] == 'close_stdin' for a in actions),
+                'stdin_half_close': half_close, 'owned_process_reaped': True,
+                'stdout_sha256': fixture.sha(stdout), 'stderr_sha256': fixture.sha(stderr)}
 
     def validate(self, output, index, *, argv, executable, env, expected_exit, expected_plan):
         self.events.append('validate-%d' % index)

@@ -61,12 +61,13 @@ def source_inputs(harness, descriptor, source_pins):
                   'project_binding': binding_module.project_binding(harness, descriptor)})
 
 
-def request(inspected, phase, previous, engine_policy, label, expected_boot_id):
+def request(inspected, phase, previous, engine_policy, label, expected_boot_id, witness_pids):
     require(isinstance(label, str) and re.fullmatch('[a-z][a-z0-9-]{0,79}', label),
             'source-selected bounded process observation label required')
     require(phase in ('running', 'stopped', 'removed'), 'unknown process observation phase')
     return clone({'inspected': inspected, 'phase': phase, 'previous': previous,
-                  'engine_policy': engine_policy, 'label': label, 'expected_boot_id': expected_boot_id})
+                  'engine_policy': engine_policy, 'label': label, 'expected_boot_id': expected_boot_id,
+                  'witness_pids': list(witness_pids)})
 
 
 def arguments(inputs, selected):
@@ -134,7 +135,8 @@ def result_proof(output, inputs, index, selected):
     require(stderr == b'', 'process observation public Exec diagnostics')
     observation = process.validate(stdout, inspected=selected['inspected'], phase=selected['phase'],
                                    previous=sampler_previous(output, inputs, index, selected),
-                                   engine_policy=selected['engine_policy'], expected_boot_id=selected['expected_boot_id'])
+                                   engine_policy=selected['engine_policy'], expected_boot_id=selected['expected_boot_id'],
+                                   witness_pids=selected['witness_pids'])
     descriptor = inputs['descriptor']
     return {'schema_version': 1, 'scope': SCOPE, 'command_index': index, 'label': selected['label'],
             'phase': selected['phase'], 'started_unix_ns': row['started_unix_ns'],
@@ -164,9 +166,10 @@ class Observer:
                 same(document(self.output / 'inputs.json'), self.inputs) and
                 self.record.env == self.inputs['environment'], 'process observer original inputs changed')
 
-    def capture(self, inspected, *, phase, previous=None, engine_policy=None, label='process', expected_boot_id=None):
+    def capture(self, inspected, *, phase, previous=None, engine_policy=None, label='process',
+                expected_boot_id=None, witness_pids=()):
         self.verify_inputs()
-        selected = request(inspected, phase, previous, engine_policy, label, expected_boot_id)
+        selected = request(inspected, phase, previous, engine_policy, label, expected_boot_id, witness_pids)
         process.policy(engine_policy, inspected)
         index = len(self.record.receipts) + 1
         require(index <= MAX_COMMANDS, 'process observation ledger exceeds bound')
@@ -191,9 +194,10 @@ class ReplayObserver:
         self.expected_count, self.count = len(live.record.receipts), 0
         self.labels = []
 
-    def capture(self, inspected, *, phase, previous=None, engine_policy=None, label='process', expected_boot_id=None):
+    def capture(self, inspected, *, phase, previous=None, engine_policy=None, label='process',
+                expected_boot_id=None, witness_pids=()):
         self.live.verify_inputs()
-        selected = request(inspected, phase, previous, engine_policy, label, expected_boot_id)
+        selected = request(inspected, phase, previous, engine_policy, label, expected_boot_id, witness_pids)
         index = self.count + 1
         require(index <= self.expected_count, 'missing source-selected process observation')
         require(same(document(self.output / ('request-%03d.json' % index)), selected),

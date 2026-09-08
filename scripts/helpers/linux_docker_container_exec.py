@@ -77,7 +77,7 @@ def check(output, inputs, operation, index, token, *, environment):
         if name == 'root':
             require(semantic['namespaces'] == semantic['pid1_namespaces'], 'root exec namespaces differ')
     elif name == 'stream':
-        semantic = fixture.validate_stream(stdout, stderr, operation['exit'], token)
+        semantic = fixture.validate_stream(stdout, stderr, operation['exit'], token, capture=proof)
     else:
         require(stderr == b'', 'TTY capture cannot have separate stderr')
         semantic = fixture.validate_tty(stdout, operation['exit'], token,

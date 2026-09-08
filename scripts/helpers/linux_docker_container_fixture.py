@@ -122,15 +122,35 @@ def exact_exit(value, expected):
     require(type(value) is int and value == expected, 'fixture exit code differs')
 
 
-def validate_stream(stdout, stderr, exit_code, owner):
+def validate_stream(stdout, stderr, exit_code, owner, *, capture):
+    """Guest payload plus the host half-close that produced it.
+
+    The fixture writes nothing to stdout, and only `stderr-begin` to stderr,
+    before its single read reaches end of file. So a capture whose half-close
+    observed no stdout and no more than that one marker delivered exactly one
+    EOF, and every returned byte followed it.
+    """
     token(owner)
     exact_exit(exit_code, 37)
     expected = marker(owner, 'stdout-begin') + INPUT + b'\n' + marker(owner, 'stdout-end')
     require(type(stdout) is bytes and stdout == expected and type(stderr) is bytes and
             stderr == marker(owner, 'stderr-begin') + marker(owner, 'stderr-end'), 'binary stream payload differs')
+    require(type(capture) is dict and capture.get('mode') == 'pipes' and capture.get('exit_code') == 37 and
+            capture.get('stdout_sha256') == sha(stdout) and capture.get('stderr_sha256') == sha(stderr),
+            'host capture describes other bytes or another invocation')
+    require(type(capture.get('stdin_eof_count')) is int and capture['stdin_eof_count'] == 1,
+            'host did not half-close the container stdin exactly once')
+    half_close = capture.get('stdin_half_close')
+    observed = half_close.get('observed_bytes') if type(half_close) is dict else None
+    require(type(observed) is dict and set(observed) == {'stdout', 'stderr', 'tty'} and
+            all(type(value) is int for value in observed.values()) and
+            observed['stdout'] == 0 and observed['tty'] == 0 and
+            0 <= observed['stderr'] <= len(marker(owner, 'stderr-begin')),
+            'guest output preceded the single half-close')
     return {'schema_version': 1, 'token': owner, 'input_sha256': INPUT_SHA256,
             'input_bytes': len(INPUT), 'stdout_sha256': sha(stdout), 'stderr_sha256': sha(stderr),
-            'exit_code': 37, 'host_eof_timing_and_transport_proof_required': True}
+            'exit_code': 37, 'eof_delivered_once': True,
+            'observed_bytes_at_half_close': dict(observed), 'plan_sha256': capture.get('plan_sha256')}
 
 
 def records(raw, owner, *, newline=b'\n'):

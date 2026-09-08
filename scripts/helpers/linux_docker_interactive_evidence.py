@@ -193,6 +193,7 @@ def validate_capture(plan_raw, receipt, stdout, stderr, *, argv, executable, cwd
     actions = receipt.get('actions')
     require(type(actions) is list and len(actions) == len(plan['actions']), 'missing or extra actions')
     previous, previous_wall, eof, counts = launch_end, launch_wall, 0, {k: 0 for k in outputs}
+    half_close = None
     for index, (planned, actual) in enumerate(zip(plan['actions'], actions)):
         require(actual.get('index') == index and type(actual.get('index')) is int and
                 actual.get('kind') == planned['kind'] and actual.get('complete') is True,
@@ -226,6 +227,9 @@ def validate_capture(plan_raw, receipt, stdout, stderr, *, argv, executable, cwd
                     actual.get('input_size') == len(planned['data']) and
                     actual.get('input_sha256') == digest(planned['data']), 'input write differs')
         elif kind == 'close_stdin':
+            # The prefix already observed when the half-close was dispatched:
+            # bytes the child produced only afterwards cannot appear in it.
+            half_close = {'action_index': index, 'observed_bytes': dict(observed)}
             eof += 1
         else:
             signal = 'SIGWINCH' if kind == 'resize' else planned['name']
@@ -250,8 +254,8 @@ def validate_capture(plan_raw, receipt, stdout, stderr, *, argv, executable, cwd
                 terminal.get('restored_attributes'), 'terminal attributes differ')
     return {'scope': 'host_interactive_capture_only_not_docker_semantics_or_release_acceptance',
             'plan_sha256': digest(plan_raw), 'mode': plan['mode'], 'action_count': len(actions),
-            'exit_code': expected_exit, 'stdin_eof_count': eof, 'stdout_sha256': digest(stdout),
-            'stderr_sha256': digest(stderr), 'owned_process_reaped': True}
+            'exit_code': expected_exit, 'stdin_eof_count': eof, 'stdin_half_close': half_close,
+            'stdout_sha256': digest(stdout), 'stderr_sha256': digest(stderr), 'owned_process_reaped': True}
 
 
 def validate_recorded(root, index, *, argv, executable, env, expected_exit, expected_plan, extra_env=None):

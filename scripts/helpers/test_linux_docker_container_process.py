@@ -93,6 +93,63 @@ class ProcessTests(unittest.TestCase):
         fields['p.1.stat_before'] = fields['p.1.stat_after'] = stat(1, birth=11)
         self.assertNotEqual(proof['process_inventory_sha256'], validate(fields)['process_inventory_sha256'])
 
+    def test_named_witnesses_record_unrelated_processes_across_both_phases(self):
+        fields = snapshot()
+        add_process(fields, 200, birth=42)
+        fields['process_paths'] = '/proc/1\n/proc/sys\n/proc/100\n/proc/200'
+        running = validate(fields, witness_pids=(1, 200))
+        self.assertEqual([row['pid'] for row in running['witnesses']], [1, 200])
+        self.assertEqual(running['witnesses'][1],
+                         {'pid': 200, 'starttime_ticks': 42, 'kernel_thread': False, 'nspid': [200],
+                          'cgroup': '/', 'namespaces': running['witnesses'][1]['namespaces']})
+        # The unrelated records are byte-identical once the owned target is gone.
+        after = snapshot(running=False)
+        add_process(after, 200, birth=42)
+        after['process_paths'] = '/proc/1\n/proc/sys\n/proc/200'
+        stopped = validate(after, 'stopped', running, witness_pids=(1, 200))
+        self.assertEqual(stopped['witnesses'], running['witnesses'])
+        self.assertEqual(validate(snapshot())['witnesses'], [])
+
+    def test_witness_must_be_recorded_live_and_outside_the_owned_subtree(self):
+        base = snapshot()
+        add_process(base, 200, birth=42)
+        base['process_paths'] = '/proc/1\n/proc/sys\n/proc/100\n/proc/200'
+        # Named but never recorded, vanished, terminal, a kernel thread, or
+        # inside the owned cgroup subtree: none of those witness anything.
+        for pids in ((0,), (300,), (200, 1), (1, 1), (1, 200, 200), (100,), (True,), {1}, (1.0,)):
+            with self.subTest(pids=pids), self.assertRaises(ValueError):
+                validate(base, witness_pids=pids)
+        # A decoded JSON request carries the same set as a list.
+        self.assertEqual(validate(base, witness_pids=[1, 200])['witnesses'],
+                         validate(base, witness_pids=(1, 200))['witnesses'])
+        vanished = dict(base)
+        for key in [k for k in vanished if k.startswith('p.200.')]:
+            del vanished[key]
+        vanished['p.200.gone'] = 'absent'
+        with self.assertRaisesRegex(ValueError, 'not recorded'):
+            validate(vanished, witness_pids=(200,))
+        for change in ({'state': 'Z'}, {'kernel': True}):
+            fields = snapshot()
+            add_process(fields, 200, birth=42, **change)
+            fields['process_paths'] = '/proc/1\n/proc/sys\n/proc/100\n/proc/200'
+            with self.subTest(change=change), self.assertRaisesRegex(ValueError, 'terminal or a kernel thread'):
+                validate(fields, witness_pids=(200,))
+        owned = snapshot()
+        add_process(owned, 200, owned=True, birth=42)
+        owned['process_paths'] = '/proc/1\n/proc/sys\n/proc/100\n/proc/200'
+        with self.assertRaisesRegex(ValueError, 'owned cgroup subtree'):
+            validate(owned, witness_pids=(200,))
+
+    def test_witness_sharing_the_owned_private_namespaces_rejected(self):
+        fields = snapshot()
+        add_process(fields, 200, birth=42)
+        fields['process_paths'] = '/proc/1\n/proc/sys\n/proc/100\n/proc/200'
+        for name in ('pid', 'mnt'):
+            shared = copy.deepcopy(fields)
+            shared['p.200.' + name] = shared['p.200.' + name + '.after'] = fields['p.100.' + name]
+            with self.subTest(namespace=name), self.assertRaisesRegex(ValueError, 'private namespaces'):
+                validate(shared, witness_pids=(200,))
+
     def test_stopped_and_removed_empty_or_absent(self):
         previous = validate(snapshot())
         for phase in ('stopped', 'removed'):

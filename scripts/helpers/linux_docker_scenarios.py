@@ -122,9 +122,9 @@ TABLE = (
     _c("docker.container.events", "lifecycle", "Lifecycle.cleanup"),
     _c("docker.container.attach", "lifecycle", "Lifecycle.exercise"),
     _c("docker.container.exec", "lifecycle", "Lifecycle.exercise"),
-    _c("docker.container.stdin", "lifecycle", "Lifecycle.exercise", "partial", ("eof_delivered_once",)),
+    _c("docker.container.stdin", "lifecycle", ("Lifecycle.exercise", "validate_stream")),
     _c("docker.container.tty", "lifecycle", "Lifecycle.exercise"),
-    _c("docker.container.signals", "lifecycle", "Lifecycle.exercise", "partial", ("unrelated_processes_unchanged",)),
+    _c("docker.container.signals", "lifecycle", ("Lifecycle.exercise", "Lifecycle.verify_witness")),
     _c("docker.container.exact_exit_results", "lifecycle", "Lifecycle.exercise"),
     # recovery: public Stop/Up of the owning Environment (not an in-place daemon restart).
     _c("docker.storage.persistence", "recovery", "run_machine"),

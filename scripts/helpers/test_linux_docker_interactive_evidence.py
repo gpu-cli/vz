@@ -81,6 +81,10 @@ os.write(2,b'DONE')
         self.assertEqual(proof['exit_code'], 37)
         self.assertEqual(proof['stdin_eof_count'], 1)
         self.assertEqual(proof['action_count'], 2)
+        # The child writes its stdout byte only after reading to end of file,
+        # so the half-close prefix cannot contain it.
+        self.assertEqual(proof['stdin_half_close'],
+                         {'action_index': 1, 'observed_bytes': {'stdout': 0, 'stderr': 6, 'tty': 0}})
         self.assertIn('not_docker_semantics', proof['scope'])
         self.assertEqual(evidence.encode_plan(evidence.decode_plan(row['plan_raw'])), row['plan_raw'])
 
@@ -90,6 +94,8 @@ os.write(2,b'DONE')
         self.assertEqual(row['stdout'], b'READYDATASIZEDDONE')
         self.assertEqual(row['stderr'], b'')
         self.assertEqual(proof['mode'], 'pty')
+        self.assertIsNone(proof['stdin_half_close'])
+        self.assertEqual(proof['stdin_eof_count'], 0)
         self.assertTrue(row['receipt']['terminal']['client_restored_attributes'])
 
     def test_deferred_real_capture_replays_mask_union_and_launch_timing(self):

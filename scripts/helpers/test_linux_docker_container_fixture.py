@@ -104,18 +104,51 @@ class AdmissionTests(unittest.TestCase):
             fixture.fixture_contract(self.root)
 
 
+def capture_for(stdout, stderr, **changes):
+    seen = {'stdout': 0, 'stderr': len(fixture.marker(TOKEN, 'stderr-begin')), 'tty': 0}
+    return {'mode': 'pipes', 'exit_code': 37, 'stdin_eof_count': 1, 'plan_sha256': 'a' * 64,
+            'stdin_half_close': {'action_index': 1, 'observed_bytes': seen},
+            'stdout_sha256': fixture.sha(stdout), 'stderr_sha256': fixture.sha(stderr)} | changes
+
+
 class ProtocolTests(unittest.TestCase):
     def test_exact_binary_stream_and_transport_scope(self):
         stdout = fixture.marker(TOKEN, 'stdout-begin')+fixture.INPUT+b'\n'+fixture.marker(TOKEN, 'stdout-end')
         stderr = fixture.marker(TOKEN, 'stderr-begin')+fixture.marker(TOKEN, 'stderr-end')
-        proof = fixture.validate_stream(stdout, stderr, 37, TOKEN)
+        capture = capture_for(stdout, stderr)
+        proof = fixture.validate_stream(stdout, stderr, 37, TOKEN, capture=capture)
         self.assertEqual(proof['input_bytes'], 65792)
-        self.assertTrue(proof['host_eof_timing_and_transport_proof_required'])
+        self.assertTrue(proof['eof_delivered_once'])
+        self.assertEqual(proof['observed_bytes_at_half_close'], capture['stdin_half_close']['observed_bytes'])
         for out, err, code in ((stdout[:-1], stderr, 37), (stdout, stderr[:-1], 37),
                                (stdout.replace(b'\x00', b'\x01'), stderr, 37),
                                (stdout, stderr+b'warning\n', 37), (stdout, stderr, 0),
                                (bytearray(stdout), stderr, 37)):
-            with self.assertRaises(ValueError): fixture.validate_stream(out, err, code, TOKEN)
+            with self.assertRaises(ValueError):
+                fixture.validate_stream(out, err, code, TOKEN, capture=capture_for(bytes(out), err))
+
+    def test_binary_stream_requires_one_half_close_that_preceded_every_returned_byte(self):
+        stdout = fixture.marker(TOKEN, 'stdout-begin')+fixture.INPUT+b'\n'+fixture.marker(TOKEN, 'stdout-end')
+        stderr = fixture.marker(TOKEN, 'stderr-begin')+fixture.marker(TOKEN, 'stderr-end')
+        begin = len(fixture.marker(TOKEN, 'stderr-begin'))
+        rejected = (
+            {'stdin_eof_count': 0}, {'stdin_eof_count': 2}, {'stdin_eof_count': True},
+            {'stdin_half_close': None}, {'stdin_half_close': {'action_index': 1}},
+            {'mode': 'pty'}, {'exit_code': 0}, {'stdout_sha256': 'c' * 64}, {'stderr_sha256': 'c' * 64},
+            # A returned byte already observed when the half-close was sent did
+            # not follow it, and the post-EOF stderr marker never precedes it.
+            {'stdin_half_close': {'action_index': 1, 'observed_bytes': {'stdout': 1, 'stderr': begin, 'tty': 0}}},
+            {'stdin_half_close': {'action_index': 1, 'observed_bytes': {'stdout': 0, 'stderr': begin + 1, 'tty': 0}}},
+            {'stdin_half_close': {'action_index': 1, 'observed_bytes': {'stdout': 0, 'stderr': begin, 'tty': 1}}},
+            {'stdin_half_close': {'action_index': 1, 'observed_bytes': {'stdout': 0, 'stderr': begin}}},
+        )
+        for change in rejected:
+            with self.subTest(change=change), self.assertRaises(ValueError):
+                fixture.validate_stream(stdout, stderr, 37, TOKEN, capture=capture_for(stdout, stderr, **change))
+        # Nothing observed at all is the ordinary ungated case, not a failure.
+        allowed = {'stdin_half_close': {'action_index': 0, 'observed_bytes': {'stdout': 0, 'stderr': 0, 'tty': 0}}}
+        self.assertTrue(fixture.validate_stream(stdout, stderr, 37, TOKEN,
+                                                capture=capture_for(stdout, stderr, **allowed))['eof_delivered_once'])
 
     def test_exact_tty_resize_and_sigint_record_not_numeric_signal_claim(self):
         proof = fixture.validate_tty(lines(tty_rows(), b'\r\n'), 37, TOKEN)
