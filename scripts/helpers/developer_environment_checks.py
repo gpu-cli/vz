@@ -11,14 +11,19 @@ Criterion 21 (`gate.cli.legacy_removal_and_bootstrap`):
   clean_up_refuses     `vz up` in a clean directory fails `definition_not_found`
                        with zero state mutation and no daemon
   bootstrap_read_only  a schema-valid minimal vz.json is read by `vz status`
-                       without spawning a daemon or creating state
+                       without spawning a daemon or creating state (the runtime
+                       directory it would spawn into is asserted absent)
   bootstrap_creates_default   a real `vz up` from a definition naming no
                        Environment creates `default`, then deletes it again
 Criterion 15 (`gate.cli_api.agreement`):
   help_surface_exact   root/subcommand help is exactly the five verbs
   error_envelope_agreement   `up` and `status` agree on `definition_not_found`
-  status_json_field_set      NOT IMPLEMENTED (needs persisted topology)
+  status_json_field_set      `vz --json status` over a live topology emits
+                       exactly its declared field set
   grpc_api_live_agreement    NOT IMPLEMENTED
+
+Every AF_UNIX path the installed binaries bind lives in the lane's short socket
+root, not under `--state-root`; see `developer_environment_recorder`.
 
 Sub-check ids are `<top-level id>__<slug>` (the lane-result schema allows
 exactly three dot-separated `[a-z_]+` segments, so a fourth `.slug` segment
@@ -38,8 +43,8 @@ import uuid
 
 from jsonschema import Draft202012Validator
 
-from developer_environment_recorder import (LaneState, Recorder, inventory, inventory_diff, processes_referencing,
-                                            write_inventory)
+from developer_environment_recorder import (ENDPOINT_NAME_BYTES, SOCKET_PATH_LIMIT, LaneState, Recorder, inventory,
+                                            inventory_diff, processes_referencing, write_inventory)
 from vz04_common import digest_file, load_json, now_ns, read_regular, write_exclusive
 
 HELP_SNAPSHOT = "tests/fixtures/vz-0.4/cli/help-snapshot.txt"
@@ -135,23 +140,29 @@ class CheckContext:
         return receipt
 
     def isolated(self, name: str, *, project_files: dict, provision: bool = False) -> dict:
-        """`<lane state>/<name>/{state,project}` plus an absent HOME.
+        """`<lane state>/<name>/{state,project}`, an absent HOME, and a runtime
+        directory in the lane's short AF_UNIX root.
 
         The daemon is absent by default so a read-only check can never spawn
         one. `provision=True` points at the release daemon instead, which is
         what a real `vz up` needs; only a check that also removes what it
         creates may ask for it.
+
+        Runtime sockets never live under `--state-root`: macOS cannot bind a
+        103+ byte path and a real state root is already longer than the budget
+        (see `developer_environment_recorder.socket_root_for`). A read-only
+        isolate's runtime directory is still not created here, so "no daemon
+        socket, PID file or runtime directory appeared" stays an assertion the
+        read-only checks make about a real path.
         """
         root = self.state.root / name
         root.mkdir(mode=0o700)
-        # Provisioning isolates keep the shallowest layout that still separates
-        # them: every AF_UNIX path underneath has a 103-byte budget, and the
-        # Docker endpoint name alone spends 45 of it.
-        state_dir = root if provision else root / "state"
-        if not provision:
-            state_dir.mkdir(mode=0o700)
+        state_dir = root / "state"
+        state_dir.mkdir(mode=0o700)
         project = root / "project"
         project.mkdir(mode=0o700)
+        self.state.socket_root.mkdir(mode=0o700, exist_ok=True)
+        runtime = self.state.isolate_runtime(name)
         overrides = {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon if provision else self.state.absent_daemon}
         if provision:
             # vz requires its runtime and Docker endpoint directories to be
@@ -160,8 +171,8 @@ class CheckContext:
             # after it has already admitted the request and allocated
             # identities. A Developer Machine also cannot reach `ready` without
             # a Docker client, and vz will not guess a path for one.
-            for directory in (RUNTIME_DIR, "docker"):
-                (state_dir / directory).mkdir(mode=0o700)
+            runtime.mkdir(mode=0o700)
+            (state_dir / "docker").mkdir(mode=0o700)
             if self.docker_client and self.docker_client != "none":
                 overrides["VZ_DOCKER_CLIENT"] = self.docker_client
             if self.plugins:
@@ -173,11 +184,10 @@ class CheckContext:
                     destination.chmod(0o500)
         for filename, data in project_files.items():
             write_exclusive(project / filename, data)
-        runtime = state_dir / (RUNTIME_DIR if provision else "runtime")
         env = self.state.env(HOME=root / "absent-home", VZ_RUNTIME_STATE_DB=state_dir / "stack-state.db",
                              VZ_RUNTIME_DATA_DIR=runtime, VZ_RUNTIME_DAEMON_SOCKET=runtime / "d.sock",
                              VZ_DOCKER_CONFIG=state_dir / "docker", **overrides)
-        return {"root": root, "state": state_dir, "project": project, "env": env}
+        return {"root": root, "state": state_dir, "project": project, "runtime": runtime, "env": env}
 
 
 def _single_json_line(data: bytes):
@@ -226,7 +236,10 @@ def check_bare_help(ctx: CheckContext, top: str) -> SubCheck:
     diff = inventory_diff(before, after)
     check.check(not diff, "isolated root (read-only empty state, project, absent HOME) byte-identical after every invocation"
                 if not diff else "isolated root changed: " + "; ".join(diff[:6]))
-    check.check(not os.path.lexists(iso["env"]["VZ_RUNTIME_DAEMON_SOCKET"]), "no daemon socket created")
+    # The runtime directory is outside the isolated root (AF_UNIX budget), so the
+    # inventory above cannot speak for it: assert it directly.
+    check.check(not os.path.lexists(iso["runtime"]),
+                f"no runtime directory, daemon socket or PID file created at {iso['runtime']}")
     check.check(not os.path.lexists(iso["env"]["HOME"]), "absent HOME not created")
     iso["state"].chmod(0o700)
     return check.finish()
@@ -367,9 +380,12 @@ def check_clean_up(ctx: CheckContext, top: str) -> SubCheck:
     check.check(not diff, "lane state root inventory identical before/after (zero mutation)" if not diff
                 else "lane state root changed: " + "; ".join(diff[:6]))
     check.check(os.listdir(iso["project"]) == [], "clean project directory still empty")
-    check.check(not os.path.lexists(env["VZ_RUNTIME_DAEMON_SOCKET"]) and not os.path.lexists(ctx.state.socket), "no daemon socket created")
+    # Runtime directories live in the lane's short AF_UNIX root, which the state
+    # root inventory above does not cover: name both of them explicitly.
+    check.check(not os.path.lexists(iso["runtime"]) and not os.path.lexists(ctx.state.runtime),
+                f"no runtime directory or daemon socket created ({iso['runtime']}, {ctx.state.runtime})")
     live = processes_referencing(ctx.state)
-    check.check(not live, "no live process references the lane state root" if not live else f"live processes: {live[:3]}")
+    check.check(not live, "no live process references either lane root" if not live else f"live processes: {live[:3]}")
     return check.finish()
 
 
@@ -415,21 +431,23 @@ def check_bootstrap_read_only(ctx: CheckContext, top: str) -> SubCheck:
     after, path = write_inventory(ctx.evidence_dir, "bootstrap-state-root-after", ctx.state.root)
     check.evidence.append(path)
     diff = inventory_diff(before, after)
-    check.check(not diff, "lane state root identical: no state DB, runtime dir or socket created" if not diff
+    check.check(not diff, "lane state root identical: no state DB created" if not diff
                 else "lane state root changed: " + "; ".join(diff[:6]))
+    # The runtime directory (socket, PID file, log) is in the lane's short
+    # AF_UNIX root, outside the inventory above: a spawn would show here.
+    created = inventory(iso["runtime"])
+    check.check(not os.path.lexists(iso["runtime"]),
+                f"no runtime directory, daemon socket or PID file created at {iso['runtime']}"
+                if not os.path.lexists(iso["runtime"]) else
+                f"read-only status created {iso['runtime']}: " + "; ".join(row[0] for row in created[:6]))
     live = processes_referencing(ctx.state)
-    check.check(not live, "no live process references the lane state root" if not live else f"live processes: {live[:3]}")
+    check.check(not live, "no live process references either lane root" if not live else f"live processes: {live[:3]}")
     return check.finish()
 
 
 UP_TIMEOUT = 900
 DELETE_TIMEOUT = 300
 GIT = "/usr/bin/git"
-SOCKET_PATH_LIMIT = 103
-# `vzr1-ot-` + 32 hex + `.sock`, the longest endpoint name observed.
-ENDPOINT_NAME_BYTES = 45
-# One character: the runtime directory of a provisioning isolate.
-RUNTIME_DIR = "r"
 
 
 CONCURRENT = 3

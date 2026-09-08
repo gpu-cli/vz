@@ -6,11 +6,16 @@ with exactly the argv contract from `vz04_lanes.lane_argv`. A schema-valid
 `<evidence-dir>/lane-result.json` is written on every exit path where the
 identity fields (run-id, digests, phase) permit one.
 
-What is physical today (phase `clean-provision`, installed release binaries,
-isolated state under `<state-root>/topology`, no Machine ever provisioned):
-criterion 21 sub-checks bare_help, legacy_rejection, clean_up_refuses,
-bootstrap_read_only and criterion 15 sub-checks help_surface_exact,
-error_envelope_agreement. Everything else is reported FAIL with an explicit
+Isolated state lives under `<state-root>/topology`; the AF_UNIX sockets the
+installed binaries bind live in a short root derived from the state root
+(`developer_environment_recorder.socket_root_for`), because macOS cannot bind a
+103+ byte path and a real `--state-root` is already over that budget. Both roots
+are owned by the lane: created here, scanned for daemons/strays, removed at
+final-cleanup.
+
+Every sub-check but `grpc_api_live_agreement` is physical, including the ones
+that provision real Developer Machines and delete them again. What is not
+implemented is reported FAIL with an explicit
 `not_implemented` assertion; the lane outcome is then `failed` with
 `failure.reason: not_implemented` (exit 3) so accounting stays honest. A real
 regression in an implemented sub-check yields `assertion` (exit 1).
@@ -250,7 +255,10 @@ class Lane:
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
         rows, path = write_inventory(self.evidence_dir, "lane-state-root-before-cleanup", state.root)
-        cleanup_errors, leaks, notes = [], [], [f"lane state root: {state.root}", f"entries before cleanup: {len(rows)}"]
+        socket_rows, _socket_path = write_inventory(self.evidence_dir, "lane-socket-root-before-cleanup", state.socket_root)
+        cleanup_errors, leaks, notes = [], [], [f"lane state root: {state.root}", f"entries before cleanup: {len(rows)}",
+                                                f"lane socket root: {state.socket_root}",
+                                                f"socket root entries before cleanup: {len(socket_rows)}"]
         try:
             daemons = stop_daemons(state)
             notes.append(f"daemons stopped: {daemons if daemons else 'none present'}")
@@ -259,14 +267,17 @@ class Lane:
         live = processes_referencing(state)
         for pid, command in live:
             leaks.append({"kind": "process", "identifier": f"pid {pid}: {command[:200]}"})
-        if not cleanup_errors and not leaks and state.root.exists():
-            try:
-                shutil.rmtree(state.root)
-            except OSError as error:
-                cleanup_errors.append(f"cannot remove lane state root: {error}")
-        remaining = inventory(state.root)
-        for relative, kind, _mode, _size, _digest in remaining:
-            leaks.append({"kind": kind, "identifier": f"{state.root}/{relative}"})
+        if not cleanup_errors and not leaks:
+            for root in state.roots():
+                if not root.exists():
+                    continue
+                try:
+                    shutil.rmtree(root)
+                except OSError as error:
+                    cleanup_errors.append(f"cannot remove lane root {root}: {error}")
+        remaining = [(root, row) for root in state.roots() for row in inventory(root)]
+        for root, (relative, kind, _mode, _size, _digest) in remaining:
+            leaks.append({"kind": kind, "identifier": f"{root}/{relative}"})
         notes.append(f"entries after cleanup: {len(remaining)}")
         write_exclusive(self.evidence_dir / "cleanup.txt", ("\n".join(notes + cleanup_errors) + "\n").encode())
         scenarios, summary = [], {"PASS": [], "FAIL": [], "not_implemented": []}
@@ -292,14 +303,15 @@ class Lane:
                 write_exclusive(self.evidence_dir / "checks" / f"{sub.slug}.txt", text.encode())
                 summary["not_implemented" if sub.not_implemented else sub.status].append(sub.slug)
         if cleanup_errors or leaks:
-            result = self.failed("cleanup", "final-cleanup could not positively remove the lane state root: " +
+            result = self.failed("cleanup", "final-cleanup could not positively remove the lane state and socket roots: " +
                                  "; ".join(cleanup_errors or [f"{len(leaks)} survivors"]), EXIT_FAILED, scenarios=scenarios,
                                  extra={"cleanup_errors": cleanup_errors, "leaks": leaks, "handoff": self.handoff_record(),
                                         "retained_root": str(state.root) if state.root.exists() else None, "evidence_files": self.evidence_files()})
             self.write_result(result)
             return EXIT_FAILED
         detail = (f"sub-checks PASS={summary['PASS']} FAIL={summary['FAIL']} not_implemented={summary['not_implemented']}; "
-                  "lane state root removed, nothing of this lane remains outside the retained evidence directory")
+                  "lane state root and socket root removed, nothing of this lane remains outside the retained "
+                  "evidence directory")
         extra = {"handoff": self.handoff_record(), "retained_root": None, "evidence_files": self.evidence_files()}
         if crash:
             result = self.failed("crash", "topology lane final-cleanup crashed; see crash.txt: " + detail,
@@ -324,6 +336,19 @@ class Lane:
             result = self.failed("prerequisite", f"lane state root already exists before clean-provision: {state.root}", EXIT_FAILED)
             self.write_result(result)
             return EXIT_FAILED
+        if os.path.lexists(state.socket_root):
+            result = self.failed("prerequisite", f"lane AF_UNIX socket root already exists before clean-provision: "
+                                 f"{state.socket_root}; a previous run of this state root leaked it", EXIT_FAILED)
+            self.write_result(result)
+            return EXIT_FAILED
+        # A socket the installed binaries cannot bind fails every provisioning
+        # check for a reason that has nothing to do with the runtime; say so
+        # before running anything rather than reporting it as an assertion.
+        budget = state.socket_budget()
+        if not budget["bindable"]:
+            result = self.failed("prerequisite", f"lane AF_UNIX paths exceed the macOS sun_path limit: {budget}", EXIT_FAILED)
+            self.write_result(result)
+            return EXIT_FAILED
         codesign = self.release_findings()
         if codesign:
             result = self.failed("prerequisite", "release components failed codesign re-verification; refusing to execute: " +
@@ -334,8 +359,9 @@ class Lane:
         recorder = Recorder(self.evidence_dir, self.ctx.run_id)
         write_exclusive(self.evidence_dir / "lane-facts.txt", (
             f"lane state root: {state.root}\ncli: {state.cli}\ncli sha256: {digest_file(state.cli)}\n"
-            f"daemon: {state.daemon}\ndaemon sha256: {digest_file(state.daemon)}\nsocket: {state.socket}\n"
-            f"socket path bindable (<= 103 bytes): {state.socket_path_bindable()}\n"
+            f"daemon: {state.daemon}\ndaemon sha256: {digest_file(state.daemon)}\n"
+            f"lane socket root: {state.socket_root}\nsocket: {state.socket}\n"
+            f"socket budget: {state.socket_budget()}\n"
             f"release signing_class: {self.release['signing_class']}\nrelease version: {self.release['release_version']}\n").encode())
         ctx = checks.CheckContext(repo_root=self.repo_root, release_dir=self.ctx.release_dir, state=state, recorder=recorder,
                                   evidence_dir=self.evidence_dir, cli_removal=self.cli_removal,

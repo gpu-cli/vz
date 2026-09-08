@@ -13,12 +13,14 @@ import subprocess
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import developer_environment_e2e as e2e  # noqa: E402
+import developer_environment_recorder as recorder  # noqa: E402
 import developer_environment_test_support as support  # noqa: E402
 import test_vz04_fixtures as fixtures  # noqa: E402
 import vz04_common as common  # noqa: E402
@@ -42,22 +44,45 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # Criterion 15's last blocker: agreement must be observed over the daemon's own
 # gRPC channel, which needs a pinned client this lane does not have.
 NOT_IMPLEMENTED = {"grpc_api_live_agreement"}
+# One component that puts the fixture's `--state-root` at the depth a real gate
+# run has, so no socket can be bound anywhere under it.
+DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
 
 
 class TopologyLaneTests(unittest.TestCase):
     def setUp(self):
-        # Short root: isolated Unix socket paths must stay under macOS's sun_path limit.
         self.tmp = Path(tempfile.mkdtemp(prefix="vztl-", dir="/private/tmp"))
         self.mode_file = self.tmp / "mode"
         self.release = support.build_fake_release(self.tmp / "release", mode_file=self.mode_file)
-        self.state_root = self.tmp / "state"
+        # A state root as deep as the gate's own: `vz04_gate` mkdtemps under
+        # `/var/folders/<2>/<28>/T` and the observed run's was 115 bytes.
+        # Nothing the lane binds may depend on the state root being short --
+        # that is exactly what stalled every provisioning sub-check, and a short
+        # fixture root hides it.
+        self.state_root = self.tmp / DEEP_STATE_ROOT_PADDING / "state"
         self.contract = contract_module.load_contract()
         self.lane = contract_module.lane_by_name(self.contract)["topology"]
         self.counter = 0
+        self.socket_root = recorder.socket_root_for(self.state_root)
+        self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
 
     def tearDown(self):
         fixtures.make_writable(self.release)
         shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_fixture_state_root_reproduces_the_af_unix_constraint(self):
+        """The fixture must reproduce the constraint, not dodge it."""
+        state = e2e.LaneState(self.state_root, self.release / "bin")
+        # Both AF_UNIX paths the old layout produced are over the limit under a
+        # state root of gate depth: the daemon socket and, by 45 bytes more, a
+        # Machine's Docker endpoint.
+        daemon_socket = self.state_root / "topology" / "boot" / "r" / "d.sock"
+        endpoint = daemon_socket.parent / ("x" * recorder.ENDPOINT_NAME_BYTES)
+        for path in (daemon_socket, endpoint):
+            self.assertGreater(len(str(path).encode()), recorder.SOCKET_PATH_LIMIT, path)
+        budget = state.socket_budget()
+        self.assertTrue(budget["bindable"], budget)
+        self.assertFalse(str(state.socket).startswith(str(self.state_root)))
 
     def set_mode(self, mode: str):
         self.mode_file.write_text(mode)
@@ -193,6 +218,26 @@ class TopologyLaneTests(unittest.TestCase):
         code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
         self.assertEqual((code, result["failure"]["reason"]), (1, "prerequisite"))
 
+    def test_existing_socket_root_is_a_prerequisite_failure(self):
+        """A leaked socket root would silently share sockets between runs."""
+        self.socket_root.mkdir(mode=0o700)
+        evidence = self.evidence()
+        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        self.assertEqual((code, result["failure"]["reason"]), (1, "prerequisite"))
+        self.assertIn(str(self.socket_root), result["failure"]["detail"])
+        self.assertFalse((self.state_root / "topology").exists())
+
+    def test_unbindable_socket_root_is_a_prerequisite_failure(self):
+        """Sockets nothing can bind are said once, not re-derived per sub-check."""
+        deep = self.tmp / ("d" * 90)
+        deep.mkdir()
+        evidence = self.evidence()
+        with mock.patch.object(recorder, "SOCKET_ROOT_BASE", deep):
+            code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        self.assertEqual((code, result["failure"]["reason"]), (1, "prerequisite"))
+        self.assertIn("sun_path", result["failure"]["detail"])
+        self.assertFalse((self.state_root / "topology").exists())
+
     def assert_regression(self, mode: str, slug: str, needle: str):
         self.set_mode(mode)
         evidence = self.evidence()
@@ -235,13 +280,16 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual((code, result["failure"]["reason"]), (1, "assertion"))
         sub = self.by_slug(result)["bootstrap_read_only"]
         self.assertEqual(sub["status"], "FAIL")
-        self.assertTrue(any("lane state root changed" in a for a in sub["assertions"]), sub["assertions"])
+        # The spawn happens in the lane's socket root, which the state-root
+        # inventory cannot see; the check names that directory itself.
+        self.assertTrue(any("read-only status created" in a for a in sub["assertions"]), sub["assertions"])
         self.assertEqual((result["cleanup_errors"], result["leaks"]), ([], []))
         cleanup = (evidence / "cleanup.txt").read_text()
         self.assertIn("graceful_shutdown_observed", cleanup)
         self.assertIn(str(self.release / "bin/vz-runtimed"), cleanup)
-        self.assertEqual(sorted((self.state_root / "topology").rglob("*.pid")), [])
-        self.assertFalse(list((self.state_root / "topology").rglob("*.sock")))
+        for root in (self.state_root / "topology", self.socket_root):
+            self.assertEqual(sorted(root.rglob("*.pid")), [], root)
+            self.assertFalse(list(root.rglob("*.sock")), root)
 
     def test_unattributable_pid_file_is_a_cleanup_failure(self):
         self.set_mode("bogus_pid")
@@ -277,8 +325,12 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual(self.top(result, TOP11)["status"], "PASS")
         self.assertIsNone(result["retained_root"])
         self.assertFalse((self.state_root / "topology").exists())
+        # The socket root is owned state too: final-cleanup removes it, or the
+        # lane leaks every daemon socket it ever bound.
+        self.assertFalse(self.socket_root.exists(), self.socket_root)
         self.assertEqual((result["cleanup_errors"], result["leaks"]), ([], []))
-        self.assertTrue((evidence / "inventories/lane-state-root-before-cleanup.txt").is_file())
+        for name in ("lane-state-root-before-cleanup.txt", "lane-socket-root-before-cleanup.txt"):
+            self.assertTrue((evidence / "inventories" / name).is_file(), name)
 
     def test_final_cleanup_reports_live_process_as_leak(self):
         root = self.state_root / "topology"
