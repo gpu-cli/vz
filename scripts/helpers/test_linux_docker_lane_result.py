@@ -144,12 +144,57 @@ class ResultShapeTests(Scratch):
         self.assertEqual({s["status"] for s in lane["scenarios"]}, {"PASS"})
         self.assertEqual(lane["scenarios"][0]["evidence"], ["harness/limits-machine-0/machine-limits-validation.json"])
         self.assertEqual(lane["scenarios"][0]["readiness_polls"][0]["samples"], 60)
-        self.assertEqual(lane["process_starts"], [{"scenario_id": "docker.operation.resource_limits", "argv0": "docker", "pid": None}] * 2)
+        # One row per accounting scenario, not one per receipt: the validator rejects a scenario started twice.
+        self.assertEqual(lane["process_starts"], [{"scenario_id": "docker.operation.resource_limits", "argv0": "docker", "pid": None}])
         self.assertEqual(lane["prohibited_observed"], {k: False for k in subject.PROHIBITED_KEYS})
         self.assertEqual(lane["retained_root"], "/private/tmp/vzdev-x")
-        self.assertEqual(lane["evidence_files"], ["harness/001-engine-info.stdout", "harness/limits-machine-0/machine-limits-validation.json",
-                                                  "harness/checksums.sha256"])
+        self.assertEqual(lane["evidence_files"], ["harness/checksums.sha256", "harness/limits-machine-0/machine-limits-validation.json"])
         self.assertEqual(lane["release_dir_sha256"] != DIGEST, True)
+
+    def composed_harness(self):
+        """A `--suite all` result: the gate's own invocation, one Machine slice per suite."""
+        harness, result, _ = self.synthetic_harness()
+        suites = ("handshake", "limits")
+        slices, evidence = {}, []
+        for suite in suites:
+            slices[suite] = [{"started_unix_ns": 1500, "ended_unix_ns": 2500,
+                              "workload": {"sibling_health": {"samples": 60}}, "health": {"samples": 60}}]
+            for pattern in scenarios.SUITES[suite].evidence:
+                relative = pattern.format(index=0)
+                path = harness / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+                evidence.append(relative)
+        with open(harness / "checksums.sha256", "a") as stream:
+            stream.write("".join(DIGEST + "  " + relative + "\n" for relative in evidence))
+        result["suite"] = "all"
+        result["outcome"] = "passed_dev_installed_all_slice"
+        result["scenario"] = {"machine_slices": [row for suite in suites for row in slices[suite]],
+                              "suite_slices": slices, "suites_executed": list(suites)}
+        return harness, result, {"suite": "all"}
+
+    def test_composed_run_translates_every_executed_suite(self):
+        harness, result, info = self.composed_harness()
+        ctx = subject.gate_context(self.argv()).validate()
+        lane = subject.from_run(ctx, result, info, harness, 0)
+        self.validate(lane)
+        self.assertEqual(lane["outcome"], "passed", lane["failure"])
+        identifiers = [entry["id"] for entry in lane["scenarios"]]
+        self.assertEqual(identifiers, list(scenarios.for_suite("handshake")) + list(scenarios.for_suite("limits")))
+        self.assertEqual({entry["status"] for entry in lane["scenarios"] if entry["id"].startswith("docker.operation.")}, {"PASS"})
+        # Each suite accounts for its host work exactly once; duplicates are a validator finding.
+        starts = [entry["scenario_id"] for entry in lane["process_starts"]]
+        self.assertEqual(starts, ["docker.engine.version", "docker.operation.resource_limits"])
+        self.assertEqual(len(set(starts)), len(starts))
+        self.assertIn("harness/limits-machine-0/machine-limits-validation.json", lane["evidence_files"])
+        self.assertIn("harness/handshake-machine-0/machine-handshake-validation.json", lane["evidence_files"])
+
+    def test_composed_run_without_per_suite_slices_is_rejected(self):
+        harness, result, info = self.composed_harness()
+        del result["scenario"]["suite_slices"]
+        ctx = subject.gate_context(self.argv()).validate()
+        with self.assertRaises(subject.driver.Rejected):
+            subject.from_run(ctx, result, info, harness, 0)
 
     def test_failed_run_maps_reason_and_marks_every_suite_scenario_fail(self):
         harness, result, info = self.synthetic_harness(passed=False)
@@ -203,8 +248,8 @@ class RetainedCandidateTests(Scratch):
             self.assertEqual(len(entry["evidence"]), 3)
             self.assertEqual(entry["readiness_polls"], [{"id": "poll.service.health_probe", "samples": 180, "deadline_seconds": 60, "satisfied": True}])
             self.assertLess(entry["started_unix_ns"], entry["ended_unix_ns"])
-        self.assertGreater(len(lane["process_starts"]), 100)
-        self.assertTrue(all(p["scenario_id"] == "docker.operation.resource_limits" and p["pid"] is None for p in lane["process_starts"]))
+        self.assertEqual(lane["process_starts"], [{"scenario_id": "docker.operation.resource_limits",
+                                                   "argv0": lane["process_starts"][0]["argv0"], "pid": None}])
         self.assertEqual(lane["prohibited_observed"], {k: False for k in subject.PROHIBITED_KEYS})
         self.assertEqual(lane["retained_root"], result["retained_root"])
         self.assertIn("harness/result.json", lane["evidence_files"])

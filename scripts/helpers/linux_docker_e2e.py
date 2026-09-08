@@ -1398,8 +1398,7 @@ def main(argv):
     except (Exception, KeyboardInterrupt) as error:
         print(f"error: {error}", file=sys.stderr)
         if ctx is not None:
-            reason = "not_implemented" if ctx.suite == "all" else "input_rejected"
-            lane_result.write(ctx, lane_result.failed(ctx, reason, f"{type(error).__name__}: {error}", 2))
+            lane_result.write(ctx, lane_result.failed(ctx, "input_rejected", f"{type(error).__name__}: {error}", 2))
         return 2
     if ctx is not None:
         harness = ctx.harness_dir()

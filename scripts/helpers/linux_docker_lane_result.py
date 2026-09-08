@@ -13,8 +13,11 @@ fully proven manifest `expected` block, never release certification -- the
 aggregate validator (`vz04_lanes.account`) decides. `release_scenarios_passed`
 in the harness `result.json` stays `[]`.
 
+The gate invokes the composed run (`--suite all`); its result carries every
+executed suite's Machine slices under `scenario.suite_slices`, and each suite
+contributes the scenarios of its own claims to the one lane result.
+
 Failure mapping (`failure_reason`):
-  `--suite all`                      -> not_implemented (before any provisioning)
   argument/preflight rejection       -> input_rejected
   harness `cleanup_errors` non-empty -> cleanup
   harness `error` mentioning an uncertain mutation -> uncertain_effects
@@ -42,12 +45,21 @@ LANE = "linux-docker"
 ENTRY_POINT = "scripts/run-linux-docker-e2e.sh"
 RESULT_NAME = "lane-result.json"
 HARNESS_SUBDIR = "harness"
+COMPOSED_SUITE = "all"
+RUN_DOCUMENTS = ("result.json", "run-info.json", "checksums.sha256")
 GATE_TRIO = ("run-id", "phase", "candidate-tuple")
 GATE_OPTIONS = ("phase", "contract", "candidate-tuple", "fixture-sha256", "handoff", "state-root")
 SCANNED_OPTIONS = (*GATE_TRIO, *GATE_OPTIONS, "evidence-dir", "release-dir", "suite")
 RUN_ID = r"[a-z0-9][a-z0-9-]{7,63}"
 DIGEST = r"[0-9a-f]{64}"
 RECEIPT_LIMIT = 4 * 1024 * 1024
+# One line per digested file: a composed run digests tens of thousands of them.
+CHECKSUMS_LIMIT = 64 * 1024 * 1024
+# A composed run's result carries every suite's evidence at once — the whole
+# continuous-sentinel sample series, the SSH cache proofs, the registry session
+# records — and runs to tens of megabytes, where a single-suite result is small.
+# Bounding it at the per-receipt limit rejected the only result that matters.
+RESULT_LIMIT = 128 * 1024 * 1024
 STREAM_LIMIT = 8 * 1024 * 1024
 HARNESS_RECEIPT = re.compile(r"^\d{3}-.+\.intent\.json$")
 DRIVER_RECEIPT = re.compile(r"^command-\d{5}\.intent\.json$")
@@ -192,10 +204,20 @@ def _read_json(path, limit):
 
 
 def load_result(harness_dir):
-    """The harness `result.json` a completed suite run leaves in its evidence dir."""
+    """The harness `result.json` a completed suite run leaves in its evidence dir.
+
+    A rejected read must say so here. `_read_json` returns None on any failure,
+    and passing that on turned "the result exceeded its bound" into an
+    AttributeError three frames away, in the one path that only ever runs after
+    a suite has actually completed.
+    """
     path = Path(harness_dir) / "result.json"
     require(path.is_file() and not path.is_symlink(), "harness result.json is missing: " + str(path))
-    return _read_json(path, RECEIPT_LIMIT)
+    result = _read_json(path, RESULT_LIMIT)
+    require(isinstance(result, dict),
+            "harness result.json is unreadable or exceeds its %d byte bound: %s is %d bytes"
+            % (RESULT_LIMIT, path, path.stat().st_size))
+    return result
 
 
 def receipts(harness_dir):
@@ -220,11 +242,29 @@ def receipts(harness_dir):
     return rows
 
 
-def process_starts(rows, suite):
-    """Attribute every harness/driver host process start to the suite's declared accounting scenario."""
-    scenario_id = scenarios.SUITES[suite].process_scenario
-    return [{"scenario_id": scenario_id, "argv0": row["argv0"], "pid": row["pid"] if row["pid"] and row["pid"] >= 1 else None}
-            for row in rows]
+def _earliest(rows):
+    ordered = sorted(rows, key=lambda row: row["started_unix_ns"] if isinstance(row["started_unix_ns"], int) and
+                     row["started_unix_ns"] >= 0 else float("inf"))
+    return ordered[0] if ordered else None
+
+
+def process_starts(rows, suites):
+    """One row per suite: the first host process its own Machine evidence recorded.
+
+    A Docker suite starts thousands of host processes for one accounting
+    scenario, so listing them all would report that scenario as started many
+    times, which the aggregate validator rejects. The suite accounts for its host
+    work once, and `prohibited_observed` is what reads every receipt.
+    """
+    starts = []
+    for suite in suites:
+        prefix = scenarios.machine_prefix(suite)
+        row = _earliest([row for row in rows if row["path"].startswith(prefix)]) or _earliest(rows)
+        if row is None:
+            continue
+        starts.append({"scenario_id": scenarios.SUITES[suite].process_scenario, "argv0": row["argv0"],
+                       "pid": row["pid"] if row["pid"] and row["pid"] >= 1 else None})
+    return starts
 
 
 def run_window(rows):
@@ -292,25 +332,63 @@ def prohibited(harness_dir, rows):
     return flags, guard_proofs
 
 
-def evidence_files(harness_dir, prefix=HARNESS_SUBDIR):
-    """Relative evidence list from the harness `checksums.sha256` (plus that file itself)."""
+def digested(harness_dir, prefix=HARNESS_SUBDIR):
+    """Every relative path the harness `checksums.sha256` commits to, by digest."""
     checksums = harness_dir / "checksums.sha256"
     if not checksums.is_file() or checksums.is_symlink():
-        return []
-    files = []
-    for line in driver.regular(checksums, RECEIPT_LIMIT).decode("utf-8", "replace").splitlines():
+        return frozenset()
+    paths = set()
+    for line in driver.regular(checksums, CHECKSUMS_LIMIT).decode("utf-8", "replace").splitlines():
         digest, separator, relative = line.partition("  ")
         if separator and re.fullmatch(DIGEST, digest) and relative:
-            files.append(prefix + "/" + relative)
-    files.append(prefix + "/checksums.sha256")
-    return files
+            paths.add(prefix + "/" + relative)
+    return frozenset(paths)
+
+
+def evidence_files(committed, cited, prefix=HARNESS_SUBDIR):
+    """What the lane declares: the run documents plus every file a scenario cites.
+
+    A composed run digests tens of thousands of files, and declaring all of them
+    would push the lane result past the gate's own JSON bound without adding a
+    claim -- `checksums.sha256` already commits to each one by digest, and the
+    gate scans the whole retained tree itself. So the declaration is the evidence
+    the scenarios actually rest on, and every path in it must appear in that
+    digest manifest.
+    """
+    documents = {prefix + "/" + name for name in RUN_DOCUMENTS}
+    return sorted((documents | set(cited)) & (committed | {prefix + "/checksums.sha256"}))
+
+
+def _machine_slices(block):
+    return [item for item in block if isinstance(item, dict)] if isinstance(block, list) else []
+
+
+def executed_suites(result, info):
+    """Every suite the run covered, paired with its Machine slices, in run order.
+
+    A single-suite run yields one pair from `scenario.machine_slices`; the
+    composed run the gate invokes yields one pair per executed suite from
+    `scenario.suite_slices`, which the harness writes only for `--suite all`.
+    """
+    suite = result.get("suite") or info.get("suite")
+    block = result.get("scenario") if isinstance(result.get("scenario"), dict) else {}
+    if suite != COMPOSED_SUITE:
+        require(suite in scenarios.SUITES, "unknown suite in harness result: " + repr(suite))
+        return ((suite, _machine_slices(block.get("machine_slices"))),)
+    executed, per_suite = block.get("suites_executed"), block.get("suite_slices")
+    require(isinstance(executed, list) and executed and isinstance(per_suite, dict),
+            "composed harness result carries no per-suite Machine slices")
+    covered = []
+    for name in executed:
+        require(name in scenarios.SUITES, "unknown suite in harness result: " + repr(name))
+        covered.append((name, _machine_slices(per_suite.get(name))))
+    return tuple(covered)
 
 
 def from_run(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT, prefix=HARNESS_SUBDIR):
-    """Translate one DEV suite run (`result.json` + `info`) into a lane result."""
+    """Translate one DEV run (`result.json` + `info`) into a lane result."""
     harness_dir = Path(harness_dir)
-    suite = result.get("suite") or info.get("suite")
-    require(suite in scenarios.SUITES, "unknown suite in harness result: " + repr(suite))
+    covered = executed_suites(result, info)
     lane = base(ctx, repo_root)
     error, cleanup_errors = result.get("error"), list(result.get("cleanup_errors") or [])
     passed = error is None and not cleanup_errors and str(result.get("outcome", "")).startswith("passed_")
@@ -320,18 +398,25 @@ def from_run(ctx, result, info, harness_dir, exit_code, *, repo_root=REPO_ROOT, 
         passed, error = False, "no retained Engine runtime guard proof (info DefaultRuntime/Runtimes) in harness evidence"
     if passed and any(flags.values()):
         passed, error = False, "prohibited component observed: " + ", ".join(sorted(k for k, v in flags.items() if v))
-    slices = []
-    scenario_block = result.get("scenario")
-    if isinstance(scenario_block, dict) and isinstance(scenario_block.get("machine_slices"), list):
-        slices = [item for item in scenario_block["machine_slices"] if isinstance(item, dict)]
-    lane["scenarios"] = scenarios.lane_scenarios(suite, slices, phase=lane["phase"], passed=passed, error=error,
-                                                 evidence_prefix=prefix, window=run_window(rows))
-    lane["process_starts"] = process_starts(rows, suite)
+    manifest_rows, window = scenarios.manifest(), run_window(rows)
+    lane["scenarios"] = [entry for suite, slices in covered
+                         for entry in scenarios.lane_scenarios(suite, slices, phase=lane["phase"], passed=passed, error=error,
+                                                               evidence_prefix=prefix, window=window, rows=manifest_rows)]
+    lane["process_starts"] = process_starts(rows, [suite for suite, _ in covered])
     lane["prohibited_observed"] = flags
     lane["cleanup_errors"] = [] if passed else cleanup_errors
     retained = result.get("retained_root")
     lane["retained_root"] = retained if isinstance(retained, str) and retained.startswith("/") else None
-    lane["evidence_files"] = evidence_files(harness_dir, prefix)
+    committed = digested(harness_dir, prefix)
+    cited = {path for entry in lane["scenarios"] for path in entry["evidence"]}
+    undigested = sorted(path for entry in lane["scenarios"] if entry["status"] == "PASS" for path in entry["evidence"]
+                        if path not in committed)
+    if passed and undigested:
+        passed, error = False, "scenario cites evidence the harness never digested: " + ", ".join(undigested[:5])
+        lane["scenarios"] = [entry for suite, slices in covered
+                             for entry in scenarios.lane_scenarios(suite, slices, phase=lane["phase"], passed=passed, error=error,
+                                                                   evidence_prefix=prefix, window=window, rows=manifest_rows)]
+    lane["evidence_files"] = evidence_files(committed, cited, prefix)
     if passed:
         lane["outcome"] = "passed"
     else:

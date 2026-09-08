@@ -292,6 +292,14 @@ def _timing(slices, key, pick, fallback):
     return pick(values) if values else fallback
 
 
+def machine_prefix(suite):
+    """The per-Machine evidence directory a suite's own receipts land under (`limits-machine-`)."""
+    head = SUITES[suite].evidence[0].split("/")[0]
+    prefix, marker, _ = head.partition("{index}")
+    require(marker and prefix, "suite evidence is not per-Machine: " + str(suite))
+    return prefix
+
+
 def lane_scenarios(suite, slices, *, phase, passed, error=None, evidence_prefix="harness", window=None, rows=None):
     """Lane-result `scenarios[]` for one suite run.
 
