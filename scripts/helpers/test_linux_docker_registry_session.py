@@ -216,6 +216,11 @@ class LogClassificationTests(unittest.TestCase):
 
 class SessionTests(unittest.TestCase):
     def setUp(self):
+        # A subTest that needs a fresh harness re-enters setUp; the previous
+        # call's patches have to stop first, or `Commands` is already a Mock and
+        # cannot be specced again.
+        for patcher in getattr(self, "patchers", ()):
+            patcher.stop()
         self.harness = SimpleNamespace(info={'run_id': 'run', 'registry_archive': '/owned/registry.tar',
             'registry': {'manifest_digest': 'sha256:' + 'b' * 64},
             'clients': {'docker': {'canonical': '/owned/docker'}}},
@@ -246,7 +251,7 @@ class SessionTests(unittest.TestCase):
                    patch.object(subject.startup, 'private', side_effect=lambda path: path),
                    patch.object(subject.startup, 'document'),
                    patch.object(subject.fixture, 'validate_tls_public'))
-        self.mocks = []
+        self.mocks, self.patchers = [], list(patches)
         for item in patches:
             self.mocks.append(item.start())
             self.addCleanup(item.stop)
