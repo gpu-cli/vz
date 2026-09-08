@@ -1,6 +1,8 @@
 """UNIT-TEST-ONLY fixtures for the topology lane: a POSIX-sh stand-in for the
-installed `vz` CLI, a copied `/bin/sh` standing in for `vz-runtimed`, and a
-fake release directory whose manifest/checksums bind those files. Behaviour
+installed `vz` CLI, a compiled stand-in for `vz-runtimed` (which both plays the
+autospawned daemon and serves as the fake `up`'s Machine-Docker-endpoint bind
+probe), and a fake release directory whose manifest/checksums bind those files.
+Behaviour
 is switched through a mode file the fake reads at startup (the lane never
 passes ambient environment to the CLI, so an env switch would be invisible).
 
@@ -80,6 +82,16 @@ if [ -n "$verb" ]; then
   if [ "$verb" = up ] && [ -f vz.json ]; then
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
     mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"
+    # A Developer Machine's Docker endpoint is an AF_UNIX socket bound in the
+    # runtime directory under the longest name the runtime mints
+    # (`vzr1-ot-<32 hex>.sock`). Bind it for real rather than trusting a length:
+    # an unbindable runtime directory must fail Up here exactly as it does on
+    # the installed binaries, whatever the caller believed about its budget.
+    ep="$VZ_RUNTIME_DATA_DIR/vzr1-ot-$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n').sock"
+    if ! "$(dirname "$0")/vz-runtimed" "$ep"; then
+      printf '{"error":{"code":"state_conflict","message":"endpoint requires a bounded absolute path without traversal"},"schema_version":1}\n' >&2
+      exit 1
+    fi
     # Runtime identities are minted per Up, not derived from the definition:
     # recreating one pinned definition must hand out entirely new ones.
     inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
@@ -209,15 +221,20 @@ static void on_term(int signal_number) {
     _exit(0);
 }
 
+/* argv[1] alone: bind that path, release it, exit. This is the Machine Docker
+   endpoint probe the fake `vz up` uses -- it decides bindability by binding,
+   not by measuring. argv[1..3]: run as the autospawned daemon stand-in. */
 int main(int argc, char **argv) {
     struct sockaddr_un address;
     int descriptor;
-    if (argc != 4) {
+    if (argc != 2 && argc != 4) {
         return 2;
     }
     snprintf(socket_path, sizeof(socket_path), "%s", argv[1]);
-    snprintf(pid_path, sizeof(pid_path), "%s", argv[2]);
-    snprintf(log_path, sizeof(log_path), "%s", argv[3]);
+    if (argc == 4) {
+        snprintf(pid_path, sizeof(pid_path), "%s", argv[2]);
+        snprintf(log_path, sizeof(log_path), "%s", argv[3]);
+    }
     memset(&address, 0, sizeof(address));
     address.sun_family = AF_UNIX;
     if (strlen(socket_path) >= sizeof(address.sun_path)) {
@@ -230,6 +247,11 @@ int main(int argc, char **argv) {
     }
     if (listen(descriptor, 1) != 0) {
         return 5;
+    }
+    if (argc == 2) {
+        close(descriptor);
+        unlink(socket_path);
+        return 0;
     }
     signal(SIGTERM, on_term);
     for (;;) {

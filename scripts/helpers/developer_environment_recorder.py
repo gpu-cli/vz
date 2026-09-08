@@ -2,7 +2,10 @@
 `topology` lane (`developer_environment_e2e.py`).
 
 Everything the installed CLI may touch is derived from the lane's
-`--state-root`; `~/.vz` and the ambient environment are never consulted.
+`--state-root` -- except its AF_UNIX sockets, which live in a short root derived
+from it (`socket_root_for`) because macOS cannot bind a 103+ byte path. Both
+roots are owned, scanned and removed by the lane; `~/.vz` and the ambient
+environment are never consulted.
 Receipts follow `schemas/vz-0.4-receipt.schema.json` so the aggregate
 validator schema-checks them by kind. Inventories are plain text so they are
 not mistaken for typed evidence.
@@ -30,6 +33,33 @@ DAEMON_SHUTDOWN_MARKER = b"runtime daemon shutting down"
 DAEMON_STOP_DEADLINE_SECONDS = 30
 # macOS sockaddr_un.sun_path is 104 bytes including the terminator.
 SOCKET_PATH_LIMIT = 103
+# `vzr1-ot-` + 32 hex + `.sock`: the longest Docker endpoint name a Developer
+# Machine is given inside its `VZ_RUNTIME_DATA_DIR`.
+ENDPOINT_NAME_BYTES = 45
+# The longest isolate name any check may ask for (`bootstrap`, `envelope`,
+# `net-a`); asserted so a new check cannot silently spend the socket budget.
+ISOLATE_NAME_BYTES = 16
+# Where this lane's AF_UNIX sockets live. They cannot live under `--state-root`:
+# the gate's own default state root is a `mkdtemp` under `/var/folders/.../T`
+# (75+ bytes before this lane adds a single component) and an endpoint name
+# alone spends 45 of the 103 bindable bytes, so no socket under such a root is
+# ever bindable and every provisioning check fails on the budget before it runs.
+# The installed user-level startup harness resolves the same constraint the same
+# way (`installed_developer_startup.Harness.__init__`): a short runtime root of
+# its own. Ownership is unchanged -- the lane creates this root, scans it for
+# daemons and stray sockets, and removes it at final-cleanup.
+SOCKET_ROOT_BASE = Path("/private/tmp")
+SOCKET_ROOT_PREFIX = "vzt-"
+
+
+def socket_root_for(state_root: Path) -> Path:
+    """The short AF_UNIX root belonging one-to-one to `state_root`.
+
+    Derived rather than random so every phase of one gate run addresses the same
+    root, and distinct so two lane runs never share one.
+    """
+    digest = hashlib.sha256(str(state_root).encode("utf-8", "surrogateescape")).hexdigest()[:12]
+    return SOCKET_ROOT_BASE / (SOCKET_ROOT_PREFIX + digest)
 
 
 class UncertainEffects(Exception):
@@ -41,12 +71,14 @@ class CleanupError(Exception):
 
 
 class LaneState:
-    """Paths under `<state-root>/topology` plus the isolated CLI environment."""
+    """Paths under `<state-root>/topology`, the lane's short AF_UNIX socket root,
+    and the isolated CLI environment."""
 
     def __init__(self, state_root: Path, release_bin: Path):
         self.state_root = Path(state_root)
         self.root = self.state_root / STATE_SUBDIR
-        self.runtime = self.root / "r"
+        self.socket_root = socket_root_for(self.state_root)
+        self.runtime = self.socket_root / "d"
         self.socket = self.runtime / "d.sock"
         self.database = self.root / "state.db"
         self.docker_config = self.state_root / DOCKER_CONFIG_DIRNAME
@@ -59,9 +91,24 @@ class LaneState:
     def create(self) -> None:
         self.root.mkdir(mode=0o700, parents=True, exist_ok=False)
         self.tmp.mkdir(mode=0o700)
+        self.socket_root.mkdir(mode=0o700, exist_ok=True)
 
-    def socket_path_bindable(self) -> bool:
-        return len(str(self.socket).encode()) <= SOCKET_PATH_LIMIT
+    def roots(self) -> tuple:
+        """Every directory this lane owns: persisted state and its AF_UNIX root."""
+        return (self.root, self.socket_root)
+
+    def isolate_runtime(self, name: str) -> Path:
+        """One isolate's runtime directory: its daemon socket and Docker endpoints."""
+        require(0 < len(name.encode()) <= ISOLATE_NAME_BYTES,
+                f"isolate name over the {ISOLATE_NAME_BYTES}-byte AF_UNIX budget: {name!r}")
+        return self.socket_root / name
+
+    def socket_budget(self) -> dict:
+        """The longest AF_UNIX paths this lane can produce, against the limit."""
+        daemon = len(str(self.socket).encode())
+        endpoint = len(str(self.socket_root / ("x" * ISOLATE_NAME_BYTES) / ("x" * ENDPOINT_NAME_BYTES)).encode())
+        return {"daemon_socket_bytes": daemon, "worst_case_endpoint_bytes": endpoint,
+                "limit_bytes": SOCKET_PATH_LIMIT, "bindable": max(daemon, endpoint) <= SOCKET_PATH_LIMIT}
 
     def env(self, **overrides) -> dict:
         env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "NO_COLOR": "1", "TMPDIR": str(self.tmp),
@@ -277,9 +324,14 @@ def ps_rows() -> list:
 
 
 def processes_referencing(state: LaneState, exclude_pids=()) -> list:
-    """Live processes whose command line names this lane's state root."""
-    needle = str(state.root)
-    return [(pid, command) for pid, command in ps_rows() if needle in command and pid not in exclude_pids and pid != os.getpid()]
+    """Live processes whose command line names either root this lane owns.
+
+    A daemon is dispatched with both its state store (under the state root) and
+    its socket (under the socket root), so neither root alone is a complete
+    needle."""
+    needles = [str(root) for root in state.roots()]
+    return [(pid, command) for pid, command in ps_rows()
+            if any(needle in command for needle in needles) and pid not in exclude_pids and pid != os.getpid()]
 
 
 def daemon_fingerprint(state: LaneState, pidfile: Path, socket_path: Path) -> dict:
@@ -298,20 +350,23 @@ def daemon_fingerprint(state: LaneState, pidfile: Path, socket_path: Path) -> di
 
 
 def daemon_artifacts(state: LaneState) -> list:
-    """(pidfile, socket) pairs for every `*.pid` file under the lane root. An
-    installed daemon writes `<socket stem>.pid` beside its socket."""
+    """(pidfile, socket) pairs for every `*.pid` file under either lane root. An
+    installed daemon writes `<socket stem>.pid` beside its socket, so in practice
+    these are found under the socket root."""
     pairs = []
-    for relative, kind, _mode, _size, _digest in inventory(state.root):
-        path = state.root / relative
-        if kind == "file" and path.suffix == ".pid":
-            pairs.append((path, path.with_suffix(".sock")))
+    for root in state.roots():
+        for relative, kind, _mode, _size, _digest in inventory(root):
+            path = root / relative
+            if kind == "file" and path.suffix == ".pid":
+                pairs.append((path, path.with_suffix(".sock")))
     return pairs
 
 
 def stray_sockets(state: LaneState) -> list:
-    """Sockets under the lane root without a daemon PID file beside them."""
-    return [state.root / relative for relative, kind, _m, _s, _d in inventory(state.root)
-            if kind == "socket" and not (state.root / relative).with_suffix(".pid").exists()]
+    """Sockets under either lane root without a daemon PID file beside them."""
+    return [root / relative for root in state.roots()
+            for relative, kind, _m, _s, _d in inventory(root)
+            if kind == "socket" and not (root / relative).with_suffix(".pid").exists()]
 
 
 def stop_daemons(state: LaneState) -> list:
