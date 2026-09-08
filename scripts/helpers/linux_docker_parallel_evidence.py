@@ -13,7 +13,8 @@ from linux_docker_compose_evidence import Invalid, MAX, decode, fixture_digest, 
 OP_KEYS = {"schema_version", "slot", "parallel_fixture", "parallel_fixture_sha256", "output", "payload", "run_id"}
 PHASES = ("started", "ready", "all_ready", "released", "completed")
 READY_KEYS = {"schema_version", "run_id", "slot", "started_unix_ns", "started_monotonic_ns", "ready_unix_ns", "ready_monotonic_ns"}
-TRANSCRIPT_KEYS = {"schema_version", "outcome", "error_code", "run_id", "slot", "generation_sha256", "participants", "samples", "payload"}
+TRANSCRIPT_KEYS = {"schema_version", "outcome", "error_code", "run_id", "slot", "generation_sha256",
+                   "dead_participant", "participants", "samples", "payload"}
 TRANSCRIPT_KEYS |= {phase + clock for phase in PHASES for clock in ("_unix_ns", "_monotonic_ns")}
 RUN_NAME = "[build 3/3] RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /fixture/parallel.py"
 
@@ -25,6 +26,7 @@ def barrier_transcript(raw, operation, guest_lower, guest_upper):
     value = decode(raw[len(prefix):-1])
     require(type(value) is dict and set(value) == TRANSCRIPT_KEYS and type(value["schema_version"]) is int
             and value["schema_version"] == 1 and value["outcome"] == "released" and value["error_code"] is None
+            and value["dead_participant"] is None
             and value["run_id"] == operation["run_id"] and type(value["slot"]) is int and value["slot"] == operation["slot"],
             "parallel barrier identity or success differs")
     require(raw[len(prefix):-1] == json.dumps(value, sort_keys=True, separators=(",", ":")).encode(),

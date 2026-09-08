@@ -53,7 +53,8 @@ class ParallelEvidenceTests(unittest.TestCase):
             participants.append({"schema_version": 1, "run_id": self.inputs["run_id"], "slot": number,
                 "started_unix_ns": self.wall(3.1 + number * .01), "started_monotonic_ns": self.mono(3.1 + number * .01),
                 "ready_unix_ns": self.wall(3.2 + number * .05), "ready_monotonic_ns": self.mono(3.2 + number * .05)})
-        value = dict(participants[slot], outcome="released", error_code=None, participants=participants)
+        value = dict(participants[slot], outcome="released", error_code=None,
+                     dead_participant=None, participants=participants)
         for phase, seconds in (("all_ready", 3.5 + slot * .01), ("released", 4.6 + slot * .01), ("completed", 4.7 + slot * .01)):
             value[phase + "_unix_ns"], value[phase + "_monotonic_ns"] = self.wall(seconds), self.mono(seconds)
         value["samples"] = [{"unix_ns": value["ready_unix_ns"], "monotonic_ns": value["ready_monotonic_ns"], "ready_slots": [slot]},
@@ -343,6 +344,11 @@ class ParallelEvidenceTests(unittest.TestCase):
                    lambda t: t["samples"][-1].update(ready_slots=[0]),
                    lambda t: t["samples"][-1].update(unix_ns=t["all_ready_unix_ns"]-1),
                    lambda t: t["samples"].pop(),
+                   # A released transcript that also names a dead participant is
+                   # a contradiction, not a pass.
+                   lambda t: t.update(dead_participant={"schema_version": 1, "run_id": "unit", "slot": 3,
+                                                        "written_unix_ns": 1}),
+                   lambda t: t.pop("dead_participant"),
                    lambda t: t.update(unexpected=True))
         for change in changes:
             self.make(0); self.rewrite_barrier(change)

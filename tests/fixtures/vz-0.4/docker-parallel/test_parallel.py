@@ -1,4 +1,5 @@
 """Real local processes and adversarial filesystem records; no Docker required."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -20,6 +21,12 @@ image_spec = importlib.util.spec_from_file_location("parallel_image_input",
 image_input = importlib.util.module_from_spec(image_spec)
 image_spec.loader.exec_module(image_input)
 BASE = "python:3@sha256:" + "a" * 64
+CHILD = ("import importlib.util,json,pathlib,sys; "
+         "s=importlib.util.spec_from_file_location('f',sys.argv[1]); "
+         "f=importlib.util.module_from_spec(s); s.loader.exec_module(f); "
+         "r=f.run(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3])); "
+         "print(f.PREFIX+f.canonical(r).decode(),flush=True); "
+         "sys.exit(0 if r['outcome']=='released' else 1)")
 
 
 def environment(slot=0):
@@ -32,7 +39,9 @@ def record(slot, run="unit-parallel-v1"):
             "ready_unix_ns": time.time_ns(), "ready_monotonic_ns": parallel.monotonic_ns()}
 
 
-class ParallelFixtureTests(unittest.TestCase):
+class Support:
+    """Shared private barrier directory and record helpers; not a test case."""
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -56,6 +65,13 @@ class ParallelFixtureTests(unittest.TestCase):
         finally:
             os.close(fd)
 
+    def spawn(self, slot):
+        return subprocess.Popen([sys.executable, "-B", "-c", CHILD,
+            str(HERE / "parallel.py"), str(self.barrier), str(self.root / ("out-" + str(slot)))],
+            env=dict(os.environ, **environment(slot)), stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+
+
+class ParallelFixtureTests(Support, unittest.TestCase):
     def test_contract_and_exact_graph(self):
         pinned = image_input.load(HERE.parent / "docker/python-image-input.json")
         contract = json.loads((HERE / "contract.json").read_text())
@@ -66,13 +82,28 @@ class ParallelFixtureTests(unittest.TestCase):
         self.assertEqual(contract["health"], {"samples": 60, "interval_ns": 10**9,
             "max_lateness_ns": 250000000, "request_timeout_ns": 500000000,
             "observer_bound_ns": 70000000000})
+        self.assertEqual(contract["tombstone"], {"target": "tombstone", "error_code": "participant_died",
+            "payload_template": "vz04-parallel-tombstone-v1\nslot=N\n",
+            "transcript_prefix": parallel.TOMBSTONE_PREFIX})
         self.assertEqual((HERE / ".dockerignore").read_text().splitlines(),
                          ["*", "!Dockerfile.parallel", "!parallel.py"])
-        self.assertEqual((HERE / "Dockerfile.parallel").read_text().splitlines(), [
-            "ARG FIXTURE_BASE=" + pinned["reference"], "FROM ${FIXTURE_BASE} AS build", "ARG FIXTURE_BASE",
+        lines = (HERE / "Dockerfile.parallel").read_text().splitlines()
+        self.assertEqual(lines, [
+            "ARG FIXTURE_BASE=" + pinned["reference"],
+            "FROM ${FIXTURE_BASE} AS tombstone-record", "ARG FIXTURE_BASE",
+            "ARG FIXTURE_RUN", "ARG FIXTURE_SLOT", "COPY parallel.py /tombstone/parallel.py",
+            "RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /tombstone/parallel.py tombstone",
+            "FROM scratch AS tombstone", "COPY --from=tombstone-record /out/tombstone.txt /tombstone.txt",
+            "FROM ${FIXTURE_BASE} AS build", "ARG FIXTURE_BASE",
             "ARG FIXTURE_RUN", "ARG FIXTURE_SLOT", "COPY parallel.py /fixture/parallel.py",
             "RUN --network=none --mount=type=cache,id=vz04-parallel-barrier-v1,target=/barrier,sharing=shared python3 /fixture/parallel.py",
             "FROM scratch AS output", "COPY --from=build /out/payload.txt /payload.txt"])
+        # The slot solves name no target, so the last stage is what they build.
+        # The tombstone stages must stay ahead of it, and must not share the
+        # slot COPY's destination, or they would join the four-slot graph.
+        self.assertEqual([line for line in lines if line.startswith("FROM ")][-1], "FROM scratch AS output")
+        self.assertEqual(lines.index("FROM scratch AS tombstone"), lines.index("FROM ${FIXTURE_BASE} AS build") - 2)
+        self.assertEqual(len({line for line in lines if line.startswith("COPY parallel.py ")}), 2)
 
     def test_default_is_verified_arm64_manifest_not_index_or_mutable_fallback(self):
         pinned = image_input.load(HERE.parent / "docker/python-image-input.json")
@@ -90,18 +121,10 @@ class ParallelFixtureTests(unittest.TestCase):
                 self.assertNotEqual(invalid, expected)
 
     def test_four_real_processes_release_same_generation_and_exact_payloads(self):
-        code = ("import importlib.util,json,pathlib,sys; "
-                "s=importlib.util.spec_from_file_location('f',sys.argv[1]); "
-                "f=importlib.util.module_from_spec(s); s.loader.exec_module(f); "
-                "r=f.run(pathlib.Path(sys.argv[2]),pathlib.Path(sys.argv[3])); "
-                "print(f.PREFIX+f.canonical(r).decode(),flush=True); "
-                "sys.exit(0 if r['outcome']=='released' else 1)")
         children = []
         try:
             for slot in range(4):
-                children.append(subprocess.Popen([sys.executable, "-B", "-c", code,
-                    str(HERE / "parallel.py"), str(self.barrier), str(self.root / ("out-" + str(slot)))],
-                    env=dict(os.environ, **environment(slot)), stdout=subprocess.PIPE, stderr=subprocess.PIPE))
+                children.append(self.spawn(slot))
             rows = []
             for slot, child in enumerate(children):
                 out, err = child.communicate(timeout=10)
@@ -264,6 +287,160 @@ class ParallelFixtureTests(unittest.TestCase):
             result = self.run_fixture()
         self.assertEqual(result["error_code"], "filesystem_error")
         self.assertEqual(path.read_bytes(), before)
+
+
+class TombstoneTests(Support, unittest.TestCase):
+    """A dead participant's siblings must fail fast without weakening release."""
+
+    def bury(self, slot, run="unit-parallel-v1"):
+        env = dict(environment(slot), FIXTURE_RUN=run)
+        return parallel.record_death(self.barrier, self.root / ("dead-out-" + str(slot)), env)
+
+    def test_a_dead_participant_aborts_its_siblings_far_inside_the_timeout(self):
+        """The defect: three live builds waited out all 180 s for a dead fourth.
+
+        Nothing here shortens the timeout, so this can only pass because the
+        tombstone was seen. A run in which nothing dies proves nothing.
+        """
+        self.assertEqual(parallel.TIMEOUT_NS, 180_000_000_000)
+        children = []
+        try:
+            for slot in range(3):
+                children.append(self.spawn(slot))
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if all((self.barrier / ("slot-" + str(slot)) / "ready.json").is_file() for slot in range(3)):
+                    break
+            else:
+                self.fail("three participants never claimed their slots")
+            self.assertEqual(self.bury(3)["outcome"], "recorded")
+            started = time.monotonic()
+            for slot, child in enumerate(children):
+                out, err = child.communicate(timeout=45)
+                self.assertEqual(err, b"")
+                self.assertEqual(child.returncode, 1, out)
+                row = json.loads(out[len(parallel.PREFIX):])
+                self.assertEqual(row["error_code"], "participant_died")
+                self.assertEqual(row["dead_participant"]["slot"], 3)
+                self.assertEqual(row["dead_participant"]["run_id"], "unit-parallel-v1")
+                self.assertEqual(row["outcome"], "failed")
+                self.assertIsNone(row["payload"])
+                self.assertFalse((self.root / ("out-" + str(slot))).exists())
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, parallel.TIMEOUT_NS / 10**9 / 4, "siblings did not abort promptly")
+        finally:
+            for child in children:
+                if child.poll() is None:
+                    child.kill()
+                child.communicate()
+
+    def test_a_tombstone_never_releases_a_barrier_short_of_four(self):
+        """A tombstone may only ever shorten a failure, never substitute for a
+        participant: no subset of records plus a tombstone can release."""
+        for present in ((), (1,), (2, 3), (1, 2), (1, 2, 3)):
+            with self.subTest(present=present), tempfile.TemporaryDirectory() as temporary:
+                self.root = Path(temporary)
+                self.barrier = self.root / "barrier"
+                self.barrier.mkdir()
+                for slot in present:
+                    self.put(slot)
+                dead = next(slot for slot in range(1, 4) if slot not in present) if len(present) < 3 else 3
+                self.assertEqual(self.bury(dead)["outcome"], "recorded")
+                with patch.object(parallel, "RELEASE_DWELL_NS", 0):
+                    result = self.run_fixture()
+                self.assertEqual(result["outcome"], "failed")
+                self.assertEqual(result["error_code"], "participant_died")
+                self.assertEqual(result["dead_participant"]["slot"], dead)
+                self.assertIsNone(result["payload"])
+                self.assertFalse((self.root / "out").exists())
+
+    def test_a_tombstone_is_fail_only_even_with_every_record_present(self):
+        for slot in (1, 2, 3):
+            self.put(slot)
+        self.bury(2)
+        with patch.object(parallel, "RELEASE_DWELL_NS", 0):
+            result = self.run_fixture()
+        self.assertEqual(result["error_code"], "participant_died")
+        self.assertIsNone(result["payload"])
+
+    def test_a_stale_foreign_tombstone_is_refused_not_obeyed(self):
+        for slot in (1, 2, 3):
+            self.put(slot)
+        self.bury(3, run="other-run")
+        with patch.object(parallel, "RELEASE_DWELL_NS", 0):
+            result = self.run_fixture()
+        self.assertEqual(result["error_code"], "foreign_tombstone")
+        self.assertIsNone(result["dead_participant"])
+        # Refused before any claim: a stranger's tombstone never silently
+        # aborts, and never leaves this run holding a slot either.
+        self.assertFalse((self.barrier / "slot-0").exists())
+
+    def test_the_writer_claims_no_slot_and_records_at_most_one_death_per_slot(self):
+        row = self.bury(1)
+        self.assertEqual(row["outcome"], "recorded")
+        self.assertEqual(row["tombstone"], {"schema_version": 1, "run_id": "unit-parallel-v1",
+                                            "slot": 1, "written_unix_ns": row["tombstone"]["written_unix_ns"]})
+        self.assertEqual(set(parallel.TOMBSTONE_KEYS), set(row["tombstone"]))
+        self.assertEqual({p.name for p in self.barrier.iterdir()}, {"dead-1"})
+        self.assertEqual({p.name for p in (self.barrier / "dead-1").iterdir()}, {"dead.json"})
+        payload = self.root / "dead-out-1" / "tombstone.txt"
+        self.assertEqual(payload.read_bytes(), b"vz04-parallel-tombstone-v1\nslot=1\n")
+        self.assertEqual(row["payload"]["sha256"], hashlib.sha256(payload.read_bytes()).hexdigest())
+        again = self.bury(1)
+        self.assertEqual(again["error_code"], "tombstone_already_claimed")
+        self.assertIsNone(again["tombstone"])
+
+    def test_the_writer_refuses_another_run_s_barrier(self):
+        self.bury(0, run="other-run")
+        refused = self.bury(1)
+        self.assertEqual(refused["error_code"], "foreign_tombstone")
+        self.assertFalse((self.barrier / "dead-1").exists())
+
+    def test_invalid_environment_records_no_death(self):
+        for key, value in [("FIXTURE_SLOT", "4"), ("FIXTURE_RUN", "../foreign"), ("FIXTURE_BASE", "python:latest")]:
+            with self.subTest(key=key, value=value):
+                env = dict(environment(0), **{key: value})
+                row = parallel.record_death(self.barrier, self.root / "unused", env)
+                self.assertEqual(row["error_code"], "invalid_environment")
+                self.assertEqual(list(self.barrier.iterdir()), [])
+
+    def test_adversarial_tombstone_contents_rejected(self):
+        self.bury(1)
+        path = self.barrier / "dead-1" / "dead.json"
+        good = json.loads(path.read_bytes())
+        for change in [{"slot": 2}, {"schema_version": True}, {"extra": 1}, {"written_unix_ns": 0},
+                       {"written_unix_ns": True}]:
+            with self.subTest(change=change):
+                path.write_bytes(parallel.canonical(dict(good, **change)))
+                with self.assertRaises(parallel.BarrierError):
+                    self.observe()
+        for raw in [b'{"slot":1,"slot":1}', b'{"x":NaN}', b'x' * 1025, b'[]']:
+            with self.subTest(raw_length=len(raw)):
+                path.write_bytes(raw)
+                with self.assertRaises(parallel.BarrierError):
+                    self.observe()
+        path.unlink()
+        (self.barrier / "dead-1" / "extra").write_bytes(b"")
+        with self.assertRaisesRegex(parallel.BarrierError, "unexpected_inventory"):
+            self.observe()
+
+    def test_a_pending_tombstone_is_not_yet_a_death(self):
+        directory = self.barrier / "dead-2"
+        directory.mkdir()
+        (directory / "dead.pending").write_bytes(b"partial")
+        self.assertEqual(self.observe(), {})
+
+    def test_unknown_mode_is_a_static_refusal(self):
+        for argv in (["bogus"], ["tombstone", "extra"], [""]):
+            with self.subTest(argv=argv):
+                with patch("builtins.print") as printed:
+                    self.assertEqual(parallel.main(argv), 1)
+                line = printed.call_args.args[0]
+                self.assertTrue(line.startswith(parallel.PREFIX))
+                row = json.loads(line[len(parallel.PREFIX):])
+                self.assertEqual(row["error_code"], "invalid_mode")
+                self.assertEqual(row["outcome"], "failed")
+                self.assertEqual(list(self.barrier.iterdir()), [])
 
 
 if __name__ == "__main__":
