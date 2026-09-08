@@ -279,9 +279,12 @@ class Health:
         # condition, because the observable one is not available. The probe's
         # samples reach the host only when the process exits, since the recorder
         # buffers the stream; and having the probe announce the sample from
-        # inside the container requires a second exec into a container that is
-        # already running the probe, which the OCI runtime refuses outright with
-        # "failed to bind notify socket".
+        # inside the container would need a second exec into a container that is
+        # already running the probe, which this suite does not attempt. A second
+        # concurrent exec is not refused by the runtime: the earlier reading here
+        # of "failed to bind notify socket" as a categorical single-exec limit was
+        # wrong. It was a name collision between invocations started together
+        # (vz-4no), corrected in the pinned runtime by vz-notify-socket-v1.
         #
         # Every term below comes from the contract the probe enforces on itself.
         # Sample zero is planned at the probe's start, must begin within

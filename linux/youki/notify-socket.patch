@@ -1,0 +1,534 @@
+Locally authored vz concurrent-exec correction for pinned youki 0.7.0.
+Not an upstream-reviewed backport. Apply AFTER every other local patch.
+
+A tenant (exec) invocation named its notify socket from a single `fastrand`
+draw and accepted the name if no file held it yet. `fastrand`'s global
+generator seeds itself from a hash of `Instant::now()` and the thread id, with
+no OS entropy, so two runtime processes started in the same instant - a
+container healthcheck and a `docker exec`, say - seed identically, draw
+identically, both find the name free, and the one that binds second fails with
+EADDRINUSE, reported as "failed to bind notify socket: tenant-notify-<hex>.sock".
+Measured on this pinned binary at 21 failures in 480 execs (8-way) with the
+container directory emptied between rounds, so nothing but a concurrent
+collision could produce them.
+
+The name now carries the reserving process's id, which two live invocations
+cannot share, and reservation is the bind itself rather than an existence test
+followed by a later bind, so no window remains between the two. The socket is
+also removed once the start notification has been delivered; it used to be left
+behind, one dead socket per exec for the lifetime of the container. The console
+socket link of an exec gets the same treatment, its `symlink(2)` already being
+atomic. A failed bind no longer leaves the process parked in the container
+directory, where a later relative path would resolve against the wrong root.
+
+--- a/crates/libcontainer/src/notify_socket.rs
++++ b/crates/libcontainer/src/notify_socket.rs
+@@ -9,6 +9,15 @@
+ 
+ pub const NOTIFY_FILE: &str = "notify.sock";
+ 
++/// How many names one invocation may try before it gives up reserving one.
++///
++/// A name carries the reserving process's id, so the only way an attempt can
++/// be refused is a name left behind by an earlier invocation of a since-exited
++/// process whose id has been reused. A handful of attempts walks past that; a
++/// directory that refuses every one of them is a fault worth reporting rather
++/// than retrying.
++pub(crate) const UNIQUE_NAME_ATTEMPTS: u32 = 8;
++
+ #[derive(Debug, thiserror::Error)]
+ pub enum NotifyListenerError {
+     #[error("failed to chdir {path} while creating notify socket: {source}")]
+@@ -20,6 +29,8 @@
+         source: std::io::Error,
+         name: String,
+     },
++    #[error("no free notify socket name under {directory} after {attempts} attempts")]
++    NoUniqueName { directory: PathBuf, attempts: u32 },
+     #[error("failed to connect to notify socket: {name}")]
+     Connect {
+         source: std::io::Error,
+@@ -39,11 +50,109 @@
+ 
+ type Result<T> = std::result::Result<T, NotifyListenerError>;
+ 
++/// Build the name of a per-invocation socket in a container directory.
++///
++/// The identity of the invocation, not a random draw, is what keeps the name
++/// apart from a concurrent one. `fastrand`'s global generator seeds itself from
++/// a hash of `Instant::now()` and the thread id, so two runtime processes that
++/// start in the same instant seed identically and draw identical values; a name
++/// built from the draw alone then repeats between them. The process id cannot
++/// repeat between two live invocations, so it carries the uniqueness, the
++/// attempt counter separates the names one invocation tries in turn, and the
++/// draw is kept only so the name stays unpredictable to anything that can read
++/// the directory.
++pub(crate) fn unique_socket_name(prefix: &str, attempt: u32) -> String {
++    socket_name(prefix, std::process::id(), attempt)
++}
++
++fn socket_name(prefix: &str, pid: u32, attempt: u32) -> String {
++    format!("{prefix}{pid:x}-{attempt:x}-{:08x}.sock", fastrand::u32(..))
++}
++
++/// Restores the working directory the guard was built with when it is dropped.
++///
++/// The socket path in a container directory routinely exceeds the 108-byte
++/// `sun_path` limit, so binding and connecting are done from inside that
++/// directory under a relative name. That makes the working directory part of
++/// the operation, and an early return in the middle of one used to leave the
++/// process parked in the container directory, where every later relative path
++/// - the bundle-relative rootfs among them - resolves against the wrong root.
++struct CurrentDirGuard {
++    path: PathBuf,
++}
++
++impl Drop for CurrentDirGuard {
++    fn drop(&mut self) {
++        if let Err(err) = unistd::chdir(self.path.as_path()) {
++            tracing::warn!(path = ?self.path, ?err, "failed to restore the working directory");
++        }
++    }
++}
++
++/// Unlinks a per-invocation socket path when the invocation is finished with it.
++///
++/// The name is spent as soon as the start notification has been delivered, and
++/// the guard also covers the paths that leave through an error. Without it a
++/// container directory accumulated one dead socket per exec for as long as the
++/// container lived.
++pub(crate) struct ReservedSocketPath {
++    path: PathBuf,
++}
++
++impl ReservedSocketPath {
++    pub(crate) fn new(path: PathBuf) -> Self {
++        Self { path }
++    }
++
++    pub(crate) fn path(&self) -> &Path {
++        &self.path
++    }
++}
++
++impl Drop for ReservedSocketPath {
++    fn drop(&mut self) {
++        match std::fs::remove_file(&self.path) {
++            Ok(()) => {}
++            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
++            Err(err) => {
++                tracing::warn!(path = ?self.path, ?err, "failed to remove reserved socket");
++            }
++        }
++    }
++}
++
+ pub struct NotifyListener {
+     socket: UnixListener,
+ }
+ 
+ impl NotifyListener {
++    /// Bind a listener on a name no concurrent invocation can also hold.
++    ///
++    /// Reservation is the bind itself. Choosing a name, testing that no file
++    /// holds it and binding it later is a check-then-use race: both invocations
++    /// see the name free and the loser's bind fails with `EADDRINUSE`, which is
++    /// what surfaced as `failed to bind notify socket` when a container's
++    /// healthcheck and an exec entered the same container together.
++    pub(crate) fn bind_unique(directory: &Path, prefix: &str) -> Result<(Self, ReservedSocketPath)> {
++        for attempt in 0..UNIQUE_NAME_ATTEMPTS {
++            let path = directory.join(unique_socket_name(prefix, attempt));
++            match Self::new(&path) {
++                Ok(listener) => return Ok((listener, ReservedSocketPath::new(path))),
++                Err(NotifyListenerError::Bind { source, .. })
++                    if source.kind() == std::io::ErrorKind::AddrInUse =>
++                {
++                    tracing::debug!(?path, "notify socket name already held; retrying");
++                }
++                Err(err) => return Err(err),
++            }
++        }
++
++        Err(NotifyListenerError::NoUniqueName {
++            directory: directory.to_owned(),
++            attempts: UNIQUE_NAME_ATTEMPTS,
++        })
++    }
++
+     pub fn new(socket_path: &Path) -> Result<Self> {
+         tracing::debug!(?socket_path, "create notify listener");
+         // Unix domain socket has a maximum length of 108, different from
+@@ -64,15 +173,14 @@
+             source: e,
+             path: workdir.to_owned(),
+         })?;
++        // The guard restores the working directory on every exit from here,
++        // including the bind failure a caller is expected to retry past.
++        let _guard = CurrentDirGuard { path: cwd };
+         let stream = UnixListener::bind(socket_name).map_err(|e| NotifyListenerError::Bind {
+             source: e,
+             // ok to unwrap here as OsStr should always be utf-8 compatible
+             name: socket_name.to_str().unwrap().to_owned(),
+         })?;
+-        unistd::chdir(&cwd).map_err(|e| NotifyListenerError::Chdir {
+-            source: e,
+-            path: cwd,
+-        })?;
+ 
+         Ok(Self { socket: stream })
+     }
+@@ -137,6 +245,9 @@
+             source: e,
+             path: workdir.to_owned(),
+         })?;
++        // As in `NotifyListener::new`: a failure between here and the end of
++        // the function must not leave the process in the container directory.
++        let _guard = CurrentDirGuard { path: cwd };
+         let socket_name = self
+             .path
+             .file_name()
+@@ -151,10 +262,6 @@
+             .write_all(b"start container")
+             .map_err(NotifyListenerError::SendStartContainer)?;
+         tracing::debug!("notify finished");
+-        unistd::chdir(&cwd).map_err(|e| NotifyListenerError::Chdir {
+-            source: e,
+-            path: cwd,
+-        })?;
+         Ok(())
+     }
+ }
+@@ -188,4 +295,112 @@
+         socket.notify_container_start().unwrap();
+         thread_handle.join().unwrap();
+     }
++
++    /// The defect this module was corrected for, stated as a property.
++    ///
++    /// A name that is only a `fastrand` draw repeats whenever two invocations
++    /// seed identically, and `fastrand` seeds from a hash of the monotonic
++    /// clock, so invocations started together routinely do. This is the
++    /// generator that produced `tenant-notify-<hex>.sock`.
++    #[test]
++    fn test_vz_notify_socket_draw_only_name_repeats_under_equal_seeds() {
++        fastrand::seed(0x5eed);
++        let first = format!("tenant-notify-{:x}.sock", fastrand::i32(..));
++        fastrand::seed(0x5eed);
++        let second = format!("tenant-notify-{:x}.sock", fastrand::i32(..));
++        assert_eq!(
++            first, second,
++            "equally seeded draws must be shown to repeat, or this test proves nothing"
++        );
++    }
++
++    /// The correction: identical draws no longer mean identical names, because
++    /// the process id two live invocations cannot share is part of the name.
++    #[test]
++    fn test_vz_notify_socket_name_separates_equally_seeded_invocations() {
++        for seed in [0u64, 1, 0x5eed, u64::MAX] {
++            fastrand::seed(seed);
++            let first = socket_name("tenant-notify-", 4321, 0);
++            fastrand::seed(seed);
++            let second = socket_name("tenant-notify-", 4322, 0);
++            assert_ne!(
++                first, second,
++                "two invocations seeded alike must not pick the same name"
++            );
++        }
++    }
++
++    /// One invocation's attempts are distinct from each other, so a retry
++    /// cannot re-offer the name that was just refused.
++    #[test]
++    fn test_vz_notify_socket_name_separates_attempts() {
++        fastrand::seed(11);
++        let first = socket_name("tenant-notify-", 4321, 0);
++        fastrand::seed(11);
++        let second = socket_name("tenant-notify-", 4321, 1);
++        assert_ne!(first, second, "attempts of one invocation must differ");
++    }
++
++    /// The reservation is the bind, not a test for the name's absence.
++    ///
++    /// Both calls run in one process with one seed, so both compute the same
++    /// first candidate - the worst case the old check-then-bind failed on.
++    /// The second must still come away with a bound listener of its own.
++    #[test]
++    fn test_vz_notify_socket_bind_unique_reserves_under_identical_candidates() {
++        let dir = tempdir().unwrap();
++        fastrand::seed(3);
++        let (first, first_path) = NotifyListener::bind_unique(dir.path(), "tenant-notify-").unwrap();
++        fastrand::seed(3);
++        let (second, second_path) =
++            NotifyListener::bind_unique(dir.path(), "tenant-notify-").unwrap();
++
++        assert_ne!(
++            first_path.path(),
++            second_path.path(),
++            "a concurrent invocation must not be handed the same socket"
++        );
++        assert!(first_path.path().exists() && second_path.path().exists());
++        // Both listeners are live and independently addressable.
++        NotifySocket::new(first_path.path().to_owned())
++            .notify_container_start()
++            .unwrap();
++        first.wait_for_container_start().unwrap();
++        NotifySocket::new(second_path.path().to_owned())
++            .notify_container_start()
++            .unwrap();
++        second.wait_for_container_start().unwrap();
++
++        // The reservation is released with the invocation that held it, so a
++        // container directory does not accumulate one socket per exec.
++        let held = (first_path.path().to_owned(), second_path.path().to_owned());
++        drop(first_path);
++        drop(second_path);
++        assert!(!held.0.exists() && !held.1.exists(), "sockets outlived their invocations");
++    }
++
++    /// A bind failure must not leave the process parked in the container
++    /// directory: the caller's next relative path would resolve there.
++    #[test]
++    fn test_vz_notify_socket_failed_bind_restores_working_directory() {
++        let dir = tempdir().unwrap();
++        let taken = dir.path().join("taken.sock");
++        let _held = NotifyListener::new(&taken).unwrap();
++        let before = env::current_dir().unwrap();
++
++        let error = match NotifyListener::new(&taken) {
++            Ok(_) => panic!("a name already bound must not be handed out twice"),
++            Err(error) => error,
++        };
++        assert!(
++            matches!(&error, NotifyListenerError::Bind { source, .. }
++                if source.kind() == std::io::ErrorKind::AddrInUse),
++            "unexpected error: {error}"
++        );
++        assert_eq!(
++            env::current_dir().unwrap(),
++            before,
++            "the working directory must survive a failed bind"
++        );
++    }
+ }
+--- a/crates/libcontainer/src/container/builder_impl.rs
++++ b/crates/libcontainer/src/container/builder_impl.rs
+@@ -41,8 +41,6 @@
+     pub console_socket: Option<OwnedFd>,
+     /// Options for new user namespace
+     pub user_ns_config: Option<UserNamespaceConfig>,
+-    /// Path to the Unix Domain Socket to communicate container start
+-    pub notify_path: PathBuf,
+     /// Container state
+     pub container: Option<Container>,
+     // Read-only original state for tenant seccomp notifications; never saved.
+@@ -72,8 +70,22 @@
+ }
+ 
+ impl ContainerBuilderImpl {
+-    pub(super) fn create(&mut self) -> Result<Pid, LibcontainerError> {
+-        match self.run_container() {
++    /// Create the container process on an already bound start-notification
++    /// listener.
++    ///
++    /// The listener is a parameter rather than something created here because
++    /// for an exec the bind is also the reservation of the socket's name
++    /// against a concurrent invocation into the same container, so the caller
++    /// that picks the name must be the one that binds it. Both callers bind
++    /// before entering here, which is earlier than the three points that
++    /// constrain it: the pivot root, since the socket lives outside the
++    /// container's rootfs; entry into an existing mount namespace; and entry
++    /// into a user namespace, in case only root can reach the path.
++    pub(super) fn create(
++        &mut self,
++        notify_listener: NotifyListener,
++    ) -> Result<Pid, LibcontainerError> {
++        match self.run_container(notify_listener) {
+             Ok(pid) => Ok(pid),
+             Err(outer) => {
+                 // Only the init container should be cleaned up in the case of
+@@ -93,7 +105,10 @@
+         matches!(self.container_type, ContainerType::InitContainer)
+     }
+ 
+-    fn run_container(&mut self) -> Result<Pid, LibcontainerError> {
++    fn run_container(
++        &mut self,
++        notify_listener: NotifyListener,
++    ) -> Result<Pid, LibcontainerError> {
+         let linux = self.spec.linux().as_ref().ok_or(MissingSpecError::Linux)?;
+         let base_cgroups_path = utils::get_cgroup_path(linux.cgroups_path(), &self.container_id);
+         let mut final_cgroups_path = base_cgroups_path;
+@@ -124,14 +139,6 @@
+             .as_ref()
+             .ok_or(MissingSpecError::Process)?;
+ 
+-        // Need to create the notify socket before we pivot root, since the unix
+-        // domain socket used here is outside of the rootfs of container. During
+-        // exec, need to create the socket before we enter into existing mount
+-        // namespace. We also need to create to socket before entering into the
+-        // user namespace in the case that the path is located in paths only
+-        // root can access.
+-        let notify_listener = NotifyListener::new(&self.notify_path)?;
+-
+         // If Out-of-memory score adjustment is set in specification.  set the score
+         // value for the current process check
+         // https://dev.to/rrampage/surviving-the-linux-oom-killer-2ki9 for some more
+--- a/crates/libcontainer/src/container/init_builder.rs
++++ b/crates/libcontainer/src/container/init_builder.rs
+@@ -11,7 +11,7 @@
+ use super::{Container, ContainerStatus};
+ use crate::config::YoukiConfig;
+ use crate::error::{ErrInvalidSpec, LibcontainerError, MissingSpecError};
+-use crate::notify_socket::NOTIFY_FILE;
++use crate::notify_socket::{NOTIFY_FILE, NotifyListener};
+ use crate::process::args::ContainerType;
+ use crate::syscall::syscall::create_syscall;
+ use crate::validator::Validator;
+@@ -86,7 +86,10 @@
+             .set_systemd(self.use_systemd)
+             .set_annotations(spec.annotations().clone());
+ 
+-        let notify_path = container_dir.join(NOTIFY_FILE);
++        // Bound here rather than inside `ContainerBuilderImpl::create`, so
++        // that binding and naming the socket stay in one place across the init
++        // and exec paths.
++        let notify_listener = NotifyListener::new(&container_dir.join(NOTIFY_FILE))?;
+         // convert path of root file system of the container to absolute path
+         let rootfs = fs::canonicalize(spec.root().as_ref().ok_or(MissingSpecError::Root)?.path())
+             .map_err(LibcontainerError::OtherIO)?;
+@@ -122,7 +125,6 @@
+             spec: Rc::new(spec),
+             rootfs,
+             user_ns_config,
+-            notify_path,
+             container: Some(container.clone()),
+             tenant_seccomp_state: None,
+             preserve_fds: self.base.preserve_fds,
+@@ -137,7 +139,7 @@
+             process_label: None,
+         };
+ 
+-        builder_impl.create()?;
++        builder_impl.create(notify_listener)?;
+ 
+         container.refresh_state()?;
+ 
+--- a/crates/libcontainer/src/container/tenant_builder.rs
++++ b/crates/libcontainer/src/container/tenant_builder.rs
+@@ -25,9 +25,12 @@
+ use crate::container::ContainerStatus;
+ use crate::container::builder_impl::ContainerBuilderImpl;
+ use crate::error::{ErrInvalidSpec, LibcontainerError, MissingSpecError};
+-use crate::notify_socket::NotifySocket;
++use crate::notify_socket::{
++    NotifyListener, NotifySocket, UNIQUE_NAME_ATTEMPTS, unique_socket_name,
++};
+ use crate::process::args::ContainerType;
+ use crate::syscall::syscall::create_syscall;
++use crate::tty::TTYError;
+ use crate::user_ns::UserNamespaceConfig;
+ use crate::validator::Validator;
+ use crate::{tty, utils};
+@@ -268,7 +271,12 @@
+ 
+         tracing::debug!("{:#?}", spec);
+ 
+-        let notify_path = Self::setup_notify_listener(&container_dir)?;
++        // Bind the notify socket here rather than naming it here and binding it
++        // in `ContainerBuilderImpl::create`: the bind is what reserves the name
++        // against a concurrent invocation into the same container.
++        // The reservation is released when this scope ends, on every path out.
++        let (notify_listener, notify_path) =
++            NotifyListener::bind_unique(&container_dir, TENANT_NOTIFY)?;
+         // convert path of root file system of the container to absolute path
+         let rootfs = fs::canonicalize(spec.root().as_ref().ok_or(MissingSpecError::Root)?.path())
+             .map_err(LibcontainerError::OtherIO)?;
+@@ -293,7 +301,6 @@
+             spec: Rc::new(spec),
+             rootfs,
+             user_ns_config,
+-            notify_path: notify_path.clone(),
+             container: None,
+             // Do not populate container: builder_impl would persist exec's
+             // PID as init's PID. Notification metadata is immutable only.
+@@ -310,9 +317,9 @@
+             process_label: self.process_label,
+         };
+ 
+-        let pid = builder_impl.create()?;
++        let pid = builder_impl.create(notify_listener)?;
+ 
+-        let mut notify_socket = NotifySocket::new(notify_path);
++        let mut notify_socket = NotifySocket::new(notify_path.path().to_owned());
+         notify_socket.notify_container_start()?;
+ 
+         // Explicitly close the write end of the pipe here to notify the
+@@ -601,36 +608,40 @@
+         container.systemd()
+     }
+ 
+-    fn setup_notify_listener(container_dir: &Path) -> Result<PathBuf, LibcontainerError> {
+-        let notify_name = Self::generate_name(container_dir, TENANT_NOTIFY);
+-        let socket_path = container_dir.join(notify_name);
+-
+-        Ok(socket_path)
+-    }
+-
+-    fn setup_tty_socket(&self, container_dir: &Path) -> Result<Option<OwnedFd>, LibcontainerError> {
+-        let tty_name = Self::generate_name(container_dir, TENANT_TTY);
+-        let csocketfd = if let Some(console_socket) = &self.base.console_socket {
+-            Some(tty::setup_console_socket(
+-                container_dir,
+-                console_socket,
+-                &tty_name,
+-            )?)
+-        } else {
+-            None
+-        };
+-
+-        Ok(csocketfd)
+-    }
++    /// Connect the console socket under a name of this invocation's own.
++    ///
++    /// The symlink is the reservation, and `symlink(2)` refuses an existing
++    /// name, so the loop needs no separate existence test. Once the connection
++    /// stands the name has no further use, and removing it keeps the container
++    /// directory to the entries of live invocations rather than one per exec.
++    fn setup_tty_socket(&self, container_dir: &Path) -> Result<Option<OwnedFd>, LibcontainerError> {
++        let Some(console_socket) = &self.base.console_socket else {
++            return Ok(None);
++        };
+ 
+-    fn generate_name(dir: &Path, prefix: &str) -> String {
+-        loop {
+-            let rand = fastrand::i32(..);
+-            let name = format!("{prefix}{rand:x}.sock");
+-            if !dir.join(&name).exists() {
+-                return name;
++        for attempt in 0..UNIQUE_NAME_ATTEMPTS {
++            let tty_name = unique_socket_name(TENANT_TTY, attempt);
++            match tty::setup_console_socket(container_dir, console_socket, &tty_name) {
++                Ok(csocketfd) => {
++                    let linked = container_dir.join(&tty_name);
++                    if let Err(err) = fs::remove_file(&linked) {
++                        tracing::warn!(?linked, ?err, "failed to remove console socket link");
++                    }
++                    return Ok(Some(csocketfd));
++                }
++                Err(TTYError::Symlink { source, .. })
++                    if source.kind() == std::io::ErrorKind::AlreadyExists =>
++                {
++                    tracing::debug!(%tty_name, "console socket name already held; retrying");
++                }
++                Err(err) => return Err(err.into()),
+             }
+         }
++
++        Err(LibcontainerError::Other(format!(
++            "no free console socket name under {} after {UNIQUE_NAME_ATTEMPTS} attempts",
++            container_dir.display()
++        )))
+     }
+ }
+ 
