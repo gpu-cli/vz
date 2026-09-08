@@ -10,7 +10,8 @@ use std::time::Duration;
 
 use thiserror::Error;
 use vz_oci_macos::{
-    KernelProfile, MacosOciError as OciError, PortMapping, SharedVmDockerReadiness,
+    KernelProfile, MacosOciError as OciError, PortMapping, SharedVmAttachment,
+    SharedVmDockerReadiness,
 };
 use vz_runtime_contract::{
     ExecOutput, OwnedResourceKind, OwnershipRecord, ResourceOwner, StackResourceHint,
@@ -167,10 +168,18 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
     /// lifecycle operation/generation. This method does not resolve images or
     /// provide authorization. This method returns no detached raw VM lease;
     /// low-level backend access remains a trusted-library interface.
+    ///
+    /// `attachments` are this Machine's Environment-network ports, already
+    /// minted against started switches. They are additional NICs, never a
+    /// replacement for the Machine's default network. A native macOS Machine
+    /// takes none: the topology contract refuses a network attachment on a
+    /// non-Linux target, so one arriving here is a caller defect rather than a
+    /// declaration this backend could honour.
     pub async fn boot_or_inspect_machine(
         self: &Arc<Self>,
         reserved_vm: &OwnershipRecord,
         ports: Vec<PortMapping>,
+        attachments: Vec<SharedVmAttachment>,
         resources: StackResourceHint,
     ) -> Result<MachineRuntimeActivation, MachineRuntimeActivationError> {
         let reservation = Self::vm_reservation(self.owner())?;
@@ -185,20 +194,23 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
             MacosRuntimeBackend::Linux(runtime) => MachineExecutionLease::Linux(
                 runtime
                     .inner()
-                    // No Environment-network attachments yet: switches exist
-                    // (`EnvironmentSwitches`) but nothing mints ports for a
-                    // Machine boot, so every Machine boots with its default
-                    // network alone.
                     .boot_or_inspect_shared_vm(
                         &reservation.resource_id,
                         ports,
-                        Vec::new(),
+                        attachments,
                         resources,
                     )
                     .await?,
             ),
             MacosRuntimeBackend::Native(runtime) => {
                 use crate::native_macos::runtime::NativeMacosBootError;
+                if !attachments.is_empty() {
+                    return Err(MachineRuntimeRegistryError::Invalid(
+                        "a native macOS Machine cannot hold an Environment-network port"
+                            .to_string(),
+                    )
+                    .into());
+                }
                 match runtime.boot(&reservation.resource_id).await {
                     Ok(lease) => MachineExecutionLease::Native(lease),
                     Err(NativeMacosBootError::BeforeStart(error)) => return Err(error.into()),
@@ -305,7 +317,7 @@ mod tests {
         foreign.machine_id = Some(MachineId::generate());
         assert!(matches!(
             entry
-                .boot_or_inspect_machine(&foreign, vec![], StackResourceHint::default())
+                .boot_or_inspect_machine(&foreign, vec![], vec![], StackResourceHint::default())
                 .await,
             Err(MachineRuntimeActivationError::Admission(
                 MachineRuntimeRegistryError::Conflict(_)

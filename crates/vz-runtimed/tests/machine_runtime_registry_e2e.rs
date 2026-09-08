@@ -717,7 +717,12 @@ async fn boot(
     fixture: &MachineFixture,
 ) -> Result<MachineRuntimeActivation> {
     let activation = entry
-        .boot_or_inspect_machine(&fixture.vm_reservation, vec![], fixture.resources.clone())
+        .boot_or_inspect_machine(
+            &fixture.vm_reservation,
+            vec![],
+            vec![],
+            fixture.resources.clone(),
+        )
         .await?;
     ensure!(activation.owner() == &fixture.owner);
     ensure!(activation.runtime_identity().stack_id == fixture.stack_id());
@@ -1803,7 +1808,7 @@ async fn run_inner(
     drift.memory_mb = Some(2048);
     ensure!(
         entries[0]
-            .boot_or_inspect_machine(&fixtures[0].vm_reservation, vec![], drift)
+            .boot_or_inspect_machine(&fixtures[0].vm_reservation, vec![], vec![], drift)
             .await
             .is_err()
     );

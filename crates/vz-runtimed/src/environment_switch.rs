@@ -308,6 +308,7 @@ impl Fabric {
     }
 }
 
+pub mod plan;
 pub mod registry;
 pub mod runtime;
 

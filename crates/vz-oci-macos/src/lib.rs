@@ -17,8 +17,9 @@ pub mod runtime;
 
 pub use buildkit::{BuildRequest, BuildResult, BuildkitError};
 pub use config::{
-    ExecConfig, ExecutionMode, KernelProfile, MountAccess, MountSpec, MountType, OciRuntimeKind,
-    PinnedLinuxBundle, PortMapping, PortProtocol, RunConfig, RuntimeBackend, RuntimeConfig,
+    DeclaredAttachment, ExecConfig, ExecutionMode, KernelProfile, MountAccess, MountSpec,
+    MountType, OciRuntimeKind, PinnedLinuxBundle, PortMapping, PortProtocol, RunConfig,
+    RuntimeBackend, RuntimeConfig, SharedVmAttachment,
 };
 pub use error::MacosOciError;
 pub use macos_backend::MacosRuntimeBackend;
