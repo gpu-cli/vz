@@ -21,10 +21,17 @@ each with its own recipe against the same Machine:
       proven to have been live at the same instant. A host thread lifetime alone
       is never evidence that the guest work overlapped.
 
-      Eight *distinct* containers, not eight execs into one: a second exec into
-      a container that is already running one is refused outright by the OCI
-      runtime ("failed to bind notify socket"), which is a runtime property of
-      this stack and is recorded here rather than worked around.
+      Eight *distinct* containers, not eight execs into one. This was recorded
+      here as "a second exec into a container already running one is refused
+      outright by the OCI runtime", which measurement disproved: concurrent
+      execs succeed about 96% of the time. The real fault was a name collision
+      in youki's tenant notify socket -- one fastrand draw plus an existence
+      test, over a generator seeded from Instant::now() and ThreadId with no OS
+      entropy, so two execs starting in the same clock bucket drew the same name
+      and the loser's later bind() got EADDRINUSE. Fixed in the pinned youki
+      patch set (vz-notify-socket-v1). Distinct containers are kept because they
+      make each participant's marker unambiguous, not because one container
+      cannot take two execs.
 
   parallel_builds
       Delegated whole to `linux_docker_build_parallel`, which already proves
