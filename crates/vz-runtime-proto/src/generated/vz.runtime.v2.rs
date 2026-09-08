@@ -323,6 +323,11 @@ pub struct MachineInstance {
     #[prost(message, optional, tag = "16")]
     pub docker_context: ::core::option::Option<MachineDockerContextDescriptor>,
 }
+/// Persisted network identity and its declared L2/L3 shape.
+///
+/// `kind` and `cidr` are carried verbatim from the declaration because the
+/// runtime derives per-attachment host addresses from `cidr` and decides
+/// external reachability from `kind`; neither can be recovered from identity.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkInstance {
     #[prost(uint32, tag = "1")]
@@ -333,7 +338,16 @@ pub struct NetworkInstance {
     pub environment_id: ::prost::alloc::string::String,
     #[prost(string, tag = "4")]
     pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "NetworkKind", tag = "5")]
+    pub kind: i32,
+    #[prost(string, optional, tag = "6")]
+    pub cidr: ::core::option::Option<::prost::alloc::string::String>,
 }
+/// Persisted endpoint identity and the exact service coordinate it names.
+///
+/// `protocol`, `port` and `hostname` are persisted so resolution and
+/// reconciliation can answer which port an endpoint names without re-reading
+/// the project definition.
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EndpointInstance {
     #[prost(uint32, tag = "1")]
@@ -348,6 +362,12 @@ pub struct EndpointInstance {
     pub network_id: ::prost::alloc::string::String,
     #[prost(string, tag = "6")]
     pub name: ::prost::alloc::string::String,
+    #[prost(enumeration = "EndpointProtocol", tag = "7")]
+    pub protocol: i32,
+    #[prost(uint32, tag = "8")]
+    pub port: u32,
+    #[prost(string, optional, tag = "9")]
+    pub hostname: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct NetworkAttachmentInstance {

@@ -18,7 +18,7 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 10;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 11;
 /// First schema version that projects declared Environment network topology.
 const ENVIRONMENT_NETWORK_STORE_SCHEMA_VERSION: u32 = 10;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
@@ -954,6 +954,11 @@ enum EnvironmentNetworkV10MigrationStage {
     NetworkSchemaCreated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnvironmentAddressingV11MigrationStage {
+    PreV11RecordsRefused,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -1007,6 +1012,12 @@ pub(super) enum TeardownFinalizerV8MigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EnvironmentNetworkV10MigrationFailpoint {
     AfterNetworkSchemaCreated,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum EnvironmentAddressingV11MigrationFailpoint {
+    AfterPreV11RecordsRefused,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -1371,6 +1382,33 @@ impl StateStore {
         reference.create_environment_network_schema_v10()?;
 
         self.validate_schema_against(10, &reference.conn)
+    }
+
+    /// Validate the v11 schema, whose SQL shape is the v10 one.
+    ///
+    /// v11 widened the persisted network and endpoint records -- the
+    /// `instance_json` a `NetworkInstance` and `EndpointInstance` serialize to
+    /// -- and not the tables that hold them, so there is no v11 DDL to build a
+    /// reference from. The version still advances because the durable record
+    /// format changed incompatibly, which is what the v10-to-v11 migration
+    /// checks for; this function keeps the table shape and foreign-key
+    /// integrity under the same guard every other version gets.
+    pub(super) fn validate_v11_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+        reference.create_teardown_finalizer_schema_v8()?;
+        reference.create_teardown_runtime_identity_schema_v9()?;
+        reference.create_environment_network_schema_v10()?;
+
+        self.validate_schema_against(11, &reference.conn)
     }
 
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
@@ -5187,6 +5225,64 @@ impl StateStore {
             store.create_environment_network_schema_v10()?;
             hook(EnvironmentNetworkV10MigrationStage::NetworkSchemaCreated)?;
             store.validate_v10_schema()?;
+            store.set_schema_version(ENVIRONMENT_NETWORK_STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn migrate_environment_addressing_v10_to_v11(&self) -> Result<(), StackError> {
+        self.migrate_environment_addressing_v10_to_v11_with_hook(|_| Ok(()))
+    }
+
+    fn migrate_environment_addressing_v10_to_v11_with_hook(
+        &self,
+        mut hook: impl FnMut(EnvironmentAddressingV11MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != 10 {
+                return Err(StackError::InvalidSpec(format!(
+                    "environment-addressing migration requires state schema version 10, found {schema_version}"
+                )));
+            }
+            store.validate_v10_schema()?;
+            // Refuse rather than invent. v11 widens the persisted record of a
+            // network with its kind and CIDR and of an endpoint with its
+            // protocol, port and hostname, so a v10 `instance_json` no longer
+            // deserializes: it recorded identity alone, and the declared values
+            // were never written anywhere to recover them from. No state
+            // database reachable through the public lifecycle can hold such a
+            // row, because Up has never admitted a declared network or
+            // endpoint, so a row here is a corruption signal rather than an
+            // upgrade path to support. Refusing before the version advances
+            // turns it into one clear failure instead of a deserialization
+            // error on some later read.
+            for (table, missing_addressing) in [
+                (
+                    "environment_networks",
+                    "json_extract(instance_json, '$.kind') IS NULL",
+                ),
+                (
+                    "environment_endpoints",
+                    "json_extract(instance_json, '$.protocol') IS NULL \
+                     OR json_extract(instance_json, '$.port') IS NULL",
+                ),
+            ] {
+                let rows: i64 = store.conn.query_row(
+                    &format!("SELECT COUNT(*) FROM {table} WHERE {missing_addressing}"),
+                    [],
+                    |row| row.get(0),
+                )?;
+                if rows != 0 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v10 table `{table}` holds {rows} row(s) whose persisted \
+                         record predates declared addressing; v11 cannot fabricate a kind, \
+                         protocol or port, so explicit recovery is required before migration"
+                    )));
+                }
+            }
+            hook(EnvironmentAddressingV11MigrationStage::PreV11RecordsRefused)?;
+            store.validate_v11_schema()?;
             store.set_schema_version(STORE_SCHEMA_VERSION)?;
             Ok(())
         })
@@ -5755,6 +5851,28 @@ impl StateStore {
             ) {
                 return Err(StackError::InvalidSpec(
                     "injected v7-to-v8 migration failure after finalizer schema creation"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_environment_addressing_v10_to_v11_with_failpoint(
+        &self,
+        failpoint: EnvironmentAddressingV11MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_environment_addressing_v10_to_v11_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    EnvironmentAddressingV11MigrationFailpoint::AfterPreV11RecordsRefused,
+                    EnvironmentAddressingV11MigrationStage::PreV11RecordsRefused
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v10-to-v11 migration failure after pre-v11 records were refused"
                         .to_string(),
                 ));
             }

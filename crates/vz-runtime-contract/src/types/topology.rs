@@ -607,14 +607,29 @@ pub struct MachineInstance {
     pub legacy_sandbox_id: Option<String>,
 }
 
+/// Persisted Environment network identity and its declared shape.
+///
+/// `kind` and `cidr` are part of the record rather than of the transient
+/// declaration because neither is recoverable from identity: the runtime
+/// derives every attachment's host address from `cidr`, and external
+/// reachability follows from `kind`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkInstance {
     pub schema_version: u32,
     pub network_id: NetworkId,
     pub environment_id: EnvironmentId,
     pub name: String,
+    pub kind: NetworkKind,
+    /// Declared L3 address range, verbatim. Absent means the runtime picks one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cidr: Option<String>,
 }
 
+/// Persisted endpoint identity and the exact service coordinate it names.
+///
+/// The coordinate is persisted so that resolution and reconciliation can answer
+/// "which port is endpoint `api` on" from durable state alone, without holding
+/// the project definition that produced it.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct EndpointInstance {
     pub schema_version: u32,
@@ -623,6 +638,11 @@ pub struct EndpointInstance {
     pub machine_id: MachineId,
     pub network_id: NetworkId,
     pub name: String,
+    pub protocol: EndpointProtocol,
+    pub port: u16,
+    /// Declared in-Environment hostname. Absent means the endpoint `name` is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Persisted attachment of one Machine to one Environment network.
@@ -1316,6 +1336,8 @@ impl ProjectDefinition {
                 network_id: NetworkId::generate(),
                 environment_id: environment_id.clone(),
                 name: network.name.clone(),
+                kind: network.kind,
+                cidr: network.cidr.clone(),
             })
             .collect();
         let network_ids: BTreeMap<_, _> = networks
@@ -1334,6 +1356,9 @@ impl ProjectDefinition {
                 machine_id: machine_ids[endpoint.machine.as_str()].clone(),
                 network_id: network_ids[endpoint.network.as_str()].clone(),
                 name: endpoint.name.clone(),
+                protocol: endpoint.protocol,
+                port: endpoint.port,
+                hostname: endpoint.hostname.clone(),
             })
             .collect();
 
@@ -4347,16 +4372,27 @@ fn validate_definition_instance(
         .iter()
         .map(|network| (network.name.as_str(), network))
         .collect();
-    if networks.len() != spec.networks.len()
-        || spec
-            .networks
-            .iter()
-            .any(|network| !networks.contains_key(network.name.as_str()))
-    {
+    if networks.len() != spec.networks.len() {
         return definition_topology_mismatch(
             &environment_id,
             "Network names/count differ from the project definition",
         );
+    }
+    for desired in &spec.networks {
+        let Some(actual) = networks.get(desired.name.as_str()) else {
+            return definition_topology_mismatch(
+                &environment_id,
+                "Network names/count differ from the project definition",
+            );
+        };
+        // Kind and CIDR are applied state, not labels: a redeclared range moves
+        // every derived host address, so a changed one is a different network.
+        if actual.kind != desired.kind || actual.cidr != desired.cidr {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("Network `{}` addressing differs", desired.name),
+            );
+        }
     }
 
     let machine_names_by_id: BTreeMap<_, _> = environment
@@ -4395,6 +4431,18 @@ fn validate_definition_instance(
             return definition_topology_mismatch(
                 &environment_id,
                 format!("Endpoint `{}` attachment differs", desired.name),
+            );
+        }
+        // The service coordinate is what an endpoint resolves to. Comparing only
+        // the attachment would let a redeclared port reuse the persisted record
+        // and silently keep resolving to the old one.
+        if actual.protocol != desired.protocol
+            || actual.port != desired.port
+            || actual.hostname != desired.hostname
+        {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("Endpoint `{}` service coordinate differs", desired.name),
             );
         }
     }
@@ -5741,6 +5789,8 @@ mod tests {
             network_id: NetworkId::new("net_empty").unwrap(),
             environment_id,
             name: String::new(),
+            kind: NetworkKind::Private,
+            cidr: None,
         });
         assert!(matches!(
             state.environments[0].validate(),
@@ -8055,6 +8105,90 @@ mod tests {
         assert!(matches!(
             validate_definition_instance(&definition.environment, &dropped_egress),
             Err(TopologyValidationError::DefinitionTopologyMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn instantiation_persists_declared_addressing_and_service_coordinates() {
+        let definition = network_topology_definition();
+        let environment = definition.instantiate_environment("agent", 7).unwrap();
+
+        let declared_network = &definition.environment.networks[0];
+        let network = &environment.networks[0];
+        assert_eq!(network.kind, declared_network.kind);
+        assert_eq!(network.cidr, declared_network.cidr);
+        // The declaration is the only place these values exist, so an instance
+        // that dropped them could not be told apart from one that never had
+        // them. Assert against a non-default kind and a present CIDR.
+        assert_eq!(network.cidr.as_deref(), Some("10.42.0.0/24"));
+
+        let declared_endpoint = &definition.environment.endpoints[0];
+        let endpoint = &environment.endpoints[0];
+        assert_eq!(endpoint.protocol, declared_endpoint.protocol);
+        assert_eq!(endpoint.port, declared_endpoint.port);
+        assert_eq!(endpoint.hostname, declared_endpoint.hostname);
+        // "Which port is endpoint `api` on" must be answerable from the
+        // persisted record alone.
+        assert_eq!(endpoint.protocol, EndpointProtocol::Https);
+        assert_eq!(endpoint.port, 443);
+        assert_eq!(endpoint.hostname.as_deref(), Some("api.shop.test"));
+
+        let round_trip: EndpointInstance =
+            serde_json::from_str(&serde_json::to_string(endpoint).unwrap()).unwrap();
+        assert_eq!(&round_trip, endpoint);
+        let round_trip: NetworkInstance =
+            serde_json::from_str(&serde_json::to_string(network).unwrap()).unwrap();
+        assert_eq!(&round_trip, network);
+    }
+
+    #[test]
+    fn reconciliation_detects_a_changed_endpoint_port_and_network_addressing() {
+        let definition = network_topology_definition();
+        let environment = definition.instantiate_environment("agent", 7).unwrap();
+        validate_definition_instance(&definition.environment, &environment).unwrap();
+
+        // A re-Up whose definition moved the endpoint to another port must not
+        // reuse the persisted record, which would keep resolving to the old one.
+        let mut moved_port = definition.clone();
+        moved_port.environment.endpoints[0].port = 8443;
+        assert!(matches!(
+            validate_definition_instance(&moved_port.environment, &environment),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { ref details, .. })
+                if details.contains("Endpoint `api` service coordinate differs")
+        ));
+
+        let mut moved_protocol = definition.clone();
+        moved_protocol.environment.endpoints[0].protocol = EndpointProtocol::Tcp;
+        assert!(matches!(
+            validate_definition_instance(&moved_protocol.environment, &environment),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { ref details, .. })
+                if details.contains("Endpoint `api` service coordinate differs")
+        ));
+
+        let mut renamed_host = definition.clone();
+        renamed_host.environment.endpoints[0].hostname = Some("api.other.test".to_string());
+        assert!(matches!(
+            validate_definition_instance(&renamed_host.environment, &environment),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { ref details, .. })
+                if details.contains("Endpoint `api` service coordinate differs")
+        ));
+
+        // Every attachment host address is derived from the range, so a
+        // redeclared CIDR is a different network rather than a relabelled one.
+        let mut moved_cidr = definition.clone();
+        moved_cidr.environment.networks[0].cidr = Some("10.43.0.0/24".to_string());
+        assert!(matches!(
+            validate_definition_instance(&moved_cidr.environment, &environment),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { ref details, .. })
+                if details.contains("Network `private` addressing differs")
+        ));
+
+        let mut moved_kind = definition;
+        moved_kind.environment.networks[0].kind = NetworkKind::SimulatedPublic;
+        assert!(matches!(
+            validate_definition_instance(&moved_kind.environment, &environment),
+            Err(TopologyValidationError::DefinitionTopologyMismatch { ref details, .. })
+                if details.contains("Network `private` addressing differs")
         ));
     }
 
