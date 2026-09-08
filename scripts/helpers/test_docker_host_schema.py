@@ -27,7 +27,8 @@ class ResultSchemaTests(unittest.TestCase):
                               "first_command": index * 2 + 1, "last_command": index * 2 + 2,
                               "outcome": "fixture_assertions_passed", "assertions": ["synthetic schema test only"]}
                              for index, recipe in enumerate(BUILD_RECIPES)],
-            "command_count": len(BUILD_RECIPES) * 2, "owned_projects": {}, "remaining": ["physical verification"]}
+            "command_count": len(BUILD_RECIPES) * 2, "owned_projects": {}, "unrelated_unchanged": [],
+            "remaining": ["physical verification"]}
 
     def test_fixture_only_success_shape(self):
         self.validator.validate(self.result)

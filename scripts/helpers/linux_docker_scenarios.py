@@ -142,7 +142,7 @@ TABLE = (
     _c("docker.compose.volumes", "compose", ("compose-volume-persistence", "persisted_digest")),
     _c("docker.compose.scaling", "compose", "compose-scale"),
     _c("docker.compose.failure_propagation", "compose", ("compose-failure", "assert_failure_health")),
-    _c("docker.compose.down", "compose", "Driver.cleanup", "partial", ("external_and_unrelated_resources_unchanged",)),
+    _c("docker.compose.down", "compose", "Driver.cleanup"),
     # build: driver recipes on the embedded builder.
     _c("docker.build.cache_reuse", "build", "build-cache-reuse"),
     _c("docker.build.cache_isolation", "build", ("build-cache-mount", "verify_cache_isolation")),

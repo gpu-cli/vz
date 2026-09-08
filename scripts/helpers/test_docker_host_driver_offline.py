@@ -54,6 +54,7 @@ class BoundaryTests(unittest.TestCase):
         item.record = driver.Recorder(self.root, {"HOME": os.environ.get("HOME", ""), "PATH": "/usr/bin:/bin"}, [])
         item.observations = []
         item.projects = {}
+        item.unrelated_unchanged = []
         item.fixture_spec = {"expected": {"volume": {"sentinel": "/data/sentinel.txt"},
                                           "persistence_template": "vz04|db|{owner}|persisted\n"}}
         return item
@@ -433,34 +434,110 @@ class BoundaryTests(unittest.TestCase):
                     with self.assertRaises(driver.Rejected):
                         self.verify_network_inventory(inventory)
 
+    def fake_engine(self, *, owned=("c" * 64,), unrelated=("u" * 64,), networks=("n" * 64,),
+                    volumes=("other_state",), survivor=None, disturb=None):
+        """A Machine whose inventory the driver's own commands actually change.
+
+        `disturb` runs when the project's down does, so a test can make that
+        down remove or add something the project never owned.
+        """
+        decoy_network = "d" * 64
+        inventory = {"container": [*unrelated, *owned], "network": [*networks], "volume": [*volumes]}
+        names = {"volume": list(volumes), "network": ["bridge"]}
+        state = {"down": 0}
+        def command(args, **kwargs):
+            kind = args[0]
+            if args[:2] == ["container", "inspect"]:
+                return driver.Command(1, [], 0 if survivor == "container" else 1,
+                                      b'[{}]' if survivor == "container" else b'[]\n',
+                                      b'' if survivor == "container" else
+                                      ("Error response from daemon: No such container: " + "c" * 64 + "\n").encode())
+            if args[1:3] == ["ls", "--format"]:
+                return driver.Command(1, [], 0, "".join(n + "\n" for n in names[kind]).encode(), b"")
+            if args[1] == "create":
+                identity = args[-1] if kind == "volume" else decoy_network
+                inventory[kind].append(identity)
+                names[kind].append(args[-1])
+                return driver.Command(1, [], 0, (identity + "\n").encode(), b"")
+            if args[1] == "rm":
+                inventory[kind] = [x for x in inventory[kind] if x != args[-1]]
+                return driver.Command(1, [], 0, (args[-1] + "\n").encode(), b"")
+            if args[1] == "ls":
+                return driver.Command(1, [], 0, "".join(x + "\n" for x in inventory[kind]).encode(), b"")
+            return driver.Command(1, [], 0, b"", b"")
+        def down(*args, **kwargs):
+            state["down"] += 1
+            for identity in owned:
+                if identity in inventory["container"]:
+                    inventory["container"].remove(identity)
+            if disturb is not None:
+                disturb(inventory)
+        return command, down, {"volume": "other_state", "network": decoy_network}
+
+    def run_cleanup(self, item, command, down, *, names=None):
+        empty = {kind: [] for kind in ("container", "network", "volume")}
+        before = {"container": [{"Id": "c" * 64}], "volume": [], "network": []}
+        with patch.object(item, "guard"), patch.object(item, "capture", return_value=before), \
+                patch.object(item, "inspect_project", return_value=empty), \
+                patch.object(item, "compose", side_effect=down), \
+                patch.object(item, "verify_named_resources", side_effect=names) as verified, \
+                patch.object(item, "command", side_effect=command):
+            return item.cleanup(), verified
+
     def test_cleanup_requires_exact_post_down_names_and_container_absence(self):
         for survivor in ("container", "volume", None):
             with self.subTest(survivor=survivor):
                 item = self.bare_driver()
-                item.projects = {"owned": {kind: set() for kind in ("container", "network", "volume")}}
-                before = {"container": [{"Id": "c" * 64}], "volume": [], "network": []}
-                empty = {kind: [] for kind in before}
-                checks = []
-                def command(args, **kwargs):
-                    checks.append(args)
-                    if args[:2] == ["container", "inspect"]:
-                        return driver.Command(1, [], 0 if survivor == "container" else 1,
-                                              b'[{}]' if survivor == "container" else b'[]\n',
-                                              b'' if survivor == "container" else
-                                              ("Error response from daemon: No such container: " + "c" * 64 + "\n").encode())
-                    return driver.Command(1, [], 0, b"", b"")
+                item.projects = {"owned": {"container": {"c" * 64}, "network": set(), "volume": set()}}
                 def names(project, inventory):
                     if not inventory["container"] and survivor == "volume":
                         raise driver.Rejected("exact unlabelled volume survived")
-                with patch.object(item, "guard"), patch.object(item, "capture", return_value=before), \
-                        patch.object(item, "inspect_project", return_value=empty), patch.object(item, "compose"), \
-                        patch.object(item, "verify_named_resources", side_effect=names) as verified, \
-                        patch.object(item, "command", side_effect=command):
-                    errors = item.cleanup()
+                command, down, _ = self.fake_engine(survivor=survivor)
+                errors, verified = self.run_cleanup(item, command, down, names=names)
                 self.assertEqual(bool(errors), survivor is not None)
                 self.assertEqual(verified.call_count, 2)
-                if survivor != "volume":
-                    self.assertIn(["container", "inspect", "c" * 64], checks)
+                if survivor is None:
+                    self.assertEqual(item.unrelated_unchanged, [{"project": "owned",
+                        "external_and_unrelated_unchanged": True,
+                        "witnessed": {"container": 1, "network": 2, "volume": 2}}])
+
+    def test_external_decoys_witness_every_down_and_are_retired(self):
+        item = self.bare_driver()
+        item.projects = {"owned": {"container": {"c" * 64}, "network": set(), "volume": set()}}
+        command, down, decoys = self.fake_engine()
+        seen = []
+        errors, _ = self.run_cleanup(item, lambda args, **kw: (seen.append(args), command(args, **kw))[1], down)
+        self.assertEqual(errors, [])
+        self.assertIn(["volume", "create", "--label", "dev.vz.fixture-owner=" + item.inputs.owner,
+                       item.inputs.owner + "-decoy"], seen)
+        self.assertIn(["network", "rm", decoys["network"]], seen)
+        # The decoy is created before the down it witnesses and removed after.
+        self.assertLess(seen.index(["volume", "create", "--label",
+                                    "dev.vz.fixture-owner=" + item.inputs.owner,
+                                    item.inputs.owner + "-decoy"]),
+                        seen.index(["volume", "rm", item.inputs.owner + "-decoy"]))
+        self.assertTrue(item.unrelated_unchanged[0]["external_and_unrelated_unchanged"])
+
+    def test_preexisting_decoy_name_is_never_adopted(self):
+        item = self.bare_driver()
+        item.projects = {"owned": {"container": {"c" * 64}, "network": set(), "volume": set()}}
+        command, down, _ = self.fake_engine(volumes=(item.inputs.owner + "-decoy",))
+        errors, _ = self.run_cleanup(item, command, down)
+        self.assertTrue(any("adoption forbidden" in error for error in errors))
+        self.assertEqual(item.unrelated_unchanged, [])
+
+    def test_down_that_disturbs_an_unrelated_resource_is_rejected(self):
+        # A resource this project never owned may not vanish, change or appear
+        # across its own down.
+        for label, disturb in (("removed", lambda inv: inv["container"].remove("u" * 64)),
+                               ("added", lambda inv: inv["volume"].append("appeared"))):
+            with self.subTest(mutation=label):
+                item = self.bare_driver()
+                item.projects = {"owned": {"container": {"c" * 64}, "network": set(), "volume": set()}}
+                command, down, _ = self.fake_engine(disturb=disturb)
+                errors, _ = self.run_cleanup(item, command, down)
+                self.assertTrue(any("outside the owned project" in error for error in errors), errors)
+                self.assertEqual(item.unrelated_unchanged, [])
 
     def test_recreated_startup_sentinel_cannot_pass_host_volume_persistence(self):
         item = self.bare_driver()

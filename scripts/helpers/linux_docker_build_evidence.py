@@ -232,13 +232,15 @@ class Replay:
         self.result = result = decode(self.files["result.json"])
         require(set(result) == {"schema_version", "kind", "suite", "run_id", "scope", "release_sha256", "fixture_sha256",
                                "compatibility_certified", "release_scenarios_passed", "test_case_retries", "outcome", "failure",
-                               "cleanup_errors", "observations", "command_count", "owned_projects", "remaining"}, "unknown result fields")
+                               "cleanup_errors", "observations", "command_count", "owned_projects",
+                               "unrelated_unchanged", "remaining"}, "unknown result fields")
         require(type(result["schema_version"]) is int and result["schema_version"] == 1
                 and result["kind"] == "docker_host_fixture_subset" and result["suite"] == "build"
                 and result["compatibility_certified"] is False and result["release_scenarios_passed"] == []
                 and type(result["test_case_retries"]) is int and result["test_case_retries"] == 0
                 and result["outcome"] == "fixture_assertions_passed" and result["failure"] is None
                 and result["cleanup_errors"] == [] and result["owned_projects"] == {}
+                and result["unrelated_unchanged"] == []
                 and result["remaining"] == REMAINING, "failed, retried, wrong-suite or overclaimed build subset")
         for key in ("scope", "run_id", "release_sha256", "fixture_sha256"):
             require(result[key] == inputs[key], "result owner or input digest mismatch")

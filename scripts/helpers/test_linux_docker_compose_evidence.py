@@ -30,6 +30,7 @@ class SyntheticEngine:
         self.inputs = inputs
         self.owner = inputs.owner
         self.projects, self.markers = {}, {}
+        self.external = {kind: [] for kind in ("container", "network", "volume")}
 
     def identity(self, name):
         return hashlib.sha256(name.encode()).hexdigest()
@@ -103,9 +104,19 @@ class SyntheticEngine:
             stdout = data([{"Id": pin["id"], "Os": "linux", "Architecture": "arm64", "RepoDigests": [pin["reference"]]}])
         elif args[0] in {"container", "network", "volume"}:
             kind = args[0]
-            values = [item for inventory in self.projects.values() for item in inventory[kind]]
+            values = [item for inventory in self.projects.values() for item in inventory[kind]] + self.external[kind]
             key = "Name" if kind == "volume" else "Id"
-            if args[1] == "ls":
+            if args[1] == "create":
+                # An external resource: no Compose project label, so no owned
+                # inventory ever contains it and every down must leave it alone.
+                item = {"Name": args[-1], "Id": self.identity(args[-1]),
+                        "Labels": {"dev.vz.fixture-owner": self.owner}}
+                self.external[kind].append(item)
+                stdout = (item[key] + "\n").encode()
+            elif args[1] == "rm":
+                self.external[kind] = [item for item in self.external[kind] if item[key] not in args[2:]]
+                stdout = ("\n".join(args[2:]) + "\n").encode()
+            elif args[1] == "ls":
                 if "--filter" in args:
                     project = args[-1].split("=", 2)[2]
                     values = self.projects.get(project, {}).get(kind, [])

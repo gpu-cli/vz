@@ -3,7 +3,7 @@
   "title": "DEV host Docker fixture observations, not aggregate release results",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "kind", "suite", "run_id", "scope", "release_sha256", "fixture_sha256", "compatibility_certified", "release_scenarios_passed", "test_case_retries", "outcome", "failure", "cleanup_errors", "observations", "command_count", "owned_projects", "remaining"],
+  "required": ["schema_version", "kind", "suite", "run_id", "scope", "release_sha256", "fixture_sha256", "compatibility_certified", "release_scenarios_passed", "test_case_retries", "outcome", "failure", "cleanup_errors", "observations", "command_count", "owned_projects", "unrelated_unchanged", "remaining"],
   "properties": {
     "schema_version": {"const": 1},
     "kind": {"const": "docker_host_fixture_subset"},
@@ -58,6 +58,28 @@
           "container": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
           "network": {"type": "array", "uniqueItems": true, "items": {"type": "string", "pattern": "^[0-9a-f]{64}$"}},
           "volume": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+        }
+      }
+    },
+    "unrelated_unchanged": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["project", "external_and_unrelated_unchanged", "witnessed"],
+        "properties": {
+          "project": {"type": "string", "minLength": 1},
+          "external_and_unrelated_unchanged": {"const": true},
+          "witnessed": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["container", "network", "volume"],
+            "properties": {
+              "container": {"type": "integer", "minimum": 0},
+              "network": {"type": "integer", "minimum": 1},
+              "volume": {"type": "integer", "minimum": 1}
+            }
+          }
         }
       }
     },

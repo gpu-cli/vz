@@ -635,6 +635,7 @@ class Driver:
         require(sha256(secret) == self.fixture_spec["secret_input_sha256"], "fixture secret mismatch")
         self.observations: list[dict[str, Any]] = []
         self.projects: dict[str, dict[str, set[str]]] = {}
+        self.unrelated_unchanged: list[dict[str, Any]] = []
         self.config_snapshot = self.validate_config()
         definition = json.loads(regular(fixture / "compose/compose.json"))
         label = {"dev.vz.fixture-owner": inputs.owner}
@@ -777,6 +778,65 @@ class Driver:
         return {kind: {item["Name"] if kind == "volume" else item["Id"] for item in items}
                 for kind, items in inventory.items()}
 
+    def machine_inventory(self) -> dict[str, list[str]]:
+        """Every container, network and volume this Machine's own Engine holds."""
+        inventory = {}
+        for kind, args in (("container", ["container", "ls", "--all", "--quiet", "--no-trunc"]),
+                           ("network", ["network", "ls", "--quiet", "--no-trunc"]),
+                           ("volume", ["volume", "ls", "--quiet"])):
+            result = self.command(args)
+            require(not result.stderr, "Machine inventory diagnostics")
+            values = result.stdout.decode().split()
+            require(len(values) == len(set(values)) and len(values) <= 4096, "ambiguous Machine inventory")
+            inventory[kind] = sorted(values)
+        return inventory
+
+    def create_decoys(self) -> dict[str, str]:
+        """Identities of one volume and one network external to every project.
+
+        Sibling projects witness the earlier downs, but the last project has no
+        sibling left, so the only resource guaranteed to be standing across
+        every down is one this suite creates outside all of them. A network is
+        listed by ID and a volume by name, so both identities come from the
+        create acknowledgement rather than from the chosen name.
+        """
+        name = self.inputs.owner + "-decoy"
+        self.guard()
+        for kind in ("volume", "network"):
+            listed = self.command([kind, "ls", "--format", "{{.Name}}"])
+            require(not listed.stderr and name not in listed.stdout.decode().split(),
+                    "decoy name already exists; adoption forbidden")
+        identities = {}
+        for kind in ("volume", "network"):
+            created = self.command([kind, "create", "--label", "dev.vz.fixture-owner=" + self.inputs.owner, name])
+            values = created.stdout.decode().split()
+            require(not created.stderr and len(values) == 1, "decoy creation acknowledgement differs")
+            identities[kind] = values[0]
+        require(identities["volume"] == name, "volume create acknowledged another name")
+        present = self.machine_inventory()
+        for kind, identity in identities.items():
+            require(identity in present[kind], "decoy absent from the Machine inventory")
+        return identities
+
+    def remove_decoys(self, identities: dict[str, str]) -> None:
+        self.guard()
+        for kind, identity in identities.items():
+            removed = self.command([kind, "rm", identity])
+            require(not removed.stderr, "decoy removal diagnostics")
+        remaining = self.machine_inventory()
+        for kind, identity in identities.items():
+            require(identity not in remaining[kind], "decoy survived its own removal")
+
+    def outside(self, project: str, inventory: dict[str, list[str]]) -> dict[str, list[str]]:
+        """The Machine's resources this project never owned.
+
+        Every ID the project was ever observed to hold is subtracted, including
+        partial creations, so a resource it may legitimately remove can never
+        be counted as an unrelated witness.
+        """
+        owned = self.projects[project]
+        return {kind: sorted(set(values) - owned.get(kind, set())) for kind, values in inventory.items()}
+
     def compose(self, project: str, args: list[str], *, blocked: bool = False,
                 expected: int | None = 0, timeout: int = 120) -> Command:
         self.guard()
@@ -859,6 +919,14 @@ class Driver:
             # A timed-out host client does not prove the daemon-side operation
             # stopped. Do not race cleanup against possibly continuing creation.
             return ["Unknown, interrupted or inflight host command effects: retained owned project names require topology-harness reconciliation"]
+        decoys = None
+        if self.projects:
+            # Only a Compose down needs an external witness; a build-only run
+            # owns no project and its command sequence stays as it was.
+            try:
+                decoys = self.create_decoys()
+            except (Rejected, KeyError, OSError, ValueError) as error:
+                errors.append(f"external decoys: {type(error).__name__}: {error}")
         for project in self.projects:
             if uncertain():
                 errors.append("Cleanup observation became uncertain; remaining owned projects retained")
@@ -868,10 +936,21 @@ class Driver:
                 inventory = self.capture(project)
                 self.verify_named_resources(project, inventory)
                 require(not uncertain(), "cleanup observations do not establish a safe destructive dispatch")
+                # Sibling projects not yet torn down, the Buildx builder and the
+                # Engine's default networks are the unrelated witnesses: they are
+                # external to this project and this down must not disturb them.
+                before = self.machine_inventory()
+                witnesses = self.outside(project, before)
+                require(decoys is not None and all(decoys[kind] in witnesses[kind] for kind in decoys),
+                        "the external decoys did not witness the owned down")
                 self.compose(project, ["--profile", "failure", "down", "--volumes", "--remove-orphans"])
                 remaining = self.inspect_project(project)
                 require(not any(remaining.values()), "owned Compose resources survived down")
                 self.verify_named_resources(project, remaining)
+                require(witnesses == self.outside(project, self.machine_inventory()),
+                        "down removed, added or replaced a resource outside the owned project")
+                self.unrelated_unchanged.append({"project": project, "external_and_unrelated_unchanged": True,
+                                                 "witnessed": {kind: len(ids) for kind, ids in witnesses.items()}})
                 for container in inventory["container"]:
                     container_id = container["Id"]
                     missing = self.command(["container", "inspect", container_id], expected=1)
@@ -882,6 +961,11 @@ class Driver:
                         "exact pre-down container absence was not proven")
             except (Rejected, KeyError, OSError, ValueError) as error:
                 errors.append(f"{project}: {type(error).__name__}: {error}")
+        if decoys is not None and not uncertain():
+            try:
+                self.remove_decoys(decoys)
+            except (Rejected, KeyError, OSError, ValueError) as error:
+                errors.append(f"external decoys: {type(error).__name__}: {error}")
         return errors
 
     @staticmethod
@@ -1355,6 +1439,7 @@ class Driver:
                   "observations": self.observations, "command_count": self.record.count,
                   "owned_projects": {project: {kind: sorted(ids) for kind, ids in kinds.items()}
                                      for project, kinds in self.projects.items()},
+                  "unrelated_unchanged": list(self.unrelated_unchanged),
                   "remaining": ["All 63 full release scenarios require aggregate certification and physical evidence",
                                 "Immutable ownership/release/runtime attestation and sibling isolation",
                                 "OCI layer/image digests, secret scans across all image/cache blobs",

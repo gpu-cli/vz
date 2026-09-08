@@ -215,7 +215,8 @@ class Replay:
         result = self.result
         require(set(result) == {"schema_version", "kind", "suite", "run_id", "scope", "release_sha256", "fixture_sha256",
                                "compatibility_certified", "release_scenarios_passed", "test_case_retries", "outcome", "failure",
-                               "cleanup_errors", "observations", "command_count", "owned_projects", "remaining"}, "unknown result fields")
+                               "cleanup_errors", "observations", "command_count", "owned_projects",
+                               "unrelated_unchanged", "remaining"}, "unknown result fields")
         runtime_proof(inputs)
         require(result["kind"] == "docker_host_fixture_subset" and type(result["schema_version"]) is int
                 and result["schema_version"] == 1 and result["suite"] == "compose"
@@ -310,6 +311,51 @@ class Replay:
         require(set(info["Runtimes"]) <= {"runc", "io.containerd.runc.v2", "youki", "io.containerd.youki.v2"}
                 and all(info["Runtimes"][name] == {"path": "runc"} for name in inert)
                 and (not inert or "runtime_evidence" in self.inputs), "alternate runtime lacks authenticated inventory")
+
+    def machine_inventory(self):
+        """Independently read the whole Machine, not just one project's label."""
+        inventory = {}
+        for kind, args in (("container", ["container", "ls", "--all", "--quiet", "--no-trunc"]),
+                           ("network", ["network", "ls", "--quiet", "--no-trunc"]),
+                           ("volume", ["volume", "ls", "--quiet"])):
+            values = self.take(args)["_stdout"].decode().split()
+            require(len(values) == len(set(values)) and len(values) <= 4096, "ambiguous Machine inventory")
+            inventory[kind] = sorted(values)
+        return inventory
+
+    def decoys(self):
+        """Replay the external decoys the driver stood up outside every project."""
+        name = self.owner + "-decoy"
+        self.guard()
+        for kind in ("volume", "network"):
+            listed = self.take([kind, "ls", "--format", "{{.Name}}"])
+            require(not listed["_stderr"] and name not in listed["_stdout"].decode().split(),
+                    "decoy name already existed")
+        identities = {}
+        for kind in ("volume", "network"):
+            created = self.take([kind, "create", "--label", "dev.vz.fixture-owner=" + self.owner, name],
+                                mutation=True)
+            values = created["_stdout"].decode().split()
+            require(not created["_stderr"] and len(values) == 1, "decoy creation acknowledgement differs")
+            identities[kind] = values[0]
+        require(identities["volume"] == name, "volume create acknowledged another name")
+        present = self.machine_inventory()
+        for kind, identity in identities.items():
+            require(identity in present[kind], "decoy absent from the Machine inventory")
+        return identities
+
+    def retire_decoys(self, identities):
+        self.guard()
+        for kind, identity in identities.items():
+            removed = self.take([kind, "rm", identity], mutation=True)
+            require(not removed["_stderr"], "decoy removal diagnostics")
+        remaining = self.machine_inventory()
+        for kind, identity in identities.items():
+            require(identity not in remaining[kind], "decoy survived its own removal")
+
+    def outside(self, project, inventory):
+        owned = self.projects[project]
+        return {kind: sorted(set(values) - owned.get(kind, set())) for kind, values in inventory.items()}
 
     def inventory(self, project, track=True):
         inventory = {}
@@ -497,14 +543,24 @@ class Replay:
             require("Health" not in job["State"], "the failed job carries a health state")
             require(services["api"][0]["State"]["StartedAt"] < job["State"]["StartedAt"],
                     "the failed job started before the dependency it declared")
+        unchanged = []
+        decoys = self.decoys()
         for owned in self.projects:
             self.guard()
             before_down = self.inventory(owned)
             self.names(owned, before_down)
+            before = self.machine_inventory()
+            witnesses = self.outside(owned, before)
+            require(all(decoys[kind] in witnesses[kind] for kind in decoys),
+                    "the external decoys did not witness the owned down")
             self.compose(owned, ["--profile", "failure", "down", "--volumes", "--remove-orphans"])
             remaining = self.inventory(owned)
             require(not any(remaining.values()), "resources remain after exact-owned down")
             self.names(owned, remaining)
+            require(witnesses == self.outside(owned, self.machine_inventory()),
+                    "down removed, added or replaced a resource outside the owned project")
+            unchanged.append({"project": owned, "external_and_unrelated_unchanged": True,
+                              "witnessed": {kind: len(ids) for kind, ids in witnesses.items()}})
             for item in before_down["container"]:
                 identity = item["Id"]
                 row = self.take(["container", "inspect", identity], code=1)
@@ -512,7 +568,10 @@ class Replay:
                     f"Error response from daemon: No such container: {identity}".encode(),
                     f"Error: No such container: {identity}".encode(),
                     f"Error: No such object: {identity}".encode()}, "known container absence after down unproven")
+        self.retire_decoys(decoys)
         require(self.i == len(self.rows), "unconsumed extra commands")
+        require(self.result["unrelated_unchanged"] == unchanged,
+                "unrelated-resource witness receipt differs from the independent replay")
         require(self.result["owned_projects"] == {p: {k: sorted(v) for k, v in kinds.items()} for p, kinds in self.projects.items()}, "owned resource receipt mismatch")
         require(self.acknowledged == {row["index"] for row in self.rows if row["effects_uncertain"]}, "unreconciled or extra negative mutation")
         return {"schema_version": 1, "kind": "installed_compose_raw_evidence", "outcome": "fixture_assertions_passed",
