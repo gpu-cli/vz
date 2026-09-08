@@ -637,6 +637,83 @@ def check_recreate_from_definition(ctx: CheckContext, top: str) -> SubCheck:
     return check.finish()
 
 
+def sentinel_write(ctx: CheckContext, check: SubCheck, name: str, instance: dict, token: str) -> bool:
+    row = ctx.run(check, name + "-sentinel-write",
+                  ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
+                   f"printf %s {token} > {SENTINEL_PATH}; cat {SENTINEL_PATH}"],
+                  cwd=instance["project"], env=instance["env"], timeout=120)
+    check.check(row.exit_code == 0 and row.stdout.strip() == token.encode(),
+                f"{name}: sentinel written into its Machine (exit {row.exit_code})")
+    return row.exit_code == 0 and row.stdout.strip() == token.encode()
+
+
+def sentinel_read(ctx: CheckContext, check: SubCheck, name: str, instance: dict):
+    row = ctx.run(check, name + "-sentinel-read",
+                  ["exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
+                   f"cat {SENTINEL_PATH} 2>/dev/null; printf END"],
+                  cwd=instance["project"], env=instance["env"], timeout=120)
+    return row
+
+
+def check_delete_single_environment_safety(ctx: CheckContext, top: str) -> SubCheck:
+    """Deleting one Environment leaves its neighbour serving and byte-identical.
+
+    Two Environments are brought up and each writes its own sentinel. One is
+    deleted; the survivor must still answer an exec (so it is serving, not
+    merely recorded as ready), keep every runtime identity it had, and return
+    its sentinel bytes unchanged. The scope is these two Environments and the
+    surfaces named here, not a host-wide sweep.
+    """
+    check = SubCheck(top, "single_environment_safety")
+    try:
+        base = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    tokens, instances = {}, {}
+    for name in ("del-a", "del-b"):
+        definition = copy.deepcopy(base)
+        definition["project_id"] = "prj_" + uuid.uuid4().hex
+        instances[name] = provision(ctx, check, name, definition)
+        if check.status != "PASS" or not instances[name]["status"]:
+            return check.finish()
+        tokens[name] = "vzdel-" + uuid.uuid4().hex[:16]
+        if not sentinel_write(ctx, check, name, instances[name], tokens[name]):
+            return check.finish()
+    victim, survivor = instances["del-a"], instances["del-b"]
+    before = runtime_identities(survivor["status"])
+    removed = ctx.run(check, "del-a-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                      cwd=victim["project"], env=victim["env"], timeout=DELETE_TIMEOUT)
+    check.check(removed.exit_code == 0, f"the selected Environment was deleted (exit {removed.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+    gone = read_status(ctx, check, "del-a-after", project=victim["project"], env=victim["env"])
+    check.check(not (gone or {}).get("environments"),
+                f"the deleted Environment is gone (observed {[e.get('name') for e in (gone or {}).get('environments') or []]})")
+    # The survivor must still answer, not merely be recorded as ready: an exec
+    # exercises its daemon, its Machine and its runtime end to end.
+    survived = read_status(ctx, check, "del-b-after", project=survivor["project"], env=survivor["env"])
+    check.check(bool((survived or {}).get("environments")), "the other Environment is still reported")
+    if not survived or not survived.get("environments"):
+        return check.finish()
+    check.check(all(row.get("state") == "ready" for row in survived["environments"]),
+                f"the other Environment is still ready (observed {[r.get('state') for r in survived['environments']]})")
+    after = runtime_identities(survived)
+    for kind in sorted(before):
+        old_values = [value for value in before[kind] if value]
+        new_values = [value for value in after[kind] if value]
+        check.check(old_values and old_values == new_values,
+                    f"the other Environment kept its {kind} identity ({len(old_values)} before, {len(new_values)} after)")
+    reread = sentinel_read(ctx, check, "del-b", survivor)
+    check.check(reread.exit_code == 0 and reread.stdout.strip() == (tokens["del-b"] + "END").encode(),
+                f"the other Environment returns byte-identical sentinel data (observed {reread.stdout[:60]!r})")
+    if check.status == "PASS":
+        final = ctx.run(check, "del-b-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                        cwd=survivor["project"], env=survivor["env"], timeout=DELETE_TIMEOUT)
+        check.check(final.exit_code == 0, f"the other Environment deleted afterwards (exit {final.exit_code})")
+    return check.finish()
+
+
 def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
     """A real `vz up` from a bare definition must create the `default` Environment.
 

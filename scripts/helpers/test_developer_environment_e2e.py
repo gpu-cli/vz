@@ -32,6 +32,7 @@ TOP21 = e2e.CRITERION_21
 TOP15 = e2e.CRITERION_15
 TOP1 = "gate.instances.three_concurrent_no_collision"
 TOP16 = "gate.reproducibility.recreate_from_definition"
+TOP11 = "gate.delete.single_environment_safety"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision"}
 # Both remaining sub-checks belong to criterion 15 and need a live typed API,
@@ -264,6 +265,7 @@ class TopologyLaneTests(unittest.TestCase):
         # not_implemented because its other scenarios are not.
         self.assertEqual((code, result["failure"]["reason"]), (3, "not_implemented"))
         self.assertEqual(self.top(result, TOP16)["status"], "PASS")
+        self.assertEqual(self.top(result, TOP11)["status"], "PASS")
         self.assertIsNone(result["retained_root"])
         self.assertFalse((self.state_root / "topology").exists())
         self.assertEqual((result["cleanup_errors"], result["leaks"]), ([], []))

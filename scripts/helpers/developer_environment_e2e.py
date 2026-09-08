@@ -44,6 +44,7 @@ CRITERION_21 = "gate.cli.legacy_removal_and_bootstrap"
 CRITERION_15 = "gate.cli_api.agreement"
 CRITERION_1 = "gate.instances.three_concurrent_no_collision"
 CRITERION_16 = "gate.reproducibility.recreate_from_definition"
+CRITERION_11 = "gate.delete.single_environment_safety"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
 
 
@@ -239,10 +240,11 @@ class Lane:
                                   docker_client=self.options.get("docker", "none"),
                                   plugins={"compose": self.options.get("compose-plugin"),
                                            "buildx": self.options.get("buildx-plugin")})
-        subchecks = {CRITERION_16: []}
+        subchecks = {CRITERION_16: [], CRITERION_11: []}
         crash = None
         try:
             subchecks[CRITERION_16].append(checks.check_recreate_from_definition(ctx, CRITERION_16))
+            subchecks[CRITERION_11].append(checks.check_delete_single_environment_safety(ctx, CRITERION_11))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
