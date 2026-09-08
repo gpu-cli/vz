@@ -40,7 +40,7 @@ class LaneContext:
 
     def __init__(self, *, run_id, release_dir, release_dir_sha256, state_root, contract_path, contract_sha256,
                  candidate_tuple_sha256, fixture_sha256, clients, repo_root=REPO_ROOT, linux_docker_context=None,
-                 tmux=None, acquired_inputs=None):
+                 tmux=None, acquired_inputs=None, uv=None):
         self.run_id = run_id
         self.release_dir = Path(release_dir)
         self.release_dir_sha256 = release_dir_sha256
@@ -60,6 +60,10 @@ class LaneContext:
         # option name the lane passes them as. Absent means nothing was acquired,
         # which a lane that needs one refuses on rather than inventing a path.
         self.acquired_inputs = dict(acquired_inputs or {})
+        # Every lane entry point is a `uv run` wrapper, and `uv` is not on the
+        # minimal PATH. The gate resolves it explicitly, the way it resolves the
+        # Docker clients, rather than the lanes inheriting an ambient one.
+        self.uv = uv
 
 
 def entry_point_record(repo_root: Path, lane: dict, argv: list) -> dict:
@@ -198,6 +202,11 @@ def minimal_env(ctx: LaneContext) -> dict:
         env["PATH"] = str(Path(cargo_home) / "bin") + ":" + env["PATH"]
     elif (Path(env["HOME"]) / ".cargo" / "bin").is_dir():
         env["PATH"] = str(Path(env["HOME"]) / ".cargo" / "bin") + ":" + env["PATH"]
+    if ctx.uv:
+        # Prepended last, so a lane runs the interpreter the gate resolved and
+        # recorded rather than one that happens to be installed elsewhere —
+        # `uv` is commonly present in the Cargo bin directory added above.
+        env["PATH"] = str(Path(ctx.uv).parent) + ":" + env["PATH"]
     return env
 
 

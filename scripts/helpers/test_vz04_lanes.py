@@ -17,7 +17,7 @@ DIGEST = "a" * 64
 
 
 def _ctx(root, **overrides):
-    options = dict(tmux="/usr/bin/true",
+    options = dict(tmux="/usr/bin/true", uv="/opt/vz-test/bin/uv",
                    acquired_inputs={"registry-archive": "/acquired/registry.tar",
                                     "registry-layout": "/acquired/layout",
                                     "ssh-packages": "/acquired/ssh-inputs"})
@@ -229,6 +229,19 @@ class LaneTests(unittest.TestCase):
             self.assertFalse((directory / "lane.stdout").exists(), "nothing may be run")
         finally:
             fixtures.make_writable(release)
+
+    def test_a_lane_can_actually_start_its_entry_point(self):
+        """Every lane entry point execs `uv run`, and `uv` is not on the minimal
+        PATH — it installs under the user's home. Without resolving it the gate
+        starts no lane at all and every one exits 127, which only a non-dry run
+        can observe; dry lanes never start the process.
+        """
+        ctx = _ctx(self.root, uv="/opt/vz-test/bin/uv")
+        env = lanes.minimal_env(ctx)
+        self.assertTrue(env["PATH"].startswith("/opt/vz-test/bin:"),
+                        "the resolved uv must precede any other on PATH")
+        # Nothing ambient: a gate without one leaves the minimal PATH alone.
+        self.assertNotIn("/opt/vz-test/bin", lanes.minimal_env(_ctx(self.root, uv=None))["PATH"])
 
     def test_stub_script_writes_valid_result_and_exits_3(self):
         """The native-macOS lane is still a stub: it must account for itself rather

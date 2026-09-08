@@ -1,7 +1,7 @@
 """Aggregate vz 0.4 release-gate orchestrator.
 
     vz04_gate.py --suite all --release-dir <dir> --run-id <id> [--evidence-root]
-                 [--state-root] [--docker] [--compose-plugin] [--buildx-plugin] [--tmux]
+                 [--state-root] [--docker] [--compose-plugin] [--buildx-plugin] [--tmux] [--uv]
                  [--linux-docker-context] [--sleep-wake-ack-file] [--dry-lanes]
 
 Only `--suite all` is accepted; anything else exits 2 before touching state.
@@ -70,6 +70,7 @@ def parse_args(argv):
     parser.add_argument("--linux-docker-context", default=None)
     parser.add_argument("--tmux", default=None)
     parser.add_argument("--run-inputs-cache", default=None, type=Path)
+    parser.add_argument("--uv", default=None)
     parser.add_argument("--sleep-wake-ack-file", default=None)
     parser.add_argument("--dry-lanes", action="store_true", help="DEV ONLY: substitute lanes with not_implemented results")
     return parser.parse_args(argv)
@@ -183,6 +184,9 @@ def run(args) -> int:
     # the same terms, but kept out of `clients`, which names Docker clients and
     # is what the manifest's client facts are built from.
     tmux = host_executable("tmux")
+    # Every lane entry point execs `uv run`, and the minimal lane PATH does not
+    # include where uv is installed. Resolve it here so a lane starts at all.
+    uv = host_executable("uv")
     # Run-frozen inputs are acquired from their checked-in pins rather than
     # carried by the candidate or retained in the tree. Cached by the pin's own
     # digest, so a changed pin can never reuse the previous artifact. A dry run
@@ -260,7 +264,7 @@ def run(args) -> int:
                                 contract_path=repo_root / "config/vz-0.4-e2e-contract.json", contract_sha256=frozen["inputs"]["e2e_contract"]["sha256"],
                                 candidate_tuple_sha256=tuple_value["sha256"], fixture_sha256=frozen["digests"]["fixtures_tree_sha256"],
                                 clients=clients, repo_root=repo_root, linux_docker_context=args.linux_docker_context,
-                                tmux=tmux, acquired_inputs=acquired)
+                                tmux=tmux, acquired_inputs=acquired, uv=uv)
 
         def observer(phase, lane, lane_phase, result):
             reason = "" if result["failure"] is None else f" ({result['failure']['reason']})"
