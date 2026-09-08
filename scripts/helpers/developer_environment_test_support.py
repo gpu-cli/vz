@@ -69,6 +69,27 @@ if [ -n "$verb" ]; then
   if [ "$verb" = up ] && [ "$mode" = provisions ]; then
     mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"; echo '{"progress":{"completion":{}}}'; exit 0
   fi
+  # A real Up persists topology; `status` succeeds only afterwards, which is
+  # what the bootstrap-creates-default check depends on.
+  topology="$VZ_RUNTIME_DATA_DIR/topology.json"
+  if [ "$verb" = up ] && [ -f vz.json ]; then
+    pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
+    mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"
+    printf '%s' "$pid" > "$topology"
+    printf '{"schema_version":1,"progress":{"completion":{}}}\n'
+    exit 0
+  fi
+  if [ "$verb" = delete ] && [ -f "$topology" ]; then
+    rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
+  fi
+  if [ "$verb" = status ] && [ -f "$topology" ]; then
+    # The real success payload is a pretty-printed document, not one line, and
+    # it names its own state source and per-Environment state.
+    printf '{\n "schema_version": 1,\n "topology_state_source": "persisted",\n "project_id": "%s",\n' "$(cat "$topology")"
+    printf ' "environments": [\n  {\n   "name": "default",\n   "state": "ready",\n'
+    printf '   "machines": [{"name": "machine-0", "state": "ready"}]\n  }\n ]\n}\n'
+    exit 0
+  fi
   if [ ! -f vz.json ]; then
     if [ "$verb" = status ]; then
       printf '{"error":{"code":"definition_not_found","message":"no vz.json project definition found at or above %s"}}\n' "$PWD" >&2

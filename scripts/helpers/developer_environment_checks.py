@@ -1,5 +1,8 @@
-"""Physical sub-checks of the `topology` lane that the installed 0.4 binaries
-can prove today without provisioning a Machine.
+"""Physical sub-checks of the `topology` lane against the installed 0.4 binaries.
+
+Most checks prove what the binaries do without provisioning; the bootstrap
+Environment check provisions one Developer Machine and removes it again, and is
+the lane's only mutating path.
 
 Criterion 21 (`gate.cli.legacy_removal_and_bootstrap`):
   bare_help            bare `vz` == pinned snapshot, exit 0, no discovery/mutation
@@ -9,7 +12,8 @@ Criterion 21 (`gate.cli.legacy_removal_and_bootstrap`):
                        with zero state mutation and no daemon
   bootstrap_read_only  a schema-valid minimal vz.json is read by `vz status`
                        without spawning a daemon or creating state
-  bootstrap_creates_default   NOT IMPLEMENTED (needs a real Up)
+  bootstrap_creates_default   a real `vz up` from a definition naming no
+                       Environment creates `default`, then deletes it again
 Criterion 15 (`gate.cli_api.agreement`):
   help_surface_exact   root/subcommand help is exactly the five verbs
   error_envelope_agreement   `up` and `status` agree on `definition_not_found`
@@ -23,6 +27,7 @@ is not schema-valid). Every assertion is recorded from raw receipts.
 from __future__ import annotations
 
 import json
+import shutil
 import os
 from pathlib import Path
 import socket
@@ -101,34 +106,72 @@ class SubCheck:
 
 class CheckContext:
     def __init__(self, *, repo_root: Path, release_dir: Path, state: LaneState, recorder: Recorder, evidence_dir: Path,
-                 cli_removal: dict):
+                 cli_removal: dict, docker_client: str = "none", plugins: dict = None):
         self.repo_root = Path(repo_root)
         self.release_dir = Path(release_dir)
         self.state = state
         self.recorder = recorder
         self.evidence_dir = Path(evidence_dir)
         self.cli_removal = cli_removal
+        # The gate passes the Mac's own unmodified client; a Developer Machine
+        # cannot reach `ready` without one, and vz will not guess a path.
+        self.docker_client = docker_client
+        # `docker compose` is a CLI plugin, not a subcommand: without it staged
+        # beside the client config the Engine handshake fails with
+        # "unknown command: docker compose" after the Machine has been created.
+        self.plugins = {name: path for name, path in (plugins or {}).items() if path and path != "none"}
 
     def run(self, check: SubCheck, label: str, argv: list, *, cwd: Path, env: dict, timeout: int = 5):
         receipt = self.recorder.run(label, [self.state.cli, *argv], cwd=cwd, env=env, scenario_id=check.id, timeout=timeout)
         check.evidence.extend(self.recorder.receipt_paths(receipt))
         return receipt
 
-    def isolated(self, name: str, *, project_files: dict) -> dict:
-        """`<lane state>/<name>/{state,project}` plus an absent HOME."""
+    def run_tool(self, check: SubCheck, label: str, argv: list, *, cwd: Path, env: dict, timeout: int = 60):
+        """Record a non-vz host tool the same way the CLI is recorded."""
+        receipt = self.recorder.run(label, argv, cwd=cwd, env=env, scenario_id=check.id, timeout=timeout)
+        check.evidence.extend(self.recorder.receipt_paths(receipt))
+        return receipt
+
+    def isolated(self, name: str, *, project_files: dict, provision: bool = False) -> dict:
+        """`<lane state>/<name>/{state,project}` plus an absent HOME.
+
+        The daemon is absent by default so a read-only check can never spawn
+        one. `provision=True` points at the release daemon instead, which is
+        what a real `vz up` needs; only a check that also removes what it
+        creates may ask for it.
+        """
         root = self.state.root / name
         root.mkdir(mode=0o700)
         state_dir = root / "state"
         state_dir.mkdir(mode=0o700)
         project = root / "project"
         project.mkdir(mode=0o700)
+        overrides = {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon if provision else self.state.absent_daemon}
+        if provision:
+            # vz requires its runtime and Docker endpoint directories to be
+            # effective-user-owned mode 0700. Left to the daemon they inherit
+            # the ambient umask, and Up then fails with an ownership conflict
+            # after it has already admitted the request and allocated
+            # identities. A Developer Machine also cannot reach `ready` without
+            # a Docker client, and vz will not guess a path for one.
+            for directory in ("runtime", "docker"):
+                (state_dir / directory).mkdir(mode=0o700)
+            if self.docker_client and self.docker_client != "none":
+                overrides["VZ_DOCKER_CLIENT"] = self.docker_client
+            if self.plugins:
+                plugin_dir = state_dir / "docker" / "cli-plugins"
+                plugin_dir.mkdir(mode=0o700)
+                for plugin, source in sorted(self.plugins.items()):
+                    destination = plugin_dir / ("docker-" + plugin)
+                    shutil.copyfile(source, destination)
+                    destination.chmod(0o500)
         for filename, data in project_files.items():
             write_exclusive(project / filename, data)
-        return {"root": root, "state": state_dir, "project": project,
-                "env": self.state.env(HOME=root / "absent-home", VZ_RUNTIME_STATE_DB=state_dir / "stack-state.db",
-                                      VZ_RUNTIME_DATA_DIR=state_dir / "runtime",
-                                      VZ_RUNTIME_DAEMON_SOCKET=state_dir / "runtime" / "runtimed.sock",
-                                      VZ_DOCKER_CONFIG=state_dir / "docker", **{"CARGO_BIN_EXE_vz-runtimed": self.state.absent_daemon})}
+        env = self.state.env(HOME=root / "absent-home", VZ_RUNTIME_STATE_DB=state_dir / "stack-state.db",
+                             VZ_RUNTIME_DATA_DIR=state_dir / "runtime",
+                             VZ_RUNTIME_DAEMON_SOCKET=state_dir / "runtime" / "runtimed.sock",
+                             VZ_DOCKER_CONFIG=state_dir / "docker", **overrides)
+        return {"root": root, "state": state_dir, "project": project, "env": env}
 
 
 def _single_json_line(data: bytes):
@@ -373,11 +416,94 @@ def check_bootstrap_read_only(ctx: CheckContext, top: str) -> SubCheck:
     return check.finish()
 
 
-def check_bootstrap_creates_default(top: str) -> SubCheck:
+UP_TIMEOUT = 900
+DELETE_TIMEOUT = 300
+GIT = "/usr/bin/git"
+SOCKET_PATH_LIMIT = 103
+
+
+def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
+    """A real `vz up` from a bare definition must create the `default` Environment.
+
+    This is the lane's first provisioning check, so it owns the whole lifecycle:
+    it brings one Developer Machine up from a definition that names no
+    Environment, reads the persisted topology back, and deletes what it created.
+    A failure never deletes: the Machines stay for inspection and the lane's own
+    leak detection reports them.
+    """
     check = SubCheck(top, "bootstrap_creates_default")
-    check.not_implemented = ("creating `default` from a schema/API-only bootstrap requires a real `vz up` (Machine provisioning); "
-                             "this skeleton never provisions. Verified experimentally: a fresh daemon answers `status` with "
-                             "project_not_found until Up persists topology.")
+    try:
+        definition = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    # The definition names machines and no Environment: `default` must be the
+    # Engine's own doing, not something this check asked for by name.
+    check.check("environments" not in definition["environment"] and "name" not in definition["environment"],
+                "the bootstrap definition names no Environment, so `default` can only come from Up")
+    data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+    iso = ctx.isolated("bootstrap-up", project_files={"vz.json": data}, provision=True)
+    env, project = iso["env"], iso["project"]
+    # AF_UNIX truncates silently past 103 bytes, and the daemon then reports a
+    # bare daemon_unavailable that looks like a provisioning defect. Say what it
+    # actually is: this lane's state root is too deep to host a socket.
+    socket = Path(env["VZ_RUNTIME_DAEMON_SOCKET"])
+    length = len(str(socket).encode())
+    check.check(length <= SOCKET_PATH_LIMIT,
+                f"provisioning socket path is {length} bytes (limit {SOCKET_PATH_LIMIT}): {socket}")
+    if check.status != "PASS":
+        return check.finish()
+    # A workspace is resolved through git, so an Up outside a repository fails
+    # with workspace_read_failed before any Machine is provisioned. The lane's
+    # env deliberately has no global or system git config, so identity is
+    # supplied per invocation rather than read from the host.
+    for label, argv in (("bootstrap-git-init", [GIT, "init", "--quiet", "--initial-branch", "main"]),
+                        ("bootstrap-git-add", [GIT, "add", "vz.json"]),
+                        ("bootstrap-git-commit", [GIT, "-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                                                  "commit", "--quiet", "-m", "bootstrap definition"])):
+        receipt = ctx.run_tool(check, label, argv, cwd=project, env=env)
+        check.check(receipt.exit_code == 0, f"{label}: exit {receipt.exit_code} (expected 0)")
+    if check.status != "PASS":
+        return check.finish()
+    up = ctx.run(check, "bootstrap-up", ["--json", "up"], cwd=project, env=env, timeout=UP_TIMEOUT)
+    check.check(up.exit_code == 0, f"vz --json up: exit {up.exit_code} (expected 0)")
+    if up.exit_code != 0:
+        return check.finish()
+    status = ctx.run(check, "bootstrap-status", ["--json", "status"], cwd=project, env=env, timeout=60)
+    check.check(status.exit_code == 0, f"vz --json status: exit {status.exit_code} (expected 0)")
+    payload = None
+    try:
+        # A success payload is pretty-printed across many lines; only the error
+        # envelope is a single line, so this is a whole-document parse.
+        payload = json.loads(status.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        check.fail(f"vz --json status did not emit a JSON document: {error}")
+    if not isinstance(payload, dict):
+        return check.finish()
+    environments = payload.get("environments") or []
+    names = sorted(row.get("name") for row in environments if isinstance(row, dict))
+    check.check(names == ["default"], f"Up created exactly the `default` Environment (observed {names})")
+    machines = [m for row in environments for m in (row.get("machines") or []) if isinstance(m, dict)]
+    check.check(len(machines) == 1 and machines[0].get("name") == "machine-0",
+                f"the definition's single Machine is present (observed {[m.get('name') for m in machines]})")
+    check.check(payload.get("topology_state_source") == "persisted",
+                f"topology read from persisted state (observed {payload.get('topology_state_source')!r})")
+    check.check(all(row.get("state") == "ready" for row in environments),
+                f"every Environment reached ready (observed {[row.get('state') for row in environments]})")
+    # Delete only after the claim is decided, and only if it held: a failed
+    # check leaves the Machines for inspection.
+    if check.status == "PASS":
+        removed = ctx.run(check, "bootstrap-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                          cwd=project, env=env, timeout=DELETE_TIMEOUT)
+        check.check(removed.exit_code == 0, f"vz --json delete --environment default: exit {removed.exit_code} (expected 0)")
+        after = ctx.run(check, "bootstrap-status-after-delete", ["--json", "status"], cwd=project, env=env, timeout=60)
+        surviving = None
+        if after.exit_code == 0:
+            try:
+                surviving = [row.get("name") for row in json.loads(after.stdout.decode("utf-8")).get("environments") or []]
+            except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+                surviving = ["<unparsable status>"]
+        check.check(not surviving, f"no Environment survives the delete (observed {surviving})")
     return check.finish()
 
 

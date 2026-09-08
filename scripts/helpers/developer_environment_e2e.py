@@ -280,7 +280,10 @@ class Lane:
             f"socket path bindable (<= 103 bytes): {state.socket_path_bindable()}\n"
             f"release signing_class: {self.release['signing_class']}\nrelease version: {self.release['release_version']}\n").encode())
         ctx = checks.CheckContext(repo_root=self.repo_root, release_dir=self.ctx.release_dir, state=state, recorder=recorder,
-                                  evidence_dir=self.evidence_dir, cli_removal=self.cli_removal)
+                                  evidence_dir=self.evidence_dir, cli_removal=self.cli_removal,
+                                  docker_client=self.options.get("docker", "none"),
+                                  plugins={"compose": self.options.get("compose-plugin"),
+                                           "buildx": self.options.get("buildx-plugin")})
         subchecks = {CRITERION_21: [], CRITERION_15: []}
         crash = None
         started = now_ns()
@@ -289,7 +292,7 @@ class Lane:
             subchecks[CRITERION_21].append(checks.check_legacy_rejection(ctx, CRITERION_21))
             subchecks[CRITERION_21].append(checks.check_clean_up(ctx, CRITERION_21))
             subchecks[CRITERION_21].append(checks.check_bootstrap_read_only(ctx, CRITERION_21))
-            subchecks[CRITERION_21].append(checks.check_bootstrap_creates_default(CRITERION_21))
+            subchecks[CRITERION_21].append(checks.check_bootstrap_creates_default(ctx, CRITERION_21))
             subchecks[CRITERION_15].append(checks.check_help_surface(ctx, CRITERION_15))
             subchecks[CRITERION_15].append(checks.check_error_envelope(ctx, CRITERION_15))
             subchecks[CRITERION_15].append(checks.check_status_field_set(CRITERION_15))

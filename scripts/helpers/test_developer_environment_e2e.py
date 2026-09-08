@@ -30,8 +30,11 @@ DIGEST = "b" * 64
 RUN_ID = "topology-unit-run-1"
 TOP21 = e2e.CRITERION_21
 TOP15 = e2e.CRITERION_15
-IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact", "error_envelope_agreement"}
-NOT_IMPLEMENTED = {"bootstrap_creates_default", "status_json_field_set", "grpc_api_live_agreement"}
+IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
+               "error_envelope_agreement", "bootstrap_creates_default"}
+# Both remaining sub-checks belong to criterion 15 and need a live typed API,
+# so criterion 21 is the first topology scenario the lane can actually pass.
+NOT_IMPLEMENTED = {"status_json_field_set", "grpc_api_live_agreement"}
 
 
 class TopologyLaneTests(unittest.TestCase):
@@ -130,7 +133,10 @@ class TopologyLaneTests(unittest.TestCase):
         for slug in NOT_IMPLEMENTED:
             self.assertEqual(subs[slug]["status"], "FAIL", slug)
             self.assertTrue(any(a.startswith("not_implemented:") for a in subs[slug]["assertions"]), slug)
-        self.assertEqual(self.top(result, TOP21)["status"], "FAIL")
+        # Criterion 21's sub-checks are all implemented now, so it is the first
+        # topology scenario the lane can pass. Criterion 15 still needs a live
+        # typed API for its remaining two.
+        self.assertEqual(self.top(result, TOP21)["status"], "PASS")
         self.assertEqual(self.top(result, TOP15)["status"], "FAIL")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
@@ -146,7 +152,10 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertTrue(any("0 connections" in a for a in subs["legacy_rejection"]["assertions"]))
         starts = [s["scenario_id"] for s in result["process_starts"]]
         self.assertEqual(len(starts), len(set(starts)))
-        self.assertEqual(set(starts), {f"{TOP21}__{s}" for s in IMPLEMENTED if s in ("bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only")} |
+        # bootstrap_creates_default dispatches the CLI too, now that it provisions.
+        self.assertEqual(set(starts), {f"{TOP21}__{s}" for s in IMPLEMENTED
+                                       if s in ("bare_help", "legacy_rejection", "clean_up_refuses",
+                                                "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
