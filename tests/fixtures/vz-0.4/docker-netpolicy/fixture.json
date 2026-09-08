@@ -1,0 +1,24 @@
+{
+  "cleanup": {
+    "owned_routes_dns_listeners_mounts_absent": true,
+    "unrelated_inventory_sha256_unchanged": true
+  },
+  "image": "developer-probe-rootfs.tar imported by the harness sentinel; no registry pull",
+  "probe": {
+    "bytes": 881,
+    "cases": ["report", "serve"],
+    "container_port": 8080,
+    "interpreter": ["/bin/busybox", "sh", "-c"],
+    "path": "probe.sh",
+    "sha256": "d107c0f92c6fd97aa06356c302636b36084e3b13b10bde95c4449b70567180c9"
+  },
+  "published_ports": {
+    "assigned_ports_unique": true,
+    "listener_address": "127.0.0.1",
+    "response_template": "vznet|{owner}|{role}",
+    "roles": ["alpha", "beta"],
+    "wildcard_or_lan_listener": false
+  },
+  "schema_version": 1,
+  "scope": "DEV_DOCKER_NETPOLICY_FIXTURE_NOT_DOCKER_CERTIFICATION"
+}

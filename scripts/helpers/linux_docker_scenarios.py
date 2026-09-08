@@ -36,8 +36,8 @@ MANIFEST_LIMIT = 4 * 1024 * 1024
 ID_PATTERN = re.compile(r"^docker\.[a-z_]+\.[a-z_]+$")
 PHASES = {"clean-provision": "clean-provision", "persisted-recovery": "persisted-recovery/pre-sleep",
           "final-cleanup": "final-cleanup"}
-# `mounts` graduated to a real suite on 2026-09-08; the rest remain planned.
-GAP_SUITES = ("netpolicy", "concurrency", "isolation")
+# `mounts` and `netpolicy` graduated to real suites on 2026-09-08.
+GAP_SUITES = ("concurrency", "isolation")
 STATUSES = ("proven", "partial", "secondary")
 
 Claim = namedtuple("Claim", "id suite sources status unproven")
@@ -88,6 +88,8 @@ SUITES = {suite.name: suite for suite in (
           (Poll("poll.service.health_probe", 60, _limits_samples),), "docker.operation.resource_limits"),
     Suite("mounts", "linux_docker_mounts_machine.py", ("mounts-machine-{index}/machine-mounts-validation.json",), (),
           "docker.storage.bind_mounts", ("mounts-cross-machine.json",)),
+    Suite("netpolicy", "linux_docker_netpolicy_machine.py",
+          ("netpolicy-machine-{index}/machine-netpolicy-validation.json",), (), "docker.network.published_ports"),
     Suite("recovery", "linux_docker_recovery_machine.py", ("recovery-machine-{index}/machine-recovery-validation.json",),
           (Poll("poll.docker.engine_ready", 60, _recovery_samples),), "docker.operation.daemon_restart_recovery"),
 )}
@@ -135,6 +137,9 @@ TABLE = (
     _c("docker.storage.tmpfs", "mounts", ("run_machine", "tmpfs")),
     _c("docker.storage.read_only_mounts", "mounts", ("run_machine", "read_only_mounts")),
     _c("docker.storage.ownership", "mounts", ("run_machine", "ownership")),
+    # netpolicy: loopback-only publication and the cleanup of what it created.
+    _c("docker.network.published_ports", "netpolicy", ("run_machine", "published_ports")),
+    _c("docker.network.cleanup", "netpolicy", ("run_machine", "network_cleanup")),
     # recovery: public Stop/Up of the owning Environment (not an in-place daemon restart).
     _c("docker.storage.persistence", "recovery", "run_machine"),
     _c("docker.operation.daemon_restart_recovery", "recovery", "run_machine"),
@@ -173,8 +178,6 @@ TABLE = (
 )
 
 UNCOVERED = (
-    ("docker.network.published_ports", "netpolicy"),
-    ("docker.network.cleanup", "netpolicy"),
     ("docker.operation.concurrent_clients", "concurrency"),
     ("docker.operation.same_environment_isolation", "isolation"),
     ("docker.operation.sibling_environment_isolation", "isolation"),

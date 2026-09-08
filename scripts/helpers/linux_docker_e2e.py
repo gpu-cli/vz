@@ -40,6 +40,7 @@ REGISTRY_SCOPE = "DEV_INSTALLED_LINUX_REGISTRY_LOGIN_PUSH_PULL_NOT_RELEASE_CERTI
 HANDSHAKE_SCOPE = "DEV_INSTALLED_LINUX_ENGINE_HANDSHAKE_NOT_RELEASE_CERTIFICATION"
 LIMITS_SCOPE = "DEV_INSTALLED_LINUX_RESOURCE_LIMITS_OOM_NOT_RELEASE_CERTIFICATION"
 MOUNTS_SCOPE = "DEV_INSTALLED_LINUX_STORAGE_MOUNTS_NOT_RELEASE_CERTIFICATION"
+NETPOLICY_SCOPE = "DEV_INSTALLED_LINUX_PUBLISHED_PORTS_NETWORK_CLEANUP_NOT_RELEASE_CERTIFICATION"
 RECOVERY_SCOPE = "DEV_INSTALLED_LINUX_PERSISTENCE_STOP_UP_RECOVERY_NOT_RELEASE_CERTIFICATION"
 ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATION"
 # One provisioning, every suite once, in an order that leaves the topology
@@ -55,12 +56,12 @@ ALL_SCOPE = "DEV_INSTALLED_LINUX_DOCKER_COMPOSED_SUITES_NOT_RELEASE_CERTIFICATIO
 # its own suite evidence, not by this journal. `--suite lifecycle` keeps the
 # whole-run window it always had.
 SUITE_ORDER = ("handshake", "compose", "build", "artifacts", "parallel", "ssh",
-               "images", "mounts", "limits", "registry", "lifecycle", "recovery")
+               "images", "mounts", "netpolicy", "limits", "registry", "lifecycle", "recovery")
 # The gate's selection: both primary Machines and the neighbour's first, with
 # the neighbour's second left as an untouched sentinel.
 GATE_MACHINES = (0, 1, 2)
 SUITES = ("compose", "build", "artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
-          "mounts", "recovery")
+          "mounts", "netpolicy", "recovery")
 REPO = Path(__file__).resolve().parents[2]
 LABEL = "dev.vz.linux-compose-proof"
 require = driver.require
@@ -130,7 +131,7 @@ def arguments(argv):
 def preflight(args, require_host=True):
     require(args.suite in (*SUITES, "all"), "full contract unavailable")
     composed = args.suite == "all"
-    if not composed and args.suite in ('images', 'registry', 'handshake', 'limits', 'mounts', 'recovery'):
+    if not composed and args.suite in ('images', 'registry', 'handshake', 'limits', 'mounts', 'netpolicy', 'recovery'):
         require(all(getattr(args, name, None) is None for name in ('buildkit_archive', 'parallel_fixture',
                 'ssh_fixture', 'ssh_packages', 'ssh_gpgv', 'container_fixture', 'tmux')),
                 ('image' if args.suite == 'images' else args.suite) + ' suite rejects builder, foreign fixture and terminal options')
@@ -157,7 +158,7 @@ def preflight(args, require_host=True):
     scopes = {"compose": SCOPE, "build": BUILD_SCOPE, "artifacts": ARTIFACT_SCOPE, "parallel": PARALLEL_SCOPE,
               "ssh": SSH_SCOPE, "lifecycle": LIFECYCLE_SCOPE, "images": IMAGES_SCOPE, "registry": REGISTRY_SCOPE,
               "handshake": HANDSHAKE_SCOPE, "limits": LIMITS_SCOPE, "mounts": MOUNTS_SCOPE,
-              "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
+              "netpolicy": NETPOLICY_SCOPE, "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
     machines = getattr(args, "machines", len(GATE_MACHINES))
     require(machines in (1, 2, 3), "unsupported Machine selection")
     scope = scopes[args.suite]
@@ -249,6 +250,12 @@ def preflight(args, require_host=True):
             info['inputs'][str(path)] = startup.digest(Path(path))
         for row in tool_inputs().values():
             info['inputs'][row['path']] = row['sha256']
+    if composed or args.suite == 'netpolicy':
+        from linux_docker_netpolicy_machine import fixture_contract as netpolicy_fixture_contract
+        from linux_docker_netpolicy_machine import required_source_paths as netpolicy_sources
+        netpolicy_fixture_contract()
+        for path in netpolicy_sources():
+            info['inputs'][str(path)] = startup.digest(Path(path))
     if composed or args.suite == 'mounts':
         from linux_docker_mounts_machine import fixture_contract as mounts_fixture_contract
         from linux_docker_mounts_machine import required_source_paths as mounts_sources
@@ -948,7 +955,7 @@ class ComposeHarness(startup.Harness):
             scope, proof = bindings[machine["machine_id"]]
             images = self.machine_images(suite, descriptor)
             if suite in {"artifacts", "parallel", "ssh", "lifecycle", "images", "registry", "handshake", "limits",
-                         "mounts", "recovery"}:
+                         "mounts", "netpolicy", "recovery"}:
                 if suite == "artifacts":
                     from linux_docker_build_artifacts import run_machine
                 elif suite == "parallel":
@@ -965,6 +972,8 @@ class ComposeHarness(startup.Harness):
                     from linux_docker_limits_machine import run_machine
                 elif suite == 'mounts':
                     from linux_docker_mounts_machine import run_machine
+                elif suite == 'netpolicy':
+                    from linux_docker_netpolicy_machine import run_machine
                 elif suite == 'recovery':
                     from linux_docker_recovery_machine import run_machine
                 else:
