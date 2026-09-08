@@ -210,6 +210,10 @@ def fixture_tree_digest(root, relative):
             visited_entries += 1
             require(visited_entries <= MAX_FIXTURE_ENTRIES, "fixture inventory exceeds entry bound")
             relative_name = "/".join((*prefix, name))
+            # The frozen inventory is the checked-in source; gitignored bytecode
+            # would make the pin depend on whether the fixture's tests have run.
+            if name == "__pycache__" or name.endswith((".pyc", ".pyo")):
+                continue
             metadata = os.stat(name, dir_fd=descriptor, follow_symlinks=False)
             if stat.S_ISDIR(metadata.st_mode):
                 child = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=descriptor)

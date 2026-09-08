@@ -202,11 +202,13 @@ and replay assertions against the exact release/topology evidence.
 
 Offline tests (no Docker invocation):
 
+These run with the rest of the helper suite; the `*_test.py` names that needed
+their own `-p` pattern were folded into the standard `test_*.py` discovery,
+where they had been silently skipped.
+
 ```sh
-PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover \
-  -s scripts/helpers -p docker_host_driver_test.py
 PYTHONDONTWRITEBYTECODE=1 uv run --offline --with jsonschema==4.23.0 \
-  python -m unittest discover -s scripts/helpers -p docker_host_schema_test.py
+  python -m unittest discover -s scripts/helpers -p 'test_*.py'
 ```
 
 ## Still required

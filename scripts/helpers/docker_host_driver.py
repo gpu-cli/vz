@@ -87,11 +87,26 @@ def regular(path: Path, limit: int = 512 * 1024 * 1024) -> bytes:
         return data
 
 
+def generated_bytecode(relative) -> bool:
+    """A gitignored build artifact of a fixture's own Python, never a fixture input."""
+    parts = relative.parts if hasattr(relative, "parts") else Path(relative).parts
+    return "__pycache__" in parts or parts[-1].endswith((".pyc", ".pyo"))
+
+
 def tree_digest(root: Path) -> str:
     require(root.is_dir() and not root.is_symlink(), "fixture root is not a directory")
     rows = []
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), "fixture symlink rejected")
+        # A fixture is pinned by the digest of its checked-in source. Generated
+        # bytecode is gitignored, and a fixture's own test module is compiled by
+        # the loader before any in-process flag can stop it, so digesting it
+        # would make the pin differ between a tree whose fixture tests have run
+        # and a fresh clone. It is not source, so it is not digested. (The
+        # parallel fixture separately refuses it from the tree it builds from,
+        # where it would be a hidden build input.)
+        if generated_bytecode(path.relative_to(root)):
+            continue
         if path.is_dir():
             continue
         data = regular(path)

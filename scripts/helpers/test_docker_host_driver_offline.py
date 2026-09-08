@@ -809,6 +809,41 @@ int main(int argc, char **argv) {
         self.assertEqual(item.observations[0]["outcome"], "failed")
 
 
+class FixtureDigestTests(unittest.TestCase):
+    """The fixture pin is the checked-in source, not what a test run left behind."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.fixture = Path(self.temp.name).resolve() / "fixture"
+        self.fixture.mkdir()
+        (self.fixture / "Dockerfile").write_text("FROM scratch\n")
+        (self.fixture / "probe.py").write_text("print('fixture')\n")
+
+    def test_generated_bytecode_does_not_change_the_digest(self):
+        before = driver.tree_digest(self.fixture)
+        cache = self.fixture / "__pycache__"
+        cache.mkdir()
+        (cache / "probe.cpython-313.pyc").write_bytes(b"generated")
+        (self.fixture / "nested").mkdir()
+        (self.fixture / "nested" / "__pycache__").mkdir()
+        (self.fixture / "nested" / "__pycache__" / "x.cpython-313.pyc").write_bytes(b"generated")
+        (self.fixture / "stray.pyo").write_bytes(b"generated")
+        self.assertEqual(driver.tree_digest(self.fixture), before)
+
+    def test_source_still_changes_the_digest(self):
+        before = driver.tree_digest(self.fixture)
+        (self.fixture / "probe.py").write_text("print('changed')\n")
+        self.assertNotEqual(driver.tree_digest(self.fixture), before)
+
+    def test_a_tree_of_only_bytecode_is_empty(self):
+        cache = Path(self.temp.name).resolve() / "only-cache"
+        (cache / "__pycache__").mkdir(parents=True)
+        (cache / "__pycache__" / "x.cpython-313.pyc").write_bytes(b"generated")
+        with self.assertRaisesRegex(ValueError, "empty fixture tree"):
+            driver.tree_digest(cache)
+
+
 class AssertionTests(unittest.TestCase):
     def test_denied_group_signal_retains_prefix_without_broad_fallback(self):
         original = driver.OutputLimitExceeded("bounded output")
@@ -918,8 +953,24 @@ class AssertionTests(unittest.TestCase):
         for _ in range(20):
             raw = json.dumps({'data': base64.b64encode(raw).decode()}).encode()
         self.assertTrue(driver.contains_canary((raw,), [b'PRIVATE-CANARY']))
-        self.assertTrue(driver.contains_canary((b'[' * 2000 + b'0' + b']' * 2000,), [b'PRIVATE-CANARY']))
         self.assertTrue(driver._contains_canary((b'ordinary',), [b'PRIVATE-CANARY'], 0, [1]))
+
+    def test_a_canary_at_extreme_json_depth_is_never_missed(self):
+        """The property, not the parser: an interpreter that refuses the document
+        fails closed, and one that parses it iteratively must still find the
+        string. `json.loads` raises RecursionError here on the pinned
+        /usr/bin/python3 and parses the same bytes on newer CPython, so asserting
+        the refusal asserts the interpreter."""
+        secret = b'PRIVATE-CANARY'
+        deep = b'[' * 2000 + b'"' + secret + b'"' + b']' * 2000
+        self.assertTrue(driver.contains_canary((deep,), [secret]))
+        harmless = b'[' * 2000 + b'0' + b']' * 2000
+        parses = True
+        try:
+            json.loads(harmless)
+        except RecursionError:
+            parses = False
+        self.assertEqual(driver.contains_canary((harmless,), [secret]), not parses)
 
     def event(self, actor, action, timestamp):
         return {"Type": "container", "Actor": {"ID": actor, "Attributes": {"com.docker.compose.project": "owned"}},

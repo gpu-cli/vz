@@ -50,6 +50,22 @@ class DockerCompatibilityContractTests(unittest.TestCase):
         value["harness"].update(state="pinned", sha256=hashlib.sha256(harness.read_bytes()).hexdigest())
         return root, value, fixtures, harness
 
+    def test_frozen_inventory_ignores_generated_bytecode(self):
+        """The pin is the checked-in source: a fixture's own tests must not change it."""
+        with tempfile.TemporaryDirectory() as temporary:
+            root, value, fixtures, _harness = self.fixture_root(temporary)
+            self.bytecode_is_ignored(root, value, fixtures)
+
+    def bytecode_is_ignored(self, root, value, fixtures):
+        before = contract.fixture_tree_digest(root, value["fixture_bundle"]["path"])
+        cache = fixtures / "__pycache__"
+        cache.mkdir()
+        (cache / "thing.cpython-313.pyc").write_bytes(b"generated")
+        (fixtures / "stray.pyc").write_bytes(b"generated")
+        self.assertEqual(contract.fixture_tree_digest(root, value["fixture_bundle"]["path"]), before)
+        (fixtures / "real-input.txt").write_text("source\n")
+        self.assertNotEqual(contract.fixture_tree_digest(root, value["fixture_bundle"]["path"]), before)
+
     def test_schema_and_truthful_draft_inventory(self):
         Draft202012Validator.check_schema(self.schema)
         result = contract.validate_contract(self.manifest, check_draft=True)
