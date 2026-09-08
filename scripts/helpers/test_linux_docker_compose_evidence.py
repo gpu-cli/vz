@@ -17,6 +17,9 @@ import docker_host_driver as driver
 import linux_docker_compose_evidence as evidence
 
 
+FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"
+
+
 def data(value):
     return json.dumps(value, sort_keys=True).encode()
 
@@ -43,6 +46,23 @@ class SyntheticEngine:
 
     def labels(self, project):
         return {"com.docker.compose.project": project, "dev.vz.fixture-owner": self.owner}
+
+    def compose_config(self):
+        """What Compose resolves from the fixture: the declared services, edges and owner."""
+        declared = json.loads(FIXTURE.joinpath("compose/compose.json").read_bytes())["services"]
+        services = {}
+        # Real Compose resolves only the services no profile gates.
+        for name, spec in ((n, x) for n, x in declared.items() if not x.get("profiles")):
+            services[name] = {"image": self.inputs.raw["images"]["compose"]["id"], "command": spec["command"], "pull_policy": spec["pull_policy"],
+                              "environment": {"FIXTURE_OWNER": self.owner},
+                              "networks": {network: None for network in spec["networks"]},
+                              "volumes": [{"source": item.split(":")[0], "target": item.split(":")[1]}
+                                          for item in spec.get("volumes", [])]}
+            if spec.get("healthcheck"):
+                services[name]["healthcheck"] = dict(spec["healthcheck"])
+            if spec.get("depends_on"):
+                services[name]["depends_on"] = dict(spec["depends_on"])
+        return data({"services": services})
 
     def compose_logs(self, project):
         """Interleaved services with Compose's grow-as-seen prefix padding; never a real stream."""
@@ -113,6 +133,9 @@ class SyntheticEngine:
             elif action == "logs":
                 assert tail == ["logs", "--no-color"], tail
                 stdout = self.compose_logs(project)
+            elif action == "config":
+                assert tail == ["config", "--format", "json"], tail
+                stdout = self.compose_config()
             else:
                 self.install(project, failure="--exit-code-from" in tail)
                 items = self.projects[project]["container"]
@@ -146,6 +169,10 @@ class SyntheticEngine:
             if tail[1] == "-c":
                 if tail[2] == evidence.WRITE:
                     self.markers[(item["Id"], tail[3])] = tail[4].encode()
+                elif tail[3].endswith("/sentinel.txt"):
+                    # The service writes its own persistence sentinel at startup;
+                    # only the host-written marker beside it is a recorded write.
+                    stdout = f"vz04|db|{self.owner}|persisted\n".encode()
                 else:
                     stdout = self.markers[(item["Id"], tail[3])]
             elif tail[2] == "transport":

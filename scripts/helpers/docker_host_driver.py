@@ -690,7 +690,7 @@ class Driver:
         readonly = args[0] in {"version", "info", "events", "logs"} or args[:2] in [
             ["context", "inspect"], ["image", "inspect"], ["container", "inspect"], ["container", "ls"],
             ["network", "inspect"], ["network", "ls"], ["volume", "inspect"], ["volume", "ls"],
-            ["buildx", "inspect"]] or compose_subcommand(args) in {"logs", "version"}
+            ["buildx", "inspect"]] or compose_subcommand(args) in {"config", "logs", "version"}
         options = {"interaction_plan": interaction_plan} if interaction_plan is not None else {}
         if progress_observer is not None:
             options["progress_observer"] = progress_observer
@@ -890,6 +890,18 @@ class Driver:
         self.guard()
         return self.command(["exec", item["Id"], *args], expected=expected)
 
+    def persisted_digest(self, container, read) -> str:
+        """SHA-256 of the volume's service-written state, digested on the host.
+
+        The manifest's `restart_data_sha256` is the digest of the fixture's own
+        declared persistence payload, not of the host marker written beside it,
+        so it is read from the fixture's declared sentinel path and digested
+        here rather than trusting a digest computed inside the container.
+        """
+        data = self.exec_container(container, read).stdout
+        require(data, "persisted state is empty")
+        return sha256(data)
+
     def volume_persistence(self, project: str) -> list[str]:
         before = self.capture(project)
         db = self.by_service(before)["db"][0]
@@ -904,13 +916,92 @@ class Driver:
         self.exec_container(db, ["python3", "-c", code, marker, payload.decode()])
         read = ["python3", "-c", "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())", marker]
         require(self.exec_container(db, read).stdout == payload, "host persistence marker was not written exactly")
+        sentinel = [*read[:-1], self.fixture_spec["expected"]["volume"]["sentinel"]]
+        persisted_before = self.persisted_digest(db, sentinel)
         self.compose(project, ["stop"])
         self.compose(project, COMPOSE_UP, timeout=COMPOSE_DEADLINE)
         after = self.capture(project)
         require(self.identities(before) == self.identities(after), "Compose stop/up changed resource identity")
         require(self.exec_container(self.by_service(after)["db"][0], read).stdout == payload,
                 "host-written persistence marker changed after Compose stop/up")
-        return ["exact owned named volume mount", "Compose stop/up preserved IDs and exclusive host-written marker bytes; Machine recovery still required"]
+        expected_digest = sha256(self.fixture_spec["expected"]["persistence_template"].format(owner=self.inputs.owner).encode())
+        require(persisted_before == expected_digest,
+                "persisted state does not match the fixture's declared payload digest")
+        require(self.persisted_digest(self.by_service(after)["db"][0], sentinel) == expected_digest,
+                "persisted state digest changed across Compose stop/up")
+        return ["exact owned named volume mount",
+                "restart_data_sha256=" + expected_digest + " matches the fixture persistence template before and after Compose stop/up",
+                "Compose stop/up preserved IDs and exclusive host-written marker bytes; Machine recovery still required"]
+
+    @staticmethod
+    def _normalized_healthcheck(value):
+        """Compose reports durations in nanoseconds; the fixture declares them as `1s`."""
+        if not isinstance(value, dict):
+            return None
+        units = {"s": 10 ** 9, "m": 60 * 10 ** 9, "h": 3600 * 10 ** 9}
+        def duration(item):
+            if isinstance(item, int):
+                return item
+            if isinstance(item, str) and item[-1:] in units and item[:-1].isdigit():
+                return int(item[:-1]) * units[item[-1]]
+            return item
+        return {"test": value.get("test"), "retries": value.get("retries"),
+                **{key: duration(value.get(key)) for key in ("interval", "timeout", "start_period")}}
+
+    @staticmethod
+    def _normalized_volumes(value):
+        """`state:/data` and `{source: state, target: /data}` are the same binding."""
+        rows = []
+        for item in value or ():
+            if isinstance(item, str):
+                source, _, target = item.partition(":")
+                rows.append((source, target))
+            elif isinstance(item, dict):
+                rows.append((item.get("source"), item.get("target")))
+        return tuple(rows)
+
+    def effective_configuration(self, project: str) -> dict:
+        """The configuration Compose itself resolved, compared to the fixture's declaration.
+
+        `create` asserts the state of four services; it cannot show that what
+        Compose resolved is what the fixture declared. An injected image,
+        network, volume or dependency edge would appear only here, so the
+        declared fields are compared field by field and the service set is
+        closed. The `depends_on` graph this returns is the same evidence the
+        ordering recipe uses to show no undeclared edge exists.
+        """
+        resolved = json.loads(self.compose(project, ["config", "--format", "json"], expected=0).stdout)
+        # Compose resolves only the services no profile gates; `failure` is
+        # declared behind one and appears only when that profile is selected.
+        declared = {name: spec for name, spec in json.loads(regular(self.fixture / "compose/compose.json"))["services"].items()
+                    if not spec.get("profiles")}
+        services = resolved.get("services")
+        require(isinstance(services, dict) and set(services) == set(declared),
+                "resolved Compose services differ from the fixture: " + repr(sorted(services or {})))
+        image = self.inputs.raw["images"]["compose"]["id"]
+        edges = []
+        for name, spec in sorted(declared.items()):
+            actual = services[name]
+            require(actual.get("image") == image, name + " resolved a foreign image: " + repr(actual.get("image")))
+            require(actual.get("command") == spec["command"], name + " resolved a different command")
+            require(actual.get("pull_policy") == spec["pull_policy"], name + " resolved a different pull policy")
+            require((actual.get("environment") or {}).get("FIXTURE_OWNER") == self.inputs.owner,
+                    name + " resolved a foreign owner token")
+            require(sorted(actual.get("networks") or {}) == sorted(spec["networks"]),
+                    name + " resolved different networks: " + repr(sorted(actual.get("networks") or {})))
+            require(self._normalized_healthcheck(actual.get("healthcheck")) ==
+                    self._normalized_healthcheck(spec.get("healthcheck")),
+                    name + " resolved a different healthcheck")
+            require(self._normalized_volumes(actual.get("volumes")) == self._normalized_volumes(spec.get("volumes")),
+                    name + " resolved different volume bindings")
+            for dependency in sorted(actual.get("depends_on") or {}):
+                require(dependency in (spec.get("depends_on") or {}),
+                        name + " resolved an undeclared dependency on " + dependency)
+                edges.append([dependency, name])
+        declared_edges = sorted([dependency, name] for name, spec in declared.items()
+                                for dependency in (spec.get("depends_on") or {}))
+        require(sorted(edges) == declared_edges, "resolved dependency edges differ from the fixture")
+        return {"services": sorted(services), "edges": sorted(edges), "image": image}
 
     def compose_workloads(self) -> None:
         project = self.new_project("compose")
@@ -923,7 +1014,10 @@ class Driver:
             require(all(len(items) == 1 and items[0]["State"]["Status"] == "created" and
                         not items[0]["State"]["Running"] for items in services.values()),
                     "services ran before up")
-            return ["four exact fixture services created; none running"]
+            configuration = self.effective_configuration(project)
+            return ["four exact fixture services created; none running",
+                    "Compose resolved exactly the fixture's declared configuration for " +
+                    ", ".join(configuration["services"]) + " on the pinned image"]
 
         self.observe("compose-create", ["docker.compose.create"], create)
 
@@ -939,7 +1033,19 @@ class Driver:
                                    "--format", "{{json .}}"], timeout=10)
             rows = [json.loads(line) for line in events.stdout.splitlines() if line]
             assert_health_order(rows, {name: items[0]["Id"] for name, items in services.items()}, project)
-            return ["four services healthy", "Engine dependency healthy timestamps precede dependent start timestamps"]
+            # The observed order is consistent with the declared graph; that a
+            # dependency Compose was never told about is also absent has to come
+            # from the resolved configuration, not from timestamps.
+            # `failure` is profile-gated and is not one of the four services this
+            # project runs, so the ordering claim is about the edges among the
+            # services that actually started.
+            active = set(services)
+            edges = [edge for edge in self.effective_configuration(project)["edges"] if set(edge) <= active]
+            expected_edges = sorted(list(edge) for edge in self.fixture_spec["expected"]["dependency_edges"])
+            require(edges == expected_edges, "resolved dependency graph is not the fixture's declared edges")
+            return ["four services healthy", "Engine dependency healthy timestamps precede dependent start timestamps",
+                    "resolved dependency edges are exactly " + json.dumps(expected_edges, separators=(",", ":")) +
+                    "; no undeclared edge"]
 
         self.observe("compose-up-order", ["docker.compose.up", "docker.compose.dependency_ordering",
                                           "docker.compose.health_ordering"], up)

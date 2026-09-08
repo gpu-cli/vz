@@ -54,6 +54,8 @@ class BoundaryTests(unittest.TestCase):
         item.record = driver.Recorder(self.root, {"HOME": os.environ.get("HOME", ""), "PATH": "/usr/bin:/bin"}, [])
         item.observations = []
         item.projects = {}
+        item.fixture_spec = {"expected": {"volume": {"sentinel": "/data/sentinel.txt"},
+                                          "persistence_template": "vz04|db|{owner}|persisted\n"}}
         return item
 
     def test_valid_boundary_requires_no_process(self):
@@ -470,11 +472,37 @@ class BoundaryTests(unittest.TestCase):
         old_sentinel = f"vz04|db|{item.inputs.owner}|persisted\n".encode()
         with patch.object(item, "capture", return_value=inventory), patch.object(item, "compose"), \
                 patch.object(item, "exec_container", side_effect=[driver.Command(1, [], 0, b"", b""),
-                    driver.Command(2, [], 0, marker, b""), driver.Command(3, [], 0, old_sentinel, b"")]) as executed, \
+                    driver.Command(2, [], 0, marker, b""), driver.Command(3, [], 0, old_sentinel, b""),
+                    driver.Command(4, [], 0, old_sentinel, b"")]) as executed, \
                 self.assertRaises(driver.Rejected):
             item.volume_persistence(project)
         self.assertIn("'xb'", executed.call_args_list[0].args[1][2])
         self.assertIn("host-persistence-", executed.call_args_list[-1].args[1][-1])
+        # The persisted-state read is the same command shape, aimed at the fixture's sentinel.
+        self.assertEqual(executed.call_args_list[2].args[1][-1], "/data/sentinel.txt")
+
+    def test_persisted_state_digest_must_match_the_fixture_payload(self):
+        item = self.bare_driver()
+        db = {"Id": "db", "Config": {"Labels": {"com.docker.compose.service": "db"}},
+              "Mounts": [{"Destination": "/data", "Type": "volume", "RW": True, "Name": "owned_state"}]}
+        inventory = {"container": [db], "volume": [{"Name": "owned_state"}], "network": []}
+        marker = f"vz04|host-written|{item.inputs.owner}|{item.inputs.raw['run_id']}|persisted\n".encode()
+        sentinel = f"vz04|db|{item.inputs.owner}|persisted\n".encode()
+
+        def run(before, after):
+            with patch.object(item, "capture", return_value=inventory), patch.object(item, "compose"), \
+                    patch.object(item, "exec_container", side_effect=[driver.Command(1, [], 0, b"", b""),
+                        driver.Command(2, [], 0, marker, b""), driver.Command(3, [], 0, before, b""),
+                        driver.Command(4, [], 0, marker, b""), driver.Command(5, [], 0, after, b"")]):
+                return item.volume_persistence("owned")
+
+        assertions = run(sentinel, sentinel)
+        self.assertIn("restart_data_sha256=" + driver.sha256(sentinel), " ".join(assertions))
+        # Persisted bytes that are not the fixture's declared payload, and bytes
+        # that change across the restart, are both refused.
+        for before, after in ((b"vz04|db|somebody-else|persisted\n", sentinel), (sentinel, b"vz04|db|x|persisted\n")):
+            with self.subTest(before=before), self.assertRaises(driver.Rejected):
+                run(before, after)
 
     def test_mutable_images_rejected_before_process(self):
         for reference in ("python:latest", "python:3.13", "sha256:" + "f" * 63,

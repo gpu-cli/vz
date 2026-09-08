@@ -27,12 +27,20 @@ RELATED = (
 ROLES = {"db", "api", "worker", "isolated"}
 UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wait-timeout", "30"]
 LOGS = ["logs", "--no-color"]
+CONFIG = ["config", "--format", "json"]
+# The fixture's declared dependency graph, restated so the replay checks the
+# resolved configuration against the contract rather than against the driver.
+EDGES = [["db", "api"], ["api", "worker"]]
 LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
 # One startup sequence per service, in order; every line carries the owner token.
 LOG_EVENTS = {"db": ("listening",), "api": ("dependency-healthy", "listening"),
               "worker": ("dependency-healthy", "listening"), "isolated": ("listening",)}
 READ = "import pathlib,sys;sys.stdout.buffer.write(pathlib.Path(sys.argv[1]).read_bytes())"
 WRITE = "import os,sys;f=open(sys.argv[1],'xb');f.write(sys.argv[2].encode());f.flush();os.fsync(f.fileno());f.close()"
+# The fixture's declared persistent state, restated here so the replay derives
+# `restart_data_sha256` independently of the driver that recorded the evidence.
+SENTINEL = "/data/sentinel.txt"
+PERSISTED = "vz04|db|{owner}|persisted\n"
 MAX = 4 * 1024 * 1024
 
 
@@ -436,12 +444,14 @@ class Replay:
             self.compose(project, ["create", "--no-build", "--pull", "never"])
             created = self.services(self.inventory(project))
             require(all(x[0]["State"]["Status"] == "created" and not x[0]["State"]["Running"] for x in created.values()), "create started service")
+            self.configuration(project)
         with self.observation("compose-up-order"):
             self.compose(project, UP)
             ready = self.services(self.inventory(project))
             require(all(ready[role][0]["Id"] == created[role][0]["Id"] and ready[role][0]["State"]["Health"]["Status"] == "healthy"
                         and ready[role][0]["State"]["Running"] for role in ROLES), "wrong healthy service identity")
             self.events(project, ready)
+            require(self.configuration(project) == sorted(EDGES), "resolved dependency graph is not the declared edges")
         with self.observation("compose-logs"):
             # Read-only history of the running project; no stop/up mutation.
             current = self.services(self.inventory(project))
@@ -554,6 +564,25 @@ class Replay:
                             "network outcome does not match observed Linux exception/errno")
                     controls()
 
+    def configuration(self, project):
+        """Replay `compose config`: the resolved services and their dependency edges."""
+        row = self.compose(project, CONFIG, mutation=False)
+        value = decode(row["_stdout"])
+        services = value.get("services")
+        # `failure` is declared behind a profile, which this project does not
+        # select, so Compose does not resolve it.
+        require(isinstance(services, dict) and set(services) == ROLES,
+                "resolved Compose services differ from the fixture: " + repr(sorted(services or {})))
+        require(all(item.get("image") == self.inputs["images"]["compose"]["id"] for item in services.values()),
+                "a resolved service uses a foreign image")
+        require(all((item.get("environment") or {}).get("FIXTURE_OWNER") == self.owner for item in services.values()),
+                "a resolved service carries a foreign owner token")
+        edges = sorted([dependency, name] for name, item in services.items()
+                       for dependency in sorted(item.get("depends_on") or {})
+                       if {dependency, name} <= ROLES)
+        require(edges == sorted(EDGES), "resolved dependency edges differ from the declared graph")
+        return edges
+
     def persistence(self, project):
         with self.observation("compose-volume-persistence"):
             before = self.inventory(project)
@@ -564,6 +593,10 @@ class Replay:
             payload = f"vz04|host-written|{self.owner}|{self.inputs['run_id']}|persisted\n"
             self.execute(db, ["python3", "-c", WRITE, marker, payload])
             require(self.execute(db, ["python3", "-c", READ, marker])["_stdout"] == payload.encode(), "marker not written")
+            # The service's own declared persistence payload, digested independently.
+            persisted = PERSISTED.format(owner=self.owner).encode()
+            before_digest = sha(self.execute(db, ["python3", "-c", READ, SENTINEL])["_stdout"])
+            require(before_digest == sha(persisted), "persisted state is not the fixture's declared payload")
             self.compose(project, ["stop"])
             self.compose(project, UP)
             after = self.inventory(project)
@@ -571,6 +604,8 @@ class Replay:
                 key = "Name" if kind == "volume" else "Id"
                 require({x[key] for x in before[kind]} == {x[key] for x in after[kind]}, "stop/up changed resource identity")
             require(self.execute(self.services(after)["db"][0], ["python3", "-c", READ, marker])["_stdout"] == payload.encode(), "host marker lost on restart")
+            require(sha(self.execute(self.services(after)["db"][0], ["python3", "-c", READ, SENTINEL])["_stdout"]) == before_digest,
+                    "restart_data_sha256 changed across stop/up")
 
     def scale(self, project):
         with self.observation("compose-scale"):

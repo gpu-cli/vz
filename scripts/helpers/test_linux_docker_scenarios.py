@@ -105,10 +105,17 @@ class LaneScenarioTests(unittest.TestCase):
         self.assertEqual(by_id["docker.engine.version"]["status"], "PASS")
         self.assertEqual(by_id["docker.engine.info"]["status"], "PASS")
         self.assertEqual(by_id["docker.engine.context"]["status"], "PASS")
-        partial = subject.lane_scenarios("compose", [{"started_unix_ns": 1, "ended_unix_ns": 2}], phase="clean-provision", passed=True)
-        volumes = next(e for e in partial if e["id"] == "docker.compose.volumes")
-        self.assertEqual(volumes["status"], "FAIL")
-        self.assertIn("UNPROVEN expected.restart_data_sha256 (no assertion in compose)", volumes["assertions"])
+        # Whichever claims are still partial, a passed run reports them FAIL and
+        # names the expected fields no suite asserts. Kept independent of the
+        # table so promoting a claim does not need an edit here.
+        rows = subject.manifest()
+        claim = next(c for c in subject.TABLE if c.status == "partial" and rows[c.id]["phase"] == "clean-provision")
+        entries = subject.lane_scenarios(claim.suite, [{"started_unix_ns": 1, "ended_unix_ns": 2}],
+                                         phase="clean-provision", passed=True, rows=rows)
+        entry = next(e for e in entries if e["id"] == claim.id)
+        self.assertEqual(entry["status"], "FAIL")
+        for field in claim.unproven:
+            self.assertIn("UNPROVEN expected." + field + " (no assertion in " + claim.suite + ")", entry["assertions"])
         # The cross-Machine document is cited once for the whole suite.
         self.assertEqual(by_id["docker.engine.info"]["evidence"].count("harness/handshake-cross-machine.json"), 1)
         self.assertEqual(by_id["docker.engine.version"]["readiness_polls"], [])
