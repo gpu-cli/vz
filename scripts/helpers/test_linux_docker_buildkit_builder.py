@@ -579,3 +579,52 @@ class LifecycleTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CacheIsolationTests(unittest.TestCase):
+    """`verify_cache_isolation`: the cross-Machine half of docker.build.cache_isolation."""
+
+    def observations(self, count=3):
+        return [{"builder": {"container_id": "c%d" % i, "image_id": "i%d" % i},
+                 "cache_volume": {"Name": "v%d" % i, "Labels": {"dev.vz.buildkit-proof": "p%d" % i}},
+                 "engine_id": "e%d" % i, "context": "x%d" % i} for i in range(count)]
+
+    def scopes(self, environments=("a", "a", "b")):
+        return [{"environment_id": "env_" + name, "machine_id": "m%d" % i} for i, name in enumerate(environments)]
+
+    def test_distinct_builders_across_two_environments_prove_isolation(self):
+        record = builder.verify_cache_isolation(self.observations(), self.scopes())
+        self.assertEqual(record["sibling_machine_cache_hit_without_import"], False)
+        self.assertEqual(record["sibling_environment_cache_hit_without_import"], False)
+        self.assertEqual((record["machines"], record["sibling_machines_in_one_environment"]), (3, 2))
+        self.assertEqual(record["environments"], ["env_a", "env_b"])
+        self.assertEqual(record["release_certified"], False)
+
+    def test_a_shared_cache_store_builder_or_engine_is_rejected(self):
+        for field, key in (("cache_volume", "Name"), ("cache_volume", "Labels"), ("builder", "container_id"),
+                           ("builder", "image_id")):
+            with self.subTest(field=field, key=key):
+                rows = self.observations()
+                rows[1][field] = dict(rows[1][field], **{key: rows[0][field][key]})
+                with self.assertRaisesRegex(ValueError, "share a"):
+                    builder.verify_cache_isolation(rows, self.scopes())
+        for field in ("engine_id", "context"):
+            with self.subTest(field=field):
+                rows = self.observations()
+                rows[1][field] = rows[0][field]
+                with self.assertRaisesRegex(ValueError, "share a"):
+                    builder.verify_cache_isolation(rows, self.scopes())
+
+    def test_a_run_without_both_topologies_cannot_certify_the_claim(self):
+        with self.assertRaisesRegex(ValueError, "sibling Machines in one Environment"):
+            builder.verify_cache_isolation(self.observations(), self.scopes(("a", "a", "a")))
+        with self.assertRaisesRegex(ValueError, "sibling Machines in one Environment"):
+            builder.verify_cache_isolation(self.observations(), self.scopes(("a", "b", "c")))
+
+    def test_too_few_machines_or_a_missing_observation_is_rejected(self):
+        with self.assertRaisesRegex(ValueError, "every Machine"):
+            builder.verify_cache_isolation(self.observations(2), self.scopes(("a", "b")))
+        rows = self.observations()
+        del rows[2]["cache_volume"]["Labels"]
+        with self.assertRaisesRegex(ValueError, "cache proof label"):
+            builder.verify_cache_isolation(rows, self.scopes())

@@ -69,7 +69,8 @@ def _recovery_samples(item):
 
 SUITES = {suite.name: suite for suite in (
     Suite("compose", "docker_host_driver.py", ("compose-machine-{index}/result.json",), (), "docker.compose.up"),
-    Suite("build", "docker_host_driver.py", ("build-machine-{index}/result.json",), (), "docker.build.cache_reuse"),
+    Suite("build", "docker_host_driver.py", ("build-machine-{index}/result.json",), (), "docker.build.cache_reuse",
+          ("build-cross-machine.json",)),
     Suite("artifacts", "linux_docker_build_artifacts.py", ("artifacts-machine-{index}/machine-artifact-validation.json",), (),
           "docker.build.multi_stage"),
     Suite("parallel", "linux_docker_build_parallel.py", ("parallel-machine-{index}/machine-parallel-validation.json",),
@@ -144,8 +145,7 @@ TABLE = (
     _c("docker.compose.down", "compose", "Driver.cleanup", "partial", ("external_and_unrelated_resources_unchanged",)),
     # build: driver recipes on the embedded builder.
     _c("docker.build.cache_reuse", "build", "build-cache-reuse"),
-    _c("docker.build.cache_isolation", "build", "build-cache-mount", "partial",
-       ("sibling_machine_cache_hit_without_import", "sibling_environment_cache_hit_without_import")),
+    _c("docker.build.cache_isolation", "build", ("build-cache-mount", "verify_cache_isolation")),
     _c("docker.build.output_export", "build", "build-multi-stage", "partial", ("oci_export_digest",)),
     _c("docker.build.multi_stage", "build", "build-multi-stage", "secondary"),
     _c("docker.build.build_arguments", "build", "build-arguments", "secondary"),

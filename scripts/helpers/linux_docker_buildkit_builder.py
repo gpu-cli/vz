@@ -460,3 +460,54 @@ class Builder:
                           "buildx_registration_absent": True,
                           "normal_stop": stop_proof,
                           "exact_owned_builder_container_volume_image_removed": True})
+
+
+ISOLATION_SCOPE = "DEV_installed_Machine_buildkit_cache_isolation_not_release_certification"
+
+
+def verify_cache_isolation(observations, scopes):
+    """Cross-Machine proof for `docker.build.cache_isolation`.
+
+    A single Machine's build can show its own first solve was cold; it cannot
+    show that no sibling supplied that cache, because it never sees a sibling.
+    The run's retained builder evidence can: every Machine drives its own
+    BuildKit container, from its own builder image, over its own labelled cache
+    volume, on its own Engine, and none of those is shared. Combined with the
+    per-Machine cold-solve assertion in `build-multi-stage`, no sibling Machine
+    and no sibling Environment can have supplied a cache hit without an import,
+    because there is no shared store to hit.
+
+    The run provisions two Machines in one Environment and a third in another,
+    which is the topology both expectations name; the check refuses to certify
+    the claim on a run that does not span both.
+    """
+    driver.require(type(observations) is list and len(observations) == len(scopes) and len(observations) >= 3,
+                   "cache isolation needs a builder observation and scope for every Machine")
+    environments = [scope["environment_id"] for scope in scopes]
+    machines = [scope["machine_id"] for scope in scopes]
+    driver.require(len(set(machines)) == len(machines), "Machines share an identity: " + repr(sorted(machines)))
+    siblings = max(environments.count(name) for name in set(environments))
+    driver.require(siblings >= 2 and len(set(environments)) >= 2,
+                   "cache isolation needs sibling Machines in one Environment and a Machine in another, observed " +
+                   repr(sorted(environments)))
+    columns = {}
+    for name, read_value in (("builder container", lambda row: row["builder"]["container_id"]),
+                             ("builder image", lambda row: row["builder"]["image_id"]),
+                             ("cache volume", lambda row: row["cache_volume"]["Name"]),
+                             ("cache proof label", lambda row: row["cache_volume"]["Labels"]["dev.vz.buildkit-proof"]),
+                             ("Engine", lambda row: row["engine_id"]),
+                             ("context", lambda row: row["context"])):
+        try:
+            values = [read_value(row) for row in observations]
+        except (KeyError, TypeError) as error:
+            raise ValueError("builder observation without a " + name + ": " + str(error)) from error
+        driver.require(all(type(value) is str and value for value in values), "builder observation without a " + name)
+        driver.require(len(set(values)) == len(values), "Machines share a " + name + ": " + repr(sorted(values)))
+        columns[name] = values
+    return {"schema_version": 1, "scope": ISOLATION_SCOPE, "machines": len(observations), "environments": sorted(set(environments)),
+            "sibling_machines_in_one_environment": siblings,
+            "sibling_machine_cache_hit_without_import": False,
+            "sibling_environment_cache_hit_without_import": False,
+            "distinct_cache_volumes": sorted(columns["cache volume"]),
+            "scenarios": {"docker.build.cache_isolation": "dev_observed_not_release_certified"},
+            "docker_parity_certified": False, "release_certified": False}

@@ -1001,11 +1001,15 @@ class ComposeHarness(startup.Harness):
         The record is retained beside the per-Machine evidence and is what the
         lane result cites for the cross-Machine part of the claim.
         """
-        if suite != "handshake":
-            return
-        from linux_docker_handshake_machine import verify_machines
-        startup.document(self.evidence / "handshake-cross-machine.json",
-                         verify_machines(self, observations, descriptors))
+        if suite == "handshake":
+            from linux_docker_handshake_machine import verify_machines
+            startup.document(self.evidence / "handshake-cross-machine.json",
+                             verify_machines(self, observations, descriptors))
+        elif suite == "build":
+            from linux_docker_buildkit_builder import verify_cache_isolation
+            startup.document(self.evidence / "build-cross-machine.json",
+                             verify_cache_isolation([row["builder_runtime"] for row in observations],
+                                                    [row["scope"] for row in observations]))
 
     def run_suite_with_audit_window(self, suite, suites, contexts, selected_machines, bindings):
         """One suite, inside its runtime-audit window when it needs its own.
