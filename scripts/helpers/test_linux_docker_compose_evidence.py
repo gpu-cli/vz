@@ -82,7 +82,8 @@ class SyntheticEngine:
                  "isolated": ("isolated",), "failure": ("frontend",)}[role]
         return {"Id": identity, "Name": f"/{project}-{role}-{number}", "Image": self.inputs.raw["images"]["compose"]["id"],
                 "Config": {"Hostname": identity[:12], "Labels": self.labels(project) | {"com.docker.compose.service": role}},
-                "State": {"Status": "created", "Running": False, "ExitCode": 0, "Health": {"Status": "starting"}},
+                "State": {"Status": "created", "Running": False, "ExitCode": 0,
+                          **({} if role == "failure" else {"Health": {"Status": "starting"}})},
                 "Mounts": [{"Destination": "/data", "Type": "volume", "Name": project + "_state", "RW": True}] if role == "db" else [],
                 "NetworkSettings": {"Networks": {project + "_" + name: {"IPAddress": f"172.{18 + index}.0.{10 + number}",
                                                                          "NetworkID": self.identity(project + name)}
@@ -151,7 +152,15 @@ class SyntheticEngine:
                     running = action == "up" and not "--exit-code-from" in tail and not (blocked and role in {"api", "worker"})
                     state = "running" if running else "created" if blocked and role in {"api", "worker"} else "exited"
                     item["State"] = {"Status": state, "Running": running, "ExitCode": 37 if role == "failure" else 0,
-                                     "Health": {"Status": "unhealthy" if blocked and role == "db" else "healthy"}}
+                                     "StartedAt": "2026-09-08T03:19:2%d.000000000Z" % (5 if role == "failure" else 3)}
+                    if role != "failure":
+                        # The fixture declares no healthcheck for the failure job,
+                        # so the Engine reports no health state for it at all.
+                        item["State"]["Health"] = {
+                            "Status": "unhealthy" if blocked and role == "db" else "healthy",
+                            "FailingStreak": 1 if blocked and role == "db" else 0,
+                            "Log": [{"ExitCode": 1 if blocked and role == "db" else 0,
+                                     "Start": "2026-09-08T03:19:20.000000Z", "End": "2026-09-08T03:19:20.100000Z"}]}
                     if state == "created":
                         item["State"].update(Paused=False, Restarting=False, Pid=0,
                             StartedAt="0001-01-01T00:00:00Z", FinishedAt="0001-01-01T00:00:00Z")

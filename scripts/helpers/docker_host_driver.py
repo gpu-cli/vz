@@ -1178,8 +1178,12 @@ class Driver:
             logs = self.command(["logs", job["Id"]])
             require(logs.stdout == f"vz04|failure|{self.inputs.owner}|exit-37\n".encode() and not logs.stderr,
                     "failure job log mismatch")
+            health = assert_failure_health(services, json.loads(regular(self.fixture / "compose/compose.json"))["services"],
+                                           "failure", "api")
             self.record.acknowledge_negative(result, "exact failure job and Compose exit 37, exact logs, all other services stopped")
-            return ["Compose and exact failure job exit 37; all five services captured and none running"]
+            return ["Compose and exact failure job exit 37; all five services captured and none running",
+                    "the failed job carries no health state and, gated on " + health["gate"] + ", started only after "
+                    "its declared dependency (" + health["dependency_started_at"] + " < " + health["failed_started_at"] + ")"]
 
         self.observe("compose-failure", ["docker.compose.failure_propagation"], failure)
 
@@ -1458,6 +1462,39 @@ def assert_health_order(events: list[dict[str, Any]], ids: dict[str, str], proje
         starts = times.get((ids[dependent], "start"), [])
         require(len(healthy) == len(starts) == 1 and healthy[0] < starts[0],
                 "missing, repeated or misordered dependency health/start events")
+
+
+def assert_failure_health(services: dict[str, list[dict[str, Any]]], declared: dict, failed: str, dependency: str) -> dict:
+    """The failed job is never reported healthy, and it ran only once its declared
+    dependency was.
+
+    Read from retained state and the pinned fixture, not from health logs or the
+    Engine event history. Both are bounded and evict this project's early
+    records within seconds (observed on candidate 31: a 41-second event window
+    returned only the last 11 seconds, and the health log keeps five entries), and
+    the last retained probe is often the one `--abort-on-container-exit` killed
+    mid-flight with 137, which is teardown rather than an unhealthy dependency.
+
+    What survives is exact: the failed job carries no `Health` at all, so no
+    observer could have been told it was healthy; the fixture gates it behind
+    `condition: service_healthy`, so Compose could only start it after observing
+    the dependency healthy; and it did start, after that dependency did.
+    """
+    require(len(services.get(failed, [])) == 1 and len(services.get(dependency, [])) == 1,
+            "exactly one failed job and one declared dependency required")
+    job, upstream = services[failed][0], services[dependency][0]
+    condition = ((declared.get(failed, {}).get("depends_on") or {}).get(dependency) or {}).get("condition")
+    require(condition == "service_healthy",
+            "the failed job does not declare a health-gated dependency on " + dependency)
+    require("Health" not in job["State"],
+            "the failed job carries a health state; it declares no healthcheck and must never be reported healthy")
+    started, upstream_started = job["State"]["StartedAt"], upstream["State"]["StartedAt"]
+    require(build_timestamp(upstream_started) < build_timestamp(started),
+            "the failed job started before the dependency it declared")
+    require(all(item["State"]["Running"] is False for items in services.values() for item in items),
+            "a service was still running after the failure aborted the project")
+    return {"failed_job_health_state": None, "gate": condition,
+            "dependency_started_at": upstream_started, "failed_started_at": started}
 
 
 def assert_builder_inspect(raw: bytes, builder: dict[str, str], context: str) -> None:

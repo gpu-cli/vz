@@ -140,7 +140,7 @@ TABLE = (
     _c("docker.network.dns", "compose", "compose-network-paths", "partial", ("foreign_environment_alias", "stale_alias_after_remove")),
     _c("docker.compose.volumes", "compose", ("compose-volume-persistence", "persisted_digest")),
     _c("docker.compose.scaling", "compose", "compose-scale"),
-    _c("docker.compose.failure_propagation", "compose", "compose-failure", "partial", ("failed_dependency_not_reported_healthy",)),
+    _c("docker.compose.failure_propagation", "compose", ("compose-failure", "assert_failure_health")),
     _c("docker.compose.down", "compose", "Driver.cleanup", "partial", ("external_and_unrelated_resources_unchanged",)),
     # build: driver recipes on the embedded builder.
     _c("docker.build.cache_reuse", "build", "build-cache-reuse"),

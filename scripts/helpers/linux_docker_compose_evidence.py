@@ -151,6 +151,10 @@ def fixture_digest(root):
     rows = []
     for path in sorted(root.rglob("*")):
         require(not path.is_symlink(), "fixture symlink")
+        # The pin is the checked-in source; gitignored bytecode is excluded here
+        # exactly as the driver excludes it, or the two digests disagree.
+        if "__pycache__" in path.parts or path.name.endswith((".pyc", ".pyo")):
+            continue
         if path.is_dir():
             continue
         data = read(path)
@@ -484,6 +488,15 @@ class Replay:
             require(job["State"]["Status"] == "exited" and job["State"]["ExitCode"] == 37, "wrong failure job exit")
             row = self.take(["logs", job["Id"]])
             require(row["_stdout"] == f"vz04|failure|{self.owner}|exit-37\n".encode() and not row["_stderr"], "wrong failure logs")
+            # State, not the Engine event history: the daemon's event buffer and
+            # the health log are both bounded and evict this project's early
+            # events well before the evidence is read.
+            declared = decode(read(self.fixture / "compose/compose.json"))["services"]
+            require(((declared["failure"].get("depends_on") or {}).get("api") or {}).get("condition") == "service_healthy",
+                    "the failed job does not declare a health-gated dependency")
+            require("Health" not in job["State"], "the failed job carries a health state")
+            require(services["api"][0]["State"]["StartedAt"] < job["State"]["StartedAt"],
+                    "the failed job started before the dependency it declared")
         for owned in self.projects:
             self.guard()
             before_down = self.inventory(owned)
