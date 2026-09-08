@@ -343,6 +343,25 @@ impl RuntimeDaemon {
         sender: mpsc::Sender<Result<StopEnvironmentProgress, MachineError>>,
     ) {
         let mut sequence = 0;
+        // A switch owns both ends of every port it minted, so it is joined
+        // before any Machine is released; a Machine released first would keep
+        // the guest end of a socket whose forwarder is gone. This precedes the
+        // terminal-replay return so no Stop path can leave a switch running.
+        // The declared network record survives, so the next Up rebinds the same
+        // fabric identity.
+        if let Err(error) = self
+            .reclaim_environment_switches(&lease, &operation.project_id, &operation.environment_id)
+            .await
+        {
+            tracing::error!(operation_id = %operation.operation_id, %error,
+                "Stop could not reclaim this Environment's switches; no Machine was released");
+            let _ = sender.try_send(Err(failure(
+                &input,
+                MachineErrorCode::StateConflict,
+                format!("Stop switch teardown failed: {error}"),
+            )));
+            return;
+        }
         if terminal(&operation) {
             publish(
                 &sender,
@@ -537,8 +556,6 @@ fn validate_supported_topology(
 ) -> Result<(), MachineError> {
     let supported = environment.machines.len() <= MAX_MACHINES
         && environment.legacy_migration.is_none()
-        && environment.networks.is_empty()
-        && environment.endpoints.is_empty()
         && environment.machines.iter().all(|machine| {
             matches!(
                 machine.target.os,
@@ -553,6 +570,14 @@ fn validate_supported_topology(
                 | OwnedResourceKind::Incarnation
                 | OwnedResourceKind::Disk
                 | OwnedResourceKind::DockerContext => true,
+                // Declared fabric is durable Environment identity, not a host
+                // resource Stop consumes: the record survives a Stop so the next
+                // Up rebinds the same network, endpoint and attachment, while
+                // the runtime half (the switch and its ports) is reclaimed by
+                // `drive_environment_stop` before any Machine is released.
+                OwnedResourceKind::Network
+                | OwnedResourceKind::Endpoint
+                | OwnedResourceKind::NetworkAttachment => true,
                 OwnedResourceKind::Other(kind) => {
                     kind == "machine_runtime_store" || kind == "runtime_vm"
                 }
@@ -562,7 +587,7 @@ fn validate_supported_topology(
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines and registered Linux Docker endpoints; additional topology resources remain unsupported",
+            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints and network attachments; additional topology resources remain unsupported",
         ));
     }
     Ok(())

@@ -697,7 +697,11 @@ pub enum OwnedResourceKind {
 }
 
 /// Minimal persisted ownership edge. Machine-owned resources always carry machine_id.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// Total ordering is part of the contract because owners are compared as sets:
+/// a controller that reconciles an exact ownership graph must be able to prove
+/// that its expected plan holds no repeated identity, not merely assume it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct OwnershipRecord {
     pub schema_version: u32,
     pub resource_kind: OwnedResourceKind,

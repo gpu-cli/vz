@@ -202,6 +202,11 @@ pub struct RuntimeDaemon {
     machine_runtime_registry: machine_runtime_registry::MachineRuntimeRegistry<TopologyBackend>,
     #[cfg(target_os = "macos")]
     environment_runtime_controller: environment_runtime_controller::EnvironmentRuntimeController,
+    /// Every Environment's running L2 switches. Declared fabric is durable
+    /// topology; the switch itself is this process's runtime state, so Stop and
+    /// Delete reclaim it here rather than leaving tasks and sockets behind.
+    #[cfg(target_os = "macos")]
+    environment_switches: environment_switch::registry::EnvironmentSwitches,
     #[cfg(target_os = "macos")]
     machine_live_sessions: machine_live_sessions::MachineLiveSessions,
     #[cfg(target_os = "macos")]
@@ -524,6 +529,8 @@ impl RuntimeDaemon {
             #[cfg(target_os = "macos")]
             environment_runtime_controller: Default::default(),
             #[cfg(target_os = "macos")]
+            environment_switches: Default::default(),
+            #[cfg(target_os = "macos")]
             machine_live_sessions: Default::default(),
             #[cfg(target_os = "macos")]
             environment_up_runs: Default::default(),
@@ -707,6 +714,44 @@ impl RuntimeDaemon {
     #[cfg(target_os = "macos")]
     pub fn machine_live_sessions(&self) -> &machine_live_sessions::MachineLiveSessions {
         &self.machine_live_sessions
+    }
+
+    /// Switch ownership, for tests that install a switch this daemon must then
+    /// reclaim. Production code reaches it through the lifecycle path below.
+    #[cfg(all(test, target_os = "macos"))]
+    pub(crate) fn environment_switches(
+        &self,
+    ) -> &environment_switch::registry::EnvironmentSwitches {
+        &self.environment_switches
+    }
+
+    /// Join and discard every switch this Environment owns, releasing its ports.
+    ///
+    /// This is the single reclamation path shared by Stop and Delete. A switch
+    /// exists only while this process runs, so an Environment that declared no
+    /// network, and one whose switches a daemon restart already released, both
+    /// reclaim nothing here rather than failing.
+    #[cfg(target_os = "macos")]
+    pub(crate) async fn reclaim_environment_switches(
+        &self,
+        lease: &environment_runtime_controller::EnvironmentControllerLease,
+        project_id: &vz_runtime_contract::ProjectId,
+        environment_id: &vz_runtime_contract::EnvironmentId,
+    ) -> Result<(), environment_switch::registry::SwitchRegistryError> {
+        let owner = vz_runtime_contract::ResourceOwner {
+            project_id: project_id.clone(),
+            environment_id: environment_id.clone(),
+            machine_id: None,
+        };
+        let receipt = self.environment_switches.stop(lease, &owner).await?;
+        if !receipt.networks.is_empty() {
+            info!(
+                environment_id = %environment_id,
+                networks = receipt.networks.len(),
+                "reclaimed Environment switches"
+            );
+        }
+        Ok(())
     }
 
     /// Prepare private runtime stores/pins under a retained Environment fence.
