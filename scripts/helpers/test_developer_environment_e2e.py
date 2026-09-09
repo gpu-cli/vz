@@ -540,3 +540,42 @@ class CriterionFiveCrossingTests(unittest.TestCase):
             definition = checks.crossing_definition(release, checks.macos_target(release))
             problems = list(Draft202012Validator(schema).iter_errors(definition))
             self.assertTrue(problems, "the pre-change schema accepted a macOS Machine on a network")
+
+    # Real `ifconfig -a` output from the macOS guest of the 2026-09-09 crossing
+    # run, trimmed to the interfaces that matter. Kept verbatim rather than
+    # idealised: the parser has to survive what the guest actually prints.
+    GUEST_IFCONFIG = (
+        b"lo0: flags=8049<UP,LOOPBACK,RUNNING,MULTICAST> mtu 16384\n"
+        b"\tinet 127.0.0.1 netmask 0xff000000\n"
+        b"gif0: flags=8010<POINTOPOINT,MULTICAST> mtu 1280\n"
+        b"anpi0: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+        b"\tether 0e:2b:40:0e:a7:84\n"
+        b"en1: flags=8863<UP,BROADCAST,SMART,RUNNING,SIMPLEX,MULTICAST> mtu 1500\n"
+        b"\tether 72:38:8c:71:14:00\n"
+        b"\tinet 10.85.187.215 netmask 0xffffff00 broadcast 10.85.187.255\n"
+        b"en2: flags=8822<BROADCAST,SMART,SIMPLEX,MULTICAST> mtu 1500\n"
+        b"\tether 0e:2b:40:0e:a7:64\n")
+
+    def test_the_macos_fabric_port_is_found_by_address_not_by_name(self):
+        port = checks.macos_fabric_port(self.GUEST_IFCONFIG, "10.85.187")
+        self.assertEqual(port, ("en1", "72:38:8c:71:14:00", "10.85.187.215"))
+
+    def test_loopback_and_addressless_interfaces_are_not_mistaken_for_the_port(self):
+        # lo0 carries an inet and anpi0/en2 carry an ether; neither is the
+        # fabric NIC. A parser that took the first interface with any address,
+        # or the first with a MAC, would pick one of them.
+        self.assertIsNone(checks.macos_fabric_port(self.GUEST_IFCONFIG, "127.0.0"))
+        port = checks.macos_fabric_port(self.GUEST_IFCONFIG, "10.85.187")
+        self.assertNotIn(port[0], ("lo0", "anpi0", "en2", "gif0"))
+
+    def test_a_guest_with_no_address_on_the_subnet_reports_none(self):
+        # The failure this must not paper over: the NIC exists but
+        # `native_macos::fabric` never applied an address to it.
+        without = self.GUEST_IFCONFIG.replace(
+            b"\tinet 10.85.187.215 netmask 0xffffff00 broadcast 10.85.187.255\n", b"")
+        self.assertIsNone(checks.macos_fabric_port(without, "10.85.187"))
+
+    def test_an_address_on_a_different_fabric_is_not_accepted(self):
+        # Two Environments derive different subnets. Matching on "some inet"
+        # would let a Machine on a foreign fabric satisfy this Environment.
+        self.assertIsNone(checks.macos_fabric_port(self.GUEST_IFCONFIG, "10.85.99"))

@@ -971,7 +971,13 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
     """
     check = SubCheck(top, "private_topology_paths")
     try:
-        definition = two_machine_definition(ctx.release_dir)
+        # Criterion 5 wants the crossing, so the Environment carries the macOS
+        # Machine whenever this release registers one. The Linux-to-Linux claims
+        # below are unchanged either way: they are the same two Machines, on the
+        # same declared network, and a third Machine on it does not weaken them.
+        native = macos_target(ctx.release_dir)
+        definition = (crossing_definition(ctx.release_dir, native) if native
+                      else two_machine_definition(ctx.release_dir))
     except (StopIteration, KeyError, OSError) as error:
         check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
         return check.finish()
@@ -997,7 +1003,8 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
     if check.status != "PASS" or not inside["status"]:
         return check.finish()
     names = [m.get("name") for e in inside["status"]["environments"] for m in e.get("machines") or []]
-    check.check(sorted(names) == ["machine-0", "machine-1"], f"both declared Machines are present (observed {names})")
+    expected = sorted(m["name"] for m in definition["environment"]["machines"])
+    check.check(sorted(names) == expected, f"every declared Machine is present (observed {names}, declared {expected})")
     if check.status != "PASS":
         return check.finish()
     # Both ports are judged BEFORE anything is asked to carry traffic. Every
@@ -1081,6 +1088,11 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
         check.check(foreign.exit_code == 0 and token.encode() not in foreign.stdout and
                     not foreign.stdout.strip().endswith(b":0"),
                     f"a Machine in another Environment cannot reach that address (observed {foreign.stdout[:80]!r})")
+        # The crossing runs last, on the same Environment and the same declared
+        # network the Linux half just proved, so a failure here is about the
+        # macOS Machine and not about the fabric existing.
+        if check.status == "PASS" and native is not None:
+            check_macos_crossing(ctx, check, inside, token, "machine-0", address)
     finally:
         released = ctx.release(check, server)
         # `None` is the one uncertain outcome: the invocation outlived SIGKILL,
@@ -1105,20 +1117,119 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
     # schema now accepts, which it did not before native macOS Machines were
     # admitted to the fabric -- but a definition that validates is not a path
     # that carries traffic.
-    if check.status == "PASS":
-        entry = macos_target(ctx.release_dir)
-        if entry is None:
-            check.not_implemented = (
-                "criterion 5 requires a required service path crossing between a Linux Machine and a "
-                "native macOS Machine in both directions; this release registers no Developer macOS "
-                "target, so no macOS Machine could be built and the crossing was never attempted. "
-                "The Linux-to-Linux half above passed. Register a template with vz-macos-setup "
-                "(planning/developer-environments/macos-local-setup.md); this check never provisions one.")
-        else:
-            check.not_implemented = (
-                "a Developer macOS target is registered but the Linux-to-macOS crossing is not yet "
-                "exercised by this check; crossing_definition() builds the declaration it needs.")
+    if check.status == "PASS" and native is None:
+        check.not_implemented = (
+            "criterion 5 requires a required service path crossing between a Linux Machine and a "
+            "native macOS Machine in both directions; this release registers no Developer macOS "
+            "target, so no macOS Machine could be built and the crossing was never attempted. "
+            "The Linux-to-Linux half above passed. Register a template with vz-macos-setup "
+            "(planning/developer-environments/macos-local-setup.md); this check never provisions one.")
     return check.finish()
+
+
+# The macOS guest is addressed by `native_macos::fabric` over the agent channel
+# rather than by a kernel cmdline, so its port is read from the interface list
+# and not from `/proc/cmdline`. `ifconfig -a` is used because it is present on a
+# stock macOS with no developer tools, which the clean template is.
+MACOS_FABRIC_PROBE = "/sbin/ifconfig -a"
+
+
+def macos_fabric_port(output: bytes, network: str):
+    """(interface, mac, address) for the macOS NIC on `network`, or None.
+
+    The interface is identified by the address it holds, never by name: a macOS
+    guest enumerates en0/en1/en2 in an order the host does not control, and the
+    fabric NIC is whichever one came up on the Environment's subnet.
+    """
+    interface = mac = None
+    loopback = False
+    for raw in output.decode("utf-8", "replace").splitlines():
+        if raw and not raw[0].isspace():
+            interface, mac = raw.split(":", 1)[0], None
+            # A fabric port is never the loopback, so it is refused here rather
+            # than relying on every caller to pass a subnet that cannot match
+            # it. `lo0` holding 127.0.0.1 is otherwise a perfectly good match
+            # for the shape of this search.
+            loopback = "LOOPBACK" in raw
+        elif raw.strip().startswith("ether "):
+            mac = raw.split()[1]
+        elif raw.strip().startswith("inet ") and interface is not None and not loopback:
+            address = raw.split()[1]
+            if address.rsplit(".", 1)[0] == network:
+                return interface, mac, address
+    return None
+
+
+def check_macos_crossing(ctx: CheckContext, check: SubCheck, inside: dict, token: str,
+                         linux_machine: str, linux_address: str) -> None:
+    """A required service path crosses Linux to macOS in BOTH declared directions.
+
+    GOAL-0.4.0.md criterion 5. Each direction is served by a foreground listener
+    held open across the peer's fetch, for the same reason the Linux half holds
+    one: `vz exec` reaps the whole process group, so a backgrounded listener is
+    dead before the invocation reports.
+
+    Both directions are required. One of them passing would prove the switch
+    forwards, but not that the macOS Machine is a peer on the fabric rather than
+    a client of it, which is what "in both directions permitted by its
+    declarations" asks for.
+    """
+    probed = machine_exec(ctx, check, "net-port-machine-mac", inside, "machine-mac", MACOS_FABRIC_PROBE)
+    network = linux_address.rsplit(".", 1)[0]
+    port = macos_fabric_port(probed.stdout, network) if probed.exit_code == 0 else None
+    check.check(port is not None,
+                f"the macOS Machine holds an address on the Environment's fabric subnet {network}.0/24 "
+                f"(exit {probed.exit_code})")
+    if port is None:
+        return
+    interface, mac, mac_address = port
+    check.ok(f"macOS fabric port: {interface} {mac} {mac_address}")
+    check.check(mac_address != linux_address,
+                f"the macOS Machine holds its own address, distinct from {linux_machine}'s "
+                f"({mac_address}, {linux_address})")
+
+    # Direction 1: the macOS Machine serves, a Linux Machine reads.
+    served = hold_machine_exec(ctx, check, "net-serve-mac", inside, "machine-mac",
+                               f"printf %s {token} > /tmp/vz-crossing; "
+                               f"while true; do /usr/bin/nc -l {PRIVATE_PORT} < /tmp/vz-crossing; done")
+    try:
+        fetched = None
+        for _ in range(LISTENER_ATTEMPTS):
+            fetched = machine_exec(ctx, check, "net-cross-to-mac", inside, linux_machine,
+                                   f"/bin/busybox nc -w 5 {mac_address} {PRIVATE_PORT}")
+            if fetched.exit_code == 0 and fetched.stdout.strip() == token.encode():
+                break
+            time.sleep(LISTENER_INTERVAL)
+        check.check(fetched is not None and fetched.exit_code == 0
+                    and fetched.stdout.strip() == token.encode(),
+                    f"{linux_machine} reads the declared path served by the macOS Machine "
+                    f"(exit {None if fetched is None else fetched.exit_code}, "
+                    f"{b'' if fetched is None else fetched.stdout[:80]!r})")
+    finally:
+        released = ctx.release(check, served)
+        check.check(released.exit_code is not None,
+                    f"the macOS listener was released (exit {released.exit_code})")
+
+    # Direction 2: a Linux Machine serves, the macOS Machine reads.
+    reverse = hold_machine_exec(ctx, check, "net-serve-linux-cross", inside, linux_machine,
+                                f"/bin/busybox sh -c 'printf %s {token} > /tmp/vz-crossing; "
+                                f"while true; do /bin/busybox nc -l -p {PRIVATE_PORT} < /tmp/vz-crossing; done'")
+    try:
+        back = None
+        for _ in range(LISTENER_ATTEMPTS):
+            back = machine_exec(ctx, check, "net-cross-from-mac", inside, "machine-mac",
+                                f"/usr/bin/nc -w 5 {linux_address} {PRIVATE_PORT}")
+            if back.exit_code == 0 and back.stdout.strip() == token.encode():
+                break
+            time.sleep(LISTENER_INTERVAL)
+        check.check(back is not None and back.exit_code == 0 and back.stdout.strip() == token.encode(),
+                    f"the macOS Machine reads the declared path served by {linux_machine} "
+                    f"(exit {None if back is None else back.exit_code}, "
+                    f"{b'' if back is None else back.stdout[:80]!r})")
+    finally:
+        released = ctx.release(check, reverse)
+        check.check(released.exit_code is not None,
+                    f"the Linux listener was released (exit {released.exit_code})")
 
 
 def check_bootstrap_creates_default(ctx: CheckContext, top: str) -> SubCheck:
