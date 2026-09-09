@@ -1193,3 +1193,33 @@ class CriterionFiveCrossingTests(unittest.TestCase):
         # Two Environments derive different subnets. Matching on "some inet"
         # would let a Machine on a foreign fabric satisfy this Environment.
         self.assertIsNone(checks.macos_fabric_port(self.GUEST_IFCONFIG, "10.85.99"))
+
+class PeerAddressTests(unittest.TestCase):
+    """The origin's peer, compared as an address rather than as a spelling.
+
+    BusyBox `httpd` accepts on an IPv6 socket, so an IPv4 peer reaches CGI as a
+    bracketed IPv4-mapped literal. Unwrapping that is what lets the translation
+    clauses compare against the address the host derived -- and it must stay
+    exact, because a lenient normaliser would let a comparison succeed against
+    something that is not the address at all.
+    """
+
+    def test_the_mapped_literal_busybox_writes_is_the_address_it_names(self):
+        for written in ("[::ffff:10.31.71.1]", "::ffff:10.31.71.1",
+                        "[::FFFF:10.31.71.1]", "10.31.71.1"):
+            with self.subTest(written=written):
+                self.assertEqual(checks.peer_address(written), "10.31.71.1")
+
+    def test_anything_that_is_not_an_address_is_returned_untouched(self):
+        # Returned as-is rather than coerced, so a comparison against the
+        # address the host derived still fails instead of being made to pass.
+        for written in ("", "::1", "[::1]", "fda6:1594:ff6b::", "10.31.71",
+                        "10.31.71.1.5", "[::ffff:not.an.address]", "10.31.71.999"):
+            with self.subTest(written=written):
+                self.assertEqual(checks.peer_address(written), written)
+        self.assertIsNone(checks.peer_address(None))
+
+    def test_a_mapped_literal_never_collapses_two_different_addresses(self):
+        """The clause it serves is `origin peer == edge` and `!= client`."""
+        self.assertNotEqual(checks.peer_address("[::ffff:10.31.71.1]"),
+                            checks.peer_address("[::ffff:10.31.71.200]"))
