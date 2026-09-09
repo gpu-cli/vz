@@ -23,8 +23,8 @@ use std::net::Ipv4Addr;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vz_runtime_contract::{
-    EnvironmentInstance, MachineId, MachineInstance, MachineProfile, NetworkAttachmentId,
-    NetworkId, NetworkKind, OperatingSystem,
+    EndpointId, EnvironmentInstance, MachineId, MachineInstance, MachineProfile,
+    NetworkAttachmentId, NetworkId, NetworkKind, OperatingSystem,
 };
 
 use super::{MacAddress, PortId};
@@ -109,6 +109,24 @@ pub enum FabricPlanError {
         machine: String,
         profile: MachineProfile,
         os: OperatingSystem,
+    },
+    #[error("endpoint `{endpoint}` names {kind} `{id}`, which this Environment does not have")]
+    DanglingEndpoint {
+        endpoint: String,
+        kind: &'static str,
+        id: String,
+    },
+    #[error(
+        "endpoint `{endpoint}` is on network `{network}`, but its Machine has no port on that network, so the endpoint has no address to resolve to"
+    )]
+    UnattachedEndpoint { endpoint: String, network: String },
+    #[error(
+        "endpoints `{first}` and `{second}` both resolve the name `{name}`, which would make it resolve to two different Machines"
+    )]
+    AmbiguousEndpointName {
+        name: String,
+        first: String,
+        second: String,
     },
 }
 
@@ -211,13 +229,42 @@ pub struct FabricPort {
     pub address: Ipv4Addr,
 }
 
-/// One network's switch, its range, and every port it will be constructed with.
+/// One declared endpoint, resolved to the address it names.
+///
+/// An endpoint is declaration and resolution only: this says which name answers
+/// with which address, and says nothing about whether anything is listening on
+/// the port behind it. Nothing here binds a listener, probes the port or waits
+/// for one, so an Up that produced this cannot be read as evidence that the
+/// service exists yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricEndpoint {
+    pub endpoint_id: EndpointId,
+    /// The name this endpoint answers to, already defaulted.
+    pub name: String,
+    /// The fabric address of the Machine that owns the endpoint, taken from
+    /// that Machine's port on this same network rather than derived a second
+    /// time — one derivation, so a name cannot resolve to an address the switch
+    /// does not actually forward to.
+    pub address: Ipv4Addr,
+}
+
+/// One network's switch, its range, every port it will be constructed with, and
+/// every name that resolves on it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NetworkPlan {
     pub network_id: NetworkId,
     pub name: String,
     pub cidr: Ipv4Cidr,
     pub ports: Vec<FabricPort>,
+    /// The endpoints declared on this network, in resolved-name order.
+    ///
+    /// Endpoints hang off the network rather than off the Environment because
+    /// reachability does: a Machine with no port on this network cannot reach
+    /// any address in this range, and resolving a name to an address that
+    /// Machine provably cannot route to would turn a clear "unknown host" into
+    /// a connection that hangs. So a name is published to exactly the Machines
+    /// that hold a port here.
+    pub endpoints: Vec<FabricEndpoint>,
 }
 
 impl NetworkPlan {
@@ -226,6 +273,14 @@ impl NetworkPlan {
         self.ports
             .iter()
             .map(|port| (port.port, port.mac))
+            .collect()
+    }
+
+    /// The `name -> address` pairs a Machine on this network resolves.
+    pub fn hosts(&self) -> Vec<(String, Ipv4Addr)> {
+        self.endpoints
+            .iter()
+            .map(|endpoint| (endpoint.name.clone(), endpoint.address))
             .collect()
     }
 }
@@ -369,9 +424,87 @@ pub fn plan_environment_fabric(
             name: network.name.clone(),
             cidr,
             ports,
+            endpoints: Vec::new(),
         });
     }
+    resolve_endpoints(environment, &mut planned)?;
     Ok(FabricPlan { networks: planned })
+}
+
+/// Give every declared endpoint the address of the Machine that owns it.
+///
+/// This runs after the ports are decided rather than beside them because an
+/// endpoint resolves to a port's address and cannot be answered before that
+/// address exists. It adds no address of its own: an endpoint whose Machine has
+/// no port on the endpoint's network is refused rather than given one, because
+/// minting an address here would put a Machine on a network its declaration
+/// never attached it to.
+fn resolve_endpoints(
+    environment: &EnvironmentInstance,
+    planned: &mut [NetworkPlan],
+) -> Result<(), FabricPlanError> {
+    let mut endpoints: Vec<_> = environment.endpoints.iter().collect();
+    endpoints.sort_by(|left, right| left.endpoint_id.as_str().cmp(right.endpoint_id.as_str()));
+
+    // One name, one address, per Environment. Two endpoints that resolve the
+    // same name are refused rather than ordered, for the same reason two
+    // attachments may not hold one address: whichever line of `/etc/hosts` a
+    // resolver happened to read first would decide which Machine the name meant,
+    // and the declaration would have said nothing about which that is.
+    let mut claimed: BTreeMap<&str, &str> = BTreeMap::new();
+    let mut resolved: BTreeMap<usize, Vec<FabricEndpoint>> = BTreeMap::new();
+    for endpoint in endpoints {
+        let name = endpoint.resolved_hostname();
+        if let Some(first) = claimed.insert(name, endpoint.name.as_str()) {
+            return Err(FabricPlanError::AmbiguousEndpointName {
+                name: name.to_string(),
+                first: first.to_string(),
+                second: endpoint.name.clone(),
+            });
+        }
+        let Some((index, network)) = planned
+            .iter()
+            .enumerate()
+            .find(|(_, network)| network.network_id == endpoint.network_id)
+        else {
+            return Err(FabricPlanError::DanglingEndpoint {
+                endpoint: endpoint.name.clone(),
+                kind: "network",
+                id: endpoint.network_id.to_string(),
+            });
+        };
+        if !environment
+            .machines
+            .iter()
+            .any(|machine| machine.machine_id == endpoint.machine_id)
+        {
+            return Err(FabricPlanError::DanglingEndpoint {
+                endpoint: endpoint.name.clone(),
+                kind: "Machine",
+                id: endpoint.machine_id.to_string(),
+            });
+        }
+        let port = network
+            .ports
+            .iter()
+            .find(|port| port.machine_id == endpoint.machine_id)
+            .ok_or_else(|| FabricPlanError::UnattachedEndpoint {
+                endpoint: endpoint.name.clone(),
+                network: network.name.clone(),
+            })?;
+        resolved.entry(index).or_default().push(FabricEndpoint {
+            endpoint_id: endpoint.endpoint_id.clone(),
+            name: name.to_string(),
+            address: port.address,
+        });
+    }
+
+    for (index, network) in planned.iter_mut().enumerate() {
+        let mut network_endpoints = resolved.remove(&index).unwrap_or_default();
+        network_endpoints.sort_by(|left, right| left.name.cmp(&right.name));
+        network.endpoints = network_endpoints;
+    }
+    Ok(())
 }
 
 /// Give every network a range: the declared one where there is one, otherwise a

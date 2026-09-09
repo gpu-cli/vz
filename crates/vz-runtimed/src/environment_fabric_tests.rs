@@ -195,6 +195,72 @@ async fn a_declared_network_becomes_a_running_switch_with_one_port_per_attached_
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_declared_endpoint_name_reaches_every_machine_on_its_network_as_one_kernel_argument() {
+    // The last link in the chain: the plan resolves a name to an address and
+    // this is what carries it to the Machine that boots. Nothing here binds a
+    // listener, probes the endpoint's port or waits for it — the Machine simply
+    // boots able to resolve the name.
+    let (_root, daemon, lease) = fixture().await;
+    let mut environment = environment(NETWORK, NetworkKind::Private);
+    environment.endpoints = vec![vz_runtime_contract::EndpointInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        endpoint_id: vz_runtime_contract::EndpointId::new(format!("ept_{:032x}", 1)).unwrap(),
+        environment_id: environment_id(),
+        // Owned by Machine 2, so Machine 1's copy is the interesting one: it
+        // resolves a name to an address that is not its own.
+        machine_id: machine_id(2),
+        network_id: NetworkId::new(NETWORK.to_string()).unwrap(),
+        name: "database".to_string(),
+        protocol: vz_runtime_contract::EndpointProtocol::Tcp,
+        port: 5432,
+        hostname: None,
+    }];
+
+    let minted = daemon
+        .install_environment_fabric(&lease, &environment, &nobody())
+        .await
+        .unwrap();
+    let plan = plan_environment_fabric(&environment).expect("the same Environment plans");
+    let owner_address = plan.networks[0]
+        .ports
+        .iter()
+        .find(|port| port.machine_id == machine_id(2))
+        .expect("the owning Machine holds a port")
+        .address;
+
+    for machine in [machine_id(1), machine_id(2)] {
+        let declaration = minted[&machine][0].declaration();
+        assert_eq!(
+            declaration.hosts.len(),
+            1,
+            "every Machine on the network resolves the name, its owner included"
+        );
+        // The hostname was absent, so the endpoint's own name is what resolves.
+        assert_eq!(declaration.hosts[0].name, "database");
+        // And it resolves to the address the plan already assigned that port,
+        // not to a second derivation that could drift from it.
+        assert_eq!(declaration.hosts[0].address, owner_address);
+    }
+    assert!(
+        vz_oci_macos::DeclaredAttachment::kernel_argument(
+            minted[&machine_id(1)][0].declaration(),
+            0
+        )
+        .starts_with("vz.net.0="),
+        "the port argument is unchanged by the presence of a name"
+    );
+
+    daemon
+        .reclaim_environment_switches(
+            &lease,
+            &ProjectId::new(PROJECT.to_string()).unwrap(),
+            &environment_id(),
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn the_switch_this_installs_is_the_one_stop_and_delete_reclaim() {
     // Ownership is registered before any descriptor is handed out, so a fabric
     // that started is always one the shared reclamation path can join.

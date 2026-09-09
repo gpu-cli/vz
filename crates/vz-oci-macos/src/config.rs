@@ -212,7 +212,31 @@ pub struct DeclaredAttachment {
     pub gateway: Option<Ipv4Addr>,
     /// The MTU the attachment was sized for.
     pub mtu: u32,
+    /// Every declared endpoint name reachable through this port, and the fabric
+    /// address it answers with.
+    ///
+    /// Names ride with the port rather than with the Machine because that is the
+    /// scope in which they are reachable: an address on this network is routable
+    /// only from a Machine that holds a port on it. Carrying them here also
+    /// means a reused boot whose Environment has since renamed or re-pointed an
+    /// endpoint compares unequal and is refused, without a second field for the
+    /// idempotency check to remember to look at.
+    ///
+    /// These resolve a name to an address and nothing more. No listener is bound
+    /// for them, no port is probed and nothing waits, so a Machine booting with
+    /// a name here is not evidence that anything answers on it.
+    pub hosts: Vec<DeclaredHost>,
 }
+
+/// One name a Machine on this network resolves, and the address it resolves to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredHost {
+    pub name: String,
+    pub address: Ipv4Addr,
+}
+
+/// The longest name a DNS-shaped label sequence may be.
+const MAX_HOST_NAME: usize = 253;
 
 impl DeclaredAttachment {
     /// This attachment rendered as the kernel argument that configures it in
@@ -247,12 +271,25 @@ impl DeclaredAttachment {
 /// The index each port is rendered with is its position in this list, which is
 /// the order the NICs are attached in, so a Machine's arguments stay distinct
 /// from each other without any of them having to know what the others are.
+///
+/// The names come after every port, numbered across the whole Machine rather
+/// than per port. The guest writes one `/etc/hosts` for the Machine, not one per
+/// NIC, so what it needs is the Machine's whole table; which port a name arrived
+/// on is a host-side scoping rule that is already settled by the time it is
+/// rendered here.
 pub(crate) fn fabric_cmdline_suffix(attachments: &[DeclaredAttachment]) -> String {
-    attachments
+    let ports: String = attachments
         .iter()
         .enumerate()
         .map(|(index, declaration)| format!(" {}", declaration.kernel_argument(index)))
-        .collect()
+        .collect();
+    let hosts: String = attachments
+        .iter()
+        .flat_map(|declaration| declaration.hosts.iter())
+        .enumerate()
+        .map(|(index, host)| format!(" vz.host.{index}={},{}", host.address, host.name))
+        .collect();
+    format!("{ports}{hosts}")
 }
 
 /// Prefix lengths a port may be declared with. A `/0` port claims every address
@@ -260,6 +297,39 @@ pub(crate) fn fabric_cmdline_suffix(attachments: &[DeclaredAttachment]) -> Strin
 /// neither the subnet nor the broadcast address, so no interface could hold one.
 const MIN_ATTACHMENT_PREFIX: u8 = 1;
 const MAX_ATTACHMENT_PREFIX: u8 = 30;
+
+/// Refuse a resolved endpoint name that the kernel cmdline could not carry
+/// intact, or that `/etc/hosts` would read as something other than a name.
+///
+/// This is the rule with the worst failure mode in the whole declaration. The
+/// name originates in a project definition, so it is attacker-influenced input
+/// in a way an address derived from persisted identifiers is not, and it is
+/// rendered into a whitespace-separated kernel cmdline that the guest re-splits
+/// on whitespace: a name containing a space would not be a broken hostname, it
+/// would be an additional kernel parameter of the author's choosing. A `#` or a
+/// newline would likewise silently truncate or extend the guest's `/etc/hosts`
+/// rather than fail. So the charset is an allowlist and never a denylist.
+fn require_cmdline_safe_host_name(name: &str) -> Result<(), OciError> {
+    if name.is_empty() || name.len() > MAX_HOST_NAME {
+        return Err(OciError::InvalidConfig(format!(
+            "endpoint name `{name}` must be 1..={MAX_HOST_NAME} bytes"
+        )));
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_'))
+    {
+        return Err(OciError::InvalidConfig(format!(
+            "endpoint name `{name}` may hold only ASCII letters, digits, `-`, `.` and `_`; anything else could not survive the kernel cmdline or `/etc/hosts` intact"
+        )));
+    }
+    if name.starts_with(['-', '.']) || name.ends_with(['-', '.']) {
+        return Err(OciError::InvalidConfig(format!(
+            "endpoint name `{name}` may not begin or end with `-` or `.`"
+        )));
+    }
+    Ok(())
+}
 
 /// One Environment-network port a Machine boots attached to.
 ///
@@ -332,6 +402,9 @@ impl SharedVmAttachment {
                     "network attachment gateway {gateway} is this port's own address, so it names no route off the fabric"
                 )));
             }
+        }
+        for host in &declaration.hosts {
+            require_cmdline_safe_host_name(&host.name)?;
         }
         Ok(Self {
             declaration,

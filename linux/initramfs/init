@@ -250,6 +250,67 @@ configure_fabric_ports_from_cmdline() {
 configure_fabric_ports_from_cmdline >/dev/console 2>&1 || true
 # --- END vz.net fabric ports ---
 
+# --- BEGIN vz.host endpoint names (extracted verbatim by vz-linux tests) ---
+# Resolve every declared Environment endpoint name to its owning Machine's
+# fabric address.
+#
+# Each `vz.host.{N}={ipv4},{name}` is one declared endpoint, already resolved on
+# the host from the same persisted records the addresses above come from, and
+# already scoped to the networks this Machine holds a port on. Resolution is all
+# this is: nothing here binds a listener, probes the port or waits for one, so a
+# name appearing below is not evidence that anything answers on it.
+#
+# It is a file and not a resolver because a fabric address is derived rather
+# than leased and therefore never changes while the Machine lives, so there is
+# nothing for a resolver to be authoritative about that the cmdline does not
+# already state. The same reasoning makes it reboot-only, exactly like the port
+# configuration above.
+fabric_hosts_are_declared() {
+  for fhd_param in $(/bin/busybox cat /proc/cmdline); do
+    case "$fhd_param" in
+      vz.host.*=*) return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# `$1` is a root *prefix*, not a directory to descend into: the empty string
+# writes this initramfs' own /etc/hosts and "$ROOTFS" writes the overlay root
+# the guest agent is later chroot'd into. Both are written, because which of
+# them the Machine ends up running in is decided after this point.
+write_fabric_hosts() {
+  wfh_root="$1"
+  # A Machine with no declared endpoint keeps whatever /etc/hosts its image
+  # shipped. Truncating that to a generated file would be a regression for
+  # every Machine that declares no endpoint at all, which is most of them.
+  fabric_hosts_are_declared || return 0
+  {
+    echo "127.0.0.1 localhost"
+    echo "::1 localhost"
+  } > "$wfh_root/etc/hosts" || return 1
+  for wfh_param in $(/bin/busybox cat /proc/cmdline); do
+    case "$wfh_param" in
+      vz.host.*=*)
+        wfh_value="${wfh_param#*=}"
+        case "$wfh_value" in
+          *,*) ;;
+          # Malformed rather than merely unmatched: emitting the two halves of
+          # a value that has no comma would write a line naming an address that
+          # is also its own hostname, which resolves and resolves wrongly.
+          *) echo "[vz-init] ignoring malformed $wfh_param"; continue ;;
+        esac
+        echo "${wfh_value%%,*} ${wfh_value#*,}" >> "$wfh_root/etc/hosts" || return 1
+        ;;
+    esac
+  done
+  echo "[vz-init] declared endpoint names resolved in $wfh_root/etc/hosts"
+  return 0
+}
+
+write_fabric_hosts "" >/dev/console 2>&1 || \
+  echo "[vz-init] warning: could not write endpoint names into /etc/hosts" >/dev/console 2>&1
+# --- END vz.host endpoint names ---
+
 switch_root_into_overlay_rootfs() {
   echo "[vz-init] preparing overlay rootfs"
 
@@ -291,6 +352,20 @@ switch_root_into_overlay_rootfs() {
   fi
   cp /etc/udhcpc.script "$ROOTFS/etc/udhcpc.script" || return 1
   /bin/busybox chmod +x "$ROOTFS/etc/udhcpc.script" || return 1
+
+  # The Machine's own /etc/hosts, in the root it will actually run in. This is
+  # the same write as the one above the switch_root and not a copy of its
+  # result, so the overlay root's file does not depend on the initramfs write
+  # having succeeded. It is written from here rather than by the guest agent
+  # because it must already be true when the agent starts: the agent is what
+  # `vz exec` runs through, so a name it populated after coming up would be
+  # unresolvable for exactly the first commands anyone runs. Writing into
+  # "$ROOTFS/etc" from the initramfs is the same move the resolv.conf copy
+  # above makes and works for the same reason — this is a plain write into the
+  # overlay's upperdir from the mount namespace that then chroots, with no
+  # VirtioFS layer and no pivot_root between the write and the reader.
+  write_fabric_hosts "$ROOTFS" || \
+    echo "[vz-init] warning: could not write endpoint names into $ROOTFS/etc/hosts"
 
   install_youki_binary "$ROOTFS/usr/local/bin/youki" || return 1
   install_youki_binary "$ROOTFS/run/vz-oci/bin/youki" || return 1

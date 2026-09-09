@@ -208,6 +208,7 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         prefix: 24,
         gateway: None,
         mtu: 1500,
+        hosts: Vec::new(),
     }];
     assert!(
         require_matching_shared_vm_boot_request(
@@ -330,6 +331,7 @@ fn declared_attachment() -> crate::config::DeclaredAttachment {
         prefix: 24,
         gateway: None,
         mtu: 1500,
+        hosts: Vec::new(),
     }
 }
 
@@ -492,6 +494,144 @@ fn every_port_a_machine_boots_with_reaches_its_cmdline_in_nic_order() {
     // A Machine with no declared attachment must contribute nothing at all,
     // not a stray separator the kernel would have to tolerate.
     assert_eq!(crate::config::fabric_cmdline_suffix(&[]), "");
+}
+
+fn declared_host(name: &str, last_octet: u8) -> crate::config::DeclaredHost {
+    crate::config::DeclaredHost {
+        name: name.to_string(),
+        address: std::net::Ipv4Addr::new(10, 4, 7, last_octet),
+    }
+}
+
+#[test]
+fn every_declared_endpoint_name_reaches_the_cmdline_numbered_across_the_whole_machine() {
+    // The exact string is the other half of the contract with
+    // `linux/initramfs/init`, which splits each value on `,` into the address
+    // and then the name. The guest writes one `/etc/hosts` for the Machine, so
+    // the numbering runs across every port rather than restarting per port; two
+    // ports that both emitted `vz.host.0` would silently lose a name.
+    assert_eq!(
+        crate::config::fabric_cmdline_suffix(&[
+            crate::config::DeclaredAttachment {
+                hosts: vec![declared_host("api", 3), declared_host("db.internal", 4)],
+                ..declared_attachment()
+            },
+            crate::config::DeclaredAttachment {
+                network_id: "net-backend".to_string(),
+                mac: "02:11:22:33:44:56".to_string(),
+                hosts: vec![declared_host("cache", 5)],
+                ..declared_attachment()
+            },
+        ]),
+        concat!(
+            " vz.net.0=02:11:22:33:44:55,10.4.7.2/24",
+            " vz.net.1=02:11:22:33:44:56,10.4.7.2/24",
+            " vz.host.0=10.4.7.3,api",
+            " vz.host.1=10.4.7.4,db.internal",
+            " vz.host.2=10.4.7.5,cache",
+        )
+    );
+    // A Machine whose ports declare no endpoint contributes no `vz.host.`
+    // argument, so the guest leaves the image's own `/etc/hosts` alone.
+    assert!(
+        !crate::config::fabric_cmdline_suffix(&[declared_attachment()]).contains("vz.host."),
+        "a port with no endpoint must emit no name argument"
+    );
+}
+
+#[test]
+fn an_attachment_refuses_an_endpoint_name_the_cmdline_could_not_carry_intact() {
+    // Endpoint names originate in a project definition, so unlike an address
+    // derived from persisted identifiers they are attacker-influenced, and they
+    // are rendered into a whitespace-separated cmdline the guest re-splits on
+    // whitespace. A name holding a space is not a broken hostname; it is an
+    // extra kernel parameter of the author's choosing.
+    let socket = || std::os::unix::net::UnixDatagram::unbound().unwrap().into();
+    let refuse = |name: &str| {
+        let error = crate::config::SharedVmAttachment::new(
+            crate::config::DeclaredAttachment {
+                hosts: vec![crate::config::DeclaredHost {
+                    name: name.to_string(),
+                    address: std::net::Ipv4Addr::new(10, 4, 7, 3),
+                }],
+                ..declared_attachment()
+            },
+            socket(),
+        )
+        .expect_err("an unsafe endpoint name must be refused before a VM exists");
+        assert!(
+            error.to_string().contains("endpoint name"),
+            "expected an endpoint-name refusal in: {error}"
+        );
+    };
+    refuse("");
+    // Injection: each of these ends the name and begins something else.
+    refuse("api root=/dev/sda");
+    refuse("api\tdb");
+    refuse("api\nvz.host.9=10.0.0.1,evil");
+    // `#` would comment out the rest of the `/etc/hosts` line.
+    refuse("api#db");
+    // A comma would re-split the value the guest reads.
+    refuse("api,10.0.0.1");
+    refuse(&"a".repeat(254));
+    refuse("-api");
+    refuse(".api");
+    refuse("api.");
+
+    for accepted in ["api", "db.internal", "web-1", "svc_a", "a"] {
+        crate::config::SharedVmAttachment::new(
+            crate::config::DeclaredAttachment {
+                hosts: vec![crate::config::DeclaredHost {
+                    name: accepted.to_string(),
+                    address: std::net::Ipv4Addr::new(10, 4, 7, 3),
+                }],
+                ..declared_attachment()
+            },
+            socket(),
+        )
+        .expect("an ordinary endpoint name must be accepted");
+    }
+}
+
+#[test]
+fn a_reused_boot_whose_endpoint_names_have_changed_is_refused_as_drift() {
+    // Names are configured from the cmdline and are therefore reboot-only. A
+    // reuse that silently kept the old table would leave the Machine resolving
+    // a name its Environment no longer declares, with nothing to say so.
+    let ports = Vec::new();
+    let resources = vz_runtime_contract::StackResourceHint::default();
+    let with = |hosts: Vec<crate::config::DeclaredHost>| {
+        vec![crate::config::DeclaredAttachment {
+            hosts,
+            ..declared_attachment()
+        }]
+    };
+    let before = with(vec![declared_host("api", 3)]);
+    let after = with(vec![declared_host("api", 4)]);
+    let renamed = with(vec![declared_host("gateway", 3)]);
+
+    require_matching_shared_vm_boot_request(
+        "machine-a",
+        &ports,
+        &before,
+        &resources,
+        &ports,
+        &before,
+        &resources,
+    )
+    .expect("an unchanged endpoint table is the same boot request");
+    for drifted in [&after, &renamed, &with(Vec::new())] {
+        require_matching_shared_vm_boot_request(
+            "machine-a",
+            &ports,
+            &before,
+            &resources,
+            &ports,
+            drifted,
+            &resources,
+        )
+        .expect_err("a changed endpoint table is a different boot request");
+    }
 }
 
 #[tokio::test]

@@ -638,20 +638,203 @@ mod tests {
     /// paths are rewritten, so what runs below is the shell the guest runs and
     /// not a restatement of it.
     fn relocated_fabric_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
+        relocated_init_block(
+            root,
+            busybox,
+            "# --- BEGIN vz.net fabric ports (extracted verbatim by vz-linux tests) ---",
+            "# --- END vz.net fabric ports ---",
+        )
+    }
+
+    /// One marked block of the guest init script, relocated so it can run on
+    /// this host against a fixture instead of a booted guest.
+    fn relocated_init_block(
+        root: &std::path::Path,
+        busybox: &std::path::Path,
+        begin: &str,
+        end: &str,
+    ) -> String {
         let source = initramfs_init_source();
         let (_, rest) = source
-            .split_once(
-                "# --- BEGIN vz.net fabric ports (extracted verbatim by vz-linux tests) ---",
-            )
-            .expect("the initramfs init script carries the vz.net block markers");
+            .split_once(begin)
+            .expect("the initramfs init script carries the block's begin marker");
         let (block, _) = rest
-            .split_once("# --- END vz.net fabric ports ---")
-            .expect("the vz.net block is closed");
+            .split_once(end)
+            .expect("the block is closed by its end marker");
         block
             .replace("/bin/busybox", &busybox.display().to_string())
             .replace("/sys/class/net", &root.join("net").display().to_string())
             .replace("/proc/cmdline", &root.join("cmdline").display().to_string())
             .replace("/dev/console", &root.join("console").display().to_string())
+    }
+
+    /// The `vz.host.N` block, which resolves declared endpoint names.
+    fn relocated_hosts_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
+        relocated_init_block(
+            root,
+            busybox,
+            "# --- BEGIN vz.host endpoint names (extracted verbatim by vz-linux tests) ---",
+            "# --- END vz.host endpoint names ---",
+        )
+    }
+
+    /// A BusyBox stub that fails the run on any applet beyond `cat`.
+    ///
+    /// The guest BusyBox is not guaranteed to carry more than the Makefile's
+    /// applet list, and a missing applet in a booted guest is a silent
+    /// unresolvable name rather than a loud failure, so reaching for one here
+    /// has to be an error at this level instead.
+    fn cat_only_busybox(root: &std::path::Path) -> std::path::PathBuf {
+        let busybox = root.join("busybox");
+        fs::write(
+            &busybox,
+            "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+             cat) exec /bin/cat \"$@\" ;;\n\
+             *) echo \"unexpected applet: $applet\" >&2; exit 127 ;;\nesac\n",
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+        busybox
+    }
+
+    /// Run the endpoint-name block against `cmdline`, with the roots it should
+    /// write into already carrying an `etc` directory.
+    ///
+    /// The block's own trailing invocation writes the initramfs root, so the
+    /// harness adds only the second call the real script makes from inside
+    /// `switch_root_into_overlay_rootfs`. That the initramfs write happens at
+    /// all is therefore part of what this exercises rather than something the
+    /// harness supplies.
+    fn run_hosts_block(cmdline: &str, overlay: &str) -> (tempfile::TempDir, String) {
+        let fixture = tempfile::Builder::new()
+            .prefix("vz-endpoint-hosts-")
+            .tempdir()
+            .expect("temp root");
+        let root = fixture.path().to_path_buf();
+        fs::create_dir_all(root.join("etc")).expect("initramfs etc");
+        fs::create_dir_all(root.join(overlay).join("etc")).expect("overlay etc");
+        fs::write(root.join("cmdline"), cmdline).expect("fake cmdline");
+        let busybox = cat_only_busybox(&root);
+
+        let mut script = relocated_hosts_block(&root, &busybox);
+        // `""` is the initramfs root prefix in the real script; here the
+        // fixture root stands in for `/`.
+        script = script.replace(
+            "write_fabric_hosts \"\"",
+            &format!("write_fabric_hosts \"{}\"", root.display()),
+        );
+        script.push_str(&format!(
+            "\nwrite_fabric_hosts \"{}\"\n",
+            root.join(overlay).display()
+        ));
+        let script_path = root.join("hosts.sh");
+        fs::write(&script_path, script).expect("write harness script");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script_path)
+            .output()
+            .expect("run the guest endpoint-name block");
+        assert!(
+            output.status.success(),
+            "guest endpoint-name block failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+        (fixture, console)
+    }
+
+    #[test]
+    fn the_guest_resolves_every_declared_endpoint_name_in_both_roots_it_may_run_in() {
+        // Which root the Machine ends up running in is decided after this block
+        // runs: the overlay root when the VirtioFS rootfs mounted, the
+        // initramfs itself when it did not. A name that resolved in only one of
+        // them would resolve or not depending on a mount the declaration says
+        // nothing about, so both are written.
+        let (fixture, console) = run_hosts_block(
+            "console=hvc0 vz.mount.0=/workspace \
+             vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24 \
+             vz.host.0=10.9.0.7,api vz.host.1=10.9.0.5,db.internal\n",
+            "merged",
+        );
+
+        let root = fixture.path();
+        let expected = "127.0.0.1 localhost\n::1 localhost\n10.9.0.7 api\n10.9.0.5 db.internal\n";
+        assert_eq!(
+            fs::read_to_string(root.join("etc/hosts")).expect("initramfs /etc/hosts"),
+            expected,
+            "console: {console}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("merged/etc/hosts")).expect("overlay /etc/hosts"),
+            expected,
+            "console: {console}"
+        );
+        // Localhost survives. The file is generated rather than appended to, so
+        // if the standard entries were not emitted here nothing else would put
+        // them back and the Machine would lose `localhost`.
+        assert!(expected.contains("127.0.0.1 localhost"));
+    }
+
+    #[test]
+    fn a_machine_that_declares_no_endpoint_keeps_the_hosts_file_its_image_shipped() {
+        // Most Machines declare no endpoint. Truncating their `/etc/hosts` to a
+        // generated file would be a regression for every one of them, and the
+        // image's own entries are not this block's to discard.
+        let (fixture, console) = run_hosts_block(
+            "console=hvc0 vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24\n",
+            "merged",
+        );
+        let root = fixture.path();
+        assert!(
+            !root.join("etc/hosts").exists(),
+            "no endpoint was declared, so nothing should have been written: {console}"
+        );
+        assert!(
+            !root.join("merged/etc/hosts").exists(),
+            "console: {console}"
+        );
+    }
+
+    #[test]
+    fn a_malformed_endpoint_argument_is_reported_and_does_not_cost_the_others() {
+        // A value with no comma would otherwise write its own half as both the
+        // address and the name, which resolves — wrongly — instead of failing.
+        let (fixture, console) = run_hosts_block(
+            "vz.host.0=10.9.0.7,api vz.host.1=nonsense vz.host.2=10.9.0.9,cache\n",
+            "merged",
+        );
+        let root = fixture.path();
+        assert!(
+            console.contains("ignoring malformed vz.host.1=nonsense"),
+            "the malformed argument must say so: {console}"
+        );
+        assert_eq!(
+            fs::read_to_string(root.join("etc/hosts")).expect("initramfs /etc/hosts"),
+            "127.0.0.1 localhost\n::1 localhost\n10.9.0.7 api\n10.9.0.9 cache\n",
+            "console: {console}"
+        );
+    }
+
+    #[test]
+    fn the_overlay_root_is_written_by_the_init_script_and_not_only_by_the_harness() {
+        // The second call happens outside the extracted markers, so the block
+        // test above cannot prove the real script makes it. This does: without
+        // this line the overlay root — the one the guest agent is chroot'd into,
+        // and therefore the one every `vz exec` resolves against — would keep
+        // whatever `/etc/hosts` the image shipped.
+        let script = initramfs_init_source();
+        let (_, after) = script
+            .split_once("switch_root_into_overlay_rootfs() {")
+            .expect("the overlay switch_root function exists");
+        assert!(
+            after.contains("write_fabric_hosts \"$ROOTFS\""),
+            "switch_root_into_overlay_rootfs must write the Machine's endpoint names into the root it chroots into"
+        );
     }
 
     #[test]

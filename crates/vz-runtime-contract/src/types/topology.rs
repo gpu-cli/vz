@@ -645,6 +645,23 @@ pub struct EndpointInstance {
     pub hostname: Option<String>,
 }
 
+impl EndpointInstance {
+    /// The name this endpoint resolves under inside its Environment.
+    ///
+    /// An absent `hostname` is not "no name": an endpoint exists to be reached
+    /// by name, so the declaration that omits one is asking for the obvious
+    /// default rather than opting out, and the endpoint's own `name` is the
+    /// only identifier the declaration already carries. Resolution reads this
+    /// and never the two fields directly, so the default cannot be applied in
+    /// one place and forgotten in another.
+    pub fn resolved_hostname(&self) -> &str {
+        match self.hostname.as_deref() {
+            Some(hostname) => hostname,
+            None => self.name.as_str(),
+        }
+    }
+}
+
 /// Persisted attachment of one Machine to one Environment network.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct NetworkAttachmentInstance {
@@ -8143,6 +8160,40 @@ mod tests {
         let round_trip: NetworkInstance =
             serde_json::from_str(&serde_json::to_string(network).unwrap()).unwrap();
         assert_eq!(&round_trip, network);
+    }
+
+    #[test]
+    fn an_endpoint_resolves_under_its_declared_hostname_or_else_its_own_name() {
+        let definition = network_topology_definition();
+        let environment = definition.instantiate_environment("agent", 7).unwrap();
+        let endpoint = &environment.endpoints[0];
+
+        // A declared hostname is used verbatim and the endpoint's own name is
+        // not: the two are different fields precisely so a service can be named
+        // one thing in the definition and reached as another.
+        assert_eq!(endpoint.hostname.as_deref(), Some("api.shop.test"));
+        assert_ne!(endpoint.resolved_hostname(), endpoint.name);
+        assert_eq!(endpoint.resolved_hostname(), "api.shop.test");
+
+        // Absent is not "no name". An endpoint exists to be reached by name, so
+        // omitting the hostname asks for the obvious default rather than opting
+        // out, and the endpoint's own name is the only identifier already there.
+        let mut unnamed = definition.clone();
+        unnamed.environment.endpoints[0].hostname = None;
+        let unnamed = unnamed.instantiate_environment("agent", 7).unwrap();
+        assert_eq!(unnamed.endpoints[0].resolved_hostname(), "api");
+        assert_eq!(
+            unnamed.endpoints[0].resolved_hostname(),
+            unnamed.endpoints[0].name
+        );
+
+        // The rule is stated once, on the persisted record resolution reads, and
+        // reaches the declaration surface only because instantiation carries
+        // both fields across verbatim. If it stopped doing so the default would
+        // be applied to a name the definition never asked for.
+        let declared = &definition.environment.endpoints[0];
+        assert_eq!(environment.endpoints[0].name, declared.name);
+        assert_eq!(environment.endpoints[0].hostname, declared.hostname);
     }
 
     #[test]

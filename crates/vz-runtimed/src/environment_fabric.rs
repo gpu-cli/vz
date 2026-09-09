@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use tracing::info;
-use vz_oci_macos::{DeclaredAttachment, SharedVmAttachment};
+use vz_oci_macos::{DeclaredAttachment, DeclaredHost, SharedVmAttachment};
 use vz_runtime_contract::{EnvironmentInstance, MachineId, ResourceOwner};
 
 use crate::RuntimeDaemon;
@@ -162,6 +162,16 @@ impl RuntimeDaemon {
                         // one answers on would be worse than no route at all.
                         gateway: None,
                         mtu: FABRIC_MTU,
+                        // Every Machine on this network gets the same table,
+                        // including the Machine that owns an endpoint: a service
+                        // that reaches a sibling by its declared name must be
+                        // able to reach itself by its own, or the name would
+                        // mean one thing from outside and nothing from inside.
+                        hosts: network
+                            .hosts()
+                            .into_iter()
+                            .map(|(name, address)| DeclaredHost { name, address })
+                            .collect(),
                     },
                     socket,
                 )

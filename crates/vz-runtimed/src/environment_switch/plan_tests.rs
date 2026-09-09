@@ -501,3 +501,247 @@ fn a_declared_network_with_no_attachment_still_gets_a_switch() {
     assert_eq!(plan.networks.len(), 1);
     assert!(plan.networks[0].ports.is_empty());
 }
+
+// --- Endpoint name resolution -------------------------------------------
+//
+// An endpoint is declaration and resolution only. Every test below asks which
+// name resolves to which address and from where; none asserts that anything is
+// listening, because nothing in this path binds, probes or waits.
+
+fn endpoint_id(suffix: u32) -> vz_runtime_contract::EndpointId {
+    vz_runtime_contract::EndpointId::new(format!("ept_{suffix:032x}")).unwrap()
+}
+
+fn endpoint(
+    id: u32,
+    name: &str,
+    hostname: Option<&str>,
+    machine: u8,
+    network: u8,
+) -> vz_runtime_contract::EndpointInstance {
+    vz_runtime_contract::EndpointInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        endpoint_id: endpoint_id(id),
+        environment_id: environment_id(),
+        machine_id: machine_id(machine),
+        network_id: network_id(network),
+        name: name.to_string(),
+        protocol: vz_runtime_contract::EndpointProtocol::Tcp,
+        port: 5432,
+        hostname: hostname.map(str::to_string),
+    }
+}
+
+/// Every name that resolves on every network, as `network:name=address`.
+fn resolved(plan: &FabricPlan) -> Vec<String> {
+    plan.networks
+        .iter()
+        .flat_map(|network| {
+            network
+                .hosts()
+                .into_iter()
+                .map(move |(name, address)| format!("{}:{name}={address}", network.name))
+        })
+        .collect()
+}
+
+#[test]
+fn a_declared_endpoint_resolves_to_the_fabric_address_of_the_machine_that_owns_it() {
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "api", Some("api.internal"), 2, 1)];
+    let plan = plan_environment_fabric(&environment).unwrap();
+
+    // The address is the one the owning Machine's port already holds, read out
+    // of the plan rather than derived a second time. If resolution ever grew a
+    // derivation of its own the two would drift and the name would answer with
+    // an address the switch does not forward to.
+    let owner = plan.networks[0]
+        .ports
+        .iter()
+        .find(|port| port.machine_id == machine_id(2))
+        .expect("the owning Machine holds a port");
+    assert_eq!(
+        resolved(&plan),
+        vec![format!("network-1:api.internal={}", owner.address)]
+    );
+}
+
+#[test]
+fn an_endpoint_that_declares_no_hostname_resolves_under_its_own_name() {
+    // The default is the endpoint's name and not, say, the Machine's: the
+    // declaration named the endpoint, so that is the identifier it already
+    // asked to be known by.
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "postgres", None, 1, 1)];
+    let plan = plan_environment_fabric(&environment).unwrap();
+    let owner = plan.networks[0]
+        .ports
+        .iter()
+        .find(|port| port.machine_id == machine_id(1))
+        .expect("the owning Machine holds a port");
+    assert_eq!(
+        resolved(&plan),
+        vec![format!("network-1:postgres={}", owner.address)]
+    );
+}
+
+#[test]
+fn a_declared_hostname_is_used_verbatim_and_the_endpoint_name_is_not() {
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "postgres", Some("db"), 1, 1)];
+    let plan = plan_environment_fabric(&environment).unwrap();
+    let names: Vec<&str> = plan.networks[0]
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["db"]);
+}
+
+#[test]
+fn every_machine_on_the_network_resolves_the_name_including_the_one_that_owns_it() {
+    // The table is the network's, not the caller's: a service that reaches a
+    // sibling by name must reach itself by its own name too, or the name would
+    // mean one thing from outside the Machine and nothing from inside it.
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "api", None, 2, 1)];
+    let plan = plan_environment_fabric(&environment).unwrap();
+    assert_eq!(plan.networks[0].ports.len(), 2);
+    assert_eq!(plan.networks[0].endpoints.len(), 1);
+}
+
+#[test]
+fn a_name_is_published_only_to_the_network_it_was_declared_on() {
+    // A Machine with no port on the endpoint's network cannot route to its
+    // address at all. Publishing the name there would turn a clear "unknown
+    // host" into a connection that hangs, which is strictly worse.
+    let environment = {
+        let mut environment = environment(
+            vec![machine(1), machine(2), machine(3)],
+            vec![
+                network(1, NetworkKind::Private, Some("10.42.0.0/24")),
+                network(2, NetworkKind::Private, Some("10.43.0.0/24")),
+            ],
+            vec![
+                attachment(1, 1, 1),
+                attachment(2, 2, 1),
+                attachment(3, 3, 2),
+            ],
+        );
+        // One endpoint on each network, so this catches a resolution that
+        // published Environment-wide *and* one that always attributed a name to
+        // whichever network happened to be planned first.
+        environment.endpoints = vec![
+            endpoint(1, "api", None, 2, 1),
+            endpoint(2, "worker", None, 3, 2),
+        ];
+        environment
+    };
+    let plan = plan_environment_fabric(&environment).unwrap();
+    let by_name: BTreeMap<&str, Vec<&str>> = plan
+        .networks
+        .iter()
+        .map(|network| {
+            (
+                network.name.as_str(),
+                network
+                    .endpoints
+                    .iter()
+                    .map(|endpoint| endpoint.name.as_str())
+                    .collect(),
+            )
+        })
+        .collect();
+    assert_eq!(by_name["network-1"], vec!["api"]);
+    assert_eq!(by_name["network-2"], vec!["worker"]);
+}
+
+#[test]
+fn an_endpoint_whose_machine_holds_no_port_on_its_network_is_refused() {
+    // Not given an address of its own: minting one here would put a Machine on
+    // a network its declaration never attached it to.
+    let mut environment = pair_on_one_network();
+    environment.machines.push(machine(3));
+    environment.endpoints = vec![endpoint(1, "api", None, 3, 1)];
+    assert_eq!(
+        plan_environment_fabric(&environment),
+        Err(FabricPlanError::UnattachedEndpoint {
+            endpoint: "api".to_string(),
+            network: "network-1".to_string(),
+        })
+    );
+}
+
+#[test]
+fn an_endpoint_naming_a_network_or_machine_the_environment_does_not_have_is_refused() {
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "api", None, 2, 9)];
+    assert_eq!(
+        plan_environment_fabric(&environment),
+        Err(FabricPlanError::DanglingEndpoint {
+            endpoint: "api".to_string(),
+            kind: "network",
+            id: network_id(9).to_string(),
+        })
+    );
+
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![endpoint(1, "api", None, 9, 1)];
+    assert_eq!(
+        plan_environment_fabric(&environment),
+        Err(FabricPlanError::DanglingEndpoint {
+            endpoint: "api".to_string(),
+            kind: "Machine",
+            id: machine_id(9).to_string(),
+        })
+    );
+}
+
+#[test]
+fn two_endpoints_that_resolve_one_name_are_refused_rather_than_ordered() {
+    // Whichever `/etc/hosts` line a resolver read first would decide which
+    // Machine the name meant, and the declaration said nothing about which.
+    let mut environment = pair_on_one_network();
+    environment.endpoints = vec![
+        endpoint(1, "api", None, 1, 1),
+        endpoint(2, "other", Some("api"), 2, 1),
+    ];
+    assert_eq!(
+        plan_environment_fabric(&environment),
+        Err(FabricPlanError::AmbiguousEndpointName {
+            name: "api".to_string(),
+            first: "api".to_string(),
+            second: "other".to_string(),
+        })
+    );
+}
+
+#[test]
+fn resolution_depends_only_on_persisted_records_and_not_on_declaration_order() {
+    let mut forward = pair_on_one_network();
+    forward.endpoints = vec![
+        endpoint(1, "api", None, 1, 1),
+        endpoint(2, "db", None, 2, 1),
+        endpoint(3, "cache", None, 1, 1),
+    ];
+    let mut reversed = forward.clone();
+    reversed.endpoints.reverse();
+    assert_eq!(
+        resolved(&plan_environment_fabric(&forward).unwrap()),
+        resolved(&plan_environment_fabric(&reversed).unwrap()),
+    );
+    // And the published order is the resolved name's, not the declaration's.
+    let plan = plan_environment_fabric(&forward).unwrap();
+    let names: Vec<&str> = plan.networks[0]
+        .endpoints
+        .iter()
+        .map(|endpoint| endpoint.name.as_str())
+        .collect();
+    assert_eq!(names, vec!["api", "cache", "db"]);
+}
+
+#[test]
+fn an_environment_that_declares_no_endpoint_resolves_no_name() {
+    let plan = plan_environment_fabric(&pair_on_one_network()).unwrap();
+    assert!(resolved(&plan).is_empty());
+}
