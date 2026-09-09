@@ -314,16 +314,23 @@ guest-agent:
 		cd "$(CRATES_DIR)" && cargo build --release -p vz-guest-agent --target "$(GUEST_AGENT_TARGET)"; \
 	fi
 
+# Unlike the agent, this binary compiles C (ring's assembly), so it is the first
+# thing here to consult `CROSS_COMPILE`. The Docker builder passes an EMPTY
+# `CROSS_COMPILE` on make's command line for the kernel, which make exports into
+# every recipe, and cc-rs turns an empty prefix into the tool name `-gcc`.
+# Clearing it for this invocation is not a workaround for cc-rs: a Rust target
+# triple already says which toolchain to use, and the kernel's prefix has no
+# business reaching cargo at all.
 guest-fetch:
 	@test "$(KERNEL_PROFILE)" = developer || { echo 'the HTTPS client belongs only to Developer images' >&2; exit 1; }
 	@echo "Building vz-guest-fetch for $(GUEST_AGENT_TARGET)"
 	@if [[ "$(GUEST_AGENT_BUILD_TOOL)" == "zigbuild" ]]; then \
-		cd "$(CRATES_DIR)" && cargo zigbuild --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
+		cd "$(CRATES_DIR)" && env -u CROSS_COMPILE cargo zigbuild --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
 	else \
 		if ! rustup target list --installed | grep -q "^$(GUEST_AGENT_TARGET)$$"; then \
 			rustup target add "$(GUEST_AGENT_TARGET)"; \
 		fi; \
-		cd "$(CRATES_DIR)" && cargo build --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
+		cd "$(CRATES_DIR)" && env -u CROSS_COMPILE cargo build --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
 	fi
 	@ELF_PROGRAM_HEADERS="$$(file "$(GUEST_FETCH_BINARY)")"; \
 	if [[ "$$ELF_PROGRAM_HEADERS" != *"statically linked"* ]]; then \
