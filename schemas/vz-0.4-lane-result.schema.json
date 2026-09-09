@@ -25,6 +25,7 @@
     "run_id",
     "scenarios",
     "schema_version",
+    "source_tree",
     "test_case_retries"
   ],
   "properties": {
@@ -437,6 +438,61 @@
           }
         }
       ]
+    },
+    "source_tree": {
+      "type": "object",
+      "description": "The source tree this lane invocation actually read. `frozen` says whether it was a per-run frozen worktree (scripts/helpers/frozen_tree.py) rather than the working checkout; `commit`, `git_tree` and `tree_sha256` name it in the sense scripts/helpers/vz04_source_tree.py defines for the release manifest. All-zero digests mean the tree could not be described, never that it was clean.",
+      "additionalProperties": false,
+      "required": [
+        "frozen",
+        "root",
+        "live_root",
+        "commit",
+        "git_tree",
+        "tree_sha256",
+        "tracked_file_count",
+        "tracked_changes",
+        "tracked_change_count"
+      ],
+      "properties": {
+        "frozen": {
+          "type": "boolean"
+        },
+        "root": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "live_root": {
+          "type": "string",
+          "pattern": "^/"
+        },
+        "commit": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "git_tree": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{40}$"
+        },
+        "tree_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "tracked_file_count": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "tracked_changes": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          }
+        },
+        "tracked_change_count": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
     }
   },
   "allOf": [

@@ -54,6 +54,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import frozen_tree  # noqa: E402
 from vz04_common import (CONFIG_FILES, GateError, LANE_PHASES, digest_file, read_regular,  # noqa: E402
                          tree_digest)
 
@@ -269,7 +270,7 @@ def build_result(args) -> dict:
               "candidate_tuple_sha256": identity["candidate_tuple_sha256"], "release_dir_sha256": identity["release_dir_sha256"],
               "fixture_sha256": identity["fixture_sha256"], "contract_sha256": identity["contract_sha256"],
               "entry_point": {"path": ENTRY_POINT, "sha256": entry_sha256, "argv": list(args.script_argv)},
-              "outcome": outcome, "failure": failure, "scenarios": [], "test_case_retries": 0,
+              "source_tree": frozen_tree.record(repo_root), "outcome": outcome, "failure": failure, "scenarios": [], "test_case_retries": 0,
               "process_starts": parse_process_starts(run_dir), "prohibited_observed": prohibited_observed(run_dir, summary),
               "leaks": [], "cleanup_errors": [], "handoff": {"produced": None, "consumed": None, "consumed_sha256": None},
               "retained_root": str(run_dir) if run_dir else None, "evidence_files": collect_evidence(run_dir, evidence_dir),

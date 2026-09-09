@@ -14,6 +14,9 @@ for arg in "$@"; do
       ;;
   esac
 done
+# Same freeze as the composed entry point: the harness reads a private frozen
+# worktree, not this checkout, so a merge during a run cannot trip source pinning.
 exec uv run --no-project --python /usr/bin/python3 \
   --with-requirements "$script_dir/helpers/registry-requirements.txt" \
-  python -B "$script_dir/helpers/linux_docker_e2e.py" --suite registry "$@"
+  python -B "$script_dir/helpers/frozen_tree.py" \
+  --entry scripts/helpers/linux_docker_e2e.py -- --suite registry "$@"

@@ -24,6 +24,7 @@ import time
 import uuid
 
 import docker_host_driver as driver
+import frozen_tree
 import installed_developer_startup as startup
 import linux_docker_engine_probe as engine_probe
 import linux_docker_lane_result as lane_result
@@ -176,7 +177,11 @@ def preflight(args, require_host=True):
         # Say it in the scope itself: a reduced selection cannot prove the
         # isolation family, so its evidence can never read as gate evidence.
         scope = "DEV_LOOP_" + str(machines) + "_MACHINE_" + scope
+    # Which tree this run actually read. The entry point runs the harness from a
+    # frozen worktree, so this is not the working checkout and cannot be assumed
+    # to be: it names the commit and the exact tracked bytes the pins bind.
     info.update(scope=scope, suite=args.suite, machines=machines,
+                source_tree=frozen_tree.record(REPO),
                 run_id=args.run_id, fixture=str(fixture),
                 fixture_sha256=driver.tree_digest(fixture), python_image=pin, image_input=str(pin_path),
                 public_ca=ca_pin)

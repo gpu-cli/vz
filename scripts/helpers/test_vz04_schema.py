@@ -5,6 +5,7 @@ import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import frozen_tree  # noqa: E402
 import vz04_common as common  # noqa: E402
 import vz04_schema as schema  # noqa: E402
 
@@ -13,7 +14,8 @@ def _lane_result():
     digest = "0" * 64
     return {"schema_version": 1, "kind": "vz-0.4-lane-result", "lane": "topology", "phase": "clean-provision",
             "run_id": "gate-test-run-1", "candidate_tuple_sha256": digest, "release_dir_sha256": digest, "fixture_sha256": digest,
-            "contract_sha256": digest, "entry_point": {"path": "scripts/x.sh", "sha256": digest, "argv": []}, "outcome": "failed",
+            "contract_sha256": digest, "entry_point": {"path": "scripts/x.sh", "sha256": digest, "argv": []},
+            "source_tree": frozen_tree.unknown("/repo"), "outcome": "failed",
             "failure": {"reason": "not_implemented", "detail": "stub", "exit_code": 3}, "scenarios": [], "test_case_retries": 0,
             "process_starts": [], "prohibited_observed": {k: False for k in ("docker_desktop", "host_system_daemon", "runc", "crun",
                                                                             "cargo_run", "path_fallback", "ssh_hosts")},
