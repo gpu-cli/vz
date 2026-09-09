@@ -418,7 +418,12 @@ impl SharedVmAttachment {
     }
 
     /// Consume this attachment into its declaration and its guest end.
-    pub(crate) fn into_parts(self) -> (DeclaredAttachment, std::os::fd::OwnedFd) {
+    ///
+    /// Public because two backends now build NICs from these: the Linux shared
+    /// VM in this crate, and `vz-runtimed`'s native macOS runtime. Taking the
+    /// attachment by value is what keeps that safe — a descriptor handed to a
+    /// VM that is not created must not be usable a second time.
+    pub fn into_parts(self) -> (DeclaredAttachment, std::os::fd::OwnedFd) {
         (self.declaration, self.socket)
     }
 }
