@@ -274,7 +274,7 @@ dry_lanes`.
 
 `.github/workflows/release.yml` builds with `cargo build --locked` and, before
 any `codesign` step, writes `dist/release-manifest-presign.json`: the unsigned
-`shasum -a 256` of the five host binaries and `normalized_content_sha256 =
+`shasum -a 256` of the six host binaries and `normalized_content_sha256 =
 sha256(canonical_json(sorted [[path, unsigned_sha256], …]) + LF)` computed with
 `vz04_source_tree.py canonical-sha256`, the same rule as the release-candidate
 builder. Its scope is the host binaries only (`components_scope:

@@ -12,7 +12,7 @@
 #       [--reuse-guest-bundles <dir>] [--dev-unclean-checkout]
 #
 # Output layout (all files read-only after the manifest is written):
-#   bin/{vz,vz-runtimed,vz-macos-setup,vz-guest-agent,vz-agent-loader}
+#   bin/{vz,vz-runtimed,vz-macos-setup,vz-runtime-probe,vz-guest-agent,vz-agent-loader}
 #   linux/developer/, linux/container/   exact guest bundle file sets
 #   buildkit/                            runtime-free BuildKit archive + builder evidence
 #   machine-target-catalog.json          written by bin/vz-runtimed
@@ -23,12 +23,16 @@
 #   release-manifest.json, release-manifest.sha256, checksums.sha256
 #
 # Component decision (verified against crates/, linux/Makefile, release.yml, install.sh):
-#   * bin/ holds the five darwin-arm64 host executables that release.yml signs and
+#   * bin/ holds the six darwin-arm64 host executables that release.yml signs and
 #     install.sh installs: `vz` and `vz-macos-setup` (package vz-cli), `vz-runtimed`
-#     (package vz-runtimed, Cargo features must be empty), `vz-guest-agent` and
-#     `vz-agent-loader` (their own packages). The macOS builds of the two agent
-#     binaries serve native macOS Machines and are ad-hoc signed without
-#     entitlements, exactly as release.yml does.
+#     (package vz-runtimed, Cargo features must be empty), `vz-runtime-probe`,
+#     `vz-guest-agent` and `vz-agent-loader` (their own packages). The macOS builds
+#     of the two agent binaries serve native macOS Machines and are ad-hoc signed
+#     without entitlements, exactly as release.yml does.
+#   * `vz-runtime-probe` is the typed gRPC half of CLI/API agreement (criterion
+#     15). It must ship, because agreement observed with an unreleased tool says
+#     nothing about the release. It speaks the daemon's channel and never starts
+#     one, so it needs no virtualization entitlement and is ad-hoc signed.
 #   * The Linux guest agent is a cross target that linux/Makefile builds into each
 #     profile's initramfs (`GUEST_AGENT_BINARY` -> initramfs /usr/bin/vz-guest-agent).
 #     It is therefore covered by the guest bundle digests, not shipped in bin/.
@@ -163,8 +167,8 @@ echo "==> building host binaries (cargo --locked --release)"
 export RUSTC_WRAPPER=
 export CC_aarch64_apple_darwin=/usr/bin/clang
 export CXX_aarch64_apple_darwin=/usr/bin/clang++
-HOST_PACKAGES=(vz-cli vz-runtimed vz-guest-agent vz-agent-loader)
-HOST_BINARIES=(vz vz-macos-setup vz-runtimed vz-guest-agent vz-agent-loader)
+HOST_PACKAGES=(vz-cli vz-runtimed vz-runtime-probe vz-guest-agent vz-agent-loader)
+HOST_BINARIES=(vz vz-macos-setup vz-runtimed vz-runtime-probe vz-guest-agent vz-agent-loader)
 cargo_package_args=()
 for package in "${HOST_PACKAGES[@]}"; do cargo_package_args+=(-p "$package"); done
 cargo build --manifest-path "$REPO_ROOT/crates/Cargo.toml" --locked --release \

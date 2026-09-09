@@ -322,6 +322,13 @@ snapshots, faults, and peering are typed API resources; native Docker clients us
 the Docker API. Migration guidance may explain replacements without preserving
 old execution paths.
 
+The release ships `vz-runtime-probe`, a typed client for that channel. It is not
+a second CLI and adds no lifecycle verb: it connects to an existing daemon,
+never spawns one, and prints the daemon's own aggregate and Up event stream as
+JSON. Its purpose is that CLI/API agreement can be observed rather than
+asserted -- comparing `vz status --json` against the CLI's own state store
+would show only that the CLI is self-consistent.
+
 The root Environment API owns topology create/reconcile/get/list/watch/start/
 stop/delete. Child Machine APIs expose get/list/watch/lifecycle/exec and
 capability discovery. Network, Endpoint, Volume, SecretBinding, Fault,

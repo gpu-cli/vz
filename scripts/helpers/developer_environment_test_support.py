@@ -42,9 +42,12 @@ reject() {
   exit 2
 }
 verb=""; sawhelp=0; version=0; all=0; endopts=0; command_tail=""; machine=""; wantmachine=0
+selected=""; wantenv=0
 for arg in "$@"; do
   if [ "$wantmachine" = 1 ]; then machine=$arg; wantmachine=0; continue; fi
+  if [ "$wantenv" = 1 ]; then selected=$arg; wantenv=0; continue; fi
   if [ "$arg" = "--machine" ] && [ "$endopts" != 1 ]; then wantmachine=1; continue; fi
+  if [ "$arg" = "--environment" ] && [ "$endopts" != 1 ]; then wantenv=1; continue; fi
   # Only `exec` takes a command payload after `--`, so a `-c` there is the
   # shell's flag rather than one of this CLI's removed ones. Everywhere else
   # `--` is just a separator and a removed root after it is still rejected.
@@ -127,6 +130,13 @@ if [ -n "$verb" ]; then
   if [ "$verb" = delete ] && [ -f "$topology" ]; then
     rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
   fi
+  # An Environment selector that names nothing is a refusal, not a silent
+  # fallback to the only Environment there is: `--environment <absent>` must
+  # fail the way the installed CLI fails it.
+  if [ -n "$selected" ] && [ "$selected" != default ] && [ -f "$topology" ]; then
+    printf '{"error":{"code":"environment_not_found","message":"no Environment named %s in this project"},"schema_version":1}\n' "$selected" >&2
+    exit 2
+  fi
   if [ "$verb" = status ] && [ -f "$topology" ]; then
     # The real success payload is a pretty-printed document, not one line, and
     # it names its own state source and per-Environment state. Every identity
@@ -202,11 +212,99 @@ cat "$SNAPSHOT_FILE"
 exit 0
 '''
 
+# The typed-channel stand-in. It reads the same persisted topology the fake
+# `vz status` reads and projects it as the daemon's own aggregate -- nested
+# `incarnation`, and no CLI projection code -- so the agreement check compares
+# two spellings of one state exactly as it does against the installed binaries.
+# Deriving any identity differently here makes the check FAIL, which is what
+# keeps it a comparison rather than a formality.
+FAKE_PROBE = r"""#!/bin/sh
+# fake vz-runtime-probe (unit tests only)
+MODE_FILE=__MODE_FILE__
+fmode=""
+[ -f "$MODE_FILE" ] && fmode=$(cat "$MODE_FILE")
+mode=$1; shift
+socket=""; project_id=""; environment="default"
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --socket) socket=$2; shift 2 ;;
+    --project-id) project_id=$2; shift 2 ;;
+    --environment) environment=$2; shift 2 ;;
+    --state-db|--definition|--workspace-root|--timeout-millis|--request-id|--idempotency-key) shift 2 ;;
+    *) printf '{"schema_version":1,"kind":"vz-runtime-probe-error","reason":"invalid_arguments","detail":"unknown option %s"}\n' "$1"; exit 1 ;;
+  esac
+done
+fail() {
+  printf '{"schema_version":1,"kind":"vz-runtime-probe-error","reason":"%s","detail":"%s"}\n' "$1" "$2"
+  exit 1
+}
+topology="$(dirname "$socket")/topology.json"
+[ -f "$topology" ] || fail daemon_unavailable "no daemon state at $topology"
+pid=$(cut -d' ' -f1 < "$topology")
+sfx=$(cut -d' ' -f2 < "$topology")
+names=$(cut -d' ' -f3- < "$topology")
+dg="sha256:$(printf '%s' "$pid" | shasum -a 256 | cut -c1-64)"
+[ -z "$project_id" ] || [ "$project_id" = "$pid" ] || fail get_project_state_failed "no project $project_id"
+# probe_drift makes the typed channel mint an Environment identity the CLI
+# never published. Everything else about the two documents still matches, so a
+# check that passed here would be reading field presence rather than agreement.
+[ "$fmode" = probe_drift ] && sfx="${sfx}drift"
+machines() {
+  sep=""
+  for m in $names; do
+    printf '%s{"schema_version":1,"machine_id":"mch_%s_%s","environment_id":"env_%s","name":"%s",' "$sep" "$sfx" "$m" "$sfx" "$m"
+    printf '"profile":"developer","target":{"os":"linux","arch":"aarch64","image":"vz-linux",'
+    printf '"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},'
+    printf '"requested_capabilities":{"capabilities":["posix_exec","docker_engine"]},'
+    printf '"negotiated_capabilities":{"capabilities":["posix_exec","docker_engine"]},'
+    printf '"backend":"macos_virtualization_linux",'
+    printf '"incarnation":{"schema_version":1,"incarnation_id":"inc_%s_%s","machine_id":"mch_%s_%s","generation":1,"created_at":1},' "$sfx" "$m" "$sfx" "$m"
+    printf '"docker_context":{"owner":{"project_id":"%s","environment_id":"env_%s","machine_id":"mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
+    printf '"name":"vzr1-ctx-%s-%s","endpoint":"unix:///tmp/vz-%s-%s.sock","engine_id":"eng-%s-%s"},' "$sfx" "$m" "$sfx" "$m" "$sfx" "$m"
+    printf '"state":"ready"}'
+    sep=","
+  done
+}
+machine_ids() {
+  sep=""
+  for m in $names; do printf '%s"mch_%s_%s"' "$sep" "$sfx" "$m"; sep=","; done
+}
+if [ "$mode" = state ]; then
+  printf '{"schema_version":1,"kind":"vz-runtime-probe-state","request_id":"req-%s","project":' "$sfx"
+  printf '{"schema_version":1,"definition":{"schema_version":1,"project_id":"%s","name":"vz04-topology-bootstrap"},' "$pid"
+  printf '"environments":[{"schema_version":1,"environment_id":"env_%s","project_id":"%s","name":"%s",' "$sfx" "$pid" "$environment"
+  printf '"definition_digest":"%s","state":"ready","lifecycle_generation":1,"machines":[' "$dg"
+  machines
+  printf ']}]}}\n'
+  exit 0
+fi
+if [ "$mode" = up ]; then
+  admission=$(printf '{"schema_version":1,"project_id":"%s","environment_id":"env_%s","machine_ids":[%s],"definition_digest":"%s","request_id":"req-up-%s","idempotency_key":"key-up-%s","request_hash":"sha256:%s","workspace_key":null,"created_at":1}' "$pid" "$sfx" "$(machine_ids)" "$dg" "$sfx" "$sfx" "$(printf '%064d' 0)")
+  seq=0
+  for phase in admitted preparing ready; do
+    printf '{"schema_version":1,"kind":"vz-runtime-probe-up-event","event":{"schema_version":1,"sequence":%s,"admission":%s,"phase":"%s","operation":null,' "$seq" "$admission" "$phase"
+    if [ "$phase" = ready ]; then
+      printf '"completion":{"schema_version":1,"environment_id":"env_%s","state":"ready"}}}\n' "$sfx"
+    else
+      printf '"completion":null}}\n'
+    fi
+    seq=$((seq + 1))
+  done
+  exit 0
+fi
+fail invalid_arguments "unknown mode $mode"
+"""
+
 CATALOG = {"schema_version": 1, "linux": [
     {"image": "vz-linux-appliance", "version": "0.4.0-fake", "profile": "developer", "bundle_dir": "/nonexistent/developer",
      "digest": "sha256:" + "1" * 64, "channels": []},
     {"image": "vz-linux-appliance", "version": "0.4.0-fake", "profile": "hardened", "bundle_dir": "/nonexistent/container",
      "digest": "sha256:" + "2" * 64, "channels": []}], "macos": []}
+
+
+def fake_probe_script(mode_file: Path) -> str:
+    """The typed stand-in, pointed at the same mode file the fake CLI reads."""
+    return FAKE_PROBE.replace("__MODE_FILE__", json.dumps(str(mode_file)))
 
 
 def fake_vz_script(mode_file: Path, snapshot_file: Path) -> bytes:
@@ -453,13 +551,15 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     (root / "bin/vz").chmod(0o755)
     build_fake_daemon(root / "bin/vz-runtimed")
     (root / "bin/vz-runtimed").chmod(0o755)
+    (root / "bin/vz-runtime-probe").write_text(fake_probe_script(mode_file))
+    (root / "bin/vz-runtime-probe").chmod(0o755)
     # The guest BusyBox stand-in every `vz exec` script addresses.
     (root / "bin/busybox-shim").write_text(BUSYBOX_SHIM)
     (root / "bin/busybox-shim").chmod(0o755)
     catalog = json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n"
     (root / "machine-target-catalog.json").write_bytes(catalog)
     manifest = json.loads(read_regular(root / "release-manifest.json"))
-    for relative in ("bin/vz", "bin/vz-runtimed"):
+    for relative in ("bin/vz", "bin/vz-runtimed", "bin/vz-runtime-probe"):
         manifest["components"][relative]["signed_sha256"] = digest_file(root / relative)
     components = manifest["components"]
     manifest["normalized_content_sha256"] = candidate.line_digest(sorted([p, c["unsigned_sha256"]] for p, c in components.items()))

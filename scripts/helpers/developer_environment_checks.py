@@ -1520,11 +1520,219 @@ def check_status_field_set(ctx: CheckContext, top: str) -> SubCheck:
     return check.finish()
 
 
-def check_grpc_agreement(top: str) -> SubCheck:
+PROBE = "vz-runtime-probe"
+
+
+def probe_documents(receipt) -> list:
+    """Every JSON document the probe wrote, in order.
+
+    The probe prints one document per line, including its error envelope, so a
+    caller never has to distinguish "failed" from "said nothing".
+    """
+    documents = []
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        if line.strip():
+            documents.append(json.loads(line))
+    return documents
+
+
+def _typed_machine(machine: dict) -> dict:
+    """A typed MachineInstance in the shape the CLI projects it.
+
+    The CLI flattens `incarnation` into two scalars; comparing the nested and
+    flattened spellings directly would report a disagreement that is only a
+    difference in serialization.
+    """
+    incarnation = machine.get("incarnation")
+    return {
+        "machine_id": machine.get("machine_id"),
+        "name": machine.get("name"),
+        "state": machine.get("state"),
+        "profile": machine.get("profile"),
+        "target": machine.get("target"),
+        "requested_capabilities": machine.get("requested_capabilities"),
+        "negotiated_capabilities": machine.get("negotiated_capabilities"),
+        "backend": machine.get("backend"),
+        "incarnation_id": (incarnation or {}).get("incarnation_id"),
+        "incarnation_generation": (incarnation or {}).get("generation"),
+        "docker_context": machine.get("docker_context"),
+    }
+
+
+def _cli_machine(machine: dict) -> dict:
+    """One `vz status --json` Machine reduced to the same comparable fields."""
+    return {key: machine.get(key) for key in _typed_machine({})}
+
+
+def check_grpc_agreement(ctx: CheckContext, top: str) -> SubCheck:
+    """The CLI's account of an Environment and the daemon's typed channel agree.
+
+    Criterion 15 is an agreement claim, and agreement needs two independent
+    speakers. `vz-runtime-probe` is the second: a shipped release component
+    that speaks the daemon's own gRPC channel, decodes the contract types off
+    the wire, and shares no projection code with `vz`. Comparing the CLI's JSON
+    against the CLI's own state store would prove only that the CLI is
+    self-consistent.
+
+    The CLI brings an Environment up. The probe then reads the same aggregate
+    (identities, topology, capabilities) and reconciles the same definition
+    bytes over the typed channel (admission identities, transitions, terminal
+    receipt). The identities must be the ones the CLI already published --
+    a typed Up that minted new ones would mean the two channels disagree about
+    what the Environment is.
+    """
     check = SubCheck(top, "grpc_api_live_agreement")
-    # The lane provisions now, so Machines are no longer what blocks this. What
-    # is missing is a typed gRPC client: agreement must be observed over the
-    # daemon's own channel, not inferred from the CLI's JSON of the same state.
-    check.not_implemented = ("CLI vs typed gRPC/API agreement (identities, transitions, events, receipts) needs a pinned "
-                             "gRPC client for the daemon channel; the lane provisions Machines but speaks only the CLI.")
+    probe = ctx.release_dir / "bin" / PROBE
+    if not probe.is_file() or probe.is_symlink():
+        check.fail(f"the release ships no {PROBE}; CLI/API agreement has no typed channel to observe")
+        return check.finish()
+    check.ok(f"typed client bin/{PROBE} sha256={digest_file(probe)}")
+    try:
+        definition = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    instance = provision(ctx, check, "agree", definition)
+    if instance.get("unsupported"):
+        check.not_implemented = "this runtime refused the definition: " + instance["unsupported"][:200]
+        return check.finish()
+    if check.status != "PASS" or not instance["status"]:
+        return check.finish()
+    env, project, status = instance["env"], instance["project"], instance["status"]
+    state_db, socket = env["VZ_RUNTIME_STATE_DB"], env["VZ_RUNTIME_DAEMON_SOCKET"]
+    environments = status.get("environments") or []
+    if not check.check(len(environments) == 1, f"the CLI reports one Environment (observed {len(environments)})"):
+        return check.finish()
+    cli_environment = environments[0]
+    cli_machines = {machine["name"]: _cli_machine(machine) for machine in cli_environment.get("machines") or []}
+
+    read = ctx.run_tool(check, "agree-probe-state",
+                        [str(probe), "state", "--state-db", state_db, "--socket", socket,
+                         "--project-id", definition["project_id"]],
+                        cwd=project, env=env, timeout=120)
+    if not check.check(read.exit_code == 0,
+                       f"the typed channel returned the aggregate (exit {read.exit_code}, "
+                       f"stdout {read.stdout[:200]!r})"):
+        return check.finish()
+    try:
+        documents = probe_documents(read)
+    except json.JSONDecodeError as error:
+        check.fail(f"the typed client did not emit JSON documents: {error}")
+        return check.finish()
+    if not check.check(len(documents) == 1 and documents[0].get("kind") == "vz-runtime-probe-state",
+                       f"one typed state document (observed {[d.get('kind') for d in documents]})"):
+        return check.finish()
+    typed = documents[0]["project"]
+    check.check(typed.get("definition", {}).get("project_id") == status.get("project_id"),
+                f"both channels name project {status.get('project_id')!r} "
+                f"(typed {typed.get('definition', {}).get('project_id')!r})")
+    typed_environments = typed.get("environments") or []
+    if not check.check(len(typed_environments) == len(environments),
+                       f"both channels report {len(environments)} Environment(s) "
+                       f"(typed {len(typed_environments)})"):
+        return check.finish()
+    typed_environment = typed_environments[0]
+    for field in ("environment_id", "name", "state", "definition_digest", "lifecycle_generation"):
+        check.check(typed_environment.get(field) == cli_environment.get(field),
+                    f"Environment {field} agrees ({cli_environment.get(field)!r} vs typed "
+                    f"{typed_environment.get(field)!r})")
+    check.check(cli_environment.get("definition_digest") == status.get("persisted_definition_digest"),
+                "the CLI's Environment digest is the persisted definition digest it reports")
+    typed_machines = {machine["name"]: _typed_machine(machine) for machine in typed_environment.get("machines") or []}
+    if not check.check(set(typed_machines) == set(cli_machines),
+                       f"both channels report the same Machines ({sorted(cli_machines)} vs typed "
+                       f"{sorted(typed_machines)})"):
+        return check.finish()
+    for name in sorted(cli_machines):
+        for field, observed in sorted(cli_machines[name].items()):
+            check.check(typed_machines[name][field] == observed,
+                        f"Machine {name} {field} agrees ({observed!r} vs typed "
+                        f"{typed_machines[name][field]!r})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # Reconciling the very same definition bytes over the typed channel. An Up
+    # that minted new identities would mean the channels disagree about what
+    # this Environment is; the admission must name the ones the CLI published.
+    reconcile = ctx.run_tool(check, "agree-probe-up",
+                             [str(probe), "up", "--state-db", state_db, "--socket", socket,
+                              "--definition", str(project / "vz.json"), "--environment", cli_environment["name"],
+                              # The CLI resolves its worktree root; /tmp is a symlink on macOS and an
+                              # unresolved spelling is a different authorizing path, not the same one.
+                              "--workspace-root", os.path.realpath(project),
+                              "--timeout-millis", str(UP_TIMEOUT * 1000)],
+                             cwd=project, env=env, timeout=UP_TIMEOUT + 60)
+    if not check.check(reconcile.exit_code == 0,
+                       f"the typed channel reconciled the same definition (exit {reconcile.exit_code}, "
+                       f"stdout {reconcile.stdout[:300]!r})"):
+        return check.finish()
+    try:
+        events = [document["event"] for document in probe_documents(reconcile)
+                  if document.get("kind") == "vz-runtime-probe-up-event"]
+    except json.JSONDecodeError as error:
+        check.fail(f"the typed Up stream did not emit JSON documents: {error}")
+        return check.finish()
+    if not check.check(events, "the typed Up emitted at least one event"):
+        return check.finish()
+    sequences = [event.get("sequence") for event in events]
+    check.check(all(isinstance(value, int) for value in sequences) and sequences == sorted(set(sequences)),
+                f"event sequences are strictly increasing (observed {sequences[:12]})")
+    admissions = {json.dumps(event.get("admission"), sort_keys=True) for event in events}
+    check.check(len(admissions) == 1, f"every event carries one admission (observed {len(admissions)})")
+    admission = events[0].get("admission") or {}
+    check.check(admission.get("environment_id") == cli_environment.get("environment_id"),
+                f"the typed admission names the Environment the CLI published "
+                f"({cli_environment.get('environment_id')!r} vs {admission.get('environment_id')!r})")
+    check.check(admission.get("project_id") == status.get("project_id"),
+                f"the typed admission names the same project ({admission.get('project_id')!r})")
+    check.check(admission.get("definition_digest") == status.get("desired_definition_digest"),
+                f"the typed admission carries the same definition digest "
+                f"({status.get('desired_definition_digest')!r} vs {admission.get('definition_digest')!r})")
+    cli_machine_ids = {machine["machine_id"] for machine in cli_environment.get("machines") or []}
+    check.check(set(admission.get("machine_ids") or []) == cli_machine_ids,
+                f"the typed admission names the Machines the CLI published ({sorted(cli_machine_ids)} vs "
+                f"{sorted(admission.get('machine_ids') or [])})")
+    phases = [event.get("phase") for event in events]
+    check.ok(f"typed transitions observed: {phases}")
+    terminal = [event for event in events if event.get("completion") is not None]
+    check.check(terminal, f"the typed stream carried a terminal receipt (phases {phases})")
+
+    # The CLI reads the same Environment after the typed reconcile. Identities
+    # that moved would mean one channel's Up is invisible to the other.
+    after = read_status(ctx, check, "agree-after", project=project, env=env)
+    if check.status == "PASS" and after:
+        after_environment = (after.get("environments") or [{}])[0]
+        check.check(after_environment.get("environment_id") == cli_environment.get("environment_id"),
+                    "the CLI reports the same Environment identity after the typed reconcile")
+        check.check({machine["machine_id"] for machine in after_environment.get("machines") or []} == cli_machine_ids,
+                    "the CLI reports the same Machine identities after the typed reconcile")
+
+    # Failure agreement: an Environment that does not exist is refused by both
+    # channels, each in its own envelope, and the typed refusal names what it
+    # could not find rather than failing silently.
+    absent = "prj_" + "0" * 32
+    denied = ctx.run_tool(check, "agree-probe-absent",
+                          [str(probe), "state", "--state-db", state_db, "--socket", socket,
+                           "--project-id", absent],
+                          cwd=project, env=env, timeout=120)
+    check.check(denied.exit_code != 0, f"the typed channel refuses an absent project (exit {denied.exit_code})")
+    try:
+        refusals = probe_documents(denied)
+    except json.JSONDecodeError:
+        refusals = []
+    check.check(len(refusals) == 1 and refusals[0].get("kind") == "vz-runtime-probe-error"
+                and isinstance(refusals[0].get("reason"), str) and refusals[0]["reason"]
+                and isinstance(refusals[0].get("detail"), str) and refusals[0]["detail"],
+                f"the typed refusal is one named error envelope (observed {refusals[:1]})")
+    missing = ctx.run(check, "agree-cli-absent",
+                      ["--json", "status", "--environment", "definitely-not-an-environment"],
+                      cwd=project, env=env, timeout=60)
+    check.check(missing.exit_code != 0,
+                f"the CLI refuses an absent Environment too (exit {missing.exit_code})")
+
+    if check.status == "PASS":
+        removed = ctx.run(check, "agree-delete",
+                          ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                          cwd=project, env=env, timeout=DELETE_TIMEOUT)
+        check.check(removed.exit_code == 0, f"deleted (exit {removed.exit_code})")
     return check.finish()

@@ -42,7 +42,8 @@ MAX_OUTPUT = 64 * 1024 * 1024
 MAX_SOCKET_WALK = 50000
 MAX_ROWS = 20000
 GATE_REQUIREMENTS = Path(__file__).resolve().parent / "gate-requirements.txt"
-HOST_BINARIES = ("vz", "vz-runtimed", "vz-macos-setup", "vz-guest-agent", "vz-agent-loader")
+HOST_BINARIES = ("vz", "vz-runtimed", "vz-macos-setup", "vz-runtime-probe", "vz-guest-agent",
+                 "vz-agent-loader")
 
 
 def run_capture(argv, timeout=60, env=None) -> dict:

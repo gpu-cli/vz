@@ -143,6 +143,7 @@ install_binaries() {
     install_binary "$version" "vz-guest-agent"
     install_binary "$version" "vz-agent-loader"
     install_binary "$version" "vz-macos-setup"
+    install_binary "$version" "vz-runtime-probe"
 }
 
 install_linux_artifacts() {

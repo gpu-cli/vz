@@ -64,7 +64,8 @@ def main():
                    apple_https_download=args.ipsw is None and not args.reuse_download_cache,
                    prefix=str(prefix), variant="xcode" if args.xcode else "clean", results=results,
                    binary_sha256={name: hashlib.file_digest((prefix / "bin" / name).open("rb"), "sha256").hexdigest()
-                                  for name in ["vz", "vz-runtimed", "vz-macos-setup", "vz-agent-loader", "vz-guest-agent"]})
+                                  for name in ["vz", "vz-runtimed", "vz-macos-setup", "vz-agent-loader", "vz-guest-agent",
+                                               "vz-runtime-probe"]})
 
     def save():
         (evidence / "summary.json").write_text(json.dumps(summary, indent=2))

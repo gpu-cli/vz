@@ -22,7 +22,8 @@ import vz04_candidate as candidate  # noqa: E402
 from vz04_common import digest_file, sha256_bytes  # noqa: E402
 
 FAKE_COMMIT = "0" * 40
-COMPONENTS = ("bin/vz", "bin/vz-runtimed", "bin/vz-macos-setup", "bin/vz-guest-agent", "bin/vz-agent-loader")
+COMPONENTS = ("bin/vz", "bin/vz-runtimed", "bin/vz-macos-setup", "bin/vz-runtime-probe",
+              "bin/vz-guest-agent", "bin/vz-agent-loader")
 
 
 def fake_codesign_verifier(_path: Path) -> tuple:

@@ -63,18 +63,19 @@ jobs:
           cargo build --locked --release -p vz-runtimed
           cargo build --locked --release -p vz-guest-agent
           cargo build --locked --release -p vz-agent-loader
+          cargo build --locked --release -p vz-runtime-probe
 
       - name: Record pre-signing digests
         # Parity with scripts/build-vz-0.4-release-candidate.sh: unsigned
         # SHA-256 of every host binary before codesign touches it, plus
         # normalized_content_sha256 = sha256(canonical_json(sorted [[path,
         # unsigned_sha256], ...]) + LF) via the builder's canonical-sha256 rule.
-        # Scope is the five host binaries only (the builder also covers guest
+        # Scope is the six host binaries only (the builder also covers guest
         # bundles, BuildKit and the entitlements file), which is recorded.
         run: |
           mkdir -p dist
           components='{}'
-          for name in vz vz-runtimed vz-macos-setup vz-guest-agent vz-agent-loader; do
+          for name in vz vz-runtimed vz-macos-setup vz-runtime-probe vz-guest-agent vz-agent-loader; do
             digest="$(shasum -a 256 "crates/target/release/$name" | cut -d' ' -f1)"
             components="$(jq -c --arg path "bin/$name" --arg digest "$digest" '. + {($path): $digest}' <<<"$components")"
           done
@@ -160,6 +161,8 @@ jobs:
           codesign --verify --verbose crates/target/release/vz-guest-agent
           codesign --sign - --force crates/target/release/vz-agent-loader
           codesign --verify --verbose crates/target/release/vz-agent-loader
+          codesign --sign - --force crates/target/release/vz-runtime-probe
+          codesign --verify --verbose crates/target/release/vz-runtime-probe
 
       - name: Notarize vz-cli and vz-runtimed
         env:
@@ -211,7 +214,7 @@ jobs:
           cp crates/target/release/vz-guest-agent "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
           chmod +x "dist/vz-guest-agent-v${VERSION}-darwin-arm64"
           shasum -a 256 "dist/vz-guest-agent-v${VERSION}-darwin-arm64" > "dist/vz-guest-agent-v${VERSION}-darwin-arm64.sha256"
-          for name in vz-macos-setup vz-agent-loader; do
+          for name in vz-macos-setup vz-agent-loader vz-runtime-probe; do
             cp "crates/target/release/$name" "dist/${name}-v${VERSION}-darwin-arm64"
             shasum -a 256 "dist/${name}-v${VERSION}-darwin-arm64" > "dist/${name}-v${VERSION}-darwin-arm64.sha256"
           done

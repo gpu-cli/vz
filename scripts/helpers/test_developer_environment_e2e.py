@@ -42,18 +42,14 @@ TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
-               "status_json_field_set"}
-# `grpc_api_live_agreement` belongs to criterion 15 and needs a live typed API:
-# agreement must be observed over the daemon's own gRPC channel, which needs a
-# pinned client this lane does not have.
-#
+               "status_json_field_set", "grpc_api_live_agreement"}
 # `private_topology_paths` proves criterion 5's Linux-to-Linux half and stops
 # there. The criterion also requires a service path crossing between a Linux
 # Machine and a native macOS Machine in both directions, and no fake CLI can
 # stand in for that: it needs a macOS template a gate host does not provision.
 # It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
 # which certified the criterion on evidence that never touched its macOS clause.
-NOT_IMPLEMENTED = {"grpc_api_live_agreement", "private_topology_paths"}
+NOT_IMPLEMENTED = {"private_topology_paths"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -176,8 +172,8 @@ class TopologyLaneTests(unittest.TestCase):
             self.assertEqual(subs[slug]["status"], "FAIL", slug)
             self.assertTrue(any(a.startswith("not_implemented:") for a in subs[slug]["assertions"]), slug)
         # Criterion 21's sub-checks are all implemented now, so it is the first
-        # topology scenario the lane can pass. Criterion 15 still needs a live
-        # typed API for its remaining two.
+        # topology scenario the lane can pass. Criterion 15 joined it once the
+        # release shipped a typed client for the daemon channel.
         self.assertEqual(self.top(result, TOP21)["status"], "PASS")
         self.assertEqual(self.top(result, TOP1)["status"], "PASS")
         # The fake applies declared networks, so criterion 5's Linux half runs to
@@ -185,7 +181,7 @@ class TopologyLaneTests(unittest.TestCase):
         # criterion. The crossing to a native macOS Machine is unexercised, so
         # the check declines to claim PASS; see check_private_topology_paths.
         self.assertEqual(self.top(result, TOP5)["status"], "FAIL")
-        self.assertEqual(self.top(result, TOP15)["status"], "FAIL")
+        self.assertEqual(self.top(result, TOP15)["status"], "PASS")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
@@ -206,7 +202,8 @@ class TopologyLaneTests(unittest.TestCase):
                                                 "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement",
                           f"{TOP1}__three_concurrent_no_collision",
-                          f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set"})
+                          f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set",
+                          f"{TOP15}__grpc_api_live_agreement"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:
@@ -270,6 +267,18 @@ class TopologyLaneTests(unittest.TestCase):
     def test_executable_alias_fails_legacy_rejection(self):
         result = self.assert_regression("alias", "legacy_rejection", "vz create: exit 0 (expected 2)")
         self.assertEqual(self.by_slug(result)["bare_help"]["status"], "PASS")
+
+    def test_a_typed_channel_that_disagrees_fails_criterion_15(self):
+        """Agreement has to be capable of failing.
+
+        The fake typed channel is built to agree, so criterion 15 passing
+        against it says nothing on its own. probe_drift mints one Environment
+        identity the CLI never published and changes nothing else; the check
+        must refuse it, or it is comparing shapes rather than identities.
+        """
+        result = self.assert_regression("probe_drift", "grpc_api_live_agreement",
+                                        "Environment environment_id agrees")
+        self.assertEqual(self.by_slug(result)["status_json_field_set"]["status"], "PASS")
 
     def test_provisioning_up_fails_clean_directory_check(self):
         result = self.assert_regression("provisions", "clean_up_refuses", "lane state root changed")

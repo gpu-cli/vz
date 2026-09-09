@@ -4003,6 +4003,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz-runtime-probe"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "vz-runtime-contract",
+ "vz-runtime-proto",
+ "vz-runtime-translate",
+ "vz-runtimed-client",
+]
+
+[[package]]
 name = "vz-runtime-proto"
 version = "0.1.0"
 dependencies = [

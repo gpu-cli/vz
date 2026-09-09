@@ -22,6 +22,7 @@ members = [
     "vz-macos-provision",
     "vz-agent-loader",
     "vz-agent-loader-client",
+    "vz-runtime-probe",
 ]
 
 [workspace.package]
@@ -191,6 +192,7 @@ vz-stack = { path = "vz-stack" }
 vz-agent-proto = { path = "vz-agent-proto" }
 vz-runtime-proto = { path = "vz-runtime-proto" }
 vz-runtime-translate = { path = "vz-runtime-translate" }
+vz-runtime-probe = { path = "vz-runtime-probe" }
 vz-runtimed-client = { path = "vz-runtimed-client" }
 vz-validation = { path = "vz-validation" }
 vz-api = { path = "vz-api" }

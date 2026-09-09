@@ -1,0 +1,24 @@
+[package]
+name = "vz-runtime-probe"
+version = "0.1.0"
+description = "Typed gRPC observer for the Runtime V2 daemon: the API half of CLI/API agreement."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vz-runtime-probe"
+path = "src/main.rs"
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+vz-runtime-contract = { workspace = true }
+vz-runtime-proto = { workspace = true }
+vz-runtime-translate = { workspace = true }
+vz-runtimed-client = { workspace = true }
+
+[lints]
+workspace = true

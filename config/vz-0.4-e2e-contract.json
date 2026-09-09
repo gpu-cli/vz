@@ -20,6 +20,7 @@
       "bin/vz",
       "bin/vz-runtimed",
       "bin/vz-macos-setup",
+      "bin/vz-runtime-probe",
       "bin/vz-guest-agent",
       "bin/vz-agent-loader"
     ],

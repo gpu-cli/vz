@@ -410,7 +410,7 @@ class Lane:
             subchecks[CRITERION_15].append(checks.check_help_surface(ctx, CRITERION_15))
             subchecks[CRITERION_15].append(checks.check_error_envelope(ctx, CRITERION_15))
             subchecks[CRITERION_15].append(checks.check_status_field_set(ctx, CRITERION_15))
-            subchecks[CRITERION_15].append(checks.check_grpc_agreement(CRITERION_15))
+            subchecks[CRITERION_15].append(checks.check_grpc_agreement(ctx, CRITERION_15))
             subchecks[CRITERION_1].append(checks.check_three_concurrent_environments(ctx, CRITERION_1))
             subchecks[CRITERION_5].append(checks.check_private_topology_paths(ctx, CRITERION_5))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
