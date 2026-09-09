@@ -1,3 +1,4 @@
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -243,10 +244,17 @@ class LaneTests(unittest.TestCase):
         # Nothing ambient: a gate without one leaves the minimal PATH alone.
         self.assertNotIn("/opt/vz-test/bin", lanes.minimal_env(_ctx(self.root, uv=None))["PATH"])
 
-    def test_stub_script_writes_valid_result_and_exits_3(self):
-        """The native-macOS lane is still a stub: it must account for itself rather
-        than be absent. The topology lane is a real lane and is covered by
-        `test_developer_environment_e2e`."""
+    def test_native_macos_entry_point_accounts_for_itself_without_a_template(self):
+        """The native-macOS lane must account for itself rather than be absent.
+
+        It is no longer a stub: it drives `run-installed-native-macos-e2e.py`.
+        With no macOS template registered it cannot exercise criterion 4, and
+        the one thing it may never do is report PASS anyway. The catalog
+        override is pointed at an absent file so this holds on a maintainer host
+        that *does* have a template registered, and so no unit run can boot a VM.
+
+        The topology lane is covered by `test_developer_environment_e2e`.
+        """
         release = fixtures.build_fake_release_dir(self.root / "release")
         try:
             evidence = self.root / "evidence"
@@ -256,13 +264,23 @@ class LaneTests(unittest.TestCase):
                 run_id="gate-test-run-1", release_dir=release, release_dir_sha256=common.tree_digest(release), state_root=self.root / "state",
                 contract_path=common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"], contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST,
                 fixture_sha256=DIGEST, clients={}), "clean-provision", evidence, None)
-            completed = subprocess.run([str(script), *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False)
-            self.assertEqual(completed.returncode, 3, completed.stderr.decode())
+            env = {**os.environ, "VZ_MACHINE_TARGET_CATALOG": str(self.root / "no-such-catalog.json")}
+            completed = subprocess.run([str(script), *argv], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       env=env, timeout=300, check=False)
+            self.assertNotEqual(completed.returncode, 0, "a lane with no template may never succeed")
             result = common.load_json(evidence / "lane-result.json")
             self.assertEqual(schema.validate("lane-result", result), [])
-            self.assertEqual((result["lane"], result["failure"]["reason"], result["failure"]["exit_code"]),
-                             ("native-macos", "not_implemented", 3))
+            self.assertEqual(result["lane"], "native-macos")
+            self.assertEqual(result["outcome"], "failed", completed.stderr.decode())
+            self.assertEqual(result["failure"]["reason"], "prerequisite", completed.stderr.decode())
+            self.assertNotIn("PASS", [s["status"] for s in result["scenarios"]])
+            self.assertEqual([s["id"] for s in result["scenarios"]], ["gate.native.target_native_execution"])
             self.assertEqual(result["entry_point"]["path"], "scripts/run-macos-developer-environment-e2e.sh")
+            # The accounting the gate performs on that result: MISSING, and the
+            # reason says the capability was never exercised, not that it failed.
+            required = [{"id": "gate.native.target_native_execution", "lane": "native-macos", "phase": "clean-provision"}]
+            self.assertEqual(lanes.account(required, [result])["rows"][0]["status"], "MISSING")
+            self.assertEqual(lanes.account(required, [result])["rows"][0]["reason"], "prerequisite")
             rejected = subprocess.run([str(script), "--suite", "lifecycle"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=300, check=False)
             self.assertEqual(rejected.returncode, 2)
         finally:
