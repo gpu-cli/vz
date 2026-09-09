@@ -413,6 +413,7 @@ fn install_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope
         project_id: scope.project_id.clone(),
         name: format!("project-{stack_id}"),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -433,6 +434,7 @@ fn install_authority(store: &StateStore, stack_id: &str) -> MachineWorkloadScope
         },
     };
     let environment = EnvironmentInstance {
+        volumes: Vec::new(),
         network_attachments: Vec::new(),
         host_exports: Vec::new(),
         host_imports: Vec::new(),

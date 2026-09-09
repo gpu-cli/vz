@@ -218,6 +218,55 @@ message HostImportSpec {
   optional string alias = 7;
 }
 
+// What a declared volume physically is.
+enum VolumeKind {
+  VOLUME_KIND_UNSPECIFIED = 0;
+  // One sparse disk image carrying one ext4 filesystem, attached as a
+  // virtio-block device. At most one attachment may write it.
+  VOLUME_KIND_BLOCK = 1;
+  // One host directory exported to every attached Machine over VirtioFS.
+  VOLUME_KIND_SHARED_CACHE = 2;
+}
+
+// Whether one attachment may write the volume it names.
+enum VolumeAccessMode {
+  VOLUME_ACCESS_MODE_UNSPECIFIED = 0;
+  VOLUME_ACCESS_MODE_READ_WRITE = 1;
+  VOLUME_ACCESS_MODE_READ_ONLY = 2;
+}
+
+// The consistency model a shared cache advertises.
+enum SharedCacheConsistencyModel {
+  SHARED_CACHE_CONSISTENCY_MODEL_UNSPECIFIED = 0;
+  // A closed write is visible to every other attachment within the declared
+  // bound; reads before the bound may observe either state.
+  SHARED_CACHE_CONSISTENCY_MODEL_BOUNDED_STALENESS = 1;
+}
+
+message SharedCacheConsistency {
+  SharedCacheConsistencyModel model = 1;
+  uint32 staleness_bound_millis = 2;
+}
+
+message VolumeAttachment {
+  string machine = 1;
+  string target_path = 2;
+  VolumeAccessMode mode = 3;
+}
+
+// Environment-owned storage: a block volume or a shared cache.
+//
+// size_bytes is meaningful for block only and consistency for shared_cache
+// only; each is refused on the other kind rather than ignored.
+message VolumeSpec {
+  uint32 schema_version = 1;
+  string name = 2;
+  VolumeKind kind = 3;
+  optional uint64 size_bytes = 4;
+  optional SharedCacheConsistency consistency = 5;
+  repeated VolumeAttachment attachments = 6;
+}
+
 message EnvironmentSpec {
   uint32 schema_version = 1;
   repeated MachineSpec machines = 2;
@@ -227,6 +276,7 @@ message EnvironmentSpec {
   optional string default_machine = 5;
   repeated HostExportSpec host_exports = 6;
   repeated HostImportSpec host_imports = 7;
+  repeated VolumeSpec volumes = 8;
 }
 
 message ProjectDefinition {
@@ -389,6 +439,17 @@ message HostExportInstance {
   string name = 5;
 }
 
+// Persisted volume identity. Environment-scoped, so there is deliberately no
+// machine_id: a shared cache spans several Machines and a block volume outlives
+// the incarnation that mounted it.
+message VolumeInstance {
+  uint32 schema_version = 1;
+  string volume_id = 2;
+  string environment_id = 3;
+  string name = 4;
+  VolumeKind kind = 5;
+}
+
 message HostImportInstance {
   uint32 schema_version = 1;
   string import_id = 2;
@@ -422,6 +483,7 @@ enum OwnedResourceKind {
   OWNED_RESOURCE_KIND_HOST_EXPORT = 13;
   OWNED_RESOURCE_KIND_HOST_IMPORT = 14;
   OWNED_RESOURCE_KIND_PORT_RANGE = 15;
+  OWNED_RESOURCE_KIND_VOLUME = 16;
 }
 
 message OwnershipRecord {
@@ -570,6 +632,7 @@ message EnvironmentInstance {
   repeated HostExportInstance host_exports = 18;
   repeated HostImportInstance host_imports = 19;
   repeated EgressInstance egress = 20;
+  repeated VolumeInstance volumes = 21;
 }
 
 message ProjectState {

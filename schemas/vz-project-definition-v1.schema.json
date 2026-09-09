@@ -147,6 +147,48 @@
       },
       "description": "Imports name exactly one 127.0.0.1 host service. The guest never sends a destination, and an alias is a guest-local convenience, never an authorization."
     },
+    "volumeAttachment": {
+      "type": "object", "additionalProperties": false,
+      "required": ["machine", "target_path", "mode"],
+      "properties": {
+        "machine": {"$ref": "#/$defs/name"},
+        "target_path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^/", "not": {"pattern": "(^|/)\\.\\.(/|$)"}, "description": "Absolute, bounded, `..`-free path inside the named Machine where this volume appears."},
+        "mode": {"enum": ["read_write", "read_only"]}
+      },
+      "description": "One Machine's attachment. Semantic validation requires the Machine to be declared, refuses one Machine attaching one volume twice, and refuses more than one attachment on a writable `block` volume."
+    },
+    "sharedCacheConsistency": {
+      "type": "object", "additionalProperties": false,
+      "required": ["model", "staleness_bound_millis"],
+      "properties": {
+        "model": {"enum": ["bounded_staleness"]},
+        "staleness_bound_millis": {"type": "integer", "minimum": 1, "maximum": 60000}
+      },
+      "description": "A closed write on one attached Machine becomes visible to every other attached Machine within staleness_bound_millis. Nothing is promised before that bound: each Machine runs its own virtio-fs attribute and dentry cache over the one host directory."
+    },
+    "volume": {
+      "type": "object", "additionalProperties": false,
+      "required": ["schema_version", "name", "kind", "attachments"],
+      "properties": {
+        "schema_version": {"const": 1},
+        "name": {"$ref": "#/$defs/name"},
+        "kind": {"enum": ["block", "shared_cache"]},
+        "size_bytes": {"anyOf": [{"type": "integer", "minimum": 1048576, "maximum": 1099511627776}, {"type": "null"}]},
+        "consistency": {"anyOf": [{"$ref": "#/$defs/sharedCacheConsistency"}, {"type": "null"}]},
+        "attachments": {"type": "array", "minItems": 1, "maxItems": 128, "items": {"$ref": "#/$defs/volumeAttachment"}}
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"kind": {"const": "block"}}, "required": ["kind"]},
+          "then": {"required": ["size_bytes"], "properties": {"size_bytes": {"type": "integer"}, "consistency": {"type": "null"}}}
+        },
+        {
+          "if": {"properties": {"kind": {"const": "shared_cache"}}, "required": ["kind"]},
+          "then": {"required": ["consistency"], "properties": {"consistency": {"$ref": "#/$defs/sharedCacheConsistency"}, "size_bytes": {"type": "null"}}}
+        }
+      ],
+      "description": "Environment-owned storage. `block` is one ext4 disk image on a virtio-block device and carries `size_bytes`; a writable block volume is refused on more than one Machine, because ext4 is not a cluster filesystem. `shared_cache` is one host directory exported to every attached Machine over VirtioFS and carries `consistency` instead; multi-attach is its purpose. Each kind refuses the other's field rather than ignoring it."
+    },
     "environment": {
       "type": "object", "additionalProperties": false,
       "required": ["schema_version", "machines"],
@@ -157,9 +199,10 @@
         "networks": {"type": "array", "items": {"$ref": "#/$defs/network"}},
         "endpoints": {"type": "array", "items": {"$ref": "#/$defs/endpoint"}},
         "host_exports": {"type": "array", "items": {"$ref": "#/$defs/hostExport"}},
-        "host_imports": {"type": "array", "items": {"$ref": "#/$defs/hostImport"}}
+        "host_imports": {"type": "array", "items": {"$ref": "#/$defs/hostImport"}},
+        "volumes": {"type": "array", "items": {"$ref": "#/$defs/volume"}}
       },
-      "description": "Semantic validation checks unique names, exact endpoint Machine/network references, that every endpoint Machine is attached to that endpoint's network, and that host exports/imports name a declared Machine. More than one named Environment may instantiate this same topology, including within one worktree."
+      "description": "Semantic validation checks unique names, exact endpoint Machine/network references, that every endpoint Machine is attached to that endpoint's network, that host exports/imports name a declared Machine, and that every volume attachment names a declared Machine. More than one named Environment may instantiate this same topology, including within one worktree."
     }
   }
 }

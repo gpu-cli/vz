@@ -25,6 +25,8 @@ use vz_runtime_contract::{
     EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, EnvironmentTombstone, Event,
     EventScope, Execution, ExecutionSpec, ExecutionState, HostExportId, HostExportInstance,
     HostExportSpec, HostImportId, HostImportInstance, HostImportSpec, HostSpec, Lease, LeaseState,
+    SharedCacheConsistency, SharedCacheConsistencyModel, VolumeAccessMode, VolumeAttachment,
+    VolumeId, VolumeInstance, VolumeKind, VolumeSpec,
     LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
     MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence, MachineBackend,
     MachineCapability, MachineDockerContextDescriptor, MachineError, MachineErrorCode, MachineId,
@@ -148,6 +150,7 @@ pub fn environment_spec_to_proto(spec: &EnvironmentSpec) -> runtime_v2::Environm
             .iter()
             .map(host_import_spec_to_proto)
             .collect(),
+        volumes: spec.volumes.iter().map(volume_spec_to_proto).collect(),
     }
 }
 
@@ -182,6 +185,11 @@ pub fn environment_spec_from_proto(
             .host_imports
             .iter()
             .map(host_import_spec_from_proto)
+            .collect::<Result<_, _>>()?,
+        volumes: spec
+            .volumes
+            .iter()
+            .map(volume_spec_from_proto)
             .collect::<Result<_, _>>()?,
     })
 }
@@ -1442,6 +1450,11 @@ pub fn environment_instance_to_proto(
             .iter()
             .map(host_export_instance_to_proto)
             .collect(),
+        volumes: environment
+            .volumes
+            .iter()
+            .map(volume_instance_to_proto)
+            .collect(),
         host_imports: environment
             .host_imports
             .iter()
@@ -1511,6 +1524,11 @@ pub fn environment_instance_from_proto(
             .host_exports
             .iter()
             .map(host_export_instance_from_proto)
+            .collect::<Result<_, _>>()?,
+        volumes: environment
+            .volumes
+            .iter()
+            .map(volume_instance_from_proto)
             .collect::<Result<_, _>>()?,
         host_imports: environment
             .host_imports
@@ -2124,6 +2142,156 @@ fn workspace_projection_mode_from_proto(
     }
 }
 
+fn volume_kind_to_proto(value: VolumeKind) -> runtime_v2::VolumeKind {
+    match value {
+        VolumeKind::Block => runtime_v2::VolumeKind::Block,
+        VolumeKind::SharedCache => runtime_v2::VolumeKind::SharedCache,
+    }
+}
+
+fn volume_kind_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<VolumeKind, TranslationError> {
+    match runtime_v2::VolumeKind::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::VolumeKind::Block => Ok(VolumeKind::Block),
+        runtime_v2::VolumeKind::SharedCache => Ok(VolumeKind::SharedCache),
+        // Unspecified is refused rather than defaulted: defaulting a volume's
+        // kind would silently choose a carrier, and the two carriers have
+        // different multi-attach rules.
+        runtime_v2::VolumeKind::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn volume_access_mode_to_proto(value: VolumeAccessMode) -> runtime_v2::VolumeAccessMode {
+    match value {
+        VolumeAccessMode::ReadWrite => runtime_v2::VolumeAccessMode::ReadWrite,
+        VolumeAccessMode::ReadOnly => runtime_v2::VolumeAccessMode::ReadOnly,
+    }
+}
+
+fn volume_access_mode_from_proto(
+    raw: i32,
+    field: &'static str,
+) -> Result<VolumeAccessMode, TranslationError> {
+    match runtime_v2::VolumeAccessMode::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
+        runtime_v2::VolumeAccessMode::ReadWrite => Ok(VolumeAccessMode::ReadWrite),
+        runtime_v2::VolumeAccessMode::ReadOnly => Ok(VolumeAccessMode::ReadOnly),
+        // Defaulting here would decide whether an attachment is a writer, which
+        // is exactly the fact the multi-attach refusal turns on.
+        runtime_v2::VolumeAccessMode::Unspecified => Err(invalid_enum(field, raw)),
+    }
+}
+
+fn shared_cache_consistency_to_proto(
+    value: SharedCacheConsistency,
+) -> runtime_v2::SharedCacheConsistency {
+    let model = match value.model {
+        SharedCacheConsistencyModel::BoundedStaleness => {
+            runtime_v2::SharedCacheConsistencyModel::BoundedStaleness
+        }
+    };
+    runtime_v2::SharedCacheConsistency {
+        model: model as i32,
+        staleness_bound_millis: value.staleness_bound_millis,
+    }
+}
+
+fn shared_cache_consistency_from_proto(
+    value: &runtime_v2::SharedCacheConsistency,
+) -> Result<SharedCacheConsistency, TranslationError> {
+    let field = "volume_spec.consistency.model";
+    let model = match runtime_v2::SharedCacheConsistencyModel::try_from(value.model)
+        .map_err(|_| invalid_enum(field, value.model))?
+    {
+        runtime_v2::SharedCacheConsistencyModel::BoundedStaleness => {
+            SharedCacheConsistencyModel::BoundedStaleness
+        }
+        runtime_v2::SharedCacheConsistencyModel::Unspecified => {
+            return Err(invalid_enum(field, value.model));
+        }
+    };
+    Ok(SharedCacheConsistency {
+        model,
+        staleness_bound_millis: value.staleness_bound_millis,
+    })
+}
+
+/// Convert a declared volume to wire form.
+pub fn volume_spec_to_proto(spec: &VolumeSpec) -> runtime_v2::VolumeSpec {
+    runtime_v2::VolumeSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        kind: volume_kind_to_proto(spec.kind) as i32,
+        size_bytes: spec.size_bytes,
+        consistency: spec.consistency.map(shared_cache_consistency_to_proto),
+        attachments: spec
+            .attachments
+            .iter()
+            .map(|attachment| runtime_v2::VolumeAttachment {
+                machine: attachment.machine.clone(),
+                target_path: attachment.target_path.clone(),
+                mode: volume_access_mode_to_proto(attachment.mode) as i32,
+            })
+            .collect(),
+    }
+}
+
+/// Decode a declared volume, refusing unspecified kinds and access modes.
+pub fn volume_spec_from_proto(
+    spec: &runtime_v2::VolumeSpec,
+) -> Result<VolumeSpec, TranslationError> {
+    Ok(VolumeSpec {
+        schema_version: spec.schema_version,
+        name: spec.name.clone(),
+        kind: volume_kind_from_proto(spec.kind, "volume_spec.kind")?,
+        size_bytes: spec.size_bytes,
+        consistency: spec
+            .consistency
+            .as_ref()
+            .map(shared_cache_consistency_from_proto)
+            .transpose()?,
+        attachments: spec
+            .attachments
+            .iter()
+            .map(|attachment| {
+                Ok(VolumeAttachment {
+                    machine: attachment.machine.clone(),
+                    target_path: attachment.target_path.clone(),
+                    mode: volume_access_mode_from_proto(
+                        attachment.mode,
+                        "volume_spec.attachments.mode",
+                    )?,
+                })
+            })
+            .collect::<Result<_, TranslationError>>()?,
+    })
+}
+
+/// Convert a persisted volume identity to wire form.
+pub fn volume_instance_to_proto(volume: &VolumeInstance) -> runtime_v2::VolumeInstance {
+    runtime_v2::VolumeInstance {
+        schema_version: volume.schema_version,
+        volume_id: volume.volume_id.to_string(),
+        environment_id: volume.environment_id.to_string(),
+        name: volume.name.clone(),
+        kind: volume_kind_to_proto(volume.kind) as i32,
+    }
+}
+
+/// Decode a persisted volume identity.
+pub fn volume_instance_from_proto(
+    volume: &runtime_v2::VolumeInstance,
+) -> Result<VolumeInstance, TranslationError> {
+    Ok(VolumeInstance {
+        schema_version: volume.schema_version,
+        volume_id: VolumeId::new(volume.volume_id.clone())?,
+        environment_id: EnvironmentId::new(volume.environment_id.clone())?,
+        name: volume.name.clone(),
+        kind: volume_kind_from_proto(volume.kind, "volume_instance.kind")?,
+    })
+}
+
 fn network_kind_to_proto(value: NetworkKind) -> runtime_v2::NetworkKind {
     match value {
         NetworkKind::Private => runtime_v2::NetworkKind::Private,
@@ -2456,6 +2624,7 @@ fn owned_resource_kind_to_proto(
         OwnedResourceKind::PortRange => (runtime_v2::OwnedResourceKind::PortRange, None),
         OwnedResourceKind::Credential => (runtime_v2::OwnedResourceKind::Credential, None),
         OwnedResourceKind::Fault => (runtime_v2::OwnedResourceKind::Fault, None),
+        OwnedResourceKind::Volume => (runtime_v2::OwnedResourceKind::Volume, None),
         OwnedResourceKind::LegacySandbox => (runtime_v2::OwnedResourceKind::LegacySandbox, None),
         OwnedResourceKind::Other(value) => {
             (runtime_v2::OwnedResourceKind::Other, Some(value.clone()))
@@ -2521,6 +2690,10 @@ fn owned_resource_kind_from_proto(
         runtime_v2::OwnedResourceKind::Fault => {
             reject_other(field, other)?;
             Ok(OwnedResourceKind::Fault)
+        }
+        runtime_v2::OwnedResourceKind::Volume => {
+            reject_other(field, other)?;
+            Ok(OwnedResourceKind::Volume)
         }
         runtime_v2::OwnedResourceKind::LegacySandbox => {
             reject_other(field, other)?;
@@ -3286,6 +3459,10 @@ mod tests {
         EgressId::new(value).expect("valid egress ID")
     }
 
+    fn volume_id(value: &str) -> VolumeId {
+        VolumeId::new(value).expect("valid volume ID")
+    }
+
     fn requested_linux_capabilities() -> CapabilitySet {
         CapabilitySet::new([
             MachineCapability::PosixExec,
@@ -3396,6 +3573,46 @@ mod tests {
             project_id: project_id("prj-roundtrip"),
             name: "roundtrip".to_string(),
             environment: EnvironmentSpec {
+                // One volume of each kind: `block` is the only branch carrying
+                // `size_bytes` and `shared_cache` the only one carrying
+                // `consistency`, so a round trip over both is what proves the
+                // optional fields are not silently dropped.
+                volumes: vec![
+                    VolumeSpec {
+                        schema_version: V,
+                        name: "data".to_string(),
+                        kind: VolumeKind::Block,
+                        size_bytes: Some(64 * 1024 * 1024),
+                        consistency: None,
+                        attachments: vec![VolumeAttachment {
+                            machine: "linux".to_string(),
+                            target_path: "/var/data".to_string(),
+                            mode: VolumeAccessMode::ReadWrite,
+                        }],
+                    },
+                    VolumeSpec {
+                        schema_version: V,
+                        name: "cache".to_string(),
+                        kind: VolumeKind::SharedCache,
+                        size_bytes: None,
+                        consistency: Some(SharedCacheConsistency {
+                            model: SharedCacheConsistencyModel::BoundedStaleness,
+                            staleness_bound_millis: 2_000,
+                        }),
+                        attachments: vec![
+                            VolumeAttachment {
+                                machine: "linux".to_string(),
+                                target_path: "/var/cache".to_string(),
+                                mode: VolumeAccessMode::ReadWrite,
+                            },
+                            VolumeAttachment {
+                                machine: "macos".to_string(),
+                                target_path: "/var/cache".to_string(),
+                                mode: VolumeAccessMode::ReadOnly,
+                            },
+                        ],
+                    },
+                ],
                 host_exports: vec![HostExportSpec {
                     schema_version: V,
                     name: "web".to_string(),
@@ -3458,6 +3675,22 @@ mod tests {
         let public_network_id = network_id(&format!("net-{suffix}-public"));
         let private_network_id = network_id(&format!("net-{suffix}-private"));
         EnvironmentInstance {
+            volumes: vec![
+                VolumeInstance {
+                    schema_version: V,
+                    volume_id: volume_id(&format!("vol-{suffix}-data")),
+                    environment_id: environment_id.clone(),
+                    name: "data".to_string(),
+                    kind: VolumeKind::Block,
+                },
+                VolumeInstance {
+                    schema_version: V,
+                    volume_id: volume_id(&format!("vol-{suffix}-cache")),
+                    environment_id: environment_id.clone(),
+                    name: "cache".to_string(),
+                    kind: VolumeKind::SharedCache,
+                },
+            ],
             network_attachments: vec![
                 NetworkAttachmentInstance {
                     schema_version: V,

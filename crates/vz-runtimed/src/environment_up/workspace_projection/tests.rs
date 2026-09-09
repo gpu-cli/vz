@@ -292,6 +292,7 @@ fn machine_instance(name: &str) -> MachineInstance {
 
 fn spec(machines: Vec<MachineSpec>) -> EnvironmentSpec {
     EnvironmentSpec {
+        volumes: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         default_machine: None,
         machines,

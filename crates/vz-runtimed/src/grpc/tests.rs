@@ -91,6 +91,7 @@ pub(super) fn seed_stack_topology(
         project_id: project_id.clone(),
         name: "stack-rpc".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -111,6 +112,7 @@ pub(super) fn seed_stack_topology(
         },
     };
     let environment = EnvironmentInstance {
+        volumes: Vec::new(),
         network_attachments: Vec::new(),
         host_exports: Vec::new(),
         host_imports: Vec::new(),

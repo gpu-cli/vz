@@ -100,6 +100,7 @@ impl Fixture {
             project_id: ProjectId::generate(),
             name: "delete-tests".into(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,

@@ -1702,6 +1702,7 @@ mod tests {
             environment: Some(EnvironmentSpec {
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
+                volumes: Vec::new(),
                 schema_version: 1,
                 default_machine: None,
                 machines: vec![machine_spec],
@@ -1752,6 +1753,7 @@ mod tests {
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             egress: Vec::new(),
+            volumes: Vec::new(),
             schema_version: 1,
             environment_id: "env_agent_a".into(),
             project_id: "prj_demo".into(),

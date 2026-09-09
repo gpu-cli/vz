@@ -169,6 +169,38 @@ fn source_components(source_path: &str) -> Vec<&str> {
     }
 }
 
+/// The shared "no silent writable multi-attach" rule, over any subject.
+///
+/// Three declarations need this rule and they differ only in what "the same
+/// subject" means: two workspace projections overlap when their declared source
+/// components nest, two resolved projections overlap when their canonicalised
+/// host paths nest, and two attachments of one block volume always overlap
+/// because they name the one image. The *rule* is identical in all three — a
+/// subject with a writer admits no second attachment, reader or writer — so it
+/// lives here once. Duplicating it is how the reader-beside-a-writer case would
+/// come to be refused for a projection and quietly allowed for a volume.
+///
+/// Returns the first offending pair in declaration order, so the refusal names
+/// a specific pair rather than reporting that some pair exists.
+pub fn first_writable_multi_attach<'a, T>(
+    attachments: &'a [T],
+    writes: impl Fn(&T) -> bool,
+    overlaps: impl Fn(&T, &T) -> bool,
+) -> Option<(&'a T, &'a T)> {
+    for (index, first) in attachments.iter().enumerate() {
+        for second in &attachments[index + 1..] {
+            // Two readers of one subject are allowed: there is no writer to
+            // serialise against. One writer and one reader is not, because the
+            // reader observes a subject another Machine mutates underneath it
+            // with no coherence protocol between the two carriers.
+            if (writes(first) || writes(second)) && overlaps(first, second) {
+                return Some((first, second));
+            }
+        }
+    }
+    None
+}
+
 /// Whether two component lists name the same host subtree or nested subtrees.
 ///
 /// Overlap, not equality, is the property: a Machine projecting `.` and another
@@ -190,10 +222,8 @@ fn components_overlap(first: &[&str], second: &[&str]) -> bool {
 /// source containment is checked syntactically and then again after
 /// canonicalisation.
 ///
-/// Two read-only projections of one source are allowed: there is no writer to
-/// serialise. One writer and one reader is still refused, because the reader
-/// observes a tree another Machine mutates underneath it with no coherence
-/// protocol between the two VirtioFS shares.
+/// The reader/writer rule itself lives in [`first_writable_multi_attach`],
+/// which the block-volume half of the storage policy shares.
 pub fn refuse_declared_writable_multi_attach(
     spec: &EnvironmentSpec,
 ) -> Result<(), WorkspaceProjectionError> {
@@ -207,23 +237,24 @@ pub fn refuse_declared_writable_multi_attach(
                 .map(|projection| (machine.name.as_str(), projection))
         })
         .collect();
-    for (index, (first, first_projection)) in declared.iter().enumerate() {
-        for (second, second_projection) in &declared[index + 1..] {
-            if !is_writer(first_projection.mode) && !is_writer(second_projection.mode) {
-                continue;
-            }
-            if components_overlap(
-                &source_components(&first_projection.source_path),
-                &source_components(&second_projection.source_path),
-            ) {
-                return Err(WorkspaceProjectionError::WritableSourceMultiAttach {
-                    first: (*first).to_string(),
-                    first_source: first_projection.source_path.clone(),
-                    second: (*second).to_string(),
-                    second_source: second_projection.source_path.clone(),
-                });
-            }
-        }
+    if let Some(((first, first_projection), (second, second_projection))) =
+        first_writable_multi_attach(
+            &declared,
+            |(_, projection)| is_writer(projection.mode),
+            |(_, first), (_, second)| {
+                components_overlap(
+                    &source_components(&first.source_path),
+                    &source_components(&second.source_path),
+                )
+            },
+        )
+    {
+        return Err(WorkspaceProjectionError::WritableSourceMultiAttach {
+            first: (*first).to_string(),
+            first_source: first_projection.source_path.clone(),
+            second: (*second).to_string(),
+            second_source: second_projection.source_path.clone(),
+        });
     }
     Ok(())
 }
@@ -235,20 +266,22 @@ pub fn refuse_declared_writable_multi_attach(
 fn refuse_resolved_writable_multi_attach(
     resolved: &[(String, String, PathBuf, bool)],
 ) -> Result<(), WorkspaceProjectionError> {
-    for (index, (first, first_source, first_path, first_writes)) in resolved.iter().enumerate() {
-        for (second, second_source, second_path, second_writes) in &resolved[index + 1..] {
-            if !first_writes && !second_writes {
-                continue;
-            }
-            if first_path.starts_with(second_path) || second_path.starts_with(first_path) {
-                return Err(WorkspaceProjectionError::WritableSourceMultiAttach {
-                    first: first.clone(),
-                    first_source: first_source.clone(),
-                    second: second.clone(),
-                    second_source: second_source.clone(),
-                });
-            }
-        }
+    if let Some((
+        (first, first_source, _, _),
+        (second, second_source, _, _),
+    )) = first_writable_multi_attach(
+        resolved,
+        |(_, _, _, writes)| *writes,
+        |(_, _, first_path, _), (_, _, second_path, _)| {
+            first_path.starts_with(second_path) || second_path.starts_with(first_path)
+        },
+    ) {
+        return Err(WorkspaceProjectionError::WritableSourceMultiAttach {
+            first: first.clone(),
+            first_source: first_source.clone(),
+            second: second.clone(),
+            second_source: second_source.clone(),
+        });
     }
     Ok(())
 }

@@ -147,6 +147,7 @@ async fn write_bundle_and_resolve(source: &Path) -> (ResolvedLinuxMachineTarget,
         project_id: ProjectId::new("prj_artifact_crash").expect("valid Project ID"),
         name: "artifact-crash".into(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,

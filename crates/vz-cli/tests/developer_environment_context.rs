@@ -153,6 +153,7 @@ fn project_state(workspace_key: &str, path_hint: &Path) -> ProjectState {
         project_id: ProjectId::new("prj_real_git_worktree").unwrap(),
         name: "real-git-worktree".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,

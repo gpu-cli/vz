@@ -597,6 +597,19 @@ fn validate_supported_topology(
                         && export.environment_id == record.environment_id
                         && Some(&export.machine_id) == record.machine_id.as_ref()
                 }),
+                // A volume survives Stop by definition: its whole purpose is to
+                // hold state across the Machine lifecycle, and Stop preserves
+                // declared disks and volumes. Nothing is reclaimed here — the
+                // image or directory stays on the host — so the only question is
+                // whether the record is accounted for, and like a host export it
+                // must name a persisted instance rather than merely a supported
+                // kind. `machine_id.is_none()` is part of that: a volume record
+                // that acquired a Machine would be released with that Machine.
+                OwnedResourceKind::Volume => environment.volumes.iter().any(|volume| {
+                    volume.volume_id.to_string() == record.resource_id
+                        && volume.environment_id == record.environment_id
+                        && record.machine_id.is_none()
+                }),
                 OwnedResourceKind::Other(kind) => {
                     kind == "machine_runtime_store" || kind == "runtime_vm"
                 }
@@ -606,7 +619,7 @@ fn validate_supported_topology(
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints, network attachments and host exports; additional topology resources remain unsupported",
+            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints, network attachments, host exports and volumes; additional topology resources remain unsupported",
         ));
     }
     Ok(())

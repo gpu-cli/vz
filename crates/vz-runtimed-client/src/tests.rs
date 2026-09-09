@@ -109,6 +109,7 @@ fn seed_stack_topology(
         project_id: project_id.clone(),
         name: "runtimed-client".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -129,6 +130,7 @@ fn seed_stack_topology(
         },
     };
     let environment = EnvironmentInstance {
+        volumes: Vec::new(),
         network_attachments: Vec::new(),
         host_exports: Vec::new(),
         host_imports: Vec::new(),
@@ -243,6 +245,7 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
         project_id: project_id.clone(),
         name: "status-roundtrip".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -277,6 +280,7 @@ fn seed_multi_environment_topology(config: &RuntimedConfig) -> vz_runtime_contra
         let incarnation_id =
             MachineIncarnationId::new(incarnation_id).expect("valid incarnation id");
         EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

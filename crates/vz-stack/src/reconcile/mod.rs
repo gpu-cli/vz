@@ -238,6 +238,7 @@ pub(crate) fn install_test_planning_authority(store: &StateStore, stack_id: &str
             project_id: project_id.clone(),
             name: "stack-unit-fixture".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -258,6 +259,7 @@ pub(crate) fn install_test_planning_authority(store: &StateStore, stack_id: &str
             },
         };
         let environment = EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

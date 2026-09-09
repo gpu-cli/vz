@@ -61,6 +61,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             project_id: project_id.clone(),
             name: "executor-fixture".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -81,6 +82,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             },
         };
         let environment = EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

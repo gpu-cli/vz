@@ -96,6 +96,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             project_id: project_id.clone(),
             name: "stack-fixture".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -116,6 +117,7 @@ fn install_planning_authority(store: &StateStore, stack_id: &str) -> MachineWork
             },
         };
         let environment = EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
@@ -5704,6 +5706,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
         project_id: project_id.clone(),
         name: "environment-lifecycle-e2e".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -5735,6 +5738,7 @@ async fn environment_lifecycle_journal_linux_vm_stop_up_delete_recovers_without_
                             disk_resource: String,
                             created_at: u64| {
         EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
