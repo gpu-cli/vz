@@ -3966,6 +3966,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "vz-guest-fetch"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "rustls-pki-types",
+ "serde_json",
+]
+
+[[package]]
 name = "vz-image"
 version = "0.1.0"
 dependencies = [

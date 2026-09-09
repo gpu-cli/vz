@@ -20,9 +20,14 @@ failing), edge_shortcut (a published `.test` name resolves to the Machine
 behind the edge instead of to the edge), edge_hosts_shortcut (the published
 name is also in the guest's /etc/hosts, so no resolver is ever asked),
 edge_public_resolver (a Machine on a public-like network keeps the image's
-public resolvers).
+public resolvers), edge_tls_unverified (the guest HTTPS client completes the
+handshake without checking the chain, so the image's pinned public bundle is
+accepted for an Environment's own edge), edge_foreign_anchor_accepted (the
+client accepts any named authority, so another Environment's is accepted), and
+edge_origin_shortcut (the origin sees the CLIENT as its peer, i.e. no source
+translation happened at the edge).
 
-The last seven exist to make the criterion 2, 6 and 17 checks falsifiable
+The last ten exist to make the criterion 2, 6 and 17 checks falsifiable
 offline: each one breaks exactly one claim, and the check has to notice.
 """
 from __future__ import annotations
@@ -193,8 +198,11 @@ if [ -n "$verb" ]; then
       grep -o '"hostname": *"[^"]*"' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/' > "$VZ_RUNTIME_DATA_DIR/edge"
       anchor="$VZ_RUNTIME_DATA_DIR/environment-edges/env_$inc/net_$inc"
       mkdir -p "$anchor"
-      printf -- '-----BEGIN CERTIFICATE-----\nZmFrZSBhdXRob3JpdHk=\n-----END CERTIFICATE-----\n' \
-        > "$anchor/authority.pem"
+      # Bound to this Up's own identity, because the authority IS per
+      # Environment: two Environments publishing identical bytes would make the
+      # cross-Environment TLS refusal unfalsifiable.
+      printf -- '-----BEGIN CERTIFICATE-----\nZmFrZSBhdXRob3JpdHk%s\n-----END CERTIFICATE-----\n' \
+        "$inc" > "$anchor/authority.pem"
     fi
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
@@ -234,8 +242,11 @@ if [ -n "$verb" ]; then
     script="$VZ_RUNTIME_DATA_DIR/script.$$.sh"
     printf '%s' "$command_tail" \
       | sed -e "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" \
+            -e "s#/usr/local/bin/vz-guest-fetch#$(dirname "$0")/guest-fetch-shim#g" \
             -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
             -e "s#/vz-storage#$VZ_RUNTIME_DATA_DIR/guest/$machine/vz-storage#g" \
+            -e "s#/run/vz-edge#$VZ_RUNTIME_DATA_DIR/vz-edge#g" \
+            -e "s#/tmp/vz-fetch-#$VZ_RUNTIME_DATA_DIR/fetch-#g" \
             -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$script"
     # The shim needs the Machine identity: every Machine on a declared network
     # gets its OWN derived address, so a fake that keys addressing on the project
@@ -840,18 +851,14 @@ fi
 serve
 '''
 
-
-BUSYBOX_SHIM = r'''#!/bin/sh
-# Stand-in for the guest BusyBox. Applets that only touch files delegate to the
-# host; `httpd`, `wget`, `ip` and the `/proc`+`/sys` reads model one
-# Environment's private reachability: an address belongs to the project whose
-# runtime directory serves it, so a probe from another project's directory
-# cannot reach it. That is the property under test, modelled at the granularity
-# this fake has (project == Environment).
-state="$VZ_RUNTIME_DATA_DIR"
-machine="${VZ_FAKE_MACHINE:-machine-0}"
-applet=$1
-shift
+FAKE_NET_IDENTITY = r'''# One Environment's addressing, sourced by every guest stand-in.
+#
+# Kept in one file rather than copied into each: the BusyBox stand-in and the
+# HTTPS-client stand-in have to agree about which address is the edge and which
+# is the origin, and two copies that drifted would let a check pass against one
+# fake's idea of the topology and fail against the other's.
+#
+# `state` (the project's runtime directory) and `machine` must already be set.
 
 # One identity per (Environment, Machine), from which BOTH the address and the
 # MAC are derived. That is the invariant the real derivation has to hold: the
@@ -889,6 +896,108 @@ edge_name=""
 # is the distinction criterion 6 exists to make.
 origin_seed=$(printf '%s' "machine-0" | cksum | cut -d' ' -f1)
 origin_addr="10.$octet_a.$octet_b.$(( origin_seed % 200 + 2 ))"
+'''
+
+
+GUEST_FETCH_SHIM = r'''#!/bin/sh
+# Stand-in for the Developer image's certificate-verifying HTTPS client.
+#
+# It models exactly the properties the criterion-6 check reads off the real
+# one, and nothing else: a name that only this Environment's resolver answers,
+# a chain that verifies against this Environment's published authority and
+# against no other trust store, an origin that must actually be listening, and
+# a body whose PEER line is the ORIGIN's view of who connected to it.
+#
+# The three vacuity modes live here because this is where a defeated claim
+# would hide: a client that skipped verification, or accepted any anchor it was
+# handed, or a path that never translated the source address, all still produce
+# a 200 and a body.
+state="$VZ_RUNTIME_DATA_DIR"
+machine="${VZ_FAKE_MACHINE:-machine-0}"
+mode="${VZ_FAKE_MODE:-}"
+. "$(dirname "$0")/fake-net.sh"
+
+# Every failure names its own reason and its own status, because the check
+# asserts on the STATUS: a negative TLS claim that accepted "it failed somehow"
+# would pass when the name merely failed to resolve.
+fail() {
+  printf '{"schema_version":1,"kind":"vz-guest-fetch-error","reason":"%s","detail":"stand-in"}\n' "$1" >&2
+  exit "$2"
+}
+
+[ "$1" = get ] || fail invalid_arguments 2
+shift
+url=""; ca=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --url) [ $# -ge 2 ] || fail invalid_arguments 2; url=$2; shift 2 ;;
+    --ca-file) [ $# -ge 2 ] || fail invalid_arguments 2; ca=$2; shift 2 ;;
+    --timeout-millis) [ $# -ge 2 ] || fail invalid_arguments 2; shift 2 ;;
+    # There is no verification escape hatch in the real client, so there is
+    # none here: an option this does not know is a refusal, never a no-op.
+    *) fail invalid_arguments 2 ;;
+  esac
+done
+case "$url" in https://*) ;; *) fail invalid_arguments 2 ;; esac
+rest=${url#https://}
+host=${rest%%/*}
+# Resolution goes through the Environment's own resolver, which answers this
+# Environment's declared name and nothing else.
+{ [ -n "$edge_name" ] && [ "$host" = "$edge_name" ] ; } || fail resolve_failed 5
+
+# The authority this Environment's daemon published. The client trusts what it
+# was pointed at and nothing else; with no --ca-file it is pointed at the
+# image's pinned PUBLIC bundle, which cannot contain an Environment authority.
+own=$(cat "$state"/environment-edges/*/*/authority.pem 2>/dev/null)
+[ -n "$own" ] || fail trust_bundle_unreadable 3
+presented=""
+if [ -n "$ca" ] && [ -f "$ca" ]; then presented=$(cat "$ca"); fi
+
+trusted=0
+if [ -n "$presented" ] && [ "$presented" = "$own" ]; then trusted=1; fi
+# A client that checks nothing: the public bundle now "verifies" this edge.
+[ "$mode" = edge_tls_unverified ] && trusted=1
+# A client that accepts whatever anchor it is handed, including another
+# Environment's.
+if [ "$mode" = edge_foreign_anchor_accepted ] && [ -n "$presented" ]; then trusted=1; fi
+[ "$trusted" = 1 ] || fail certificate_rejected 7
+
+# A listener lives exactly as long as the invocation holding it; a marker left
+# by a process that is gone is not a service.
+[ -f "$state/httpd" ] || fail connect_failed 6
+pid=$(cut -d' ' -f1 < "$state/httpd")
+root=$(cut -d' ' -f2- < "$state/httpd")
+kill -0 "$pid" 2>/dev/null || fail connect_failed 6
+
+# The edge opens the origin connection itself, so the ORIGIN's peer is the
+# edge and the client's address appears nowhere on it. The shortcut mode is
+# what a path with no translation looks like from the origin's side.
+peer=$edge_addr
+[ "$mode" = edge_origin_shortcut ] && peer=$fabric_addr
+
+printf 'TOKEN %s\n' "$(cat "$root/token")"
+printf 'PEER %s\n' "$peer"
+# The receipt reports the guest path it was pointed at, not the host path this
+# stand-in was rewritten to use.
+guest_ca=$(printf '%s' "$ca" | sed "s#^$state/vz-edge#/run/vz-edge#")
+printf '{"schema_version":1,"kind":"vz-guest-fetch-response","url":"%s","host":"%s","port":443,"peer":"%s","peer_port":443,"status":200,"protocol":"TLSv1_3","body_bytes":0,"trust_bundle":"%s","trust_anchors":1,"verified":true}\n' \
+  "$url" "$host" "$edge_addr" "$guest_ca" >&2
+exit 0
+'''
+
+
+BUSYBOX_SHIM = r'''#!/bin/sh
+# Stand-in for the guest BusyBox. Applets that only touch files delegate to the
+# host; `httpd`, `wget`, `ip` and the `/proc`+`/sys` reads model one
+# Environment's private reachability: an address belongs to the project whose
+# runtime directory serves it, so a probe from another project's directory
+# cannot reach it. That is the property under test, modelled at the granularity
+# this fake has (project == Environment).
+state="$VZ_RUNTIME_DATA_DIR"
+machine="${VZ_FAKE_MACHINE:-machine-0}"
+applet=$1
+shift
+. "$(dirname "$0")/fake-net.sh"
 
 # A peer's MAC is derived from its address by the same rule, so an ARP row names
 # the address the peer genuinely carries rather than an invented one.
@@ -1081,7 +1190,16 @@ case "$applet" in
       counter "$target" tx 1 > /dev/null
       counter "$fabric_addr" rx 1 > /dev/null
     fi
-    cat "$root/index.html"
+    # The origin's CGI reports the peer IT saw. Reached directly like this the
+    # peer is the caller, which is the control the translation claim needs: if
+    # this reported the edge too, "the origin's peer is the edge" would be a
+    # property of the CGI rather than of the path.
+    case "$url" in
+      */cgi-bin/peer)
+        printf 'TOKEN %s\n' "$(cat "$root/token")"
+        printf 'PEER %s\n' "$fabric_addr" ;;
+      *) cat "$root/index.html" ;;
+    esac
     exit 0 ;;
   *) exec "$applet" "$@" ;;
 esac
@@ -1117,9 +1235,14 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     (root / "bin/vz-runtimed").chmod(0o755)
     (root / "bin/vz-runtime-probe").write_text(fake_probe_script(mode_file))
     (root / "bin/vz-runtime-probe").chmod(0o755)
-    # The guest BusyBox stand-in every `vz exec` script addresses.
+    # The guest stand-ins every `vz exec` script addresses, and the one file
+    # they both source so they cannot disagree about the Environment's shape.
+    (root / "bin/fake-net.sh").write_text(FAKE_NET_IDENTITY)
+    (root / "bin/fake-net.sh").chmod(0o644)
     (root / "bin/busybox-shim").write_text(BUSYBOX_SHIM)
     (root / "bin/busybox-shim").chmod(0o755)
+    (root / "bin/guest-fetch-shim").write_text(GUEST_FETCH_SHIM)
+    (root / "bin/guest-fetch-shim").chmod(0o755)
     # Declared-storage admission and materialisation, which the fake `up` runs.
     (root / "bin/vz-storage-model").write_text(STORAGE_MODEL)
     (root / "bin/vz-storage-model").chmod(0o755)

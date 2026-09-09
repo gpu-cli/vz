@@ -3351,6 +3351,28 @@ PUBLIC_ORIGIN_PORT = 8080
 PUBLIC_NAMES = ("api.one.test", "api.two.test")
 UNDECLARED_NAME = "admin.one.test"
 
+# The Developer image's certificate-verifying HTTPS client, and where a client
+# inside a Machine is handed the authority its own Environment published.
+#
+# The client is deliberately rigid: it has no `--insecure`, and its DEFAULT
+# trust store is the pinned public bundle the image already ships at
+# /etc/vz/ca-certificates.crt. That default is what makes the negative claims
+# below mean something -- an Environment's own authority is not in any public
+# bundle, so a fetch that omits `--ca-file` MUST be refused, and one that
+# names another Environment's authority must be refused too.
+GUEST_FETCH = "/usr/local/bin/vz-guest-fetch"
+GUEST_ANCHOR_DIR = "/run/vz-edge"
+# `vz-guest-fetch` gives every failure its own status; 7 is "the peer's chain
+# was refused". Asserting the exact status is what keeps a negative TLS claim
+# from passing because the name failed to resolve or nothing was listening.
+FETCH_CERTIFICATE_REJECTED = "7"
+FETCH_TIMEOUT_MILLIS = 20000
+# The path the origin serves its own view of the connection on. BusyBox `httpd`
+# runs anything under `cgi-bin/` as CGI and hands it `REMOTE_ADDR`, which is the
+# only way the ORIGIN (rather than the client, or the host) gets to say which
+# peer it saw -- and therefore the only first-hand evidence of the translation.
+ORIGIN_CGI_PATH = "/cgi-bin/peer"
+
 # What a Machine on a public-like network knows about its own edge, read from
 # the guest rather than assumed from the host.
 #
@@ -3371,6 +3393,12 @@ UNDECLARED_NAME = "admin.one.test"
 #                          mean the resolver was never asked, and every DNS
 #                          claim below would pass without the resolver existing.
 #   ADDR <iface> <cidr>    the Machine's own IPv4 addresses.
+#   FETCH <yes|no>         whether this Machine actually carries the HTTPS
+#                          client. Read off the running root rather than
+#                          assumed from the image having been built with it:
+#                          the binary is copied across the overlay/chroot
+#                          boundary by `init`, and a copy that did not happen
+#                          leaves a Machine that cannot fetch anything.
 PUBLIC_EDGE_PROBE = (
     '/bin/busybox --list | /bin/busybox awk \'{print "APPLET", $0}\'; '
     'for p in $(/bin/busybox cat /proc/cmdline); do '
@@ -3381,7 +3409,8 @@ PUBLIC_EDGE_PROBE = (
     'done; '
     '/bin/busybox cat /etc/resolv.conf 2>/dev/null | /bin/busybox awk \'{print "RESOLV", $0}\'; '
     '/bin/busybox cat /etc/hosts 2>/dev/null | /bin/busybox awk \'{print "HOSTS", $0}\'; '
-    '/bin/busybox ip -o -4 addr show | /bin/busybox awk \'$2!="lo"{print "ADDR", $2, $4}\''
+    '/bin/busybox ip -o -4 addr show | /bin/busybox awk \'$2!="lo"{print "ADDR", $2, $4}\'; '
+    f'if [ -x {GUEST_FETCH} ]; then printf "FETCH yes\\n"; else printf "FETCH no\\n"; fi'
 )
 
 
@@ -3395,6 +3424,7 @@ class EdgeState:
         self.resolv_conf = []   # nameserver addresses in /etc/resolv.conf
         self.hosts = []         # raw /etc/hosts lines
         self.addresses = []     # this Machine's own IPv4 addresses
+        self.https_client = False  # whether GUEST_FETCH is present and executable
         for line in receipt.stdout.decode("ascii", "replace").splitlines():
             row = line.split()
             if row[:1] == ["APPLET"] and len(row) == 2:
@@ -3411,11 +3441,25 @@ class EdgeState:
                 self.hosts.append(" ".join(row[1:]))
             elif row[:1] == ["ADDR"] and len(row) == 3:
                 self.addresses.append(row[2].split("/")[0])
+            elif row[:2] == ["FETCH", "yes"]:
+                self.https_client = True
+
+    def fabric_address(self, edge: str):
+        """This Machine's address on the edge's own network, and no other.
+
+        A Machine carries Apple's NAT address as well as its fabric one, and the
+        origin the edge dials is the fabric one. Picking by /24 rather than by
+        interface name is the same rule the fabric checks use: the host cannot
+        predict which name the NIC gets, but it derived the range.
+        """
+        prefix = edge.rsplit(".", 1)[0] + "."
+        matching = [address for address in self.addresses if address.startswith(prefix)]
+        return matching[0] if len(matching) == 1 else None
 
     def evidence(self) -> str:
         return (f"cmdline gateways {self.gateways!r}, vz.dns {self.resolver_args!r}, "
                 f"resolv.conf {self.resolv_conf!r}, addresses {self.addresses!r}, "
-                f"hosts {self.hosts!r}")
+                f"hosts {self.hosts!r}, https client {self.https_client}")
 
 
 def public_like_definition(release_dir: Path, hostname: str) -> dict:
@@ -3486,6 +3530,122 @@ def _is_ipv4(text: str) -> bool:
     return len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
 
 
+def install_anchor(ctx, check, label, instance, machine, name, pem: bytes):
+    """Put one published certificate authority inside a Machine, verbatim.
+
+    The daemon publishes an Environment's authority on the HOST, under its own
+    runtime directory; a client inside the Environment has to be handed it. It
+    is written here as the exact bytes the daemon published -- not a re-encoded
+    or re-derived copy -- because what the client then verifies against is the
+    whole meaning of the TLS claim, and the byte count is read back so a
+    truncated write cannot look like a refused certificate later.
+    """
+    body = pem.decode("ascii").rstrip("\n")
+    script = (f"/bin/busybox mkdir -p {GUEST_ANCHOR_DIR}; "
+              f"/bin/busybox cat > {GUEST_ANCHOR_DIR}/{name} <<'VZPEM'\n{body}\nVZPEM\n"
+              f"printf 'BYTES '; /bin/busybox wc -c < {GUEST_ANCHOR_DIR}/{name}")
+    receipt = machine_exec(ctx, check, label, instance, machine, script)
+    written = None
+    for line in receipt.stdout.decode("ascii", "replace").splitlines():
+        if line.startswith("BYTES"):
+            fields = line.split()
+            written = int(fields[1]) if len(fields) == 2 and fields[1].isdigit() else None
+    check.check(receipt.exit_code == 0 and written == len(body) + 1,
+                f"{label}: the published authority is inside {machine} byte for byte "
+                f"(exit {receipt.exit_code}, wrote {written}, published {len(body) + 1})")
+    return f"{GUEST_ANCHOR_DIR}/{name}"
+
+
+# The origin behind the edge: a token that says the response came from the
+# declared Machine, and the peer address that Machine's own kernel reports for
+# the connection. `REMOTE_ADDR` is the origin's first-hand account of who
+# connected to it, which is the only place the source translation is visible as
+# a fact rather than as an intention.
+def origin_script(token: str) -> str:
+    return (
+        "/bin/busybox mkdir -p /www/cgi-bin; "
+        f"printf %s {token} > /www/token; "
+        "/bin/busybox cat > /www/cgi-bin/peer <<'VZCGI'\n"
+        "#!/bin/busybox sh\n"
+        "printf 'Content-Type: text/plain\\r\\n\\r\\n'\n"
+        "printf 'TOKEN %s\\n' \"$(/bin/busybox cat /www/token)\"\n"
+        "printf 'PEER %s\\n' \"$REMOTE_ADDR\"\n"
+        "VZCGI\n"
+        "/bin/busybox chmod 755 /www/cgi-bin/peer; "
+        f"printf %s {token} > /www/index.html; "
+        f"/bin/busybox httpd -f -p {PUBLIC_ORIGIN_PORT} -h /www"
+    )
+
+
+class FetchResult:
+    """One `vz-guest-fetch` invocation, as the Machine reported it.
+
+    Three separate streams, kept separate on purpose: the exit status names the
+    KIND of failure, stdout is the response body byte for byte, and the JSON
+    receipt on stderr is the client's own account of the exchange -- the address
+    it reached, the protocol it negotiated, and the trust store it verified
+    against.
+    """
+
+    def __init__(self, receipt):
+        self.exit = None
+        self.body = []
+        self.receipt = {}
+        self.receipt_raw = ""
+        for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+            if line.startswith("EXIT "):
+                self.exit = line[len("EXIT "):].strip()
+            elif line.startswith("BODY "):
+                self.body.append(line[len("BODY "):])
+            elif line.startswith("RECEIPT "):
+                self.receipt_raw = line[len("RECEIPT "):]
+                try:
+                    self.receipt = json.loads(self.receipt_raw)
+                except ValueError:
+                    self.receipt = {}
+
+    def field(self, name):
+        return self.receipt.get(name)
+
+    def reported(self, key: str):
+        """A `KEY value` line the origin's CGI printed into the body."""
+        for line in self.body:
+            fields = line.split()
+            if fields[:1] == [key] and len(fields) >= 2:
+                return fields[1]
+        return None
+
+    def evidence(self) -> str:
+        return f"exit {self.exit}, body {self.body!r}, receipt {self.receipt_raw[:300]!r}"
+
+
+def _reported(receipt, key: str):
+    """A `KEY value` line out of a plaintext CGI response on stdout."""
+    if receipt is None:
+        return None
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        fields = line.split()
+        if fields[:1] == [key] and len(fields) >= 2:
+            return fields[1]
+    return None
+
+
+def guest_fetch(ctx, check, label, instance, machine, url, *, ca_file=None):
+    """One HTTPS GET from inside a Machine, with its three streams kept apart.
+
+    `ca_file` is omitted deliberately in the negative cases: with no `--ca-file`
+    the client verifies against the image's pinned PUBLIC bundle, which cannot
+    contain an Environment's own authority, so the fetch must be refused.
+    """
+    anchor = f" --ca-file {ca_file}" if ca_file else ""
+    script = (f"{GUEST_FETCH} get --url {url}{anchor} --timeout-millis {FETCH_TIMEOUT_MILLIS} "
+              "> /tmp/vz-fetch-body 2> /tmp/vz-fetch-receipt; code=$?; "
+              "printf 'EXIT %s\\n' \"$code\"; "
+              "/bin/busybox awk '{print \"BODY\", $0}' /tmp/vz-fetch-body; "
+              "/bin/busybox awk '{print \"RECEIPT\", $0}' /tmp/vz-fetch-receipt")
+    return FetchResult(machine_exec(ctx, check, label, instance, machine, script))
+
+
 def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
     """Criterion 6: the Environment's own public-like edge, and nothing on the host.
 
@@ -3509,6 +3669,20 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
     * an undeclared name in the same Environment does not resolve, and a second
       Environment's Machine cannot resolve this Environment's name nor this one
       the other's -- which is what makes the DNS view split rather than shared;
+    * the declared API answers, from inside a Machine, over a TLS session that
+      Machine's own client verified against its Environment's published
+      authority -- and the SAME request is refused against the image's pinned
+      public CA bundle and against a second Environment's authority. The
+      refusals are what make the acceptance mean something: they are the same
+      request over the same path with only the trust store changed, so the
+      difference can be nothing but a verification result;
+    * the response body carries the token the DECLARED origin Machine wrote, on
+      the declared port, so the ingress was routed rather than answered by the
+      edge for itself;
+    * the origin's own `REMOTE_ADDR` for that connection is the EDGE. The same
+      origin, spoken to directly by its sibling, reports the caller instead --
+      which is what makes the translation a property of the path rather than of
+      the CGI;
     * and no listener attributable to this run appeared on the host's LAN or on
       any wildcard address while all of it was running, while the edge's own
       address is bound nowhere on the host at all -- both read off the host's
@@ -3516,7 +3690,7 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
       absence of a bind in the source.
 
     What it does NOT prove, and says so rather than passing on the rest: the
-    TLS, routed-ingress and address-translation clauses. See the
+    controlled-egress, host-import/export and fault-control clauses. See the
     `not_implemented` text at the end for exactly why.
     """
     check = SubCheck(top, "public_like_ingress")
@@ -3646,6 +3820,151 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
         check.check(code != "0" and not addresses,
                     f"{label}: `{name}` does not resolve in the other Environment "
                     f"(exit {code}, addresses {addresses})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ---- TLS, routed ingress and the source translation --------------------
+    #
+    # Everything above is about names. These are the criterion's other three
+    # clauses, and none of them could be exercised until the Developer image
+    # carried a client that can both complete this edge's handshake and check a
+    # certificate: BusyBox `ssl_client` can do neither. `vz-guest-fetch` is that
+    # client, and it has no way to disable verification, so a fetch that
+    # succeeds is a fetch whose chain was checked.
+    #
+    # The order below is chosen so each claim rests on the one before it:
+    # the client exists; the two Environments published DIFFERENT authorities;
+    # the origin answers on its own address and reports the client's address
+    # when spoken to directly; the same origin, reached through the edge by
+    # name over TLS, reports the EDGE instead; and the same request is refused
+    # against the image's public bundle and against the other Environment's
+    # authority. Without those last two, "the handshake succeeded" would be
+    # compatible with a client that verifies nothing.
+    for machine, state in states.items():
+        check.check(state.https_client,
+                    f"{machine} carries the Developer image's HTTPS client at {GUEST_FETCH} "
+                    f"({state.evidence()})")
+    foreign_anchors = edge_anchor(outside)
+    check.check(len(foreign_anchors) == 1,
+                f"the second Environment published exactly one authority of its own ({foreign_anchors})")
+    if check.status != "PASS":
+        return check.finish()
+    foreign = read_regular(foreign_anchors[0])
+    # Two Environments, two authorities. If they were the same bytes, the
+    # cross-Environment refusal below would prove nothing at all.
+    check.check(foreign != anchor,
+                f"the two Environments minted different authorities "
+                f"({len(anchor)} and {len(foreign)} bytes, identical: {foreign == anchor})")
+    origin_address = states["machine-0"].fabric_address(edge)
+    client_address = states["machine-1"].fabric_address(edge)
+    check.check(origin_address is not None and client_address is not None
+                and origin_address != client_address,
+                f"origin and client hold distinct addresses on the edge's own network "
+                f"(machine-0 {origin_address}, machine-1 {client_address}, edge {edge})")
+    if check.status != "PASS":
+        return check.finish()
+
+    own_anchor = install_anchor(ctx, check, "edge-anchor-own", inside, "machine-1",
+                                "authority.pem", anchor)
+    other_anchor = install_anchor(ctx, check, "edge-anchor-foreign", inside, "machine-1",
+                                  "foreign.pem", foreign)
+    if check.status != "PASS":
+        return check.finish()
+
+    token = "vzedge-" + uuid.uuid4().hex[:16]
+    # Held open for exactly as long as the fetches need it, for the same reason
+    # the private-path listener is: a Machine `exec` SIGKILLs its whole process
+    # group before reporting, so a backgrounded `httpd` is already dead when the
+    # sibling fetches -- which reads exactly like an edge that does not route.
+    server = hold_machine_exec(ctx, check, "edge-serve", inside, "machine-0", origin_script(token))
+    try:
+        # The origin answering its OWN address settles the listener before the
+        # edge is asked to carry anything, and it is also the control for the
+        # translation claim: spoken to directly, this same CGI reports the
+        # caller. If it reported the edge here too, the claim below would be an
+        # artefact of the CGI rather than a fact about the path.
+        direct = None
+        for attempt in range(1, LISTENER_ATTEMPTS + 1):
+            direct = machine_exec(ctx, check, "edge-serve-local", inside, "machine-0",
+                                  f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - "
+                                  f"http://{origin_address}:{PUBLIC_ORIGIN_PORT}{ORIGIN_CGI_PATH}")
+            if direct.exit_code == 0 and token.encode() in direct.stdout:
+                break
+            time.sleep(LISTENER_INTERVAL)
+        direct_peer = _reported(direct, "PEER")
+        check.check(direct.exit_code == 0 and token.encode() in direct.stdout,
+                    f"the declared origin answers on its own fabric address after {attempt} "
+                    f"attempt(s) (exit {direct.exit_code}, {direct.stdout[:120]!r})")
+        check.check(direct_peer == origin_address,
+                    f"spoken to directly, the origin reports the caller as its peer "
+                    f"(reported {direct_peer}, caller {origin_address})")
+        if check.status != "PASS":
+            return check.finish()
+
+        # The criterion's own path: a client inside a Machine, reaching a
+        # declared API by its published name, over TLS it verified against its
+        # Environment's authority.
+        url = f"https://{PUBLIC_NAMES[0]}{ORIGIN_CGI_PATH}"
+        through = guest_fetch(ctx, check, "edge-fetch", inside, "machine-1", url, ca_file=own_anchor)
+        check.check(through.exit == "0",
+                    f"the declared `.test` API answers over verified TLS from inside a Machine "
+                    f"({through.evidence()})")
+        if through.exit != "0":
+            return check.finish()
+        # The client's own account: which address the NAME led it to, and what
+        # it negotiated there. The edge terminates TLS, so this address is the
+        # edge's and never the origin's.
+        check.check(through.field("peer") == edge,
+                    f"the TLS session terminated at the edge, not at the origin "
+                    f"(client reached {through.field('peer')}, edge {edge}, origin {origin_address})")
+        check.check(through.field("verified") is True and through.field("trust_anchors") == 1
+                    and through.field("trust_bundle") == own_anchor,
+                    f"the chain was verified against the Environment's own published authority "
+                    f"and nothing else ({through.receipt_raw[:200]!r})")
+        check.check(str(through.field("protocol") or "").startswith("TLSv1")
+                    and through.field("status") == 200,
+                    f"the exchange was TLS 1.x and the origin returned 200 "
+                    f"(protocol {through.field('protocol')!r}, status {through.field('status')!r})")
+        # Routed ingress: the bytes came from the DECLARED origin, on the
+        # declared port, and not from the edge answering for itself.
+        check.check(through.reported("TOKEN") == token,
+                    f"the response body came from the declared origin Machine "
+                    f"(token {through.reported('TOKEN')!r}, expected {token!r})")
+        # The translation. The origin's own kernel says its peer was the edge;
+        # the client's address appears nowhere on that connection.
+        through_peer = through.reported("PEER")
+        check.check(through_peer == edge,
+                    f"the origin's peer on the ingress path is the edge "
+                    f"(origin reported {through_peer}, edge {edge})")
+        check.check(through_peer != client_address,
+                    f"the client's own address never reached the origin "
+                    f"(origin reported {through_peer}, client {client_address})")
+
+        # The negatives, without which the positive proves only that bytes
+        # moved. Both are the SAME request over the SAME path; only the trust
+        # store changes, so a refusal can be nothing but a verification result.
+        public_bundle = guest_fetch(ctx, check, "edge-fetch-public-bundle", inside, "machine-1", url)
+        check.check(public_bundle.exit == FETCH_CERTIFICATE_REJECTED,
+                    f"the same request is REFUSED against the image's pinned public CA bundle "
+                    f"(exit {public_bundle.exit}, expected {FETCH_CERTIFICATE_REJECTED}; "
+                    f"{public_bundle.evidence()})")
+        check.check(not public_bundle.reported("TOKEN"),
+                    f"the refused fetch returned no body from the origin "
+                    f"(body {public_bundle.body!r})")
+        cross = guest_fetch(ctx, check, "edge-fetch-foreign-anchor", inside, "machine-1", url,
+                            ca_file=other_anchor)
+        check.check(cross.exit == FETCH_CERTIFICATE_REJECTED,
+                    f"the same request is REFUSED against the OTHER Environment's authority "
+                    f"(exit {cross.exit}, expected {FETCH_CERTIFICATE_REJECTED}; {cross.evidence()})")
+        check.check(not cross.reported("TOKEN"),
+                    f"the cross-Environment fetch returned no body from the origin "
+                    f"(body {cross.body!r})")
+    finally:
+        released = ctx.release(check, server)
+        # `None` is the one uncertain outcome: the invocation outlived SIGKILL,
+        # so something this lane started may still be running.
+        check.check(released.exit_code is not None,
+                    f"the held origin was released (exit {released.exit_code})")
 
     # Nothing on the host LAN or the public Internet. A negative claim about the
     # host has to be read off the host: this is the real listener table while
@@ -3686,39 +4005,42 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
             check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
 
     # Everything above is real, and it is not the whole criterion. Criterion 6
-    # also requires that the client reach the API through TLS, routed ingress
-    # and NAT, and none of that was exercised here, because the client could not
-    # be: the Developer Linux guest image ships no TLS client that can talk to
-    # this edge.
+    # is one long sentence, and this check now exercises most of it against
+    # installed binaries: isolated routing and DNS views, environment-local
+    # public-like ingress, the firewall/NAT translation, TLS, and the negative
+    # host claim that no shared NAT address or wildcard listener stands in for
+    # an authorization boundary.
     #
-    # BusyBox 1.37.0's `ssl_client` (the only TLS in the image, reached by
-    # `wget https://`) reads exactly one handshake message per TLS record, and
-    # rustls coalesces its whole TLS 1.2 server flight into one record; the
-    # handshake deadlocks. That is not a server setting: capping the record size
-    # splits the flight on byte boundaries and BusyBox then rejects it outright.
-    # And `networking/wget.c` force-sets no-check-certificate and prints "TLS
-    # certificate validation not implemented", so even a completed handshake
-    # would verify nothing -- it could not tell this Environment's authority
-    # from any other, which is most of what the TLS clause is for.
+    # Three of its clauses are still untouched here, and they are named rather
+    # than left to look covered:
     #
-    # Reporting PASS on the DNS and host-listener clauses would certify the
-    # criterion on evidence that never touched its TLS, ingress or translation
-    # clauses. The edge implements all three and they are exercised end to end
-    # over a real switch, by a real TLS client against a real origin that
-    # reports the peer address it saw, in
-    # `crates/vz-runtimed/src/environment_gateway_tests.rs`. That is
-    # component-level evidence and it is not this criterion's evidence: nothing
-    # in it boots a Machine.
+    #   * controlled egress. `EgressPolicy` admits `Offline` alone in this
+    #     runtime -- reaching a host off the fabric needs a translation towards
+    #     the host's own network and a policy deciding which hosts, and neither
+    #     exists. The edge translates only between an Environment's own client
+    #     and its own declared origin, which is what was proved above.
+    #   * explicit host imports and exports. Criterion 6 requires host imports
+    #     to reach exact stored loopback services through authenticated
+    #     Environment/Machine-owned relays; no such relay is implemented, so
+    #     nothing here imports or exports anything.
+    #   * the deterministic latency/loss/bandwidth/partition/DNS fault controls.
+    #     No `Fault` is declared, applied or measured by this lane.
+    #
+    # Reporting PASS would certify the criterion on evidence that never touched
+    # those three, so the sub-check stays not_implemented and says which.
     if check.status == "PASS":
         check.not_implemented = (
-            "criterion 6's TLS, routed-ingress and NAT clauses were not exercised from inside a "
-            "Machine. The Developer Linux guest image carries no TLS client that can reach this "
-            "edge: BusyBox 1.37.0 `ssl_client` reads one handshake message per TLS record while "
-            "rustls coalesces its TLS 1.2 server flight into one, so the handshake never completes, "
-            "and `wget` force-sets no-check-certificate, so it could not verify the Environment's "
-            "authority even if it did. The split-DNS, `.test`-hostname, edge-versus-origin, "
-            "cross-Environment and host-listener clauses above all passed. Closing this criterion "
-            "needs a certificate-verifying HTTPS client inside a Developer Linux Machine; the edge "
-            "itself terminates TLS, routes by SNI and translates the source address, proved over a "
-            "real switch in crates/vz-runtimed/src/environment_gateway_tests.rs.")
+            "criterion 6's controlled-egress, host-import/export and fault-control clauses were "
+            "not exercised. `EgressPolicy` admits only `Offline` in this runtime and no "
+            "authenticated host-import relay exists, so nothing reached a host off the fabric or "
+            "was imported to one; and no latency/loss/bandwidth/partition/DNS fault was declared, "
+            "applied or measured. Everything else in the criterion did run from inside real "
+            "Machines and passed: the split-DNS and `.test`-hostname views, the edge-versus-origin "
+            "distinction, cross-Environment name isolation, a verified TLS session from a Machine "
+            "to the declared API through the edge, routed ingress to the declared origin on its "
+            "declared port, the source translation (the origin's own `REMOTE_ADDR` is the edge, "
+            "and is the caller when that same origin is spoken to directly), the refusal of the "
+            "same request against the image's pinned public CA bundle and against another "
+            "Environment's authority, and the absence of any attributable host LAN or wildcard "
+            "listener while both edges ran.")
     return check.finish()

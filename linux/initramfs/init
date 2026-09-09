@@ -145,6 +145,38 @@ install_developer_e2fsprogs() {
   verify_developer_e2fsprogs "$e2_target_root"
 }
 
+# The Developer image's certificate-verifying HTTPS client.
+#
+# It has to be carried across the overlay/chroot boundary for the same reason
+# every other static tool does: `vz exec` runs inside the chroot, and a binary
+# left behind in the initramfs is not a capability any Machine has. It is
+# installed beside the pinned CA bundle that `install_developer_ca_trust` puts
+# in the same root, because that bundle is the client's default trust store and
+# a client without one fails closed on every fetch.
+install_developer_https_client() {
+  hc_origin=/usr/bin/vz-guest-fetch
+  hc_root="$1"
+  [ -f "$hc_origin" ] && [ ! -L "$hc_origin" ] || return 1
+  [ -d "$hc_root" ] && [ ! -L "$hc_root" ] || return 1
+  hc_target_dir="$hc_root/usr/local/bin"
+  [ ! -L "$hc_target_dir" ] || return 1
+  if [ -e "$hc_target_dir" ]; then [ -d "$hc_target_dir" ] || return 1; fi
+  /bin/busybox mkdir -p "$hc_target_dir" || return 1
+  hc_target="$hc_target_dir/vz-guest-fetch"
+  # A path the external image already occupies is not overwritten silently: the
+  # copy is only accepted when it is byte-identical to the one this initramfs
+  # verified, so an image cannot substitute its own client for this one.
+  [ ! -L "$hc_target" ] || return 1
+  if [ -e "$hc_target" ]; then
+    [ -f "$hc_target" ] || return 1
+    /bin/busybox cmp "$hc_origin" "$hc_target" || return 1
+  else
+    /bin/busybox cp "$hc_origin" "$hc_target" || return 1
+  fi
+  /bin/busybox chmod 555 "$hc_target" || return 1
+  [ -x "$hc_target" ] || return 1
+}
+
 # Developer trust is a pinned public bundle in this verified initramfs, not
 # host trust or the build container's CA directory. Hardened has neither the
 # Developer xtables marker nor CA payload. Integrity failure is terminal.
@@ -432,6 +464,13 @@ switch_root_into_overlay_rootfs() {
   if [ -x /sbin/xtables-legacy-multi ] && ! install_developer_ca_trust "$ROOTFS"; then
     # Do not fall back to a different rootfs after rejecting unsafe trust paths.
     echo "[vz-init] Developer overlay CA trust installation failed"
+    exit 1
+  fi
+  # Terminal for the same reason the trust install is: a Developer Machine that
+  # came up without its HTTPS client would report every https fetch as "no such
+  # file", which is indistinguishable from a network that does not carry.
+  if [ -x /sbin/xtables-legacy-multi ] && ! install_developer_https_client "$ROOTFS"; then
+    echo "[vz-init] Developer overlay HTTPS client installation failed"
     exit 1
   fi
   # Install applet symlinks using busybox's built-in mechanism.

@@ -92,7 +92,7 @@ E2FSPROGS_URL := https://www.kernel.org/pub/linux/kernel/people/tytso/e2fsprogs/
 E2FSPROGS_HELPER := $(ROOT_DIR)/e2fsprogs-build.py
 
 ifeq ($(KERNEL_PROFILE),developer)
-INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY) e2fsprogs $(CA_TRUST_HELPER) \
+INITRAMFS_PROFILE_INPUTS := $(IPTABLES_BINARY) e2fsprogs guest-fetch $(CA_TRUST_HELPER) \
 	$(CA_TRUST_SOURCE)/inputs.json $(CA_TRUST_SOURCE)/cacert.pem \
 	$(CA_TRUST_SOURCE)/LICENSE $(CA_TRUST_SOURCE)/install.sh
 IPTABLES_VERSION_JSON := "$(IPTABLES_VERSION)"
@@ -104,6 +104,16 @@ endif
 GUEST_AGENT_TARGET ?= aarch64-unknown-linux-musl
 GUEST_AGENT_BUILD_TOOL ?= cargo
 GUEST_AGENT_BINARY := $(CRATES_DIR)/target/$(GUEST_AGENT_TARGET)/release/vz-guest-agent
+# The Developer image's HTTPS client. Built for the same target and by the same
+# tool as the agent; kept a separate binary because the agent speaks tonic over
+# vsock and has no business carrying a TLS stack, and kept out of the container
+# profile because that profile ships no trust bundle for it to read.
+#
+# Derived from the agent's path rather than restated, and deferred rather than
+# expanded here: the Docker builder overrides GUEST_AGENT_BINARY because its
+# CARGO_TARGET_DIR is inside the build volume, and a second path spelled out in
+# terms of the checkout would point at a directory that does not exist there.
+GUEST_FETCH_BINARY = $(dir $(GUEST_AGENT_BINARY))vz-guest-fetch
 
 INITRAMFS_IMAGE := $(OUT_DIR)/initramfs.img
 VERSION_JSON := $(OUT_DIR)/version.json
@@ -120,7 +130,7 @@ AGENT_VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' $(CRATES_DIR)/vz-gu
 AGENT_PROTOCOL_REVISION := $(shell sed -n 's/^pub const AGENT_PROTOCOL_REVISION: u32 = \([0-9][0-9]*\);/\1/p' $(CRATES_DIR)/vz-agent-proto/src/lib.rs | head -1)
 BUILD_TIMESTAMP := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
-.PHONY: help all all-profiles dirs clean distclean kernel kernel-config-summary initramfs guest-agent youki iptables developer-probe version docker-build docker-build-all
+.PHONY: help all all-profiles dirs clean distclean kernel kernel-config-summary initramfs guest-agent guest-fetch youki iptables developer-probe version docker-build docker-build-all
 
 help:
 	@echo "Linux artifact build targets:"
@@ -304,6 +314,23 @@ guest-agent:
 		cd "$(CRATES_DIR)" && cargo build --release -p vz-guest-agent --target "$(GUEST_AGENT_TARGET)"; \
 	fi
 
+guest-fetch:
+	@test "$(KERNEL_PROFILE)" = developer || { echo 'the HTTPS client belongs only to Developer images' >&2; exit 1; }
+	@echo "Building vz-guest-fetch for $(GUEST_AGENT_TARGET)"
+	@if [[ "$(GUEST_AGENT_BUILD_TOOL)" == "zigbuild" ]]; then \
+		cd "$(CRATES_DIR)" && cargo zigbuild --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
+	else \
+		if ! rustup target list --installed | grep -q "^$(GUEST_AGENT_TARGET)$$"; then \
+			rustup target add "$(GUEST_AGENT_TARGET)"; \
+		fi; \
+		cd "$(CRATES_DIR)" && cargo build --release -p vz-guest-fetch --target "$(GUEST_AGENT_TARGET)"; \
+	fi
+	@ELF_PROGRAM_HEADERS="$$(file "$(GUEST_FETCH_BINARY)")"; \
+	if [[ "$$ELF_PROGRAM_HEADERS" != *"statically linked"* ]]; then \
+		echo "vz-guest-fetch must be statically linked for the initramfs: $$ELF_PROGRAM_HEADERS" >&2; \
+		exit 1; \
+	fi
+
 $(INITRAMFS_IMAGE): $(BUSYBOX_BINARY) $(INITRAMFS_PROFILE_INPUTS) guest-agent $(ROOT_DIR)/Makefile \
 	$(INITRAMFS_TEMPLATE_DIR)/init \
 	$(INITRAMFS_TEMPLATE_DIR)/etc/resolv.conf \
@@ -327,6 +354,14 @@ ifeq ($(KERNEL_PROFILE),developer)
 	cp "$(OUT_DIR)/e2fsprogs/mke2fs" "$(INITRAMFS_ROOT)/sbin/mke2fs"
 	cp "$(OUT_DIR)/e2fsprogs/dumpe2fs" "$(INITRAMFS_ROOT)/sbin/dumpe2fs"
 	cp "$(OUT_DIR)/e2fsprogs/e2fsprogs.build.json" "$(INITRAMFS_ROOT)/etc/vz-e2fsprogs.json"
+	cp "$(GUEST_FETCH_BINARY)" "$(INITRAMFS_ROOT)/usr/bin/vz-guest-fetch"
+	chmod +x "$(INITRAMFS_ROOT)/usr/bin/vz-guest-fetch"
+	# One path in every root a Machine can end up running in. `init` copies the
+	# binary to /usr/local/bin inside the overlay rootfs; when that rootfs is
+	# unavailable the initramfs itself is the root, and without this the client
+	# would live at a different path in the two cases.
+	mkdir -p "$(INITRAMFS_ROOT)/usr/local/bin"
+	ln -sf /usr/bin/vz-guest-fetch "$(INITRAMFS_ROOT)/usr/local/bin/vz-guest-fetch"
 	cp "$(IPTABLES_BINARY)" "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	chmod +x "$(INITRAMFS_ROOT)/sbin/xtables-legacy-multi"
 	for cmd in iptables iptables-save iptables-restore ip6tables ip6tables-save ip6tables-restore; do \

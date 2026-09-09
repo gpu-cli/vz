@@ -102,6 +102,22 @@ foreign ELF output, and revalidates source/recipe/binary hashes on cache reuse.
 The provenance record ships as `/etc/vz-e2fsprogs.json`; the initramfs digest
 binds both tools and this record. Hardened initramfs builds omit these tools.
 
+Developer initramfs builds also include `vz-guest-fetch`, a static
+certificate-verifying HTTPS client, staged at `/usr/bin/vz-guest-fetch` and
+copied by `init` into every Machine's running root at
+`/usr/local/bin/vz-guest-fetch`. It exists because BusyBox has no usable TLS
+client for an Environment's own edge: `ssl_client` reads one handshake message
+per TLS record while the edge coalesces its TLS 1.2 server flight into one, and
+`wget` force-sets no-check-certificate, so a completed handshake would verify
+nothing. `vz-guest-fetch` performs one HTTPS GET, always verifies the chain --
+there is no option to disable verification -- and reads its trust anchors from a
+PEM file, defaulting to the image's pinned bundle at
+`/etc/vz/ca-certificates.crt`. An Environment's own authority is trusted only
+when it is named with `--ca-file`, so a fetch of an Environment edge against the
+default bundle fails, which is what makes a successful one evidence. `make
+guest-fetch` builds it for `GUEST_AGENT_TARGET`; hardened initramfs builds omit
+it, along with the trust bundle it would read.
+
 Private Docker disks are formatted only with an exact outstanding format
 intent. New disks use journaled ext4 with eager inode/journal initialization;
 both new and existing disks must pass a read-only feature, UUID, clean-state,

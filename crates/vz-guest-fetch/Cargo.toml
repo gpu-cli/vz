@@ -1,0 +1,24 @@
+[package]
+name = "vz-guest-fetch"
+version = "0.1.0"
+description = "Certificate-verifying HTTPS client for the Developer Linux guest image: the client half of a public-like Environment edge."
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "vz-guest-fetch"
+path = "src/main.rs"
+
+[dependencies]
+rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+rustls-pki-types = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+rcgen = { workspace = true }
+
+[lints]
+workspace = true

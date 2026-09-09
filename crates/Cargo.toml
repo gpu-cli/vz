@@ -10,6 +10,7 @@ members = [
     "vz-cli",
     "vz-runtimed",
     "vz-guest-agent",
+    "vz-guest-fetch",
     "vz-image",
     "vz-linux",
     "vz-oci",
@@ -204,6 +205,7 @@ vz-agent-loader-client = { path = "vz-agent-loader-client" }
 smoltcp = { version = "0.12", default-features = false, features = ["std", "medium-ethernet", "proto-ipv4", "socket-tcp", "socket-udp"] }
 rustls = { version = "0.23", default-features = false, features = ["std", "ring"] }
 rustls-pki-types = "1"
+rustls-pemfile = "2"
 rcgen = { version = "0.13", default-features = false, features = ["crypto", "pem", "ring"] }
 
 # gRPC / Protobuf
@@ -211,6 +213,14 @@ tonic = { version = "0.12", features = ["transport"] }
 prost = "0.13"
 tower = "0.5"
 hyper-util = "0.1"
+
+# The guest fetch client is copied into an initramfs, which is loaded whole
+# into every Machine's memory at boot. Symbols it would never be debugged with
+# in there are pure cost, so this one package is stripped regardless of which
+# linker built it -- `cargo zigbuild` strips by default and the Docker builder's
+# `cargo build` does not, and an artefact in an image should not differ by that.
+[profile.release.package.vz-guest-fetch]
+strip = "symbols"
 
 [workspace.lints.rust]
 unsafe_code = "warn"

@@ -55,11 +55,11 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
 # which certified the criterion on evidence that never touched its macOS clause.
 #
-# `public_like_ingress` proves criterion 6's split-DNS, `.test`-hostname,
-# edge-versus-origin, cross-Environment and host-listener clauses and stops
-# there. Its TLS, routed-ingress and address-translation clauses need an HTTPS
-# client inside a Developer Linux Machine, and the guest image ships none that
-# can verify a certificate or complete a handshake with the edge.
+# `public_like_ingress` now proves criterion 6's split-DNS, `.test`-hostname,
+# edge-versus-origin, cross-Environment, TLS, routed-ingress, source-translation
+# and host-listener clauses -- the TLS half became reachable when the Developer
+# image gained `vz-guest-fetch`. It stops at the criterion's controlled-egress,
+# host-import/export and fault-control clauses, which no adapter implements.
 # `install_upgrade_rollback_uninstall` proves every clause of criterion 19
 # except one: the restored store being opened again by v0.3.20 itself needs
 # the pinned ~22 MiB v0.3.20 daemon, which is neither committed nor fetched
@@ -856,18 +856,23 @@ class TopologyLaneTests(unittest.TestCase):
         code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
         return code, result, self.by_slug(result)[INGRESS_SLUG]
 
-    def test_the_edge_is_proved_and_its_tls_clause_is_reported_unexercised(self):
+    def test_the_edge_is_proved_and_only_its_unimplemented_clauses_are_reported(self):
         code, result, sub = self.ingress()
         failures = [line for line in sub["assertions"] if line.startswith("FAILED:")]
         self.assertEqual(failures, [], failures)
-        # Not PASS, and deliberately: the criterion's TLS, ingress and
-        # translation clauses were never exercised, and reporting PASS on the
-        # rest would certify the criterion on evidence that never touched them.
+        # Still not PASS, and deliberately: criterion 6 also names controlled
+        # egress, host imports/exports and fault controls, and reporting PASS
+        # would certify it on evidence that never touched those.
         self.assertEqual(sub["status"], "FAIL")
         unexercised = [line for line in sub["assertions"] if line.startswith("not_implemented:")]
         self.assertEqual(len(unexercised), 1, sub["assertions"])
-        for named in ("TLS", "routed-ingress", "NAT", "BusyBox"):
+        for named in ("controlled-egress", "host-import", "fault", "Offline"):
             self.assertIn(named, unexercised[0])
+        # The clauses that used to be reported unexercised are now exercised,
+        # so they must not still be named as missing. A report that kept
+        # claiming them would hide the fact that they now run for real.
+        for retired in ("BusyBox", "ssl_client", "no-check-certificate"):
+            self.assertNotIn(retired, unexercised[0])
         # The lane's outcome is not_implemented rather than an assertion
         # failure, so a real regression in this check stays distinguishable
         # from the clause it cannot reach.
@@ -880,7 +885,18 @@ class TopologyLaneTests(unittest.TestCase):
                       "does not resolve in the other Environment",
                       "an undeclared name in the same Environment does not resolve",
                       "no listener on the host LAN or a wildcard address appeared",
-                      "the published authority is a certificate and carries no key"):
+                      "the published authority is a certificate and carries no key",
+                      "carries the Developer image's HTTPS client",
+                      "the two Environments minted different authorities",
+                      "spoken to directly, the origin reports the caller as its peer",
+                      "answers over verified TLS from inside a Machine",
+                      "the TLS session terminated at the edge, not at the origin",
+                      "verified against the Environment's own published authority",
+                      "the response body came from the declared origin Machine",
+                      "the origin's peer on the ingress path is the edge",
+                      "the client's own address never reached the origin",
+                      "REFUSED against the image's pinned public CA bundle",
+                      "REFUSED against the OTHER Environment's authority"):
             self.assertTrue(any(claim in line for line in sub["assertions"]),
                             (claim, sub["assertions"]))
 
@@ -924,6 +940,49 @@ class TopologyLaneTests(unittest.TestCase):
         the fabric for every lookup, while the cmdline said otherwise.
         """
         self.assert_broken("edge_public_resolver", "resolves through its Environment alone")
+
+    def test_a_client_that_does_not_verify_the_chain_fails_the_criterion(self):
+        """A TLS clause proved by a client with verification off proves nothing.
+
+        This is the failure the whole client exists to remove: a handshake that
+        completes against any certificate cannot tell this Environment's
+        authority from any other, so it says nothing about who the client
+        reached. The check catches it by making the SAME request against the
+        image's pinned public bundle and requiring a refusal; a client that
+        skipped verification would be answered there too.
+        """
+        sub = self.assert_broken("edge_tls_unverified",
+                                 "REFUSED against the image's pinned public CA bundle")
+        # The positive fetch still succeeds in this mode, which is the point:
+        # only the negative distinguishes a verifying client from a credulous
+        # one, so only the negative may fail here.
+        self.assertTrue(any("answers over verified TLS from inside a Machine" in line
+                            and not line.startswith("FAILED:") for line in sub["assertions"]),
+                        sub["assertions"])
+
+    def test_a_client_that_accepts_any_named_authority_fails_the_criterion(self):
+        """Trusting a file is not the same as trusting the right file.
+
+        An Environment's authority is per Environment. A client that accepted
+        whatever anchor it was handed would let one Environment's Machines
+        verify another Environment's edge, and the isolation the criterion asks
+        for would exist only in the naming.
+        """
+        self.assert_broken("edge_foreign_anchor_accepted",
+                           "REFUSED against the OTHER Environment's authority")
+
+    def test_an_origin_that_sees_the_client_as_its_peer_fails_the_criterion(self):
+        """No translation means no edge in the path, whatever TLS reported.
+
+        If the origin's own `REMOTE_ADDR` is the client, the connection reached
+        it directly and the edge terminated nothing; every other observable --
+        the name, the certificate, the body -- would look identical.
+        """
+        sub = self.assert_broken("edge_origin_shortcut",
+                                 "the origin's peer on the ingress path is the edge")
+        self.assertTrue(any(line.startswith("FAILED:")
+                            and "client's own address never reached the origin" in line
+                            for line in sub["assertions"]), sub["assertions"])
 
 
 # One `#[derive(...)]`-preceded struct body out of the Rust source, as
