@@ -865,6 +865,54 @@ def two_machine_definition(release_dir: Path) -> dict:
     return definition
 
 
+def macos_target(release_dir: Path):
+    """The Developer macOS target this release registers, or None.
+
+    Criterion 5 requires a service path crossing between a Linux Machine and a
+    native macOS Machine. A host with no registered macOS template cannot build
+    that Machine at all, which is a fact about the host rather than about the
+    runtime, so it is reported separately from a crossing that was attempted and
+    failed.
+    """
+    try:
+        catalog = load_json(release_dir / "machine-target-catalog.json")
+    except (OSError, ValueError):
+        return None
+    entries = catalog.get("macos")
+    if not isinstance(entries, list):
+        return None
+    for entry in entries:
+        if isinstance(entry, dict) and entry.get("profile") == "developer" and entry.get("digest"):
+            return entry
+    return None
+
+
+def crossing_definition(release_dir: Path, macos_entry: dict) -> dict:
+    """One Environment whose declared private path crosses Linux to macOS.
+
+    This is the shape criterion 5 asks for and `two_machine_definition` cannot
+    express: two Developer Linux Machines and one Developer native macOS
+    Machine on one declared private network, with an endpoint on each side so
+    the required path is declared in both directions. Until native macOS
+    Machines were admitted to the fabric this definition could not even be
+    written -- the schema capped a macOS Machine's `networks` at zero -- so a
+    definition that validates is itself evidence that the declaration half of
+    the crossing landed.
+    """
+    definition = two_machine_definition(release_dir)
+    environment = definition["environment"]
+    native = {"schema_version": 1, "name": "machine-mac", "profile": "developer",
+              "target": {"os": "macos", "arch": "aarch64",
+                         "image": macos_entry["image"], "digest": macos_entry["digest"]},
+              "resources": {"cpus": 2, "memory_mb": 4096},
+              "networks": [PRIVATE_NETWORK]}
+    environment["machines"] = [*environment["machines"], native]
+    environment["endpoints"] = [*environment["endpoints"],
+                                {"schema_version": 1, "name": "probe-mac", "machine": "machine-mac",
+                                 "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
+    return definition
+
+
 def machine_exec_argv(machine: str, script: str) -> list:
     return ["exec", "--environment", "default", "--machine", machine, "--", "/bin/busybox", "sh", "-c", script]
 
@@ -1030,6 +1078,31 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
                               ["--json", "delete", "--environment", "default", "--timeout", "120"],
                               cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
             check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+    # Everything above proves the Linux half. Criterion 5 also requires that "at
+    # least one required service path crosses between a Linux Machine and a
+    # native macOS Machine in both directions permitted by its declarations",
+    # and none of it attempted that. Reporting PASS here would certify the
+    # criterion on evidence that never touched its macOS clause, so the crossing
+    # is claimed last and only when it was actually exercised.
+    #
+    # This deliberately cannot pass on a host with no registered macOS template.
+    # The declaration half landed -- `crossing_definition` is a definition the
+    # schema now accepts, which it did not before native macOS Machines were
+    # admitted to the fabric -- but a definition that validates is not a path
+    # that carries traffic.
+    if check.status == "PASS":
+        entry = macos_target(ctx.release_dir)
+        if entry is None:
+            check.not_implemented = (
+                "criterion 5 requires a required service path crossing between a Linux Machine and a "
+                "native macOS Machine in both directions; this release registers no Developer macOS "
+                "target, so no macOS Machine could be built and the crossing was never attempted. "
+                "The Linux-to-Linux half above passed. Register a template with vz-macos-setup "
+                "(planning/developer-environments/macos-local-setup.md); this check never provisions one.")
+        else:
+            check.not_implemented = (
+                "a Developer macOS target is registered but the Linux-to-macOS crossing is not yet "
+                "exercised by this check; crossing_definition() builds the declaration it needs.")
     return check.finish()
 
 

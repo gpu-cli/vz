@@ -5,6 +5,7 @@ Run: uv run --no-project --python /usr/bin/python3 --with-requirements scripts/h
 """
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -14,6 +15,8 @@ import tempfile
 import time
 import unittest
 from unittest import mock
+
+from jsonschema import Draft202012Validator
 
 import sys
 
@@ -39,12 +42,18 @@ TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
-               "private_topology_paths", "status_json_field_set"}
-# Both remaining sub-checks belong to criterion 15 and need a live typed API,
-# so criterion 21 is the first topology scenario the lane can actually pass.
-# Criterion 15's last blocker: agreement must be observed over the daemon's own
-# gRPC channel, which needs a pinned client this lane does not have.
-NOT_IMPLEMENTED = {"grpc_api_live_agreement"}
+               "status_json_field_set"}
+# `grpc_api_live_agreement` belongs to criterion 15 and needs a live typed API:
+# agreement must be observed over the daemon's own gRPC channel, which needs a
+# pinned client this lane does not have.
+#
+# `private_topology_paths` proves criterion 5's Linux-to-Linux half and stops
+# there. The criterion also requires a service path crossing between a Linux
+# Machine and a native macOS Machine in both directions, and no fake CLI can
+# stand in for that: it needs a macOS template a gate host does not provision.
+# It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
+# which certified the criterion on evidence that never touched its macOS clause.
+NOT_IMPLEMENTED = {"grpc_api_live_agreement", "private_topology_paths"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -171,15 +180,16 @@ class TopologyLaneTests(unittest.TestCase):
         # typed API for its remaining two.
         self.assertEqual(self.top(result, TOP21)["status"], "PASS")
         self.assertEqual(self.top(result, TOP1)["status"], "PASS")
-        # The fake applies declared networks, so the check completes here. The
-        # installed 0.4 runtime refuses them and the check reports
-        # not_implemented instead; see check_private_topology_paths.
-        self.assertEqual(self.top(result, TOP5)["status"], "PASS")
+        # The fake applies declared networks, so criterion 5's Linux half runs to
+        # completion -- and that is exactly why it must not be read as the
+        # criterion. The crossing to a native macOS Machine is unexercised, so
+        # the check declines to claim PASS; see check_private_topology_paths.
+        self.assertEqual(self.top(result, TOP5)["status"], "FAIL")
         self.assertEqual(self.top(result, TOP15)["status"], "FAIL")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
-        for identifier in assigned - {TOP21, TOP15, TOP1, TOP5}:
+        for identifier in assigned - {TOP21, TOP15, TOP1}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
         cli_removal = common.load_json(common.REPO_ROOT / self.contract["pins"]["cli_removal"])
@@ -444,3 +454,85 @@ class StatusFieldSetAgreementTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class CriterionFiveCrossingTests(unittest.TestCase):
+    """Criterion 5's macOS clause must not be certified by Linux-only evidence.
+
+    `check_private_topology_paths` proved a Linux-to-Linux private path and
+    reported PASS, while GOAL-0.4.0.md:172-174 also requires that "at least one
+    required service path crosses between a Linux Machine and a native macOS
+    Machine in both directions permitted by its declarations". Nothing in the
+    check ever built a macOS Machine, so the criterion's row could go green on
+    evidence that never touched half of what it claims.
+    """
+
+    SCHEMA = common.REPO_ROOT / "schemas/vz-project-definition-v1.schema.json"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.schema = common.load_json(cls.SCHEMA)
+
+    def _release(self, root: Path, macos: bool):
+        """A release dir carrying only the catalog these definitions read."""
+        release = root / "release"
+        release.mkdir(parents=True, exist_ok=True)
+        catalog = {"linux": [{"profile": "developer", "image": "vz-linux",
+                              "digest": "sha256:" + "a" * 64}],
+                   "macos": ([{"profile": "developer", "image": "vz-macos",
+                               "digest": "sha256:" + "b" * 64, "channels": ["xcode"]}] if macos else [])}
+        (release / "machine-target-catalog.json").write_text(json.dumps(catalog))
+        return release
+
+    def test_no_macos_target_is_reported_rather_than_assumed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(checks.macos_target(self._release(Path(tmp), macos=False)))
+
+    def test_a_registered_developer_macos_target_is_found(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            entry = checks.macos_target(self._release(Path(tmp), macos=True))
+            self.assertIsNotNone(entry)
+            self.assertEqual(entry["image"], "vz-macos")
+
+    def test_the_crossing_definition_validates_against_the_shipped_schema(self):
+        # The declaration half of criterion 5: a Developer macOS Machine on a
+        # declared private network, with an endpoint on each side.
+        with tempfile.TemporaryDirectory() as tmp:
+            release = self._release(Path(tmp), macos=True)
+            definition = checks.crossing_definition(release, checks.macos_target(release))
+            problems = sorted(Draft202012Validator(self.schema).iter_errors(definition),
+                              key=lambda e: list(map(str, e.absolute_path)))
+            self.assertEqual(problems, [], problems[0].message if problems else "")
+            machines = definition["environment"]["machines"]
+            self.assertEqual([m["target"]["os"] for m in machines], ["linux", "linux", "macos"])
+            # Declared in both directions: an endpoint on the Linux side and on
+            # the macOS side of the same network.
+            endpoints = {e["machine"] for e in definition["environment"]["endpoints"]}
+            self.assertEqual(endpoints, {"machine-0", "machine-mac"})
+            self.assertIn(checks.PRIVATE_NETWORK, machines[2]["networks"])
+
+    def test_that_definition_would_have_been_refused_before_macos_joined_the_fabric(self):
+        # Falsifiability: the schema capped a macOS Machine's `networks` at zero
+        # and forced `egress: offline`. Restore that and the same definition must
+        # be refused, so the test above is evidence the schema change landed and
+        # not merely that jsonschema accepts anything.
+        schema = json.loads(json.dumps(self.schema))
+        conditionals = schema["$defs"]["machine"]["allOf"]
+        restored = False
+        for rule in conditionals:
+            branches = rule.get("if", {}).get("anyOf")
+            then = rule.get("then", {}).get("properties", {})
+            if not branches or "networks" not in then:
+                continue
+            for branch in branches:
+                spec = branch.get("properties", {}).get("target", {}).get("properties", {}).get("os")
+                if isinstance(spec, dict) and (spec.get("const") == "windows" or spec.get("enum") == ["windows"]):
+                    spec.pop("const", None)
+                    spec["enum"] = ["macos", "windows"]
+                    restored = True
+        self.assertTrue(restored, "the network conditional no longer has the shape this test restores")
+        with tempfile.TemporaryDirectory() as tmp:
+            release = self._release(Path(tmp), macos=True)
+            definition = checks.crossing_definition(release, checks.macos_target(release))
+            problems = list(Draft202012Validator(schema).iter_errors(definition))
+            self.assertTrue(problems, "the pre-change schema accepted a macOS Machine on a network")
