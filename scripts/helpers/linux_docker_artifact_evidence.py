@@ -125,16 +125,24 @@ def importer_materialization(vertices):
     return [row for index, row in enumerate(vertices) if index not in excluded], proofs
 
 
-def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_import, lower, upper):
+def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_import, host_lower, host_upper,
+                      engine_before, engine_after):
     """Separate exporter/importer grammar; existing payload graph stays strict."""
     vertices, logs = progress(raw)
-    require(lower <= upper, "Engine clocks reversed")
+    # Buildx rebases every progress timestamp onto the *client's* clock before
+    # printing it, so the client-observed interval of the command that emitted
+    # this stream is what bounds it. The Engine's `SystemTime` is the guest's
+    # clock, a separate timebase from the host's, and comparing the two
+    # measures skew rather than chronology --- `linux_docker_ssh_evidence` and
+    # `linux_docker_parallel_evidence` bound their frames this way already.
+    require(0 < host_lower <= host_upper, "client command clock bounds reversed")
     # Check the full original stream before projecting any controller records.
     for vertex in vertices:
         require(not vertex.get("error"), "artifact solve contains an error")
         for key in ("started", "completed"):
             if key in vertex:
-                require(lower <= progress_ns(vertex[key]) <= upper, "artifact progress outside Engine clocks")
+                require(host_lower <= progress_ns(vertex[key]) <= host_upper,
+                        "artifact progress outside the client-observed command that produced it")
     materialization = []
     if cache_import and cached and not secret:
         vertices, materialization = importer_materialization(vertices)
@@ -152,9 +160,9 @@ def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_imp
         prior.append(v)
         if "completed" in v:
             require("started" in v and progress_ns(v["started"]) <= progress_ns(v["completed"]), "reversed artifact lifetime")
-        for key in ("started", "completed"):
-            if key in v:
-                require(lower <= progress_ns(v[key]) <= upper, "artifact progress outside Engine clocks")
+        # No clock bound here: the loop above already held every row of the
+        # original stream inside the observed command, and projection only
+        # removes rows from it.
     imports = [name for name in names if name.startswith("importing cache manifest from ")]
     require(len(imports) == int(cache_import), "missing or unexpected cache import")
     extra = {OCI_EXPORT} | ({CACHE_EXPORT} if cache_export else set()) | set(imports)
@@ -178,7 +186,8 @@ def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_imp
                 require(row.get("vertex") in grouped, "unbound artifact progress frame")
                 for key in ("timestamp", "started", "completed"):
                     if key in row:
-                        require(lower <= progress_ns(row[key]) <= upper, "artifact frame outside Engine clocks")
+                        require(host_lower <= progress_ns(row[key]) <= host_upper,
+                                "artifact frame outside the client-observed command that produced it")
                 if "completed" in row:
                     require("started" in row and progress_ns(row["started"]) <= progress_ns(row["completed"]),
                             "reversed artifact status lifetime")
@@ -271,7 +280,8 @@ def artifact_progress(raw, *, reference, secret, cached, cache_export, cache_imp
     return {"progress_sha256": sha(raw), "graph": graph, "export_roots": sorted(extra),
             "importer_output_materialization": materialization,
             "imported_manifest_status": import_status,
-            "engine_before_ns": lower, "engine_after_ns": upper}
+            "client_command_ns": {"started": host_lower, "ended": host_upper},
+            "engine_before_ns": engine_before, "engine_after_ns": engine_after}
 
 
 class Replay(BuildReplay):
@@ -345,7 +355,7 @@ class Replay(BuildReplay):
                 op["cache_import"] == (str(self.directory.parent / "source-alpha/cache") if imported else None),
                 "artifact role or output/cache path mismatch")
         self.builder_guard()
-        lower = self.build_engine_ns
+        engine_lower = self.build_engine_ns
         fixture = _absolute(self.rows[4]["_args"][-1]).parent
         require(fixture_digest(fixture) == op["fixture_sha256"], "artifact fixture changed")
         spec = decode(read(fixture / "fixture.json"))
@@ -375,8 +385,13 @@ class Replay(BuildReplay):
             args += ["--no-cache", "--secret", "id=fixture,src=" + str(fixture / "inputs/secret.txt")]
         build = self.take(args + [str(fixture / "build")], mutation=True)
         require(not build["_stdout"], "unexpected artifact build stdout")
+        require(type(build.get("started_unix_ns")) is int and type(build.get("elapsed_ns")) is int
+                and build["started_unix_ns"] > 0 and build["elapsed_ns"] >= 0,
+                "artifact build client-clock interval unavailable")
+        host_lower = build["started_unix_ns"]
+        host_upper = build["started_unix_ns"] + build["elapsed_ns"]
         self.builder_guard()
-        upper = self.build_engine_ns
+        require(engine_lower <= self.build_engine_ns, "Engine observation precedes the previous Engine observation")
         require(self.i == 9, "unconsumed artifact commands")
         before, after = (decode(self.rows[i]["_stdout"])[0] for i in (3, 8))
         for key in ("Config", "HostConfig", "Mounts"):
@@ -387,7 +402,8 @@ class Replay(BuildReplay):
             require(not any(value in row["_stdout"] or value in row["_stderr"] for value in canaries), "artifact command leaked secret")
         graph = artifact_progress(build["_stderr"], reference=self.inputs["images"]["base"]["reference"],
                                   secret=secret, cached=imported, cache_export=cache_export, cache_import=imported,
-                                  lower=lower, upper=upper)
+                                  host_lower=host_lower, host_upper=host_upper,
+                                  engine_before=engine_lower, engine_after=self.build_engine_ns)
         require(not any(value in progress(build["_stderr"])[1] for value in canaries), "decoded artifact log leaked secret")
         image = layout.validate_oci(_absolute(op["output"]), expected_path=expected["path"],
                                     expected_sha256=expected["sha256"], expected_size=expected["size"], canaries=oci_canaries)

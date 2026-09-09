@@ -327,6 +327,24 @@ class ArtifactEvidenceTests(unittest.TestCase):
             self.stream(5, "stderr", encoded(batch))
             with self.subTest(mutation=mutation), self.assertRaises(evidence.Invalid): self.validate()
 
+    def test_progress_outside_the_observed_command_is_refused(self):
+        """Buildx progress is on the client's clock, so the client's own
+        interval for the command is what can hold it. A solve reported over
+        seconds cannot have happened inside an instant, and a frame outside the
+        window is a frame from another command."""
+        self.change(5, lambda row: row.update(elapsed_ns=0))
+        with self.assertRaises(evidence.Invalid): self.validate()
+        self.make("source-alpha")
+        batch = json.loads((self.directory / "command-00005.stderr").read_text())
+        # A status frame on an ordinary graph vertex: no export-root lifetime
+        # covers it, so only the observed command's interval can place it.
+        payload = next(v for v in batch["vertexes"] if " RUN " in v["name"])
+        batch.setdefault("statuses", []).append({"id": "extracting", "vertex": payload["digest"],
+                                                 "started": SyntheticBuilder.stamp(10.5),
+                                                 "completed": SyntheticBuilder.stamp(11)})
+        self.stream(5, "stderr", encoded(batch))
+        with self.assertRaises(evidence.Invalid): self.validate()
+
     def test_future_unfinished_source_reject(self):
         batch = json.loads((self.directory / "command-00005.stderr").read_text())
         source = copy.deepcopy(next(v for v in batch["vertexes"] if v["name"] == "[internal] load build context"))

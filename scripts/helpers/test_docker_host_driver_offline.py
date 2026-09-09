@@ -2,6 +2,7 @@
 
 import copy
 import base64
+import time
 import json
 import os
 from pathlib import Path
@@ -1258,8 +1259,20 @@ class PayloadGraphTests(unittest.TestCase):
     def encoded(self, batch):
         return json.dumps(batch).encode() + b"\n"
 
-    def proof(self, batch, cached=False):
-        return driver.assert_payload_graph(self.encoded(batch), self.base, cached=cached)
+    def host_bounds(self, solve=0):
+        """The client-clock interval of the command that carried this solve.
+
+        A solve numbered `solve` runs at seconds `solve * 10 + 1 .. + 5`, so its
+        command is observed from `solve * 10` to `solve * 10 + 6`.
+        """
+        return (driver.build_timestamp(f"2026-09-06T06:00:{solve * 10:02d}Z"),
+                driver.build_timestamp(f"2026-09-06T06:00:{solve * 10 + 6:02d}Z"))
+
+    def proof(self, batch, cached=False, *, solve=0, host_lower=None, host_upper=None):
+        lower, upper = self.host_bounds(solve)
+        return driver.assert_payload_graph(self.encoded(batch), self.base, cached=cached,
+                                           host_lower=lower if host_lower is None else host_lower,
+                                           host_upper=upper if host_upper is None else host_upper)
 
     def command(self, batch, *, solve=0, variant="alpha"):
         dest = Path(f"/private/owned/export-{solve}")
@@ -1270,15 +1283,17 @@ class PayloadGraphTests(unittest.TestCase):
         result = driver.Command(solve + 1, argv, 0, b"", self.encoded(batch))
         result.build_binding = driver.bind_build_command(argv, list(argv), dest, self.fixture_digest, b"exact Dockerfile")
         result.build_engine_ns = driver.build_timestamp(f"2026-09-06T06:00:{solve * 10:02d}Z")
+        result.build_host_interval = self.host_bounds(solve)
         return result
 
     def test_changed_solve_ids_preserve_only_proven_operation_identity(self):
         first, second = self.graph(), self.graph(cached=True, solve=1)
-        a, b = self.proof(first), self.proof(second, True)
+        a, b = self.proof(first), self.proof(second, True, solve=1)
         self.assertNotEqual(a["vertices"]["run"], b["vertices"]["run"])
         driver.assert_payload_pair(self.command(first), a, self.command(second, solve=1), b)
         beta = self.graph(solve=2)
-        driver.assert_payload_pair(self.command(first), a, self.command(beta, solve=2, variant="beta"), self.proof(beta), variant=True)
+        driver.assert_payload_pair(self.command(first), a, self.command(beta, solve=2, variant="beta"),
+                                   self.proof(beta, solve=2), variant=True)
 
     def test_source_multi_phase_progress_is_accepted_without_identity_drift(self):
         batch = self.graph()
@@ -1358,7 +1373,7 @@ class PayloadGraphTests(unittest.TestCase):
 
     def test_exact_command_fixture_and_variant_binding_reject_drift(self):
         first, second = self.graph(), self.graph(cached=True, solve=1)
-        a, b = self.proof(first), self.proof(second, True)
+        a, b = self.proof(first), self.proof(second, True, solve=1)
         for field in ("fixture_sha256", "dockerfile_sha256"):
             command = self.command(second, solve=1); command.build_binding[field] = "a" * 64
             with self.subTest(field=field), self.assertRaises(ValueError):
@@ -1377,15 +1392,20 @@ class PayloadGraphTests(unittest.TestCase):
 
     def test_stale_progress_engine_clock_and_base_identity_rejected(self):
         first, second = self.graph(), self.graph(cached=True, solve=1)
-        a, b = self.proof(first), self.proof(second, True)
+        a, b = self.proof(first), self.proof(second, True, solve=1)
         for field, value in (("base_vertex", "sha256:" + "7" * 64), ("progress_sha256", a["progress_sha256"]),
                              ("started_ns", a["started_ns"]), ("cached", False)):
             changed = dict(b, **{field: value})
             with self.subTest(field=field), self.assertRaises(ValueError):
                 driver.assert_payload_pair(self.command(first), a, self.command(second, solve=1), changed)
-        for engine in (None, True, a["started_ns"], b["started_ns"] + 1):
+        for engine in (None, True, self.command(first).build_engine_ns - 1):
             command = self.command(second, solve=1); command.build_engine_ns = engine
             with self.subTest(engine=engine), self.assertRaises(ValueError):
+                driver.assert_payload_pair(self.command(first), a, command, b)
+        upper = self.host_bounds(1)[1]
+        for interval in (None, (a["solve_last_observed_ns"] - 1, upper), (b["solve_started_ns"] + 1, upper)):
+            command = self.command(second, solve=1); command.build_host_interval = interval
+            with self.subTest(interval=interval), self.assertRaises(ValueError):
                 driver.assert_payload_pair(self.command(first), a, command, b)
 
     def test_other_successful_recipe_runs_must_really_execute(self):
@@ -1398,31 +1418,74 @@ class PayloadGraphTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(ValueError):
                 driver.assert_uncached_run(self.encoded(bad), instruction)
 
-    def test_whole_solve_source_and_output_bounded_by_engine_observations(self):
-        first, second = self.graph(), self.graph(cached=True, solve=1)
-        late = copy.deepcopy(first)
-        late["vertexes"][4].update(started="2030-01-01T00:00:00Z", completed="2030-01-01T00:00:01Z")
-        graph = self.proof(late)
-        with self.assertRaises(ValueError):
-            driver.assert_payload_pair(self.command(late), graph, self.command(second, solve=1), self.proof(second, True))
+    def stub_driver(self):
+        """A Driver reduced to its build clock gates and the check after them."""
         item = driver.Driver.__new__(driver.Driver)
         item.builder_guard = lambda: None
-        item._engine_system_time = "2026-09-06T06:00:10Z"
-        item._last_payload_graph = graph
-        with self.assertRaisesRegex(ValueError, "subsequent Engine"):
-            item.build("cache-cold", "Dockerfile.cache", {})
+        item.fixture = Path("/private/fixture")
+        item.inputs = type("Inputs", (), {"raw": {"fixture_sha256": "0" * 64}})()
+        return item
+
+    def test_whole_solve_is_bounded_by_the_command_that_produced_it(self):
+        """A solve belongs to the command the client observed emitting it.
+
+        Buildx rebases every progress timestamp onto the client's clock before
+        printing it, so this window is the one that can decide attribution. A
+        vertex outside it is a solve credited to the wrong build.
+        """
+        first = self.graph()
+        late = copy.deepcopy(first)
+        late["vertexes"][4].update(started="2030-01-01T00:00:00Z", completed="2030-01-01T00:00:01Z")
+        with self.assertRaisesRegex(ValueError, "outside the client-observed command"):
+            self.proof(late)
         early = copy.deepcopy(first)
         early["vertexes"][1].update(started="2026-09-06T05:59:59Z")
-        with self.assertRaises(ValueError):
-            driver.assert_payload_pair(self.command(early), self.proof(early), self.command(second, solve=1), self.proof(second, True))
+        with self.assertRaisesRegex(ValueError, "outside the client-observed command"):
+            self.proof(early)
+
+    def test_build_refuses_a_predecessor_solve_and_a_regressing_engine(self):
+        """The two orderings the discarded cross-clock comparison stood in for."""
+        item = self.stub_driver()
+        item._engine_system_time = "2026-09-06T06:00:10Z"
+        item._last_payload_graph = dict(self.proof(self.graph()), solve_last_observed_ns=time.time_ns() + 10 ** 12)
+        with self.assertRaisesRegex(ValueError, "subsequent client observation"):
+            item.build("cache-cold", "Dockerfile.cache", {})
+        item = self.stub_driver()
+        item._engine_system_time = "2026-09-06T05:59:59Z"
+        item._last_engine_ns = driver.build_timestamp("2026-09-06T06:00:00Z")
+        with self.assertRaisesRegex(ValueError, "Engine observation precedes"):
+            item.build("cache-cold", "Dockerfile.cache", {})
+
+    def test_engine_clock_trailing_the_client_never_rejects_a_sound_solve(self):
+        """The regression this arrangement exists for.
+
+        `docker info` reports the guest Engine's clock; a payload graph reports
+        the client's. They are separate timebases, and a guest that trails the
+        host -- three Machines working at once under one host is exactly where
+        that shows -- used to reject a sound build with "previous payload solve
+        exceeds subsequent Engine observation". Nothing compares them now, so a
+        whole hour of skew changes no verdict.
+        """
+        first, second = self.graph(), self.graph(cached=True, solve=1)
+        a, b = self.proof(first), self.proof(second, True, solve=1)
+        earlier, later = self.command(first), self.command(second, solve=1)
+        for command in (earlier, later):
+            command.build_engine_ns -= 3600 * 10 ** 9
+        driver.assert_payload_pair(earlier, a, later, b)
+        item = self.stub_driver()
+        item._engine_system_time = "2026-09-06T05:00:00Z"
+        item._last_payload_graph = a
+        with self.assertRaisesRegex(ValueError, "fixture changed"):
+            with patch.object(driver, "tree_digest", return_value="1" * 64):
+                item.build("cache-cold", "Dockerfile.cache", {})
 
     def test_unfinished_source_future_update_is_bounded(self):
-        first, second = self.graph(), self.graph(cached=True, solve=1)
+        first = self.graph()
         unfinished = dict(first["vertexes"][0], started="2030-01-01T00:00:00Z")
         unfinished.pop("completed")
         first["vertexes"].append(unfinished)
-        with self.assertRaises(ValueError):
-            driver.assert_payload_pair(self.command(first), self.proof(first), self.command(second, solve=1), self.proof(second, True))
+        with self.assertRaisesRegex(ValueError, "outside the client-observed command"):
+            self.proof(first)
 
 
 if __name__ == "__main__":
