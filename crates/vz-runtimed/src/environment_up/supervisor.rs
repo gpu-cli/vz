@@ -1,6 +1,7 @@
 use std::collections::BTreeSet;
 
 use super::host_exports;
+use super::host_imports;
 use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
 use super::volumes;
 use super::workspace_projection;
@@ -291,6 +292,35 @@ impl RuntimeDaemon {
             )
         })?;
         let mut host_export_ports = host_exports::boot_port_mappings(&resolved_host_exports);
+        // Host imports are resolved and their credentials minted here, before
+        // the first boot, for the reason exports are: a declaration Up cannot
+        // serve must fail before any Machine has started. The installation
+        // itself happens after each boot, because its guest half is an agent
+        // RPC and the agent is not running until then.
+        //
+        // The credentials are minted once per Up and held only in this map and
+        // in the relay they are handed to. Nothing writes them to the state
+        // store, so a stopped Machine's secrets do not survive it.
+        let resolved_host_imports = host_imports::resolve_environment_host_imports(
+            &request.definition.environment,
+            &environment.machines,
+            &environment.host_imports,
+        )
+        .map_err(|error| {
+            failure(
+                &metadata,
+                MachineErrorCode::ValidationError,
+                error.to_string(),
+            )
+        })?;
+        let mut host_import_grants = host_imports::boot_import_grants(&resolved_host_imports)
+            .map_err(|error| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::BackendUnavailable,
+                    error.to_string(),
+                )
+            })?;
         // Workspace projections are resolved here for the same reason the
         // fabric is: a VirtioFS share is fixed when `LinuxVm::create` runs, so
         // a share cannot be minted inside the loop that boots the Machine
@@ -472,6 +502,31 @@ impl RuntimeDaemon {
                     // let public Stop obtain positive shutdown evidence.
                     if let Some(error)=start_error {
                         return Err(backend_error(format!("native Machine start failed; original VM retained for Stop: {error}")));
+                    }
+                    // Taken, not borrowed, for the same reason as the export
+                    // mappings and the guest descriptors: grants handed to a
+                    // boot that did not happen must not be handed to a second
+                    // one. A Machine reused from `existing` never reaches here,
+                    // so its relay is the one its original boot installed.
+                    //
+                    // A Machine with no declared import gets no call at all,
+                    // and therefore no vsock listener and no guest listener.
+                    // That is what "host imports are absent by default" means
+                    // at runtime rather than in the definition.
+                    let import_grants=host_import_grants.remove(&step.machine_id).unwrap_or_default();
+                    if !import_grants.is_empty() {
+                        let declared:Vec<String>=import_grants.iter().map(|grant|grant.name.clone()).collect();
+                        let installation=activation.install_host_imports(import_grants).await
+                            .map_err(|error|backend_error(format!("declared host imports could not be installed on Machine `{}`: {error}",machine.name)))?;
+                        // The guest reports where it bound. A non-loopback
+                        // answer is a boundary wider than the one declared, so
+                        // it fails the Up rather than being logged.
+                        if installation.guest_bind_address!="127.0.0.1" {
+                            return Err(backend_error(format!("Machine `{}` bound its host imports on {} rather than guest loopback",machine.name,installation.guest_bind_address)));
+                        }
+                        if installation.bound!=declared {
+                            return Err(backend_error(format!("Machine `{}` bound host imports {:?} rather than the declared {declared:?}",machine.name,installation.bound)));
+                        }
                     }
                     activation
                 };

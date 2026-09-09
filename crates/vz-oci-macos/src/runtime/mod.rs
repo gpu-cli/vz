@@ -39,6 +39,7 @@ use vz_image::{ImageInfo, PruneResult};
 
 mod bundle;
 mod exec;
+mod host_import_relay;
 mod machine_exec;
 mod networking;
 mod oci_lifecycle;
@@ -549,7 +550,24 @@ pub struct SharedVmLifecycleLease {
     runtime_identity: vz_runtime_contract::StackRuntimeIdentity,
     verified_profile: KernelProfile,
     stack_vms: Arc<Mutex<HashMap<String, StackVmRecord>>>,
+    stack_host_import_relays: Arc<Mutex<HashMap<String, host_import_relay::HostImportRelay>>>,
     _stack_lifecycle_guard: OwnedRwLockReadGuard<()>,
+}
+
+/// What one `install_host_imports` call put in place, as evidence.
+///
+/// Both addresses are reported rather than assumed. `guest_bind_address` is
+/// what the guest agent says it bound its import listeners on, and
+/// `host_termination_address` is the address this host will dial for them. A
+/// caller asserts both are loopback; neither is a value any guest chose.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HostImportInstallation {
+    /// Declaration names actually bound in the guest.
+    pub bound: Vec<String>,
+    /// The address the guest agent bound its import listeners on.
+    pub guest_bind_address: String,
+    /// The address the host terminator dials for an authorized grant.
+    pub host_termination_address: String,
 }
 
 /// Unified runtime entrypoint.
@@ -596,6 +614,13 @@ pub struct Runtime {
     /// Kept alive so TCP listeners for shared VM stacks continue running.
     /// Cleaned up when the shared VM is shut down.
     stack_port_forwards: Arc<Mutex<HashMap<String, PortForwarding>>>,
+    /// Active host-import relays keyed by stack ID.
+    ///
+    /// One per Machine that declares at least one host import. A Machine that
+    /// declares none has no entry here and no vsock listener at all, which is
+    /// what "host imports are absent by default" means at runtime. Torn down
+    /// beside `stack_port_forwards` on shared-VM shutdown.
+    stack_host_import_relays: Arc<Mutex<HashMap<String, host_import_relay::HostImportRelay>>>,
     /// Active container lifecycle metadata keyed by container ID.
     ///
     /// Entries exist only while container lifecycle is active (running/leased).
@@ -680,6 +705,7 @@ impl Runtime {
             container_stack: Arc::new(Mutex::new(recovered_container_routes)),
             port_forwards: Arc::new(Mutex::new(HashMap::new())),
             stack_port_forwards: Arc::new(Mutex::new(HashMap::new())),
+            stack_host_import_relays: Arc::new(Mutex::new(HashMap::new())),
             active_lifecycle: Arc::new(Mutex::new(HashMap::new())),
             log_rotation_tasks: Arc::new(Mutex::new(HashMap::new())),
             exec_sessions: Arc::new(Mutex::new(HashMap::new())),

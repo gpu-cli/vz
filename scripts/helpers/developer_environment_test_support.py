@@ -26,6 +26,10 @@ accepted for an Environment's own edge), edge_foreign_anchor_accepted (the
 client accepts any named authority, so another Environment's is accepted), and
 edge_origin_shortcut (the origin sees the CLIENT as its peer, i.e. no source
 translation happened at the edge).
+PID file), import_any_port (the guest relays ANY host loopback port instead of
+only its declared ones), import_any_machine (every Machine relays machine-0's
+grants), export_wildcard (the export listener binds 0.0.0.0 instead of
+127.0.0.1).
 
 The last ten exist to make the criterion 2, 6 and 17 checks falsifiable
 offline: each one breaks exactly one claim, and the check has to notice.
@@ -113,6 +117,13 @@ if [ -n "$verb" ]; then
     exit 0
   fi
   if [ "$verb" = up ] && [ -f vz.json ]; then
+    # This Up applies `offline` egress only, exactly as the installed one does:
+    # a non-offline Machine needs the per-Environment gateway that is not built
+    # yet. Modelled here so a check that depends on the refusal sees it.
+    if grep -q '"egress": *"\(allowed\|restricted\)"' vz.json; then
+      printf '{"error":{"code":"unsupported_operation","message":"Machine declares a non-offline egress policy, whose adapter is not implemented; this Up applies `offline` only and performs no admission"},"schema_version":1}\n' >&2
+      exit 1
+    fi
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
     mkdir -p "$VZ_RUNTIME_DATA_DIR"
     # A Developer Machine's Docker endpoint is an AF_UNIX socket bound in the
@@ -204,6 +215,27 @@ if [ -n "$verb" ]; then
       printf -- '-----BEGIN CERTIFICATE-----\nZmFrZSBhdXRob3JpdHk%s\n-----END CERTIFICATE-----\n' \
         "$inc" > "$anchor/authority.pem"
     fi
+    # Declared host imports and exports, read out of the definition the same way
+    # the runtime reads them: per Machine for an import (a grant belongs to one
+    # Machine) and per host port for an export.
+    /usr/bin/python3 "$(dirname "$0")/vz-fake-topology.py" vz.json "$VZ_RUNTIME_DATA_DIR" || exit 1
+    if [ -f "$VZ_RUNTIME_DATA_DIR/exports" ]; then
+      bind_flag=""
+      [ "$mode" = export_wildcard ] && bind_flag="--any"
+      while read -r hp mp; do
+        # Prove the loopback port is free before claiming it, exactly as
+        # `probe_exportable_host_ports` does: a second Environment declaring a
+        # port a live one already holds must fail the Up, not share it.
+        if ! "$(dirname "$0")/vz-runtimed" --probe-tcp "$hp"; then
+          printf '{"error":{"code":"state_conflict","message":"host loopback port %s for export is already held on this host"},"schema_version":1}\n' "$hp" >&2
+          rm -f "$topology"
+          exit 1
+        fi
+        VZ_FAKE_EXPORT_FILE="$VZ_RUNTIME_DATA_DIR/www/index.html" \
+          "$(dirname "$0")/vz-runtimed" --export "$hp" $bind_flag >/dev/null 2>&1 &
+        echo $! >> "$VZ_RUNTIME_DATA_DIR/export-pids"
+      done < "$VZ_RUNTIME_DATA_DIR/exports"
+    fi
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
   fi
@@ -253,7 +285,8 @@ if [ -n "$verb" ]; then
     # alone would hand two Machines one address and model the wrong property.
     nets=$(awk -v m="$machine" '$1=="M" && $2==m {print $5}' "$topology")
     [ "$nets" = "-" ] && nets=""
-    VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" VZ_FAKE_MODE="$mode" /bin/sh "$script"
+    VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" VZ_FAKE_MODE="$mode" \
+      VZ_FAKE_MODE_FILE="$MODE_FILE" /bin/sh "$script"
     code=$?
     rm -f "$script"
     exit $code
@@ -266,7 +299,12 @@ if [ -n "$verb" ]; then
     # nothing equivalent is needed of the real runtime.
     chmod -R u+rwX "$VZ_RUNTIME_DATA_DIR/guest" 2>/dev/null
     rm -rf "$VZ_RUNTIME_DATA_DIR/guest" "$VZ_RUNTIME_DATA_DIR/volumes"
-    rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
+    if [ -f "$VZ_RUNTIME_DATA_DIR/export-pids" ]; then
+      while read -r p; do kill "$p" 2>/dev/null; done < "$VZ_RUNTIME_DATA_DIR/export-pids"
+      rm -f "$VZ_RUNTIME_DATA_DIR/export-pids"
+    fi
+    rm -f "$topology" "$VZ_RUNTIME_DATA_DIR"/imports-* "$VZ_RUNTIME_DATA_DIR/exports"
+    printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
   fi
   # An Environment selector that names nothing is a refusal, not a silent
   # fallback to the only Environment there is: `--environment <absent>` must
@@ -625,6 +663,36 @@ def main():
 
 main()
 """
+FAKE_TOPOLOGY_READER = r'''#!/usr/bin/env python3
+"""Read the declared host imports/exports out of a fake project definition.
+
+The fake `vz` is POSIX sh, and a nested JSON array is not something `grep` reads
+honestly. This writes the two tables the stand-in needs:
+
+  <state>/imports-<machine>   "<guest_port> <host_port>" per declared import,
+                              keyed by the Machine that was granted it, because
+                              a grant belongs to one Machine and to no other.
+  <state>/exports             "<host_port> <machine_port>" per declared export.
+"""
+import json
+import sys
+
+definition = json.loads(open(sys.argv[1]).read())
+state = sys.argv[2]
+environment = definition.get("environment", {})
+tables = {}
+for entry in environment.get("host_imports", []):
+    guest_port = entry.get("guest_port") or entry["host_port"]
+    tables.setdefault(entry["machine"], []).append(f"{guest_port} {entry['host_port']}")
+for machine, rows in tables.items():
+    with open(f"{state}/imports-{machine}", "w") as handle:
+        handle.write("\n".join(rows) + "\n")
+rows = [f"{entry.get('host_port')} {entry['machine_port']}"
+        for entry in environment.get("host_exports", []) if entry.get("host_port")]
+if rows:
+    with open(f"{state}/exports", "w") as handle:
+        handle.write("\n".join(rows) + "\n")
+'''
 
 
 CATALOG = {"schema_version": 1, "linux": [
@@ -660,7 +728,84 @@ FAKE_DAEMON_SOURCE = r"""
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+
 static char socket_path[1024], pid_path[1024], log_path[1024];
+
+/* Bind one TCP port on 127.0.0.1 and release it: the fake `vz up`'s collision
+   proof, deciding by binding rather than by believing a table. */
+static int probe_tcp(int port) {
+    struct sockaddr_in address;
+    int descriptor = socket(AF_INET, SOCK_STREAM, 0);
+    if (descriptor < 0) {
+        return 4;
+    }
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((unsigned short)port);
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        close(descriptor);
+        return 4;
+    }
+    close(descriptor);
+    return 0;
+}
+
+/* The host half of a declared export: a listener that serves the Machine's own
+   file over HTTP. Bound to 127.0.0.1 unless `--any` asks for the wildcard the
+   `export_wildcard` mode exists to be caught by, so the listener evidence the
+   check reads with lsof is a real bind and not a claim. */
+static int serve_export(int port, int wildcard) {
+    struct sockaddr_in address;
+    int descriptor = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    const char *file = getenv("VZ_FAKE_EXPORT_FILE");
+    if (descriptor < 0 || file == NULL) {
+        return 4;
+    }
+    setsockopt(descriptor, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    memset(&address, 0, sizeof(address));
+    address.sin_family = AF_INET;
+    address.sin_port = htons((unsigned short)port);
+    address.sin_addr.s_addr = htonl(wildcard ? INADDR_ANY : INADDR_LOOPBACK);
+    if (bind(descriptor, (struct sockaddr *)&address, sizeof(address)) != 0) {
+        return 4;
+    }
+    if (listen(descriptor, 8) != 0) {
+        return 5;
+    }
+    /* A fixture must not outlive its test even when the test fails before it
+       could delete the Environment that started it: a failing test never runs
+       `vz delete`, and a listener still holding a port when the next test
+       starts is a leak that reads as that test's flakiness. */
+    alarm(60);
+    for (;;) {
+        char request[2048], body[65536], header[256];
+        FILE *source;
+        size_t length = 0;
+        int client = accept(descriptor, NULL, NULL);
+        if (client < 0) {
+            continue;
+        }
+        (void)read(client, request, sizeof(request));
+        source = fopen(file, "rb");
+        if (source != NULL) {
+            length = fread(body, 1, sizeof(body), source);
+            fclose(source);
+        }
+        snprintf(header, sizeof(header),
+                 "HTTP/1.1 200 OK\r\nContent-Length: %zu\r\nConnection: close\r\n\r\n", length);
+        (void)write(client, header, strlen(header));
+        if (length > 0) {
+            (void)write(client, body, length);
+        }
+        close(client);
+    }
+}
 
 static void on_term(int signal_number) {
     (void)signal_number;
@@ -714,6 +859,12 @@ static void delegate_flag_form(int argc, char **argv) {
 int main(int argc, char **argv) {
     struct sockaddr_un address;
     int descriptor;
+    if (argc >= 3 && strcmp(argv[1], "--probe-tcp") == 0) {
+        return probe_tcp(atoi(argv[2]));
+    }
+    if (argc >= 3 && strcmp(argv[1], "--export") == 0) {
+        return serve_export(atoi(argv[2]), argc >= 4 && strcmp(argv[3], "--any") == 0);
+    }
     delegate_flag_form(argc, argv);
     if (argc != 2 && argc != 4) {
         return 2;
@@ -1143,23 +1294,59 @@ case "$applet" in
     [ "$on_fabric" = 1 ] && printf '3: %s    inet %s/24 brd 10.%s.%s.255 scope global %s\n' \
       "$fabric_iface" "$fabric_addr" "$octet_a" "$octet_b" "$fabric_iface"
     exit 0 ;;
+  nc)
+    # Nothing in a Machine serves UDP on an import's guest port: the grant is
+    # for the declared stream protocol and nothing else.
+    exit 1 ;;
   wget)
     url=""
     while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done
-    target=${url#http://}; target=${target%%:*}
-    # A Machine's own loopback never touches the fabric: it is the control that
-    # says this Machine's HTTP client and server work at all, which is what
-    # makes its failure to reach a sibling a routing fact rather than a missing
-    # applet.
-    if [ "$target" = 127.0.0.1 ]; then
+    hostpart=${url#http://}; hostpart=${hostpart%%/*}
+    target=${hostpart%%:*}
+    port=${hostpart#*:}; [ "$port" = "$hostpart" ] && port=80
+    # The guest's OWN loopback. Reaching a host service through it is a declared
+    # host import and nothing else: the guest holds a table of (guest port ->
+    # host port) grants for THIS Machine, and a port that is not in it has
+    # nothing bound. The guest never names the host destination -- the table
+    # does -- so an undeclared host port, another Machine's grant, and a sibling
+    # Environment's grant are all simply absent from this table.
+    if [ "$target" = "127.0.0.1" ]; then
+      table="$state/imports-$machine"
+      # The whole point of the grant being per-Machine.
+      [ "$mode" = import_any_machine ] && table="$state/imports-machine-0"
+      # No table is not a refusal on its own: a Machine with no import grant can
+      # still reach its OWN listener below, which is criterion 5's control. A
+      # bare `exit 1` here made that control fail for the Hardened Machine and
+      # so reported a missing applet as a routing fact -- the exact confusion
+      # the control exists to rule out.
+      hostport=""
+      if [ -f "$table" ]; then
+        hostport=$(awk -v p="$port" '$1==p {print $2}' "$table")
+      fi
+      # The whole point of the guest not choosing the destination: a Machine
+      # that HAS a grant also reaches every other host loopback port. Its
+      # declared grant still resolves normally and a Machine with no grant still
+      # reaches nothing, so this mode breaks only the "cannot choose a host
+      # destination" and "undeclared port" denials -- a mode that also broke the
+      # positive or "absent by default" would not say which clause caught it.
+      if [ -z "$hostport" ] && [ -f "$table" ] && [ "$mode" = import_any_port ]; then hostport=$port; fi
+      if [ -n "$hostport" ]; then
+        exec /usr/bin/curl -s -m 5 "http://127.0.0.1:$hostport/"
+      fi
+      # No grant names this port, so this is the Machine's OWN listener rather
+      # than a host import: criterion 5's control that its HTTP client and
+      # server work at all, which is what makes failing to reach a sibling a
+      # routing fact rather than a missing applet. Trying the grant table first
+      # keeps both claims falsifiable -- an undeclared host port still reaches
+      # nothing, and a local listener is still reachable.
       [ -f "$state/httpd-$machine" ] || exit 1
       pid=$(cut -d' ' -f1 < "$state/httpd-$machine")
       kill -0 "$pid" 2>/dev/null || exit 1
       cat "$(cut -d' ' -f3- < "$state/httpd-$machine")/index.html"
       exit 0
     fi
-    # No port on the switch means no route to any Environment address, whatever
-    # is listening on it.
+    # No port on the switch means no route to any Environment address,
+    # whatever is listening on it.
     [ "$on_fabric" = 1 ] || exit 1
     # Served on the FABRIC address only. A request to the NAT address must not
     # be answered: the declared private path serves inside its Environment, and
@@ -1258,6 +1445,10 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     # Declared-storage admission and materialisation, which the fake `up` runs.
     (root / "bin/vz-storage-model").write_text(STORAGE_MODEL)
     (root / "bin/vz-storage-model").chmod(0o755)
+    # The declared-topology reader the fake `up` calls: a nested JSON array is
+    # not something the sh stand-in can read honestly with `grep`.
+    (root / "bin/vz-fake-topology.py").write_text(FAKE_TOPOLOGY_READER)
+    (root / "bin/vz-fake-topology.py").chmod(0o755)
     catalog = json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n"
     (root / "machine-target-catalog.json").write_bytes(catalog)
     manifest = json.loads(read_regular(root / "release-manifest.json"))

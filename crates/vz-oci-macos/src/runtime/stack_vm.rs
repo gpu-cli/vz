@@ -1067,6 +1067,117 @@ impl SharedVmLifecycleLease {
         Ok(record.vm.open_docker_stream().await?)
     }
 
+    /// Install this Machine's declared host imports on this exact boot.
+    ///
+    /// Two halves, both scoped to this VM and neither addressable by the guest:
+    ///
+    /// * a vsock listener on this VM's own socket device, holding a table of
+    ///   exactly these grants and their `127.0.0.1` destinations; and
+    /// * the guest agent's loopback listeners, installed over this Machine's
+    ///   private agent channel and carrying only a name, a guest port and a
+    ///   credential.
+    ///
+    /// An empty grant list positively removes both. "Host imports are absent by
+    /// default" is a clause of the release criterion, so a Machine that stops
+    /// declaring one must stop serving it rather than merely stop refreshing it.
+    ///
+    /// The returned address is what the guest reports binding on. The caller
+    /// asserts it is loopback; this side does not take the guest's word as
+    /// authorization, it takes it as evidence.
+    pub async fn install_host_imports(
+        &self,
+        grants: Vec<vz::host_import::HostImportGrant>,
+    ) -> Result<HostImportInstallation, OciError> {
+        let record = self
+            .stack_vms
+            .lock()
+            .await
+            .get(&self.runtime_identity.stack_id)
+            .cloned();
+        require_exact_stack_runtime(
+            record.as_ref().map(|record| &record.identity),
+            &self.runtime_identity,
+        )?;
+        let record = record.ok_or_else(|| OciError::SharedRuntimeAbsent {
+            stack_id: self.runtime_identity.stack_id.clone(),
+        })?;
+        // Only a Developer Linux Machine carries the agent half. A Hardened or
+        // native Machine reaching here would have been refused at admission;
+        // repeating it means this method cannot be made unsound by a future
+        // caller that forgets.
+        //
+        // The profile, and deliberately not Docker provisioning: a host import
+        // is a network boundary, not a Docker capability, and coupling it to
+        // the private Engine would make an unrelated Engine failure look like
+        // the boundary refusing.
+        if record.verified_linux_profile != Some(KernelProfile::Developer) {
+            return Err(OciError::UnsupportedOperation {
+                operation: "shared_vm_lease_install_host_imports".to_string(),
+                reason: format!(
+                    "host imports require an actually verified Developer Linux boot; active profile is {:?}",
+                    record.verified_linux_profile
+                ),
+            });
+        }
+        let stack_id = self.runtime_identity.stack_id.clone();
+        // Withdraw first, always: an existing relay holds this VM's one vsock
+        // listener for the import port, and a second `vsock_listen` on the same
+        // port would replace the delegate underneath the live one.
+        if let Some(mut existing) = self.stack_host_import_relays.lock().await.remove(&stack_id) {
+            existing.shutdown().await?;
+        }
+        let mut client = vz_linux::grpc_client::GrpcAgentClient::connect(
+            record.vm.inner_shared(),
+            vz::protocol::AGENT_PORT,
+        )
+        .await
+        .map_err(|error| {
+            OciError::InvalidConfig(format!(
+                "host import installation could not reach the guest agent: {error}"
+            ))
+        })?;
+        if grants.is_empty() {
+            let (bound, address) = client.configure_host_imports(&[]).await.map_err(|error| {
+                OciError::InvalidConfig(format!(
+                    "host import withdrawal was not accepted by the guest agent: {error}"
+                ))
+            })?;
+            return Ok(HostImportInstallation {
+                bound,
+                guest_bind_address: address,
+                host_termination_address: host_import_relay::IMPORT_TERMINATION_ADDRESS.to_string(),
+            });
+        }
+        let relay =
+            host_import_relay::start_host_import_relay(record.vm.inner_shared(), grants.clone())
+                .await?;
+        let (bound, address) = match client.configure_host_imports(&grants).await {
+            Ok(result) => result,
+            Err(error) => {
+                // The host half is live and the guest half is not. Tear the
+                // host half down rather than leaving a listener no declared
+                // guest can use.
+                if let Some(mut relay) = relay {
+                    relay.shutdown().await?;
+                }
+                return Err(OciError::InvalidConfig(format!(
+                    "host import grants were not accepted by the guest agent: {error}"
+                )));
+            }
+        };
+        if let Some(relay) = relay {
+            self.stack_host_import_relays
+                .lock()
+                .await
+                .insert(stack_id, relay);
+        }
+        Ok(HostImportInstallation {
+            bound,
+            guest_bind_address: address,
+            host_termination_address: host_import_relay::IMPORT_TERMINATION_ADDRESS.to_string(),
+        })
+    }
+
     /// Full identity of the exact shared-VM boot protected by this lease.
     pub fn runtime_identity(&self) -> &vz_runtime_contract::StackRuntimeIdentity {
         &self.runtime_identity
@@ -2875,6 +2986,12 @@ esac
                 "shutdown_shared_vm: no in-memory VM (likely after daemon respawn); treating as already-stopped"
             );
             shutdown_port_forwarding_registry_entry(&self.stack_port_forwards, stack_id).await?;
+            // Same reasoning for the import relay: without a VM handle there is
+            // nothing to relay to, and a stale listener would answer for a
+            // Machine that no longer exists.
+            if let Some(mut relay) = self.stack_host_import_relays.lock().await.remove(stack_id) {
+                relay.shutdown().await?;
+            }
             commit_stack_cleanup_batch(
                 self,
                 &self.container_stack,
@@ -2959,6 +3076,31 @@ esac
         // published. Retry can therefore resume from stopped metadata without
         // re-signalling or losing the shared VM handle.
         let mut infrastructure_failures = Vec::new();
+        // The import relay owns a vsock listener on this VM's socket device and
+        // a task per live relay. It is stopped before the VM, for the same
+        // reason the port forwards are: a listener outliving its VM is a
+        // boundary nothing owns.
+        let import_relay_present = {
+            let mut guard = self.stack_host_import_relays.lock().await;
+            if let Some(relay) = guard.get_mut(stack_id) {
+                let (accepted, relayed, refused) = relay.counts();
+                tracing::info!(
+                    target: "vz_post_stop",
+                    stack_id = %stack_id,
+                    imports = ?relay.names(),
+                    accepted,
+                    relayed,
+                    refused,
+                    "[L4/stack-vm] shutdown_shared_vm: awaiting HostImportRelay::shutdown"
+                );
+                if let Err(error) = relay.shutdown().await {
+                    infrastructure_failures.push(error.to_string());
+                }
+                true
+            } else {
+                false
+            }
+        };
         let pf_present = {
             let mut guard = self.stack_port_forwards.lock().await;
             if let Some(pf) = guard.get_mut(stack_id) {
@@ -3033,6 +3175,9 @@ esac
         // No fallible teardown remains: publish the complete registry commit.
         if pf_present {
             self.stack_port_forwards.lock().await.remove(stack_id);
+        }
+        if import_relay_present {
+            self.stack_host_import_relays.lock().await.remove(stack_id);
         }
         self.stack_vms.lock().await.remove(stack_id);
         self.clear_stack_vm_stop_complete(stack_id);
@@ -3158,6 +3303,7 @@ esac
             runtime_identity: record.identity,
             verified_profile,
             stack_vms: Arc::clone(&self.stack_vms),
+            stack_host_import_relays: Arc::clone(&self.stack_host_import_relays),
             _stack_lifecycle_guard: stack_lifecycle_guard,
         })
     }

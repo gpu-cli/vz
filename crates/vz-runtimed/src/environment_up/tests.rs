@@ -129,38 +129,25 @@ async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_adm
 }
 
 #[tokio::test]
-async fn declared_host_relays_and_egress_reject_before_project_creation() {
-    // These are declarable records with no adapter behind them yet. Admitting
-    // one would start a Machine that silently lacks the boundary its definition
-    // asks for, so Up must refuse and create no project.
+async fn declared_egress_rejects_before_project_creation() {
+    // A declarable record with no adapter behind it. Admitting one would start
+    // a Machine that silently lacks the boundary its definition asks for, so Up
+    // must refuse and create no project.
     //
-    // A host EXPORT is no longer in this list: `start_port_forwarding` carries
-    // it on a loopback-only listener and `authorize_ownership` accounts for it,
-    // so the admitted case is asserted by
-    // `a_fixed_port_host_export_is_admitted_and_persisted` below. What remains
-    // refused about exports is only the shape no surface can serve, which
-    // `an_export_this_up_cannot_serve_is_refused_for_its_own_named_reason`
-    // covers one case at a time.
-    for mutate in [
-        (|request: &mut EnvironmentUpRequest| {
-            request
-                .definition
-                .environment
-                .host_imports
-                .push(HostImportSpec {
-                    schema_version: 1,
-                    name: "db".into(),
-                    machine: request.definition.environment.machines[0].name.clone(),
-                    protocol: TransportProtocol::Tcp,
-                    host_port: 5432,
-                    guest_port: None,
-                    alias: None,
-                });
-        }) as fn(&mut EnvironmentUpRequest),
-        |request: &mut EnvironmentUpRequest| {
-            request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
-        },
-    ] {
+    // Host EXPORTS and IMPORTS are no longer in this list. An export is carried
+    // by `start_port_forwarding`'s loopback-only listener; an import by the
+    // per-Machine vsock terminator and the guest agent's loopback listeners,
+    // with a per-declaration credential. `authorize_ownership` accounts for
+    // both, and the admitted cases are asserted by
+    // `a_fixed_port_host_export_is_admitted_and_persisted` and
+    // `a_declared_host_import_is_admitted_and_persisted` below. What remains
+    // refused about either is only the shape no surface can serve, which the
+    // `..._cannot_serve_is_refused_for_its_own_named_reason` tests cover one
+    // case at a time.
+    for mutate in [(|request: &mut EnvironmentUpRequest| {
+        request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
+    }) as fn(&mut EnvironmentUpRequest)]
+    {
         let (_root, daemon, mut request, metadata) = fixture();
         mutate(&mut request);
         assert_eq!(
@@ -178,6 +165,192 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
                 )
                 .unwrap()
                 .is_none()
+        );
+    }
+}
+
+/// Declare one host import on a Developer Linux Machine.
+fn declare_host_import(
+    request: &mut EnvironmentUpRequest,
+    name: &str,
+    host_port: u16,
+    guest_port: Option<u16>,
+) {
+    request
+        .definition
+        .environment
+        .host_imports
+        .push(HostImportSpec {
+            schema_version: 1,
+            name: name.into(),
+            machine: request.definition.environment.machines[0].name.clone(),
+            protocol: TransportProtocol::Tcp,
+            host_port,
+            guest_port,
+            alias: None,
+        });
+}
+
+/// The admitted half of criterion 7's import clauses.
+///
+/// This is the positive every import denial is measured against. Without it,
+/// "an import is refused" would be indistinguishable from "imports are not
+/// implemented", which is exactly what the blanket refusal this replaced meant.
+/// The Up still fails afterwards, because the test backend cannot boot a
+/// Machine — what is asserted is that the failure is no longer an admission
+/// refusal, that the import instance and its Machine-scoped ownership edge were
+/// persisted (that edge is what `environment_delete` demands before it will
+/// reclaim anything), and that the join the boot loop performs resolves the
+/// persisted instance to exactly one grant.
+#[tokio::test]
+async fn a_declared_host_import_is_admitted_and_persisted() {
+    let (_root, daemon, mut request, metadata) = fixture();
+    declare_host_import(&mut request, "db", 5432, Some(15432));
+    let completion = terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    // The Up does not succeed in this fixture; it must not fail at admission.
+    assert!(completion.error.is_some());
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("a declared import is now admitted, so its project exists");
+    let environment = &project.environments[0];
+    assert_eq!(environment.host_imports.len(), 1);
+    assert_eq!(environment.host_imports[0].name, "db");
+    assert_eq!(
+        environment.host_imports[0].machine_id,
+        environment.machines[0].machine_id
+    );
+    let edges = environment
+        .ownership
+        .iter()
+        .filter(|record| record.resource_kind == OwnedResourceKind::HostImport)
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 1, "exactly one HostImport ownership edge");
+    assert_eq!(
+        edges[0].resource_id,
+        environment.host_imports[0].import_id.to_string()
+    );
+    assert_eq!(
+        edges[0].machine_id.as_ref(),
+        Some(&environment.machines[0].machine_id),
+        "the edge must be Machine-scoped or Delete dispatches its cleanup with no store"
+    );
+    let resolved = super::host_imports::resolve_environment_host_imports(
+        &request.definition.environment,
+        &environment.machines,
+        &environment.host_imports,
+    )
+    .expect("the persisted import joins its declaration");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].host_port, 5432);
+    assert_eq!(resolved[0].guest_port, 15432);
+    assert_eq!(resolved[0].machine_id, environment.machines[0].machine_id);
+    // The grant that would be installed carries a secret and, in its guest
+    // projection, no host destination at all.
+    let grants = super::host_imports::boot_import_grants(&resolved).expect("credentials");
+    let machine_grants = grants
+        .get(&environment.machines[0].machine_id)
+        .expect("grants for the declared Machine");
+    assert_eq!(machine_grants.len(), 1);
+    assert_eq!(machine_grants[0].host_port, 5432);
+    assert_ne!(machine_grants[0].credential, [0u8; 32]);
+}
+
+/// Each import shape Up cannot serve is refused by its own name, before any
+/// project row exists. Paired with the admitted case above, so each refusal is
+/// evidence about that shape rather than about imports as a whole.
+///
+/// Four of these are refused by the portable definition itself rather than by
+/// this Up, exactly as two of the export cases are: `EnvironmentSpec::validate`
+/// (`vz-runtime-contract/src/types/topology.rs`) already refuses port 0 on
+/// either side, a repeated declaration name, and an import naming a Machine the
+/// Environment does not declare, so they never reach
+/// `refuse_unsupported_host_imports`. Asserting the message actually produced,
+/// rather than the one this Up would have produced, is the point; that module's
+/// own rule for each is exercised directly by its unit tests. The
+/// duplicate-guest-port refusal below has no counterpart in the contract -- one
+/// Machine's loopback port carrying two imports is a runtime fact -- and is
+/// this module's alone.
+#[tokio::test]
+async fn an_import_this_up_cannot_serve_is_refused_for_its_own_named_reason() {
+    for (mutate, expected) in [
+        // Port 0 names no host service; the relay would have nothing to dial.
+        (
+            (|request: &mut EnvironmentUpRequest| {
+                declare_host_import(request, "db", 0, None);
+            }) as fn(&mut EnvironmentUpRequest),
+            "invalid host_import.host_port",
+        ),
+        // Guest port 0 asks the kernel to pick a port nothing granted.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                declare_host_import(request, "db", 5432, Some(0));
+            },
+            "invalid host_import.guest_port",
+        ),
+        // Two declarations of one name: one name resolves to one host service,
+        // and the open frame carries only the name.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                declare_host_import(request, "db", 5432, Some(15432));
+                declare_host_import(request, "db", 5433, Some(15433));
+            },
+            "duplicate host_import_name",
+        ),
+        // Two declarations on one guest loopback port: the second would shadow
+        // the first and a guest process could not tell which it reached.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                declare_host_import(request, "db", 5432, Some(15432));
+                declare_host_import(request, "cache", 6379, Some(15432));
+            },
+            "both bind guest loopback port",
+        ),
+        // A Machine the Environment does not declare.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request
+                    .definition
+                    .environment
+                    .host_imports
+                    .push(HostImportSpec {
+                        schema_version: 1,
+                        name: "db".into(),
+                        machine: "absent".into(),
+                        protocol: TransportProtocol::Tcp,
+                        host_port: 5432,
+                        guest_port: None,
+                        alias: None,
+                    });
+            },
+            "host_import.machine",
+        ),
+    ] {
+        let (_root, daemon, mut request, metadata) = fixture();
+        mutate(&mut request);
+        let error = daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains(expected),
+            "expected a refusal naming {expected:?}, got {:?}",
+            error.message
+        );
+        assert!(
+            daemon
+                .with_state_store(
+                    |store| store.load_project_state(request.definition.project_id.as_str())
+                )
+                .unwrap()
+                .is_none(),
+            "a refused import must leave no project row behind"
         );
     }
 }
@@ -587,7 +760,6 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
     );
 
     for kind in [
-        OwnedResourceKind::HostImport,
         OwnedResourceKind::Socket,
         OwnedResourceKind::PortRange,
         OwnedResourceKind::Credential,
@@ -610,6 +782,25 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
             "{kind:?} has no adapter and must stay refused"
         );
     }
+    // `HostImport` now has an adapter, so it leaves that list — but an edge
+    // with no persisted instance behind it must still be refused, exactly as an
+    // unaccounted export edge is. Otherwise Up would boot an Environment whose
+    // import Delete could never reclaim.
+    let mut unaccounted_import = environment.clone();
+    let environment_id = unaccounted_import.environment_id.clone();
+    let machine_id = unaccounted_import.machines[0].machine_id.clone();
+    unaccounted_import.ownership.push(OwnershipRecord {
+        schema_version: 1,
+        resource_kind: OwnedResourceKind::HostImport,
+        resource_id: "hmp_unaccounted".into(),
+        environment_id,
+        machine_id: Some(machine_id),
+    });
+    assert_eq!(
+        code(&unaccounted_import),
+        MachineErrorCode::UnsupportedOperation,
+        "an import ownership edge with no instance behind it must stay refused"
+    );
 }
 
 /// The refused half of the same boundary: declarations no adapter implements

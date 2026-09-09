@@ -40,6 +40,7 @@ TOP1 = "gate.instances.three_concurrent_no_collision"
 TOP5 = "gate.network.private_topology_paths"
 TOP2 = e2e.CRITERION_2
 TOP17 = e2e.CRITERION_17
+TOP7 = e2e.CRITERION_7
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 TOP19 = e2e.CRITERION_19
@@ -55,6 +56,11 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
 # which certified the criterion on evidence that never touched its macOS clause.
 #
+# `host_import_export_boundaries` proves every clause of criterion 7 except the
+# one no runtime here can offer: "enabled egress does not create one" needs a
+# Machine with non-offline egress, and this Up refuses those until the egress
+# gateway lands. The check names that clause exactly and declines to claim PASS
+# on the rest, rather than certifying the criterion on the clauses that ran.
 # `public_like_ingress` now proves criterion 6's split-DNS, `.test`-hostname,
 # edge-versus-origin, cross-Environment, TLS, routed-ingress, source-translation
 # and host-listener clauses -- the TLS half became reachable when the Developer
@@ -77,7 +83,8 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # `grpc_api_live_agreement` is deliberately absent from this set: the release
 # now ships vz-runtime-probe, so criterion 15's typed channel is exercised.
 NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall",
-                   "mixed_profile_topology_status", "public_like_ingress"}
+                   "mixed_profile_topology_status", "public_like_ingress",
+                   "host_import_export_boundaries"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -238,6 +245,10 @@ class TopologyLaneTests(unittest.TestCase):
         # criterion. The crossing to a native macOS Machine is unexercised, so
         # the check declines to claim PASS; see check_private_topology_paths.
         self.assertEqual(self.top(result, TOP5)["status"], "FAIL")
+        # Criterion 7 runs every clause it can against the fake -- the granted
+        # import serves, and each denial is measured against it -- and still
+        # declines to PASS while the enabled-egress clause is unexercisable.
+        self.assertEqual(self.top(result, TOP7)["status"], "FAIL")
         self.assertEqual(self.top(result, TOP15)["status"], "PASS")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
@@ -267,7 +278,8 @@ class TopologyLaneTests(unittest.TestCase):
                           f"{TOP15}__grpc_api_live_agreement",
                           f"{TOP19}__install_upgrade_rollback_uninstall",
                           f"{TOP2}__mixed_profile_topology_status",
-                          f"{TOP6}__public_like_ingress"})
+                          f"{TOP6}__public_like_ingress",
+                          f"{TOP7}__host_import_export_boundaries"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:
@@ -350,6 +362,14 @@ class TopologyLaneTests(unittest.TestCase):
     def test_provisioning_up_fails_clean_directory_check(self):
         result = self.assert_regression("provisions", "clean_up_refuses", "lane state root changed")
         self.assertTrue(any("exit 0 (expected 2)" in a for a in self.by_slug(result)["clean_up_refuses"]["assertions"]))
+        # An Up that reports success and persists no topology leaves every
+        # criterion-7 clause unexercised. The check must FAIL rather than return
+        # early with an empty PASS: that is exactly how a criterion gets
+        # certified on evidence that never touched it.
+        boundaries = self.by_slug(result)["host_import_export_boundaries"]
+        self.assertEqual(boundaries["status"], "FAIL")
+        self.assertTrue(any("reports a readable status" in a for a in boundaries["assertions"]),
+                        boundaries["assertions"])
 
     def test_hanging_command_is_uncertain_effects(self):
         self.set_mode("hang")
@@ -983,6 +1003,80 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertTrue(any(line.startswith("FAILED:")
                             and "client's own address never reached the origin" in line
                             for line in sub["assertions"]), sub["assertions"])
+    # -- criterion 7: host import and export boundaries -----------------------------------
+    def host_boundary_sub(self, mode: str = ""):
+        """Run clean-provision under `mode` and return (result, criterion-7 sub-check)."""
+        if mode:
+            self.set_mode(mode)
+        evidence = self.evidence()
+        _code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        return result, self.by_slug(result)["host_import_export_boundaries"]
+
+    def assert_asserted(self, sub: dict, needle: str, mode: str):
+        """The sub-check FAILED for a stated reason, not for want of running."""
+        self.assertEqual(sub["status"], "FAIL", mode)
+        failures = [a for a in sub["assertions"] if a.startswith("FAILED: ")]
+        self.assertTrue(any(needle in a for a in failures), (mode, failures))
+
+    def test_host_boundaries_prove_every_clause_they_can_and_name_the_one_they_cannot(self):
+        """The conformant run: the positive holds, every denial holds, and the
+        one clause this runtime cannot offer is named rather than skipped."""
+        result, sub = self.host_boundary_sub()
+        self.assertEqual(result["failure"]["reason"], "not_implemented")
+        self.assertEqual(sub["status"], "FAIL")
+        self.assertEqual([a for a in sub["assertions"] if a.startswith("FAILED: ")], [])
+        not_implemented = [a for a in sub["assertions"] if a.startswith("not_implemented:")]
+        self.assertEqual(len(not_implemented), 1, sub["assertions"])
+        self.assertIn("enabled egress", not_implemented[0])
+        assertions = "\n".join(sub["assertions"])
+        # Every clause of the criterion, each named in the evidence it produced.
+        for needle in (
+            "an Environment that declares no import cannot reach",
+            "the authorized Machine reaches the 127.0.0.1-only host service",
+            "the undeclared guest port",
+            "a UDP datagram to the declared guest port is not served",
+            "the sibling Machine in the SAME Environment",
+            "a Machine in a sibling Environment cannot reach the granted port",
+            "cannot choose a host destination",
+            "a NAT alias or LAN address is not the grant",
+            "declares offline egress, and its declared import served anyway",
+            "the declared loopback export serves the Machine's own service",
+            "is loopback and nothing else",
+            "no wildcard or LAN host listener holds any port this check declared",
+            "an import's guest loopback port has no host listener at all",
+            "declaring the export host port already held is refused",
+        ):
+            self.assertIn(needle, assertions, needle)
+
+    def test_a_guest_that_can_choose_any_host_port_fails_criterion_7(self):
+        """Vacuity: make the guest relay any loopback port instead of only its
+        declared grants. The positive still passes, so the failure is the
+        denials and nothing else."""
+        _result, sub = self.host_boundary_sub("import_any_port")
+        self.assert_asserted(sub, "cannot choose a host destination", "import_any_port")
+        failures = "\n".join(a for a in sub["assertions"] if a.startswith("FAILED: "))
+        # Both shapes: the host port of its own declared service, and a host
+        # service nothing ever declared to it.
+        self.assertIn("own-host-port", failures)
+        self.assertIn("undeclared-host-service", failures)
+        # The positive still held, so the failure is the denials and not the
+        # fixture: a mode that also broke the granted import would prove nothing.
+        self.assertIn("the authorized Machine reaches the 127.0.0.1-only host service",
+                      "\n".join(a for a in sub["assertions"] if not a.startswith("FAILED: ")))
+
+    def test_a_grant_honoured_on_the_wrong_machine_fails_criterion_7(self):
+        """Vacuity: make every Machine honour machine-0's grants. Only the
+        wrong-Machine and sibling-Environment denials may break."""
+        _result, sub = self.host_boundary_sub("import_any_machine")
+        self.assert_asserted(sub, "the sibling Machine in the SAME Environment", "import_any_machine")
+
+    def test_a_wildcard_export_listener_fails_criterion_7(self):
+        """Vacuity: bind the export on 0.0.0.0. The export still serves on
+        loopback, so only the listener evidence may catch it -- which is the
+        whole reason that clause reads real listeners instead of asserting the
+        bind address from the code that chose it."""
+        _result, sub = self.host_boundary_sub("export_wildcard")
+        self.assert_asserted(sub, "is loopback and nothing else", "export_wildcard")
 
 
 # One `#[derive(...)]`-preceded struct body out of the Rust source, as

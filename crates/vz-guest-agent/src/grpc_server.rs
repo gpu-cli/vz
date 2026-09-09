@@ -3248,6 +3248,52 @@ impl agent_service_server::AgentService for AgentServiceImpl {
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 
+    /// Install this Machine's declared host imports.
+    ///
+    /// The grants arrive over this agent's private vsock control channel, which
+    /// only its own host daemon can open, so the credentials they carry never
+    /// cross a boundary a guest process can observe. What the guest gets is a
+    /// loopback listener per declaration; where each one terminates on the host
+    /// stays the host terminator's secret.
+    async fn configure_host_imports(
+        &self,
+        request: Request<ConfigureHostImportsRequest>,
+    ) -> Result<Response<ConfigureHostImportsResponse>, Status> {
+        let request = request.into_inner();
+        let mut grants = Vec::with_capacity(request.imports.len());
+        for import in request.imports {
+            let credential: [u8; ::vz::host_import::CREDENTIAL_BYTES] =
+                import.credential.as_slice().try_into().map_err(|_| {
+                    Status::invalid_argument(format!(
+                        "host import '{}' carries a {}-byte credential; {} are required",
+                        import.name,
+                        import.credential.len(),
+                        ::vz::host_import::CREDENTIAL_BYTES
+                    ))
+                })?;
+            let guest_port = u16::try_from(import.guest_port).map_err(|_| {
+                Status::invalid_argument(format!(
+                    "host import '{}' declares guest port {}, which is not a TCP port",
+                    import.name, import.guest_port
+                ))
+            })?;
+            grants.push(::vz::host_import::GuestHostImportGrant {
+                name: import.name,
+                guest_port,
+                credential,
+            });
+        }
+        let bound = crate::host_imports::imports()
+            .configure(grants)
+            .await
+            .map_err(|error| Status::failed_precondition(error.to_string()))?;
+        info!(imports = ?bound, "host imports configured");
+        Ok(Response::new(ConfigureHostImportsResponse {
+            bound,
+            bound_address: crate::host_imports::IMPORT_BIND_ADDRESS.to_string(),
+        }))
+    }
+
     async fn resize_exec_pty(
         &self,
         request: Request<ResizeExecPtyRequest>,

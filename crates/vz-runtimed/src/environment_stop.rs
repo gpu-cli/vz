@@ -610,6 +610,17 @@ fn validate_supported_topology(
                         && volume.environment_id == record.environment_id
                         && record.machine_id.is_none()
                 }),
+                // A host import is durable identity on the same terms, checked
+                // the same way. Its runtime halves — this Machine's vsock
+                // terminator and its guest loopback listeners — are owned by the
+                // VM and released with it, and its credential is deliberately
+                // not persisted, so the next Up mints a new one rather than
+                // resurrecting a secret a stopped Machine once held.
+                OwnedResourceKind::HostImport => environment.host_imports.iter().any(|import| {
+                    import.import_id.to_string() == record.resource_id
+                        && import.environment_id == record.environment_id
+                        && Some(&import.machine_id) == record.machine_id.as_ref()
+                }),
                 OwnedResourceKind::Other(kind) => {
                     kind == "machine_runtime_store" || kind == "runtime_vm"
                 }
@@ -619,7 +630,7 @@ fn validate_supported_topology(
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints, network attachments, host exports and volumes; additional topology resources remain unsupported",
+            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints, network attachments, host exports, volumes and host imports; additional topology resources remain unsupported",
         ));
     }
     Ok(())

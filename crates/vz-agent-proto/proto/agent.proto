@@ -69,6 +69,16 @@ service AgentService {
   // configured, and the guest resolves the address. Client sends
   // PortForwardOpen as the first frame, then raw data flows in both directions.
   rpc PortForward(stream PortForwardFrame) returns (stream PortForwardFrame);
+
+  // Install this Machine's declared host imports.
+  //
+  // Each grant names one declaration, the guest loopback port to bind for it,
+  // and the per-import credential the guest must present when it dials the
+  // host relay. No host address is carried: the host terminator holds the only
+  // copy of the `127.0.0.1:<port>` pair a grant resolves to. The call replaces
+  // the whole installed set, so an Environment whose declarations changed does
+  // not accumulate listeners for imports it no longer declares.
+  rpc ConfigureHostImports(ConfigureHostImportsRequest) returns (ConfigureHostImportsResponse);
 }
 
 // ─── OCI Container Service ──────────────────────────────────────
@@ -370,6 +380,31 @@ message PortForwardOpen {
   // unregistered name is refused. Empty selects the guest's own loopback.
   string target_service = 3;
   TransportMetadata metadata = 4;
+}
+
+// One declared host import as the guest holds it. Deliberately has no field
+// able to carry a host address or host port: a guest that could name the
+// destination could name any destination.
+message HostImportGrant {
+  // Declaration name, echoed in the open frame the guest sends the host.
+  string name = 1;
+  // Guest loopback port the agent binds. Never a wildcard or LAN address.
+  uint32 guest_port = 2;
+  // Per-import secret minted by the host for this Machine and this boot.
+  bytes credential = 3;
+}
+
+message ConfigureHostImportsRequest {
+  repeated HostImportGrant imports = 1;
+  TransportMetadata metadata = 2;
+}
+
+message ConfigureHostImportsResponse {
+  // Names actually bound, in declaration order.
+  repeated string bound = 1;
+  // The exact loopback address every listener was bound to, so the caller can
+  // assert it rather than assume it.
+  string bound_address = 2;
 }
 
 // ─── OCI Messages ───────────────────────────────────────────────

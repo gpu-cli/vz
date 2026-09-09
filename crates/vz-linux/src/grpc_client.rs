@@ -863,6 +863,42 @@ impl GrpcAgentClient {
         Ok(())
     }
 
+    /// Install this Machine's declared host imports in its guest agent.
+    ///
+    /// The grants carry a declaration name, the guest loopback port to bind,
+    /// and the per-import credential the guest presents when it dials back.
+    /// They deliberately carry no host address: the host terminator holds the
+    /// only copy of the `127.0.0.1:<port>` pair a name resolves to, so a guest
+    /// agent — compromised or not — has nothing to point elsewhere.
+    ///
+    /// Returns the names actually bound and the address the guest reports
+    /// binding them on, so the caller can assert loopback rather than assume it.
+    pub async fn configure_host_imports(
+        &mut self,
+        grants: &[vz::host_import::HostImportGrant],
+    ) -> Result<(Vec<String>, String), LinuxError> {
+        let metadata = self.next_transport_metadata(None);
+        let response = self
+            .agent
+            .configure_host_imports(vz_agent_proto::ConfigureHostImportsRequest {
+                imports: grants
+                    .iter()
+                    .map(|grant| {
+                        let view = grant.guest_view();
+                        vz_agent_proto::HostImportGrant {
+                            name: view.name,
+                            guest_port: u32::from(view.guest_port),
+                            credential: view.credential.to_vec(),
+                        }
+                    })
+                    .collect(),
+                metadata: Some(metadata),
+            })
+            .await?
+            .into_inner();
+        Ok((response.bound, response.bound_address))
+    }
+
     /// Open a bidirectional port forward stream to a guest-local target.
     ///
     /// `target_service` names a service whose network the guest configured, or

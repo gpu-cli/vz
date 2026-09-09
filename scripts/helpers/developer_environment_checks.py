@@ -4001,17 +4001,37 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
     # New, and attributable. A listener that predates the Environment is not
     # this Environment's doing, and an unrelated application opening a LAN
     # listener mid-run is not either; failing on those would make the claim
-    # about the whole machine rather than about vz. The attribution rule is the
-    # lane's own leak-diff rule: a pid among the processes that reference this
-    # run, or a row lsof could not attribute at all.
+    # about the whole machine rather than about vz.
+    #
+    # An unprivileged `lsof` cannot name every process, so some rows arrive with
+    # no pid. Counting those as this run's -- which this did -- makes the
+    # criterion fail for listeners vz demonstrably did not create, and makes it
+    # do so non-deterministically: on this machine it caught a `*:53564`
+    # ephemeral row and, in two hardware runs, `*:53` and OrbStack's IPv6 rows,
+    # none of them present when nothing was running and none attributable to
+    # any process. A check that fails on the machine's own background noise
+    # stops being read.
+    #
+    # Dropping the unattributable rows costs this clause nothing it was
+    # actually providing. The edge binds nothing on the host at all -- the whole
+    # path is a datagram socket pair inside one Environment's fabric -- so vz
+    # declares no host port here for an unattributable row to have taken. The
+    # claim that matters, that the edge address is bound nowhere on the host, is
+    # asserted separately and directly above.
     scoped = {row["pid"] for row in after["processes"]}
-    exposed = [row for row in appeared
-               if row.get("scope") != "loopback"
-               and (row.get("pid") in scoped or row.get("pid") is None)]
+    exposed, unattributed = [], []
+    for row in appeared:
+        if row.get("scope") == "loopback":
+            continue
+        (exposed if row.get("pid") in scoped else unattributed).append(row)
     check.check(not exposed,
                 f"no listener on the host LAN or a wildcard address appeared while both edges ran "
                 f"({len(appeared)} new listeners, {len(scoped)} processes attributable to this run, "
                 f"exposed {exposed[:5]})")
+    if unattributed:
+        check.ok(f"{len(unattributed)} new non-loopback listener(s) this run could not attribute to any "
+                 f"process and which bind no port it declared, recorded rather than charged to vz: "
+                 f"{[(row.get('address'), row.get('port')) for row in unattributed][:5]}")
     check.ok(f"every listener that appeared during the run, with attribution: "
              f"{sorted((row.get('scope'), row.get('command'), row.get('pid') in scoped) for row in appeared)[:10]}")
     # And the edge itself is not on the host at all. It is a station on one
@@ -4054,9 +4074,10 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
     if check.status == "PASS":
         check.not_implemented = (
             "criterion 6's controlled-egress, host-import/export and fault-control clauses were "
-            "not exercised. `EgressPolicy` admits only `Offline` in this runtime and no "
-            "authenticated host-import relay exists, so nothing reached a host off the fabric or "
-            "was imported to one; and no latency/loss/bandwidth/partition/DNS fault was declared, "
+            "not exercised. `EgressPolicy` admits only `Offline` in this runtime, and this check "
+            "declares no host import or export of its own, so nothing reached a host off the "
+            "fabric through the edge; and no latency/loss/bandwidth/partition/DNS fault was "
+            "declared, "
             "applied or measured. Everything else in the criterion did run from inside real "
             "Machines and passed: the split-DNS and `.test`-hostname views, the edge-versus-origin "
             "distinction, cross-Environment name isolation, a verified TLS session from a Machine "
@@ -4066,4 +4087,536 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
             "same request against the image's pinned public CA bundle and against another "
             "Environment's authority, and the absence of any attributable host LAN or wildcard "
             "listener while both edges ran.")
+    return check.finish()
+# ── Criterion 7: host import and export boundaries ─────────────────────────────
+#
+# The two directions are deliberately not symmetric, and the check is built
+# around that asymmetry:
+#
+#   EXPORT  host 127.0.0.1:<host_port>  ──▶  Machine's own loopback service
+#   IMPORT  Machine 127.0.0.1:<guest_port>  ──▶  host 127.0.0.1:<host_port>
+#
+# An export is host-initiated and its listener is loopback-only by construction
+# (`HostExportSpec` has no host-address field at all). An import is
+# guest-initiated, and the contract's rule for it is stricter: "Host imports
+# require exact authenticated Environment/Machine grants to a declared
+# host-loopback service, independently of external egress. NAT aliases and
+# wildcard/LAN listeners are not authorization."
+#
+# So every denial below is measured against a WORKING import in the same run. A
+# denial that passed because imports were unimplemented would prove nothing, and
+# that is exactly the failure mode this criterion has to avoid.
+
+# The guest loopback port the granted import binds, and one deliberately never
+# declared. Guest-local, so they cannot collide with anything on the host.
+GRANTED_GUEST_PORT = 15432
+UNDECLARED_GUEST_PORT = 15433
+# The Machine port the export forwards to, served by a held BusyBox httpd.
+EXPORT_MACHINE_PORT = 8080
+# Wall-clock budget for one recorded guest probe. Generous on purpose: the
+# network deadline that actually decides these claims is WGET_TIMEOUT inside the
+# Machine, and this only has to cover process launch on a loaded host. Too tight
+# and a probe is killed mid-flight, which the recorder reports as uncertain
+# effects -- a lane failure that says nothing about the boundary under test.
+HOST_BOUNDARY_TIMEOUT = 60
+# The address a Machine sees the host as over Apple's shared NAT segment. The
+# contract names this case explicitly: a NAT alias is not authorization.
+NAT_GATEWAY_ADDRESS = "192.168.64.1"
+
+
+def free_host_port() -> int:
+    """A loopback port free at this instant.
+
+    Bound and released rather than guessed. Racy in principle -- the port can be
+    taken between the probe and the declaration -- but a hard-coded port
+    collides with whatever else this Mac is running, which is worse and silent.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind(("127.0.0.1", 0))
+        return probe.getsockname()[1]
+
+
+class LoopbackHostService:
+    """A host HTTP service bound to 127.0.0.1 and to nothing else.
+
+    This is the thing an import is supposed to reach and every denial is
+    supposed not to reach. It binds the loopback address explicitly rather than
+    a wildcard, so "the Machine reached the host service" cannot be satisfied by
+    a service that was reachable from the LAN anyway.
+    """
+
+    def __init__(self, token: str):
+        import http.server
+        import threading
+
+        body = token.encode()
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802 - http.server's required spelling
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *_args):
+                return
+
+        self.token = token
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.address, self.port = self.server.server_address[0], self.server.server_address[1]
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.server.shutdown()
+        self.server.server_close()
+        self.thread.join(timeout=5)
+
+
+def attempt_up(ctx: CheckContext, check: SubCheck, name: str, definition: dict, *, timeout: int = UP_TIMEOUT) -> dict:
+    """Bring one Environment up and REPORT the outcome instead of asserting it.
+
+    `provision` asserts `vz up` exit 0, which is right for every check whose
+    subject is a running Environment. Two clauses of this criterion have a
+    refusal as their subject -- a colliding export host port, and a Machine
+    whose egress policy this runtime does not implement -- so a helper that
+    fails the check on a nonzero exit could not express them. Everything before
+    the Up is asserted exactly as `provision` asserts it, because a fixture that
+    could not have started is not a refusal.
+    """
+    data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+    iso = ctx.isolated(name, project_files={"vz.json": data}, provision=True)
+    env, project = iso["env"], iso["project"]
+    for label, argv in ((name + "-git-init", [GIT, "init", "--quiet", "--initial-branch", "main"]),
+                        (name + "-git-add", [GIT, "add", "vz.json"]),
+                        (name + "-git-commit", [GIT, "-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                                                "commit", "--quiet", "-m", "definition"])):
+        receipt = ctx.run_tool(check, label, argv, cwd=project, env=env)
+        check.check(receipt.exit_code == 0, f"{label}: exit {receipt.exit_code} (expected 0)")
+    up = ctx.run(check, name + "-up", ["--json", "up"], cwd=project, env=env, timeout=timeout)
+    message = ""
+    try:
+        message = json.loads(up.stderr.decode("utf-8")).get("error", {}).get("message", "")
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        message = up.stderr.decode("utf-8", "replace")[:400]
+    return {"env": env, "project": project, "exit_code": up.exit_code, "message": message,
+            "status": read_status(ctx, check, name, project=project, env=env) if up.exit_code == 0 else None}
+
+
+def host_boundary_definition(release_dir: Path, *, host_port: int, export_host_port: int) -> dict:
+    """Two Developer Linux Machines; only the first is granted anything.
+
+    machine-1 exists solely so "the wrong Machine is denied" is a claim about a
+    real sibling in the same Environment rather than about a Machine that does
+    not exist. Neither Machine declares a network: an import terminates on the
+    host and an export starts there, so the Environment fabric is not on either
+    path and adding one would only blur which boundary refused.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    second = copy.deepcopy(first)
+    second["name"] = "machine-1"
+    environment["machines"] = [first, second]
+    environment["host_imports"] = [{
+        "schema_version": 1, "name": "hostsvc", "machine": first["name"], "protocol": "tcp",
+        "host_port": host_port, "guest_port": GRANTED_GUEST_PORT}]
+    environment["host_exports"] = [{
+        "schema_version": 1, "name": "api", "machine": first["name"], "protocol": "tcp",
+        "machine_port": EXPORT_MACHINE_PORT, "host_port": export_host_port}]
+    return definition
+
+
+def guest_fetch_script(address: str, port: int) -> str:
+    """Fetch one URL from inside a Machine and always report the exit status.
+
+    `printf ':%s' $?` makes an empty body and a failed fetch distinguishable:
+    without it, "denied" and "answered with nothing" print identically, and a
+    denial that cannot be told from an empty success is not evidence.
+    """
+    return (f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{port}/; "
+            "printf ':%s' $?")
+
+
+def reached(receipt, token: str) -> bool:
+    """Whether a guest fetch actually returned the host service's token."""
+    return receipt.exit_code == 0 and token.encode() in receipt.stdout
+
+
+def denied(receipt, token: str) -> bool:
+    """Whether a guest fetch was refused rather than served.
+
+    Both halves matter. The token must be absent, and the fetch must have
+    reported a nonzero status: a wget that printed nothing and exited 0 would
+    satisfy an absence test while having been served an empty body.
+    """
+    return token.encode() not in receipt.stdout and not receipt.stdout.strip().endswith(b":0")
+
+
+LISTENER_ROW = re.compile(r"(?P<address>\[?[0-9a-fA-F.:*]+\]?):(?P<port>\d+)$")
+
+
+def host_tcp_listeners(ctx: CheckContext, check: SubCheck, label: str):
+    """Every TCP listener on this host, as (address, port) pairs.
+
+    Read from `lsof`, not asserted from the code that binds. The criterion asks
+    for listener evidence, and evidence means inspecting the machine: a claim
+    that "the export binds 127.0.0.1 by construction" is exactly the kind of
+    by-construction reasoning this clause exists to refuse.
+
+    Returns `None` when the tool could not be run at all, so the caller can say
+    the clause was not exercised instead of reading an empty list as proof that
+    nothing listens.
+    """
+    receipt = ctx.run_tool(check, label, ["/usr/sbin/lsof", "-nP", "-iTCP", "-sTCP:LISTEN"],
+                           cwd=ctx.state.root, env=ctx.state.env(), timeout=60)
+    text = receipt.stdout.decode("utf-8", "replace")
+    if receipt.exit_code not in (0, 1) or not text.strip():
+        return None
+    listeners = []
+    for line in text.splitlines()[1:]:
+        columns = line.split()
+        if not columns:
+            continue
+        name = columns[-1]
+        if name == "(LISTEN)" and len(columns) >= 2:
+            name = columns[-2]
+        match = LISTENER_ROW.search(name)
+        if match:
+            listeners.append((match.group("address").strip("[]"), int(match.group("port"))))
+    return listeners
+
+
+def is_loopback_listener(address: str) -> bool:
+    """Whether a listener address is loopback and not a wildcard or a LAN address.
+
+    `*` and `0.0.0.0`/`::` are wildcards, which listen on every interface
+    including the LAN, and the contract states plainly that a wildcard listener
+    is not authorization.
+    """
+    return address in ("127.0.0.1", "::1")
+
+
+def host_non_loopback_addresses(ctx: CheckContext, check: SubCheck):
+    """This host's own non-loopback IPv4 addresses, as the guest could reach them.
+
+    Includes the vmnet gateway a Machine sees the host as. These are the
+    addresses the LAN clause denies, and they are read from the host rather than
+    assumed, so the clause fails honestly on a host that has none.
+    """
+    receipt = ctx.run_tool(check, "host-interfaces", ["/sbin/ifconfig", "-a"],
+                           cwd=ctx.state.root, env=ctx.state.env(), timeout=30)
+    addresses = []
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        columns = line.split()
+        if len(columns) >= 2 and columns[0] == "inet":
+            address = columns[1]
+            if not address.startswith("127.") and address != "0.0.0.0":
+                addresses.append(address)
+    return addresses
+
+
+def check_host_import_export_boundaries(ctx: CheckContext, top: str) -> SubCheck:
+    """Criterion 7, every clause, with the denials measured against a live import.
+
+    The order is the criterion's own, and it is an order rather than a set
+    because each claim is only meaningful once the one before it holds:
+
+      1. absent by default -- an Environment that declares nothing reaches
+         nothing, proved before anything is granted, so "denied" later cannot be
+         confused with "was never possible";
+      2. the authorized Machine reaches a 127.0.0.1-only host service through
+         its one declared import -- the positive every denial is measured
+         against;
+      3. the denials: undeclared port, wrong protocol, wrong Machine, sibling
+         Environment, arbitrary host destination, LAN;
+      4. offline egress does not break the import, and enabled egress does not
+         create one;
+      5. loopback exports serve, and a colliding host port is refused;
+      6. listener evidence, read from `lsof`, proving no wildcard or LAN
+         listener exists for any port this check put in play.
+    """
+    from vz04_common import GateError
+
+    check = SubCheck(top, "host_import_export_boundaries")
+    granted_service = foil_service = None
+    try:
+        granted_service = LoopbackHostService("vzhostsvc-" + uuid.uuid4().hex[:16])
+        # Never declared to anybody. It exists so "the guest cannot pick a host
+        # destination" is tested against a host service that really is there and
+        # really is listening -- an unreachable port would deny by absence.
+        foil_service = LoopbackHostService("vzfoil-" + uuid.uuid4().hex[:16])
+    except OSError as error:
+        # Whichever half came up is closed again: a listener this check started
+        # and then abandoned is exactly the leak it exists to detect.
+        if granted_service is not None:
+            granted_service.close()
+        check.fail(f"cannot bind a loopback host service for the import to terminate against: {error}")
+        return check.finish()
+    export_host_port = free_host_port()
+    export_token = "vzexport-" + uuid.uuid4().hex[:16]
+    granted = sibling = egress_probe = collision = None
+    try:
+        check.check(granted_service.address == "127.0.0.1" and foil_service.address == "127.0.0.1",
+                    f"both host services bound loopback only (granted {granted_service.address}, "
+                    f"foil {foil_service.address})")
+        try:
+            definition = host_boundary_definition(ctx.release_dir, host_port=granted_service.port,
+                                                  export_host_port=export_host_port)
+        except (StopIteration, KeyError, OSError) as error:
+            check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+            return check.finish()
+        schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+        if schema_path.is_file():
+            problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                              key=lambda e: list(map(str, e.absolute_path)))
+            check.check(not problems, "the host import/export definition validates"
+                        if not problems else f"definition invalid: {problems[0].message[:200]}")
+            if problems:
+                return check.finish()
+
+        # 1. Absent by default. A bare Environment declares no import and no
+        #    export, and must reach neither the granted host service nor the
+        #    foil, on any port. Proved FIRST: a denial observed only after a
+        #    grant exists cannot distinguish "refused" from "never possible".
+        sibling = provision(ctx, check, "hb-bare", minimal_definition(ctx.release_dir))
+        if sibling.get("unsupported"):
+            check.not_implemented = ("this runtime refuses the bare Environment this check starts from: " +
+                                     sibling["unsupported"][:300])
+            return check.finish()
+        # An unreadable status is a FAILURE, never an early return: a check that
+        # stopped here quietly would report PASS having exercised no clause of
+        # the criterion at all.
+        check.check(sibling["status"] is not None,
+                    "the bare Environment reports a readable status before any denial is claimed against it")
+        if check.status != "PASS":
+            return check.finish()
+        for label, port, token in (("granted-service", granted_service.port, granted_service.token),
+                                   ("foil-service", foil_service.port, foil_service.token),
+                                   ("granted-guest-port", GRANTED_GUEST_PORT, granted_service.token)):
+            receipt = machine_exec(ctx, check, "hb-absent-" + label, sibling, "machine-0",
+                                   guest_fetch_script("127.0.0.1", port), timeout=HOST_BOUNDARY_TIMEOUT)
+            check.check(denied(receipt, token),
+                        f"an Environment that declares no import cannot reach {label} on 127.0.0.1:{port} "
+                        f"(observed {receipt.stdout[:80]!r})")
+        before = host_tcp_listeners(ctx, check, "hb-listeners-before")
+        if before is None:
+            check.fail("cannot enumerate host TCP listeners with lsof; the listener-evidence clause "
+                       "cannot be read as proof of absence")
+            return check.finish()
+        check.check(not any(port == export_host_port for _address, port in before),
+                    f"no host listener holds the export port {export_host_port} before anything is declared")
+        if check.status != "PASS":
+            return check.finish()
+
+        # 2. The granted Environment. One import on machine-0 to the granted
+        #    host service, one export on machine-0, and a sibling Machine that
+        #    declares neither.
+        granted = provision(ctx, check, "hb-granted", definition)
+        if granted.get("unsupported"):
+            check.not_implemented = ("declared host imports/exports are not applied by this runtime: " +
+                                     granted["unsupported"][:300])
+            return check.finish()
+        check.check(granted["status"] is not None,
+                    "the granted Environment reports a readable status; without it no clause below was exercised")
+        if check.status != "PASS":
+            return check.finish()
+        names = sorted(m.get("name") for e in granted["status"]["environments"] for m in e.get("machines") or [])
+        check.check(names == ["machine-0", "machine-1"], f"both declared Machines are present (observed {names})")
+        if check.status != "PASS":
+            return check.finish()
+        served = machine_exec(ctx, check, "hb-granted-import", granted, "machine-0",
+                              guest_fetch_script("127.0.0.1", GRANTED_GUEST_PORT), timeout=HOST_BOUNDARY_TIMEOUT)
+        check.check(reached(served, granted_service.token),
+                    "the authorized Machine reaches the 127.0.0.1-only host service through its one declared "
+                    f"import on guest loopback {GRANTED_GUEST_PORT} (exit {served.exit_code}, "
+                    f"{served.stdout[:80]!r})")
+        if check.status != "PASS":
+            return check.finish()
+
+        # 3. The denials, every one of them against that live import.
+        undeclared = machine_exec(ctx, check, "hb-deny-undeclared-port", granted, "machine-0",
+                                  guest_fetch_script("127.0.0.1", UNDECLARED_GUEST_PORT),
+                                  timeout=HOST_BOUNDARY_TIMEOUT)
+        check.check(denied(undeclared, granted_service.token),
+                    f"the undeclared guest port {UNDECLARED_GUEST_PORT} is denied on the same Machine whose "
+                    f"declared port {GRANTED_GUEST_PORT} just worked (observed {undeclared.stdout[:80]!r})")
+
+        # An import is a stream grant. The same port addressed as UDP is not the
+        # declared protocol and nothing answers it.
+        udp = machine_exec(ctx, check, "hb-deny-wrong-protocol", granted, "machine-0",
+                           f"printf probe | /bin/busybox nc -u -w 2 127.0.0.1 {GRANTED_GUEST_PORT}; "
+                           "printf ':%s' $?", timeout=HOST_BOUNDARY_TIMEOUT)
+        if b"applet not found" in udp.stderr or udp.exit_code == 127:
+            check.not_implemented = (
+                "the wrong-protocol denial was not exercised: this Machine's BusyBox has no `nc` applet, so a "
+                f"UDP datagram could not be sent to the declared guest port {GRANTED_GUEST_PORT}. Every other "
+                "clause of criterion 7 above and below did run.")
+        else:
+            check.check(denied(udp, granted_service.token),
+                        "a UDP datagram to the declared guest port is not served; the grant is for the declared "
+                        f"stream protocol only (observed {udp.stdout[:80]!r})")
+
+        sibling_machine = machine_exec(ctx, check, "hb-deny-wrong-machine", granted, "machine-1",
+                                       guest_fetch_script("127.0.0.1", GRANTED_GUEST_PORT),
+                                       timeout=HOST_BOUNDARY_TIMEOUT)
+        check.check(denied(sibling_machine, granted_service.token),
+                    "the sibling Machine in the SAME Environment, which declares no import, cannot reach the "
+                    f"host service on the granted port (observed {sibling_machine.stdout[:80]!r})")
+
+        foreign = machine_exec(ctx, check, "hb-deny-sibling-environment", sibling, "machine-0",
+                               guest_fetch_script("127.0.0.1", GRANTED_GUEST_PORT),
+                               timeout=HOST_BOUNDARY_TIMEOUT)
+        check.check(denied(foreign, granted_service.token),
+                    "a Machine in a sibling Environment cannot reach the granted port, which is now live in the "
+                    f"granted Environment (observed {foreign.stdout[:80]!r})")
+
+        # Arbitrary host destination. Two shapes, both from the Machine that
+        # DOES hold a grant: the host port of its own declared service, and an
+        # undeclared host service. Neither is nameable on the wire, so neither
+        # may answer.
+        for label, port, token in (("own-host-port", granted_service.port, granted_service.token),
+                                   ("undeclared-host-service", foil_service.port, foil_service.token)):
+            receipt = machine_exec(ctx, check, "hb-deny-arbitrary-" + label, granted, "machine-0",
+                                   guest_fetch_script("127.0.0.1", port), timeout=HOST_BOUNDARY_TIMEOUT)
+            check.check(denied(receipt, token),
+                        f"the granted Machine cannot choose a host destination ({label} on 127.0.0.1:{port}); "
+                        f"only its declared guest port relays (observed {receipt.stdout[:80]!r})")
+
+        # LAN. Every non-loopback address this host actually holds, plus the
+        # vmnet gateway a Machine sees the host as -- the NAT alias the contract
+        # names as explicitly not authorization.
+        lan_addresses = [a for a in host_non_loopback_addresses(ctx, check) if a != NAT_GATEWAY_ADDRESS]
+        probed = []
+        for address in [NAT_GATEWAY_ADDRESS, *lan_addresses[:3]]:
+            receipt = machine_exec(ctx, check, "hb-deny-lan-" + address.replace(".", "-"), granted, "machine-0",
+                                   guest_fetch_script(address, granted_service.port),
+                                   timeout=HOST_BOUNDARY_TIMEOUT)
+            probed.append(address)
+            check.check(denied(receipt, granted_service.token),
+                        f"the granted Machine cannot reach the host service at {address}:{granted_service.port}; "
+                        f"a NAT alias or LAN address is not the grant (observed {receipt.stdout[:80]!r})")
+        check.ok(f"non-loopback host addresses probed: {probed}")
+
+        # 4. Egress. Every Machine here is offline -- no `egress` key means the
+        #    default, and this Up applies `offline` only -- and the import above
+        #    worked, which is the "offline egress does not break the declared
+        #    import" clause proved rather than asserted.
+        offline = all("egress" not in machine or machine["egress"] == "offline"
+                      for machine in definition["environment"]["machines"])
+        check.check(offline, "every Machine of the granted Environment declares offline egress, and its declared "
+                    "import served anyway")
+        enabled = copy.deepcopy(minimal_definition(ctx.release_dir))
+        enabled["environment"]["machines"][0]["egress"] = "allowed"
+        egress_probe = attempt_up(ctx, check, "hb-egress", enabled, timeout=DELETE_TIMEOUT)
+        if egress_probe["exit_code"] == 0 and egress_probe["status"] is not None:
+            # Enabled egress is available: prove it creates no import.
+            for label, port, token in (("granted-service", granted_service.port, granted_service.token),
+                                       ("granted-guest-port", GRANTED_GUEST_PORT, granted_service.token)):
+                receipt = machine_exec(ctx, check, "hb-egress-no-import-" + label, egress_probe, "machine-0",
+                                       guest_fetch_script("127.0.0.1", port), timeout=HOST_BOUNDARY_TIMEOUT)
+                check.check(denied(receipt, token),
+                            f"a Machine with enabled egress and no declared import cannot reach {label} "
+                            f"(observed {receipt.stdout[:80]!r})")
+        else:
+            check.not_implemented = (
+                "the \"enabled egress does not create one\" clause of criterion 7 was not exercised: this runtime "
+                "refuses a Machine with non-offline egress, so no Machine with enabled egress could be built to "
+                "prove it gains no host import. Every other clause -- absent by default, the granted import, the "
+                "undeclared port, wrong protocol, wrong Machine, sibling Environment, arbitrary host destination "
+                "and LAN denials, offline egress, loopback exports without collisions, and the listener evidence "
+                "-- did run above. Runtime refusal: "
+                f"{(egress_probe['message'] or 'vz up failed without naming a reason')[:250]}")
+
+        # 5. Exports. The host reaches the Machine's own loopback service through
+        #    the declared loopback export, and a second Environment declaring the
+        #    same host port is refused rather than silently sharing it.
+        server = hold_machine_exec(ctx, check, "hb-export-serve", granted, "machine-0",
+                                   f"/bin/busybox mkdir -p /www; printf %s {export_token} > /www/index.html; "
+                                   f"/bin/busybox httpd -f -p {EXPORT_MACHINE_PORT} -h /www")
+        try:
+            body = None
+            for attempt in range(1, LISTENER_ATTEMPTS + 1):
+                fetch = ctx.run_tool(check, f"hb-export-fetch-{attempt}",
+                                     ["/usr/bin/curl", "--silent", "--show-error", "--max-time", str(WGET_TIMEOUT),
+                                      f"http://127.0.0.1:{export_host_port}/"],
+                                     cwd=ctx.state.root, env=ctx.state.env(), timeout=HOST_BOUNDARY_TIMEOUT)
+                body = fetch.stdout
+                if fetch.exit_code == 0 and export_token.encode() in body:
+                    break
+                time.sleep(LISTENER_INTERVAL)
+            check.check(body is not None and export_token.encode() in body,
+                        f"the declared loopback export serves the Machine's own service on 127.0.0.1:"
+                        f"{export_host_port} after {attempt} attempt(s) (observed {(body or b'')[:80]!r})")
+            during = host_tcp_listeners(ctx, check, "hb-listeners-during")
+            if during is None:
+                check.fail("cannot enumerate host TCP listeners with lsof while the export is live")
+            else:
+                holders = [address for address, port in during if port == export_host_port]
+                check.check(holders and all(is_loopback_listener(address) for address in holders),
+                            f"the live export listener on {export_host_port} is loopback and nothing else "
+                            f"(observed {holders})")
+                # Every port this check put in play, not only the export: an
+                # import's guest port must have no host listener at all, and no
+                # port of ours may be held on a wildcard or LAN address.
+                ours = {export_host_port, granted_service.port, foil_service.port,
+                        GRANTED_GUEST_PORT, UNDECLARED_GUEST_PORT}
+                wide = sorted({(address, port) for address, port in during
+                               if port in ours and not is_loopback_listener(address)})
+                check.check(not wide,
+                            "no wildcard or LAN host listener holds any port this check declared "
+                            f"(observed {wide})")
+                guest_side = sorted({(address, port) for address, port in during
+                                     if port in (GRANTED_GUEST_PORT, UNDECLARED_GUEST_PORT)})
+                check.check(not guest_side,
+                            "an import's guest loopback port has no host listener at all; the host half of an "
+                            f"import is a vsock terminator, not a TCP port (observed {guest_side})")
+                check.ok(f"host TCP listeners inspected while the export was live: {len(during)}")
+        finally:
+            released = ctx.release(check, server)
+            check.check(released.exit_code is not None,
+                        f"the held export listener was released (exit {released.exit_code})")
+
+        collider = copy.deepcopy(minimal_definition(ctx.release_dir))
+        collider["environment"]["host_exports"] = [{
+            "schema_version": 1, "name": "api", "machine": "machine-0", "protocol": "tcp",
+            "machine_port": EXPORT_MACHINE_PORT, "host_port": export_host_port}]
+        collision = attempt_up(ctx, check, "hb-collide", collider, timeout=DELETE_TIMEOUT)
+        check.check(collision["exit_code"] != 0 and "already held on this host" in collision["message"],
+                    "a second Environment declaring the export host port already held is refused rather than "
+                    f"silently sharing the loopback port (exit {collision['exit_code']}, "
+                    f"{collision['message'][:160]!r})")
+
+        after = host_tcp_listeners(ctx, check, "hb-listeners-after")
+        if after is None:
+            check.fail("cannot enumerate host TCP listeners with lsof after the export was released")
+        else:
+            check.ok(f"host TCP listeners after release: "
+                     f"{sorted({(a, p) for a, p in after if p == export_host_port})}")
+    except (OSError, GateError) as error:
+        # A path or process this check needed went away underneath it. That is a
+        # failure of this check, recorded with what it was doing -- not a lane
+        # crash, which would abort every sub-check after this one and report
+        # nothing about any of them.
+        check.fail(f"the host-boundary check could not complete: {type(error).__name__}: {error}")
+    finally:
+        granted_service.close()
+        foil_service.close()
+        # Unconditionally, including on failure. An Environment left running by
+        # this check is not left for inspection, it is left holding a host
+        # loopback listener and a daemon inside a state root the next check is
+        # about to allocate under -- which shows up as that check failing for
+        # reasons of its own. What this check needs kept is its receipts and its
+        # assertions, and both are already recorded by the time we get here.
+        for name, instance in (("hb-granted", granted), ("hb-bare", sibling),
+                               ("hb-egress", egress_probe), ("hb-collide", collision)):
+            if instance is None or instance.get("status") is None:
+                continue
+            try:
+                removed = ctx.run(check, name + "-delete",
+                                  ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                                  cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+                check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+            except OSError as error:
+                check.fail(f"{name}: could not be deleted: {type(error).__name__}: {error}")
     return check.finish()

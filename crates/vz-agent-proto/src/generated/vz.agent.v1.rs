@@ -489,6 +489,38 @@ pub struct PortForwardOpen {
     #[prost(message, optional, tag = "4")]
     pub metadata: ::core::option::Option<TransportMetadata>,
 }
+/// One declared host import as the guest holds it. Deliberately has no field
+/// able to carry a host address or host port: a guest that could name the
+/// destination could name any destination.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct HostImportGrant {
+    /// Declaration name, echoed in the open frame the guest sends the host.
+    #[prost(string, tag = "1")]
+    pub name: ::prost::alloc::string::String,
+    /// Guest loopback port the agent binds. Never a wildcard or LAN address.
+    #[prost(uint32, tag = "2")]
+    pub guest_port: u32,
+    /// Per-import secret minted by the host for this Machine and this boot.
+    #[prost(bytes = "vec", tag = "3")]
+    pub credential: ::prost::alloc::vec::Vec<u8>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigureHostImportsRequest {
+    #[prost(message, repeated, tag = "1")]
+    pub imports: ::prost::alloc::vec::Vec<HostImportGrant>,
+    #[prost(message, optional, tag = "2")]
+    pub metadata: ::core::option::Option<TransportMetadata>,
+}
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct ConfigureHostImportsResponse {
+    /// Names actually bound, in declaration order.
+    #[prost(string, repeated, tag = "1")]
+    pub bound: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// The exact loopback address every listener was bound to, so the caller can
+    /// assert it rather than assume it.
+    #[prost(string, tag = "2")]
+    pub bound_address: ::prost::alloc::string::String,
+}
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct OciCreateRequest {
     #[prost(string, tag = "1")]
@@ -1089,6 +1121,40 @@ pub mod agent_service_client {
                 .insert(GrpcMethod::new("vz.agent.v1.AgentService", "PortForward"));
             self.inner.streaming(req, path, codec).await
         }
+        /// Install this Machine's declared host imports.
+        ///
+        /// Each grant names one declaration, the guest loopback port to bind for it,
+        /// and the per-import credential the guest must present when it dials the
+        /// host relay. No host address is carried: the host terminator holds the only
+        /// copy of the `127.0.0.1:<port>` pair a grant resolves to. The call replaces
+        /// the whole installed set, so an Environment whose declarations changed does
+        /// not accumulate listeners for imports it no longer declares.
+        pub async fn configure_host_imports(
+            &mut self,
+            request: impl tonic::IntoRequest<super::ConfigureHostImportsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ConfigureHostImportsResponse>,
+            tonic::Status,
+        > {
+            self.inner
+                .ready()
+                .await
+                .map_err(|e| {
+                    tonic::Status::unknown(
+                        format!("Service was not ready: {}", e.into()),
+                    )
+                })?;
+            let codec = tonic::codec::ProstCodec::default();
+            let path = http::uri::PathAndQuery::from_static(
+                "/vz.agent.v1.AgentService/ConfigureHostImports",
+            );
+            let mut req = request.into_request();
+            req.extensions_mut()
+                .insert(
+                    GrpcMethod::new("vz.agent.v1.AgentService", "ConfigureHostImports"),
+                );
+            self.inner.unary(req, path, codec).await
+        }
     }
 }
 /// Generated client implementations.
@@ -1639,6 +1705,21 @@ pub mod agent_service_server {
             request: tonic::Request<tonic::Streaming<super::PortForwardFrame>>,
         ) -> std::result::Result<
             tonic::Response<Self::PortForwardStream>,
+            tonic::Status,
+        >;
+        /// Install this Machine's declared host imports.
+        ///
+        /// Each grant names one declaration, the guest loopback port to bind for it,
+        /// and the per-import credential the guest must present when it dials the
+        /// host relay. No host address is carried: the host terminator holds the only
+        /// copy of the `127.0.0.1:<port>` pair a grant resolves to. The call replaces
+        /// the whole installed set, so an Environment whose declarations changed does
+        /// not accumulate listeners for imports it no longer declares.
+        async fn configure_host_imports(
+            &self,
+            request: tonic::Request<super::ConfigureHostImportsRequest>,
+        ) -> std::result::Result<
+            tonic::Response<super::ConfigureHostImportsResponse>,
             tonic::Status,
         >;
     }
@@ -2397,6 +2478,52 @@ pub mod agent_service_server {
                                 max_encoding_message_size,
                             );
                         let res = grpc.streaming(method, req).await;
+                        Ok(res)
+                    };
+                    Box::pin(fut)
+                }
+                "/vz.agent.v1.AgentService/ConfigureHostImports" => {
+                    #[allow(non_camel_case_types)]
+                    struct ConfigureHostImportsSvc<T: AgentService>(pub Arc<T>);
+                    impl<
+                        T: AgentService,
+                    > tonic::server::UnaryService<super::ConfigureHostImportsRequest>
+                    for ConfigureHostImportsSvc<T> {
+                        type Response = super::ConfigureHostImportsResponse;
+                        type Future = BoxFuture<
+                            tonic::Response<Self::Response>,
+                            tonic::Status,
+                        >;
+                        fn call(
+                            &mut self,
+                            request: tonic::Request<super::ConfigureHostImportsRequest>,
+                        ) -> Self::Future {
+                            let inner = Arc::clone(&self.0);
+                            let fut = async move {
+                                <T as AgentService>::configure_host_imports(&inner, request)
+                                    .await
+                            };
+                            Box::pin(fut)
+                        }
+                    }
+                    let accept_compression_encodings = self.accept_compression_encodings;
+                    let send_compression_encodings = self.send_compression_encodings;
+                    let max_decoding_message_size = self.max_decoding_message_size;
+                    let max_encoding_message_size = self.max_encoding_message_size;
+                    let inner = self.inner.clone();
+                    let fut = async move {
+                        let method = ConfigureHostImportsSvc(inner);
+                        let codec = tonic::codec::ProstCodec::default();
+                        let mut grpc = tonic::server::Grpc::new(codec)
+                            .apply_compression_config(
+                                accept_compression_encodings,
+                                send_compression_encodings,
+                            )
+                            .apply_max_message_size_config(
+                                max_decoding_message_size,
+                                max_encoding_message_size,
+                            );
+                        let res = grpc.unary(method, req).await;
                         Ok(res)
                     };
                     Box::pin(fut)

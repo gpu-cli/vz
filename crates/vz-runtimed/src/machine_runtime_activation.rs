@@ -109,6 +109,30 @@ impl MachineRuntimeActivation {
         }
     }
 
+    /// Install this Machine's declared host imports on this exact boot.
+    ///
+    /// Two halves, both scoped to this VM: the host terminator listening on
+    /// this VM's own vsock socket device, and the guest agent's loopback
+    /// listeners. Neither is addressable from outside the Machine, and the
+    /// grants that cross to the guest carry no host address — the terminator
+    /// keeps the `127.0.0.1:<port>` pair.
+    ///
+    /// A native macOS Machine has no import listener at all; a declaration
+    /// naming one is refused at admission, and reaching here with one would be
+    /// a bug rather than a capability question, so it is an error and not a
+    /// silent no-op.
+    pub async fn install_host_imports(
+        &self,
+        grants: Vec<vz::host_import::HostImportGrant>,
+    ) -> Result<vz_oci_macos::HostImportInstallation, OciError> {
+        match &self.lease {
+            MachineExecutionLease::Linux(l) => l.install_host_imports(grants).await,
+            MachineExecutionLease::Native(_) => Err(OciError::InvalidConfig(
+                "native macOS Machines carry no host import relay".into(),
+            )),
+        }
+    }
+
     /// Execute in the exact leased guest without recursively acquiring a
     /// lifecycle read lock behind a queued shutdown writer.
     pub async fn exec(

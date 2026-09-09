@@ -120,6 +120,73 @@ fn sockaddr_vm_any(port: u32) -> SockaddrVm {
     }
 }
 
+#[cfg(target_os = "macos")]
+fn sockaddr_vm_host(port: u32) -> SockaddrVm {
+    SockaddrVm {
+        svm_len: std::mem::size_of::<SockaddrVm>() as u8,
+        svm_family: AF_VSOCK as u8,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: VMADDR_CID_HOST,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn sockaddr_vm_host(port: u32) -> SockaddrVm {
+    SockaddrVm {
+        svm_family: AF_VSOCK as libc::sa_family_t,
+        svm_reserved1: 0,
+        svm_port: port,
+        svm_cid: VMADDR_CID_HOST,
+        svm_flags: 0,
+        svm_zero: [0; 3],
+    }
+}
+
+/// Dial the host on `port` over vsock.
+///
+/// The only outbound channel this agent has. The destination is
+/// `VMADDR_CID_HOST` and nothing else: a CID is not a routable address and the
+/// guest cannot name a host interface, port range, or third party through it.
+/// The port is a compile-time constant at every call site, so the guest never
+/// chooses where this lands either — the host terminator does.
+pub async fn connect_host(port: u32) -> io::Result<VsockStream> {
+    let fd = tokio::task::spawn_blocking(move || -> io::Result<RawFd> {
+        // SAFETY: socket() is a standard POSIX call returning a new descriptor.
+        let fd = unsafe { libc::socket(AF_VSOCK, libc::SOCK_STREAM, 0) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: the descriptor was just created and is owned here; closing it
+        // on the error paths below is the only other use.
+        let owned = unsafe { OwnedFd::from_raw_fd(fd) };
+        let addr = sockaddr_vm_host(port);
+        // SAFETY: connect() with a valid fd and a fully initialised sockaddr_vm
+        // whose declared length matches the struct passed.
+        let ret = unsafe {
+            libc::connect(
+                fd,
+                &addr as *const SockaddrVm as *const libc::sockaddr,
+                std::mem::size_of::<SockaddrVm>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(std::os::fd::IntoRawFd::into_raw_fd(owned))
+    })
+    .await
+    .map_err(io::Error::other)??;
+
+    // SAFETY: fd is a valid connected descriptor this function owns; wrapping
+    // it transfers that ownership to the returned stream exactly once.
+    let std_stream = unsafe { std::os::unix::net::UnixStream::from_raw_fd(fd) };
+    std_stream.set_nonblocking(true)?;
+    Ok(VsockStream {
+        inner: tokio::net::UnixStream::from_std(std_stream)?,
+    })
+}
+
 impl VsockListener {
     /// Bind a vsock listener on the given port.
     ///

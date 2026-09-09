@@ -46,10 +46,11 @@ ProjectDefinition
 - Target OS belongs to a Machine, not to an Environment. A single Environment
   may therefore contain Linux and native macOS Machines now and Windows Machines
   later.
-- Cross-Environment communication is forbidden by default. It requires an
-  explicit, directional, service-scoped, expiring, audited peer grant; it never
-  merges route domains or exposes storage, credentials, Docker, or control-plane
-  access.
+- Cross-Environment communication is forbidden, unconditionally. 0.4 ships no
+  grant, exception, or escape hatch that opens a path between Environments: no
+  route domain is merged and no storage, credential, Docker or control-plane
+  access crosses. Machines that must reach one another belong to the same
+  Environment, which is what its declared networks are for.
 - The public Developer Environment CLI has exactly five lifecycle verbs:
   `vz up`, `vz exec`, `vz status`, `vz stop`, and `vz delete`. Environment and
   Machine selectors make them topology-aware. Infrastructure-oriented command
@@ -66,7 +67,7 @@ ProjectDefinition
    MachineSpec and MachineInstance with a required Developer/Hardened profile,
    replaceable MachineIncarnation,
    Network, Endpoint, HostImport, HostExport, EgressPolicy, Volume,
-   SecretBinding, PeerGrant, Fault, Execution, Receipt, lifecycle, and ownership schemas
+   SecretBinding, Execution, Receipt, lifecycle, and ownership schemas
    with migration from legacy records. Immutable IDs, human selectors, and
    machine incarnations are distinct. Persistent identity never depends on raw
    host path spelling.
@@ -183,15 +184,17 @@ required E2E scenario and retained evidence:
    Offline egress does not break the declared import; enabled egress does not
    create one. Loopback exports work without collisions, and listener evidence
    proves no wildcard or LAN host listener exists.
-8. **Cross-Environment isolation and peering:** the three Environments cannot
-   resolve, route to, read, control, or receive events from one another. One
-   directional endpoint peer grant permits only its declared protocol/port,
-   denies reverse and transitive access, then passes both explicit revocation and
-   independent TTL expiry scenarios with clean denial restoration.
-9. **Network faults:** seeded latency, loss, bandwidth restriction, DNS failure,
-   reset, and timed partition affect only the declared path. The checked-in gate
-   manifest fixes numeric tolerances and activation/removal deadlines. TTL
-   cleanup restores baseline connectivity and emits a receipt.
+8. **Cross-Environment isolation:** the three Environments cannot resolve,
+   route to, read, control, or receive events from one another. Isolation is
+   unconditional: 0.4 has no grant, exception, or escape hatch that opens a path
+   between Environments. Machines that must reach one another belong to the same
+   Environment, which is what its declared networks are for.
+9. *Withdrawn from 0.4.* Seeded network faults — latency, loss, bandwidth
+   restriction, DNS failure, reset and timed partition, with pinned tolerances —
+   are a testing capability nothing else in the release depends on, and no user
+   is blocked without them. The number is left vacant rather than reused:
+   renumbering would silently invalidate every reference to criteria 10-22 in
+   this repository, its issue history and its retained gate evidence.
 10. **Lifecycle and recovery:** stop/up preserves identity and declared disks,
     volumes, Docker data, and endpoints. Daemon/adapter/guest crashes and Mac
     sleep/wake reconstruct authoritative routes, sockets, DNS, and port state
@@ -243,8 +246,8 @@ required E2E scenario and retained evidence:
 20. **Exhaustive network denial:** a machine-readable
     source×destination×protocol×port matrix records expected and observed results
     for private, public-like, declared and undeclared host imports/exports,
-    offline/allowed/CIDR/domain Internet policy, LAN/control-plane destinations,
-    and peered paths. Two Machines in one Environment use different egress
+    offline/allowed/CIDR/domain Internet policy, and LAN/control-plane
+    destinations. Two Machines in one Environment use different egress
     attachments without policy or host-import cross-talk. Any unexpected success
     fails the gate.
 21. **CLI removal:** a checked-in help snapshot lists the five lifecycle verbs.
@@ -472,7 +475,7 @@ includes command/stdout/stderr/exit/timing logs; Project/Environment/Machine map
 resolved topology; status/event streams; Docker contexts and state inventories;
 runtime inventory/invocation proof; persistence checksums; source×destination×
 protocol×port expected/observed matrices; DNS/routes/NAT/firewall/TLS/ingress;
-fault/peering receipts; before/during/after host listeners and interfaces;
+lifecycle receipts; before/during/after host listeners and interfaces;
 recovery timelines; and pre/post resource inventories.
 
 Listener evidence probes every applicable local interface and proves host exports

@@ -24,10 +24,10 @@ pub use config::{
 pub use error::MacosOciError;
 pub use macos_backend::MacosRuntimeBackend;
 pub use runtime::{
-    ContainerNamespaceIdentity, ContainerReadyGeneration, InteractiveExecEvent,
-    KernelObjectIdentity, Runtime, RuntimeLifecycleAdmissionEvent, RuntimeLifecycleAdmissionKind,
-    RuntimeLifecycleDiagnostics, RuntimeLifecycleObserver, SharedVmDockerReadiness,
-    SharedVmLifecycleLease,
+    ContainerNamespaceIdentity, ContainerReadyGeneration, HostImportInstallation,
+    InteractiveExecEvent, KernelObjectIdentity, Runtime, RuntimeLifecycleAdmissionEvent,
+    RuntimeLifecycleAdmissionKind, RuntimeLifecycleDiagnostics, RuntimeLifecycleObserver,
+    SharedVmDockerReadiness, SharedVmLifecycleLease,
 };
 
 // Re-export shared types for convenience.

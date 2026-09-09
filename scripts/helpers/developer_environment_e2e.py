@@ -53,6 +53,7 @@ CRITERION_11 = "gate.delete.single_environment_safety"
 CRITERION_5 = "gate.network.private_topology_paths"
 CRITERION_2 = "gate.machines.mixed_profile_topology_status"
 CRITERION_6 = "gate.network.public_like_ingress"
+CRITERION_7 = "gate.host.import_export_boundaries"
 CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 CRITERION_17 = "gate.storage.workspace_projection_policy"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
@@ -574,7 +575,8 @@ class Lane:
                                   plugins={"compose": self.options.get("compose-plugin"),
                                            "buildx": self.options.get("buildx-plugin")})
         subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: [],
-                     CRITERION_2: [], CRITERION_6: [], CRITERION_17: [], CRITERION_19: []}
+                     CRITERION_2: [], CRITERION_6: [], CRITERION_7: [], CRITERION_17: [],
+                     CRITERION_19: []}
         crash = None
         started = now_ns()
         try:
@@ -590,6 +592,7 @@ class Lane:
             subchecks[CRITERION_1].append(checks.check_three_concurrent_environments(ctx, CRITERION_1))
             subchecks[CRITERION_5].append(checks.check_private_topology_paths(ctx, CRITERION_5))
             subchecks[CRITERION_6].append(checks.check_public_like_ingress(ctx, CRITERION_6))
+            subchecks[CRITERION_7].append(checks.check_host_import_export_boundaries(ctx, CRITERION_7))
             subchecks[CRITERION_2].append(checks.check_mixed_profile_topology_status(ctx, CRITERION_2))
             subchecks[CRITERION_17].append(checks.check_workspace_projection_policy(ctx, CRITERION_17))
             subchecks[CRITERION_19].append(checks.check_migration_install_upgrade_rollback_uninstall(ctx, CRITERION_19))

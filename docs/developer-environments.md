@@ -283,8 +283,8 @@ inheriting Linux OCI/youki assumptions. Both Windows pairings are
 
 Every topology capability in this section—private networks, the simulated-public
 edge, endpoints, split DNS, TLS ingress, NAT/firewall, host imports and exports,
-egress policy, faults and peering—is
-<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy,faults,peering -->**PLANNED**
+egress policy—is
+<!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer network_private,network_simulated_public,endpoint,split_dns,tls_ingress,nat_firewall,host_import,host_export,egress_policy -->**PLANNED**
 for every pair in the matrix. Up currently rejects declared networks and
 endpoints without admission; the typed contract below is the committed
 direction, not shipped behavior.
@@ -324,12 +324,12 @@ Deterministic latency, jitter, loss, bandwidth, reset, DNS failure, and
 partition controls are scoped to a declared path, seeded, bounded by TTL, and
 produce receipts. Runtime faults expire rather than stranding connectivity.
 
-Separate Environments cannot resolve, route to, inspect, or control one another.
-When independently managed Environments must interact, a directional,
-service-scoped, least-privilege, expiring peer grant may expose one declared
-endpoint. It never merges L2/L3 networks, becomes transitive, or grants access
-to storage, credentials, Docker, private DNS, or the control plane. Systems that
-share lifecycle should normally be Machines in one Environment instead.
+Separate Environments cannot resolve, route to, inspect, or control one another,
+and 0.4 offers no way to change that: there is no peer grant, no exception, and
+no escape hatch. Systems that must interact are Machines in one Environment,
+which is what its declared networks and endpoints are for. Deferring the
+cross-Environment case keeps the isolation claim absolute rather than
+conditional, which is the property parallel Environments are worth having for.
 
 ## Public UX and API contract
 
@@ -375,7 +375,7 @@ or egress policy.
 There is no canonical `vz dev` namespace and no public or hidden `run`, `shell`,
 `list`, `logs`, `restart`, `docker`, `stack`, `network`, `machine`, or `vm`
 compatibility family in 0.4. Advanced lifecycle, topology, files, logs,
-snapshots, faults, and peering are typed API resources; native Docker clients use
+snapshots and receipts are typed API resources; native Docker clients use
 the Docker API. Migration guidance may explain replacements without preserving
 old execution paths.
 

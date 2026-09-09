@@ -12,6 +12,7 @@ mod docker;
 mod docker_forward;
 mod forward_grants;
 mod grpc_server;
+mod host_imports;
 mod listener;
 #[cfg(target_os = "macos")]
 mod native_machine_exec;

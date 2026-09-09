@@ -41,6 +41,8 @@ rcgen = { workspace = true }
 rustix = { version = "1.1.3", features = ["fs", "net", "process"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
+# Host-import credentials come from the OS CSPRNG, not from a PRNG seeded here.
+ring = { workspace = true }
 vz-macos-provision = { path = "../vz-macos-provision" }
 vz = { workspace = true }
 tempfile = { workspace = true }

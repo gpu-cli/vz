@@ -225,8 +225,7 @@ Top-level scenario IDs, one per acceptance criterion:
 | 5 | `gate.network.private_topology_paths` | topology | clean-provision |
 | 6 | `gate.network.public_like_ingress` | topology | clean-provision |
 | 7 | `gate.host.import_export_boundaries` | topology | clean-provision |
-| 8 | `gate.isolation.cross_environment_peering` | topology | persisted-recovery/pre-sleep |
-| 9 | `gate.faults.measured_network_faults` | topology | persisted-recovery/pre-sleep |
+| 8 | `gate.isolation.cross_environment_isolation` | topology | persisted-recovery/pre-sleep |
 | 10 | `gate.lifecycle.recovery_including_sleep_wake` | topology | persisted-recovery/post-wake |
 | 11 | `gate.delete.single_environment_safety` | topology | final-cleanup |
 | 12 | `gate.agent.deterministic_workers` | topology | persisted-recovery/pre-sleep |

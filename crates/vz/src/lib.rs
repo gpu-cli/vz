@@ -44,6 +44,7 @@
 // unsafe is required for objc2 FFI calls — kept minimal and contained
 #![allow(unsafe_code)]
 
+pub mod host_import;
 pub mod protocol;
 
 #[cfg(target_os = "macos")]

@@ -54,8 +54,18 @@ def required_scenarios(contract: dict, docker: dict) -> list:
                 f"{scenario['id']} assigned to phase {scenario['phase']} its lane does not run")
         seen.add(scenario["id"])
         rows.append({"id": scenario["id"], "lane": scenario["lane"], "phase": scenario["phase"]})
+    # Criterion 9 (seeded network faults) was withdrawn from 0.4; its number is
+    # left vacant rather than reused, because renumbering would silently
+    # invalidate every reference to criteria 10-22 in this repository, its issue
+    # history and its retained gate evidence. The rule is still exactness -- a
+    # criterion may not appear twice and none but the withdrawn one may be
+    # missing -- so a scenario quietly dropped is still caught.
+    WITHDRAWN = {9}
     criteria = sorted(scenario["criterion"] for scenario in contract["scenarios"])
-    require(criteria == list(range(1, 23)), "contract must map every acceptance criterion 1..22 exactly once")
+    expected = [n for n in range(1, 23) if n not in WITHDRAWN]
+    require(criteria == expected,
+            f"contract must map every acceptance criterion in {expected} exactly once "
+            f"(withdrawn: {sorted(WITHDRAWN)})")
     docker_lane = contract["docker_contract"]["lane"]
     docker_ids = {scenario["id"]: scenario for scenario in docker["scenarios"]}
     require(set(docker_ids) == set(docker_contract.REQUIRED_IDS) and len(docker["scenarios"]) == len(docker_contract.REQUIRED_IDS),

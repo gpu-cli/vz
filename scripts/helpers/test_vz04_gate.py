@@ -38,12 +38,12 @@ class GateDryRunTests(unittest.TestCase):
         fixtures.make_writable(cls.release)
         cls.tmp.cleanup()
 
-    def test_verdict_fail_with_85_missing(self):
+    def test_verdict_fail_with_84_missing(self):
         self.assertEqual(self.exit_code, 1)
         summary = common.load_json(self.run_root / "summary.json")
         self.assertEqual(summary["verdict"], "FAIL")
-        self.assertEqual(summary["counts"]["required"], 85)
-        self.assertEqual(summary["counts"]["MISSING"], 85)
+        self.assertEqual(summary["counts"]["required"], 84)
+        self.assertEqual(summary["counts"]["MISSING"], 84)
         self.assertEqual(summary["counts"]["PASS"], 0)
         self.assertTrue(all(row["reason"] == "not_implemented" for row in summary["scenarios"]))
         self.assertEqual(summary["developer_overrides"], ["dry_lanes"])

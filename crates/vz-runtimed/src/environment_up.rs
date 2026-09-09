@@ -11,6 +11,7 @@ use vz_runtime_contract::*;
 use vz_stack::StackError;
 
 pub mod host_exports;
+pub mod host_imports;
 mod native_readiness;
 mod readiness;
 mod supervisor;
@@ -252,9 +253,12 @@ impl RuntimeDaemon {
 /// reclaims. Making it here as well, and not only in Delete, is what stops Up
 /// booting every Machine of an Environment that could then never be deleted.
 ///
-/// Records with no adapter behind them stay refused: `HostImport`, `Socket`,
-/// `PortRange`, `Credential`, `Fault`, `LegacySandbox` and any unrecognised
-/// `Other` kind.
+/// Records with no adapter behind them stay refused: `Socket`, `PortRange`,
+/// `Credential`, `Fault`, `LegacySandbox` and any unrecognised `Other` kind.
+/// `HostImport` is admitted now that the authenticated relay serves it; its
+/// instances are minted by the same `instantiate_environment` call as the rest
+/// of the declared fabric and are never added afterwards, so the exact-set
+/// comparison below holds for them too.
 fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackError> {
     fn unsupported(message: &str) -> StackError {
         StackError::Machine {
@@ -319,6 +323,18 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
         environment_id: environment.environment_id.clone(),
         machine_id: None,
     }));
+    expected.extend(
+        environment
+            .host_imports
+            .iter()
+            .map(|import| OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::HostImport,
+                resource_id: import.import_id.to_string(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(import.machine_id.clone()),
+            }),
+    );
     // Two instances sharing one identity would emit one record twice. That is
     // state corruption, and it is refused rather than deduplicated: a silent
     // dedup would leave the slot the duplicate vacated free for an unaccounted
@@ -339,7 +355,8 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
             | OwnedResourceKind::Endpoint
             | OwnedResourceKind::NetworkAttachment
             | OwnedResourceKind::HostExport
-            | OwnedResourceKind::Volume => declared.insert(record),
+            | OwnedResourceKind::Volume
+            | OwnedResourceKind::HostImport => declared.insert(record),
             OwnedResourceKind::DockerContext => environment.machines.iter().any(|machine| {
                 machine.docker_context.as_ref().is_some_and(|context| {
                     context.name == record.resource_id
@@ -363,7 +380,7 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
     }
     if declared != expected_set {
         return Err(unsupported(
-            "Up declared-topology ownership does not account for exactly the persisted network, endpoint, attachment and host export instances; no effects admitted",
+            "Up declared-topology ownership does not account for exactly the persisted network, endpoint, attachment, host export and host import instances; no effects admitted",
         ));
     }
     Ok(())
@@ -463,18 +480,21 @@ fn validate_supported(
             error.to_string(),
         ));
     }
-    // Host IMPORTS are not. An import is the opposite direction: a guest-initiated
-    // stream that the host terminates against exactly one stored `127.0.0.1`
-    // service. Nothing in the workspace carries that direction — `Vm::vsock_listen`
-    // has no caller and no test, the guest agent only ever accepts on vsock and
-    // never dials out, and there is no per-import credential to authenticate one
-    // with. Admitting an import would start a Machine whose definition asks for a
-    // boundary that does not exist, which is strictly worse than refusing it.
-    if !spec.host_imports.is_empty() {
+    // Host IMPORTS are applied too, by the opposite mechanism. An import is a
+    // guest-initiated stream that the host terminates against exactly one
+    // stored `127.0.0.1` service: `host_imports::boot_import_grants` mints a
+    // per-declaration credential, the boot loop installs a vsock terminator on
+    // that Machine's own socket device and the matching loopback listeners in
+    // its agent, and the host destination never crosses to the guest at all.
+    // What cannot be served is refused here, one case at a time, so the refusal
+    // says which declaration it could not carry.
+    if let Err(error) =
+        host_imports::refuse_unsupported_host_imports(&request.definition.environment)
+    {
         return Err(failure(
             metadata,
             MachineErrorCode::UnsupportedOperation,
-            "declared host imports require the guest-initiated authenticated relay adapter, which is not implemented; this Up cannot apply them and performs no admission",
+            error.to_string(),
         ));
     }
     // Egress is not applied. `EgressPolicy::Offline` is the only policy this Up

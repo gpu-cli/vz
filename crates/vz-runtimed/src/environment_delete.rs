@@ -862,6 +862,29 @@ fn validate_supported(
             machine_id: None,
         });
     }
+    // A host import is reclaimed the same way and for the same reason. Its two
+    // runtime halves — the vsock terminator on that Machine's socket device and
+    // the loopback listeners inside its agent — are both owned by the Machine's
+    // VM and cease to exist when it stops. The persisted row cascades from
+    // `machine_instances` exactly as an export's does. What it must not do is
+    // name a Machine this Environment does not hold: an import attributed to an
+    // absent Machine would be dispatched with no store, and the host service it
+    // grants would have no owner to reclaim its grant.
+    for import in &environment.host_imports {
+        if !known_machines.contains(&&import.machine_id) {
+            return Err(conflict(
+                input,
+                "Delete host import references absent topology",
+            ));
+        }
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::HostImport,
+            resource_id: import.import_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(import.machine_id.clone()),
+        });
+    }
     // Exact set equality, compared as sets rather than inferred from a length
     // and a membership test. `expected` is minted from the persisted instances,
     // so two instances sharing one identity would emit one record twice; that is

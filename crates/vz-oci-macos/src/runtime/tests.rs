@@ -672,6 +672,7 @@ async fn shared_vm_lifecycle_lease_blocks_exact_shutdown_until_drop() {
         runtime_identity: identity.clone(),
         verified_profile: KernelProfile::Developer,
         stack_vms: Arc::clone(&runtime.stack_vms),
+        stack_host_import_relays: Arc::clone(&runtime.stack_host_import_relays),
         _stack_lifecycle_guard: runtime
             .stack_lifecycle_lock(&identity.stack_id)
             .await
