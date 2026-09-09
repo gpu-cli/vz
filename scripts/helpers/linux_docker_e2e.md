@@ -17,6 +17,44 @@ scripts/run-linux-docker-e2e.sh --suite compose \
   --evidence-dir /absolute/fresh-evidence --run-id compose-unique-candidate
 ```
 
+## The run reads a frozen tree, not this checkout
+
+Every suite module pins its own source paths (`required_source_paths` /
+`verify_sources`) and re-verifies them **during** the run, so a lane result can
+never come from a tree that changed underneath it. Editing a pinned file mid-run
+aborts it (`Rejected: limits source changed: ...`). That check is correct and is
+not relaxed anywhere; what changed is which tree it binds.
+
+`scripts/run-linux-docker-e2e.sh` and `scripts/run-linux-docker-registry-e2e.sh`
+no longer run the harness in place. They run `scripts/helpers/frozen_tree.py`,
+which copies this checkout into a private `git worktree` under `/private/tmp`,
+executes `linux_docker_e2e.py` from there, and removes the copy when the run
+ends. Consequences:
+
+* The working checkout is free to be merged, rebased and edited for the whole
+  50-55 minutes a composed run takes. The run does not see it.
+* Mutating the run's **own** frozen tree still aborts the run, unchanged.
+* The freeze carries uncommitted edits to tracked files (including staged
+  additions), so an edit-then-run loop behaves as before. It carries no
+  untracked file: no lane input is untracked, and the checkout's untracked set
+  can include whole sibling worktrees. A checkout with a tracked file deleted
+  cannot be digested and is refused with that reason before anything is created.
+* `--evidence-dir`, `--state-root` and every artifact/client path are argv and
+  are unaffected; they must be absolute, as before, and stay outside the frozen
+  tree. The harness's own runtime root is still a `mkdtemp` under `/private/tmp`
+  (`installed_developer_startup.Harness`), so the AF_UNIX socket budget is
+  untouched by where the frozen tree lives.
+* `inputs.json` keys are absolute paths into the frozen tree and therefore do
+  not resolve after the run. Their values are content digests, as before, and
+  `result.json#/source_tree` (also `lane-result.json#/source_tree`) records the
+  `commit`, `git_tree` and `tree_sha256` that identify the bytes.
+
+The release-candidate builder (`scripts/build-vz-0.4-release-candidate.sh`) and
+the guest artifact build (`make -C linux docker-build-all`) are **not** frozen.
+They run before a lane, produce a `--release-dir` the lane then admits by digest,
+and record their own source identity through `vz04_source_tree.describe`; the
+lane never re-reads them.
+
 The optional `--fixture` and `--image-input` default to the repository fixture
 and `python-image-input.json`. The latter contains exact raw registry index,
 ARM64 manifest and config metadata with independently checked SHA-256 links.

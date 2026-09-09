@@ -24,6 +24,7 @@ import subprocess
 import sys
 import time
 
+import frozen_tree
 import vz04_schema as schema
 from vz04_host import DOCKER_CONFIG_DIRNAME
 from vz04_common import (CONFIG_FILES, LANE_PHASES, REPO_ROOT, GateError, canonical_path, digest_file, document,
@@ -142,7 +143,7 @@ def base_result(lane_name: str, phase: str, ctx: LaneContext, entry_point: dict)
     return {"schema_version": 1, "kind": "vz-0.4-lane-result", "lane": lane_name, "phase": phase, "run_id": ctx.run_id,
             "candidate_tuple_sha256": ctx.candidate_tuple_sha256, "release_dir_sha256": ctx.release_dir_sha256,
             "fixture_sha256": ctx.fixture_sha256, "contract_sha256": ctx.contract_sha256, "entry_point": entry_point,
-            "outcome": "failed", "failure": None, "scenarios": [], "test_case_retries": 0, "process_starts": [],
+            "source_tree": frozen_tree.record(ctx.repo_root), "outcome": "failed", "failure": None, "scenarios": [], "test_case_retries": 0, "process_starts": [],
             "prohibited_observed": dict(PROHIBITED_NONE), "leaks": [], "cleanup_errors": [],
             "handoff": {"produced": None, "consumed": None, "consumed_sha256": None}, "retained_root": None,
             "evidence_files": [], "result_adapter": None}

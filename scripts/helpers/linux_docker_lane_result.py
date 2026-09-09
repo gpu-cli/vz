@@ -38,6 +38,7 @@ from pathlib import Path
 import re
 
 import docker_host_driver as driver
+import frozen_tree
 import linux_docker_scenarios as scenarios
 from vz04_common import LANE_PHASES, REPO_ROOT, digest_file, document, sha256_bytes, tree_digest
 
@@ -169,7 +170,8 @@ def base(ctx, repo_root=REPO_ROOT):
     return {"schema_version": 1, "kind": "vz-0.4-lane-result", "lane": LANE, "phase": phase, "run_id": run_id,
             "candidate_tuple_sha256": _optional_digest(ctx.candidate_tuple), "release_dir_sha256": release_digest,
             "fixture_sha256": _optional_digest(ctx.fixture_sha256), "contract_sha256": contract_digest,
-            "entry_point": entry_point(ctx, repo_root), "outcome": "failed", "failure": None, "scenarios": [],
+            "entry_point": entry_point(ctx, repo_root), "source_tree": frozen_tree.record(repo_root),
+            "outcome": "failed", "failure": None, "scenarios": [],
             "test_case_retries": 0, "process_starts": [], "prohibited_observed": {key: False for key in PROHIBITED_KEYS},
             "leaks": [], "cleanup_errors": [], "handoff": _handoff(ctx), "retained_root": None, "evidence_files": [],
             "result_adapter": None}
