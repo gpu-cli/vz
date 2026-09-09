@@ -48,10 +48,10 @@
   "migration": {
     "barriers_path": "config/vz-0.4-migration-barriers.json",
     "legacy_release_tag": "v0.3.20",
-    "legacy_artifact_url": null,
-    "legacy_artifact_sha256": null,
-    "legacy_state_fixture": null,
-    "legacy_state_fixture_sha256": null
+    "legacy_artifact_url": "https://github.com/gpu-cli/vz/releases/download/v0.3.20/vz-runtimed-v0.3.20-darwin-arm64",
+    "legacy_artifact_sha256": "618d33f633eaced3a9b691524067feb37113b9560f1b85f34fb24fa9ac4fe929",
+    "legacy_state_fixture": "tests/fixtures/vz-0.4/migration/v0.3.20-state.db",
+    "legacy_state_fixture_sha256": "e0df6098f206398e30feef3d0312a32e8c9f696685b7f720dc04f4817239bb63"
   },
   "resources": {
     "developer_machine": {"cpus": 2, "memory_bytes": 4294967296, "disk_bytes": 21474836480},

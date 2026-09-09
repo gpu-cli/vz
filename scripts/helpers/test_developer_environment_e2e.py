@@ -40,6 +40,7 @@ TOP1 = "gate.instances.three_concurrent_no_collision"
 TOP5 = "gate.network.private_topology_paths"
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
+TOP19 = e2e.CRITERION_19
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
                "status_json_field_set"}
@@ -53,7 +54,13 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # stand in for that: it needs a macOS template a gate host does not provision.
 # It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
 # which certified the criterion on evidence that never touched its macOS clause.
-NOT_IMPLEMENTED = {"grpc_api_live_agreement", "private_topology_paths"}
+# `install_upgrade_rollback_uninstall` proves every clause of criterion 19
+# except one: the restored store being opened again by v0.3.20 itself needs
+# the pinned ~22 MiB v0.3.20 daemon, which is neither committed nor fetched
+# from inside a check. These tests deliberately unstage it (see `setUp`), so
+# offline the check reports the gap by name instead of claiming the criterion.
+NOT_IMPLEMENTED = {"grpc_api_live_agreement", "private_topology_paths",
+                   "install_upgrade_rollback_uninstall"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -75,6 +82,12 @@ class TopologyLaneTests(unittest.TestCase):
         self.counter = 0
         self.socket_root = recorder.socket_root_for(self.state_root)
         self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
+        # Criterion 19 runs the pinned v0.3.20 daemon over the store it restored
+        # when it is staged. Point it at a path that is not, so these tests
+        # observe one outcome whatever this machine has cached.
+        unstaged = mock.patch.dict(os.environ, {checks.LEGACY_ARTIFACT_ENV: str(self.tmp / "unstaged-v0320")})
+        unstaged.start()
+        self.addCleanup(unstaged.stop)
 
     def tearDown(self):
         fixtures.make_writable(self.release)
@@ -192,6 +205,9 @@ class TopologyLaneTests(unittest.TestCase):
         for identifier in assigned - {TOP21, TOP15, TOP1}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
+        # Criterion 19's own sub-check ran; what it could not do is named.
+        self.assertTrue(any("pinned v0.3.20 daemon" in a for a in subs["install_upgrade_rollback_uninstall"]["assertions"]),
+                        subs["install_upgrade_rollback_uninstall"]["assertions"])
         cli_removal = common.load_json(common.REPO_ROOT / self.contract["pins"]["cli_removal"])
         expected = (len(cli_removal["removed_roots"]) * 9 + 18 +
                     (len(cli_removal["dev_baseline"]["help_paths"]) + len(cli_removal["normative_only_paths"])) * 4)
@@ -206,7 +222,8 @@ class TopologyLaneTests(unittest.TestCase):
                                                 "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement",
                           f"{TOP1}__three_concurrent_no_collision",
-                          f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set"})
+                          f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set",
+                          f"{TOP19}__install_upgrade_rollback_uninstall"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:
@@ -363,6 +380,127 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual((code, result["failure"]["reason"]), (1, "cleanup"))
         self.assertTrue(any(f"pid {process.pid}" in leak["identifier"] for leak in result["leaks"]))
         self.assertTrue(root.exists(), "survivors must retain the lane state root")
+
+    # -- criterion 19: migration, installation, rollback and uninstall ----------------
+    def criterion_19(self, mode: str = "") -> dict:
+        """Run the lane in `mode` and return criterion 19's own sub-check."""
+        self.set_mode(mode)
+        evidence = self.evidence()
+        _code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        return self.by_slug(result)["install_upgrade_rollback_uninstall"]
+
+    def assert_claims(self, sub: dict, *needles: str) -> None:
+        for needle in needles:
+            self.assertTrue(any(needle in a and not a.startswith("FAILED:") for a in sub["assertions"]),
+                            (needle, sub["assertions"]))
+
+    def assert_fails(self, sub: dict, *needles: str) -> None:
+        failures = [a for a in sub["assertions"] if a.startswith("FAILED:")]
+        for needle in needles:
+            self.assertTrue(any(needle in a for a in failures), (needle, failures))
+
+    def test_the_installed_flow_clauses_of_criterion_19_are_proved(self):
+        """Everything but the staged-v0.3.20-daemon clause runs and passes."""
+        sub = self.criterion_19()
+        self.assertEqual([a for a in sub["assertions"] if a.startswith("FAILED:")], [])
+        self.assert_claims(
+            sub,
+            "the fixture on disk is the one the contract pins",
+            "the fixture carries one legacy record of each classification",
+            "a clean 0.4 installation into",
+            "installed bin/vz is the release's own executable",
+            "the installation records the release version",
+            "the installer added its PATH entry to the shell rc",
+            "migrates it off the legacy schema",
+            "exactly one Project, Environment, Machine and WorkspaceBinding",
+            "image and resources survived the upgrade",
+            "keeps its markers, spec and backend",
+            "no legacy Hardened or generic record acquired a Machine",
+            "no legacy Hardened or generic record acquired Docker capabilities",
+            "no environment_host_imports row",
+            "no environment_machine_egress row",
+            "retained a completed pre-migration backup",
+            "the injected migration failure fails the installed daemon's start",
+            "byte-identical to the v0.3.20 fixture",
+            "records that it restored the backup",
+            "uninstall succeeds",
+            "uninstall removed the installed software",
+            "survives uninstall",
+            "the legacy project directory is byte-identical after uninstall",
+            "unrelated Docker configuration is byte-identical after uninstall",
+            "uninstall removed its own PATH entry",
+        )
+        self.assertIn("pinned v0.3.20 daemon", sub["assertions"][-1])
+
+    def test_a_migration_that_widens_a_hardened_record_fails_criterion_19(self):
+        """Vacuity: a runtime that gives the Hardened record Developer/Docker/imports/egress."""
+        sub = self.criterion_19("migration_widens")
+        self.assertEqual(sub["status"], "FAIL")
+        self.assert_fails(
+            sub,
+            "exactly one Project, Environment, Machine and WorkspaceBinding",
+            "no legacy Hardened or generic record acquired a Machine",
+            "no legacy Hardened or generic record acquired Docker capabilities",
+            "no environment_host_imports row",
+            "no environment_machine_egress row",
+        )
+        # The gap must not swallow a real regression: with something failing, the
+        # check stays a failure rather than being relabelled not_implemented.
+        self.assertFalse(any(a.startswith("not_implemented:") for a in sub["assertions"]), sub["assertions"])
+
+    def test_a_migration_without_a_backup_fails_criterion_19(self):
+        """Vacuity: a runtime that migrates without taking the pre-migration backup."""
+        sub = self.criterion_19("migration_no_backup")
+        self.assertEqual(sub["status"], "FAIL")
+        self.assert_fails(
+            sub,
+            "retained a completed pre-migration backup",
+            "byte-identical to the fixture",
+            "byte-identical to the v0.3.20 fixture",
+            "records that it restored the backup",
+        )
+        # The upgrade itself still worked, so that claim is still made.
+        self.assert_claims(sub, "exactly one Project, Environment, Machine and WorkspaceBinding")
+
+    def test_the_pinned_fixture_is_the_one_the_contract_names(self):
+        """The fixture matches its pin and is substantive, offline."""
+        contract = common.load_json(common.REPO_ROOT / checks.E2E_CONTRACT)["migration"]
+        fixture = common.REPO_ROOT / checks.MIGRATION_FIXTURE
+        self.assertEqual(contract["legacy_state_fixture"], checks.MIGRATION_FIXTURE)
+        self.assertEqual(contract["legacy_state_fixture_sha256"], common.digest_file(fixture))
+        self.assertEqual(checks._schema_version(fixture, immutable=True), "1")
+        records = checks._legacy_records(fixture, immutable=True)
+        kinds = checks._classify(records)
+        self.assertEqual({k: len(v) for k, v in kinds.items()}, {"developer": 1, "hardened": 1, "generic": 1})
+        spec = records[kinds["developer"][0]]["spec"]
+        self.assertTrue(spec["base_image_ref"] and spec["cpus"] and spec["memory_mb"], spec)
+
+    def test_uninstall_refuses_an_unsafe_prefix_and_keeps_foreign_state(self):
+        """The uninstaller removes what vz owns by name and nothing else."""
+        installer = common.REPO_ROOT / "scripts/install.sh"
+        prefix, home = self.tmp / "uninstall-prefix", self.tmp / "uninstall-home"
+        (prefix / "bin").mkdir(parents=True)
+        home.mkdir()
+        for name in ("vz", "vz-runtimed", "vz-guest-agent", "vz-agent-loader", "vz-macos-setup"):
+            (prefix / "bin" / name).write_bytes(b"vz-owned executable\n")
+        (prefix / ".installed-version").write_bytes(b"0.4.0-test\n")
+        (prefix / "stack-state.db").write_bytes(b"vz-owned state store\n")
+        (prefix / "mine.txt").write_bytes(b"not vz's\n")
+        (prefix / "bin/my-tool").write_bytes(b"also not vz's\n")
+        env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "HOME": str(home), "VZ_INSTALL_DIR": str(prefix)}
+        done = subprocess.run(["/bin/bash", str(installer), "--uninstall"], env=env, capture_output=True, timeout=120)
+        self.assertEqual(done.returncode, 0, done.stderr.decode())
+        self.assertFalse((prefix / "bin/vz").exists())
+        self.assertFalse((prefix / "stack-state.db").exists())
+        self.assertEqual((prefix / "mine.txt").read_bytes(), b"not vz's\n")
+        self.assertEqual((prefix / "bin/my-tool").read_bytes(), b"also not vz's\n")
+        # A prefix that is the home directory, or relative, is refused outright.
+        for unsafe, message in ((str(home), b"refusing to uninstall from the home directory"),
+                                ("relative/prefix", b"must be an absolute path"), ("/", b"refusing to uninstall from /")):
+            refused = subprocess.run(["/bin/bash", str(installer), "--uninstall"],
+                                     env={**env, "VZ_INSTALL_DIR": unsafe}, capture_output=True, timeout=120)
+            self.assertEqual(refused.returncode, 1, (unsafe, refused.stdout.decode()))
+            self.assertIn(message, refused.stderr)
 
     def test_wrapper_script_runs_the_lane(self):
         evidence = self.evidence()

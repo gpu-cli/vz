@@ -1,0 +1,6 @@
+{
+  "image": "alpine:3.20",
+  "workspace": "/workspace",
+  "mounts": [{"source": ".", "target": "/workspace"}],
+  "resources": {"cpus": 1, "memory": "2G"}
+}

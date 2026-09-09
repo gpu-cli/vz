@@ -224,6 +224,7 @@ def fake_vz_script(mode_file: Path, snapshot_file: Path) -> bytes:
 FAKE_DAEMON_SOURCE = r"""
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/un.h>
@@ -243,12 +244,47 @@ static void on_term(int signal_number) {
     _exit(0);
 }
 
+static const char *MIGRATE_SHIM = __SHIM__;
+
+/* Delegate the daemon's own flag form to the embedded sh stand-in. The daemon
+   that migrates a state store has to be scriptable (it reads and rewrites
+   SQLite), while the daemon a `vz status` autospawns has to BE this Mach-O so
+   its executable path is the release `bin/vz-runtimed`. One binary satisfies
+   both, and embedding the script rather than shipping it beside the binary
+   keeps `install.sh`'s exact five-name install honest. `$0` is this binary, so
+   the script can exec it back for the socket-binding form. */
+static void delegate_flag_form(int argc, char **argv) {
+    char **shell;
+    int index;
+    for (index = 1; index < argc; index++) {
+        if (strcmp(argv[index], "--state-store-path") == 0) {
+            break;
+        }
+    }
+    if (index == argc) {
+        return;
+    }
+    shell = calloc((size_t)argc + 4, sizeof(char *));
+    if (shell == NULL) {
+        return;
+    }
+    shell[0] = (char *)"/bin/sh";
+    shell[1] = (char *)"-c";
+    shell[2] = (char *)MIGRATE_SHIM;
+    for (index = 0; index < argc; index++) {
+        shell[index + 3] = argv[index];
+    }
+    execv("/bin/sh", shell);
+    free(shell);
+}
+
 /* argv[1] alone: bind that path, release it, exit. This is the Machine Docker
    endpoint probe the fake `vz up` uses -- it decides bindability by binding,
    not by measuring. argv[1..3]: run as the autospawned daemon stand-in. */
 int main(int argc, char **argv) {
     struct sockaddr_un address;
     int descriptor;
+    delegate_flag_form(argc, argv);
     if (argc != 2 && argc != 4) {
         return 2;
     }
@@ -281,6 +317,109 @@ int main(int argc, char **argv) {
     }
 }
 """
+
+
+# The daemon stand-in's flag form: what an installed `vz-runtimed` does to a
+# state store older than its own schema. It models exactly the properties
+# criterion 19 reads -- a byte-identical pre-migration backup, one
+# Project/Environment/Machine per legacy DEVELOPER record, legacy rows left
+# where they are, and restoration of the backup when a migration failure is
+# injected -- and the `migration_widens`/`migration_no_backup` modes break one
+# of them on purpose so the check can be shown to fail on a wrong runtime.
+MIGRATE_SHIM = r'''#!/bin/sh
+set -u
+MODE_FILE=__MODE_FILE__
+mode=""
+[ -f "$MODE_FILE" ] && mode=$(cat "$MODE_FILE")
+db=""; rt=""; sock=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --state-store-path) db=$2; shift 2 ;;
+    --runtime-data-dir) rt=$2; shift 2 ;;
+    --socket-path) sock=$2; shift 2 ;;
+    *) shift ;;
+  esac
+done
+[ -n "$db" ] && [ -n "$rt" ] && [ -n "$sock" ] || exit 2
+mkdir -p "$rt"
+serve() { exec "$0" "$sock" "$sock.pid" "$sock.log"; }
+
+version=$(sqlite3 "$db" "select value from control_metadata where key='schema_version';" 2>/dev/null || echo "")
+[ "$version" = 1 ] || serve
+
+if [ "$mode" != migration_no_backup ]; then
+  mkdir -p "$rt/state-store-backups"
+  bak="$rt/state-store-backups/$(basename "$db").v1.$(date +%s)000000000.bak"
+  cp "$db" "$bak"
+  sha=$(shasum -a 256 "$bak" | cut -d' ' -f1)
+  printf '{"from_schema_version":1,"to_schema_version":12,"sha256":"%s","state_store_path":"%s","backup_path":"%s","created_unix_ns":%s,"migration_completed":%s,"restored":false}\n' \
+    "$sha" "$db" "$bak" "$(date +%s)000000000" false > "$bak.json"
+fi
+
+developer="json_extract(labels_json,'\$.\"vz.run.workspace\"') IS NOT NULL AND coalesce(json_extract(labels_json,'\$.\"vz.space.mode\"'),'') <> 'required'"
+migrated="$developer"
+# A runtime that also migrated the Hardened record, and gave it Developer,
+# Docker, a host import and an egress default.
+[ "$mode" = migration_widens ] && migrated="1=1"
+
+sqlite3 "$db" <<SQL
+CREATE TABLE project_definitions (project_id TEXT PRIMARY KEY, schema_version INTEGER, name TEXT, definition_json TEXT, created_at INTEGER, updated_at INTEGER);
+CREATE TABLE environment_instances (environment_id TEXT PRIMARY KEY, project_id TEXT, schema_version INTEGER, name TEXT, definition_digest TEXT, state TEXT, instance_json TEXT, created_at INTEGER, updated_at INTEGER, legacy_sandbox_id TEXT, lifecycle_generation INTEGER, active_operation_id TEXT);
+CREATE TABLE machine_instances (machine_id TEXT PRIMARY KEY, environment_id TEXT, schema_version INTEGER, name TEXT, state TEXT, instance_json TEXT, legacy_sandbox_id TEXT);
+CREATE TABLE workspace_bindings (binding_id TEXT PRIMARY KEY, project_id TEXT, environment_id TEXT, name TEXT, binding_json TEXT);
+CREATE TABLE environment_network_attachments (environment_id TEXT, name TEXT, machine_id TEXT);
+CREATE TABLE environment_host_exports (environment_id TEXT, name TEXT, machine_id TEXT);
+CREATE TABLE environment_host_imports (environment_id TEXT, name TEXT, machine_id TEXT);
+CREATE TABLE environment_machine_egress (environment_id TEXT, machine_id TEXT, policy TEXT);
+
+INSERT INTO project_definitions
+ SELECT 'prj_'||substr(replace(sandbox_id,'-',''),1,24), 1, sandbox_id, '{}', created_at, updated_at
+ FROM sandbox_state WHERE $migrated;
+INSERT INTO environment_instances
+ SELECT 'env_'||substr(replace(sandbox_id,'-',''),1,24), 'prj_'||substr(replace(sandbox_id,'-',''),1,24), 1,
+        'default', 'sha256:0', state, '{}', created_at, updated_at, sandbox_id, 0, NULL
+ FROM sandbox_state WHERE $migrated;
+INSERT INTO machine_instances
+ SELECT 'mac_'||substr(replace(sandbox_id,'-',''),1,24), 'env_'||substr(replace(sandbox_id,'-',''),1,24), 1, 'linux', state,
+        json_object('schema_version',1,'name','linux','profile','developer',
+                    'target',json_object('os','linux','arch','aarch64','image',json_extract(spec_json,'\$.base_image_ref')),
+                    'resources',json_object('cpus',json_extract(spec_json,'\$.cpus'),'memory_mb',json_extract(spec_json,'\$.memory_mb')),
+                    'negotiated_capabilities',json_object('capabilities',json_array('posix_exec','docker_engine','compose','buildx')),
+                    'legacy_sandbox_id',sandbox_id),
+        sandbox_id
+ FROM sandbox_state WHERE $migrated;
+INSERT INTO workspace_bindings
+ SELECT 'wsp_'||substr(replace(sandbox_id,'-',''),1,24), 'prj_'||substr(replace(sandbox_id,'-',''),1,24),
+        'env_'||substr(replace(sandbox_id,'-',''),1,24), 'workspace', '{"slots":["workspace"]}'
+ FROM sandbox_state WHERE $migrated;
+SQL
+if [ "$mode" = migration_widens ]; then
+  sqlite3 "$db" "
+    INSERT INTO environment_host_imports
+      SELECT 'env_'||substr(replace(sandbox_id,'-',''),1,24), 'legacy-import', 'mac_'||substr(replace(sandbox_id,'-',''),1,24)
+      FROM sandbox_state WHERE json_extract(labels_json,'\$.\"vz.space.mode\"') = 'required';
+    INSERT INTO environment_machine_egress
+      SELECT 'env_'||substr(replace(sandbox_id,'-',''),1,24), 'mac_'||substr(replace(sandbox_id,'-',''),1,24), 'allowed'
+      FROM sandbox_state WHERE json_extract(labels_json,'\$.\"vz.space.mode\"') = 'required';"
+fi
+sqlite3 "$db" "UPDATE control_metadata SET value='12' WHERE key='schema_version';"
+
+if [ -n "${VZ_STATE_STORE_MIGRATION_FAILPOINT:-}" ]; then
+  if [ "$mode" != migration_no_backup ]; then
+    rm -f "$db-wal" "$db-shm" "$db-journal"
+    cp "$bak" "$db"
+    sed 's/"restored":false/"restored":true/' "$bak.json" > "$bak.json.tmp" && mv "$bak.json.tmp" "$bak.json"
+    echo "state store migration from schema version 1 failed; the pre-migration backup at $bak was restored over $db byte-for-byte" >&2
+  else
+    echo "state store migration from schema version 1 failed; no backup was taken" >&2
+  fi
+  exit 1
+fi
+[ "$mode" = migration_no_backup ] || {
+  sed 's/"migration_completed":false/"migration_completed":true/' "$bak.json" > "$bak.json.tmp" && mv "$bak.json.tmp" "$bak.json"
+}
+serve
+'''
 
 
 BUSYBOX_SHIM = r'''#!/bin/sh
@@ -427,13 +566,14 @@ esac
 '''
 
 
-def build_fake_daemon(destination: Path) -> None:
+def build_fake_daemon(destination: Path, mode_file: Path) -> None:
     """Compile the daemon stand-in, or skip the caller when no compiler exists."""
     compiler = shutil.which("cc") or shutil.which("clang")
     if compiler is None:
         raise unittest.SkipTest("no C compiler for the fake vz-runtimed stand-in")
     source = destination.parent / "fake-vz-runtimed.c"
-    source.write_text(FAKE_DAEMON_SOURCE)
+    shim = MIGRATE_SHIM.replace("__MODE_FILE__", json.dumps(str(mode_file)))
+    source.write_text(FAKE_DAEMON_SOURCE.replace("__SHIM__", json.dumps(shim)))
     completed = subprocess.run([compiler, "-O0", "-o", str(destination), str(source)], stdout=subprocess.PIPE,
                                stderr=subprocess.STDOUT, timeout=120, check=False)
     source.unlink()
@@ -451,7 +591,7 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     fixtures.make_writable(root)
     (root / "bin/vz").write_bytes(fake_vz_script(mode_file, snapshot_file))
     (root / "bin/vz").chmod(0o755)
-    build_fake_daemon(root / "bin/vz-runtimed")
+    build_fake_daemon(root / "bin/vz-runtimed", mode_file)
     (root / "bin/vz-runtimed").chmod(0o755)
     # The guest BusyBox stand-in every `vz exec` script addresses.
     (root / "bin/busybox-shim").write_text(BUSYBOX_SHIM)

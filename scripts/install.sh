@@ -58,6 +58,13 @@ resolve_version() {
         return
     fi
 
+    if [ -n "${VZ_LOCAL_RELEASE_DIR:-}" ]; then
+        /usr/bin/plutil -extract release_version raw -expect string \
+            "$VZ_LOCAL_RELEASE_DIR/release-manifest.json" 2>/dev/null && return
+        echo "error: $VZ_LOCAL_RELEASE_DIR/release-manifest.json has no release_version." >&2
+        exit 1
+    fi
+
     local latest
     latest="$(curl -sSf -o /dev/null -w '%{redirect_url}' \
         "https://github.com/$REPO/releases/latest" 2>/dev/null || true)"
@@ -112,8 +119,48 @@ verify_checksum() {
 
 # --- Install steps ---
 
+# Digest of one path relative to a local release directory, read from the
+# checksums.sha256 that directory ships. An unlisted path is refused: an
+# unverified artifact must never be installed.
+local_release_digest() {
+    local relpath="$1" line
+    line="$(/usr/bin/grep -E "^[0-9a-f]{64}  ${relpath}\$" \
+        "$VZ_LOCAL_RELEASE_DIR/checksums.sha256")" || {
+        echo "error: $relpath is not listed in $VZ_LOCAL_RELEASE_DIR/checksums.sha256" >&2
+        exit 1
+    }
+    printf '%s' "${line%% *}"
+}
+
+install_local_file() {
+    local relpath="$1" dest="$2" expected actual
+    expected="$(local_release_digest "$relpath")"
+    cp "$VZ_LOCAL_RELEASE_DIR/$relpath" "$dest"
+    actual="$(shasum -a 256 "$dest" | awk '{print $1}')"
+    if [ "$expected" != "$actual" ]; then
+        echo "error: checksum mismatch for $relpath" >&2
+        echo "  expected: $expected" >&2
+        echo "  actual:   $actual" >&2
+        rm -f "$dest"
+        exit 1
+    fi
+}
+
 install_binary() {
     local version="$1" name="$2"
+
+    if [ -n "${VZ_LOCAL_RELEASE_DIR:-}" ]; then
+        echo "  staging: $name"
+        install_local_file "bin/$name" "$BIN_DIR/$name"
+        chmod +x "$BIN_DIR/$name"
+        if codesign --verify "$BIN_DIR/$name" 2>/dev/null; then
+            echo "  $name: signature verified"
+        else
+            echo "  $name: warning — signature verification failed, may trigger Gatekeeper"
+        fi
+        return
+    fi
+
     local base_url="https://github.com/$REPO/releases/download/v${version}"
     local artifact_name="${name}-v${version}-darwin-arm64"
 
@@ -209,6 +256,24 @@ install_linux_profile_artifacts() {
     mkdir -p "$dest_dir"
 
     echo "Installing Linux ${profile} kernel + initramfs..."
+
+    if [ -n "${VZ_LOCAL_RELEASE_DIR:-}" ]; then
+        local artifact
+        if [ ! -d "$VZ_LOCAL_RELEASE_DIR/linux/$profile" ]; then
+            if [ "$required" = "optional" ]; then
+                echo "  warning: this release provides no ${profile} Linux artifacts; skipping"
+                return
+            fi
+            echo "error: this release provides no ${profile} Linux artifacts" >&2
+            exit 1
+        fi
+        for artifact in $(cd "$VZ_LOCAL_RELEASE_DIR/linux/$profile" && ls); do
+            install_local_file "linux/$profile/$artifact" "$dest_dir/$artifact"
+        done
+        echo "  installed ${profile}: $dest_dir"
+        INSTALLED_LINUX_PROFILES+=("$profile")
+        return
+    fi
 
     if ! download_if_available "$base_url/$tarball_name" "$dest_dir/$tarball_name"; then
         rm -f "$dest_dir/$tarball_name"
@@ -330,6 +395,124 @@ setup_path() {
     fi
 }
 
+# --- Uninstall ---
+#
+# Removes exactly the software and runtime resources vz installed or created,
+# named one at a time. Nothing is removed by wildcard and `$INSTALL_DIR` itself
+# is never removed recursively: a user who keeps their own files under the
+# prefix keeps them. Project directories, `vz.json` definitions, workspaces and
+# the user's Docker configuration are never vz-owned and are never touched --
+# every per-Machine Docker context vz creates lives inside the runtime data
+# directory removed below, not in `~/.docker`.
+
+VZ_BINARIES="vz vz-runtimed vz-guest-agent vz-agent-loader vz-macos-setup"
+LINUX_ARTIFACTS="vmlinux initramfs.img youki version.json developer-probe-rootfs.tar"
+
+removed_count=0
+uninstall_dry_run=0
+
+drop() {
+    local path="$1"
+    [ -e "$path" ] || [ -L "$path" ] || return 0
+    if [ "$uninstall_dry_run" = 1 ]; then
+        echo "  would remove: $path"
+    else
+        rm -rf -- "$path"
+        echo "  removed: $path"
+    fi
+    removed_count=$((removed_count + 1))
+}
+
+drop_state_db() {
+    local db="$1" suffix
+    drop "$db"
+    for suffix in -wal -shm -journal .startup-lock; do
+        drop "${db}${suffix}"
+    done
+}
+
+# The rc block `setup_path` appends, removed only when it is exactly that block.
+remove_path_entry() {
+    local shell_rc="$1"
+    [ -f "$shell_rc" ] && [ ! -L "$shell_rc" ] || return 0
+    grep -qF "export PATH=\"$BIN_DIR:\$PATH\"" "$shell_rc" || return 0
+    if [ "$uninstall_dry_run" = 1 ]; then
+        echo "  would remove the vz PATH entry from $shell_rc"
+        return 0
+    fi
+    local trimmed
+    trimmed="$(mktemp)"
+    BIN_DIR="$BIN_DIR" /usr/bin/awk '
+        $0 == "# vz" { pending = $0; next }
+        $0 == "export PATH=\"" ENVIRON["BIN_DIR"] ":$PATH\"" { pending = ""; next }
+        { if (pending != "") { print pending; pending = "" } print }
+        END { if (pending != "") print pending }
+    ' "$shell_rc" > "$trimmed"
+    cat "$trimmed" > "$shell_rc"
+    rm -f "$trimmed"
+    echo "  removed the vz PATH entry from $shell_rc"
+}
+
+uninstall_main() {
+    case "$INSTALL_DIR" in
+        /) echo "error: refusing to uninstall from /" >&2; exit 1 ;;
+        /*) ;;
+        *) echo "error: VZ_INSTALL_DIR must be an absolute path: $INSTALL_DIR" >&2; exit 1 ;;
+    esac
+    if [ "$INSTALL_DIR" = "$HOME" ]; then
+        echo "error: refusing to uninstall from the home directory itself" >&2
+        exit 1
+    fi
+
+    # A live daemon owns running Machines, their disks and their sockets.
+    # Removing its binaries and state underneath it would strand them, so this
+    # refuses rather than terminating somebody else's processes.
+    if command -v pgrep >/dev/null 2>&1 && pgrep -f "^$BIN_DIR/vz-runtimed" >/dev/null 2>&1; then
+        echo "error: $BIN_DIR/vz-runtimed is running; stop your Environments first" >&2
+        echo "       (vz stop, then retry the uninstall)" >&2
+        exit 1
+    fi
+
+    local state_db runtime_dir binary artifact
+    state_db="${VZ_RUNTIME_STATE_DB:-$INSTALL_DIR/stack-state.db}"
+    runtime_dir="${VZ_RUNTIME_DATA_DIR:-$INSTALL_DIR/.vz-runtime}"
+
+    echo "Uninstalling vz from $INSTALL_DIR..."
+    for binary in $VZ_BINARIES; do
+        drop "$BIN_DIR/$binary"
+        drop "$BIN_DIR/$binary.sha256"
+    done
+    for artifact in $LINUX_ARTIFACTS; do
+        drop "$LINUX_DIR/$artifact"
+    done
+    drop "$LINUX_DIR/developer"
+    drop "$LINUX_DIR/container"
+    drop "$INSTALL_DIR/machine-target-catalog.json"
+    drop "$VERSION_FILE"
+
+    echo "Removing vz-owned runtime resources..."
+    drop_state_db "$state_db"
+    drop "$runtime_dir"
+    drop "$INSTALL_DIR/run"
+
+    remove_path_entry "$HOME/.zshrc"
+    remove_path_entry "$HOME/.bash_profile"
+
+    if [ "$uninstall_dry_run" != 1 ]; then
+        # Only when nothing else lives there. A non-empty directory is somebody
+        # else's, and rmdir says so by failing.
+        rmdir "$LINUX_DIR" 2>/dev/null || true
+        rmdir "$BIN_DIR" 2>/dev/null || true
+        rmdir "$INSTALL_DIR" 2>/dev/null || true
+    fi
+
+    echo ""
+    echo "vz uninstalled ($removed_count vz-owned path(s))."
+    echo "Project directories, vz.json definitions and workspaces were not touched."
+    echo "Your Docker configuration was not touched: vz keeps its Machine contexts"
+    echo "inside its own runtime directory."
+}
+
 # --- Main ---
 
 print_getting_started() {
@@ -344,9 +527,45 @@ print_getting_started() {
     echo "To also prepare an Xcode template, review its license and run:"
     printf '  %q --xcode /Applications/Xcode.app --accept-xcode-license\n' "$BIN_DIR/vz-macos-setup"
     echo "Setup requests administrator access once to provision the new guest disk."
+    echo ""
+    echo "To remove vz's software and runtime resources again (project directories,"
+    echo "vz.json definitions, workspaces and your Docker configuration are kept):"
+    echo "  sh install.sh --uninstall        (add --dry-run to list what it would remove)"
+}
+
+usage() {
+    echo "Usage: install.sh [--uninstall [--dry-run]]"
+    echo ""
+    echo "  --uninstall   remove the vz software and runtime resources under"
+    echo "                VZ_INSTALL_DIR (default \$HOME/.vz), leaving project"
+    echo "                data and your Docker configuration alone"
+    echo "  --dry-run     with --uninstall, list what would be removed"
+    echo ""
+    echo "Set VZ_LOCAL_RELEASE_DIR to install from a local release directory"
+    echo "instead of downloading, verifying every file against its checksums.sha256."
 }
 
 main() {
+    local action=install
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --uninstall) action=uninstall ;;
+            --dry-run) uninstall_dry_run=1 ;;
+            -h|--help) usage; exit 0 ;;
+            *) echo "error: unknown argument: $1" >&2; usage >&2; exit 2 ;;
+        esac
+        shift
+    done
+    if [ "$action" = uninstall ]; then
+        check_platform
+        uninstall_main
+        return
+    fi
+    if [ "$uninstall_dry_run" = 1 ]; then
+        echo "error: --dry-run is only meaningful with --uninstall" >&2
+        exit 2
+    fi
+
     check_platform
     check_dependencies
 

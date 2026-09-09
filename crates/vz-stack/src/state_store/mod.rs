@@ -32,6 +32,7 @@ pub mod machine_boot_non_dispatch;
 #[cfg(test)]
 mod machine_docker_context_tests;
 mod machine_execution;
+pub mod migration_backup;
 mod stack_journal;
 pub use stack_journal::{
     StackContainerCreateIntent, StackContainerCreateSelector, StackContainerCreateStatus,
@@ -1003,16 +1004,53 @@ impl StateStore {
     }
 
     /// Open or create a state store with explicit SQLite pragma policy.
+    ///
+    /// The pre-migration backup lands beside the store; a caller that owns a
+    /// runtime data directory should name it with
+    /// [`open_with_migration_backup_root`](Self::open_with_migration_backup_root).
     pub fn open_with_pragmas(path: &Path, pragmas: StateStorePragmas) -> Result<Self, StackError> {
-        let conn = Connection::open(path)?;
-        let store = Self {
-            conn,
-            event_sender: None,
-        };
-        store.apply_connection_pragmas(pragmas)?;
-        store.init_schema()?;
-        store.apply_journal_mode(pragmas)?;
-        Ok(store)
+        Self::open_with_migration_backup_root(path, pragmas, None)
+    }
+
+    /// Open or create a state store, retaining any pre-migration backup under
+    /// `backup_root`.
+    ///
+    /// When the store on disk predates this build's schema version, a
+    /// byte-identical copy is taken before the first schema write. If the open
+    /// then fails for any reason — including the release gate's injected
+    /// migration failure — the copy is restored over the store, so the release
+    /// that wrote it can still read it. See [`migration_backup`].
+    pub fn open_with_migration_backup_root(
+        path: &Path,
+        pragmas: StateStorePragmas,
+        backup_root: Option<&Path>,
+    ) -> Result<Self, StackError> {
+        let backup = migration_backup::prepare(path, backup_root)?;
+        // The store is constructed inside this closure so that a failure drops
+        // its connection before any restore touches the file.
+        let opened = (|| -> Result<Self, StackError> {
+            let conn = Connection::open(path)?;
+            let store = Self {
+                conn,
+                event_sender: None,
+            };
+            store.apply_connection_pragmas(pragmas)?;
+            store.init_schema()?;
+            if backup.is_some() {
+                migration_backup::injected_failure()?;
+            }
+            store.apply_journal_mode(pragmas)?;
+            Ok(store)
+        })();
+        match (opened, backup) {
+            (Ok(store), None) => Ok(store),
+            (Ok(store), Some(backup)) => {
+                backup.record_success()?;
+                Ok(store)
+            }
+            (Err(error), None) => Err(error),
+            (Err(error), Some(backup)) => backup.restore(error),
+        }
     }
 
     /// Create an in-memory state store (useful for testing).
