@@ -207,6 +207,7 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         ipv4: std::net::Ipv4Addr::new(10, 4, 7, 2),
         prefix: 24,
         gateway: None,
+        dns: None,
         mtu: 1500,
         hosts: Vec::new(),
     }];
@@ -330,6 +331,7 @@ fn declared_attachment() -> crate::config::DeclaredAttachment {
         ipv4: std::net::Ipv4Addr::new(10, 4, 7, 2),
         prefix: 24,
         gateway: None,
+        dns: None,
         mtu: 1500,
         hosts: Vec::new(),
     }
@@ -410,6 +412,7 @@ fn an_attachment_refuses_an_l3_configuration_the_guest_would_apply_and_then_be_m
     refuse(
         crate::config::DeclaredAttachment {
             gateway: Some(std::net::Ipv4Addr::new(10, 4, 8, 1)),
+            dns: None,
             ..declared_attachment()
         },
         "is not on 10.4.7.2/24",
@@ -417,6 +420,7 @@ fn an_attachment_refuses_an_l3_configuration_the_guest_would_apply_and_then_be_m
     refuse(
         crate::config::DeclaredAttachment {
             gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 2)),
+            dns: None,
             ..declared_attachment()
         },
         "this port's own address",
@@ -427,6 +431,7 @@ fn an_attachment_refuses_an_l3_configuration_the_guest_would_apply_and_then_be_m
     for accepted in [
         crate::config::DeclaredAttachment {
             gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 1)),
+            dns: None,
             ..declared_attachment()
         },
         crate::config::DeclaredAttachment {
@@ -452,6 +457,7 @@ fn a_port_reaches_the_guest_as_one_kernel_argument_keyed_on_its_mac() {
     assert_eq!(
         crate::config::DeclaredAttachment {
             gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 1)),
+            dns: None,
             ..declared_attachment()
         }
         .kernel_argument(3),
@@ -486,6 +492,7 @@ fn every_port_a_machine_boots_with_reaches_its_cmdline_in_nic_order() {
                 ipv4: std::net::Ipv4Addr::new(10, 9, 0, 3),
                 prefix: 16,
                 gateway: Some(std::net::Ipv4Addr::new(10, 9, 0, 1)),
+                dns: None,
                 ..declared_attachment()
             },
         ]),

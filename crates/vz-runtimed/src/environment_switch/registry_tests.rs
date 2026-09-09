@@ -57,7 +57,7 @@ async fn a_switch_is_owned_by_its_environment_until_it_is_stopped() {
     let held = lease(&controller, ENVIRONMENT).await;
     let owner = owner(ENVIRONMENT);
     switches
-        .install(&held, &owner, "private", switch(2))
+        .install(&held, &owner, "private", switch(2), None)
         .await
         .unwrap();
     assert_eq!(
@@ -80,10 +80,12 @@ async fn one_network_cannot_have_two_switches() {
     let held = lease(&controller, ENVIRONMENT).await;
     let owner = owner(ENVIRONMENT);
     switches
-        .install(&held, &owner, "private", switch(1))
+        .install(&held, &owner, "private", switch(1), None)
         .await
         .unwrap();
-    let refused = switches.install(&held, &owner, "private", switch(1)).await;
+    let refused = switches
+        .install(&held, &owner, "private", switch(1), None)
+        .await;
     assert_eq!(
         refused,
         Err(conflict(
@@ -101,7 +103,7 @@ async fn a_lease_cannot_act_on_another_environments_switches() {
     let foreign = owner(OTHER_ENVIRONMENT);
     assert!(matches!(
         switches
-            .install(&held, &foreign, "private", switch(1))
+            .install(&held, &foreign, "private", switch(1), None)
             .await,
         Err(SwitchRegistryError::Conflict(_))
     ));
@@ -118,14 +120,16 @@ async fn a_second_controller_cannot_adopt_established_switches() {
     let held = lease(&controller, ENVIRONMENT).await;
     let owner = owner(ENVIRONMENT);
     switches
-        .install(&held, &owner, "private", switch(1))
+        .install(&held, &owner, "private", switch(1), None)
         .await
         .unwrap();
 
     let other_controller = EnvironmentRuntimeController::default();
     let other = lease(&other_controller, ENVIRONMENT).await;
     assert_eq!(
-        switches.install(&other, &owner, "second", switch(1)).await,
+        switches
+            .install(&other, &owner, "second", switch(1), None)
+            .await,
         Err(conflict(
             "switch registry belongs to another Environment controller"
         ))
@@ -152,7 +156,7 @@ async fn stopping_twice_reports_nothing_the_second_time() {
     let held = lease(&controller, ENVIRONMENT).await;
     let owner = owner(ENVIRONMENT);
     switches
-        .install(&held, &owner, "private", switch(2))
+        .install(&held, &owner, "private", switch(2), None)
         .await
         .unwrap();
     assert_eq!(
@@ -173,7 +177,7 @@ async fn an_environment_can_own_a_switch_for_each_of_its_networks() {
     let owner = owner(ENVIRONMENT);
     for network in ["private", "build", "data"] {
         switches
-            .install(&held, &owner, network, switch(1))
+            .install(&held, &owner, network, switch(1), None)
             .await
             .unwrap();
     }
@@ -190,7 +194,7 @@ async fn a_switch_needs_a_bounded_network_name() {
     let owner = owner(ENVIRONMENT);
     for name in ["", "   ", &"n".repeat(129)] {
         assert!(matches!(
-            switches.install(&held, &owner, name, switch(1)).await,
+            switches.install(&held, &owner, name, switch(1), None).await,
             Err(SwitchRegistryError::Conflict(_))
         ));
     }
@@ -208,7 +212,7 @@ async fn a_machine_scoped_owner_still_has_to_match_the_lease() {
         Some(MachineId::new("mch_0123456789abcdef0123456789abcdef".to_string()).unwrap());
     // A Machine-scoped owner of the same Environment is still that Environment.
     switches
-        .install(&held, &scoped, "private", switch(1))
+        .install(&held, &scoped, "private", switch(1), None)
         .await
         .unwrap();
     switches.stop(&held, &scoped).await.unwrap();

@@ -391,7 +391,7 @@ async fn declared_fabric_ownership_is_accounted_and_stop_completes() {
     fixture
         .daemon
         .environment_switches()
-        .install(&lease, &owner, "private", switch)
+        .install(&lease, &owner, "private", switch, None)
         .await
         .unwrap();
     drop(lease);

@@ -18,6 +18,7 @@ use tokio::sync::Mutex;
 use vz_runtime_contract::{EnvironmentId, ResourceOwner};
 
 use super::runtime::{NetworkSwitch, SwitchShutdown};
+use crate::environment_gateway::{EdgeShutdown, EnvironmentGateway};
 use crate::environment_runtime_controller::EnvironmentControllerLease;
 
 #[derive(Debug, Error, PartialEq, Eq)]
@@ -34,6 +35,12 @@ fn conflict(message: impl Into<String>) -> SwitchRegistryError {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EnvironmentSwitchShutdown {
     pub networks: BTreeMap<String, SwitchShutdown>,
+    /// What each network's edge decided while it ran, for the networks that had
+    /// one. Reported beside the switch's own counters rather than folded into
+    /// them: a frame the edge's filter refused never reached the switch, and a
+    /// frame the switch refused never reached the edge, so one number could not
+    /// be attributed to either.
+    pub edges: BTreeMap<String, EdgeShutdown>,
 }
 
 #[derive(Default)]
@@ -41,7 +48,19 @@ struct Registry {
     /// Bound on first use, so a second controller cannot adopt switches this
     /// daemon's controller established.
     controller: Option<std::sync::Arc<()>>,
-    switches: BTreeMap<EnvironmentId, BTreeMap<String, NetworkSwitch>>,
+    switches: BTreeMap<EnvironmentId, BTreeMap<String, Installed>>,
+}
+
+/// One network's switch and, where the network declared one, its edge.
+///
+/// They are installed and reclaimed together because the edge holds the guest
+/// end of one of that switch's ports: a switch stopped while its edge still ran
+/// would present to the edge as a network that silently stopped forwarding,
+/// and an edge left running after its switch is gone owns a socket whose peer
+/// no longer exists.
+struct Installed {
+    switch: NetworkSwitch,
+    gateway: Option<EnvironmentGateway>,
 }
 
 /// Every Environment's running switches, owned by the daemon.
@@ -62,6 +81,7 @@ impl EnvironmentSwitches {
         owner: &ResourceOwner,
         network_id: &str,
         switch: NetworkSwitch,
+        gateway: Option<EnvironmentGateway>,
     ) -> Result<(), SwitchRegistryError> {
         lease
             .require_owner(owner)
@@ -78,7 +98,7 @@ impl EnvironmentSwitches {
                 "network `{network_id}` already has a switch in this Environment"
             )));
         }
-        networks.insert(network_id.to_string(), switch);
+        networks.insert(network_id.to_string(), Installed { switch, gateway });
         Ok(())
     }
 
@@ -115,8 +135,19 @@ impl EnvironmentSwitches {
                 .unwrap_or_default()
         };
         let mut receipt = EnvironmentSwitchShutdown::default();
-        for (network_id, mut switch) in taken {
-            let stopped = switch
+        for (network_id, mut installed) in taken {
+            // The edge first, and joined before the switch is touched: it is a
+            // port on that switch, and the order is the same one the boot loop
+            // uses in reverse.
+            if let Some(gateway) = installed.gateway.as_mut() {
+                let stopped = gateway
+                    .shutdown()
+                    .await
+                    .map_err(|error| conflict(format!("network `{network_id}` edge: {error}")))?;
+                receipt.edges.insert(network_id.clone(), stopped);
+            }
+            let stopped = installed
+                .switch
                 .shutdown()
                 .await
                 .map_err(|error| conflict(format!("network `{network_id}`: {error}")))?;

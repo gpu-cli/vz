@@ -33,6 +33,10 @@ use thiserror::Error;
 /// Domain separator for derived addresses, so this derivation can never collide
 /// with another use of the same identifiers under a different hash purpose.
 const ADDRESS_DERIVATION_DOMAIN: &[u8] = b"vz.environment.network.attachment.mac.v1\n";
+/// The edge's address is derived under its own domain rather than by passing a
+/// reserved Machine name into the attachment derivation, so no Machine
+/// identifier can ever be spelled in a way that collides with it.
+const GATEWAY_DERIVATION_DOMAIN: &[u8] = b"vz.environment.network.gateway.mac.v1\n";
 
 /// Destination, source and ethertype: the fixed part of an Ethernet II header.
 /// VLAN tags are not accepted, so this length is exact rather than a minimum.
@@ -120,6 +124,29 @@ impl MacAddress {
         // Length-prefixed, so no pair of identifiers can be re-split to produce
         // the same input and hand two attachments one address.
         for field in [environment_id, machine_id, network_id] {
+            hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 6];
+        bytes.copy_from_slice(&digest[..6]);
+        bytes[0] = (bytes[0] | 2) & 0xfe;
+        Self(bytes)
+    }
+}
+
+impl MacAddress {
+    /// The address the Environment's edge presents on one network.
+    ///
+    /// Derived for the same reasons an attachment's is, from the two
+    /// identifiers that outlive any Machine: the switch refuses a frame whose
+    /// source is not the address it assigned to the ingress port, and a
+    /// restarted edge has to present the address its peers' ARP caches and its
+    /// switch already hold.
+    pub fn derive_gateway(environment_id: &str, network_id: &str) -> Self {
+        let mut hasher = Sha256::new();
+        hasher.update(GATEWAY_DERIVATION_DOMAIN);
+        for field in [environment_id, network_id] {
             hasher.update(u64::try_from(field.len()).unwrap_or(u64::MAX).to_be_bytes());
             hasher.update(field.as_bytes());
         }

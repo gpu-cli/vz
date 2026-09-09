@@ -265,6 +265,7 @@ mod tests {
             ipv4: Ipv4Addr::new(10, 9, 0, last_octet),
             prefix: 24,
             gateway: None,
+            dns: None,
             mtu: 1500,
             hosts: Vec::new(),
         }

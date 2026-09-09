@@ -8,6 +8,7 @@ mod control_socket;
 pub mod environment_delete;
 #[cfg(target_os = "macos")]
 pub mod environment_fabric;
+pub mod environment_gateway;
 #[cfg(target_os = "macos")]
 pub mod environment_runtime_controller;
 #[cfg(target_os = "macos")]

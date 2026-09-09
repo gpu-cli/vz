@@ -51,6 +51,7 @@ CRITERION_1 = "gate.instances.three_concurrent_no_collision"
 CRITERION_16 = "gate.reproducibility.recreate_from_definition"
 CRITERION_11 = "gate.delete.single_environment_safety"
 CRITERION_5 = "gate.network.private_topology_paths"
+CRITERION_6 = "gate.network.public_like_ingress"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
 
 
@@ -380,7 +381,7 @@ class Lane:
                                   docker_client=self.options.get("docker", "none"),
                                   plugins={"compose": self.options.get("compose-plugin"),
                                            "buildx": self.options.get("buildx-plugin")})
-        subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: []}
+        subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: [], CRITERION_6: []}
         crash = None
         started = now_ns()
         try:
@@ -395,6 +396,7 @@ class Lane:
             subchecks[CRITERION_15].append(checks.check_grpc_agreement(CRITERION_15))
             subchecks[CRITERION_1].append(checks.check_three_concurrent_environments(ctx, CRITERION_1))
             subchecks[CRITERION_5].append(checks.check_private_topology_paths(ctx, CRITERION_5))
+            subchecks[CRITERION_6].append(checks.check_public_like_ingress(ctx, CRITERION_6))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())

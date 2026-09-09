@@ -23,7 +23,7 @@ use std::net::Ipv4Addr;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vz_runtime_contract::{
-    EndpointId, EnvironmentInstance, MachineId, MachineInstance, MachineProfile,
+    EndpointId, EndpointProtocol, EnvironmentInstance, MachineId, MachineInstance, MachineProfile,
     NetworkAttachmentId, NetworkId, NetworkKind, OperatingSystem,
 };
 
@@ -41,11 +41,11 @@ const HOST_DERIVATION_DOMAIN: &[u8] = b"vz.environment.network.attachment.host.v
 pub const FABRIC_MTU: u32 = 1500;
 
 /// Offset 0 is the subnet address and the last offset is its broadcast address;
-/// neither can be a host. Offset 1 is reserved and never assigned to a Machine:
-/// `NetworkKind::SimulatedPublic` is defined as this private fabric plus
-/// external egress, which will need a per-Environment gateway on the fabric,
-/// and a gateway that had to take an offset already assigned would move a
-/// Machine's address — exactly what deriving rather than leasing exists to
+/// neither can be a host. Offset 1 is the Environment's edge gateway and is
+/// never assigned to a Machine, on every network rather than only on the ones
+/// that have a gateway today: an offset that a `NetworkKind::SimulatedPublic`
+/// declaration could later claim from a Machine would move that Machine's
+/// address, which is exactly what deriving rather than leasing exists to
 /// prevent.
 const GATEWAY_OFFSET: u32 = 1;
 const FIRST_HOST_OFFSET: u32 = GATEWAY_OFFSET + 1;
@@ -73,9 +73,21 @@ const MAX_PREFIX: u8 = 30;
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FabricPlanError {
     #[error(
-        "network `{network}` is SimulatedPublic, which is this private fabric plus external egress; no egress path off an Environment fabric exists yet, so it cannot be applied"
+        "Machine `{machine}` is a native {os:?} Machine on public-like network `{network}`; the native guest-addressing channel installs the edge's default route but has no way to point the guest at the edge's resolver, so that Machine would hold a port on a network whose names it could never resolve"
     )]
-    EgressNotImplemented { network: String },
+    UnresolvedPublicMachine {
+        machine: String,
+        os: OperatingSystem,
+        network: String,
+    },
+    #[error(
+        "endpoint `{endpoint}` is on public-like network `{network}` with protocol {protocol:?}; the Environment edge terminates `https` ingress only, so this endpoint has no edge listener to be published behind"
+    )]
+    UnservedPublicEndpoint {
+        endpoint: String,
+        network: String,
+        protocol: EndpointProtocol,
+    },
     #[error("network `{network}` declares cidr `{cidr}`: {reason}")]
     InvalidCidr {
         network: String,
@@ -241,10 +253,35 @@ pub struct FabricEndpoint {
     pub endpoint_id: EndpointId,
     /// The name this endpoint answers to, already defaulted.
     pub name: String,
+    /// The address this name answers with inside the Environment.
+    ///
+    /// On a private network that is `origin`: the name is the Machine. On a
+    /// public-like network it is the edge gateway instead, and that difference
+    /// is the whole difference between the two kinds. A client that resolved
+    /// the name to the Machine would connect to the Machine, and every clause
+    /// criterion 6 asks for — TLS termination, routed ingress, the firewall,
+    /// the address translation — happens at the edge or not at all.
+    /// Publishing the edge address is therefore not a detail of the answer; it
+    /// is what makes the answer the edge's.
+    pub address: Ipv4Addr,
     /// The fabric address of the Machine that owns the endpoint, taken from
     /// that Machine's port on this same network rather than derived a second
     /// time — one derivation, so a name cannot resolve to an address the switch
     /// does not actually forward to.
+    pub origin: Ipv4Addr,
+    /// The port on `origin` that serves this endpoint.
+    pub port: u16,
+    pub protocol: EndpointProtocol,
+}
+
+/// The Environment's edge on one public-like network: a switch port the daemon
+/// keeps rather than one it attaches to a Machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FabricGateway {
+    pub port: PortId,
+    pub mac: MacAddress,
+    /// Always `GATEWAY_OFFSET` within the network's range, on every network,
+    /// so a network that gains an edge never moves a Machine.
     pub address: Ipv4Addr,
 }
 
@@ -255,6 +292,15 @@ pub struct NetworkPlan {
     pub network_id: NetworkId,
     pub name: String,
     pub cidr: Ipv4Cidr,
+    /// The Environment's edge on this network, present exactly on the networks
+    /// declared `simulated_public`.
+    ///
+    /// It is a port on the same switch as every Machine and holds no other
+    /// privilege: the daemon keeps this port's guest end and runs a stack on it
+    /// instead of attaching it to a VM. That is what makes the edge
+    /// per-Environment rather than shared — it sits inside one Environment's
+    /// fabric, which nothing outside that fabric can send a frame into.
+    pub gateway: Option<FabricGateway>,
     pub ports: Vec<FabricPort>,
     /// The endpoints declared on this network, in resolved-name order.
     ///
@@ -269,15 +315,34 @@ pub struct NetworkPlan {
 
 impl NetworkPlan {
     /// The membership `NetworkSwitch::start` is constructed with.
+    ///
+    /// The edge is a member like any other. It is listed last so a Machine's
+    /// port number does not move when a network gains or loses one.
     pub fn members(&self) -> Vec<(PortId, MacAddress)> {
         self.ports
             .iter()
             .map(|port| (port.port, port.mac))
+            .chain(
+                self.gateway
+                    .iter()
+                    .map(|gateway| (gateway.port, gateway.mac)),
+            )
             .collect()
     }
 
-    /// The `name -> address` pairs a Machine on this network resolves.
+    /// The `name -> address` pairs a Machine on this network resolves from the
+    /// static table it is booted with.
+    ///
+    /// Empty on a public-like network, and deliberately so. Criterion 6 asks
+    /// for a name resolved by environment-local split DNS; a name already in
+    /// `/etc/hosts` is resolved by the file and the resolver is never asked, so
+    /// publishing both would leave the DNS clause unexercised while looking
+    /// exactly like success. On such a network the edge answers the name or
+    /// nothing does.
     pub fn hosts(&self) -> Vec<(String, Ipv4Addr)> {
+        if self.gateway.is_some() {
+            return Vec::new();
+        }
         self.endpoints
             .iter()
             .map(|endpoint| (endpoint.name.clone(), endpoint.address))
@@ -315,14 +380,6 @@ pub fn plan_environment_fabric(
 ) -> Result<FabricPlan, FabricPlanError> {
     let mut networks: Vec<_> = environment.networks.iter().collect();
     networks.sort_by(|left, right| left.network_id.as_str().cmp(right.network_id.as_str()));
-    for network in &networks {
-        if network.kind == NetworkKind::SimulatedPublic {
-            return Err(FabricPlanError::EgressNotImplemented {
-                network: network.name.clone(),
-            });
-        }
-    }
-
     let machines: BTreeMap<&str, &MachineInstance> = environment
         .machines
         .iter()
@@ -433,10 +490,45 @@ pub fn plan_environment_fabric(
                 address: cidr.address_at(offset),
             });
         }
+        // A public-like network's names are answered by its edge and by nothing
+        // else: `NetworkPlan::hosts` publishes no static entry for them, so a
+        // Machine that cannot be pointed at the resolver cannot resolve them at
+        // all. The Linux path carries the resolver on the kernel cmdline;
+        // `native_macos::fabric` applies an address and a route over the agent
+        // channel and has no resolver step, so such a Machine is refused here
+        // rather than started holding a port on a network whose names it would
+        // silently never see.
+        if network.kind == NetworkKind::SimulatedPublic {
+            for port in &ports {
+                let Some(machine) = machines.get(port.machine_id.as_str()) else {
+                    continue;
+                };
+                if machine.target.os != OperatingSystem::Linux {
+                    return Err(FabricPlanError::UnresolvedPublicMachine {
+                        machine: machine.name.clone(),
+                        os: machine.target.os,
+                        network: network.name.clone(),
+                    });
+                }
+            }
+        }
+        // The edge's port number comes after every Machine's, so a network
+        // that gains or loses an edge does not renumber a Machine's port, and
+        // its address is `GATEWAY_OFFSET`, which `assign_host_offset` never
+        // hands out on any network whether or not that network has an edge.
+        let gateway = (network.kind == NetworkKind::SimulatedPublic).then(|| FabricGateway {
+            port: PortId(u32::try_from(ports.len()).unwrap_or(u32::MAX)),
+            mac: MacAddress::derive_gateway(
+                environment.environment_id.as_str(),
+                network.network_id.as_str(),
+            ),
+            address: cidr.address_at(GATEWAY_OFFSET),
+        });
         planned.push(NetworkPlan {
             network_id: network.network_id.clone(),
             name: network.name.clone(),
             cidr,
+            gateway,
             ports,
             endpoints: Vec::new(),
         });
@@ -506,10 +598,33 @@ fn resolve_endpoints(
                 endpoint: endpoint.name.clone(),
                 network: network.name.clone(),
             })?;
+        // On a public-like network the name is the edge's, not the Machine's.
+        // The edge only terminates `https`, so an endpoint declared with any
+        // other protocol there is refused rather than published behind a
+        // listener that does not exist: resolving it to the edge address would
+        // hand a client a connection that nothing accepts, and resolving it to
+        // the Machine would silently make the declared public path a private
+        // one.
+        let address = match &network.gateway {
+            Some(gateway) => {
+                if endpoint.protocol != EndpointProtocol::Https {
+                    return Err(FabricPlanError::UnservedPublicEndpoint {
+                        endpoint: endpoint.name.clone(),
+                        network: network.name.clone(),
+                        protocol: endpoint.protocol,
+                    });
+                }
+                gateway.address
+            }
+            None => port.address,
+        };
         resolved.entry(index).or_default().push(FabricEndpoint {
             endpoint_id: endpoint.endpoint_id.clone(),
             name: name.to_string(),
-            address: port.address,
+            address,
+            origin: port.address,
+            port: endpoint.port,
+            protocol: endpoint.protocol,
         });
     }
 

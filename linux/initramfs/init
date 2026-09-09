@@ -311,6 +311,55 @@ write_fabric_hosts "" >/dev/console 2>&1 || \
   echo "[vz-init] warning: could not write endpoint names into /etc/hosts" >/dev/console 2>&1
 # --- END vz.host endpoint names ---
 
+# --- BEGIN vz.dns resolver (extracted verbatim by vz-linux tests) ---
+# Point this Machine at its Environment's own resolver.
+#
+# Each `vz.dns.{N}={ipv4}` names the edge of a public-like network this Machine
+# holds a port on. Unlike the names above, these are not resolved on the host
+# and written down here: a public-like name answers with the edge's address and
+# is answered by the edge, which is what makes it an ingress path rather than a
+# direct route to the Machine behind it.
+#
+# The image's resolv.conf is replaced, not added to. The Environment's resolver
+# is authoritative for the Environment's names and answers nothing else, and a
+# public resolver left beside it would be asked for an Environment name the
+# moment the first query came back unanswered -- which is exactly the split the
+# declaration asked not to have. A Machine with no `vz.dns` argument keeps
+# whatever resolv.conf its image shipped.
+#
+# `$1` is a root *prefix*, exactly as for the hosts table above, and for the
+# same reason: which root the Machine ends up running in is decided later.
+write_fabric_resolver() {
+  wfr_root="$1"
+  wfr_written=0
+  for wfr_param in $(/bin/busybox cat /proc/cmdline); do
+    case "$wfr_param" in
+      vz.dns.*=*)
+        wfr_value="${wfr_param#*=}"
+        # An empty value would write a nameserver line naming nothing, which
+        # resolves nothing and hides the fact that the argument was malformed.
+        if [ -z "$wfr_value" ]; then
+          echo "[vz-init] ignoring malformed $wfr_param"
+          continue
+        fi
+        if [ "$wfr_written" = 0 ]; then
+          : > "$wfr_root/etc/resolv.conf" || return 1
+          wfr_written=1
+        fi
+        echo "nameserver $wfr_value" >> "$wfr_root/etc/resolv.conf" || return 1
+        ;;
+    esac
+  done
+  if [ "$wfr_written" = 1 ]; then
+    echo "[vz-init] Environment resolver written to $wfr_root/etc/resolv.conf"
+  fi
+  return 0
+}
+
+write_fabric_resolver "" >/dev/console 2>&1 || \
+  echo "[vz-init] warning: could not write the Environment resolver into /etc/resolv.conf" >/dev/console 2>&1
+# --- END vz.dns resolver ---
+
 switch_root_into_overlay_rootfs() {
   echo "[vz-init] preparing overlay rootfs"
 
@@ -364,6 +413,8 @@ switch_root_into_overlay_rootfs() {
   # above makes and works for the same reason — this is a plain write into the
   # overlay's upperdir from the mount namespace that then chroots, with no
   # VirtioFS layer and no pivot_root between the write and the reader.
+  write_fabric_resolver "$ROOTFS" || \
+    echo "[vz-init] warning: could not write the Environment resolver into $ROOTFS/etc/resolv.conf"
   write_fabric_hosts "$ROOTFS" || \
     echo "[vz-init] warning: could not write endpoint names into $ROOTFS/etc/hosts"
 

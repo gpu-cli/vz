@@ -421,30 +421,53 @@ async fn a_running_fabric_for_different_networks_is_refused_rather_than_re_membe
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_simulated_public_definition_starts_no_switch_at_all() {
-    // SimulatedPublic is this fabric plus external egress. Starting the private
-    // half would attach Machines to a network that silently lacks the
-    // reachability its definition asked for.
+async fn a_simulated_public_definition_starts_a_switch_and_an_edge_on_it() {
+    // The switch is the same switch. What a public-like declaration adds is a
+    // port the daemon keeps, and a route and resolver the Machines are booted
+    // pointing at.
     let (_root, daemon, lease) = fixture().await;
-    assert!(matches!(
-        daemon
-            .install_environment_fabric(
-                &lease,
-                &environment(NETWORK, NetworkKind::SimulatedPublic),
-                &nobody(),
-            )
-            .await,
-        Err(EnvironmentFabricError::Plan(
-            crate::environment_switch::plan::FabricPlanError::EgressNotImplemented { .. }
-        ))
-    ));
-    assert!(
+    let environment = environment(NETWORK, NetworkKind::SimulatedPublic);
+    let minted = daemon
+        .install_environment_fabric(&lease, &environment, &nobody())
+        .await
+        .expect("a public-like network is applied");
+    assert_eq!(
         daemon
             .environment_switches()
             .networks(&environment_id())
-            .await
-            .is_empty()
+            .await,
+        vec![NETWORK.to_string()]
     );
+    let plan =
+        crate::environment_switch::plan::plan_environment_fabric(&environment).expect("plan");
+    let edge = plan.networks[0]
+        .gateway
+        .as_ref()
+        .expect("a public-like network has an edge")
+        .address;
+    assert!(!minted.is_empty());
+    for attachments in minted.values() {
+        for attachment in attachments {
+            // A Machine on a public-like network is booted knowing where its
+            // route leads and who answers its names, and both are the edge that
+            // is already running by the time this descriptor exists.
+            assert_eq!(attachment.declaration().gateway, Some(edge));
+            assert_eq!(attachment.declaration().dns, Some(edge));
+        }
+    }
+    // Stopping the Environment joins the edge with its switch and reports what
+    // the edge decided, which is the only record of a frame it refused.
+    let owner = ResourceOwner {
+        project_id: ProjectId::new(PROJECT.to_string()).unwrap(),
+        environment_id: environment_id(),
+        machine_id: None,
+    };
+    let receipt = daemon
+        .environment_switches()
+        .stop(&lease, &owner)
+        .await
+        .expect("stopped");
+    assert!(receipt.edges.contains_key(NETWORK), "{:?}", receipt.edges);
 }
 
 #[tokio::test(flavor = "multi_thread")]

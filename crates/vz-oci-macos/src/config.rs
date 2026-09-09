@@ -210,6 +210,15 @@ pub struct DeclaredAttachment {
     /// The fabric gateway, when this network has one. `None` for a purely
     /// private fabric, which has no route off itself to describe.
     pub gateway: Option<Ipv4Addr>,
+    /// The resolver this port's names are answered by, when the network has an
+    /// edge. `None` on a private network, whose names travel as a static table
+    /// instead.
+    ///
+    /// It is a separate field from `gateway` rather than the same address read
+    /// twice, because they are separate claims: one says where a route leads
+    /// and the other says who answers a name, and a network could later have
+    /// either without the other.
+    pub dns: Option<Ipv4Addr>,
     /// The MTU the attachment was sized for.
     pub mtu: u32,
     /// Every declared endpoint name reachable through this port, and the fabric
@@ -252,6 +261,13 @@ impl DeclaredAttachment {
     /// `index` only keeps one Machine's arguments distinct from each other. It
     /// is deliberately not an interface selector: the guest matches on `mac`,
     /// never on this index and never on an interface name.
+    /// The resolver argument this attachment contributes, if it has one:
+    /// `vz.dns.{index}={ipv4}`.
+    pub fn resolver_argument(&self, index: usize) -> Option<String> {
+        self.dns
+            .map(|resolver| format!("vz.dns.{index}={resolver}"))
+    }
+
     pub fn kernel_argument(&self, index: usize) -> String {
         // Lowercased here rather than trusted from the caller, because the
         // guest compares this against sysfs, which the kernel always renders
@@ -289,7 +305,15 @@ pub(crate) fn fabric_cmdline_suffix(attachments: &[DeclaredAttachment]) -> Strin
         .enumerate()
         .map(|(index, host)| format!(" vz.host.{index}={},{}", host.address, host.name))
         .collect();
-    format!("{ports}{hosts}")
+    // Resolvers are numbered across the Machine for the same reason names are:
+    // the guest writes one `/etc/resolv.conf`, not one per NIC.
+    let resolvers: String = attachments
+        .iter()
+        .enumerate()
+        .filter_map(|(index, declaration)| declaration.resolver_argument(index))
+        .map(|argument| format!(" {argument}"))
+        .collect();
+    format!("{ports}{hosts}{resolvers}")
 }
 
 /// Prefix lengths a port may be declared with. A `/0` port claims every address
