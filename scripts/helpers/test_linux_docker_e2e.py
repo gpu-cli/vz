@@ -2,6 +2,7 @@
 import contextlib
 import copy
 import io
+import itertools
 import json
 import os
 from pathlib import Path
@@ -818,9 +819,13 @@ class BuildDispatchTests(unittest.TestCase):
                      'platform': 'linux/arm64', 'extra_registry_metadata': 'not passed as image identity'}
         harness.info = {"suite": suite, "public_ca": {"bundle_sha256": "a" * 64}, 'python_image': image_pin}
         harness.drivers, harness.driver_cleanup_verified = [], []
-        harness.record = types.SimpleNamespace(receipts=[], pending_interactions=[])
+        harness.record = types.SimpleNamespace(receipts=[], pending_interactions=[], canaries=[])
+        harness.slice_records = []
+        harness.env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
         harness.effects_uncertain = False
-        harness.cli, harness.evidence = Path("/owned/bin/vz"), Path("/owned/evidence")
+        evidence = tempfile.TemporaryDirectory()
+        self.addCleanup(evidence.cleanup)
+        harness.cli, harness.evidence = Path("/owned/bin/vz"), Path(evidence.name)
         contexts = [{"name": "context-" + str(i), "endpoint": "endpoint-" + str(i),
                      "engine_id": "engine-" + str(i), "config_dir": "/owned/machine-config-" + str(i)} for i in range(4)]
         environments = [{"environment_id": "env-" + str(i), "machines": [
@@ -859,8 +864,17 @@ class BuildDispatchTests(unittest.TestCase):
         monitor.thread.is_alive.return_value = False
         monitor.summary.return_value = {"samples": "observed"}
         observations = [{"operation": i} for i in range(3)]
+        # A parallel suite's slices must genuinely be in flight together. The
+        # barrier is the assertion: a slice reaches it only after the other two
+        # have started, so an implementation that dispatched the Machines one
+        # after another never releases it and this test fails on the timeout
+        # rather than passing on a claim.
+        parallel = suite in gate.PARALLEL_SUITES
+        barrier = threading.Barrier(3, timeout=20) if parallel else None
         def selected_machine(*args):
             index = args[-1]
+            if barrier is not None:
+                barrier.wait()
             if suite == 'images':
                 harness.drivers.append(types.SimpleNamespace(record=types.SimpleNamespace(
                     receipts=[{'effects_uncertain': False}], pending_interactions=[])))
@@ -874,7 +888,7 @@ class BuildDispatchTests(unittest.TestCase):
                 patch.object(gate.startup, "exact_developer_topology"), \
                 patch.object(gate.startup, "document"), \
                 patch.object(gate, "authenticated_proof", return_value=({"scope": "exact"}, {"proof": "exact"})), \
-                patch.object(gate.time, "time_ns", side_effect=range(10, 16)), \
+                patch.object(gate.time, "time_ns", side_effect=itertools.count(10)), \
                 patch.object(gate.driver, "Driver") as selected:
             if fail_at is None:
                 result = harness.scenario()
@@ -882,7 +896,11 @@ class BuildDispatchTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, 'image Machine replay failed'):
                     harness.scenario()
         if fail_at is None:
-            self.assertEqual(result["machine_slices"], observations)
+            self.assertCountEqual(result["machine_slices"], observations)
+            scheduling = result["suite_concurrency"][suite]
+            self.assertEqual(scheduling["execution"],
+                             "concurrent" if suite in gate.PARALLEL_SUITES else "serial")
+            self.assertEqual([row["index"] for row in scheduling["slices"]], [0, 1, 2])
         else:
             self.assertEqual(harness.driver_cleanup_verified, [True] * fail_at + [False])
             with self.assertRaisesRegex(ValueError, 'cleanup lacks successful independent replay'):
@@ -903,16 +921,29 @@ class BuildDispatchTests(unittest.TestCase):
         else:
             expected_images = {'exact': 'images'}
         self.assertEqual(harness.sentinel.call_args_list, [unittest.mock.call(context) for context in contexts])
-        self.assertEqual(module.run_machine.call_args_list, [unittest.mock.call(
-            harness, contexts[i], {"scope": "exact"}, {"proof": "exact"}, expected_images, i)
-            for i in range(3 if fail_at is None else fail_at + 1)])
-        self.assertEqual(monitor.check_interval.call_args_list, [unittest.mock.call(
-            10+2*i, 11+2*i, contexts[i]["name"]) for i in range(3 if fail_at is None else fail_at)])
         dispatched = 3 if fail_at is None else fail_at + 1
-        self.assertEqual(exclusions, [edge for i in range(dispatched)
-                                      for edge in (("enter", contexts[i]["name"]),
-                                                   ("exit", contexts[i]["name"]))],
-                         "each Machine is unobserved for its own workload and no longer")
+        expected_dispatch = [unittest.mock.call(harness, contexts[i], {"scope": "exact"}, {"proof": "exact"},
+                                                expected_images, i) for i in range(dispatched)]
+        names = [context["name"] for context in contexts[:3]]
+        if suite in gate.PARALLEL_SUITES:
+            # Concurrent slices are dispatched in no particular order and
+            # nothing is excluded: every Machine in the window keeps being
+            # sampled, so each slice's interval is witnessed by all the others.
+            self.assertCountEqual(module.run_machine.call_args_list, expected_dispatch)
+            self.assertEqual(exclusions, [], "a concurrent window excludes no Machine from sampling")
+            self.assertCountEqual([call.args[2] for call in monitor.check_interval.call_args_list],
+                                  names[:dispatched])
+        else:
+            self.assertEqual(module.run_machine.call_args_list, expected_dispatch)
+            # A serial slice asserts liveness over every Machine but its own.
+            self.assertEqual([call.args[2] for call in monitor.check_interval.call_args_list],
+                             [contexts[i]["name"] for i in range(3 if fail_at is None else fail_at)])
+            self.assertEqual(exclusions, [edge for i in range(dispatched)
+                                          for edge in (("enter", contexts[i]["name"]),
+                                                       ("exit", contexts[i]["name"]))],
+                             "each Machine is unobserved for its own workload and no longer")
+        for call in monitor.check_interval.call_args_list:
+            self.assertLess(call.args[0], call.args[1])
         monitor.start.assert_called_once_with()
         monitor.stop.assert_called_once_with()
         harness.driver_inputs.assert_not_called()
@@ -1041,6 +1072,251 @@ class BuildDispatchTests(unittest.TestCase):
         self.assertEqual(harness.docker.call_count, 2)
         harness.mutate.assert_called_once_with("python-pull", descriptor,
             ["pull", "--platform", "linux/arm64", pin["reference"]], timeout=300)
+
+
+class ParallelSliceTests(unittest.TestCase):
+    """Concurrent per-Machine slices: isolation, ordering and observability.
+
+    These are scheduling assertions. Every one of them would still pass under
+    serial execution if it only checked results, so each holds a barrier the
+    slices must meet: a run that dispatched the Machines one after another never
+    releases it, and the test fails on the barrier rather than on the claim.
+    """
+    def harness(self, count=3):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        evidence = tempfile.TemporaryDirectory()
+        self.addCleanup(evidence.cleanup)
+        harness.evidence = Path(evidence.name)
+        harness.env = {"PATH": "/usr/bin:/bin", "LC_ALL": "C"}
+        harness.record = types.SimpleNamespace(receipts=[], canaries=["run-canary"])
+        harness.slice_records = []
+        harness.prepared_images = {}
+        harness.info = {"suite": "ssh"}
+        harness.prepare_image = Mock(side_effect=lambda descriptor: {"compose": descriptor["name"]})
+        self.exclusions = []
+        monitor = types.SimpleNamespace(check=Mock(), excluded=frozenset())
+        def excluding(*names):
+            self.exclusions.append(("enter",) + names)
+            try:
+                yield
+            finally:
+                self.exclusions.append(("exit",) + names)
+        monitor.excluding = contextlib.contextmanager(excluding)
+        harness.monitor = monitor
+        machines = [(None, {"machine_id": "mch_" + str(i),
+                            "docker_context": {"name": "context-" + str(i),
+                                               "owner": {"machine_id": "mch_" + str(i)}}})
+                    for i in range(count)]
+        bindings = {"mch_" + str(i): ({"machine_id": "mch_" + str(i)}, {"proof": i}) for i in range(count)}
+        return harness, machines, bindings
+
+    def test_slices_overlap_and_each_records_into_its_own_recorder(self):
+        harness, machines, bindings = self.harness()
+        barrier = threading.Barrier(len(machines), timeout=20)
+        seen = {}
+        def slice_body(suite, index, machine, _bindings, *, own_exclusion):
+            # Nothing is excluded: a busy Machine still witnesses its siblings.
+            self.assertFalse(own_exclusion, "a concurrent slice excludes no Machine from sampling")
+            seen[index] = (harness.record, threading.current_thread().name)
+            # Released only once every Machine has reached it.
+            barrier.wait()
+            return {"slice": index}
+        harness.run_machine_slice = slice_body
+        observations = harness.run_concurrent_slices("ssh", machines, bindings)
+        self.assertEqual(observations, [{"slice": 0}, {"slice": 1}, {"slice": 2}])
+        recorders = [seen[i][0] for i in range(3)]
+        self.assertEqual(len({id(item) for item in recorders}), 3, "each slice needs a Recorder of its own")
+        self.assertNotIn(id(harness.shared_record), {id(item) for item in recorders})
+        self.assertEqual(harness.slice_records, recorders)
+        for index, item in enumerate(recorders):
+            # Numbering a receipt by list length is exactly what makes a shared
+            # Recorder unsafe, so each slice records into a directory of its own.
+            self.assertEqual(item.root, harness.evidence / ("ssh-machine-" + str(index) + "-commands"))
+            # One canary list run-wide: a secret one slice admits stays refused
+            # by every command of every other slice and of the rest of the run.
+            self.assertIs(item.canaries, harness.shared_record.canaries)
+        self.assertEqual(len({name for _, name in seen.values()}), 3)
+        self.assertIs(harness.record, harness.shared_record, "the parent thread keeps the run's Recorder")
+        self.assertEqual(self.exclusions, [], "every Machine stays observed for the whole window")
+        record = harness.slice_concurrency_records["ssh"]
+        self.assertEqual(record["execution"], "concurrent")
+        self.assertTrue(record["observed_concurrent"])
+        self.assertGreater(record["min_pairwise_overlap_ns"], 0)
+        self.assertEqual([row["index"] for row in record["slices"]], [0, 1, 2])
+        self.assertEqual([row["failed"] for row in record["slices"]], [False] * 3)
+        self.assertLess(record["wall_ns"], record["summed_slice_ns"], "a serialised window cannot beat its own sum")
+
+    def test_owned_image_preparation_precedes_every_thread(self):
+        """The mutation fence is run-wide, so warming images inside the threads
+        would only make them queue; it happens once, in Machine order, first."""
+        harness, machines, bindings = self.harness()
+        barrier = threading.Barrier(len(machines), timeout=20)
+        def slice_body(suite, index, machine, _bindings, *, own_exclusion):
+            self.assertEqual(harness.prepare_image.call_count, 3, "images are warmed before any slice starts")
+            barrier.wait()
+            return {"slice": index}
+        harness.run_machine_slice = slice_body
+        harness.run_concurrent_slices("ssh", machines, bindings)
+        self.assertEqual([call.args[0]["name"] for call in harness.prepare_image.call_args_list],
+                         ["context-0", "context-1", "context-2"])
+
+    def test_a_failing_slice_joins_its_siblings_before_the_lowest_machine_raises(self):
+        harness, machines, bindings = self.harness()
+        barrier = threading.Barrier(len(machines), timeout=20)
+        failures = {0: ValueError("machine-0 failed"), 2: ValueError("machine-2 failed")}
+        finished = []
+        def slice_body(suite, index, machine, _bindings, *, own_exclusion):
+            barrier.wait()
+            finished.append(index)
+            if index in failures:
+                raise failures[index]
+            return {"slice": index}
+        harness.run_machine_slice = slice_body
+        with self.assertRaises(ValueError) as caught:
+            harness.run_concurrent_slices("ssh", machines, bindings)
+        self.assertIs(caught.exception, failures[0], "the lowest-numbered Machine's failure is the run's failure")
+        self.assertCountEqual(finished, [0, 1, 2], "every dispatched slice is joined, not abandoned")
+        record = harness.slice_concurrency_records["ssh"]
+        self.assertEqual([row["failed"] for row in record["slices"]], [True, False, True])
+        self.assertTrue((harness.evidence / "ssh-machine-concurrency.json").exists())
+        self.assertIs(harness.record, harness.shared_record)
+
+    def test_a_window_that_silently_serialised_is_rejected(self):
+        """The recorded overlap is the check, not the intent to parallelise."""
+        harness, _machines, _bindings = self.harness()
+        rows = [{"index": i, "context": "context-" + str(i), "thread": "t", "started_unix_ns": 100 * i,
+                 "ended_unix_ns": 100 * i + 50, "failed": False} for i in range(3)]
+        with self.assertRaisesRegex(ValueError, "did not overlap"):
+            harness.slice_concurrency("ssh", rows, 0, 300, execution="concurrent")
+        # Written before it is judged: a serialised window's evidence is exactly
+        # what a reader needs to see.
+        document = json.loads((harness.evidence / "ssh-machine-concurrency.json").read_text())
+        self.assertEqual(document["execution"], "concurrent")
+        self.assertFalse(document["observed_concurrent"])
+        # The same rows are an ordinary serial window, which claims nothing.
+        self.assertFalse(harness.slice_concurrency("build", rows, 0, 300, execution="serial")["observed_concurrent"])
+
+    def test_a_failed_window_records_without_demanding_overlap(self):
+        harness, _machines, _bindings = self.harness()
+        rows = [{"index": i, "context": "context-" + str(i), "thread": "t", "started_unix_ns": 100 * i,
+                 "ended_unix_ns": 100 * i + 50, "failed": i == 1} for i in range(3)]
+        self.assertFalse(harness.slice_concurrency("ssh", rows, 0, 300, execution="concurrent")["observed_concurrent"])
+
+    def test_register_driver_reserves_one_slot_per_driver_under_concurrency(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.drivers, harness.driver_cleanup_verified = [], []
+        writers, each = 8, 3
+        barrier, errors = threading.Barrier(writers, timeout=20), []
+        claimed = []
+        def register(start):
+            try:
+                barrier.wait()
+                for offset in range(each):
+                    item = ("driver", start, offset)
+                    claimed.append((harness.register_driver(item), item))
+            except BaseException as error:
+                errors.append(error)
+        threads = [threading.Thread(target=register, args=(index,)) for index in range(writers)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(sorted(position for position, _ in claimed), list(range(writers * each)),
+                         "positions must be unique and dense")
+        self.assertEqual(len(harness.drivers), len(harness.driver_cleanup_verified))
+        for position, item in claimed:
+            self.assertIs(harness.drivers[position], item, "a reserved position must name its own Driver")
+        self.assertEqual(harness.driver_cleanup_verified, [False] * (writers * each))
+
+    def test_the_named_fences_are_created_once_however_many_threads_race(self):
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        barrier, seen, lock = threading.Barrier(8, timeout=20), [], threading.Lock()
+        def take():
+            barrier.wait()
+            with lock:
+                seen.append(harness.fence("mutation_lock"))
+        threads = [threading.Thread(target=take) for _ in range(8)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+        self.assertEqual(len({id(item) for item in seen}), 1)
+        self.assertIsNot(harness.fence("slice_lock"), harness.fence("mutation_lock"))
+        with self.assertRaisesRegex(ValueError, "unknown harness fence"):
+            harness.fence("registry_lock")
+
+    def test_one_mutation_at_a_time_run_wide_even_across_machines(self):
+        """`effects_uncertain` is one fence over every Machine, so concurrent
+        slices take it in turn rather than each keeping their own."""
+        harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
+        harness.effects_uncertain, harness.mutations = False, []
+        harness.evidence = Path("/owned/evidence")
+        harness.record = types.SimpleNamespace(receipts=[])
+        overlapping, active, lock = [], [], threading.Lock()
+        started = threading.Barrier(4, timeout=20)
+        def docker(label, descriptor, args, **kwargs):
+            with lock:
+                active.append(label)
+                overlapping.append(len(active))
+            gate.time.sleep(0.01)
+            with lock:
+                active.remove(label)
+            return (b"", b"", 0)
+        harness.docker = docker
+        errors = []
+        def mutating(index):
+            try:
+                started.wait()
+                harness.mutate("owned-" + str(index), {"name": "context", "owner": {}}, ["image", "rm"])
+            except BaseException as error:
+                errors.append(error)
+        with patch.object(gate.startup, "document"):
+            threads = [threading.Thread(target=mutating, args=(index,)) for index in range(4)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+        self.assertEqual(errors, [])
+        self.assertEqual(overlapping, [1, 1, 1, 1], "two owned mutations must never be in flight together")
+        self.assertEqual(sorted(row["index"] for row in harness.mutations), [1, 2, 3, 4],
+                         "mutation sequence numbers name retained documents and must stay unique")
+        self.assertFalse(harness.effects_uncertain)
+
+
+class LivenessWitnessTests(unittest.TestCase):
+    def monitor(self, names):
+        monitor = object.__new__(gate.SentinelMonitor)
+        monitor.rows = [{"descriptor": {"name": name}} for name in names]
+        monitor.samples, monitor.errors = [], []
+        monitor.finished = threading.Event()
+        monitor.thread = types.SimpleNamespace(is_alive=lambda: True)
+        return monitor
+
+    def test_one_busy_machine_is_witnessed_by_all_the_others(self):
+        self.assertEqual(self.monitor(["a", "b", "c", "d"]).observers("a"), {"b", "c", "d"})
+
+    def test_a_concurrently_busy_sibling_is_still_a_witness(self):
+        """The point of excluding nothing during a concurrent window: `b` and
+        `c` are under workload beside `a`, and they still have to be observed
+        live inside `a`'s interval. A parallelised suite's liveness claim is
+        exactly the serial suite's, not a reduced one over untouched Machines."""
+        monitor = self.monitor(["a", "b", "c", "d"])
+        self.assertEqual(monitor.observers("a"), {"b", "c", "d"})
+        monitor.samples = [{"context": name, "unix_ns": 15} for name in ("b", "c", "d")]
+        self.assertGreaterEqual(monitor.close_interval(10, "a", deadline_seconds=0.2), 15)
+        monitor.check_interval(10, 20, "a")
+        # Drop the busy sibling's observation and the same interval fails: it is
+        # required evidence, not a nicety the concurrent path may skip.
+        monitor.samples = [{"context": name, "unix_ns": 15} for name in ("c", "d")]
+        with self.assertRaises(ValueError):
+            monitor.check_interval(10, 20, "a")
+        with self.assertRaises(ValueError):
+            monitor.close_interval(10, "a", deadline_seconds=0.2)
+
+    def test_an_interval_with_no_unobserved_machine_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "no unobserved Machine"):
+            self.monitor(["a"]).observers("a")
 
 
 class UncertaintyTests(unittest.TestCase):

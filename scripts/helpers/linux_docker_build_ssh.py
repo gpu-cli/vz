@@ -211,9 +211,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
         server_context = stage_context(fixture, source, contexts / "server")
         server = Server(admitted, Path(harness.info["fixture"]), root / "server",
                         Path(server_context["path"]), agent, "vzssh-" + uuid.uuid4().hex[:24])
-        indices.append(len(harness.drivers))
-        harness.drivers.append(server.driver)
-        harness.driver_cleanup_verified.append(False)
+        indices.append(harness.register_driver(server.driver))
         request = public_request(server.prepare())
         require(request["host_key_fingerprint"] == ready["fingerprints"]["host"], "server adopted another host key")
         for case in CASES:
@@ -227,9 +225,7 @@ def run_machine(harness, descriptor, scope, proof, images, index):
             operation = specification(case, root / case, inputs, staged["path"], request,
                                       None if case == "provider_omitted" else agent.paths["socket"], fixture=fixture)
             item = SSHDriver(admitted, Path(harness.info["fixture"]), root / case, canaries=canaries)
-            indices.append(len(harness.drivers))
-            harness.drivers.append(item)
-            harness.driver_cleanup_verified.append(False)
+            indices.append(harness.register_driver(item))
             selected.append(item)
             results.append(item.execute(operation))
             server.verify()

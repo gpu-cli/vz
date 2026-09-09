@@ -278,6 +278,7 @@ class Command:
     timed_out: bool = False
     build_binding: dict[str, Any] | None = None
     build_engine_ns: int | None = None
+    build_host_interval: tuple[int, int] | None = None
 
 
 class OutputLimitExceeded(Rejected):
@@ -599,6 +600,25 @@ class Recorder:
             raise pending_error
         require(not leaked, "secret canary appeared in command output; bytes withheld")
         return Command(index, argv, code, stdout, stderr, timed_out)
+
+    def host_interval(self, command: Command) -> tuple[int, int]:
+        """One command's own bounds on the client clock.
+
+        Pinned Buildx rebases every Vertex/Status/Log timestamp onto the
+        client's clock before the rawjson printer sees it (progress.ResetTime
+        anchors the first vertex to the client's `time.Now()` and shifts the
+        rest by that one offset), so a payload graph's timestamps can only be
+        ordered against other client-clock observations. The Engine's
+        `SystemTime` is the guest's clock and a wholly separate timebase; this
+        is the clock a solve is placed on, and `linux_docker_ssh_evidence` and
+        `linux_docker_parallel_evidence` bound their progress frames the same
+        way for the same reason.
+        """
+        receipt = self.receipts[command.index - 1]
+        require(receipt["index"] == command.index and type(receipt.get("started_unix_ns")) is int and
+                type(receipt.get("elapsed_ns")) is int and receipt["started_unix_ns"] > 0 and
+                receipt["elapsed_ns"] >= 0, "command client-clock interval unavailable")
+        return receipt["started_unix_ns"], receipt["started_unix_ns"] + receipt["elapsed_ns"]
 
     def acknowledge_negative(self, command: Command, assertion: str) -> None:
         """Clear failed mutation uncertainty only after its semantic proof."""
@@ -1315,9 +1335,22 @@ class Driver:
         self.builder_guard()
         require(isinstance(getattr(self, "_engine_system_time", None), str), "missing build Engine clock")
         engine_ns = build_timestamp(self._engine_system_time)
+        # Two clocks, never compared to each other. `SystemTime` is the guest
+        # Engine's clock; a payload graph's timestamps are the client's, because
+        # Buildx rebases them onto it before they are printed (see
+        # `Recorder.host_interval`). Ordering a solve against an Engine reading
+        # therefore decides nothing about attribution and everything about
+        # host/guest skew, which is why it is not done here. Each clock is
+        # ordered against itself, and the solve is bound to the command that
+        # produced it by `assert_payload_graph`.
+        previous_engine_ns = getattr(self, "_last_engine_ns", None)
+        require(previous_engine_ns is None or previous_engine_ns <= engine_ns,
+                "Engine observation precedes the previous Engine observation")
+        self._last_engine_ns = engine_ns
+        client_ns = time.time_ns()
         previous_graph = getattr(self, "_last_payload_graph", None)
-        require(previous_graph is None or previous_graph["solve_last_observed_ns"] <= engine_ns,
-                "previous payload solve exceeds subsequent Engine observation")
+        require(previous_graph is None or previous_graph["solve_last_observed_ns"] <= client_ns,
+                "previous payload solve exceeds subsequent client observation")
         require(tree_digest(self.fixture) == self.inputs.raw["fixture_sha256"], "fixture changed")
         dest = self.output / ("export-" + suffix)
         require(not dest.exists(), "build destination already exists")
@@ -1335,6 +1368,7 @@ class Driver:
         result.build_binding = bind_build_command(result.argv, expected_argv, dest,
             self.inputs.raw["fixture_sha256"], regular(self.fixture / "build" / dockerfile))
         result.build_engine_ns = engine_ns
+        result.build_host_interval = self.record.host_interval(result)
         return result, dest
 
     def build_workloads(self) -> None:
@@ -1346,8 +1380,11 @@ class Driver:
         def stage() -> list[str]:
             result, dest = self.build("alpha", "Dockerfile", arguments)
             assert_export(dest, "payload.txt", expected["build_alpha"].encode())
-            first_graph.append(assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=False))
-            require(result.build_engine_ns <= first_graph[0]["solve_started_ns"], "payload predates authenticated Engine observation")
+            first_graph.append(assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"],
+                                                    cached=False, host_lower=result.build_host_interval[0],
+                                                    host_upper=result.build_host_interval[1]))
+            require(result.build_host_interval[0] <= first_graph[0]["solve_started_ns"],
+                    "payload predates the command its Engine observation authorized")
             self._last_payload_graph = first_graph[0]
             first_result.append(result)
             # The same content again as a digest-addressed OCI layout: the local
@@ -1366,7 +1403,9 @@ class Driver:
         def reuse() -> list[str]:
             result, dest = self.build("alpha-reuse", "Dockerfile", arguments)
             assert_export(dest, "payload.txt", expected["build_alpha"].encode())
-            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=True)
+            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=True,
+                                         host_lower=result.build_host_interval[0],
+                                         host_upper=result.build_host_interval[1])
             assert_payload_pair(first_result[0], first_graph[0], result, graph)
             first_graph.append(graph)
             self._last_payload_graph = graph
@@ -1377,9 +1416,11 @@ class Driver:
         def variation() -> list[str]:
             result, dest = self.build("beta", "Dockerfile", arguments | {"FIXTURE_VARIANT": "beta"})
             assert_export(dest, "payload.txt", expected["build_beta"].encode())
-            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=False)
+            graph = assert_payload_graph(result.stderr, self.inputs.raw["images"]["base"]["reference"], cached=False,
+                                         host_lower=result.build_host_interval[0],
+                                         host_upper=result.build_host_interval[1])
             assert_payload_pair(first_result[0], first_graph[0], result, graph, variant=True)
-            require(first_graph[-1]["completed_ns"] <= result.build_engine_ns, "payload solve chronology regressed")
+            require(first_graph[-1]["completed_ns"] <= result.build_host_interval[0], "payload solve chronology regressed")
             self._last_payload_graph = graph
             require(expected["build_alpha"] != expected["build_beta"], "fixture argument variants identical")
             return ["alpha and beta arguments produce exact distinct payloads; OCI layer comparison still required"]
@@ -1733,7 +1774,8 @@ def build_timestamp(value: str) -> int:
     return calendar.timegm(parsed.timetuple()) * 10**9 + int((match[2] or "").ljust(9, "0"))
 
 
-def assert_payload_graph(raw: bytes, base_reference: str, *, cached: bool) -> dict[str, Any]:
+def assert_payload_graph(raw: bytes, base_reference: str, *, cached: bool,
+                         host_lower: int, host_upper: int) -> dict[str, Any]:
     """Prove this fixture's connected operation, not cross-solve progress hashes.
 
     BuildKit 0.19.0 embeds per-solve LocalUniqueID in local source operations
@@ -1832,9 +1874,21 @@ def assert_payload_graph(raw: bytes, base_reference: str, *, cached: bool) -> di
         payload.extend(base64.b64decode(log["data"], validate=True))
     require((not logs if cached else bytes(payload) == b"vz04-payload-step-executed\n"),
             "payload execution marker differs from cache state")
+    # `solve_starts`/`solve_completions` hold every vertex timestamp in the
+    # stream, so these two bound the whole solve; the log frames are already
+    # bound inside the run vertex above. Containing them in the client-observed
+    # interval of the command that emitted them is what proves this solve
+    # belongs to this build rather than to a neighbouring one — the claim the
+    # discarded Engine-clock comparison was reaching for but could not decide,
+    # because it was reading the guest's clock.
+    solve_started, solve_last_observed = min(solve_starts), max(solve_starts + solve_completions)
+    require(type(host_lower) is int and type(host_upper) is int and 0 < host_lower <= host_upper,
+            "invalid client command clock bounds")
+    require(host_lower <= solve_started and solve_last_observed <= host_upper,
+            "payload solve outside the client-observed command that produced it")
     return {"graph": edges, "base_vertex": ids["base"], "vertices": ids,
             "started_ns": started, "completed_ns": completed, "cached": cached,
-            "solve_started_ns": min(solve_starts), "solve_last_observed_ns": max(solve_starts + solve_completions),
+            "solve_started_ns": solve_started, "solve_last_observed_ns": solve_last_observed,
             "progress_sha256": sha256(raw)}
 
 
@@ -1850,10 +1904,16 @@ def assert_payload_pair(first: Command, first_graph: dict[str, Any], second: Com
         require(wanted["argv"].count("FIXTURE_VARIANT=alpha") == 1, "ambiguous variant argument")
         wanted["argv"][wanted["argv"].index("FIXTURE_VARIANT=alpha")] = "FIXTURE_VARIANT=beta"
     require(wanted == second.build_binding, "payload fixture or command identity drift")
+    # The Engine readings order against each other on the guest clock; the two
+    # solves order against each other, and against the command that carried the
+    # second one, on the client clock. Nothing crosses between the two.
+    require(first.build_host_interval is not None and second.build_host_interval is not None,
+            "missing client-observed build interval")
     require(first.index < second.index and first_graph["progress_sha256"] != second_graph["progress_sha256"] and
             type(first.build_engine_ns) is int and type(second.build_engine_ns) is int and
-            first.build_engine_ns <= first_graph["solve_started_ns"] and
-            first_graph["solve_last_observed_ns"] <= second.build_engine_ns <= second_graph["solve_started_ns"],
+            first.build_engine_ns <= second.build_engine_ns and
+            first.build_host_interval[0] <= first_graph["solve_started_ns"] and
+            first_graph["solve_last_observed_ns"] <= second.build_host_interval[0] <= second_graph["solve_started_ns"],
             "stale or reordered payload solve")
     require(first_graph["cached"] is False and second_graph["cached"] is (not variant), "wrong payload solve cache transition")
     require(first_graph["graph"] == second_graph["graph"] and first_graph["base_vertex"] == second_graph["base_vertex"],

@@ -328,8 +328,15 @@ class Replay:
         self.guard()
         engine = decode(self.rows[self.i - 1]["_stdout"])
         self.build_engine_ns = progress_ns(engine["SystemTime"])
-        require(getattr(self, "payload_completed_ns", 0) <= self.build_engine_ns,
-                "payload completion is outside subsequent Engine clock")
+        # The Engine's clock is the guest's; Buildx progress timestamps are the
+        # client's, rebased before they are printed. Ordering one against the
+        # other measures host/guest skew, not chronology, so the Engine reading
+        # is ordered against the previous Engine reading and the payload solves
+        # are ordered against the client clock in `build`.
+        previous = getattr(self, "last_engine_ns", None)
+        require(previous is None or previous <= self.build_engine_ns,
+                "Engine observation precedes the previous Engine observation")
+        self.last_engine_ns = self.build_engine_ns
         raw = self.take(["buildx", "inspect", self.builder["name"]])["_stdout"].decode()
         sections = raw.split("\nNodes:\n")
         require(len(sections) == 2, "ambiguous builder nodes")
@@ -406,6 +413,11 @@ class Replay:
             args += ["--build-arg", key + "=" + value]
         row = self.take(args + (extra or []) + [str(fixture / "build")], code=code, mutation=True)
         require(not row["_stdout"], "unexpected Buildx stdout")
+        require(type(row.get("started_unix_ns")) is int and type(row.get("elapsed_ns")) is int
+                and row["started_unix_ns"] > 0 and row["elapsed_ns"] >= 0, "build client-clock interval unavailable")
+        host_lower, host_upper = row["started_unix_ns"], row["started_unix_ns"] + row["elapsed_ns"]
+        require(getattr(self, "payload_completed_ns", 0) <= host_lower,
+                "previous payload solve exceeds this build's client observation")
         vertices, logs = progress(row["_stderr"], read(fixture / "build/Dockerfile.secret") if code is None else None)
         require(self.secret not in logs, "secret leaked into decoded BuildKit logs")
         if code == 0:
@@ -415,7 +427,8 @@ class Replay:
         # only, and `oci_export` proves what it produced.
         if dockerfile == "Dockerfile" and not oci:
             proof = payload_graph(row["_stderr"], self.inputs["images"]["base"]["reference"], suffix in CACHED_ALPHA)
-            require(proof["solve_started_ns"] >= self.build_engine_ns, "payload predates authenticated Engine clock")
+            require(host_lower <= proof["solve_started_ns"] and proof["solve_last_observed_ns"] <= host_upper,
+                    "payload solve outside the client-observed command that produced it")
             binding = list(row["_args"])
             # Exact argv was checked above; normalize only its known output
             # destination. Fixture bytes and all other arguments remain bound.

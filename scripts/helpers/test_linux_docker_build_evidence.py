@@ -24,6 +24,7 @@ class SyntheticBuilder(SyntheticEngine):
     def stamp(seconds):
         return (datetime(2026, 9, 6, 6) + timedelta(seconds=seconds)).isoformat() + "Z"
 
+
     def __call__(self, argv, **kwargs):
         args, builder = argv[5:], self.inputs.raw["builder"]
         if args == ["info", "--format", "{{json .}}"]:
@@ -132,8 +133,21 @@ class BuildEvidenceTests(unittest.TestCase):
             return original_stat(path, *args, **kwargs)
         def persist(_recorder, path, value, **_kwargs):
             path.write_bytes(data(value))  # Synthetic tests make no durability claim.
+        builder = SyntheticBuilder(inputs)
+        def client_ns():
+            """The synthetic client clock, ten seconds wide per solve.
+
+            Buildx reports progress on the *client's* clock, so a build's
+            recorded interval has to be the interval its progress falls in: the
+            counter advances when the fixture answers a build, which puts solve
+            N's stream at N*10+1..+5 inside a window of [N*10, N*10+10]. The
+            Engine's `SystemTime` is the guest's clock and is deliberately left
+            free to disagree; nothing may compare the two.
+            """
+            return evidence.progress_ns(SyntheticBuilder.stamp(getattr(builder, "solve_count", 0) * 10))
         with patch.object(driver.sys, "platform", "darwin"), patch.object(driver.os, "uname", return_value=types.SimpleNamespace(machine="arm64")), \
-                patch.object(Path, "stat", fake_stat), patch.object(driver, "execute", side_effect=SyntheticBuilder(inputs)), \
+                patch.object(Path, "stat", fake_stat), patch.object(driver, "execute", side_effect=builder), \
+                patch.object(driver.time, "time_ns", client_ns), patch.object(driver.time, "monotonic_ns", client_ns), \
                 patch.object(driver.Recorder, "persist", persist):
             result = driver.Driver(inputs, cls.fixture, cls.base).run("build")
         if result["outcome"] != "fixture_assertions_passed":
@@ -319,6 +333,46 @@ class BuildEvidenceTests(unittest.TestCase):
                     evidence.validate(self.directory, self.inputs)
                     vertices, _ = evidence.progress(data(changed))
                     self.assertEqual(vertices[0]["completed"], stamp)
+
+    def test_payload_solve_credited_to_a_neighbouring_command_is_refused(self):
+        """The misattribution the client-clock binding exists to catch.
+
+        The stream is byte-for-byte a real solve of this fixture, moved into
+        the window of the build that follows it. Its graph, its digests and its
+        payload are all sound; only the interval the client actually observed
+        it in says it belongs to another command.
+        """
+        def shift(value):
+            return SyntheticBuilder.stamp(
+                (evidence.progress_ns(value) - evidence.progress_ns(SyntheticBuilder.stamp(0))) / 10 ** 9 + 10)
+        shifted = json.loads((self.directory / "command-00009.stderr").read_bytes())
+        for vertex in shifted["vertexes"]:
+            for key in ("started", "completed"):
+                if key in vertex:
+                    vertex[key] = shift(vertex[key])
+        for log in shifted.get("logs", []):
+            log["timestamp"] = shift(log["timestamp"])
+        self.raw(9, "stderr", lambda _: data(shifted)); self.rejected()
+
+    def test_solve_still_running_at_the_next_build_dispatch_is_refused(self):
+        """Overlapping observed windows must still not carry overlapping solves.
+
+        Containment binds each solve inside its own command. This is the claim
+        containment cannot make on its own: a solve that is inside its own
+        window and was still being reported when the next build was dispatched.
+        """
+        def shift(value):
+            return SyntheticBuilder.stamp(
+                (evidence.progress_ns(value) - evidence.progress_ns(SyntheticBuilder.stamp(0))) / 10 ** 9 + 8)
+        stream = json.loads((self.directory / "command-00009.stderr").read_bytes())
+        for vertex in stream["vertexes"]:
+            for key in ("started", "completed"):
+                if key in vertex:
+                    vertex[key] = shift(vertex[key])
+        for log in stream.get("logs", []):
+            log["timestamp"] = shift(log["timestamp"])
+        self.change("command-00009.json", lambda row: row.update(elapsed_ns=30 * 10 ** 9))
+        self.raw(9, "stderr", lambda _: data(stream)); self.rejected()
 
     def test_distinct_solve_ids_preserve_content_operation_identity(self):
         a = json.loads((self.directory / "command-00009.stderr").read_bytes())
