@@ -293,6 +293,10 @@ def invoke_lane(lane: dict, phase: str, ctx: LaneContext, evidence_dir: Path, ha
     return result
 
 
+# `developer_environment_checks.SubCheck` names a sub-check `<scenario id>__<slug>`.
+SUBCHECK_SEPARATOR = "__"
+
+
 def account(required: list, results: list) -> dict:
     """Required-scenario accounting. Returns {rows, findings}."""
     by_key = {}
@@ -310,6 +314,19 @@ def account(required: list, results: list) -> dict:
     for identifier, places in sorted(reported.items()):
         expected = assigned.get(identifier)
         if expected is None:
+            parent, separator, slug = identifier.partition(SUBCHECK_SEPARATOR)
+            if separator and slug and parent in assigned:
+                # A sub-check of a required scenario. The topology lane reports
+                # these so its evidence names which assertion of a criterion
+                # failed, and the contract deliberately does not require them --
+                # they are diagnostics, not claims. Counting one as an unknown
+                # scenario made every finding-free verdict unreachable for that
+                # lane: `validate.verdict_for` returns PASS only when `findings`
+                # is empty, so a lane failed the gate precisely because it
+                # explained itself. `scenario.unknown` still catches a lane
+                # reporting anything that is not a sub-check of a required
+                # scenario, which is the case it exists for.
+                continue
             findings.append(("scenario.unknown", identifier, f"reported by {places[0][0]}/{places[0][1]} but not required"))
             continue
         if len(places) > 1:

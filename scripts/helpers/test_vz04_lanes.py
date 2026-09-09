@@ -327,6 +327,34 @@ class LaneTests(unittest.TestCase):
         self.assertIn("scenario.duplicate", codes)
         self.assertIn("scenario.misassigned", codes)
 
+    def test_a_subcheck_of_a_required_scenario_is_evidence_not_an_unknown_scenario(self):
+        """The topology lane's sub-check rows must not fail the gate.
+
+        `developer_environment_checks.SubCheck` names each sub-check
+        `<scenario id>__<slug>` and the lane reports them so its evidence says
+        which assertion of a criterion failed. The contract deliberately does
+        not require them. Counting one as an unknown scenario made a
+        finding-free verdict unreachable for that lane -- `validate.verdict_for`
+        returns PASS only when `findings` is empty -- so every topology row
+        would have been denied however much of the product landed, and the lane
+        would have failed the gate precisely because it explained itself.
+
+        The narrowness is the point: only `<required id>__<slug>` is forgiven.
+        """
+        required = [{"id": "gate.a.b", "lane": "topology", "phase": "clean-provision"}]
+        reported = _passed("topology", "clean-provision",
+                           ["gate.a.b", "gate.a.b__first_assertion", "gate.a.b__second_assertion"], self.ctx)
+        outcome = lanes.account(required, [reported])
+        self.assertEqual([(row["id"], row["status"]) for row in outcome["rows"]], [("gate.a.b", "PASS")])
+        self.assertEqual(outcome["findings"], [])
+        # A sub-check whose parent is not required, and a plain unknown
+        # scenario, are still reported. Forgiving those would retire the check.
+        stray = _passed("topology", "clean-provision",
+                        ["gate.a.b", "gate.not.required__slug", "gate.not.required"], self.ctx)
+        codes = {(code, subject) for code, subject, _detail in lanes.account(required, [stray])["findings"]}
+        self.assertEqual(codes, {("scenario.unknown", "gate.not.required__slug"),
+                                 ("scenario.unknown", "gate.not.required")})
+
 
 if __name__ == "__main__":
     unittest.main()
