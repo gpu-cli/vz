@@ -214,9 +214,83 @@ pub enum WorkspaceProjectionMode {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct WorkspaceProjection {
+    /// Symbolic slot name. It is resolved to a minted [`WorkspaceBinding`]
+    /// through that binding's `slots` resolution table; it is never itself a
+    /// binding name.
     pub binding: String,
+    /// Absolute path inside the Machine where the projection appears.
     pub target_path: String,
     pub mode: WorkspaceProjectionMode,
+    /// Host source declared RELATIVE to the worktree root.
+    ///
+    /// `"."` projects the worktree root itself. The runtime joins this to the
+    /// authoritative worktree root, canonicalises the result and refuses
+    /// absolute paths, `..` components and symlinks that escape the root.
+    /// Unlike `path_hint`, the resolved path is authorizing.
+    pub source_path: String,
+}
+
+/// Syntactic containment rule for a declared workspace source path.
+///
+/// The declaration is refused unless it is a bounded, relative, `..`-free path.
+/// This is only the half a pure declaration can prove; the runtime still has to
+/// canonicalise the joined path and refuse symlinks that escape the worktree
+/// root, because a well-formed relative path can still point outside once the
+/// filesystem is consulted.
+pub fn validate_workspace_source_path(
+    machine: &str,
+    source_path: &str,
+) -> Result<(), TopologyValidationError> {
+    let invalid = |reason: &str| TopologyValidationError::InvalidIdentifier {
+        kind: "machine.workspace.source_path".to_string(),
+        value: format!("{machine}:{source_path}"),
+        reason: reason.to_string(),
+    };
+    if source_path.is_empty() || source_path.len() > 1024 {
+        return Err(invalid("length must be 1..=1024"));
+    }
+    if source_path.chars().any(char::is_control) {
+        return Err(invalid("control characters"));
+    }
+    if source_path.starts_with('/') {
+        return Err(invalid("absolute paths are refused"));
+    }
+    if source_path == "." {
+        return Ok(());
+    }
+    for component in source_path.split('/') {
+        if component.is_empty() {
+            return Err(invalid("empty path component"));
+        }
+        if component == ".." {
+            return Err(invalid("`..` traversal is refused"));
+        }
+        if component == "." {
+            return Err(invalid("`.` component is only valid alone"));
+        }
+    }
+    Ok(())
+}
+
+/// Validate one declared workspace projection.
+pub fn validate_workspace_projection(
+    machine: &str,
+    projection: &WorkspaceProjection,
+) -> Result<(), TopologyValidationError> {
+    validate_name("machine.workspace.binding", &projection.binding)?;
+    validate_workspace_source_path(machine, &projection.source_path)?;
+    if !projection.target_path.starts_with('/')
+        || projection.target_path.len() > 1024
+        || projection.target_path.chars().any(char::is_control)
+        || projection.target_path.split('/').any(|c| c == "..")
+    {
+        return Err(TopologyValidationError::InvalidIdentifier {
+            kind: "machine.workspace.target_path".to_string(),
+            value: format!("{machine}:{}", projection.target_path),
+            reason: "must be a bounded absolute `..`-free Machine path".to_string(),
+        });
+    }
+    Ok(())
 }
 
 /// Whether one Machine may reach anything outside its Environment.
@@ -388,6 +462,13 @@ pub struct WorkspaceBinding {
     pub workspace_key: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path_hint: Option<String>,
+    /// Durable symbolic-slot resolution table for this minted binding.
+    ///
+    /// `name` stays the opaque minted `worktree-{sha256(workspace_key)}`
+    /// identity. Every `WorkspaceProjection.binding` slot this binding answers
+    /// for is recorded here, so a definition can name a slot that Up never
+    /// mints. Slots are unique within an Environment.
+    pub slots: BTreeSet<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -1563,6 +1644,9 @@ impl EnvironmentSpec {
                 &machine.requested_capabilities,
                 None,
             )?;
+            if let Some(workspace) = &machine.workspace {
+                validate_workspace_projection(&machine.name, workspace)?;
+            }
             let declared = validate_unique_names("machine_network", machine.networks.iter())?;
             for network in &declared {
                 if !network_names.contains(network) {
@@ -2090,11 +2174,27 @@ impl EnvironmentInstance {
             }
             validate_name("workspace_binding", &binding.name)?;
             validate_name("workspace_key", &binding.workspace_key)?;
+            for slot in &binding.slots {
+                validate_name("workspace_binding_slot", slot)?;
+            }
         }
         validate_unique_names(
             "workspace_binding",
             self.bindings.iter().map(|binding| &binding.name),
         )?;
+        // A symbolic slot resolves to exactly one minted binding per
+        // Environment, so the resolution table is a function, not a relation.
+        let mut resolved_slots = BTreeSet::new();
+        for binding in &self.bindings {
+            for slot in &binding.slots {
+                if !resolved_slots.insert(slot.as_str()) {
+                    return Err(TopologyValidationError::Duplicate {
+                        kind: "workspace_binding_slot".to_string(),
+                        value: slot.clone(),
+                    });
+                }
+            }
+        }
         let mut network_ids = BTreeSet::new();
         let mut network_names = BTreeSet::new();
         for network in &self.networks {
@@ -4338,10 +4438,12 @@ fn validate_definition_instance(
             "Machine names/count differ from the project definition",
         );
     }
-    let binding_names: BTreeSet<_> = environment
+    // Decision 8: the definition names a symbolic slot, never the opaque
+    // minted binding name, so reconciliation reads the resolution table.
+    let resolved_binding_slots: BTreeSet<&str> = environment
         .bindings
         .iter()
-        .map(|binding| binding.name.as_str())
+        .flat_map(|binding| binding.slots.iter().map(String::as_str))
         .collect();
     for desired in &spec.machines {
         let Some(actual) = machines.get(desired.name.as_str()) else {
@@ -4376,12 +4478,12 @@ fn validate_definition_instance(
             environment.state,
             EnvironmentState::Creating | EnvironmentState::Failed
         ) && let Some(workspace) = &desired.workspace
-            && !binding_names.contains(workspace.binding.as_str())
+            && !resolved_binding_slots.contains(workspace.binding.as_str())
         {
             return definition_topology_mismatch(
                 &environment_id,
                 format!(
-                    "Machine `{}` references missing workspace binding `{}`",
+                    "Machine `{}` references unresolved workspace binding slot `{}`",
                     desired.name, workspace.binding
                 ),
             );
@@ -4808,6 +4910,8 @@ pub fn migrate_legacy_developer_sandbox(
                 .cloned()
                 .unwrap_or_else(|| "/workspace".to_string()),
             mode: WorkspaceProjectionMode::ReadWrite,
+            // A legacy sandbox projected its whole project directory.
+            source_path: ".".to_string(),
         }),
     };
     let environment_spec = EnvironmentSpec {
@@ -4834,6 +4938,9 @@ pub fn migrate_legacy_developer_sandbox(
         name: "workspace".to_string(),
         workspace_key: format!("legacy:{}", sandbox.sandbox_id),
         path_hint: sandbox.labels.get(SANDBOX_LABEL_PROJECT_DIR).cloned(),
+        // The legacy binding keeps its legacy name and additionally resolves
+        // the slot the migrated definition declares.
+        slots: BTreeSet::from(["workspace".to_string()]),
     };
     let machine = MachineInstance {
         docker_context: None,
@@ -5122,6 +5229,7 @@ mod tests {
                 binding: "source".to_string(),
                 target_path: "/workspace".to_string(),
                 mode: WorkspaceProjectionMode::ReadWrite,
+                source_path: ".".to_string(),
             }),
         }
     }
@@ -5864,15 +5972,20 @@ mod tests {
         }
     }
 
+    /// Bind exactly as Up does under decision 8: an OPAQUE minted name that is
+    /// not the symbolic slot, plus a resolution table entry for the slot the
+    /// definition declares. If the two were the same string these tests could
+    /// not tell a name lookup from a slot resolution.
     fn bind(environment: &mut EnvironmentInstance, workspace_key: &str) {
         environment.bindings.push(WorkspaceBinding {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             binding_id: WorkspaceBindingId::generate(),
             project_id: environment.project_id.clone(),
             environment_id: environment.environment_id.clone(),
-            name: "source".to_string(),
+            name: format!("worktree-{workspace_key}"),
             workspace_key: workspace_key.to_string(),
             path_hint: Some("/diagnostic/only".to_string()),
+            slots: BTreeSet::from(["source".to_string()]),
         });
     }
 

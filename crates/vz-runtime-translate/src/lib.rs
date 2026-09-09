@@ -369,6 +369,7 @@ pub fn workspace_projection_to_proto(
         binding: projection.binding.clone(),
         target_path: projection.target_path.clone(),
         mode: workspace_projection_mode_to_proto(projection.mode) as i32,
+        source_path: projection.source_path.clone(),
     }
 }
 
@@ -380,6 +381,7 @@ pub fn workspace_projection_from_proto(
         binding: projection.binding.clone(),
         target_path: projection.target_path.clone(),
         mode: workspace_projection_mode_from_proto(projection.mode)?,
+        source_path: projection.source_path.clone(),
     })
 }
 
@@ -506,6 +508,7 @@ pub fn workspace_binding_to_proto(binding: &WorkspaceBinding) -> runtime_v2::Wor
         name: binding.name.clone(),
         workspace_key: binding.workspace_key.clone(),
         path_hint: binding.path_hint.clone(),
+        slots: binding.slots.iter().cloned().collect(),
     }
 }
 
@@ -521,6 +524,7 @@ pub fn workspace_binding_from_proto(
         name: binding.name.clone(),
         workspace_key: binding.workspace_key.clone(),
         path_hint: binding.path_hint.clone(),
+        slots: binding.slots.iter().cloned().collect(),
     })
 }
 
@@ -3346,6 +3350,7 @@ mod tests {
                     binding: "source".to_string(),
                     target_path: "/workspace".to_string(),
                     mode: WorkspaceProjectionMode::ReadWrite,
+                    source_path: "services/api".to_string(),
                 }),
             ),
             OperatingSystem::Macos => (
@@ -3354,6 +3359,7 @@ mod tests {
                     binding: "source".to_string(),
                     target_path: "/Users/vz/workspace".to_string(),
                     mode: WorkspaceProjectionMode::Snapshot,
+                    source_path: ".".to_string(),
                 }),
             ),
             OperatingSystem::Windows => (CapabilitySet::default(), None),
@@ -3503,9 +3509,10 @@ mod tests {
                     .expect("valid binding ID"),
                 project_id,
                 environment_id: environment_id.clone(),
-                name: "source".to_string(),
+                name: "worktree-shared".to_string(),
                 workspace_key: "shared-worktree-key".to_string(),
                 path_hint: Some(path_hint.to_string()),
+                slots: BTreeSet::from(["source".to_string()]),
             }],
             machines: vec![
                 MachineInstance {
@@ -4339,7 +4346,13 @@ mod tests {
                 .iter()
                 .all(|environment| environment.definition_digest == definition_digest)
         );
-        assert_eq!(decoded.environments[0].bindings[0].name, "source");
+        // Decision 8: the wire carries the opaque minted name AND the durable
+        // symbolic-slot resolution table, not a name that doubles as the slot.
+        assert_eq!(decoded.environments[0].bindings[0].name, "worktree-shared");
+        assert_eq!(
+            decoded.environments[0].bindings[0].slots,
+            BTreeSet::from(["source".to_string()])
+        );
         assert!(
             decoded.environments[0].machines[0]
                 .runtime_identity

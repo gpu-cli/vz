@@ -121,6 +121,9 @@ message WorkspaceProjection {
   string binding = 1;
   string target_path = 2;
   WorkspaceProjectionMode mode = 3;
+  // Host source declared RELATIVE to the worktree root. Absolute paths, ".."
+  // components and symlinks escaping the root are refused at resolve time.
+  string source_path = 4;
 }
 
 enum MachineProfile {
@@ -241,6 +244,9 @@ message WorkspaceBinding {
   string workspace_key = 5;
   optional string path_hint = 6;
   string name = 7;
+  // Durable symbolic-slot -> minted-binding resolution table. Each entry is a
+  // `WorkspaceProjection.binding` slot resolved by this minted binding.
+  repeated string slots = 8;
 }
 
 enum EnvironmentState {
@@ -683,6 +689,9 @@ message UpEnvironmentRequest {
   optional string workspace_key = 5;
   optional string path_hint = 6;
   uint64 timeout_millis = 7;
+  // Authoritative canonical absolute worktree root for workspace projections.
+  // Unlike path_hint this is authorizing and enters the Up request hash.
+  optional string workspace_root = 8;
 }
 
 message EnvironmentUpAdmission {

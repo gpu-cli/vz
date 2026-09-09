@@ -157,6 +157,17 @@ pub async fn cmd_dev_up(args: DevUpArgs, json_output: bool) -> Result<(), UpComm
             process_environment_id,
             workspace_key: Some(workspace.workspace_key),
             path_hint: Some(cwd.to_string_lossy().into_owned()),
+            // Authoritative worktree root for workspace projections. Sent
+            // canonicalised so the daemon hashes and resolves against a path
+            // with no symlink components of its own.
+            workspace_root: Some(
+                workspace
+                    .path_hint
+                    .canonicalize()
+                    .unwrap_or(workspace.path_hint)
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
             timeout_millis: args.timeout.unwrap_or_else(|| {
                 if discovered
                     .definition

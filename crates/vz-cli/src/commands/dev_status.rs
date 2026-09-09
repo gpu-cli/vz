@@ -816,6 +816,7 @@ mod tests {
             name: "dev-worktree".to_string(),
             workspace_key: "workspace-dev".to_string(),
             path_hint: None,
+            slots: std::collections::BTreeSet::new(),
         });
         let mut staging = environment_with_machines("env-alpha", "staging");
         staging.bindings.push(WorkspaceBinding {
@@ -826,6 +827,7 @@ mod tests {
             name: "staging-worktree".to_string(),
             workspace_key: "workspace-staging".to_string(),
             path_hint: None,
+            slots: std::collections::BTreeSet::new(),
         });
         ProjectStateSnapshot {
             request_id: "req-status".to_string(),
@@ -1036,6 +1038,7 @@ mod tests {
             name: "ambiguous-worktree".to_string(),
             workspace_key: "workspace-dev".to_string(),
             path_hint: None,
+            slots: std::collections::BTreeSet::new(),
         });
         let error = select_status_environments(
             snapshot,

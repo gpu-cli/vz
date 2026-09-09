@@ -177,6 +177,7 @@ fn project_state(workspace_key: &str, path_hint: &Path) -> ProjectState {
                     binding: "workspace".to_string(),
                     target_path: "/workspace".to_string(),
                     mode: WorkspaceProjectionMode::ReadWrite,
+                    source_path: ".".to_string(),
                 }),
             }],
             networks: vec![],
@@ -190,9 +191,10 @@ fn project_state(workspace_key: &str, path_hint: &Path) -> ProjectState {
         binding_id: WorkspaceBindingId::generate(),
         project_id: definition.project_id.clone(),
         environment_id: environment.environment_id.clone(),
-        name: "workspace".to_string(),
+        name: format!("worktree-{workspace_key}"),
         workspace_key: workspace_key.to_string(),
         path_hint: Some(path_hint.to_string_lossy().into_owned()),
+        slots: std::collections::BTreeSet::from(["workspace".to_string()]),
     });
     ProjectState {
         schema_version: TOPOLOGY_SCHEMA_VERSION,

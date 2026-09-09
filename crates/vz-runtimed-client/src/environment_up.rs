@@ -10,6 +10,7 @@ mod tests {
     fn fixture() -> (Validator, runtime_v2::UpEnvironmentEvent) {
         let definition:ProjectDefinition=serde_json::from_value(serde_json::json!({"schema_version":1,"project_id":ProjectId::generate(),"name":"up-client","environment":{"schema_version":1,"machines":[{"schema_version":1,"name":"app","profile":"hardened","target":{"os":"linux","arch":"aarch64","image":"fixture"}}]}})).unwrap();
         let request = EnvironmentUpRequest {
+            workspace_root: None,
             definition,
             selection: EnvironmentSelectionContext::default(),
             path_hint: None,

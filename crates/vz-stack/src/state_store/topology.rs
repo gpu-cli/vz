@@ -18,9 +18,10 @@ use super::{ServiceObservedState, ServiceReplicaKey, StateStore};
 use crate::StackError;
 use crate::error::OwnedResourceCollisionError;
 
-pub(super) const STORE_SCHEMA_VERSION: u32 = 11;
+pub(super) const STORE_SCHEMA_VERSION: u32 = 12;
 /// First schema version that projects declared Environment network topology.
 const ENVIRONMENT_NETWORK_STORE_SCHEMA_VERSION: u32 = 10;
+const ENVIRONMENT_ADDRESSING_STORE_SCHEMA_VERSION: u32 = 11;
 const STACK_JOURNAL_SCHEMA_VERSION: u32 = 4;
 const REPLICA_SCHEMA_VERSION: u32 = 5;
 const CLAIM_SCHEMA_VERSION: u32 = 7;
@@ -959,6 +960,11 @@ enum EnvironmentAddressingV11MigrationStage {
     PreV11RecordsRefused,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkspaceSlotsV12MigrationStage {
+    SlotsBackfilled,
+}
+
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum LegacyMigrationFailpoint {
@@ -1018,6 +1024,12 @@ pub(super) enum EnvironmentNetworkV10MigrationFailpoint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum EnvironmentAddressingV11MigrationFailpoint {
     AfterPreV11RecordsRefused,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum WorkspaceSlotsV12MigrationFailpoint {
+    AfterSlotsBackfilled,
 }
 
 fn normalized_schema_sql(sql: Option<String>) -> Option<String> {
@@ -1409,6 +1421,34 @@ impl StateStore {
         reference.create_environment_network_schema_v10()?;
 
         self.validate_schema_against(11, &reference.conn)
+    }
+
+    /// Validate the v12 schema, whose SQL shape is still the v10 one.
+    ///
+    /// v12 added the durable symbolic-slot resolution table to the persisted
+    /// `WorkspaceBinding` record -- the `binding_json` column's content -- and
+    /// not a table. That is deliberate: the loaders' SELECT list is the read
+    /// floor for a Project aggregate, so a new column would have to be readable
+    /// at every earlier version a migration test reads an aggregate at. Keeping
+    /// the resolution table inside `binding_json` leaves that floor untouched,
+    /// adds no rows for `delete_exact_environment` to count and no
+    /// `OwnershipRecord` for Delete's expected-ownership `BTreeSet`.
+    pub(super) fn validate_v12_schema(&self) -> Result<(), StackError> {
+        let reference = StateStore {
+            conn: Connection::open_in_memory()?,
+            event_sender: None,
+        };
+        reference.create_legacy_schema()?;
+        reference.create_topology_schema_v3()?;
+        reference.create_stack_journal_schema_v4()?;
+        reference.create_replica_schema_v5()?;
+        reference.create_reconcile_schema_v6()?;
+        reference.create_claim_schema_v7()?;
+        reference.create_teardown_finalizer_schema_v8()?;
+        reference.create_teardown_runtime_identity_schema_v9()?;
+        reference.create_environment_network_schema_v10()?;
+
+        self.validate_schema_against(STORE_SCHEMA_VERSION, &reference.conn)
     }
 
     pub(super) fn create_reconcile_schema_v6(&self) -> Result<(), StackError> {
@@ -2242,16 +2282,26 @@ impl StateStore {
                         requested.project_id
                     ))
                 })?;
-            let slot_is_declared = project.definition.environment.machines.iter().any(|machine| {
-                machine
-                    .workspace
-                    .as_ref()
-                    .is_some_and(|workspace| workspace.binding == requested.name)
-            });
-            if !slot_is_declared {
+            // Decision 8: the binding's own `name` is the opaque minted
+            // `worktree-{sha256(token)}` identity and is never declared by a
+            // definition. What must be declared is every symbolic slot in the
+            // binding's resolution table.
+            let declared_slots: BTreeSet<&str> = project
+                .definition
+                .environment
+                .machines
+                .iter()
+                .filter_map(|machine| machine.workspace.as_ref())
+                .map(|workspace| workspace.binding.as_str())
+                .collect();
+            if let Some(undeclared) = requested
+                .slots
+                .iter()
+                .find(|slot| !declared_slots.contains(slot.as_str()))
+            {
                 return Err(StackError::InvalidSpec(format!(
-                    "workspace binding slot `{}` is not declared by project `{}`",
-                    requested.name, requested.project_id
+                    "workspace binding slot `{undeclared}` is not declared by project `{}`",
+                    requested.project_id
                 )));
             }
             let environment = project
@@ -2271,7 +2321,9 @@ impl StateStore {
                 )));
             }
             if let Some(existing) = environment.bindings.iter().find(|binding| {
-                binding.name == requested.name || binding.workspace_key == requested.workspace_key
+                binding.name == requested.name
+                    || binding.workspace_key == requested.workspace_key
+                    || binding.slots.intersection(&requested.slots).next().is_some()
             }) {
                 if existing == requested {
                     return Ok(existing.clone());
@@ -2346,6 +2398,10 @@ impl StateStore {
                 let previous = existing.clone();
                 existing.workspace_key = requested.workspace_key.clone();
                 existing.path_hint = requested.path_hint.clone();
+                // The resolution table is durable: a refresh may move the slot
+                // to a new opaque workspace key, but it never silently drops
+                // the slots the Environment's Machines already resolve through.
+                existing.slots.extend(requested.slots.iter().cloned());
                 (existing.clone(), Some(previous))
             } else {
                 if let Some(existing) = environment
@@ -5283,6 +5339,188 @@ impl StateStore {
             }
             hook(EnvironmentAddressingV11MigrationStage::PreV11RecordsRefused)?;
             store.validate_v11_schema()?;
+            store.set_schema_version(ENVIRONMENT_ADDRESSING_STORE_SCHEMA_VERSION)?;
+            Ok(())
+        })
+    }
+
+    pub(super) fn migrate_workspace_slots_v11_to_v12(&self) -> Result<(), StackError> {
+        self.migrate_workspace_slots_v11_to_v12_with_hook(|_| Ok(()))
+    }
+
+    /// Backfill the durable symbolic-slot resolution table (decision 8).
+    ///
+    /// Unlike the v10-to-v11 migration this one derives rather than refuses,
+    /// and the difference is evidential, not stylistic. v11 could not recover a
+    /// network's kind or CIDR because those values were never written anywhere.
+    /// A v11 binding's slot set *is* recoverable, because before decision 8 the
+    /// rule was that a `WorkspaceProjection.binding` had to equal a binding's
+    /// own `name`. So a v11 binding resolved exactly the slots equal to its own
+    /// name, and every other binding resolved none. The only databases that can
+    /// hold such a row are legacy-sandbox migrations, since
+    /// `validate_supported` has always refused an Up whose definition declares
+    /// a workspace projection.
+    ///
+    /// This is done in SQL over `binding_json` rather than through the typed
+    /// loaders on purpose: at v11 the stored JSON has no `slots` member, so
+    /// `WorkspaceBinding` no longer deserializes and every typed read of the
+    /// aggregate would fail before the migration could fix it.
+    fn migrate_workspace_slots_v11_to_v12_with_hook(
+        &self,
+        mut hook: impl FnMut(WorkspaceSlotsV12MigrationStage) -> Result<(), StackError>,
+    ) -> Result<(), StackError> {
+        self.with_immediate_transaction(|store| {
+            let schema_version = store.schema_version()?;
+            if schema_version != ENVIRONMENT_ADDRESSING_STORE_SCHEMA_VERSION {
+                return Err(StackError::InvalidSpec(format!(
+                    "workspace-slot migration requires state schema version {ENVIRONMENT_ADDRESSING_STORE_SCHEMA_VERSION}, found {schema_version}"
+                )));
+            }
+            store.validate_v11_schema()?;
+            // Derive each binding's slot set from the pre-decision-8 rule that a
+            // `WorkspaceProjection.binding` had to equal a binding's own name.
+            let declared: BTreeMap<String, BTreeSet<String>> = {
+                let mut statement = store
+                    .conn
+                    .prepare("SELECT project_id, definition_json FROM project_definitions")?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows.into_iter()
+                    .map(|(project_id, json)| {
+                        let value: serde_json::Value = serde_json::from_str(&json)?;
+                        let slots = value
+                            .pointer("/environment/machines")
+                            .and_then(serde_json::Value::as_array)
+                            .map(|machines| {
+                                machines
+                                    .iter()
+                                    .filter_map(|machine| {
+                                        machine.pointer("/workspace/binding")?.as_str()
+                                    })
+                                    .map(str::to_string)
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                        Ok((project_id, slots))
+                    })
+                    .collect::<Result<_, StackError>>()?
+            };
+            // A binding value gains `slots` only when it has none; an existing
+            // table is never rewritten.
+            let backfill = |binding: &mut serde_json::Value, project_id: &str| {
+                let serde_json::Value::Object(fields) = binding else {
+                    return;
+                };
+                if fields.contains_key("slots") {
+                    return;
+                }
+                let name = fields.get("name").and_then(serde_json::Value::as_str);
+                let resolves = name.is_some_and(|name| {
+                    declared
+                        .get(project_id)
+                        .is_some_and(|slots| slots.contains(name))
+                });
+                let slots = match (resolves, name) {
+                    (true, Some(name)) => vec![serde_json::Value::String(name.to_string())],
+                    _ => Vec::new(),
+                };
+                fields.insert("slots".to_string(), serde_json::Value::Array(slots));
+            };
+
+            // The binding record lives in two places: its own row, and the
+            // parent Environment aggregate that the loader cross-checks it
+            // against. Backfilling only one leaves every load failing with a
+            // projection mismatch.
+            let binding_rows = {
+                let mut statement = store
+                    .conn
+                    .prepare("SELECT binding_id, project_id, binding_json FROM workspace_bindings")?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (binding_id, project_id, json) in binding_rows {
+                let mut binding: serde_json::Value = serde_json::from_str(&json)?;
+                backfill(&mut binding, &project_id);
+                store.conn.execute(
+                    "UPDATE workspace_bindings SET binding_json = ?2 WHERE binding_id = ?1",
+                    params![binding_id, serde_json::to_string(&binding)?],
+                )?;
+            }
+
+            let environment_rows = {
+                let mut statement = store.conn.prepare(
+                    "SELECT environment_id, project_id, instance_json FROM environment_instances",
+                )?;
+                statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?
+            };
+            for (environment_id, project_id, json) in environment_rows {
+                let mut environment: serde_json::Value = serde_json::from_str(&json)?;
+                if let Some(bindings) = environment
+                    .get_mut("bindings")
+                    .and_then(serde_json::Value::as_array_mut)
+                {
+                    for binding in bindings.iter_mut() {
+                        backfill(binding, &project_id);
+                    }
+                }
+                store.conn.execute(
+                    "UPDATE environment_instances SET instance_json = ?2 WHERE environment_id = ?1",
+                    params![environment_id, serde_json::to_string(&environment)?],
+                )?;
+            }
+            // Every record must now carry the member, in both places.
+            for (table, json_column, path) in [
+                ("workspace_bindings", "binding_json", "$.slots"),
+                ("environment_instances", "instance_json", "$.slots"),
+            ] {
+                let unresolved: i64 = if table == "workspace_bindings" {
+                    store.conn.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table} \
+                             WHERE json_extract({json_column}, '{path}') IS NULL"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )?
+                } else {
+                    store.conn.query_row(
+                        &format!(
+                            "SELECT COUNT(*) FROM {table}, \
+                                    json_each(json_extract({json_column}, '$.bindings')) AS binding \
+                             WHERE json_extract(binding.value, '{path}') IS NULL"
+                        ),
+                        [],
+                        |row| row.get(0),
+                    )?
+                };
+                if unresolved != 0 {
+                    return Err(StackError::InvalidSpec(format!(
+                        "state schema v11 table `{table}` holds {unresolved} record(s) whose \
+                         persisted binding could not be given a slot resolution table; explicit \
+                         recovery is required before migration"
+                    )));
+                }
+            }
+            hook(WorkspaceSlotsV12MigrationStage::SlotsBackfilled)?;
+            store.validate_v12_schema()?;
             store.set_schema_version(STORE_SCHEMA_VERSION)?;
             Ok(())
         })
@@ -5874,6 +6112,27 @@ impl StateStore {
                 return Err(StackError::InvalidSpec(
                     "injected v10-to-v11 migration failure after pre-v11 records were refused"
                         .to_string(),
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    #[cfg(test)]
+    pub(super) fn migrate_workspace_slots_v11_to_v12_with_failpoint(
+        &self,
+        failpoint: WorkspaceSlotsV12MigrationFailpoint,
+    ) -> Result<(), StackError> {
+        self.migrate_workspace_slots_v11_to_v12_with_hook(|stage| {
+            if matches!(
+                (failpoint, stage),
+                (
+                    WorkspaceSlotsV12MigrationFailpoint::AfterSlotsBackfilled,
+                    WorkspaceSlotsV12MigrationStage::SlotsBackfilled
+                )
+            ) {
+                return Err(StackError::InvalidSpec(
+                    "injected v11-to-v12 migration failure after slots were backfilled".to_string(),
                 ));
             }
             Ok(())

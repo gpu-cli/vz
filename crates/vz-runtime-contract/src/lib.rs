@@ -102,5 +102,6 @@ pub use types::{
     TOPOLOGY_SCHEMA_VERSION, TargetSpec, TopologyCandidate, TopologyLifecycleError,
     TopologyResolutionError, TopologyValidationError, TransportProtocol, Volume, VolumeType,
     WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
-    default_namespace_config, migrate_legacy_developer_sandbox, verify_remote_cache_artifact,
+    default_namespace_config, migrate_legacy_developer_sandbox, validate_workspace_projection,
+    validate_workspace_source_path, verify_remote_cache_artifact,
 };

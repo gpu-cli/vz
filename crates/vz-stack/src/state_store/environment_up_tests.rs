@@ -1,5 +1,7 @@
 #![allow(clippy::unwrap_used)]
+
 use super::*;
+use std::collections::BTreeSet;
 use vz_runtime_contract::*;
 
 fn fixture() -> (
@@ -365,9 +367,10 @@ fn successful_completion_requires_the_exact_persisted_workspace_binding() {
         binding_id: WorkspaceBindingId::generate(),
         project_id: admission.project_id.clone(),
         environment_id: admission.environment_id.clone(),
-        name: "source".into(),
+        name: "worktree-source".into(),
         workspace_key: selection.workspace_key.unwrap(),
         path_hint: None,
+        slots: BTreeSet::from(["source".to_string()]),
     };
     let mut completion = EnvironmentUpCompletion {
         admission,

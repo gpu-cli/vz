@@ -276,6 +276,22 @@
       "receipt_field": "receipts.schema.environment_addressing_v11"
     },
     {
+      "id": "mig.schema.workspace_slots_v12",
+      "domain": "schema",
+      "component": "vz-stack state store workspace slot resolution v12 migration",
+      "source_reference": "crates/vz-stack/src/state_store/topology.rs migrate_workspace_slots_v11_to_v12, WorkspaceSlotsV12MigrationStage::SlotsBackfilled, WorkspaceSlotsV12MigrationFailpoint::AfterSlotsBackfilled",
+      "pre_state": "user_version 11; a workspace_bindings row's binding_json records only the minted binding name, so persisted state cannot answer which symbolic WorkspaceProjection slot that binding resolves and a definition naming a slot is rejected as a missing binding",
+      "post_state": "user_version advanced to 12 in one immediate transaction after every binding_json gains a slots resolution table derived from the pre-decision-8 rule that a projection had to name a binding's own name; the SQL shape is unchanged because v12 widens binding_json rather than the table, so the loaders' SELECT list and delete_exact_environment's per-table row counts are untouched",
+      "failure_injection": "abort at WorkspaceSlotsV12MigrationFailpoint::AfterSlotsBackfilled, after every binding_json is given its slots member and before the schema is validated and the version advanced",
+      "expected_failure_state": "the transaction rolls back, so every binding_json is byte-identical to the pre-migration one and user_version is still 11; reopening the store migrates it to 12 and the legacy-sandbox project aggregate loads with its slot resolved",
+      "rollback_assertion": "restoring the backup returns user_version to 11 with every binding_json byte-identical, since the backfill is confined to one immediate transaction and derives each slot set from the row's own name rather than inventing one",
+      "state_schema_step": {
+        "from": 11,
+        "to": 12
+      },
+      "receipt_field": "receipts.schema.workspace_slots_v12"
+    },
+    {
       "id": "mig.filesystem.legacy_checkpoint_archive",
       "domain": "filesystem",
       "component": "vz-runtimed legacy checkpoint artifact archival",
