@@ -385,12 +385,19 @@ impl RuntimeDaemon {
             )?;
         let mut prevalidation_pragmas = StateStorePragmas::daemon_defaults();
         prevalidation_pragmas.journal_mode_wal = false;
-        let state_store =
-            StateStore::open_with_pragmas(&config.state_store_path, prevalidation_pragmas)
-                .map_err(|source| RuntimedError::OpenStateStore {
-                    path: config.state_store_path.clone(),
-                    source,
-                })?;
+        // A store older than this build is migrated in place here. The backup
+        // that makes that reversible belongs with the runtime's own data, not
+        // beside whatever directory the state store happens to live in, so
+        // uninstall removes it with the rest of the runtime.
+        let state_store = StateStore::open_with_migration_backup_root(
+            &config.state_store_path,
+            prevalidation_pragmas,
+            Some(&config.runtime_data_dir),
+        )
+        .map_err(|source| RuntimedError::OpenStateStore {
+            path: config.state_store_path.clone(),
+            source,
+        })?;
         #[cfg(target_os = "macos")]
         control_socket.verify_state_store().map_err(|source| {
             RuntimedError::ControlSocketAdmission {

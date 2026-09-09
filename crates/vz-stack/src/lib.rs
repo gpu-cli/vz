@@ -69,6 +69,11 @@ pub use spec::{
     ServiceSecretRef, ServiceSpec, StackSpec, VolumeSpec,
 };
 pub use state_store::machine_boot_non_dispatch::MachineBootNonDispatchProof;
+pub use state_store::migration_backup::{
+    BACKUP_DIRNAME as STATE_STORE_BACKUP_DIRNAME,
+    FAILPOINT_AFTER_SCHEMA_MIGRATION as STATE_STORE_MIGRATION_FAILPOINT_AFTER_SCHEMA_MIGRATION,
+    FAILPOINT_ENV as STATE_STORE_MIGRATION_FAILPOINT_ENV, MigrationBackup, MigrationBackupRecord,
+};
 pub use state_store::{
     AllocatorSnapshot, CheckpointGcReport, CheckpointRetentionPolicy, CheckpointRetentionState,
     ClaimedAllocatorNetworkIp, ClaimedAllocatorRelease, ClaimedAllocatorResources,

@@ -1943,3 +1943,461 @@ def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> 
                                  "Machine-local state and stop/up above did pass; these clauses were "
                                  "not exercised and are not claimed.")
     return check.finish()
+
+
+# --------------------------------------------------------------------- criterion 19
+#
+# `gate.migration.install_upgrade_rollback_uninstall`: the installed-flow
+# clauses of criterion 19, each proved separately.
+#
+# Everything here happens inside a disposable prefix and a disposable HOME under
+# the lane state root. The uninstaller removes things, so it is never pointed at
+# the developer's own `~/.vz`: `VZ_INSTALL_DIR`, `HOME`, `VZ_RUNTIME_DATA_DIR`,
+# `VZ_RUNTIME_STATE_DB` and `VZ_DOCKER_CONFIG` are all lane-owned paths and the
+# environment the installer sees is built from scratch rather than inherited.
+MIGRATION_FIXTURE = "tests/fixtures/vz-0.4/migration/v0.3.20-state.db"
+MIGRATION_PROJECT = "tests/fixtures/vz-0.4/migration/project"
+INSTALLER = "scripts/install.sh"
+E2E_CONTRACT = "config/vz-0.4-e2e-contract.json"
+INSTALLED_BINARIES = ("vz", "vz-runtimed", "vz-guest-agent", "vz-agent-loader", "vz-macos-setup")
+# The legacy classification markers, from
+# `crates/vz-runtime-contract/src/types/{sandbox,topology}.rs`.
+LEGACY_DEVELOPER_LABEL = "vz.run.workspace"
+LEGACY_SPACE_MODE_LABEL = "vz.space.mode"
+LEGACY_SPACE_MODE_REQUIRED = "required"
+MIGRATION_FAILPOINT_ENV = "VZ_STATE_STORE_MIGRATION_FAILPOINT"
+MIGRATION_FAILPOINT = "after_schema_migration"
+# The migrated topology's own tables, and the four declared-topology projections
+# a legacy Hardened/generic record must not appear in.
+MIGRATED_TABLES = ("project_definitions", "environment_instances", "machine_instances", "workspace_bindings")
+DEFAULTED_TABLES = ("environment_host_imports", "environment_host_exports", "environment_machine_egress",
+                    "environment_network_attachments")
+DOCKER_CAPABILITIES = ("docker_engine", "compose", "buildx")
+MIGRATION_DEADLINE = 180
+INSTALL_TIMEOUT = 300
+RC_PREAMBLE = b"# a line this user had before vz\nexport EDITOR=vi\n"
+FOREIGN_BYTES = b"a file the user keeps under the vz prefix\n"
+# Where the pinned v0.3.20 daemon is looked for. It is ~22 MiB, so it is neither
+# committed nor downloaded from inside a check; the operator stages it once and
+# its digest is verified against the contract pin before it is executed.
+LEGACY_ARTIFACT_ENV = "VZ04_LEGACY_V0320_RUNTIMED"
+LEGACY_ARTIFACT_CACHE = ".cache/vz-0.4-legacy-v0.3.20/vz-runtimed-v0.3.20-darwin-arm64"
+
+
+def _sqlite_query(path: Path, sql: str, *, immutable: bool = False) -> list:
+    """Query a state store without writing to it.
+
+    `immutable` is for the checked-in fixture and nothing else: opening a store
+    in WAL mode the ordinary way creates `-wal`/`-shm` beside it, and a check
+    must not leave those in the source tree next to a digest-pinned file.
+    """
+    import sqlite3
+
+    if immutable:
+        connection = sqlite3.connect(f"file:{path}?immutable=1", uri=True)
+    else:
+        connection = sqlite3.connect(str(path))
+    try:
+        return connection.execute(sql).fetchall()
+    finally:
+        connection.close()
+
+
+def _schema_version(path: Path, *, immutable: bool = False):
+    try:
+        rows = _sqlite_query(path, "SELECT value FROM control_metadata WHERE key = 'schema_version'",
+                             immutable=immutable)
+    except Exception:  # noqa: BLE001 - a store mid-migration or absent is not an error here
+        return None
+    return rows[0][0] if rows else None
+
+
+def _table_rows(path: Path, table: str):
+    """Every row of `table`, or `None` when the table does not exist."""
+    try:
+        return _sqlite_query(path, f"SELECT * FROM {table}")
+    except Exception:  # noqa: BLE001 - an absent table is absent, not empty
+        return None
+
+
+def _machine_rows(path: Path) -> list:
+    return _sqlite_query(path, "SELECT machine_id, legacy_sandbox_id, instance_json FROM machine_instances")
+
+
+def _legacy_records(path: Path, *, immutable: bool = False) -> dict:
+    """`{sandbox_id: {...}}` from a legacy `sandbox_state` table."""
+    records = {}
+    for sandbox_id, state, backend, spec, labels in _sqlite_query(
+            path, "SELECT sandbox_id, state, backend, spec_json, labels_json FROM sandbox_state ORDER BY sandbox_id",
+            immutable=immutable):
+        parsed = json.loads(labels)
+        records[sandbox_id] = {
+            "state": state, "backend": backend, "spec": json.loads(spec), "labels": parsed,
+            "developer": LEGACY_DEVELOPER_LABEL in parsed,
+            "hardened": parsed.get(LEGACY_SPACE_MODE_LABEL) == LEGACY_SPACE_MODE_REQUIRED,
+        }
+    return records
+
+
+def _classify(records: dict) -> dict:
+    """Legacy ids by the classification 0.4 migration gives them."""
+    return {
+        "developer": sorted(i for i, r in records.items() if r["developer"] and not r["hardened"]),
+        "hardened": sorted(i for i, r in records.items() if r["hardened"]),
+        "generic": sorted(i for i, r in records.items() if not r["developer"] and not r["hardened"]),
+    }
+
+
+def _await_daemon(socket_path: Path, deadline: float, held) -> None:
+    """Wait for the daemon to finish opening the store: it serves or it dies.
+
+    Not "the schema version moved": the migrations commit one step at a time, so
+    an intermediate version is visible long before the store is migrated, and
+    stopping the daemon there would leave it half-migrated and judge that.
+    """
+    while time.monotonic() < deadline:
+        if socket_path.is_socket() or held.process.poll() is not None:
+            return
+        time.sleep(0.2)
+
+
+def _open_store(ctx: CheckContext, check: SubCheck, label: str, prefix: Path, database: Path, runtime: Path,
+                socket_path: Path, home: Path, *, failpoint: bool):
+    """Run the installed daemon over `database` until it migrates or dies."""
+    runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+    env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "NO_COLOR": "1", "HOME": str(home),
+           "TMPDIR": str(ctx.state.tmp), "VZ_RUNTIME_STATE_DB": str(database), "VZ_RUNTIME_DATA_DIR": str(runtime),
+           "VZ_RUNTIME_DAEMON_SOCKET": str(socket_path), "VZ_DOCKER_CONFIG": str(ctx.state.docker_config)}
+    if failpoint:
+        env[MIGRATION_FAILPOINT_ENV] = MIGRATION_FAILPOINT
+    held = ctx.recorder.start(label, [prefix / "bin/vz-runtimed", "--state-store-path", database,
+                                      "--runtime-data-dir", runtime, "--socket-path", socket_path],
+                              cwd=prefix, env=env, scenario_id=check.id, timeout=MIGRATION_DEADLINE)
+    _await_daemon(socket_path, time.monotonic() + MIGRATION_DEADLINE, held)
+    receipt = ctx.recorder.release(held)
+    check.evidence.extend(ctx.recorder.receipt_paths(receipt))
+    # Read after the daemon is gone: the store may be in WAL mode, so its schema
+    # version lives in the write-ahead log until the last connection closes.
+    return _schema_version(database), receipt
+
+
+def _backup_records(runtime: Path) -> list:
+    """`[(backup path, decoded sidecar or None)]` under one runtime data dir."""
+    directory = runtime / "state-store-backups"
+    if not directory.is_dir():
+        return []
+    rows = []
+    for path in sorted(directory.glob("*.bak.json")):
+        try:
+            rows.append((Path(str(path)[:-len(".json")]), json.loads(read_regular(path))))
+        except (OSError, json.JSONDecodeError):
+            rows.append((Path(str(path)[:-len(".json")]), None))
+    return rows
+
+
+def _legacy_artifact(ctx: CheckContext, check: SubCheck, pinned_digest: str, url: str):
+    """The pinned v0.3.20 daemon, or `None` with the reason recorded."""
+    if check.failures:
+        # `not_implemented` claims everything else ran and passed. Something has
+        # already failed, so this stays a failure and does not become a gap.
+        check.ok("the pinned v0.3.20 daemon was not consulted: earlier assertions in this check already failed")
+        return None
+    staged = os.environ.get(LEGACY_ARTIFACT_ENV) or str(ctx.repo_root / LEGACY_ARTIFACT_CACHE)
+    path = Path(staged)
+    if not path.is_file():
+        check.not_implemented = (
+            "criterion 19 requires the restored store to be usable by v0.3.20 itself, and the pinned v0.3.20 daemon "
+            f"was not staged, so the restored store was never opened by v0.3.20. Stage it once with: "
+            f"curl -sSfL --create-dirs -o {ctx.repo_root / LEGACY_ARTIFACT_CACHE} {url} "
+            f"(sha256 {pinned_digest}), or point {LEGACY_ARTIFACT_ENV} at a copy. Every other clause of this "
+            "check ran; see its assertions.")
+        return None
+    observed = digest_file(path)
+    if observed != pinned_digest:
+        check.fail(f"the staged v0.3.20 daemon at {path} is not the pinned artifact "
+                   f"(pinned {pinned_digest}, staged {observed})")
+        return None
+    check.ok(f"the pinned v0.3.20 daemon is staged at {path} with the contract's digest {pinned_digest}")
+    return path
+
+
+def check_migration_install_upgrade_rollback_uninstall(ctx: CheckContext, top: str) -> SubCheck:
+    """Clean install, upgrade from the pinned v0.3.20 fixture, injected failure, uninstall.
+
+    Every clause of criterion 19 is separated, because each fails for its own
+    reason and one verdict over the four would hide which:
+
+    * a clean 0.4 install places exactly the release's own binaries under a
+      disposable prefix and records the release version;
+    * the pinned v0.3.20 fixture is upgraded to exactly one Project, one
+      Environment and one Machine, and that Machine is compared field by field
+      against the legacy record it came from rather than merely counted;
+    * the same fixture, upgraded with a migration failure injected through the
+      installed daemon, ends byte-identical to the fixture and is opened again
+      by the pinned v0.3.20 daemon;
+    * the legacy Hardened and generic records acquire none of the four things
+      the criterion names -- Developer, Docker, host imports, egress -- each
+      checked on its own; and
+    * uninstall removes what vz installed and created and nothing else: a
+      foreign file under the prefix, the legacy project, the user's shell rc and
+      the user's Docker configuration are all compared before and after.
+
+    The fixture is deliberately substantive -- three legacy records, one of each
+    classification, and a Developer record carrying an image and resources -- so
+    that none of the counts below can be satisfied by an empty legacy store.
+    """
+    check = SubCheck(top, "install_upgrade_rollback_uninstall")
+    root = ctx.state.root / "migration"
+    prefix, home, project = root / "prefix", root / "home", root / "project"
+    docker_config, rc_file = home / ".docker", home / ".zshrc"
+    foreign = prefix / "keep-me.txt"
+    runtime = ctx.state.isolate_runtime("mig")
+    socket_path = runtime / "d.sock"
+    database = prefix / "stack-state.db"
+
+    fixture = ctx.repo_root / MIGRATION_FIXTURE
+    contract = load_json(ctx.repo_root / E2E_CONTRACT)["migration"]
+    if not fixture.is_file():
+        check.fail(f"the pinned v0.3.20 state fixture is missing: {fixture}")
+        return check.finish()
+    fixture_digest = digest_file(fixture)
+    check.check(contract["legacy_state_fixture"] == MIGRATION_FIXTURE and
+                contract["legacy_state_fixture_sha256"] == fixture_digest,
+                f"the fixture on disk is the one the contract pins (contract {contract['legacy_state_fixture']} "
+                f"{str(contract['legacy_state_fixture_sha256'])[:16]}, observed {MIGRATION_FIXTURE} {fixture_digest[:16]})")
+    check.check(contract["legacy_release_tag"] == "v0.3.20",
+                f"the pinned legacy tag is v0.3.20 (observed {contract['legacy_release_tag']!r})")
+    check.check(_schema_version(fixture, immutable=True) == "1",
+                f"the fixture is at the legacy schema version "
+                f"(observed {_schema_version(fixture, immutable=True)!r})")
+
+    legacy = _legacy_records(fixture, immutable=True)
+    kinds = _classify(legacy)
+    check.check(len(kinds["developer"]) == 1 and len(kinds["hardened"]) == 1 and len(kinds["generic"]) == 1,
+                f"the fixture carries one legacy record of each classification (observed {kinds})")
+    if check.status != "PASS":
+        return check.finish()
+    developer_id, hardened_id, generic_id = kinds["developer"][0], kinds["hardened"][0], kinds["generic"][0]
+    developer_spec = legacy[developer_id]["spec"]
+    check.check(bool(developer_spec.get("base_image_ref")) and bool(developer_spec.get("cpus")) and
+                bool(developer_spec.get("memory_mb")),
+                f"the legacy Developer record carries the data migration must preserve (spec {developer_spec})")
+
+    # -- clean 0.4 installation ---------------------------------------------------
+    for directory in (root, prefix, home, docker_config / "contexts/meta/vz04-unrelated"):
+        directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    shutil.copytree(ctx.repo_root / MIGRATION_PROJECT, project)
+    foreign.write_bytes(FOREIGN_BYTES)
+    rc_file.write_bytes(RC_PREAMBLE)
+    (docker_config / "config.json").write_bytes(b'{"currentContext":"desktop-linux"}\n')
+    (docker_config / "contexts/meta/vz04-unrelated/meta.json").write_bytes(b'{"Name":"vz04-unrelated"}\n')
+    before = {"docker": inventory(docker_config), "project": inventory(project)}
+
+    installer = ctx.repo_root / INSTALLER
+    install_env = {"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C", "NO_COLOR": "1", "HOME": str(home),
+                   "TMPDIR": str(ctx.state.tmp), "SHELL": "/bin/zsh", "VZ_INSTALL_DIR": str(prefix),
+                   "VZ_LOCAL_RELEASE_DIR": str(ctx.release_dir)}
+    # A candidate carrying no guest bundles cannot have them installed. Say which
+    # half ran rather than letting an absent bundle read as a passing install.
+    guest_bundles = (ctx.release_dir / "linux").is_dir()
+    if not guest_bundles:
+        install_env["VZ_NO_LINUX"] = "1"
+    installed = ctx.recorder.run("migration-install", ["/bin/bash", installer], cwd=root, env=install_env,
+                                 scenario_id=check.id, timeout=INSTALL_TIMEOUT)
+    check.evidence.extend(ctx.recorder.receipt_paths(installed))
+    check.check(installed.exit_code == 0, f"a clean 0.4 installation into {prefix} succeeds "
+                f"(exit {installed.exit_code}, {installed.stderr[-200:]!r})")
+    if installed.exit_code != 0:
+        return check.finish()
+    for name in INSTALLED_BINARIES:
+        target, source = prefix / "bin" / name, ctx.release_dir / "bin" / name
+        check.check(target.is_file() and os.access(target, os.X_OK) and digest_file(target) == digest_file(source),
+                    f"installed bin/{name} is the release's own executable")
+    recorded = (read_regular(prefix / ".installed-version").decode().strip()
+                if (prefix / ".installed-version").is_file() else None)
+    declared = load_json(ctx.release_dir / "release-manifest.json")["release_version"]
+    check.check(recorded == declared,
+                f"the installation records the release version (recorded {recorded!r}, release {declared!r})")
+    rc_installed = rc_file.read_bytes()
+    check.check(rc_installed.startswith(RC_PREAMBLE) and
+                f'export PATH="{prefix / "bin"}:$PATH"'.encode() in rc_installed,
+                "the installer added its PATH entry to the shell rc and kept what was already there")
+    if guest_bundles:
+        check.check((prefix / "linux/developer/version.json").is_file() and
+                    (prefix / "machine-target-catalog.json").is_file(),
+                    "the installation placed the release's guest bundle and wrote the installed machine-target catalog")
+    else:
+        check.ok("this candidate carries no linux/ guest bundles, so the installation ran with VZ_NO_LINUX=1 and the "
+                 "guest-bundle and machine-target-catalog half of installation was not exercised")
+
+    # -- upgrade from the pinned v0.3.20 fixture ----------------------------------
+    shutil.copyfile(fixture, database)
+    upgraded, upgrade_receipt = _open_store(ctx, check, "migration-upgrade", prefix, database, runtime, socket_path,
+                                            home, failpoint=False)
+    check.check(upgraded not in (None, "1") and str(upgraded).isdigit() and int(upgraded) > 1,
+                f"opening the v0.3.20 store with the installed daemon migrates it off the legacy schema "
+                f"(observed schema_version {upgraded!r}, daemon exit {upgrade_receipt.exit_code}, "
+                f"{upgrade_receipt.stderr[-200:]!r})")
+    if upgraded in (None, "1"):
+        return check.finish()
+    counts = {table: (None if _table_rows(database, table) is None else len(_table_rows(database, table)))
+              for table in MIGRATED_TABLES}
+    check.check(counts == {table: 1 for table in MIGRATED_TABLES},
+                f"the upgrade produced exactly one Project, Environment, Machine and WorkspaceBinding (observed {counts})")
+
+    # No early return on a wrong Machine count: the Hardened/generic claims below
+    # are exactly what a migration that adopted too much would break, and they
+    # have to be reached to say so.
+    machines = _machine_rows(database)
+    developer_rows = [row for row in machines if row[1] == developer_id]
+    check.check(len(developer_rows) == 1 and len(machines) == 1,
+                f"exactly one Machine was migrated and it is the legacy Developer record "
+                f"(all {[(row[0], row[1]) for row in machines]})")
+    for _machine_id, _legacy_id, instance_json in developer_rows:
+        instance = json.loads(instance_json)
+        check.check(instance.get("legacy_sandbox_id") == developer_id,
+                    f"the migrated Machine names the legacy sandbox it came from "
+                    f"(instance {instance.get('legacy_sandbox_id')!r}, legacy {developer_id!r})")
+        survived = {"image": (instance.get("target") or {}).get("image"),
+                    "cpus": (instance.get("resources") or {}).get("cpus"),
+                    "memory_mb": (instance.get("resources") or {}).get("memory_mb")}
+        expected = {"image": developer_spec.get("base_image_ref"), "cpus": developer_spec.get("cpus"),
+                    "memory_mb": developer_spec.get("memory_mb")}
+        check.check(survived == expected,
+                    f"the legacy record's image and resources survived the upgrade (legacy {expected}, "
+                    f"migrated {survived})")
+    environments = sorted(_sqlite_query(database, "SELECT name, legacy_sandbox_id FROM environment_instances"))
+    check.check(environments == [("default", developer_id)],
+                f"the one Environment is the legacy record's own (observed {environments})")
+
+    # -- legacy Hardened/generic records keep their meaning -----------------------
+    after_upgrade = _legacy_records(database)
+    for name, identifier in (("Hardened", hardened_id), ("generic", generic_id)):
+        original, current = legacy[identifier], after_upgrade.get(identifier)
+        check.check(current is not None and current["labels"] == original["labels"] and
+                    current["spec"] == original["spec"] and current["backend"] == original["backend"],
+                    f"the legacy {name} record {identifier} keeps its markers, spec and backend "
+                    f"(labels {None if current is None else current['labels']})")
+    check.check(after_upgrade.get(hardened_id, {}).get("hardened") is True,
+                f"the legacy Hardened record still reads as Hardened ({LEGACY_SPACE_MODE_LABEL}="
+                f"{after_upgrade.get(hardened_id, {}).get('labels', {}).get(LEGACY_SPACE_MODE_LABEL)!r})")
+    check.check(after_upgrade.get(generic_id, {}).get("developer") is False and
+                after_upgrade.get(generic_id, {}).get("hardened") is False,
+                f"the legacy generic record still carries neither marker "
+                f"(labels {sorted(after_upgrade.get(generic_id, {}).get('labels', {}))})")
+    # The four things the criterion says they must not acquire, one at a time.
+    foreign_ids = (hardened_id, generic_id)
+    adopted = [(row[0], row[1]) for row in _machine_rows(database) if row[1] in foreign_ids]
+    check.check(not adopted, f"no legacy Hardened or generic record acquired a Machine, so none acquired a Developer "
+                f"profile (observed {adopted})")
+    profiles = sorted({json.loads(row[2]).get("profile") for row in _machine_rows(database) if row[1] in foreign_ids})
+    check.check(not profiles, f"no Machine carrying a Hardened/generic legacy id declares a profile (observed {profiles})")
+    docker_granted = [row[1] for row in _machine_rows(database) if row[1] in foreign_ids and
+                      set(DOCKER_CAPABILITIES) &
+                      set((json.loads(row[2]).get("negotiated_capabilities") or {}).get("capabilities") or [])]
+    check.check(not docker_granted,
+                f"no legacy Hardened or generic record acquired Docker capabilities (observed {docker_granted})")
+    for table in DEFAULTED_TABLES:
+        rows = _table_rows(database, table)
+        check.check(rows == [], f"the upgrade created no {table} row for any legacy record, migrated or refused "
+                    f"(observed {'no such table' if rows is None else len(rows)})")
+    check.check(all(json.loads(row[2]).get("docker_context") in (None, {}) for row in _machine_rows(database)),
+                "the upgrade materialised no Docker context for any migrated Machine")
+
+    # -- a pre-migration backup exists, byte-identical to the fixture --------------
+    retained = _backup_records(runtime)
+    check.check(any(record and record.get("sha256") == fixture_digest and record.get("from_schema_version") == 1 and
+                    record.get("migration_completed") for _path, record in retained),
+                "the successful upgrade retained a completed pre-migration backup of the fixture's exact bytes "
+                f"(records {[r for _p, r in retained]})")
+    backup_digests = [digest_file(path) for path, _record in retained if path.is_file()]
+    check.check(fixture_digest in backup_digests, f"the retained backup file is byte-identical to the fixture "
+                f"(fixture {fixture_digest[:16]}, backups {[d[:16] for d in backup_digests]})")
+
+    # -- injected migration failure restores the backup ---------------------------
+    failed_runtime = ctx.state.isolate_runtime("migf")
+    shutil.copyfile(fixture, database)
+    failed_version, failed_receipt = _open_store(ctx, check, "migration-injected-failure", prefix, database,
+                                                 failed_runtime, failed_runtime / "d.sock", home, failpoint=True)
+    check.check(failed_receipt.exit_code not in (0, None),
+                f"the injected migration failure fails the installed daemon's start (exit {failed_receipt.exit_code})")
+    # Byte-identity of the store file is not enough on its own: this store is in
+    # WAL mode, so a half-migrated store can have identical main-file bytes and
+    # its newest committed state in the sidecar. The schema version is therefore
+    # read back through SQLite, which sees whatever the write-ahead log holds --
+    # a restore that left a v12 log behind reads as v12 and fails here.
+    sidecars = [suffix for suffix in ("-wal", "-shm", "-journal") if os.path.lexists(str(database) + suffix)]
+    check.check(failed_version == "1" and digest_file(database) == fixture_digest,
+                f"the failed migration left the store byte-identical to the v0.3.20 fixture and reading it through "
+                f"SQLite still answers the legacy schema version (schema_version {failed_version!r}, "
+                f"sha256 {digest_file(database)[:16]}, fixture {fixture_digest[:16]}, sidecars present {sidecars})")
+    restored = [record for _path, record in _backup_records(failed_runtime) if record]
+    check.check(any(record.get("restored") and record.get("sha256") == fixture_digest for record in restored),
+                f"the daemon records that it restored the backup (records {restored})")
+    check.check(_classify(_legacy_records(database)) == kinds,
+                f"every legacy record survived the failed migration (observed {_classify(_legacy_records(database))})")
+
+    # v0.3.20 must still be able to open what was restored. The pinned daemon is
+    # the component that owns the store, so it is the one run here; the v0.3.20
+    # CLI is not pinned by the contract and is not run.
+    legacy_daemon = _legacy_artifact(ctx, check, contract["legacy_artifact_sha256"], contract["legacy_artifact_url"])
+    if legacy_daemon is not None:
+        rollback_runtime = ctx.state.isolate_runtime("migr")
+        rollback_runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+        rollback_socket = rollback_runtime / "d.sock"
+        held = ctx.recorder.start("migration-v0320-rollback",
+                                  [legacy_daemon, "--state-store-path", database,
+                                   "--runtime-data-dir", rollback_runtime, "--socket-path", rollback_socket],
+                                  cwd=prefix, env={"PATH": "/usr/bin:/bin:/usr/sbin:/sbin", "LC_ALL": "C",
+                                                   "HOME": str(home), "TMPDIR": str(ctx.state.tmp)},
+                                  scenario_id=check.id, timeout=MIGRATION_DEADLINE)
+        deadline = time.monotonic() + 60
+        while time.monotonic() < deadline and not rollback_socket.is_socket() and held.process.poll() is None:
+            time.sleep(0.2)
+        served = rollback_socket.is_socket()
+        rollback = ctx.recorder.release(held)
+        check.evidence.extend(ctx.recorder.receipt_paths(rollback))
+        check.check(served, f"the pinned v0.3.20 daemon opened the restored store and served its socket "
+                    f"(exit {rollback.exit_code}, {rollback.stderr[-200:]!r})")
+        # v0.3.20 owns the store it opened and reconciles it, so its bytes are
+        # allowed to change here. What rollback means is that it still reads its
+        # own schema and still holds its own records afterwards.
+        after_rollback = _legacy_records(database)
+        check.check(_schema_version(database) == "1" and _classify(after_rollback) == kinds,
+                    f"after v0.3.20 owned the restored store it is still the legacy schema holding every legacy "
+                    f"record (schema_version {_schema_version(database)!r}, {_classify(after_rollback)})")
+        check.check(all(after_rollback[identifier]["labels"] == legacy[identifier]["labels"] and
+                        after_rollback[identifier]["spec"] == legacy[identifier]["spec"]
+                        for identifier in legacy if identifier in after_rollback),
+                    "every legacy record kept its markers and spec across the v0.3.20 rollback")
+
+    # -- uninstall removes only vz-owned resources --------------------------------
+    uninstall_env = dict(install_env)
+    uninstall_env.pop("VZ_LOCAL_RELEASE_DIR")
+    uninstall_env.update({"VZ_RUNTIME_STATE_DB": str(database), "VZ_RUNTIME_DATA_DIR": str(runtime)})
+    owned = (prefix / "bin/vz", prefix / ".installed-version", database, runtime)
+    present_before = [path for path in owned if os.path.lexists(path)]
+    check.check(len(present_before) == len(owned),
+                f"every vz-owned path exists before uninstall (present {[str(p) for p in present_before]})")
+    removed = ctx.recorder.run("migration-uninstall", ["/bin/bash", installer, "--uninstall"], cwd=root,
+                               env=uninstall_env, scenario_id=check.id, timeout=INSTALL_TIMEOUT)
+    check.evidence.extend(ctx.recorder.receipt_paths(removed))
+    check.check(removed.exit_code == 0, f"uninstall succeeds (exit {removed.exit_code}, {removed.stderr[-200:]!r})")
+    reported = [line for line in removed.stdout.decode("utf-8", "replace").splitlines()
+                if line.strip().startswith("removed:")]
+    check.check(len(reported) >= len(INSTALLED_BINARIES),
+                f"uninstall reports what it removed rather than finding nothing to remove ({len(reported)} path(s))")
+    survivors = [str(path) for path in owned if os.path.lexists(path)]
+    check.check(not survivors, f"uninstall removed the installed software and the vz-owned runtime resources "
+                f"(surviving {survivors})")
+    check.check(foreign.is_file() and foreign.read_bytes() == FOREIGN_BYTES,
+                f"a file the user keeps under the prefix survives uninstall ({foreign})")
+    check.check(inventory(project) == before["project"],
+                "the legacy project directory is byte-identical after uninstall")
+    check.check(inventory(docker_config) == before["docker"],
+                "unrelated Docker configuration is byte-identical after uninstall")
+    rc_text = rc_file.read_bytes()
+    check.check(rc_text.startswith(RC_PREAMBLE), "uninstall kept the shell rc lines that were not vz's")
+    check.check(f'export PATH="{prefix / "bin"}:$PATH"'.encode() not in rc_text and b"# vz\n" not in rc_text,
+                f"uninstall removed its own PATH entry from the shell rc (rc now {rc_text!r})")
+    return check.finish()

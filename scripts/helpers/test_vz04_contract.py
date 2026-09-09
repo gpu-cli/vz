@@ -215,3 +215,46 @@ class NativeMacosPinTests(unittest.TestCase):
         self.assertIn("xcodebuild -license accept", toolchain)
         self.assertIn("accept_xcode_license", toolchain)
 
+
+
+class InstallerComponentTests(unittest.TestCase):
+    """The installer's binary list against the release contract's.
+
+    `scripts/install.sh` installs the host binaries and `--uninstall` removes
+    them. Criterion 19 claims uninstall removes only, and all of, vz-owned
+    software, which is only true while that list is the release's list.
+
+    It was not: install and uninstall each carried their own hand-written copy,
+    and adding a sixth binary (`vz-runtime-probe`) to one left the other at
+    five, so an uninstall silently stranded it. Both now read one `VZ_BINARIES`,
+    and this compares that one to the contract rather than to a third copy
+    written here -- a restated list would drift the same way.
+    """
+
+    INSTALL = common.REPO_ROOT / "scripts/install.sh"
+
+    def declared_binaries(self) -> list:
+        match = re.search(r'^VZ_BINARIES="([^"]*)"', self.INSTALL.read_text(), re.M)
+        self.assertIsNotNone(match, "install.sh declares no VZ_BINARIES")
+        return match.group(1).split()
+
+    def test_the_installer_owns_exactly_the_release_host_binaries(self):
+        contract = common.load_json(common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"])
+        required = contract["release"]["required_components"]
+        expected = sorted(path.split("/", 1)[1] for path in required if path.startswith("bin/"))
+        self.assertEqual(sorted(self.declared_binaries()), expected)
+
+    def test_install_and_uninstall_read_the_same_list(self):
+        text = self.INSTALL.read_text()
+        # One definition, and every consumer a loop over it: a second literal
+        # spelling of the set is the defect this test exists to prevent.
+        self.assertEqual(len(re.findall(r'^VZ_BINARIES=', text, re.M)), 1)
+        self.assertEqual(len(re.findall(r'for binary in \$VZ_BINARIES; do', text)), 2)
+
+    def test_the_reader_would_notice_a_shortened_list(self):
+        """Vacuity: the comparison must be capable of failing."""
+        shortened = sorted(self.declared_binaries())[:-1]
+        contract = common.load_json(common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"])
+        expected = sorted(path.split("/", 1)[1] for path in contract["release"]["required_components"]
+                          if path.startswith("bin/"))
+        self.assertNotEqual(shortened, expected)

@@ -8,3 +8,11 @@ __pycache__/
 # Gate run-frozen inputs, acquired from their checked-in pins and cached by
 # the pin's own digest. Reproducible, so never committed.
 .cache/
+
+# The pinned v0.3.20 migration fixture is a checked-in gate input, not a
+# build artifact, and `*.db` above would otherwise hide it.
+!tests/fixtures/vz-0.4/migration/*.db
+
+# Agent worktrees live inside the repo. They are git worktrees, so `git add -A`
+# records each as a gitlink and sweeps a nested checkout into the index.
+.claude/worktrees/
