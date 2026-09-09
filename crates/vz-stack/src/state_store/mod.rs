@@ -1183,7 +1183,8 @@ impl StateStore {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             2 => {
                 self.migrate_topology_v2_to_v3()?;
@@ -1194,7 +1195,8 @@ impl StateStore {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             3 => {
                 self.migrate_stack_journal_v3_to_v4()?;
@@ -1204,7 +1206,8 @@ impl StateStore {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             4 => {
                 self.migrate_replica_v4_to_v5()?;
@@ -1213,7 +1216,8 @@ impl StateStore {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             5 => {
                 self.migrate_reconcile_v5_to_v6()?;
@@ -1221,32 +1225,41 @@ impl StateStore {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             6 => {
                 self.migrate_claim_v6_to_v7()?;
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             7 => {
                 self.migrate_teardown_finalizer_v7_to_v8()?;
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             8 => {
                 self.migrate_teardown_runtime_identity_v8_to_v9()?;
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
             9 => {
                 self.migrate_environment_network_v9_to_v10()?;
-                self.migrate_environment_addressing_v10_to_v11()
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
             }
-            10 => self.migrate_environment_addressing_v10_to_v11(),
-            topology::STORE_SCHEMA_VERSION => self.validate_v11_schema(),
+            10 => {
+                self.migrate_environment_addressing_v10_to_v11()?;
+                self.migrate_workspace_slots_v11_to_v12()
+            }
+            11 => self.migrate_workspace_slots_v11_to_v12(),
+            topology::STORE_SCHEMA_VERSION => self.validate_v12_schema(),
             future if future > topology::STORE_SCHEMA_VERSION => {
                 Err(StackError::InvalidSpec(format!(
                     "state schema version {future} is newer than supported version {}",

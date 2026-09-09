@@ -81,6 +81,10 @@ pub struct WorkspaceProjection {
     pub target_path: ::prost::alloc::string::String,
     #[prost(enumeration = "WorkspaceProjectionMode", tag = "3")]
     pub mode: i32,
+    /// Host source declared RELATIVE to the worktree root. Absolute paths, ".."
+    /// components and symlinks escaping the root are refused at resolve time.
+    #[prost(string, tag = "4")]
+    pub source_path: ::prost::alloc::string::String,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineSpec {
@@ -219,6 +223,10 @@ pub struct WorkspaceBinding {
     pub path_hint: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(string, tag = "7")]
     pub name: ::prost::alloc::string::String,
+    /// Durable symbolic-slot -> minted-binding resolution table. Each entry is a
+    /// `WorkspaceProjection.binding` slot resolved by this minted binding.
+    #[prost(string, repeated, tag = "8")]
+    pub slots: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct MachineIncarnation {
@@ -799,6 +807,10 @@ pub struct UpEnvironmentRequest {
     pub path_hint: ::core::option::Option<::prost::alloc::string::String>,
     #[prost(uint64, tag = "7")]
     pub timeout_millis: u64,
+    /// Authoritative canonical absolute worktree root for workspace projections.
+    /// Unlike path_hint this is authorizing and enters the Up request hash.
+    #[prost(string, optional, tag = "8")]
+    pub workspace_root: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct EnvironmentUpAdmission {

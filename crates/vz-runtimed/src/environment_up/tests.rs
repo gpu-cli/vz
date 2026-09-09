@@ -27,6 +27,7 @@ fn fixture() -> (
         root,
         daemon,
         EnvironmentUpRequest {
+            workspace_root: None,
             definition,
             selection: EnvironmentSelectionContext {
                 workspace_key: Some("opaque-worktree".into()),
@@ -244,6 +245,7 @@ async fn declared_networks_and_endpoints_still_reject_before_project_creation() 
 async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     let (_root, daemon, mut request, mut metadata) = fixture();
     request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+        source_path: "src".to_string(),
         binding: "source".into(),
         target_path: "/src".into(),
         mode: WorkspaceProjectionMode::ReadOnly,

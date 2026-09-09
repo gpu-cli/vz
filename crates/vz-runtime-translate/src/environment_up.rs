@@ -32,6 +32,7 @@ pub fn environment_up_request_from_proto(
             workspace_key: value.workspace_key.clone(),
         },
         path_hint: value.path_hint.clone(),
+        workspace_root: value.workspace_root.clone(),
         timeout_millis: value.timeout_millis,
     };
     request.request_hash()?;

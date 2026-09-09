@@ -93,6 +93,7 @@ mod tests {
             process_environment_id: Some("env_ignored".into()),
             workspace_key: Some("opaque".into()),
             path_hint: Some("/diagnostic".into()),
+            workspace_root: Some("/authoritative/worktree".into()),
             timeout_millis: 300_000,
         };
         assert_eq!(
@@ -834,7 +835,12 @@ mod tests {
             ),
             (
                 "WorkspaceProjection",
-                &[("binding", 1), ("target_path", 2), ("mode", 3)],
+                &[
+                    ("binding", 1),
+                    ("target_path", 2),
+                    ("mode", 3),
+                    ("source_path", 4),
+                ],
             ),
             (
                 "MachineSpec",
@@ -920,6 +926,7 @@ mod tests {
                     ("workspace_key", 5),
                     ("path_hint", 6),
                     ("name", 7),
+                    ("slots", 8),
                 ],
             ),
             (
@@ -1199,6 +1206,7 @@ mod tests {
                     ("workspace_key", 5),
                     ("path_hint", 6),
                     ("timeout_millis", 7),
+                    ("workspace_root", 8),
                 ],
             ),
             (
@@ -1669,6 +1677,7 @@ mod tests {
                 binding: "checkout".into(),
                 target_path: "/workspace".into(),
                 mode: WorkspaceProjectionMode::ReadWrite as i32,
+                source_path: "services/checkout".into(),
             }),
         };
         let network_spec = NetworkSpec {
@@ -1707,7 +1716,9 @@ mod tests {
             environment_id: "env_agent_a".into(),
             workspace_key: "git-worktree:agent-a".into(),
             path_hint: Some("/relocatable/agent-a".into()),
-            name: "checkout".into(),
+            // Opaque minted identity; the symbolic slot lives in `slots`.
+            name: "worktree-0f1e2d3c".into(),
+            slots: vec!["checkout".into()],
         };
         let machine = MachineInstance {
             docker_context: None,

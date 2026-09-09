@@ -14,6 +14,17 @@ pub struct EnvironmentUpRequest {
     pub definition: super::ProjectDefinition,
     pub selection: super::EnvironmentSelectionContext,
     pub path_hint: Option<String>,
+    /// Authoritative canonical absolute worktree root for workspace projections.
+    ///
+    /// This is deliberately NOT `path_hint`. `path_hint` is diagnostic and
+    /// excluded from the mutation identity, so authorizing a host share from it
+    /// would let two Ups with different roots share one idempotency key. This
+    /// field is authorizing and enters `request_hash`, which is what makes the
+    /// resolved projection path part of the mutation identity: the resolved
+    /// path is a function of this root and the definition's declared relative
+    /// `source_path`, and both are hashed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_root: Option<String>,
     pub timeout_millis: u64,
 }
 
@@ -29,8 +40,13 @@ impl EnvironmentUpRequest {
         if selection.explicit.is_some() {
             selection.process_environment_id = None;
         }
-        let bytes = serde_json::to_vec(&(&self.definition, selection, self.timeout_millis))
-            .map_err(|error| error.to_string())?;
+        let bytes = serde_json::to_vec(&(
+            &self.definition,
+            selection,
+            &self.workspace_root,
+            self.timeout_millis,
+        ))
+        .map_err(|error| error.to_string())?;
         Ok(format!("sha256:{:x}", Sha256::digest(bytes)))
     }
 }

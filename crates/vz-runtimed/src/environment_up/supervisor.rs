@@ -1,4 +1,7 @@
+use std::collections::BTreeSet;
+
 use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
+use super::workspace_projection;
 use super::*;
 use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
 use crate::machine_docker_endpoint::MachineDockerEndpoint;
@@ -255,6 +258,64 @@ impl RuntimeDaemon {
             )
             .await
             .map_err(|error| backend_error(error.to_string()))?;
+        // Workspace projections are resolved here for the same reason the
+        // fabric is: a VirtioFS share is fixed when `LinuxVm::create` runs, so
+        // a share cannot be minted inside the loop that boots the Machine
+        // holding it. Decision 8's slot resolution therefore has to be durable
+        // BEFORE the first boot, not published with the success binding after
+        // the last one.
+        let declared_slots =
+            workspace_projection::declared_workspace_slots(&request.definition.environment);
+        let mut workspace_mounts = if declared_slots.is_empty() {
+            BTreeMap::new()
+        } else {
+            let workspace_key = request.selection.workspace_key.as_deref().ok_or_else(|| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::ValidationError,
+                    "declared workspace projection requires a worktree binding token",
+                )
+            })?;
+            let mut resolved: BTreeSet<String> = environment
+                .bindings
+                .iter()
+                .flat_map(|binding| binding.slots.iter().cloned())
+                .collect();
+            if !declared_slots.is_subset(&resolved) {
+                let binding = WorkspaceBinding {
+                    schema_version: 1,
+                    binding_id: WorkspaceBindingId::generate(),
+                    project_id: environment.project_id.clone(),
+                    environment_id: environment.environment_id.clone(),
+                    name: workspace_projection::minted_binding_name(workspace_key),
+                    workspace_key: workspace_key.to_string(),
+                    path_hint: request.path_hint.clone(),
+                    slots: declared_slots.clone(),
+                };
+                let reserved = self
+                    .with_state_store(|store| {
+                        store.reserve_workspace_binding_for_environment(
+                            &binding,
+                            current_unix_secs(),
+                        )
+                    })
+                    .map_err(state_error)?;
+                resolved.extend(reserved.slots);
+            }
+            workspace_projection::resolve_environment_workspace_mounts(
+                &request.definition.environment,
+                &environment.machines,
+                &resolved,
+                request.workspace_root.as_deref(),
+            )
+            .map_err(|error| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::ValidationError,
+                    error.to_string(),
+                )
+            })?
+        };
         let mut first_error = None;
         let mut uncertain = false;
         for step in operation.machine_steps.clone() {
@@ -292,7 +353,9 @@ impl RuntimeDaemon {
                     self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                     self.with_state_store(|store|store.consume_machine_boot_non_dispatch(&operation,&step.machine_id)).map_err(state_error)?;
                     let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,vec![],attachments,StackResourceHint {
-                        cpus:Some(cpus),memory_mb:Some(memory_mb),..Default::default()
+                        cpus:Some(cpus),memory_mb:Some(memory_mb),
+                        volume_mounts:workspace_mounts.remove(&step.machine_id).unwrap_or_default(),
+                        ..Default::default()
                     }).await {
                         Ok(activation)=>(Arc::new(activation),None),
                         Err(MachineRuntimeActivationError::NativeStart {error,activation})=>(Arc::from(activation),Some(error)),
@@ -410,6 +473,7 @@ impl RuntimeDaemon {
                     },
                     workspace_key: workspace_key.clone(),
                     path_hint: request.path_hint,
+                    slots: declared_slots.clone(),
                 };
                 if let Err(error) = self.with_state_store(|store| {
                     if tokio::time::Instant::now() >= deadline

@@ -3,11 +3,12 @@
 use super::topology::{
     ClaimV7MigrationFailpoint, EnvironmentAddressingV11MigrationFailpoint,
     EnvironmentNetworkV10MigrationFailpoint, TeardownFinalizerV8MigrationFailpoint,
+    WorkspaceSlotsV12MigrationFailpoint,
 };
 use super::*;
 use crate::spec::{NetworkSpec, ServiceKind, ServiceSpec, VolumeSpec};
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use vz_runtime_contract::types::{
     Architecture, CapabilitySet, EgressId, EgressInstance, EgressPolicy, EndpointId,
     EndpointInstance, EndpointProtocol, EndpointSpec as TopologyEndpointSpec, EnvironmentId,
@@ -252,6 +253,7 @@ fn topology_project_state(
             binding: "workspace".to_string(),
             target_path: "/workspace".to_string(),
             mode: WorkspaceProjectionMode::ReadWrite,
+            source_path: ".".to_string(),
         }),
     };
     let definition = ProjectDefinition {
@@ -323,9 +325,10 @@ fn topology_project_state(
                     binding_id: WorkspaceBindingId::new(format!("wsp_{name}")).unwrap(),
                     project_id: project_id.clone(),
                     environment_id: environment_id.clone(),
-                    name: "workspace".to_string(),
+                    name: format!("worktree-{name}"),
                     workspace_key: "same-worktree-key".to_string(),
                     path_hint: Some(path_hint.to_string()),
+                    slots: BTreeSet::from(["workspace".to_string()]),
                 }],
                 machines: vec![MachineInstance {
                     docker_context: None,
@@ -3535,7 +3538,7 @@ fn phase2_control_metadata_crud() {
 fn phase2_schema_version_defaults_to_current() {
     let store = StateStore::in_memory().unwrap();
     let version = store.schema_version().unwrap();
-    assert_eq!(version, 11);
+    assert_eq!(version, 12);
 }
 
 #[test]
@@ -4636,7 +4639,7 @@ fn phase2_validation_schema_version_survives_reopen() {
     // Drop store (close connection), reopen
     {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
     }
 }
 
@@ -5238,7 +5241,7 @@ fn environment_network_topology_round_trips_through_normalized_projections() {
 
     {
         let store = StateStore::open(&path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
         store.save_project_state(&expected).unwrap();
         for (table, column) in [
             ("environment_network_attachments", "attachment_id"),
@@ -5329,8 +5332,8 @@ fn v9_to_v10_environment_network_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
-    reopened.validate_v11_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    reopened.validate_v12_schema().unwrap();
     for object in [
         "environment_network_attachments",
         "environment_host_exports",
@@ -5520,8 +5523,8 @@ fn v10_to_v11_addressing_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
-    reopened.validate_v11_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    reopened.validate_v12_schema().unwrap();
     let loaded = reopened
         .load_project_state("prj_v10_addressing")
         .unwrap()
@@ -5546,7 +5549,7 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
         let store = StateStore::open(&first_path).unwrap();
         store.save_project_state(&expected).unwrap();
         assert_eq!(store.list_project_states().unwrap(), vec![expected.clone()]);
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
         let definition_json: String = store
             .conn
             .query_row(
@@ -5583,7 +5586,12 @@ fn topology_complete_aggregate_round_trips_after_database_relocation() {
             store
                 .conn
                 .query_row(
-                    "SELECT COUNT(*) FROM workspace_bindings WHERE name = 'workspace'",
+                    // Relocation must carry the durable slot resolution table,
+                    // not just the opaque minted name.
+                    "SELECT COUNT(*) FROM workspace_bindings
+                     WHERE name LIKE 'worktree-%'
+                       AND EXISTS (SELECT 1 FROM json_each(binding_json, '$.slots')
+                                   WHERE json_each.value = 'workspace')",
                     [],
                     |row| row.get::<_, i64>(0)
                 )
@@ -5910,6 +5918,7 @@ fn persisted_topology_parent_child_comparison_is_stable_identity_ordered() {
         name: "secondary".to_string(),
         workspace_key: "secondary-worktree-key".to_string(),
         path_hint: Some("/secondary".to_string()),
+        slots: BTreeSet::new(),
     });
     state.validate().unwrap();
     store.save_project_state(&state).unwrap();
@@ -8214,7 +8223,7 @@ fn v2_to_v3_failure_rolls_back_schema_rows_and_version_then_retries() {
     drop(store);
 
     let retried = StateStore::open(&db_path).expect("v2-to-v3 migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 11);
+    assert_eq!(retried.schema_version().unwrap(), 12);
     assert_eq!(
         retried.load_project_state("prj_v2_failpoint").unwrap(),
         Some(expected)
@@ -8272,7 +8281,7 @@ fn v0_3_20_developer_migration_is_atomic_idempotent_and_preserves_legacy_rows() 
 
     let migrated = {
         let store = StateStore::open(&db_path).unwrap();
-        assert_eq!(store.schema_version().unwrap(), 11);
+        assert_eq!(store.schema_version().unwrap(), 12);
         assert_eq!(
             store
                 .conn
@@ -8507,7 +8516,7 @@ fn v0_3_20_migration_failure_after_partial_write_rolls_back_and_retries() {
     drop(connection);
 
     let retried = StateStore::open(&db_path).expect("migration retry must succeed");
-    assert_eq!(retried.schema_version().unwrap(), 11);
+    assert_eq!(retried.schema_version().unwrap(), 12);
     let projects = retried.list_project_states().unwrap();
     assert_eq!(projects.len(), 1);
     assert_eq!(
@@ -8654,7 +8663,7 @@ fn future_and_incomplete_v4_schemas_are_rejected_without_repair() {
         .err()
         .expect("incomplete v4 schema must fail")
         .to_string();
-    assert!(error.contains("state schema v11 shape mismatch"));
+    assert!(error.contains("state schema v12 shape mismatch"));
     assert!(error.contains("table:environment_endpoints"));
     let conn = Connection::open(&incomplete_path).unwrap();
     assert_eq!(
@@ -8683,7 +8692,7 @@ fn malformed_current_columns_and_foreign_key_data_are_rejected() {
             .unwrap();
     }
     let error = StateStore::open(&column_path).err().unwrap().to_string();
-    assert!(error.contains("state schema v11 shape mismatch"));
+    assert!(error.contains("state schema v12 shape mismatch"));
     assert!(error.contains("table:project_definitions"));
 
     let constraint_dir = tempfile::tempdir().unwrap();
@@ -8788,7 +8797,7 @@ fn v4_open_rejects_noncanonical_legacy_schema_objects_without_repair() {
             .expect("noncanonical v4 schema must fail")
             .to_string();
         assert!(
-            error.contains("state schema v11 shape mismatch"),
+            error.contains("state schema v12 shape mismatch"),
             "unexpected error for {name}: {error}"
         );
         assert!(
@@ -9159,10 +9168,10 @@ fn migration_v4_schema_detectable() {
         .get_control_metadata("schema_version")
         .unwrap()
         .expect("schema_version should be set on first init");
-    assert_eq!(version_str, "11");
+    assert_eq!(version_str, "12");
 
     // The typed accessor must agree.
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
 
     // created_at must also be set.
     assert!(
@@ -9222,7 +9231,7 @@ fn migration_old_data_readable_after_schema_update() {
 
     // Schema version must not have been overwritten by re-init
     // (INSERT OR IGNORE preserves original value).
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
 }
 
 /// Verify that all existing queries continue to work correctly after new
@@ -9304,7 +9313,7 @@ fn migration_new_tables_dont_break_old_queries() {
     assert_eq!(loaded.checkpoint_id, "ckpt-1");
 
     // Schema version still intact.
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
 }
 
 fn journal_fixture(
@@ -9761,7 +9770,7 @@ fn v3_to_v4_stack_journal_migration_rolls_back_and_retries() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     assert_eq!(
         reopened.load_project_state("prj_journal").unwrap(),
         Some(project)
@@ -9804,7 +9813,7 @@ fn v4_to_v5_replica_migration_rolls_back_then_reopens_and_quarantines_zero() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     assert!(
         reopened
             .load_observed_state("legacy-stack")
@@ -10461,7 +10470,7 @@ fn v4_to_v5_quarantines_terminal_legacy_history_and_preserves_namespace_fences()
 #[test]
 fn fresh_store_uses_v7_reconcile_claim_schema_and_replica_claim_index() {
     let store = StateStore::in_memory().unwrap();
-    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(store.schema_version().unwrap(), 12);
 
     for table in ["reconcile_sessions", "reconcile_progress"] {
         let sql: String = store
@@ -10750,7 +10759,7 @@ fn v5_to_v6_failpoints_roll_back_then_reopen_and_retry() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 11);
+        assert_eq!(reopened.schema_version().unwrap(), 12);
         assert_eq!(
             reopened
                 .conn
@@ -10849,8 +10858,8 @@ fn v7_to_v8_teardown_finalizer_migration_rolls_back_then_reopens() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
-    reopened.validate_v11_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    reopened.validate_v12_schema().unwrap();
     for object in [
         "teardown_finalizers",
         "teardown_one_active_workload",
@@ -10922,7 +10931,7 @@ fn v7_to_v8_preserves_terminal_claimed_teardown_history() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     let session = reopened
         .load_reconcile_session(session_id)
         .unwrap()
@@ -10939,8 +10948,8 @@ fn v8_to_v9_adds_exact_runtime_identity_projection() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
-    reopened.validate_v11_schema().unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    reopened.validate_v12_schema().unwrap();
     let column_count: i64 = reopened
         .conn
         .query_row(
@@ -11503,7 +11512,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     for trigger in [
         "reconcile_session_identity_immutable",
         "reconcile_audit_identity_immutable",
@@ -11521,7 +11530,7 @@ fn v6_to_v7_claim_migration_rolls_back_then_reopens_with_immutable_identity() {
             1
         );
     }
-    reopened.validate_v11_schema().unwrap();
+    reopened.validate_v12_schema().unwrap();
 }
 
 #[test]
@@ -11594,7 +11603,7 @@ fn v6_to_v7_preserves_effect_free_active_session_and_terminal_history() {
         drop(store);
 
         let reopened = StateStore::open(&path).unwrap();
-        assert_eq!(reopened.schema_version().unwrap(), 11);
+        assert_eq!(reopened.schema_version().unwrap(), 12);
         assert_eq!(
             reopened
                 .load_reconcile_session_actions(&session_id)
@@ -11665,7 +11674,7 @@ fn v6_to_v7_preserves_terminal_history_beside_one_effect_free_active_session() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     assert_eq!(
         reopened
             .load_audit_log_for_session("rs-v6-terminal")
@@ -11787,7 +11796,7 @@ fn v6_to_v7_preserves_length_framed_whitespace_ids_for_atomic_claim() {
     };
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     assert_eq!(
         crate::reconcile::ReconcileActionExecutionKey::new(
             session_id,
@@ -11852,7 +11861,7 @@ fn v7_reopen_preserves_v3_actions_and_started_claim_uniqueness() {
     drop(store);
 
     let reopened = StateStore::open(&path).unwrap();
-    assert_eq!(reopened.schema_version().unwrap(), 11);
+    assert_eq!(reopened.schema_version().unwrap(), 12);
     assert_eq!(
         reopened
             .load_reconcile_session_actions(&session.session_id)
@@ -13566,7 +13575,7 @@ fn stack_v4_schema_refresh_replaces_incarnation_scoped_history_guards() {
         .unwrap();
     assert!(index_sql.contains("project_id"));
     assert!(!index_sql.contains("machine_incarnation_id"));
-    store.validate_v11_schema().unwrap();
+    store.validate_v12_schema().unwrap();
 }
 
 #[test]
@@ -14270,9 +14279,10 @@ fn topology_create_and_binding_mutations_never_rewrite_active_sibling_rows() {
         binding_id: WorkspaceBindingId::generate(),
         project_id: definition.project_id.clone(),
         environment_id: created.environment_id,
-        name: "workspace".to_string(),
+        name: "worktree-narrow-created".to_string(),
         workspace_key: "narrow-created-workspace".to_string(),
         path_hint: Some("/created".to_string()),
+        slots: BTreeSet::from(["workspace".to_string()]),
     };
     store
         .reserve_workspace_binding_for_environment(&reserved, 201)
@@ -14334,9 +14344,11 @@ fn creating_environment_can_reserve_declared_workspace_before_reconciliation() {
         binding_id: WorkspaceBindingId::generate(),
         project_id: definition.project_id.clone(),
         environment_id: environment.environment_id.clone(),
-        name: "workspace".to_string(),
+        // Decision 8: the minted name is opaque and never the symbolic slot.
+        name: "worktree-opaque".to_string(),
         workspace_key: "opaque-worktree-token".to_string(),
         path_hint: Some("/diagnostic/checkout".to_string()),
+        slots: BTreeSet::from(["workspace".to_string()]),
     };
     assert_eq!(
         store
@@ -20253,5 +20265,479 @@ fn exact_batch_successful_subsets_advance_monotonically_until_completion() {
             .load_reconcile_progress(&session.stack_name)
             .unwrap()
             .is_none()
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Durable symbolic-slot -> minted-binding resolution table (owner decision 8).
+// ---------------------------------------------------------------------------
+
+/// Put a store back into the v11 shape: strip the `slots` member every v12
+/// `binding_json` carries and drop `user_version` to 11. v11 and v12 share one
+/// SQL shape, so this is exactly the difference the migration closes.
+fn downgrade_workspace_slots_fixture_to_v11(store: &StateStore) {
+    store
+        .conn
+        .execute(
+            "UPDATE workspace_bindings
+             SET binding_json = json_remove(binding_json, '$.slots')",
+            [],
+        )
+        .unwrap();
+    // The binding record is mirrored in the parent Environment aggregate, and a
+    // real v11 database has no `slots` in either place.
+    let environments: Vec<(String, String)> = store
+        .conn
+        .prepare("SELECT environment_id, instance_json FROM environment_instances")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (environment_id, json) in environments {
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if let Some(bindings) = value
+            .get_mut("bindings")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for binding in bindings.iter_mut() {
+                if let Some(fields) = binding.as_object_mut() {
+                    fields.remove("slots");
+                }
+            }
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE environment_instances SET instance_json = ?2 WHERE environment_id = ?1",
+                params![environment_id, serde_json::to_string(&value).unwrap()],
+            )
+            .unwrap();
+    }
+    store.set_schema_version(11).unwrap();
+    store.validate_v11_schema().unwrap();
+}
+
+/// Rewrite one binding's minted name in both the column and its JSON, so a
+/// fixture can reproduce the pre-decision-8 world where a projection had to
+/// name a binding's own name.
+fn rename_binding_to_legacy_slot(store: &StateStore, binding_id: &str, name: &str) {
+    store
+        .conn
+        .execute(
+            "UPDATE workspace_bindings
+             SET name = ?2, binding_json = json_set(binding_json, '$.name', ?2)
+             WHERE binding_id = ?1",
+            params![binding_id, name],
+        )
+        .unwrap();
+    let environments: Vec<(String, String)> = store
+        .conn
+        .prepare("SELECT environment_id, instance_json FROM environment_instances")
+        .unwrap()
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    for (environment_id, json) in environments {
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        if let Some(bindings) = value
+            .get_mut("bindings")
+            .and_then(serde_json::Value::as_array_mut)
+        {
+            for binding in bindings.iter_mut() {
+                if binding
+                    .get("binding_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(binding_id)
+                    && let Some(fields) = binding.as_object_mut()
+                {
+                    fields.insert(
+                        "name".to_string(),
+                        serde_json::Value::String(name.to_string()),
+                    );
+                }
+            }
+        }
+        store
+            .conn
+            .execute(
+                "UPDATE environment_instances SET instance_json = ?2 WHERE environment_id = ?1",
+                params![environment_id, serde_json::to_string(&value).unwrap()],
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn v11_to_v12_migration_derives_the_legacy_slot_and_leaves_unrelated_bindings_empty() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v11-to-v12-slots.db");
+    let store = StateStore::open(&path).unwrap();
+    let mut state = topology_project_state("prj_v11_slots", &["agent"], "/checkout");
+    let environment = &mut state.environments[0];
+    let legacy_id = environment.bindings[0].binding_id.to_string();
+    // A second binding that resolves nothing: it must stay empty, or the
+    // migration would be inventing a slot rather than deriving one.
+    environment.bindings.push(WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::new("wsp_unrelated").unwrap(),
+        project_id: state.definition.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "unrelated".to_string(),
+        workspace_key: "unrelated-worktree-key".to_string(),
+        path_hint: None,
+        slots: BTreeSet::new(),
+    });
+    store.save_project_state(&state).unwrap();
+    // The pre-decision-8 identity rule: this binding's NAME is the slot.
+    rename_binding_to_legacy_slot(&store, &legacy_id, "workspace");
+    downgrade_workspace_slots_fixture_to_v11(&store);
+    assert_eq!(store.schema_version().unwrap(), 11);
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    let loaded = reopened
+        .load_project_state("prj_v11_slots")
+        .unwrap()
+        .expect("the aggregate must survive the migration");
+    let bindings = &loaded.environments[0].bindings;
+    let legacy = bindings
+        .iter()
+        .find(|binding| binding.name == "workspace")
+        .expect("the legacy binding survives");
+    assert_eq!(
+        legacy.slots,
+        BTreeSet::from(["workspace".to_string()]),
+        "the slot a v11 binding resolved is derivable from its own name, not invented"
+    );
+    let unrelated = bindings
+        .iter()
+        .find(|binding| binding.name == "unrelated")
+        .expect("the unrelated binding survives");
+    assert!(
+        unrelated.slots.is_empty(),
+        "a binding whose name no definition declares resolves no slot"
+    );
+}
+
+#[test]
+fn v11_to_v12_workspace_slots_migration_rolls_back_then_reopens() {
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("v11-to-v12-rollback.db");
+    let store = StateStore::open(&path).unwrap();
+    let expected = topology_project_state("prj_v11_rollback", &["agent"], "/checkout");
+    store.save_project_state(&expected).unwrap();
+    // Only a legacy-sandbox migration could produce a v11 binding, and its name
+    // IS the declared slot. An opaque-named v11 binding beside a definition that
+    // declares a slot is a state the public lifecycle cannot reach, so using one
+    // here would test a database that never existed.
+    rename_binding_to_legacy_slot(
+        &store,
+        expected.environments[0].bindings[0].binding_id.as_str(),
+        "workspace",
+    );
+    downgrade_workspace_slots_fixture_to_v11(&store);
+    let before = application_schema_snapshot(&store.conn);
+    let rows_before: Vec<String> = store
+        .conn
+        .prepare("SELECT binding_json FROM workspace_bindings ORDER BY binding_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+
+    let error = store
+        .migrate_workspace_slots_v11_to_v12_with_failpoint(
+            WorkspaceSlotsV12MigrationFailpoint::AfterSlotsBackfilled,
+        )
+        .unwrap_err()
+        .to_string();
+    assert!(error.contains("injected v11-to-v12 migration failure"));
+    assert_eq!(store.schema_version().unwrap(), 11);
+    assert_eq!(application_schema_snapshot(&store.conn), before);
+    let rows_after: Vec<String> = store
+        .conn
+        .prepare("SELECT binding_json FROM workspace_bindings ORDER BY binding_id")
+        .unwrap()
+        .query_map([], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert_eq!(
+        rows_after, rows_before,
+        "the backfill is confined to one immediate transaction, so a rollback \
+         leaves every binding_json byte-identical"
+    );
+    drop(store);
+
+    let reopened = StateStore::open(&path).unwrap();
+    assert_eq!(reopened.schema_version().unwrap(), 12);
+    reopened.validate_v12_schema().unwrap();
+    assert!(
+        reopened
+            .load_project_state("prj_v11_rollback")
+            .unwrap()
+            .is_some(),
+        "the aggregate loads after the retried migration"
+    );
+}
+
+/// Reserve a fresh Creating Environment for the pre-boot slot reservation path.
+fn created_environment_for_slots(store: &StateStore, project_id: &str) -> EnvironmentInstance {
+    let definition = topology_project_state(project_id, &["fixture"], "/x").definition;
+    let created = store
+        .resolve_or_reserve_environment_for_up(
+            &definition,
+            &EnvironmentSelectionContext {
+                explicit: Some(EnvironmentSelector::Name("agent".to_string())),
+                ..EnvironmentSelectionContext::default()
+            },
+            100,
+        )
+        .unwrap();
+    match created {
+        EnvironmentUpReservation::Created { environment } => environment,
+        EnvironmentUpReservation::Existing { .. } => panic!("expected a new Environment"),
+    }
+}
+
+#[test]
+fn reserving_a_binding_refuses_a_slot_the_definition_never_declared() {
+    let store = StateStore::in_memory().unwrap();
+    let environment = created_environment_for_slots(&store, "prj_slot_undeclared");
+    let requested = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        // Decision 8: the minted name is opaque and is NOT what gets checked.
+        name: "worktree-opaque".to_string(),
+        workspace_key: "opaque-token".to_string(),
+        path_hint: None,
+        // The definition declares only `workspace`.
+        slots: BTreeSet::from(["invented".to_string()]),
+    };
+    let error = store
+        .reserve_workspace_binding_for_environment(&requested, 101)
+        .expect_err("an undeclared slot must be refused");
+    assert!(
+        error
+            .to_string()
+            .contains("slot `invented` is not declared"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        store
+            .load_project_state(environment.project_id.as_str())
+            .unwrap()
+            .unwrap()
+            .environments
+            .iter()
+            .all(|environment| environment.bindings.is_empty()),
+        "a refused reservation writes nothing"
+    );
+}
+
+#[test]
+fn an_opaque_minted_name_reserves_a_declared_slot_it_does_not_equal() {
+    // The exact case the pre-decision-8 code refused: the binding a real Up
+    // mints is named `worktree-{sha256(token)}`, which no definition can name.
+    let store = StateStore::in_memory().unwrap();
+    let environment = created_environment_for_slots(&store, "prj_slot_minted");
+    let requested = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "worktree-9f2c4a1b7e".to_string(),
+        workspace_key: "random-per-worktree-token".to_string(),
+        path_hint: None,
+        slots: BTreeSet::from(["workspace".to_string()]),
+    };
+    assert_ne!(requested.name, "workspace");
+    let reserved = store
+        .reserve_workspace_binding_for_environment(&requested, 101)
+        .expect("an opaque minted name resolving a declared slot is admitted");
+    assert_eq!(reserved, requested);
+    // Idempotent, exactly like the pre-decision-8 reservation.
+    assert_eq!(
+        store
+            .reserve_workspace_binding_for_environment(&requested, 999)
+            .unwrap(),
+        requested
+    );
+}
+
+#[test]
+fn a_slot_another_binding_already_resolves_is_a_state_conflict() {
+    let store = StateStore::in_memory().unwrap();
+    let environment = created_environment_for_slots(&store, "prj_slot_conflict");
+    let first = WorkspaceBinding {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        binding_id: WorkspaceBindingId::generate(),
+        project_id: environment.project_id.clone(),
+        environment_id: environment.environment_id.clone(),
+        name: "worktree-first".to_string(),
+        workspace_key: "first-token".to_string(),
+        path_hint: None,
+        slots: BTreeSet::from(["workspace".to_string()]),
+    };
+    store
+        .reserve_workspace_binding_for_environment(&first, 101)
+        .unwrap();
+    // A different worktree, a different minted name, but the same symbolic
+    // slot. The resolution table is a function, so this cannot be admitted.
+    let second = WorkspaceBinding {
+        binding_id: WorkspaceBindingId::generate(),
+        name: "worktree-second".to_string(),
+        workspace_key: "second-token".to_string(),
+        ..first.clone()
+    };
+    let error = store
+        .reserve_workspace_binding_for_environment(&second, 102)
+        .expect_err("a slot cannot resolve to two bindings");
+    assert!(
+        matches!(
+            error,
+            StackError::Machine {
+                code: MachineErrorCode::StateConflict,
+                ..
+            }
+        ),
+        "unexpected error: {error:?}"
+    );
+}
+
+#[test]
+fn refreshing_a_binding_preserves_its_durable_slot_resolution_table() {
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_slot_refresh", &["agent"], "/checkout");
+    store.save_project_state(&state).unwrap();
+    let mut requested = state.environments[0].bindings[0].clone();
+    assert_eq!(requested.slots, BTreeSet::from(["workspace".to_string()]));
+    // A refresh publishes a moved worktree; here it carries no slot set of its
+    // own, and must not be able to erase the one the Machines resolve through.
+    requested.slots = BTreeSet::new();
+    requested.workspace_key = "relocated-token".to_string();
+    requested.path_hint = Some("/relocated".to_string());
+    let refreshed = store.refresh_workspace_binding(&requested, 500).unwrap();
+    assert_eq!(
+        refreshed.slots,
+        BTreeSet::from(["workspace".to_string()]),
+        "a refresh must not silently drop the slots the Machines resolve through"
+    );
+    let persisted = store
+        .load_project_state("prj_slot_refresh")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        persisted.environments[0].bindings[0].slots,
+        BTreeSet::from(["workspace".to_string()])
+    );
+    assert_eq!(
+        persisted.environments[0].bindings[0].workspace_key,
+        "relocated-token"
+    );
+}
+
+#[test]
+fn the_slot_resolution_table_adds_no_ownership_record_and_no_extra_delete_row() {
+    // Decision 8's table lives inside `binding_json`, so Delete's exact
+    // expected-ownership BTreeSet and `delete_exact_environment`'s per-table
+    // row counts must see exactly what they saw before it existed.
+    let store = StateStore::in_memory().unwrap();
+    let state = topology_project_state("prj_slot_delete", &["agent"], "/checkout");
+    let environment_id = state.environments[0].environment_id.clone();
+    store.save_project_state(&state).unwrap();
+
+    let ownership_kinds: Vec<String> = store
+        .conn
+        .prepare(
+            "SELECT resource_kind FROM topology_ownership
+             WHERE environment_id = ?1 ORDER BY resource_kind, resource_id",
+        )
+        .unwrap()
+        .query_map(params![environment_id.as_str()], |row| row.get(0))
+        .unwrap()
+        .collect::<Result<_, _>>()
+        .unwrap();
+    assert!(
+        !ownership_kinds
+            .iter()
+            .any(|kind| kind.to_lowercase().contains("slot")),
+        "the resolution table must not mint an owned resource: {ownership_kinds:?}"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_bindings WHERE environment_id = ?1",
+                params![environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        state.environments[0].bindings.len() as i64,
+        "one row per binding, whatever its resolution table holds; \
+         delete_exact_environment counts exactly this"
+    );
+
+    let mut operation = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Delete,
+            "req-slot-delete",
+            "idem-slot-delete",
+            "sha256:slot-delete",
+            600,
+        )
+        .unwrap();
+    for step in operation.machine_steps.clone() {
+        operation = store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation,
+                    resulting_incarnation: None,
+                    resulting_activation: None,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                601,
+            )
+            .unwrap();
+    }
+    for step in operation.cleanup_steps.clone() {
+        operation = store
+            .acknowledge_environment_cleanup_step(
+                &OwnershipCleanupStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    ownership: step.ownership,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                602,
+            )
+            .unwrap();
+    }
+    store
+        .finish_environment_delete(operation.operation_id.as_str(), operation.generation, 603)
+        .expect("exact delete succeeds with the resolution table present");
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM workspace_bindings WHERE environment_id = ?1",
+                params![environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "Delete reclaims the binding rows that carry the resolution table"
     );
 }

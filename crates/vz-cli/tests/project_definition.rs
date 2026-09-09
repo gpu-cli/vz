@@ -127,7 +127,8 @@ fn unknown_definition_fields_fail_instead_of_silently_dropping_policy() {
     ))
     .unwrap();
     base["environment"]["machines"][0]["workspace"] = serde_json::json!({
-        "binding": "source", "target_path": "/workspace", "mode": "read_only"
+        "binding": "source", "target_path": "/workspace", "mode": "read_only",
+        "source_path": "."
     });
     base["environment"]["machines"][0]["requested_capabilities"] =
         serde_json::json!({"capabilities": ["posix_exec"]});

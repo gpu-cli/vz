@@ -15,6 +15,7 @@ mod readiness;
 mod supervisor;
 #[cfg(test)]
 mod tests;
+pub mod workspace_projection;
 
 /// Exact, authorized boot boundary for trusted backend instrumentation. This
 /// observer can delay dispatch but cannot supply activation/readiness evidence.
