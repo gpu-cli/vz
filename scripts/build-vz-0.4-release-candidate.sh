@@ -54,6 +54,16 @@
 #                             local-test-signed so a certification-grade validator
 #                             rejects it. crates/Cargo.lock must still be unchanged.
 #   --reuse-guest-bundles DIR admit pre-built bundles from DIR/{developer,container}
+#   --native-bundle DIR       register a prepared native macOS template in the
+#                             candidate's machine-target-catalog.json, with
+#                             --native-manifest-sha256 as its trusted pin. Without
+#                             both, the catalog carries Linux profiles only and
+#                             `macos_target()` finds nothing -- which is why gate
+#                             criteria 2 and 5 report their macOS clauses
+#                             unexercised rather than failing. `vz-runtimed`
+#                             already accepts these; the builder simply never
+#                             passed them.
+#   --native-manifest-sha256 DIGEST  trusted manifest pin for --native-bundle
 #                             after verifying every version.json digest; the
 #                             manifest records guest_bundles.source=reused and the
 #                             directory content digest. The release-grade default
@@ -74,6 +84,8 @@ source "$REPO_ROOT/scripts/lib/guest-bundles.sh"
 OUTPUT=""
 VERSION=""
 REUSE_GUEST_BUNDLES=""
+NATIVE_BUNDLE=""
+NATIVE_MANIFEST_SHA256=""
 DEV_UNCLEAN=false
 ORIGINAL_ARGS=("$@")
 while [[ $# -gt 0 ]]; do
@@ -81,6 +93,8 @@ while [[ $# -gt 0 ]]; do
         --output) [[ $# -ge 2 ]] || err "--output requires a value"; OUTPUT="$2"; shift 2 ;;
         --version) [[ $# -ge 2 ]] || err "--version requires a value"; VERSION="$2"; shift 2 ;;
         --reuse-guest-bundles) [[ $# -ge 2 ]] || err "--reuse-guest-bundles requires a value"; REUSE_GUEST_BUNDLES="$2"; shift 2 ;;
+        --native-bundle) [[ $# -ge 2 ]] || err "--native-bundle requires a value"; NATIVE_BUNDLE="$2"; shift 2 ;;
+        --native-manifest-sha256) [[ $# -ge 2 ]] || err "--native-manifest-sha256 requires a value"; NATIVE_MANIFEST_SHA256="$2"; shift 2 ;;
         --dev-unclean-checkout) DEV_UNCLEAN=true; shift ;;
         -h|--help) usage; exit 0 ;;
         *) usage >&2; err "unknown argument: $1" ;;
@@ -116,6 +130,13 @@ ENTITLEMENTS="$REPO_ROOT/entitlements/vz-cli.entitlements.plist"
 DEV_FLAGS=()
 [[ "$DEV_UNCLEAN" == true ]] && DEV_FLAGS+=(dev-unclean-checkout)
 [[ -n "$REUSE_GUEST_BUNDLES" ]] && DEV_FLAGS+=(reuse-guest-bundles)
+if [[ -n "$NATIVE_BUNDLE" || -n "$NATIVE_MANIFEST_SHA256" ]]; then
+    [[ -n "$NATIVE_BUNDLE" && -n "$NATIVE_MANIFEST_SHA256" ]] \
+        || err "--native-bundle and --native-manifest-sha256 are required together"
+    [[ -d "$NATIVE_BUNDLE" ]] || err "--native-bundle must name a directory"
+    [[ "$NATIVE_MANIFEST_SHA256" =~ ^[0-9a-f]{64}$ ]] || err "--native-manifest-sha256 must be lowercase SHA-256"
+    NATIVE_BUNDLE="$(cd "$NATIVE_BUNDLE" && pwd -P)"
+fi
 
 umask 022
 mkdir -m 0700 "$OUTPUT"
@@ -304,10 +325,23 @@ echo "==> writing machine-target-catalog.json"
 catalog_prefix="$(cd "$OUTPUT" && pwd -P)"
 catalog_args=(--write-installed-machine-target-catalog "$catalog_prefix" --installed-release-version "$VERSION")
 for profile in "${VZ04_GUEST_PROFILES[@]}"; do catalog_args+=(--installed-linux-profile "$profile"); done
+if [[ -n "$NATIVE_BUNDLE" ]]; then
+    catalog_args+=(--installed-native-bundle "$NATIVE_BUNDLE" --installed-native-manifest-sha256 "$NATIVE_MANIFEST_SHA256")
+fi
 "$OUTPUT/bin/vz-runtimed" "${catalog_args[@]}" > "$EVIDENCE/write-installed-catalog.log" 2>&1 \
     || { cat "$EVIDENCE/write-installed-catalog.log" >&2; err "vz-runtimed could not write the installed catalog"; }
 [[ -f "$OUTPUT/machine-target-catalog.json" ]] || err "machine-target-catalog.json not written"
 [[ "$(jq '.linux | length' "$OUTPUT/machine-target-catalog.json")" == 2 ]] || err "exact two-profile installed catalog required"
+# A candidate built with a native bundle must actually carry it. Asserting the
+# count here means a template that silently failed to register produces a build
+# error rather than a catalog the gate reads as "this release has no macOS
+# target", which is indistinguishable from not having asked for one.
+native_count="$(jq '.macos | length' "$OUTPUT/machine-target-catalog.json")"
+if [[ -n "$NATIVE_BUNDLE" ]]; then
+    [[ "$native_count" == 1 ]] || err "--native-bundle was given but the catalog registered $native_count macOS targets"
+else
+    [[ "$native_count" == 0 ]] || err "no --native-bundle was given but the catalog carries $native_count macOS targets"
+fi
 # The advisory writer lock is transient installer state, not a release component.
 rm -f "$OUTPUT/machine-target-catalog.lock"
 
