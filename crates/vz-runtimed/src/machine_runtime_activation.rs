@@ -170,11 +170,18 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
     /// low-level backend access remains a trusted-library interface.
     ///
     /// `attachments` are this Machine's Environment-network ports, already
-    /// minted against started switches. They are additional NICs, never a
-    /// replacement for the Machine's default network. A native macOS Machine
-    /// takes none: the topology contract refuses a network attachment on a
-    /// non-Linux target, so one arriving here is a caller defect rather than a
-    /// declaration this backend could honour.
+    /// minted against started switches. On a Linux Machine they are additional
+    /// NICs, never a replacement for its default network; a native macOS Machine
+    /// has no default network, so its ports are the only NICs it holds.
+    ///
+    /// Both backends take them. Nothing about `VZFileHandleNetworkDeviceAttachment`
+    /// or `VmConfigBuilder::build` distinguishes a macOS guest from a Linux one,
+    /// so a native Machine holding a fabric port was a policy refusal rather than
+    /// a capability limit, and it is no longer refused here. The two backends do
+    /// differ in how the guest is *addressed*: a Linux guest reads its address
+    /// off the kernel cmdline before its agent starts, while a macOS guest is
+    /// given it over the agent channel during readiness
+    /// (`native_macos::fabric`).
     pub async fn boot_or_inspect_machine(
         self: &Arc<Self>,
         reserved_vm: &OwnershipRecord,
@@ -204,14 +211,7 @@ impl MachineRuntimeEntry<MacosRuntimeBackend> {
             ),
             MacosRuntimeBackend::Native(runtime) => {
                 use crate::native_macos::runtime::NativeMacosBootError;
-                if !attachments.is_empty() {
-                    return Err(MachineRuntimeRegistryError::Invalid(
-                        "a native macOS Machine cannot hold an Environment-network port"
-                            .to_string(),
-                    )
-                    .into());
-                }
-                match runtime.boot(&reservation.resource_id).await {
+                match runtime.boot(&reservation.resource_id, attachments).await {
                     Ok(lease) => MachineExecutionLease::Native(lease),
                     Err(NativeMacosBootError::BeforeStart(error)) => return Err(error.into()),
                     Err(NativeMacosBootError::Start { error, lease }) => {

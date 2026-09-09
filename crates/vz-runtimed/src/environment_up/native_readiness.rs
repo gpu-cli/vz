@@ -46,6 +46,9 @@ pub(super) async fn verify(
         elapsed_seconds = started.elapsed().as_secs_f64(),
         "native OS and guest-agent identity verified"
     );
+    // Only now: the address is applied by the agent, so it is applied to the
+    // guest whose agent has just been proved to be the pinned one.
+    configure_fabric_ports(activation, lease, metadata).await?;
     if !pin.release().toolchain_sha256.is_empty() {
         use vz_macos_provision::toolchain::{MAX_RECEIPT_BYTES, RECEIPT_PATH, ToolchainManifest};
         let receipt = activation
@@ -138,4 +141,66 @@ pub(super) async fn verify(
                 .map_err(|e| bad(e.to_string()))?,
         },
     })
+}
+
+/// Give this Machine's Environment-network ports the addresses its fabric plan
+/// derived, and prove each one landed.
+///
+/// This is the macOS half of what `linux/initramfs/init` does for a Linux guest.
+/// It happens later than the Linux path — after the guest agent answers rather
+/// than before anything in the guest runs — because a macOS boot loader takes no
+/// kernel arguments this host could write, so the vsock channel the agent serves
+/// is the only one that reaches a guest which does not yet have an address.
+/// Readiness runs before Ready is published, so a Machine whose ports could not
+/// be configured fails Up rather than coming up unaddressed.
+///
+/// The address itself is unchanged by any of that: it is the one
+/// `environment_switch::plan` derived, applied here and never leased, so a
+/// Machine that stops and comes back presents the address its switch expects.
+///
+/// Each port is judged on stdout read back off the interface, not on the exit
+/// status of the configuring command. `ifconfig` exiting zero says the request
+/// was accepted; only reading the address back off the NIC says the Machine has
+/// it.
+async fn configure_fabric_ports(
+    activation: &Arc<MachineRuntimeActivation>,
+    lease: &crate::native_macos::runtime::NativeMacosLease,
+    metadata: &RequestMetadata,
+) -> Result<(), MachineError> {
+    let bad = |e: String| failure(metadata, MachineErrorCode::BackendUnavailable, e);
+    for declaration in lease.attachments() {
+        let rendered = crate::native_macos::fabric::configure_fabric_port(declaration);
+        let started = std::time::Instant::now();
+        let applied = activation
+            .exec(
+                rendered.command.clone(),
+                rendered.args.clone(),
+                Duration::from_secs(30),
+            )
+            .await
+            .map_err(|e| {
+                bad(format!(
+                    "native fabric port {} on {}: {e}",
+                    declaration.ipv4, declaration.mac
+                ))
+            })?;
+        if applied.exit_code != 0
+            || applied.stdout != rendered.expected_stdout
+            || !applied.stderr.is_empty()
+        {
+            return Err(bad(format!(
+                "native fabric port {}/{} on {} did not come up holding its derived address: {applied:?}",
+                declaration.ipv4, declaration.prefix, declaration.mac
+            )));
+        }
+        tracing::info!(
+            network_id = %declaration.network_id,
+            mac = %declaration.mac,
+            address = %declaration.ipv4,
+            prefix = declaration.prefix,
+            elapsed_seconds = started.elapsed().as_secs_f64(),
+            "native Environment-network port configured"
+        );
+    }
+    Ok(())
 }
