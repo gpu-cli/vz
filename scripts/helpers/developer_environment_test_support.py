@@ -11,7 +11,8 @@ drift (help gains a line), alias (`create` executes), provisions (`up` writes
 state and exits 0 without a definition), hang (`ls` sleeps past the
 deadline), autospawn (`status --all` spawns a fake daemon that shuts down
 gracefully on SIGTERM), bogus_pid (`status --all` leaves an unattributable
-PID file).
+PID file), leaky_multi_attach (`up` admits a writable block volume on two
+Machines instead of refusing it, and writes state before failing).
 """
 from __future__ import annotations
 
@@ -83,7 +84,7 @@ if [ -n "$verb" ]; then
   topology="$VZ_RUNTIME_DATA_DIR/topology.json"
   if [ "$verb" = up ] && [ -f vz.json ]; then
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
-    mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"
+    mkdir -p "$VZ_RUNTIME_DATA_DIR"
     # A Developer Machine's Docker endpoint is an AF_UNIX socket bound in the
     # runtime directory under the longest name the runtime mints
     # (`vzr1-ot-<32 hex>.sock`). Bind it for real rather than trusting a length:
@@ -96,6 +97,25 @@ if [ -n "$verb" ]; then
     fi
     # Runtime identities are minted per Up, not derived from the definition:
     # recreating one pinned definition must hand out entirely new ones.
+    # Declared projections and volumes are admitted and materialised BEFORE any
+    # identity is minted, so a refused definition leaves the state root exactly
+    # as it was -- which is the ordering the criterion-17 check inventories.
+    leak=""
+    if [ "$mode" = leaky_multi_attach ]; then leak=--admit-multi-attach; : > "$VZ_RUNTIME_STATE_DB"; fi
+    # HOME points at the runtime directory, which is outside the lane state
+    # root: the interpreter writes framework caches under HOME on startup, and
+    # those would otherwise land inside the state root the criterion-17 check
+    # inventories.
+    if ! HOME="$VZ_RUNTIME_DATA_DIR" /usr/bin/python3 "$(dirname "$0")/vz-storage-model" vz.json \
+        "$VZ_RUNTIME_DATA_DIR/guest" "$PWD" "$VZ_RUNTIME_DATA_DIR/volumes" $leak 2>"$VZ_RUNTIME_DATA_DIR/storage.err"; then
+      printf '{"error":{"code":"validation_error","message":"%s"},"schema_version":1}\n' \
+        "$(tr -d '\n' < "$VZ_RUNTIME_DATA_DIR/storage.err" | sed 's/"/\\"/g')" >&2
+      rm -rf "$VZ_RUNTIME_DATA_DIR/guest" "$VZ_RUNTIME_DATA_DIR/volumes"
+      rm -f "$VZ_RUNTIME_STATE_DB" "$VZ_RUNTIME_DATA_DIR/storage.err" "$ep"
+      exit 1
+    fi
+    rm -f "$VZ_RUNTIME_DATA_DIR/storage.err"
+    : > "$VZ_RUNTIME_STATE_DB"
     inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
     # Status must reflect the Machines the definition declares, not a fixed one.
     names=$(grep -o '"name": *"machine-[^"]*"' vz.json | sed 's/.*"\(machine-[^"]*\)"/\1/' | sort -u | tr '\n' ' ')
@@ -115,6 +135,7 @@ if [ -n "$verb" ]; then
     printf '%s' "$command_tail" \
       | sed -e "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" \
             -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
+            -e "s#/vz-storage#$VZ_RUNTIME_DATA_DIR/guest/$machine/vz-storage#g" \
             -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$script"
     # The shim needs the Machine identity: every Machine on a declared network
     # gets its OWN derived address, so a fake that keys addressing on the project
@@ -125,6 +146,13 @@ if [ -n "$verb" ]; then
     exit $code
   fi
   if [ "$verb" = delete ] && [ -f "$topology" ]; then
+    # Delete reclaims the Environment's declared storage as well as its
+    # topology. The chmod is needed only because a read_only projection is
+    # modelled here as a copy whose owner cannot write it; a VirtioFS read-only
+    # share is a mount option over a directory the host still owns writable, so
+    # nothing equivalent is needed of the real runtime.
+    chmod -R u+rwX "$VZ_RUNTIME_DATA_DIR/guest" 2>/dev/null
+    rm -rf "$VZ_RUNTIME_DATA_DIR/guest" "$VZ_RUNTIME_DATA_DIR/volumes"
     rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
   fi
   if [ "$verb" = status ] && [ -f "$topology" ]; then
@@ -201,6 +229,116 @@ cat "$SNAPSHOT_FILE"
 [ "$mode" = drift ] && echo "extra line"
 exit 0
 '''
+
+# The storage model is Python rather than `sh` because a POSIX-sh stand-in
+# cannot parse a nested JSON definition, and a grep-shaped parse would decide
+# the policy questions this check exists to ask. It is a MODEL of the observable
+# semantics only: what a Machine can read, what it can write, and what the host
+# sees afterwards. The real carriers (VirtioFS shares, a virtio-block image) are
+# exercised by the installed binaries in the gate, never here.
+STORAGE_MODEL = r"""#!/usr/bin/env python3
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+
+
+def refuse(message):
+    print(message, file=sys.stderr)
+    raise SystemExit(3)
+
+
+def main():
+    definition_path, guest_root, worktree, volumes_root = (Path(a) for a in sys.argv[1:5])
+    # The vacuity switch. With it, a writable block volume on two Machines is
+    # ADMITTED and both Machines are given the one backing directory -- exactly
+    # the silent multi-attach the policy exists to prevent. The criterion-17
+    # check must fail on this input, and a check that could not tell this apart
+    # from the correct behaviour would be asserting nothing.
+    admit_multi_attach = "--admit-multi-attach" in sys.argv[5:]
+    environment = json.loads(definition_path.read_text())["environment"]
+    machines = {m["name"]: m for m in environment["machines"]}
+    volumes = environment.get("volumes") or []
+
+    # ADMISSION, before anything is created. A writable block volume attached to
+    # more than one Machine is refused here and the function returns without
+    # having made a single directory, which is what the check's before/after
+    # inventory of the state root observes.
+    for volume in volumes:
+        if volume["kind"] != "block":
+            continue
+        attachments = volume["attachments"]
+        writers = [a for a in attachments if a["mode"] == "read_write"]
+        if writers and len(attachments) > 1 and not admit_multi_attach:
+            first, second = attachments[0]["machine"], attachments[1]["machine"]
+            refuse(
+                "volume `%s` is a writable block device attached to Machines `%s` and `%s`; "
+                "a block volume carries one ext4 filesystem, which has exactly one writer"
+                % (volume["name"], first, second))
+        for attachment in attachments:
+            if attachment["machine"] not in machines:
+                refuse("volume `%s` names Machine `%s`, which this Environment does not have"
+                       % (volume["name"], attachment["machine"]))
+    for name, machine in machines.items():
+        projection = machine.get("workspace")
+        if projection is None:
+            continue
+        source = worktree / projection["source_path"]
+        if not source.is_dir():
+            refuse("Machine `%s` workspace source `%s` is not resolvable"
+                   % (name, projection["source_path"]))
+
+    def place(machine, target_path, maker):
+        destination = guest_root / machine / target_path.lstrip("/")
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if destination.is_symlink() or destination.exists():
+            return
+        maker(destination)
+
+    for name, machine in machines.items():
+        projection = machine.get("workspace")
+        if projection is None:
+            continue
+        source = (worktree / projection["source_path"]).resolve()
+        mode = projection["mode"]
+        if mode == "read_write":
+            # The share IS the source: a write inside the Machine lands on the
+            # host file, which is the property that separates read_write from a
+            # copy.
+            place(name, projection["target_path"], lambda d: d.symlink_to(source))
+        elif mode == "read_only":
+            # A copy the Machine cannot write. The real carrier answers EROFS
+            # and this answers EACCES; the check asserts the write fails and the
+            # host file survives, never a particular errno.
+            def read_only(destination, source=source):
+                shutil.copytree(source, destination, symlinks=True)
+                for path in sorted(destination.rglob("*"), reverse=True):
+                    path.chmod(path.stat().st_mode & ~0o222)
+                destination.chmod(destination.stat().st_mode & ~0o222)
+            place(name, projection["target_path"], read_only)
+        elif mode == "snapshot":
+            # A private writable copy: the Machine may write, and nothing it
+            # writes reaches the worktree.
+            place(name, projection["target_path"],
+                  lambda d, source=source: shutil.copytree(source, d, symlinks=True))
+        else:
+            refuse("Machine `%s` declares unknown workspace mode `%s`" % (name, mode))
+
+    for volume in volumes:
+        backing = volumes_root / volume["name"]
+        backing.mkdir(parents=True, exist_ok=True)
+        for attachment in volume["attachments"]:
+            # One backing directory for every attachment, so a shared cache is
+            # genuinely one directory two Machines see. A per-Machine copy would
+            # pass a naive consistency fixture and model the wrong thing.
+            place(attachment["machine"], attachment["target_path"],
+                  lambda d, backing=backing: d.symlink_to(backing))
+
+
+main()
+"""
+
 
 CATALOG = {"schema_version": 1, "linux": [
     {"image": "vz-linux-appliance", "version": "0.4.0-fake", "profile": "developer", "bundle_dir": "/nonexistent/developer",
@@ -456,6 +594,9 @@ def build_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path = Non
     # The guest BusyBox stand-in every `vz exec` script addresses.
     (root / "bin/busybox-shim").write_text(BUSYBOX_SHIM)
     (root / "bin/busybox-shim").chmod(0o755)
+    # Declared-storage admission and materialisation, which the fake `up` runs.
+    (root / "bin/vz-storage-model").write_text(STORAGE_MODEL)
+    (root / "bin/vz-storage-model").chmod(0o755)
     catalog = json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n"
     (root / "machine-target-catalog.json").write_bytes(catalog)
     manifest = json.loads(read_regular(root / "release-manifest.json"))

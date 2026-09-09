@@ -14,11 +14,12 @@ use vz_runtime_contract::{
     LifecycleStepResult, LifecycleStepStatus, MachineError, MachineErrorCode, MachineId,
     MachineLifecycleStepAcknowledgement, OperatingSystem, OwnedResourceKind,
     OwnershipCleanupStepAcknowledgement, OwnershipRecord, PolicyDecision, ProjectId,
-    RequestMetadata, ResourceOwner, TopologyAuthorization, TopologyOperation,
+    RequestMetadata, ResourceOwner, TopologyAuthorization, TopologyOperation, VolumeId,
 };
 
 use crate::RuntimeDaemon;
 use crate::environment_runtime_controller::EnvironmentControllerLease;
+use crate::environment_up::volumes;
 use crate::machine_docker_config::ManagedMachineDockerConfig;
 use crate::machine_docker_context::{
     ManagedMachineDockerContext, PreparedMachineDockerContextDelete,
@@ -437,11 +438,64 @@ impl RuntimeDaemon {
         self.reclaim_environment_switches(lease, &operation.project_id, &operation.environment_id)
             .await
             .map_err(|error| conflict(input, error))?;
+        // Declared volumes are the other Environment-scoped owned resource, and
+        // their reclamation is a directory removal rather than a registry
+        // teardown. It happens before the Machines are retired for the same
+        // reason the switch does: a Machine still holding a virtio-block
+        // descriptor onto an image that had already been unlinked would be
+        // reading a file with no name, and the removal would look like it
+        // succeeded while the bytes stayed live. Each removal is acknowledged
+        // only after it has actually happened, so an unremovable image fails
+        // Delete instead of leaving an unaccounted survivor behind a clean
+        // ownership graph.
+        //
+        // The step is acknowledged per record, and the Environment's own volume
+        // root is removed last with `remove_dir`, which refuses a non-empty
+        // directory: anything left under it is a leak this must surface.
+        for record in operation
+            .cleanup_steps
+            .clone()
+            .into_iter()
+            .map(|step| step.ownership)
+            .filter(|ownership| ownership.resource_kind == OwnedResourceKind::Volume)
+        {
+            let volume_id = VolumeId::new(record.resource_id.clone())
+                .map_err(|error| conflict(input, error))?;
+            volumes::reclaim_volume(
+                &self.config.runtime_data_dir,
+                &operation.environment_id,
+                &volume_id,
+            )
+            .map_err(|error| {
+                conflict(
+                    input,
+                    format!("Delete could not reclaim volume {volume_id}: {error}"),
+                )
+            })?;
+            operation = self
+                .with_state_store(|store| {
+                    store.acknowledge_environment_cleanup_step(
+                        &OwnershipCleanupStepAcknowledgement {
+                            operation_id: operation.operation_id.clone(),
+                            generation: operation.generation,
+                            ownership: record.clone(),
+                            result: LifecycleStepResult::Succeeded,
+                        },
+                        crate::current_unix_secs(),
+                    )
+                })
+                .map_err(|e| e.to_machine_error(&input.metadata))?;
+        }
+        volumes::reclaim_environment_volume_root(
+            &self.config.runtime_data_dir,
+            &operation.environment_id,
+        );
         // That teardown is the whole physical reclamation of a declared network,
-        // which is the only Environment-scoped owned resource Delete accepts, so
-        // its cleanup steps are acknowledged here. Endpoint and attachment
-        // records are Machine-scoped and are acknowledged with that Machine's
-        // store below, after the store itself is positively removed.
+        // and a declared volume is the only other Environment-scoped owned
+        // resource Delete accepts, so both sets of cleanup steps are
+        // acknowledged here. Endpoint and attachment records are Machine-scoped
+        // and are acknowledged with that Machine's store below, after the store
+        // itself is positively removed.
         for step in operation
             .cleanup_steps
             .clone()
@@ -792,6 +846,20 @@ fn validate_supported(
             resource_id: export.export_id.to_string(),
             environment_id: environment.environment_id.clone(),
             machine_id: Some(export.machine_id.clone()),
+        });
+    }
+    // A volume is Environment-scoped, so its expected record carries no
+    // `machine_id` and its cleanup is dispatched by the Environment rather than
+    // by a Machine's store. `machine_id: None` is part of the expected record,
+    // not merely tolerated: a volume record that acquired a Machine would be
+    // reclaimed with that Machine's teardown while its storage stayed on disk.
+    for volume in &environment.volumes {
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::Volume,
+            resource_id: volume.volume_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: None,
         });
     }
     // Exact set equality, compared as sets rather than inferred from a length

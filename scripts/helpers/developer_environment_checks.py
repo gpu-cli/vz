@@ -22,6 +22,15 @@ Criterion 15 (`gate.cli_api.agreement`):
                        exactly its declared field set, at the top level and for
                        the Environment and Machine objects under it
   grpc_api_live_agreement    NOT IMPLEMENTED
+Criterion 17 (`gate.storage.workspace_projection_policy`):
+  workspace_storage_policy   read_write/read_only/snapshot projections prove
+                       their own target-qualified semantics against the host
+                       worktree, a write into a read_only projection fails, a
+                       writable block volume on two Machines is refused with no
+                       storage allocated and no Environment persisted, and two
+                       Machines writing one declared shared cache concurrently
+                       both observe every write within its declared staleness
+                       bound
 
 Every AF_UNIX path the installed binaries bind lives in the lane's short socket
 root, not under `--state-root`; see `developer_environment_recorder`.
@@ -1416,4 +1425,439 @@ def check_grpc_agreement(top: str) -> SubCheck:
     # daemon's own channel, not inferred from the CLI's JSON of the same state.
     check.not_implemented = ("CLI vs typed gRPC/API agreement (identities, transitions, events, receipts) needs a pinned "
                              "gRPC client for the daemon channel; the lane provisions Machines but speaks only the CLI.")
+    return check.finish()
+
+
+# -- criterion 17: workspace and storage policy --------------------------------
+
+# Every declared projection and volume appears under one guest prefix, so a
+# `vz exec` script names a path the definition chose rather than one this check
+# assumed. `/vz-storage` is not special to the runtime; it is simply a prefix no
+# Machine image already occupies.
+STORAGE_ROOT = "/vz-storage"
+RW_TARGET = STORAGE_ROOT + "/rw"
+RO_TARGET = STORAGE_ROOT + "/ro"
+SNAPSHOT_TARGET = STORAGE_ROOT + "/snapshot"
+CACHE_TARGET = STORAGE_ROOT + "/cache"
+BLOCK_TARGET = STORAGE_ROOT + "/block"
+# Declared in the definition and read back out of it, never restated: the
+# fixture below polls to exactly this bound, so a definition that declared a
+# different one would change what the fixture proves.
+STALENESS_BOUND_MILLIS = 4000
+BLOCK_VOLUME_BYTES = 16 * 1024 * 1024
+# Files each Machine writes into the shared cache. Small enough to stay well
+# inside an exec deadline, large enough that a lost update is visible as a
+# count rather than as one missing name.
+CACHE_WRITES = 8
+BARRIER_ATTEMPTS = 60
+BARRIER_INTERVAL = 0.5
+CONSISTENCY_POLL_INTERVAL = 0.1
+# Host-side seed content, written into the worktree before Up so every read
+# below has something to observe that this check did not write from inside.
+SEED = b"seed written on the host before Up\n"
+
+
+def storage_definition(release_dir: Path, *, block_attachments) -> dict:
+    """Three Developer Linux Machines, one of each projection mode, plus volumes.
+
+    A Machine carries at most one workspace projection, so proving all three
+    modes needs three Machines. `block_attachments` is the one thing that
+    varies: the accepted definition attaches the block volume to one Machine,
+    and the refused one attaches the same writable volume to two.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    base = environment["machines"][0]
+    machines = []
+    for index, (mode, source, target) in enumerate((
+            ("read_write", "rw", RW_TARGET),
+            ("read_only", "ro", RO_TARGET),
+            ("snapshot", "snapshot", SNAPSHOT_TARGET))):
+        machine = copy.deepcopy(base)
+        machine["name"] = f"machine-{index}"
+        machine["workspace"] = {"binding": "source", "target_path": target, "mode": mode,
+                                "source_path": source}
+        machines.append(machine)
+    environment["machines"] = machines
+    environment["volumes"] = [
+        # Multi-attached and writable on both sides. This is the case a block
+        # volume may not be, and it is exactly why the two kinds are separate.
+        {"schema_version": 1, "name": "cache", "kind": "shared_cache",
+         "consistency": {"model": "bounded_staleness",
+                         "staleness_bound_millis": STALENESS_BOUND_MILLIS},
+         "attachments": [{"machine": "machine-0", "target_path": CACHE_TARGET, "mode": "read_write"},
+                         {"machine": "machine-1", "target_path": CACHE_TARGET, "mode": "read_write"}]},
+        {"schema_version": 1, "name": "data", "kind": "block", "size_bytes": BLOCK_VOLUME_BYTES,
+         "attachments": list(block_attachments)},
+    ]
+    return definition
+
+
+def block_attachment(machine: str, mode: str) -> dict:
+    return {"machine": machine, "target_path": BLOCK_TARGET, "mode": mode}
+
+
+def seed_worktree(project: Path) -> None:
+    """The three declared sources, each holding one host-written file."""
+    for source in ("rw", "ro", "snapshot"):
+        directory = project / source
+        directory.mkdir(mode=0o700)
+        write_exclusive(directory / "seed.txt", SEED)
+
+
+def guest_read(ctx, check, label, instance, machine, path):
+    return machine_exec(ctx, check, label, instance, machine,
+                        f"/bin/busybox cat {path}")
+
+
+def guest_write(ctx, check, label, instance, machine, path, payload):
+    """Write from INSIDE the Machine and report the guest's own exit status.
+
+    `printf` is the shell's builtin, so a write that fails failed because the
+    filesystem refused it and not because an applet was missing.
+    """
+    return machine_exec(ctx, check, label, instance, machine,
+                        f"printf %s {payload} > {path}; printf ':%s' $?")
+
+
+def refused_write(receipt) -> bool:
+    """Whether the guest's redirection was refused.
+
+    The shell reports a refused redirection with a non-zero status appended by
+    the probe itself, so this reads the guest's own verdict rather than the
+    exec's transport status. A read-only VirtioFS share answers `EROFS` and a
+    mode-refused copy answers `EACCES`; either is the forbidden write failing,
+    and pinning one errno would make this check pass or fail on which carrier
+    the runtime chose rather than on the policy.
+    """
+    return receipt.exit_code == 0 and not receipt.stdout.strip().endswith(b":0")
+
+
+def cache_writer_script(machine: str, peer: str) -> str:
+    """Write `CACHE_WRITES` files, but only once the peer has started.
+
+    The barrier is what makes this concurrent rather than merely sequential:
+    each Machine waits for the other's start marker before writing any of its
+    own files, so the two write phases genuinely overlap. Without it the first
+    exec could finish before the second was even issued, and the fixture would
+    prove nothing about two writers.
+    """
+    return (
+        f"/bin/busybox mkdir -p {CACHE_TARGET}; "
+        f"printf started > {CACHE_TARGET}/start-{machine}; "
+        f"i=0; while [ $i -lt {BARRIER_ATTEMPTS} ]; do "
+        f"  [ -f {CACHE_TARGET}/start-{peer} ] && break; "
+        f"  /bin/busybox sleep {BARRIER_INTERVAL}; i=$((i+1)); done; "
+        f"[ -f {CACHE_TARGET}/start-{peer} ] || exit 3; "
+        f"i=0; while [ $i -lt {CACHE_WRITES} ]; do "
+        f"  printf %s {machine}-$i > {CACHE_TARGET}/{machine}-$i; i=$((i+1)); done; "
+        f"printf done > {CACHE_TARGET}/done-{machine}"
+    )
+
+
+def cache_entries(ctx, check, label, instance, machine) -> set:
+    receipt = machine_exec(ctx, check, label, instance, machine,
+                           f"/bin/busybox ls {CACHE_TARGET}")
+    if receipt.exit_code != 0:
+        return set()
+    return set(receipt.stdout.decode("utf-8", "replace").split())
+
+
+def check_workspace_projection_policy(ctx: CheckContext, top: str) -> SubCheck:
+    """Criterion 17: workspace projections, forbidden writes, and storage policy.
+
+    Four clauses, and the check is ordered so that each is proved by something
+    only that clause could produce.
+
+    *Projection semantics* are target-qualified: every read and write below is
+    issued by `vz exec` on a named Machine, and the corresponding host-side
+    observation is made on the worktree file. `read_write` is proved by a write
+    inside the Machine appearing on the HOST, which a private copy could not do.
+    `snapshot` is proved by the opposite: the guest's write succeeds and the
+    host file is unchanged, which a share could not do. Asserting only that each
+    mode mounted would have passed for all three carriers being the same one.
+
+    *Forbidden writes fail* is asserted against the guest's own exit status and
+    then confirmed on the host file, because a write that silently went nowhere
+    and a write that was refused look identical from inside if only the byte
+    content is read back.
+
+    *Rejected before mutation* is an ordering claim, so it is proved by
+    inventorying the isolate's whole state root before the refused `vz up` and
+    again after, and requiring the two to be identical. Nothing is asserted
+    about what the runtime "would have" written.
+
+    *Shared-cache consistency* polls to exactly the bound the definition
+    declares. Two Machines write concurrently behind a barrier, and each must
+    then observe every one of the other's files within `staleness_bound_millis`
+    of both writers finishing. A fixture that polled without a deadline would
+    prove the writes landed eventually and nothing about the declared model.
+    """
+    check = SubCheck(top, "workspace_storage_policy")
+    try:
+        accepted = storage_definition(
+            ctx.release_dir, block_attachments=[block_attachment("machine-0", "read_write")])
+        refused = storage_definition(
+            ctx.release_dir,
+            block_attachments=[block_attachment("machine-0", "read_write"),
+                               block_attachment("machine-1", "read_only")])
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if not schema_path.is_file():
+        check.fail(f"project definition schema absent: {PROJECT_DEFINITION_SCHEMA}")
+        return check.finish()
+    validator = Draft202012Validator(load_json(schema_path))
+    for label, definition in (("accepted", accepted), ("refused", refused)):
+        problems = sorted(validator.iter_errors(definition), key=lambda e: list(map(str, e.absolute_path)))
+        check.check(not problems, f"the {label} storage definition validates against the authoring schema"
+                    if not problems else f"the {label} definition is invalid: {problems[0].message[:200]}")
+    # The refused definition must be SCHEMA-VALID: a multi-attach the schema
+    # rejected would never reach the runtime, and the refusal below would be
+    # proving that the authoring schema works rather than that Up refuses
+    # before mutation.
+    if check.status != "PASS":
+        return check.finish()
+
+    # -- clause: a writable block volume on two Machines, refused before mutation
+    deny = ctx.isolated("store-deny", project_files={
+        "vz.json": json.dumps(refused, indent=2, sort_keys=True).encode() + b"\n"},
+        provision=True)
+    seed_worktree(deny["project"])
+    for argv in (["init", "--quiet", "--initial-branch", "main"],
+                 ["add", "-A"],
+                 ["-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                  "commit", "--quiet", "-m", "definition"]):
+        ctx.run_tool(check, "store-deny-git", [GIT, *argv], cwd=deny["project"], env=deny["env"])
+    # Taken after the repository exists and immediately before the refused Up,
+    # so the comparison spans that invocation and nothing else. An inventory
+    # taken earlier would also carry this check's own `git init`.
+    before, path = write_inventory(ctx.evidence_dir, "storage-deny-before", deny["project"])
+    check.evidence.append(path)
+    denied = ctx.run(check, "store-deny-up", ["--json", "up"], cwd=deny["project"], env=deny["env"],
+                     timeout=UP_TIMEOUT)
+    detail = ""
+    try:
+        detail = json.loads(denied.stderr.decode("utf-8")).get("error", {}).get("message", "")
+    except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+        detail = ""
+    if "adapters remain required" in detail:
+        check.not_implemented = ("declared volumes are not applied by this runtime: " + detail[:300])
+        return check.finish()
+    check.check(denied.exit_code != 0,
+                f"a writable block volume on two Machines is refused (vz up exit {denied.exit_code})")
+    # Named, not merely non-zero: an Up that failed for an unrelated reason
+    # would satisfy a bare exit-code assertion and prove nothing about the rule.
+    check.check("data" in detail and "machine-0" in detail and "machine-1" in detail,
+                f"the refusal names the volume and both Machines (message {detail[:200]!r})")
+    _after, path = write_inventory(ctx.evidence_dir, "storage-deny-after", deny["project"])
+    check.evidence.append(path)
+
+    # "Rejected before mutation" is an ordering claim, so it is proved by
+    # observing what is NOT there rather than by asserting an intention. Three
+    # separate things must all still be absent, because each could be true while
+    # another was violated:
+    #
+    #   * the worktree, byte for byte -- the refusal must not have touched the
+    #     user's own files;
+    #   * the volume storage root -- no image and no cache directory was
+    #     allocated for a declaration that was refused;
+    #   * the persisted topology -- no Environment exists to be deleted later.
+    #
+    # The lane state root as a whole is deliberately NOT compared: an autospawned
+    # daemon legitimately creates its own database and runtime directory on
+    # startup, and folding that in would make this assertion about daemon
+    # start-up rather than about the declaration.
+    _unchanged(check, "the worktree across the refused Up", before, deny["project"])
+    volume_root = Path(deny["runtime"]) / "volumes"
+    survivors = sorted(p.name for p in volume_root.iterdir()) if volume_root.is_dir() else []
+    check.check(not survivors,
+                "no volume storage was allocated for the refused declaration"
+                if not survivors else
+                f"the refused Up allocated storage under {volume_root}: {survivors[:6]}")
+    persisted = ctx.run(check, "store-deny-status", ["--json", "status"], cwd=deny["project"],
+                        env=deny["env"], timeout=60)
+    environments = None
+    if persisted.exit_code == 0:
+        try:
+            environments = json.loads(persisted.stdout.decode("utf-8")).get("environments")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            environments = "unreadable"
+    check.check(persisted.exit_code != 0 or environments == [],
+                f"no Environment was persisted by the refused Up (status exit "
+                f"{persisted.exit_code}, environments {environments!r})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # -- the accepted topology
+    data = json.dumps(accepted, indent=2, sort_keys=True).encode() + b"\n"
+    write_exclusive(ctx.evidence_dir / "storage-vz.json.txt", data)
+    check.evidence.append("storage-vz.json.txt")
+    inside = ctx.isolated("store-ok", project_files={"vz.json": data}, provision=True)
+    seed_worktree(inside["project"])
+    for argv in (["init", "--quiet", "--initial-branch", "main"],
+                 ["add", "-A"],
+                 ["-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                  "commit", "--quiet", "-m", "definition"]):
+        receipt = ctx.run_tool(check, "store-ok-git", [GIT, *argv], cwd=inside["project"], env=inside["env"])
+        check.check(receipt.exit_code == 0, f"store-ok git {argv[0]}: exit {receipt.exit_code} (expected 0)")
+    if check.status != "PASS":
+        return check.finish()
+    up = ctx.run(check, "store-ok-up", ["--json", "up"], cwd=inside["project"], env=inside["env"],
+                 timeout=UP_TIMEOUT)
+    if up.exit_code != 0:
+        try:
+            message = json.loads(up.stderr.decode("utf-8")).get("error", {}).get("message", "")
+        except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
+            message = ""
+        if "adapters remain required" in message:
+            check.not_implemented = ("declared projections and volumes are not applied by this runtime: " +
+                                     message[:300])
+            return check.finish()
+        check.check(False, f"store-ok: vz --json up exit {up.exit_code} (expected 0): {message[:200]}")
+        return check.finish()
+    check.check(True, "the three-mode storage topology comes up (vz --json up exit 0)")
+
+    try:
+        # -- clause: target-qualified file semantics, one mode at a time
+        # read_write: written inside machine-0, observed on the HOST.
+        token = "vzrw-" + uuid.uuid4().hex[:16]
+        wrote = guest_write(ctx, check, "storage-rw-write", inside, "machine-0",
+                            f"{RW_TARGET}/guest.txt", token)
+        check.check(wrote.exit_code == 0 and wrote.stdout.strip().endswith(b":0"),
+                    f"machine-0 writes into its read_write projection (guest status {wrote.stdout[-8:]!r})")
+        host_copy = inside["project"] / "rw" / "guest.txt"
+        observed = host_copy.read_bytes() if host_copy.is_file() else b""
+        check.check(observed == token.encode(),
+                    f"the read_write projection is the worktree itself: the host file holds the "
+                    f"Machine's bytes (observed {observed[:40]!r})")
+        # And the seed the host wrote before Up is visible inside the Machine,
+        # so the share is the source in both directions.
+        seen = guest_read(ctx, check, "storage-rw-read", inside, "machine-0", f"{RW_TARGET}/seed.txt")
+        check.check(seen.exit_code == 0 and seen.stdout == SEED,
+                    f"machine-0 reads the host-written seed through its projection (exit {seen.exit_code})")
+
+        # read_only: reads work, writes are refused, and the host file survives.
+        seen = guest_read(ctx, check, "storage-ro-read", inside, "machine-1", f"{RO_TARGET}/seed.txt")
+        check.check(seen.exit_code == 0 and seen.stdout == SEED,
+                    f"machine-1 reads through its read_only projection (exit {seen.exit_code})")
+        forbidden = guest_write(ctx, check, "storage-ro-write", inside, "machine-1",
+                                f"{RO_TARGET}/seed.txt", "overwritten")
+        check.check(refused_write(forbidden),
+                    f"a write into a read_only projection fails (guest status {forbidden.stdout[-8:]!r})")
+        survived = (inside["project"] / "ro" / "seed.txt").read_bytes()
+        check.check(survived == SEED,
+                    f"the read_only source is byte-identical after the refused write (observed {survived[:40]!r})")
+        created = guest_write(ctx, check, "storage-ro-create", inside, "machine-1",
+                              f"{RO_TARGET}/new.txt", "created")
+        check.check(refused_write(created),
+                    f"creating a file in a read_only projection fails too (guest status {created.stdout[-8:]!r})")
+        check.check(not (inside["project"] / "ro" / "new.txt").exists(),
+                    "no file appeared in the read_only source")
+
+        # snapshot: the guest's write SUCCEEDS and the host is untouched. Both
+        # halves are needed: success alone is read_write, and an unchanged host
+        # alone is read_only.
+        seen = guest_read(ctx, check, "storage-snap-read", inside, "machine-2",
+                          f"{SNAPSHOT_TARGET}/seed.txt")
+        check.check(seen.exit_code == 0 and seen.stdout == SEED,
+                    f"machine-2's snapshot carries the source's content (exit {seen.exit_code})")
+        private = "vzsnap-" + uuid.uuid4().hex[:16]
+        wrote = guest_write(ctx, check, "storage-snap-write", inside, "machine-2",
+                            f"{SNAPSHOT_TARGET}/seed.txt", private)
+        check.check(wrote.exit_code == 0 and wrote.stdout.strip().endswith(b":0"),
+                    f"machine-2 may write into its own snapshot (guest status {wrote.stdout[-8:]!r})")
+        readback = guest_read(ctx, check, "storage-snap-verify", inside, "machine-2",
+                              f"{SNAPSHOT_TARGET}/seed.txt")
+        check.check(readback.stdout.strip() == private.encode(),
+                    f"the snapshot keeps the Machine's own write (observed {readback.stdout[:40]!r})")
+        untouched = (inside["project"] / "snapshot" / "seed.txt").read_bytes()
+        check.check(untouched == SEED,
+                    f"the snapshot source is byte-identical on the host: the copy is private "
+                    f"(observed {untouched[:40]!r})")
+
+        # -- clause: the block volume is the attached Machine's alone
+        block_token = "vzblk-" + uuid.uuid4().hex[:16]
+        wrote = guest_write(ctx, check, "storage-block-write", inside, "machine-0",
+                            f"{BLOCK_TARGET}/payload", block_token)
+        check.check(wrote.exit_code == 0 and wrote.stdout.strip().endswith(b":0"),
+                    f"machine-0 writes into its block volume (guest status {wrote.stdout[-8:]!r})")
+        readback = guest_read(ctx, check, "storage-block-read", inside, "machine-0",
+                              f"{BLOCK_TARGET}/payload")
+        check.check(readback.stdout.strip() == block_token.encode(),
+                    f"the block volume reads back what was written (observed {readback.stdout[:40]!r})")
+        absent = machine_exec(ctx, check, "storage-block-absent", inside, "machine-1",
+                              f"/bin/busybox cat {BLOCK_TARGET}/payload; printf ':%s' $?")
+        check.check(block_token.encode() not in absent.stdout and
+                    not absent.stdout.strip().endswith(b":0"),
+                    f"the Machine the block volume is NOT attached to cannot read it "
+                    f"(observed {absent.stdout[:60]!r})")
+
+        # -- clause: declared shared-cache consistency, concurrent fixture
+        writer = hold_machine_exec(ctx, check, "storage-cache-write-0", inside, "machine-0",
+                                   cache_writer_script("machine-0", "machine-1"),
+                                   timeout=BARRIER_ATTEMPTS * 2)
+        try:
+            peer = machine_exec(ctx, check, "storage-cache-write-1", inside, "machine-1",
+                                cache_writer_script("machine-1", "machine-0"),
+                                timeout=int(BARRIER_ATTEMPTS * BARRIER_INTERVAL) + 60)
+            check.check(peer.exit_code == 0,
+                        f"machine-1's concurrent cache writer completed (exit {peer.exit_code}); "
+                        "exit 3 means it never saw machine-0 start, so the two never overlapped")
+        finally:
+            released = ctx.release(check, writer)
+        check.check(released.exit_code == 0,
+                    f"machine-0's concurrent cache writer completed (exit {released.exit_code})")
+        if check.status != "PASS":
+            return check.finish()
+        expected = ({f"machine-0-{index}" for index in range(CACHE_WRITES)} |
+                    {f"machine-1-{index}" for index in range(CACHE_WRITES)} |
+                    {"start-machine-0", "start-machine-1", "done-machine-0", "done-machine-1"})
+        # Both writers have exited, so every write above is closed. The declared
+        # model gives each Machine `staleness_bound_millis` from that moment to
+        # observe them all; the deadline is what makes this an assertion about
+        # the declaration rather than about eventual convergence.
+        deadline = time.monotonic() + STALENESS_BOUND_MILLIS / 1000.0
+        converged, observed, polls = {}, {}, 0
+        while time.monotonic() < deadline and len(converged) < 2:
+            polls += 1
+            for machine in ("machine-0", "machine-1"):
+                if machine in converged:
+                    continue
+                entries = cache_entries(ctx, check, "storage-cache-poll-" + machine, inside, machine)
+                observed[machine] = entries
+                if expected <= entries:
+                    converged[machine] = time.monotonic()
+            if len(converged) < 2:
+                time.sleep(CONSISTENCY_POLL_INTERVAL)
+        for machine in ("machine-0", "machine-1"):
+            missing = sorted(expected - observed.get(machine, set()))
+            check.check(machine in converged,
+                        f"{machine} observed every concurrent write within the declared "
+                        f"{STALENESS_BOUND_MILLIS} ms staleness bound after {polls} poll(s)"
+                        if machine in converged else
+                        f"{machine} still missing {missing[:6]} after the declared "
+                        f"{STALENESS_BOUND_MILLIS} ms staleness bound")
+        # Convergence on names alone would pass if two writers had overwritten
+        # each other's files, so the contents are compared too: a lost update
+        # shows here and nowhere above.
+        for machine, peer in (("machine-0", "machine-1"), ("machine-1", "machine-0")):
+            sample = machine_exec(ctx, check, "storage-cache-verify-" + machine, inside, machine,
+                                  f"/bin/busybox cat {CACHE_TARGET}/{peer}-0")
+            check.check(sample.stdout.strip() == f"{peer}-0".encode(),
+                        f"{machine} reads {peer}'s own bytes out of the shared cache, not a "
+                        f"clobbered copy (observed {sample.stdout[:40]!r})")
+    finally:
+        if check.status == "PASS":
+            for name, instance in (("store-ok", inside), ("store-deny", deny)):
+                removed = ctx.run(check, name + "-delete",
+                                  ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                                  cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+                # The refused Environment was never created, so `delete` legitimately
+                # has nothing to remove; only the one that came up must delete cleanly.
+                if name == "store-ok":
+                    check.check(removed.exit_code == 0,
+                                f"{name}: deleted (exit {removed.exit_code})")
     return check.finish()

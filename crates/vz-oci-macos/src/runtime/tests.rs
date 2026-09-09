@@ -200,6 +200,12 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
             read_only: false,
         }],
         disk_image_path: Some(std::path::PathBuf::from("/tmp/vz-machine-volume.img")),
+        block_volumes: vec![vz_runtime_contract::StackBlockVolume {
+            id: "volume-vol_test".to_string(),
+            host_path: std::path::PathBuf::from("/tmp/vz-machine-block.img"),
+            guest_path: "/data".to_string(),
+            read_only: false,
+        }],
     };
     let attachments = vec![crate::config::DeclaredAttachment {
         network_id: "net-frontend".to_string(),
@@ -233,6 +239,14 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
     drifted_mounts.volume_mounts[0].read_only = true;
     let mut drifted_disk = resources.clone();
     drifted_disk.disk_image_path = None;
+    // A block volume that came back read-only, or at a different guest path,
+    // would mount the wrong filesystem where the definition asked for one.
+    let mut drifted_block_mode = resources.clone();
+    drifted_block_mode.block_volumes[0].read_only = true;
+    let mut drifted_block_path = resources.clone();
+    drifted_block_path.block_volumes[0].guest_path = "/elsewhere".to_string();
+    let mut drifted_block_absent = resources.clone();
+    drifted_block_absent.block_volumes.clear();
     // A Machine may not be re-attached to a different network, moved to a
     // different address on the same network, or given a different MTU, and it
     // may not silently lose or gain a port.
@@ -254,6 +268,9 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         (ports.clone(), attachments.clone(), drifted_memory),
         (ports.clone(), attachments.clone(), drifted_mounts),
         (ports.clone(), attachments.clone(), drifted_disk),
+        (ports.clone(), attachments.clone(), drifted_block_mode),
+        (ports.clone(), attachments.clone(), drifted_block_path),
+        (ports.clone(), attachments.clone(), drifted_block_absent),
         (ports.clone(), drifted_network, resources.clone()),
         (ports.clone(), drifted_address, resources.clone()),
         // A Machine that comes back at a different L3 address is as much a
@@ -287,6 +304,8 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         );
         assert!(!resources.volume_mounts[0].read_only);
         assert!(resources.disk_image_path.is_some());
+        assert!(!resources.block_volumes[0].read_only);
+        assert_eq!(resources.block_volumes[0].guest_path, "/data");
         assert_eq!(
             attachments[0].network_id, "net-frontend",
             "drift check mutated the active attachment"
@@ -7489,4 +7508,32 @@ async fn lifecycle_oci_exec_with_env_and_cwd() {
     );
     assert_eq!(exec.options.cwd, Some("/workspace".to_string()));
     assert_eq!(exec.options.user, Some("1000:1000".to_string()));
+}
+
+#[test]
+fn declared_block_devices_are_named_after_the_disks_appended_before_them() {
+    // The whole point of computing this is that both preceding disks are
+    // optional and independent. A Developer Machine with Docker and no
+    // named-volume disk must not be handed the letter a Machine with both would
+    // get, or the mount lands on the Docker data disk.
+    use super::stack_vm::{MAX_DECLARED_BLOCK_VOLUMES, declared_block_device};
+    for (docker, named, index, expected) in [
+        (false, false, 0, "/dev/vda"),
+        (false, false, 1, "/dev/vdb"),
+        (true, false, 0, "/dev/vdb"),
+        (false, true, 0, "/dev/vdb"),
+        (true, true, 0, "/dev/vdc"),
+        (true, true, 2, "/dev/vde"),
+    ] {
+        assert_eq!(
+            declared_block_device(docker, named, index).unwrap(),
+            expected,
+            "docker={docker} named={named} index={index}"
+        );
+    }
+    // Past the last nameable device the refusal is explicit rather than an
+    // out-of-range letter that fails later as a missing file.
+    assert!(declared_block_device(false, false, MAX_DECLARED_BLOCK_VOLUMES).is_err());
+    assert!(declared_block_device(true, true, MAX_DECLARED_BLOCK_VOLUMES - 1).is_err());
+    assert!(declared_block_device(true, true, MAX_DECLARED_BLOCK_VOLUMES - 3).is_ok());
 }

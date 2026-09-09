@@ -25,8 +25,6 @@ use vz_runtime_contract::{
     EnvironmentLifecycleStatus, EnvironmentSpec, EnvironmentState, EnvironmentTombstone, Event,
     EventScope, Execution, ExecutionSpec, ExecutionState, HostExportId, HostExportInstance,
     HostExportSpec, HostImportId, HostImportInstance, HostImportSpec, HostSpec, Lease, LeaseState,
-    SharedCacheConsistency, SharedCacheConsistencyModel, VolumeAccessMode, VolumeAttachment,
-    VolumeId, VolumeInstance, VolumeKind, VolumeSpec,
     LegacyMigrationProvenance, LifecycleOperationId, LifecycleStepResult, LifecycleStepStatus,
     MACHINE_WORKLOAD_SCOPE_SCHEMA_VERSION, MachineActivationEvidence, MachineBackend,
     MachineCapability, MachineDockerContextDescriptor, MachineError, MachineErrorCode, MachineId,
@@ -37,9 +35,11 @@ use vz_runtime_contract::{
     OperatingSystem, OwnedResourceKind, OwnershipCleanupStep, OwnershipCleanupStepAcknowledgement,
     OwnershipRecord, ProjectDefinition, ProjectId, ProjectState, RequestMetadata, ResourceOwner,
     RuntimeCapabilities, SANDBOX_LABEL_BASE_IMAGE_REF, SANDBOX_LABEL_MAIN_CONTAINER, Sandbox,
-    SandboxBackend, SandboxSpec, SandboxState, TargetSpec, TopologyCandidate,
-    TopologyLifecycleError, TopologyResolutionError, TopologyValidationError, TransportProtocol,
-    WorkspaceBinding, WorkspaceBindingId, WorkspaceProjection, WorkspaceProjectionMode,
+    SandboxBackend, SandboxSpec, SandboxState, SharedCacheConsistency, SharedCacheConsistencyModel,
+    TargetSpec, TopologyCandidate, TopologyLifecycleError, TopologyResolutionError,
+    TopologyValidationError, TransportProtocol, VolumeAccessMode, VolumeAttachment, VolumeId,
+    VolumeInstance, VolumeKind, VolumeSpec, WorkspaceBinding, WorkspaceBindingId,
+    WorkspaceProjection, WorkspaceProjectionMode,
 };
 use vz_runtime_proto::runtime_v2;
 
@@ -2149,10 +2149,7 @@ fn volume_kind_to_proto(value: VolumeKind) -> runtime_v2::VolumeKind {
     }
 }
 
-fn volume_kind_from_proto(
-    raw: i32,
-    field: &'static str,
-) -> Result<VolumeKind, TranslationError> {
+fn volume_kind_from_proto(raw: i32, field: &'static str) -> Result<VolumeKind, TranslationError> {
     match runtime_v2::VolumeKind::try_from(raw).map_err(|_| invalid_enum(field, raw))? {
         runtime_v2::VolumeKind::Block => Ok(VolumeKind::Block),
         runtime_v2::VolumeKind::SharedCache => Ok(VolumeKind::SharedCache),
@@ -3920,6 +3917,23 @@ mod tests {
                     environment_id: environment_id.clone(),
                     machine_id: Some(linux_id.clone()),
                 },
+                // Environment-scoped: `machine_id` is deliberately absent, and
+                // `validate_exact_topology_ownership` refuses a volume record
+                // that carries one.
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Volume,
+                    resource_id: format!("vol-{suffix}-data"),
+                    environment_id: environment_id.clone(),
+                    machine_id: None,
+                },
+                OwnershipRecord {
+                    schema_version: V,
+                    resource_kind: OwnedResourceKind::Volume,
+                    resource_id: format!("vol-{suffix}-cache"),
+                    environment_id: environment_id.clone(),
+                    machine_id: None,
+                },
                 OwnershipRecord {
                     schema_version: V,
                     resource_kind: OwnedResourceKind::HostImport,
@@ -5086,6 +5100,7 @@ mod tests {
             OwnedResourceKind::HostExport,
             OwnedResourceKind::HostImport,
             OwnedResourceKind::PortRange,
+            OwnedResourceKind::Volume,
         ] {
             let (wire, other) = owned_resource_kind_to_proto(&kind);
             assert_eq!(

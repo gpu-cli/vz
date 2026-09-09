@@ -201,9 +201,7 @@ pub fn validate_volume(spec: &VolumeSpec) -> Result<(), TopologyValidationError>
                 return Err(invalid("`block` volume requires `size_bytes`"));
             };
             if !(MIN_BLOCK_VOLUME_BYTES..=MAX_BLOCK_VOLUME_BYTES).contains(&size) {
-                return Err(invalid(
-                    "`block` volume `size_bytes` must be 1 MiB..=1 TiB",
-                ));
+                return Err(invalid("`block` volume `size_bytes` must be 1 MiB..=1 TiB"));
             }
             if spec.consistency.is_some() {
                 return Err(invalid(

@@ -905,6 +905,7 @@ mod tests {
                     ("default_machine", 5),
                     ("host_exports", 6),
                     ("host_imports", 7),
+                    ("volumes", 8),
                 ],
             ),
             (
@@ -1035,6 +1036,38 @@ mod tests {
                     ("machine_id", 4),
                     ("name", 5),
                 ],
+            ),
+            // Environment-scoped, so deliberately no `machine_id` field: a
+            // shared cache spans several Machines and a block volume outlives
+            // the incarnation that mounted it.
+            (
+                "VolumeInstance",
+                &[
+                    ("schema_version", 1),
+                    ("volume_id", 2),
+                    ("environment_id", 3),
+                    ("name", 4),
+                    ("kind", 5),
+                ],
+            ),
+            (
+                "VolumeSpec",
+                &[
+                    ("schema_version", 1),
+                    ("name", 2),
+                    ("kind", 3),
+                    ("size_bytes", 4),
+                    ("consistency", 5),
+                    ("attachments", 6),
+                ],
+            ),
+            (
+                "VolumeAttachment",
+                &[("machine", 1), ("target_path", 2), ("mode", 3)],
+            ),
+            (
+                "SharedCacheConsistency",
+                &[("model", 1), ("staleness_bound_millis", 2)],
             ),
             (
                 "HostImportInstance",
@@ -1178,6 +1211,7 @@ mod tests {
                     ("host_exports", 18),
                     ("host_imports", 19),
                     ("egress", 20),
+                    ("volumes", 21),
                 ],
             ),
             (
@@ -1603,6 +1637,30 @@ mod tests {
                     ("OWNED_RESOURCE_KIND_HOST_EXPORT", 13),
                     ("OWNED_RESOURCE_KIND_HOST_IMPORT", 14),
                     ("OWNED_RESOURCE_KIND_PORT_RANGE", 15),
+                    ("OWNED_RESOURCE_KIND_VOLUME", 16),
+                ],
+            ),
+            (
+                "VolumeKind",
+                &[
+                    ("VOLUME_KIND_UNSPECIFIED", 0),
+                    ("VOLUME_KIND_BLOCK", 1),
+                    ("VOLUME_KIND_SHARED_CACHE", 2),
+                ],
+            ),
+            (
+                "VolumeAccessMode",
+                &[
+                    ("VOLUME_ACCESS_MODE_UNSPECIFIED", 0),
+                    ("VOLUME_ACCESS_MODE_READ_WRITE", 1),
+                    ("VOLUME_ACCESS_MODE_READ_ONLY", 2),
+                ],
+            ),
+            (
+                "SharedCacheConsistencyModel",
+                &[
+                    ("SHARED_CACHE_CONSISTENCY_MODEL_UNSPECIFIED", 0),
+                    ("SHARED_CACHE_CONSISTENCY_MODEL_BOUNDED_STALENESS", 1),
                 ],
             ),
         ] {

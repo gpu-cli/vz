@@ -177,7 +177,11 @@ fn the_same_block_volume_on_one_machine_is_accepted() {
         vec![developer_linux("machine-0"), developer_linux("machine-1")],
         vec![block_volume(
             "data",
-            vec![attachment("machine-0", "/data", VolumeAccessMode::ReadWrite)],
+            vec![attachment(
+                "machine-0",
+                "/data",
+                VolumeAccessMode::ReadWrite,
+            )],
         )],
     );
     refuse_unsupported_volumes(&declaration).expect("one writer is the supported case");
@@ -279,7 +283,11 @@ fn a_block_volume_becomes_one_sparse_owner_only_image_and_a_shared_cache_one_dir
         vec![
             block_volume(
                 "data",
-                vec![attachment("machine-0", "/data", VolumeAccessMode::ReadWrite)],
+                vec![attachment(
+                    "machine-0",
+                    "/data",
+                    VolumeAccessMode::ReadWrite,
+                )],
             ),
             shared_cache(
                 "cache",
@@ -310,7 +318,11 @@ fn a_block_volume_becomes_one_sparse_owner_only_image_and_a_shared_cache_one_dir
 
     let image = block_image_path(data_dir, &environment_id, &instances[0].volume_id);
     let metadata = std::fs::metadata(&image).expect("block image exists");
-    assert_eq!(metadata.len(), 16 * MIB, "the declared size is the one made");
+    assert_eq!(
+        metadata.len(),
+        16 * MIB,
+        "the declared size is the one made"
+    );
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -358,7 +370,11 @@ fn a_shared_cache_share_never_collides_with_a_workspace_projections_tag() {
         vec![developer_linux("machine-0")],
         vec![shared_cache(
             "cache",
-            vec![attachment("machine-0", "/cache", VolumeAccessMode::ReadWrite)],
+            vec![attachment(
+                "machine-0",
+                "/cache",
+                VolumeAccessMode::ReadWrite,
+            )],
         )],
     );
     let instances = vec![instance(&environment_id, "cache", VolumeKind::SharedCache)];
@@ -374,7 +390,10 @@ fn a_shared_cache_share_never_collides_with_a_workspace_projections_tag() {
         &next,
     )
     .expect("volumes resolve");
-    assert_eq!(resolved[&machines[0].machine_id].shares[0].tag, "vz-mount-1");
+    assert_eq!(
+        resolved[&machines[0].machine_id].shares[0].tag,
+        "vz-mount-1"
+    );
 }
 
 #[test]
@@ -385,7 +404,11 @@ fn a_second_up_reuses_the_existing_image_and_its_contents() {
         vec![developer_linux("machine-0")],
         vec![block_volume(
             "data",
-            vec![attachment("machine-0", "/data", VolumeAccessMode::ReadWrite)],
+            vec![attachment(
+                "machine-0",
+                "/data",
+                VolumeAccessMode::ReadWrite,
+            )],
         )],
     );
     let instances = vec![instance(&environment_id, "data", VolumeKind::Block)];
@@ -417,7 +440,11 @@ fn a_declared_volume_with_no_persisted_identity_is_refused_rather_than_minted() 
         vec![developer_linux("machine-0")],
         vec![block_volume(
             "data",
-            vec![attachment("machine-0", "/data", VolumeAccessMode::ReadWrite)],
+            vec![attachment(
+                "machine-0",
+                "/data",
+                VolumeAccessMode::ReadWrite,
+            )],
         )],
     );
     let machines = vec![machine_instance(&environment_id, "machine-0")];
@@ -500,7 +527,11 @@ fn declared_volume_helpers_report_the_declaration() {
         vec![developer_linux("machine-0")],
         vec![shared_cache(
             "cache",
-            vec![attachment("machine-0", "/cache", VolumeAccessMode::ReadWrite)],
+            vec![attachment(
+                "machine-0",
+                "/cache",
+                VolumeAccessMode::ReadWrite,
+            )],
         )],
     );
     assert!(declares_volumes(&declared));

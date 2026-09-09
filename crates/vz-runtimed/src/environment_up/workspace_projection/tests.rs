@@ -230,19 +230,94 @@ fn the_mount_tag_keeps_the_shape_the_kernel_cmdline_mapping_requires() {
 }
 
 #[test]
-fn snapshot_is_refused_with_a_reason_rather_than_silently_projected() {
-    let error = projection_to_volume_mount(
+fn a_snapshot_projection_is_shared_writable_because_the_copy_is_private() {
+    // A snapshot Machine writes into its own clone, so the share is read-write.
+    // Mounting it read-only would make `snapshot` an awkward synonym for
+    // `read_only` with a copy nobody could use.
+    let mount = projection_to_volume_mount(
         "dev",
         0,
         &projection(WorkspaceProjectionMode::Snapshot),
         PathBuf::from("/tmp/x"),
     )
-    .expect_err("snapshot must be refused");
-    assert!(matches!(
-        error,
-        WorkspaceProjectionError::SnapshotUnsupported { .. }
-    ));
-    assert!(error.to_string().contains("no directory-copy primitive"));
+    .expect("snapshot projections are applied");
+    assert!(!mount.read_only);
+    assert_eq!(mount.tag, "vz-mount-0");
+}
+
+#[test]
+fn a_snapshot_copy_is_private_recursive_and_remade_on_every_up() {
+    // The three properties `snapshot` promises, each asserted rather than
+    // assumed: the copy is recursive, writes into it never reach the source,
+    // and a second Up does not merge the previous boot's tree into it.
+    let temp = tempfile::tempdir().expect("tempdir");
+    let base = temp.path().canonicalize().expect("canonical");
+    let source = base.join("source");
+    fs::create_dir_all(source.join("nested")).expect("source tree");
+    fs::write(source.join("nested/file"), b"original").expect("file");
+    let store = base.join("machine-store");
+    fs::create_dir_all(&store).expect("store");
+
+    let clone = materialise_snapshot("dev", &source, &store).expect("snapshot");
+    assert_eq!(clone, machine_snapshot_path(&store));
+    assert_eq!(
+        fs::read(clone.join("nested/file")).expect("cloned"),
+        b"original"
+    );
+
+    // The Machine writes into its copy; the worktree must not see it. This is
+    // the entire difference between `snapshot` and `read_write`.
+    fs::write(clone.join("nested/file"), b"guest wrote this").expect("guest write");
+    fs::write(clone.join("guest-only"), b"new").expect("guest create");
+    assert_eq!(
+        fs::read(source.join("nested/file")).expect("source"),
+        b"original"
+    );
+    assert!(!source.join("guest-only").exists());
+
+    // A second Up re-clones: the tree is the source as it is NOW, and the
+    // previous boot's additions are gone rather than merged in.
+    fs::write(source.join("nested/file"), b"changed on the host").expect("host write");
+    let again = materialise_snapshot("dev", &source, &store).expect("second snapshot");
+    assert_eq!(
+        fs::read(again.join("nested/file")).expect("recloned"),
+        b"changed on the host"
+    );
+    assert!(!again.join("guest-only").exists());
+}
+
+#[test]
+fn snapshot_projections_of_one_source_do_not_collide() {
+    // Two snapshots of one source are allowed where two read-write projections
+    // of it are refused, because neither Machine mutates the shared subtree.
+    let tree = worktree();
+    let spec = spec(vec![
+        machine_spec("dev-a", Some(projection(WorkspaceProjectionMode::Snapshot))),
+        machine_spec("dev-b", Some(projection(WorkspaceProjectionMode::Snapshot))),
+    ]);
+    refuse_declared_writable_multi_attach(&spec).expect("two snapshots are not a multi-attach");
+    let machines = vec![machine_instance("dev-a"), machine_instance("dev-b")];
+    let resolved = resolve_environment_workspace_mounts(
+        &spec,
+        &machines,
+        &BTreeSet::from(["src".to_string()]),
+        Some(tree.root.to_str().expect("utf-8 root")),
+    )
+    .expect("snapshots resolve");
+    // Both are reported as needing a clone, and both shares still name the
+    // SOURCE at this point: the redirect happens once each Machine's store
+    // exists.
+    assert_eq!(resolved.snapshot_sources.len(), 2);
+    for machine in &machines {
+        assert_eq!(
+            resolved.snapshot_sources[&machine.machine_id],
+            tree.root.join("inside")
+        );
+        assert_eq!(
+            resolved.mounts[&machine.machine_id][0].host_path,
+            tree.root.join("inside")
+        );
+    }
 }
 
 fn machine_spec(name: &str, workspace: Option<WorkspaceProjection>) -> MachineSpec {
@@ -357,12 +432,13 @@ fn only_machines_that_declare_a_projection_get_shares() {
         Some(&tree.root.to_string_lossy()),
     )
     .expect("resolves");
-    assert_eq!(mounts.len(), 1);
-    let shares = &mounts[&machines[0].machine_id];
+    assert_eq!(mounts.mounts.len(), 1);
+    assert!(mounts.snapshot_sources.is_empty());
+    let shares = &mounts.mounts[&machines[0].machine_id];
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0].host_path, tree.root.join("inside"));
     assert!(shares[0].read_only);
-    assert!(!mounts.contains_key(&machines[1].machine_id));
+    assert!(!mounts.mounts.contains_key(&machines[1].machine_id));
 }
 
 #[test]
@@ -377,6 +453,7 @@ fn an_environment_with_no_declared_projection_resolves_to_no_shares() {
             None,
         )
         .expect("resolves")
+        .mounts
         .is_empty()
     );
 }
@@ -503,7 +580,10 @@ fn the_supervisors_pre_boot_sequence_resolves_shares_from_durable_state() {
     )
     .expect("shares resolve");
     let machine_id = &reloaded.machines[0].machine_id;
-    let shares = mounts.get(machine_id).expect("the Machine gets its share");
+    let shares = mounts
+        .mounts
+        .get(machine_id)
+        .expect("the Machine gets its share");
     assert_eq!(shares.len(), 1);
     assert_eq!(shares[0].host_path, tree.root.join("inside"));
     assert_eq!(shares[0].guest_path.as_deref(), Some("/work"));
@@ -567,7 +647,7 @@ fn resolve_pair(
     tree: &Worktree,
     first: WorkspaceProjection,
     second: WorkspaceProjection,
-) -> Result<BTreeMap<MachineId, Vec<StackVolumeMount>>, WorkspaceProjectionError> {
+) -> Result<ResolvedWorkspaceMounts, WorkspaceProjectionError> {
     let spec = spec(vec![
         machine_spec("dev-a", Some(first)),
         machine_spec("dev-b", Some(second)),
@@ -637,8 +717,14 @@ fn two_machines_reading_one_host_source_read_only_are_allowed() {
     let tree = worktree();
     let mounts = resolve_pair(&tree, readable_at("inside"), readable_at("inside"))
         .expect("two read-only readers of one source are not a multi-attach");
-    assert_eq!(mounts.len(), 2);
-    assert!(mounts.values().flatten().all(|mount| mount.read_only));
+    assert_eq!(mounts.mounts.len(), 2);
+    assert!(
+        mounts
+            .mounts
+            .values()
+            .flatten()
+            .all(|mount| mount.read_only)
+    );
     admit_pair(readable_at("inside"), readable_at("inside")).expect("admitted");
 }
 
@@ -650,7 +736,7 @@ fn distinct_sources_under_one_root_are_not_a_multi_attach() {
     fs::create_dir_all(tree.root.join("inside-two")).expect("sibling");
     let mounts = resolve_pair(&tree, writable_at("inside"), writable_at("inside-two"))
         .expect("distinct writable sources are not a multi-attach");
-    assert_eq!(mounts.len(), 2);
+    assert_eq!(mounts.mounts.len(), 2);
     admit_pair(writable_at("inside"), writable_at("inside-two")).expect("admitted");
 }
 
@@ -705,7 +791,13 @@ fn a_single_writable_projection_is_untouched_by_the_rule() {
         Some(tree.root.to_str().expect("utf-8 root")),
     )
     .expect("one writer is not a multi-attach");
-    assert_eq!(mounts.len(), 1);
-    assert!(mounts.values().flatten().all(|mount| !mount.read_only));
+    assert_eq!(mounts.mounts.len(), 1);
+    assert!(
+        mounts
+            .mounts
+            .values()
+            .flatten()
+            .all(|mount| !mount.read_only)
+    );
     refuse_declared_writable_multi_attach(&spec).expect("admitted");
 }

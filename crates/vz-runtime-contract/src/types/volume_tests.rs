@@ -103,7 +103,9 @@ fn a_shared_cache_validates_only_with_an_explicit_consistency_declaration() {
         .expect("a declared shared cache is valid");
     let error = validate_volume(&shared(None, attachments)).unwrap_err();
     assert!(
-        error.to_string().contains("requires an explicit `consistency`"),
+        error
+            .to_string()
+            .contains("requires an explicit `consistency`"),
         "{error}"
     );
 }

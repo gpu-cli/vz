@@ -408,23 +408,14 @@ fn validate_supported(
         ));
     }
     for machine in &spec.machines {
-        let Some(workspace) = &machine.workspace else {
+        if machine.workspace.is_none() {
             continue;
-        };
-        // Snapshot has neither a directory-tree copy primitive (only the
-        // single-file `clone_file` in `vz-macos-provision`) nor an
-        // `OwnedResourceKind` variant, so a snapshot Delete could neither
-        // reclaim nor account for would leak on the first successful Up.
-        if workspace.mode == WorkspaceProjectionMode::Snapshot {
-            return Err(failure(
-                metadata,
-                MachineErrorCode::UnsupportedOperation,
-                format!(
-                    "Machine `{}` requests `snapshot` workspace projection, which has no directory-copy primitive and no owned-resource kind; this Up applies `read_write` and `read_only` only and performs no admission",
-                    machine.name
-                ),
-            ));
         }
+        // Every mode is applied. `snapshot` is a private per-Machine clone of
+        // the source, made with `clonefile` inside that Machine's own runtime
+        // store; see `workspace_projection` for why that needs no
+        // `OwnedResourceKind` of its own.
+        //
         // A projection is carried by a VirtioFS share whose `vz-mount-{N}` tag
         // `linux/initramfs/init` bind-mounts. `boot_or_inspect_machine` hands
         // the native macOS backend no `StackResourceHint` at all, so admitting

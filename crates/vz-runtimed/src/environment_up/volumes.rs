@@ -78,12 +78,7 @@ pub fn refuse_unsupported_volumes(spec: &EnvironmentSpec) -> Result<(), VolumeEr
     let machines: BTreeMap<&str, (MachineProfile, OperatingSystem)> = spec
         .machines
         .iter()
-        .map(|machine| {
-            (
-                machine.name.as_str(),
-                (machine.profile, machine.target.os),
-            )
-        })
+        .map(|machine| (machine.name.as_str(), (machine.profile, machine.target.os)))
         .collect();
     for volume in &spec.volumes {
         for attachment in &volume.attachments {
@@ -254,7 +249,8 @@ pub fn resolve_environment_volumes(
             let entry = resolved.entry(machine.machine_id.clone()).or_default();
             match volume.kind {
                 VolumeKind::SharedCache => {
-                    let host_path = shared_cache_path(data_dir, environment_id, &instance.volume_id);
+                    let host_path =
+                        shared_cache_path(data_dir, environment_id, &instance.volume_id);
                     create_directory(&volume.name, &host_path)?;
                     let slot = index.entry(machine.machine_id.clone()).or_insert(0);
                     entry.shares.push(StackVolumeMount {
