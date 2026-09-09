@@ -43,6 +43,8 @@ TOP17 = e2e.CRITERION_17
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 TOP19 = e2e.CRITERION_19
+TOP6 = e2e.CRITERION_6
+INGRESS_SLUG = "public_like_ingress"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
                "status_json_field_set", "grpc_api_live_agreement", "workspace_storage_policy"}
@@ -52,6 +54,12 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # stand in for that: it needs a macOS template a gate host does not provision.
 # It was in IMPLEMENTED while the check reported PASS on the Linux half alone,
 # which certified the criterion on evidence that never touched its macOS clause.
+#
+# `public_like_ingress` proves criterion 6's split-DNS, `.test`-hostname,
+# edge-versus-origin, cross-Environment and host-listener clauses and stops
+# there. Its TLS, routed-ingress and address-translation clauses need an HTTPS
+# client inside a Developer Linux Machine, and the guest image ships none that
+# can verify a certificate or complete a handshake with the edge.
 # `install_upgrade_rollback_uninstall` proves every clause of criterion 19
 # except one: the restored store being opened again by v0.3.20 itself needs
 # the pinned ~22 MiB v0.3.20 daemon, which is neither committed nor fetched
@@ -69,7 +77,7 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # `grpc_api_live_agreement` is deliberately absent from this set: the release
 # now ships vz-runtime-probe, so criterion 15's typed channel is exercised.
 NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall",
-                   "mixed_profile_topology_status"}
+                   "mixed_profile_topology_status", "public_like_ingress"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -258,7 +266,8 @@ class TopologyLaneTests(unittest.TestCase):
                           f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set",
                           f"{TOP15}__grpc_api_live_agreement",
                           f"{TOP19}__install_upgrade_rollback_uninstall",
-                          f"{TOP2}__mixed_profile_topology_status"})
+                          f"{TOP2}__mixed_profile_topology_status",
+                          f"{TOP6}__public_like_ingress"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:
@@ -834,6 +843,87 @@ class TopologyLaneTests(unittest.TestCase):
         # A Machine carries at most one projection, so three modes need three
         # Machines; a definition with fewer could not exercise all three.
         self.assertEqual(len(definition["environment"]["machines"]), 3)
+    # -- criterion 6 ------------------------------------------------------------------
+    #
+    # Every test below runs the whole `clean-provision` phase, so the sub-check
+    # is exercised through the path the gate runs it through rather than called
+    # directly with arguments a caller chose.
+
+
+    def ingress(self, mode: str = ""):
+        self.set_mode(mode)
+        evidence = self.evidence()
+        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        return code, result, self.by_slug(result)[INGRESS_SLUG]
+
+    def test_the_edge_is_proved_and_its_tls_clause_is_reported_unexercised(self):
+        code, result, sub = self.ingress()
+        failures = [line for line in sub["assertions"] if line.startswith("FAILED:")]
+        self.assertEqual(failures, [], failures)
+        # Not PASS, and deliberately: the criterion's TLS, ingress and
+        # translation clauses were never exercised, and reporting PASS on the
+        # rest would certify the criterion on evidence that never touched them.
+        self.assertEqual(sub["status"], "FAIL")
+        unexercised = [line for line in sub["assertions"] if line.startswith("not_implemented:")]
+        self.assertEqual(len(unexercised), 1, sub["assertions"])
+        for named in ("TLS", "routed-ingress", "NAT", "BusyBox"):
+            self.assertIn(named, unexercised[0])
+        # The lane's outcome is not_implemented rather than an assertion
+        # failure, so a real regression in this check stays distinguishable
+        # from the clause it cannot reach.
+        self.assertEqual((code, result["failure"]["reason"]), (3, "not_implemented"))
+        # And what it did prove is present as values, not as field presence.
+        for claim in ("resolves to the edge inside the Environment",
+                      "never resolves to the origin Machine",
+                      "no static /etc/hosts entry for the published name",
+                      "resolves through its Environment alone",
+                      "does not resolve in the other Environment",
+                      "an undeclared name in the same Environment does not resolve",
+                      "no listener on the host LAN or a wildcard address appeared",
+                      "the published authority is a certificate and carries no key"):
+            self.assertTrue(any(claim in line for line in sub["assertions"]),
+                            (claim, sub["assertions"]))
+
+    def assert_broken(self, mode: str, needle: str):
+        code, result, sub = self.ingress(mode)
+        self.assertEqual(sub["status"], "FAIL", mode)
+        self.assertTrue(any(line.startswith("FAILED:") and needle in line for line in sub["assertions"]),
+                        (mode, sub["assertions"]))
+        # A broken clause is an assertion failure, never the not_implemented
+        # report: the two must not be able to stand in for one another.
+        self.assertEqual((code, result["outcome"], result["failure"]["reason"]),
+                         (1, "failed", "assertion"), mode)
+        self.assertEqual(self.top(result, e2e.CRITERION_6)["status"], "FAIL")
+        return sub
+
+    def test_a_name_that_resolves_to_the_machine_behind_the_edge_fails_the_criterion(self):
+        """The one distinction criterion 6 exists to make.
+
+        A published name answering with the origin's own address is a private
+        shortcut wearing a public name: the client would reach the Machine
+        directly, and the TLS, ingress, firewall and translation clauses would
+        all be bypassed while every other observable stayed identical.
+        """
+        sub = self.assert_broken("edge_shortcut", "the declared `.test` name resolves to the edge")
+        self.assertTrue(any(line.startswith("FAILED:") and "never resolves to the origin" in line
+                            for line in sub["assertions"]), sub["assertions"])
+
+    def test_a_published_name_in_the_static_hosts_table_fails_the_criterion(self):
+        """If the name is in `/etc/hosts` the resolver is never asked.
+
+        Every DNS assertion would then pass with no resolver in the Environment
+        at all, which is exactly the way a check passes for the wrong reason.
+        """
+        self.assert_broken("edge_hosts_shortcut", "no static /etc/hosts entry for the published name")
+
+    def test_a_machine_left_pointing_at_public_resolvers_fails_the_criterion(self):
+        """`vz.dns` on the cmdline is not the same claim as the running resolver.
+
+        A Machine booted with the edge named on its cmdline but still running
+        with the image's public resolvers would resolve nothing local and leave
+        the fabric for every lookup, while the cmdline said otherwise.
+        """
+        self.assert_broken("edge_public_resolver", "resolves through its Environment alone")
 
 
 # One `#[derive(...)]`-preceded struct body out of the Rust source, as

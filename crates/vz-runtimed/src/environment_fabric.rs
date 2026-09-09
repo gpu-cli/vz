@@ -22,6 +22,7 @@ use vz_oci_macos::{DeclaredAttachment, DeclaredHost, SharedVmAttachment};
 use vz_runtime_contract::{EnvironmentInstance, MachineId, ResourceOwner};
 
 use crate::RuntimeDaemon;
+use crate::environment_gateway::{EnvironmentGateway, GatewayError};
 use crate::environment_runtime_controller::EnvironmentControllerLease;
 use crate::environment_switch::plan::{FABRIC_MTU, FabricPlanError, plan_environment_fabric};
 use crate::environment_switch::registry::SwitchRegistryError;
@@ -41,6 +42,11 @@ pub enum EnvironmentFabricError {
         machine_id: MachineId,
         error: vz_oci_macos::MacosOciError,
     },
+    #[error("network `{network}` edge: {error}")]
+    Gateway {
+        network: String,
+        error: GatewayError,
+    },
     /// The Environment's running fabric is not the fabric it now needs, and no
     /// operation can reconcile the difference without disconnecting Machines.
     #[error("Environment fabric conflict: {0}")]
@@ -56,6 +62,10 @@ fn conflict(message: impl Into<String>) -> EnvironmentFabricError {
 /// A Machine absent from the map has no declared attachment, or is already
 /// running and already holds the ends it was minted.
 pub(crate) type MintedAttachments = BTreeMap<MachineId, Vec<SharedVmAttachment>>;
+
+/// Where an Environment edge's certificate authority is published, under the
+/// daemon's runtime directory: `<root>/<environment id>/<network id>/authority.pem`.
+pub const EDGE_ANCHOR_ROOT: &str = "environment-edges";
 
 impl RuntimeDaemon {
     /// Start every switch this Environment's definition asks for and mint one
@@ -120,6 +130,11 @@ impl RuntimeDaemon {
             )));
         }
 
+        // Every Environment's trust anchors live under one root in the daemon's
+        // own runtime directory, so an Environment's client can be handed the
+        // one certificate that verifies its edge without the daemon publishing
+        // anything else about the Environment.
+        let anchor_root = self.runtime_data_dir().join(EDGE_ANCHOR_ROOT);
         let mut minted = MintedAttachments::new();
         for network in &plan.networks {
             let (switch, guests) =
@@ -129,11 +144,6 @@ impl RuntimeDaemon {
                         error,
                     }
                 })?;
-            // Ownership before the descriptors are handed out: a switch this
-            // Environment does not own is one Stop and Delete cannot reclaim.
-            self.environment_switches
-                .install(lease, &owner, network.network_id.as_str(), switch)
-                .await?;
             // Matched by port number rather than by position: the guest ends
             // come back as a list, and a mis-paired descriptor would give a
             // Machine a NIC the switch has assigned to a different address,
@@ -142,6 +152,31 @@ impl RuntimeDaemon {
                 .into_iter()
                 .map(|guest| (guest.port, guest.socket))
                 .collect();
+            // The edge's port is claimed before any Machine's, and by the
+            // daemon rather than by a VM. It is the same kind of port on the
+            // same switch; what differs is only who holds the guest end.
+            let gateway = match &network.gateway {
+                Some(planned) => {
+                    let socket = guests.remove(&planned.port).ok_or_else(|| {
+                        conflict(format!(
+                            "switch for network `{}` returned no guest end for its edge port {}",
+                            network.name, planned.port
+                        ))
+                    })?;
+                    EnvironmentGateway::start(
+                        environment.environment_id.as_str(),
+                        network,
+                        socket,
+                        &anchor_root,
+                    )
+                    .map_err(|error| EnvironmentFabricError::Gateway {
+                        network: network.name.clone(),
+                        error,
+                    })?
+                }
+                None => None,
+            };
+            let resolver = gateway.as_ref().map(EnvironmentGateway::address);
             for port in &network.ports {
                 let socket = guests.remove(&port.port).ok_or_else(|| {
                     conflict(format!(
@@ -156,12 +191,12 @@ impl RuntimeDaemon {
                         ipv4: port.address,
                         prefix: network.cidr.prefix(),
                         // A private fabric has no route off itself, so there
-                        // is no gateway to name. The offset one address is
-                        // reserved for the one `NetworkKind::SimulatedPublic`
-                        // will need, but nothing occupies it until an egress
-                        // path exists, and pointing a guest at an address no
-                        // one answers on would be worse than no route at all.
-                        gateway: None,
+                        // is no gateway to name and offset one stays empty. A
+                        // public-like one names its edge, which is running by
+                        // the time this descriptor is built: a guest is never
+                        // pointed at an address nothing answers on.
+                        gateway: resolver,
+                        dns: resolver,
                         mtu: FABRIC_MTU,
                         // Every Machine on this network gets the same table,
                         // including the Machine that owns an endpoint: a service
@@ -186,12 +221,20 @@ impl RuntimeDaemon {
                     .or_default()
                     .push(attachment);
             }
+            // Ownership last, and with the edge, because the two are
+            // reclaimed as one: a switch installed before its edge existed
+            // could be stopped by a concurrent Stop while the edge it does not
+            // yet own kept running on a port that had gone.
+            self.environment_switches
+                .install(lease, &owner, network.network_id.as_str(), switch, gateway)
+                .await?;
             info!(
                 environment_id = %environment.environment_id,
                 network = %network.name,
                 network_id = %network.network_id,
                 cidr = %network.cidr,
                 ports = network.ports.len(),
+                edge = ?resolver,
                 "started Environment network switch"
             );
         }

@@ -57,6 +57,7 @@ from jsonschema import Draft202012Validator
 from developer_environment_recorder import (ENDPOINT_NAME_BYTES, SOCKET_PATH_LIMIT, LaneState, Recorder, inventory,
                                             inventory_diff, processes_referencing, write_inventory)
 from vz04_common import digest_file, load_json, now_ns, read_regular, write_exclusive
+import vz04_host
 
 HELP_SNAPSHOT = "tests/fixtures/vz-0.4/cli/help-snapshot.txt"
 PROJECT_DEFINITION_SCHEMA = "schemas/vz-project-definition-v1.schema.json"
@@ -3336,4 +3337,388 @@ def check_workspace_projection_policy(ctx: CheckContext, top: str) -> SubCheck:
                 if name == "store-ok":
                     check.check(removed.exit_code == 0,
                                 f"{name}: deleted (exit {removed.exit_code})")
+    return check.finish()
+
+
+# --------------------------------------------------------------- criterion 6
+
+# The public-like network's name, the endpoint port behind its edge, and the
+# `.test` names two separate Environments publish. `.test` is reserved for
+# exactly this: a name that must never resolve or validate outside the context
+# that defined it.
+PUBLIC_NETWORK = "edge"
+PUBLIC_ORIGIN_PORT = 8080
+PUBLIC_NAMES = ("api.one.test", "api.two.test")
+UNDECLARED_NAME = "admin.one.test"
+
+# What a Machine on a public-like network knows about its own edge, read from
+# the guest rather than assumed from the host.
+#
+#   APPLET <name>          every applet this BusyBox actually carries. The guest
+#                          image is not a promise; a clause that needs an applet
+#                          this build lacks must be reported unexercised rather
+#                          than failed or quietly skipped.
+#   CMDLINE <value>        `vz.net.N=<mac>,<cidr>[,<gateway>]` as the HOST wrote
+#                          it, so the guest's resolver can be compared against
+#                          the address the host planned instead of against
+#                          itself.
+#   DNSARG <value>         `vz.dns.N=<ipv4>`, likewise.
+#   RESOLV <line>          `/etc/resolv.conf` as the guest is actually running
+#                          with. This is the file every resolver call reads, so
+#                          it is the only thing that makes "resolved through the
+#                          Environment" a fact rather than an intention.
+#   HOSTS <line>           `/etc/hosts`. A published name appearing here would
+#                          mean the resolver was never asked, and every DNS
+#                          claim below would pass without the resolver existing.
+#   ADDR <iface> <cidr>    the Machine's own IPv4 addresses.
+PUBLIC_EDGE_PROBE = (
+    '/bin/busybox --list | /bin/busybox awk \'{print "APPLET", $0}\'; '
+    'for p in $(/bin/busybox cat /proc/cmdline); do '
+    '  case "$p" in '
+    '    vz.net.*=*) printf "CMDLINE %s\\n" "${p#*=}" ;; '
+    '    vz.dns.*=*) printf "DNSARG %s\\n" "${p#*=}" ;; '
+    '  esac; '
+    'done; '
+    '/bin/busybox cat /etc/resolv.conf 2>/dev/null | /bin/busybox awk \'{print "RESOLV", $0}\'; '
+    '/bin/busybox cat /etc/hosts 2>/dev/null | /bin/busybox awk \'{print "HOSTS", $0}\'; '
+    '/bin/busybox ip -o -4 addr show | /bin/busybox awk \'$2!="lo"{print "ADDR", $2, $4}\''
+)
+
+
+class EdgeState:
+    """One Machine's view of its Environment's edge, as the probe reported it."""
+
+    def __init__(self, receipt):
+        self.applets = set()
+        self.gateways = []      # gateways named on the kernel cmdline
+        self.resolver_args = []  # `vz.dns.N` values
+        self.resolv_conf = []   # nameserver addresses in /etc/resolv.conf
+        self.hosts = []         # raw /etc/hosts lines
+        self.addresses = []     # this Machine's own IPv4 addresses
+        for line in receipt.stdout.decode("ascii", "replace").splitlines():
+            row = line.split()
+            if row[:1] == ["APPLET"] and len(row) == 2:
+                self.applets.add(row[1])
+            elif row[:1] == ["CMDLINE"] and len(row) == 2:
+                fields = row[1].split(",")
+                if len(fields) >= 3 and fields[2]:
+                    self.gateways.append(fields[2])
+            elif row[:1] == ["DNSARG"] and len(row) == 2:
+                self.resolver_args.append(row[1])
+            elif row[:1] == ["RESOLV"] and len(row) == 3 and row[1] == "nameserver":
+                self.resolv_conf.append(row[2])
+            elif row[:1] == ["HOSTS"]:
+                self.hosts.append(" ".join(row[1:]))
+            elif row[:1] == ["ADDR"] and len(row) == 3:
+                self.addresses.append(row[2].split("/")[0])
+
+    def evidence(self) -> str:
+        return (f"cmdline gateways {self.gateways!r}, vz.dns {self.resolver_args!r}, "
+                f"resolv.conf {self.resolv_conf!r}, addresses {self.addresses!r}, "
+                f"hosts {self.hosts!r}")
+
+
+def public_like_definition(release_dir: Path, hostname: str) -> dict:
+    """One Environment, two Machines, one public-like network, one `https` name.
+
+    The endpoint is declared `https` because that is what the edge terminates;
+    a `tcp` or `http` endpoint on a public-like network is refused at plan time
+    rather than published behind a listener that does not exist.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    second = copy.deepcopy(first)
+    second["name"] = "machine-1"
+    for machine in (first, second):
+        machine["networks"] = [PUBLIC_NETWORK]
+    environment["machines"] = [first, second]
+    environment["networks"] = [{"schema_version": 1, "name": PUBLIC_NETWORK, "kind": "simulated_public"}]
+    environment["endpoints"] = [{"schema_version": 1, "name": "api", "machine": first["name"],
+                                 "network": PUBLIC_NETWORK, "protocol": "https",
+                                 "port": PUBLIC_ORIGIN_PORT, "hostname": hostname}]
+    return definition
+
+
+def edge_anchor(instance: dict) -> Path:
+    """The Environment authority the daemon published for this Environment.
+
+    One file per Environment per network, under the daemon's own runtime
+    directory. Reading it from the host is what lets a client inside the
+    Environment be handed the one certificate that verifies its edge; finding
+    exactly one is also how this check learns which Environment and network the
+    edge belongs to without being told.
+    """
+    root = Path(instance["env"]["VZ_RUNTIME_DATA_DIR"]) / "environment-edges"
+    return sorted(root.glob("*/*/authority.pem")) if root.is_dir() else []
+
+
+def _lookup(ctx, check, label, instance, machine, name):
+    """Resolve one name from inside a Machine, through whatever resolver it has.
+
+    Deliberately not given a server argument. The claim is that the Machine
+    resolves the Environment's names through its Environment, and a lookup that
+    named the resolver on the command line would prove only that the resolver
+    answers -- not that the Machine is pointed at it.
+    """
+    return machine_exec(ctx, check, label, instance, machine,
+                        f'/bin/busybox nslookup {name} 2>&1; printf "EXIT:%s\\n" $?')
+
+
+def _resolved(receipt) -> tuple:
+    """(exit code, every address the lookup reported after the server line)."""
+    text = receipt.stdout.decode("ascii", "replace")
+    code, addresses, seen_name = None, [], False
+    for line in text.splitlines():
+        if line.startswith("EXIT:"):
+            code = line.split(":", 1)[1].strip()
+        elif line.startswith("Name:"):
+            seen_name = True
+        elif seen_name and line.startswith("Address"):
+            # `Address: 10.0.0.1` and `Address 1: 10.0.0.1 name` both occur.
+            fields = line.replace(":", " ").split()
+            addresses.extend(field for field in fields[1:] if _is_ipv4(field))
+    return code, addresses
+
+
+def _is_ipv4(text: str) -> bool:
+    parts = text.split(".")
+    return len(parts) == 4 and all(part.isdigit() and 0 <= int(part) <= 255 for part in parts)
+
+
+def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
+    """Criterion 6: the Environment's own public-like edge, and nothing on the host.
+
+    What this proves, in the order the claims depend on each other:
+
+    * a `simulated_public` declaration is applied at all -- it was refused
+      outright until the edge existed, so an Up that succeeds here is the first
+      fact;
+    * the daemon published exactly one Environment certificate authority for it,
+      which is the trust anchor a client inside the Environment would verify
+      against, and which is a certificate and never a key;
+    * every Machine on that network is booted pointing at its Environment's own
+      resolver, and at nothing else -- read out of the `/etc/resolv.conf` the
+      guest is actually running with, and agreeing with the address the host
+      derived and wrote to that Machine's kernel cmdline;
+    * the declared `.test` name resolves, through that resolver, to the EDGE's
+      address and never to the address of the Machine behind it. That is the
+      difference between ingress and a private shortcut, and it is asserted on
+      the values rather than on the lookup having succeeded;
+    * the name is not in `/etc/hosts`, so the resolver was genuinely asked;
+    * an undeclared name in the same Environment does not resolve, and a second
+      Environment's Machine cannot resolve this Environment's name nor this one
+      the other's -- which is what makes the DNS view split rather than shared;
+    * and no listener attributable to this run appeared on the host's LAN or on
+      any wildcard address while all of it was running, while the edge's own
+      address is bound nowhere on the host at all -- both read off the host's
+      real listener table before and after rather than inferred from the
+      absence of a bind in the source.
+
+    What it does NOT prove, and says so rather than passing on the rest: the
+    TLS, routed-ingress and address-translation clauses. See the
+    `not_implemented` text at the end for exactly why.
+    """
+    check = SubCheck(top, "public_like_ingress")
+    try:
+        one = public_like_definition(ctx.release_dir, PUBLIC_NAMES[0])
+        two = public_like_definition(ctx.release_dir, PUBLIC_NAMES[1])
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if schema_path.is_file():
+        problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(one),
+                          key=lambda e: list(map(str, e.absolute_path)))
+        check.check(not problems, "the public-like definition validates"
+                    if not problems else f"definition invalid: {problems[0].message[:200]}")
+        if problems:
+            return check.finish()
+
+    # The host, before anything of this Environment exists. Everything below is
+    # judged against this snapshot, because a listener that was already there is
+    # not this Environment's and a claim that ignored that would be a claim
+    # about the whole machine.
+    scope = vz04_host.HostScope(run_id=ctx.recorder.run_id, state_root=ctx.state.root,
+                                release_dir=ctx.release_dir, clients={})
+    before = vz04_host.capture(scope, "public_like_ingress_before")
+    check.check(before["capture_state"] == "captured",
+                f"the host listener table was read before the Environment existed "
+                f"({before['capture_state']}, {len(before['listeners'])} listeners)")
+
+    inside = provision(ctx, check, "edge-a", one)
+    if inside.get("unsupported"):
+        check.not_implemented = ("a public-like network is not applied by this runtime: " +
+                                 inside["unsupported"][:300])
+        return check.finish()
+    if check.status != "PASS" or not inside["status"]:
+        return check.finish()
+    check.ok("a `simulated_public` network with an `https` endpoint was applied by Up")
+
+    anchors = edge_anchor(inside)
+    check.check(len(anchors) == 1,
+                f"the daemon published exactly one Environment authority for this edge ({anchors})")
+    if len(anchors) != 1:
+        return check.finish()
+    anchor = read_regular(anchors[0])
+    # A trust anchor and nothing else: a reader can verify the edge and cannot
+    # issue under it.
+    check.check(anchor.startswith(b"-----BEGIN CERTIFICATE-----") and b"PRIVATE KEY" not in anchor,
+                f"the published authority is a certificate and carries no key ({len(anchor)} bytes)")
+
+    states = {}
+    for machine in ("machine-0", "machine-1"):
+        probed = machine_exec(ctx, check, "edge-probe-" + machine, inside, machine, PUBLIC_EDGE_PROBE)
+        state = EdgeState(probed)
+        check.check(probed.exit_code == 0 and len(state.resolver_args) == 1,
+                    f"{machine} was booted with exactly one Environment resolver "
+                    f"({state.evidence()})")
+        if probed.exit_code != 0 or len(state.resolver_args) != 1:
+            return check.finish()
+        # The route and the resolver are separate declarations that must name
+        # the same edge; a Machine whose default route and resolver disagreed
+        # would reach one thing and ask another.
+        check.check(state.gateways == state.resolver_args,
+                    f"{machine}'s declared route and resolver are the same edge "
+                    f"(route {state.gateways}, resolver {state.resolver_args})")
+        # The file every resolver call in this Machine actually reads. The
+        # image ships public resolvers; finding them here would mean the
+        # Environment's resolver was never installed and every lookup below
+        # would have left the fabric.
+        check.check(state.resolv_conf == state.resolver_args,
+                    f"{machine} resolves through its Environment alone "
+                    f"(resolv.conf {state.resolv_conf}, declared {state.resolver_args})")
+        check.check(state.resolver_args[0] not in state.addresses,
+                    f"{machine}'s resolver is the edge and not the Machine itself "
+                    f"(resolver {state.resolver_args}, own addresses {state.addresses})")
+        published = [line for line in state.hosts if PUBLIC_NAMES[0] in line]
+        # If the name were also in the static table the resolver would never be
+        # asked, and every DNS assertion below would pass with no resolver at
+        # all.
+        check.check(not published,
+                    f"{machine} has no static /etc/hosts entry for the published name "
+                    f"(matching lines {published})")
+        states[machine] = state
+    if check.status != "PASS":
+        return check.finish()
+
+    edge = states["machine-0"].resolver_args[0]
+    origin = states["machine-0"].addresses
+    check.check(edge not in states["machine-1"].addresses,
+                f"the edge address is no Machine's address (edge {edge}, machine-1 {states['machine-1'].addresses})")
+
+    if "nslookup" not in states["machine-1"].applets:
+        # Reported, never assumed away: without a resolver client in the guest
+        # the DNS clauses are unexercised, and passing the rest would certify
+        # the criterion on evidence that never asked a resolver anything.
+        check.not_implemented = (
+            "criterion 6 requires a client to reach an API through environment-local split DNS; "
+            "this Developer Linux guest image carries no `nslookup` applet, so no lookup could be "
+            f"issued from inside a Machine at all (applets present: {len(states['machine-1'].applets)}). "
+            "The edge, its published authority and the resolver configuration every Machine booted "
+            "with were verified above.")
+        return check.finish()
+
+    # The declared name, resolved from the client Machine through the resolver
+    # that Machine is actually configured with.
+    code, addresses = _resolved(_lookup(ctx, check, "edge-lookup", inside, "machine-1", PUBLIC_NAMES[0]))
+    check.check(code == "0" and addresses == [edge],
+                f"the declared `.test` name resolves to the edge inside the Environment "
+                f"(exit {code}, addresses {addresses}, edge {edge})")
+    # The claim that makes this ingress rather than a private shortcut: the
+    # client is told the edge, never the Machine that serves behind it.
+    check.check(all(address not in origin for address in addresses),
+                f"the published name never resolves to the origin Machine "
+                f"(addresses {addresses}, machine-0 {origin})")
+    undeclared = _resolved(_lookup(ctx, check, "edge-lookup-undeclared", inside, "machine-1", UNDECLARED_NAME))
+    check.check(undeclared[0] != "0" and not undeclared[1],
+                f"an undeclared name in the same Environment does not resolve "
+                f"(exit {undeclared[0]}, addresses {undeclared[1]})")
+
+    # Two Environments, two views. Each resolver is the whole name space its own
+    # Machines can see, so neither Environment's name exists in the other.
+    outside = provision(ctx, check, "edge-b", two)
+    if check.status != "PASS" or not outside["status"]:
+        return check.finish()
+    for label, instance, name in (("edge-b-cannot-see-a", outside, PUBLIC_NAMES[0]),
+                                  ("edge-a-cannot-see-b", inside, PUBLIC_NAMES[1])):
+        code, addresses = _resolved(_lookup(ctx, check, label, instance, "machine-1", name))
+        check.check(code != "0" and not addresses,
+                    f"{label}: `{name}` does not resolve in the other Environment "
+                    f"(exit {code}, addresses {addresses})")
+
+    # Nothing on the host LAN or the public Internet. A negative claim about the
+    # host has to be read off the host: this is the real listener table while
+    # both Environments and both edges are running, compared against the table
+    # from before either existed.
+    after = vz04_host.capture(scope, "public_like_ingress_after")
+    check.check(after["capture_state"] == "captured",
+                f"the host listener table was read while both edges ran ({after['capture_state']})")
+    known = {vz04_host.listener_key(row) for row in before["listeners"]}
+    appeared = [row for row in after["listeners"] if vz04_host.listener_key(row) not in known]
+    # New, and attributable. A listener that predates the Environment is not
+    # this Environment's doing, and an unrelated application opening a LAN
+    # listener mid-run is not either; failing on those would make the claim
+    # about the whole machine rather than about vz. The attribution rule is the
+    # lane's own leak-diff rule: a pid among the processes that reference this
+    # run, or a row lsof could not attribute at all.
+    scoped = {row["pid"] for row in after["processes"]}
+    exposed = [row for row in appeared
+               if row.get("scope") != "loopback"
+               and (row.get("pid") in scoped or row.get("pid") is None)]
+    check.check(not exposed,
+                f"no listener on the host LAN or a wildcard address appeared while both edges ran "
+                f"({len(appeared)} new listeners, {len(scoped)} processes attributable to this run, "
+                f"exposed {exposed[:5]})")
+    check.ok(f"every listener that appeared during the run, with attribution: "
+             f"{sorted((row.get('scope'), row.get('command'), row.get('pid') in scoped) for row in appeared)[:10]}")
+    # And the edge itself is not on the host at all. It is a station on one
+    # Environment's fabric; an address of it appearing in the host's own
+    # listener table would mean it had been given a second, unowned identity.
+    on_host = [row for row in after["listeners"] if row.get("address", "").strip("[]") == edge]
+    check.check(not on_host, f"the edge address {edge} is bound nowhere on the host ({on_host})")
+
+    if check.status == "PASS":
+        for name, instance in (("edge-a", inside), ("edge-b", outside)):
+            removed = ctx.run(check, name + "-delete",
+                              ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                              cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+            check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+
+    # Everything above is real, and it is not the whole criterion. Criterion 6
+    # also requires that the client reach the API through TLS, routed ingress
+    # and NAT, and none of that was exercised here, because the client could not
+    # be: the Developer Linux guest image ships no TLS client that can talk to
+    # this edge.
+    #
+    # BusyBox 1.37.0's `ssl_client` (the only TLS in the image, reached by
+    # `wget https://`) reads exactly one handshake message per TLS record, and
+    # rustls coalesces its whole TLS 1.2 server flight into one record; the
+    # handshake deadlocks. That is not a server setting: capping the record size
+    # splits the flight on byte boundaries and BusyBox then rejects it outright.
+    # And `networking/wget.c` force-sets no-check-certificate and prints "TLS
+    # certificate validation not implemented", so even a completed handshake
+    # would verify nothing -- it could not tell this Environment's authority
+    # from any other, which is most of what the TLS clause is for.
+    #
+    # Reporting PASS on the DNS and host-listener clauses would certify the
+    # criterion on evidence that never touched its TLS, ingress or translation
+    # clauses. The edge implements all three and they are exercised end to end
+    # over a real switch, by a real TLS client against a real origin that
+    # reports the peer address it saw, in
+    # `crates/vz-runtimed/src/environment_gateway_tests.rs`. That is
+    # component-level evidence and it is not this criterion's evidence: nothing
+    # in it boots a Machine.
+    if check.status == "PASS":
+        check.not_implemented = (
+            "criterion 6's TLS, routed-ingress and NAT clauses were not exercised from inside a "
+            "Machine. The Developer Linux guest image carries no TLS client that can reach this "
+            "edge: BusyBox 1.37.0 `ssl_client` reads one handshake message per TLS record while "
+            "rustls coalesces its TLS 1.2 server flight into one, so the handshake never completes, "
+            "and `wget` force-sets no-check-certificate, so it could not verify the Environment's "
+            "authority even if it did. The split-DNS, `.test`-hostname, edge-versus-origin, "
+            "cross-Environment and host-listener clauses above all passed. Closing this criterion "
+            "needs a certificate-verifying HTTPS client inside a Developer Linux Machine; the edge "
+            "itself terminates TLS, routes by SNI and translates the source address, proved over a "
+            "real switch in crates/vz-runtimed/src/environment_gateway_tests.rs.")
     return check.finish()

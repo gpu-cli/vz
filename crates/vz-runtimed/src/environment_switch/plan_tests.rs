@@ -416,18 +416,86 @@ fn a_range_this_fabric_cannot_address_is_refused_with_its_reason() {
 }
 
 #[test]
-fn a_simulated_public_network_is_refused_until_an_egress_path_exists() {
-    // SimulatedPublic is this private fabric plus external egress. Planning the
-    // private half and calling it done would start Machines that silently lack
-    // the boundary their definition asked for.
+fn a_simulated_public_network_plans_an_edge_and_a_private_one_does_not() {
+    // A public-like network is this same fabric plus one more port, which the
+    // daemon keeps rather than attaches to a Machine. It is the only difference
+    // between the two kinds at plan time, and it is visible here as a port that
+    // no attachment claimed.
+    let private = plan_environment_fabric(&pair_on_one_network()).unwrap();
+    assert_eq!(private.networks[0].gateway, None);
+    assert_eq!(
+        private.networks[0].members().len(),
+        private.networks[0].ports.len()
+    );
+
     let mut environment = pair_on_one_network();
     environment.networks[0].kind = NetworkKind::SimulatedPublic;
+    let plan = plan_environment_fabric(&environment).unwrap();
+    let network = &plan.networks[0];
+    let edge = network
+        .gateway
+        .as_ref()
+        .expect("a public-like network has an edge");
+    // The reserved offset, which `assign_host_offset` never hands out on any
+    // network: a network that gains an edge does not move a Machine.
+    assert_eq!(
+        edge.address,
+        "10.42.0.1".parse::<std::net::Ipv4Addr>().unwrap()
+    );
+    assert_eq!(
+        private.networks[0]
+            .ports
+            .iter()
+            .map(|port| port.address)
+            .collect::<Vec<_>>(),
+        network
+            .ports
+            .iter()
+            .map(|port| port.address)
+            .collect::<Vec<_>>(),
+        "the same attachments plan to the same addresses either way"
+    );
+    for port in &network.ports {
+        assert_ne!(port.address, edge.address);
+        assert_ne!(port.mac, edge.mac);
+    }
+    // A member of the switch like any other station, numbered after every
+    // Machine so no Machine's port number moved.
+    assert_eq!(network.members().len(), network.ports.len() + 1);
+    assert_eq!(
+        edge.port,
+        PortId(u32::try_from(network.ports.len()).unwrap())
+    );
+    assert!(edge.mac.is_locally_administered() && !edge.mac.is_group());
+
+    // Derived, so the same persisted Environment plans the same edge every Up.
+    let again = plan_environment_fabric(&environment).unwrap();
+    assert_eq!(again.networks[0].gateway.as_ref(), Some(edge));
+}
+
+#[test]
+fn a_native_machine_on_a_public_like_network_is_refused_rather_than_left_unable_to_resolve() {
+    // A public-like network publishes no static host entry, so its names exist
+    // only through its edge's resolver. The native addressing channel can give
+    // a macOS Machine the address and the route but not the resolver, and a
+    // Machine on that network that could not resolve its names would be exactly
+    // the silent half-configuration that admitting a declaration nothing serves
+    // produces everywhere else.
+    let mut environment = pair_on_one_network();
+    environment.networks[0].kind = NetworkKind::SimulatedPublic;
+    environment.machines[1].target.os = OperatingSystem::Macos;
     assert_eq!(
         plan_environment_fabric(&environment),
-        Err(FabricPlanError::EgressNotImplemented {
+        Err(FabricPlanError::UnresolvedPublicMachine {
+            machine: "machine-2".to_string(),
+            os: OperatingSystem::Macos,
             network: "network-1".to_string(),
         })
     );
+    // The same Machine on a private network is fine: its names travel as a
+    // static table that needs no resolver at all.
+    environment.networks[0].kind = NetworkKind::Private;
+    assert!(plan_environment_fabric(&environment).is_ok());
 }
 
 #[test]

@@ -701,6 +701,107 @@ mod tests {
         busybox
     }
 
+    /// The `vz.dns.N` block, which points the Machine at its Environment's own
+    /// resolver.
+    fn relocated_resolver_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
+        relocated_init_block(
+            root,
+            busybox,
+            "# --- BEGIN vz.dns resolver (extracted verbatim by vz-linux tests) ---",
+            "# --- END vz.dns resolver ---",
+        )
+    }
+
+    /// Run the resolver block against `cmdline`, in both roots the Machine may
+    /// end up running in, with an image resolv.conf already in place.
+    ///
+    /// The image ships a resolv.conf naming public resolvers, so "the block did
+    /// nothing" and "the block wrote the Environment's resolver" are visibly
+    /// different outcomes here rather than both being an empty file.
+    fn run_resolver_block(cmdline: &str, overlay: &str) -> (tempfile::TempDir, String) {
+        let fixture = tempfile::Builder::new()
+            .prefix("vz-environment-resolver-")
+            .tempdir()
+            .expect("temp root");
+        let root = fixture.path().to_path_buf();
+        for prefix in ["", overlay] {
+            fs::create_dir_all(root.join(prefix).join("etc")).expect("etc");
+            fs::write(
+                root.join(prefix).join("etc/resolv.conf"),
+                "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+            )
+            .expect("image resolv.conf");
+        }
+        fs::write(root.join("cmdline"), cmdline).expect("fake cmdline");
+        let busybox = cat_only_busybox(&root);
+
+        let mut script = relocated_resolver_block(&root, &busybox);
+        script = script.replace(
+            "write_fabric_resolver \"\"",
+            &format!("write_fabric_resolver \"{}\"", root.display()),
+        );
+        script.push_str(&format!(
+            "\nwrite_fabric_resolver \"{}\"\n",
+            root.join(overlay).display()
+        ));
+        let script_path = root.join("resolver.sh");
+        fs::write(&script_path, script).expect("write harness script");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script_path)
+            .output()
+            .expect("run the guest resolver block");
+        assert!(
+            output.status.success(),
+            "guest resolver block failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+        (fixture, console)
+    }
+
+    #[test]
+    fn a_machine_on_a_public_like_network_resolves_through_its_environment_alone() {
+        // Replaced, not appended to. The Environment's resolver answers the
+        // Environment's names and nothing else; a public resolver left beside
+        // it would be asked for an Environment name the moment the first query
+        // came back unanswered, which is exactly the split the declaration
+        // asked not to have.
+        let (fixture, console) = run_resolver_block(
+            "console=hvc0 vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24,10.9.0.1 \
+             vz.host.0=10.9.0.7,db.internal vz.dns.0=10.9.0.1\n",
+            "merged",
+        );
+        let root = fixture.path();
+        for prefix in ["", "merged"] {
+            assert_eq!(
+                fs::read_to_string(root.join(prefix).join("etc/resolv.conf")).expect("resolv.conf"),
+                "nameserver 10.9.0.1\n",
+                "prefix {prefix:?}, console: {console}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_declared_resolver_keeps_the_one_its_image_shipped() {
+        // Most Machines declare no public-like network at all. Truncating their
+        // resolv.conf to an empty file would be a regression for every one of
+        // them, so the absence of the argument is the absence of the write.
+        let (fixture, console) = run_resolver_block(
+            "console=hvc0 vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24\n",
+            "merged",
+        );
+        let root = fixture.path();
+        for prefix in ["", "merged"] {
+            assert_eq!(
+                fs::read_to_string(root.join(prefix).join("etc/resolv.conf")).expect("resolv.conf"),
+                "nameserver 1.1.1.1\nnameserver 8.8.8.8\n",
+                "prefix {prefix:?}, console: {console}"
+            );
+        }
+    }
+
     /// Run the endpoint-name block against `cmdline`, with the roots it should
     /// write into already carrying an `etc` directory.
     ///

@@ -444,6 +444,48 @@ async fn declared_networks_endpoints_and_workspaces_are_admitted_and_persisted()
     }
 }
 
+/// The public-like half of the same boundary.
+///
+/// `simulated_public` was refused outright until the Environment edge existed;
+/// it is now admitted and persisted exactly like a private network, and what
+/// distinguishes it is what the fabric then starts on it rather than whether Up
+/// will take it. The endpoint is declared `https` because the edge terminates
+/// that and only that; the plan refuses anything else on a public-like network
+/// rather than publishing a name behind a listener that does not exist.
+#[tokio::test]
+async fn a_public_like_network_is_admitted_and_persisted_like_a_private_one() {
+    let (root, daemon, mut request, metadata) = fixture();
+    request.workspace_root = Some(root.path().to_string_lossy().into_owned());
+    declare_private_fabric(&mut request, NetworkKind::SimulatedPublic);
+    request.definition.environment.endpoints[0].protocol = EndpointProtocol::Https;
+    request.definition.environment.endpoints[0].hostname = Some("api.shop.test".into());
+    let completion = terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    // As with the private case, this build has no verified image, so the Up
+    // still ends in a preparation failure long before a switch or an edge is
+    // started. Admission is all this asserts; the edge actually carrying
+    // traffic is proved over a real switch in `environment_gateway_tests`.
+    assert!(completion.error.is_some());
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("a public-like fabric is admitted, so its project exists");
+    let environment = &project.environments[0];
+    assert_eq!(environment.networks.len(), 1);
+    assert_eq!(environment.networks[0].kind, NetworkKind::SimulatedPublic);
+    assert_eq!(environment.endpoints.len(), 1);
+    assert_eq!(
+        environment.endpoints[0].hostname.as_deref(),
+        Some("api.shop.test")
+    );
+    assert_eq!(environment.network_attachments.len(), 1);
+}
+
 /// `authorize_up`'s ownership guard, exercised directly on the graph.
 ///
 /// Admitting declared fabric is only sound while every fabric ownership edge
@@ -653,23 +695,20 @@ fn declare_shared_cache(request: &mut EnvironmentUpRequest, first: &str, second:
 #[tokio::test]
 async fn declarations_without_adapters_still_reject_before_project_creation() {
     for (mutate, expected) in [
-        // No egress path off a private fabric exists, and the shared vmnet NAT
-        // segment is disqualified by the contract, so nothing can serve this
-        // until vz-9vv.6 builds a per-Environment gateway.
-        (
-            (|request: &mut EnvironmentUpRequest| {
-                declare_private_fabric(request, NetworkKind::SimulatedPublic);
-            }) as fn(&mut EnvironmentUpRequest),
-            MachineErrorCode::UnsupportedOperation,
-        ),
+        // `simulated_public` is no longer here: criterion 6 built the
+        // per-Environment gateway, and `snapshot` is gone for the same reason
+        // -- criterion 17 implemented it once `clonefile(2)` was shown to
+        // clone a hierarchy. What remains are declarations whose carrier
+        // genuinely does not exist.
+        //
         // A volume is carried by the same VirtioFS/virtio-block hint the native
         // macOS backend is never handed, so a volume on a native Machine would
         // boot storage that silently never appears.
         (
-            |request: &mut EnvironmentUpRequest| {
+            (|request: &mut EnvironmentUpRequest| {
                 request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
                 declare_shared_cache(request, "app", "app");
-            },
+            }) as fn(&mut EnvironmentUpRequest),
             MachineErrorCode::UnsupportedOperation,
         ),
         // The share is carried by a `vz-mount-{N}` VirtioFS tag that only

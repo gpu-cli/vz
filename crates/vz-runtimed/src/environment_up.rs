@@ -386,27 +386,6 @@ fn validate_supported(
     // `workspace_projection` resolves every share, both before the boot loop.
     // What is refused below is only what no adapter implements, named one case
     // at a time so the refusal says which declaration it cannot serve.
-    //
-    // `NetworkKind::SimulatedPublic` is a private fabric plus external egress,
-    // and no egress path off the fabric exists. The shared vmnet NAT segment is
-    // disqualified by the product contract (a NAT alias is not authorization),
-    // so a per-Environment gateway has to be built first (vz-9vv.6). The switch
-    // planner already reserves the address such a gateway would take, but
-    // nothing answers on it.
-    if let Some(network) = spec
-        .networks
-        .iter()
-        .find(|network| network.kind == NetworkKind::SimulatedPublic)
-    {
-        return Err(failure(
-            metadata,
-            MachineErrorCode::UnsupportedOperation,
-            format!(
-                "network `{}` declares kind `simulated_public`, whose per-Environment egress gateway is not implemented; this Up applies `private` networks only and performs no admission",
-                network.name
-            ),
-        ));
-    }
     for machine in &spec.machines {
         if machine.workspace.is_none() {
             continue;
@@ -498,9 +477,14 @@ fn validate_supported(
             "declared host imports require the guest-initiated authenticated relay adapter, which is not implemented; this Up cannot apply them and performs no admission",
         ));
     }
-    // Egress is likewise unapplied. `EgressPolicy::Offline` is the only policy
-    // this Up can honour, because a non-offline Machine would need the
-    // per-Environment gateway that `simulated_public` is refused for above.
+    // Egress is not applied. `EgressPolicy::Offline` is the only policy this Up
+    // can honour, and the Environment edge does not change that: the edge
+    // translates addresses between a client and an origin that are both inside
+    // one Environment's fabric, and never towards a host outside it. A
+    // non-offline Machine needs a translation towards the host's own network
+    // and a policy deciding which destinations it may reach, and neither
+    // exists. Refusing here rather than admitting a Machine whose declared
+    // reachability is silently absent is the same rule the imports below follow.
     if let Some(machine) = spec
         .machines
         .iter()
@@ -510,7 +494,7 @@ fn validate_supported(
             metadata,
             MachineErrorCode::UnsupportedOperation,
             format!(
-                "Machine `{}` declares a non-offline egress policy, whose adapter is not implemented; this Up applies `offline` only and performs no admission",
+                "Machine `{}` declares a non-offline egress policy, whose host-facing translation and destination policy are not implemented; the Environment edge translates only between an Environment's own client and its own declared origin. This Up applies `offline` only and performs no admission",
                 machine.name
             ),
         ));

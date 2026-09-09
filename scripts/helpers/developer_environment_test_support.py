@@ -16,10 +16,14 @@ the Docker capabilities), constant_health (every Machine reads `supervised`
 whatever its state), ambiguous_exec_runs (`exec` without `--machine` silently
 picks the first Machine and runs), leaky_multi_attach (`up` admits a writable
 block volume on two Machines instead of refusing it, and writes state before
-failing).
+failing), edge_shortcut (a published `.test` name resolves to the Machine
+behind the edge instead of to the edge), edge_hosts_shortcut (the published
+name is also in the guest's /etc/hosts, so no resolver is ever asked),
+edge_public_resolver (a Machine on a public-like network keeps the image's
+public resolvers).
 
-The last four exist to make the criterion 2 and 17 checks falsifiable offline:
-each one breaks exactly one claim, and the check has to notice.
+The last seven exist to make the criterion 2, 6 and 17 checks falsifiable
+offline: each one breaks exactly one claim, and the check has to notice.
 """
 from __future__ import annotations
 
@@ -181,6 +185,17 @@ if [ -n "$verb" ]; then
       ' vz.json
     } > "$topology"
     grep -q '^M ' "$topology" || printf 'M machine-0 developer linux -\n' >> "$topology"
+    # A public-like network is the only declaration that gives an Environment an
+    # edge, and the edge is the only thing that publishes a name and an
+    # authority. Both are recorded here so the guest stand-in models a Machine
+    # that was booted knowing them, rather than one told about them afterwards.
+    if grep -q '"kind": *"simulated_public"' vz.json; then
+      grep -o '"hostname": *"[^"]*"' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/' > "$VZ_RUNTIME_DATA_DIR/edge"
+      anchor="$VZ_RUNTIME_DATA_DIR/environment-edges/env_$inc/net_$inc"
+      mkdir -p "$anchor"
+      printf -- '-----BEGIN CERTIFICATE-----\nZmFrZSBhdXRob3JpdHk=\n-----END CERTIFICATE-----\n' \
+        > "$anchor/authority.pem"
+    fi
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
   fi
@@ -227,7 +242,7 @@ if [ -n "$verb" ]; then
     # alone would hand two Machines one address and model the wrong property.
     nets=$(awk -v m="$machine" '$1=="M" && $2==m {print $5}' "$topology")
     [ "$nets" = "-" ] && nets=""
-    VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" /bin/sh "$script"
+    VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" VZ_FAKE_MODE="$mode" /bin/sh "$script"
     code=$?
     rm -f "$script"
     exit $code
@@ -862,6 +877,19 @@ on_fabric=1
 nat_addr="192.168.64.$(( host_seed % 200 + 20 ))"
 nat_mac=$(printf '02:00:01:%02x:%02x:%02x' "$octet_a" "$octet_b" "$octet_c")
 
+# The Environment's edge, on the reserved first offset of the same range every
+# Machine on this network holds an address in. It exists only where the
+# definition declared a public-like network, which is exactly when the runtime
+# starts one, and it is never any Machine's own address.
+edge_addr="10.$octet_a.$octet_b.1"
+edge_name=""
+[ -f "$state/edge" ] && edge_name=$(cat "$state/edge")
+# The Machine the declared endpoint is on. A name that answered with this
+# instead of the edge would be a private shortcut wearing a public name, which
+# is the distinction criterion 6 exists to make.
+origin_seed=$(printf '%s' "machine-0" | cksum | cut -d' ' -f1)
+origin_addr="10.$octet_a.$octet_b.$(( origin_seed % 200 + 2 ))"
+
 # A peer's MAC is derived from its address by the same rule, so an ARP row names
 # the address the peer genuinely carries rather than an invented one.
 peer_mac() {
@@ -883,6 +911,31 @@ counter() {
 }
 
 case "$applet" in
+  --list)
+    # What this BusyBox carries. A check whose clause needs an applet this
+    # image lacks has to be able to see that it lacks it, rather than reading
+    # an exit code that means several things.
+    for bs_applet in sh mount umount mkdir cp cat ls ip hostname chroot switch_root \
+      udhcpc echo sleep dmesg tail head wget nsenter unshare mke2fs blkid awk grep \
+      nslookup httpd ssl_client; do
+      echo "$bs_applet"
+    done
+    exit 0 ;;
+  nslookup)
+    # Resolution through the Environment's own resolver, which answers the
+    # Environment's declared name and nothing else. There is no upstream: a name
+    # this Environment did not declare is not looked for anywhere.
+    [ -n "$edge_name" ] || { printf 'nslookup: no resolver\n'; exit 1; }
+    target=$edge_addr
+    [ "${VZ_FAKE_MODE:-}" = edge_shortcut ] && target=$origin_addr
+    if [ "$1" = "$edge_name" ]; then
+      printf 'Server:\t%s\nAddress:\t%s:53\n\nName:\t%s\nAddress: %s\n' \
+        "$edge_addr" "$edge_addr" "$1" "$target"
+      exit 0
+    fi
+    printf "Server:\t%s\nAddress:\t%s:53\n\nnslookup: can't resolve '%s'\n" \
+      "$edge_addr" "$edge_addr" "$1"
+    exit 1 ;;
   httpd)
     root=""; foreground=0
     while [ $# -gt 0 ]; do
@@ -904,12 +957,40 @@ case "$applet" in
   cat)
     case "${1:-}" in
       /proc/cmdline)
-        # The host writes vz.net.N=<mac>,<ipv4>/<prefix> for each fabric port,
-        # and writes none at all for a Machine that holds no port.
-        if [ "$on_fabric" = 1 ]; then
-          printf 'console=hvc0 vz.net.0=%s,%s/24\n' "$fabric_mac" "$fabric_addr"
-        else
+        # The host writes vz.net.N=<mac>,<ipv4>/<prefix>[,<gateway>] for each
+        # fabric port, and vz.dns.N=<ipv4> for each edge that answers names.
+        # A private network has neither: it has no route off itself and its
+        # names travel as a static table.
+        # A Machine that declares no Environment network gets no `vz.net.N` at
+        # all -- that is how the runtime denies the Hardened profile a fabric
+        # port, and criterion 2 reads exactly this absence. Criterion 6's
+        # gateway suffix only applies to a Machine that has a port to begin
+        # with; the merge of the two lanes briefly lost this gate and gave the
+        # Hardened Machine a fabric address.
+        if [ "$on_fabric" != 1 ]; then
           printf 'console=hvc0\n'
+        elif [ -n "$edge_name" ]; then
+          printf 'console=hvc0 vz.net.0=%s,%s/24,%s vz.dns.0=%s\n' \
+            "$fabric_mac" "$fabric_addr" "$edge_addr" "$edge_addr"
+        else
+          printf 'console=hvc0 vz.net.0=%s,%s/24\n' "$fabric_mac" "$fabric_addr"
+        fi
+        exit 0 ;;
+      /etc/resolv.conf)
+        # The image ships public resolvers; a Machine on a public-like network
+        # is booted with its Environment's resolver in their place.
+        if [ -n "$edge_name" ] && [ "${VZ_FAKE_MODE:-}" != edge_public_resolver ]; then
+          printf 'nameserver %s\n' "$edge_addr"
+        else
+          printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n'
+        fi
+        exit 0 ;;
+      /etc/hosts)
+        printf '127.0.0.1 localhost\n::1 localhost\n'
+        # A published name in the static table would mean the resolver is never
+        # asked, so the mode that puts one there must break the DNS claims.
+        if [ -n "$edge_name" ] && [ "${VZ_FAKE_MODE:-}" = edge_hosts_shortcut ]; then
+          printf '%s %s\n' "$origin_addr" "$edge_name"
         fi
         exit 0 ;;
       /proc/net/arp)

@@ -735,7 +735,7 @@ async fn declared_fabric_is_expected_and_delete_reclaims_switches_and_records() 
     fixture
         .daemon
         .environment_switches()
-        .install(&lease, &owner, "private", switch)
+        .install(&lease, &owner, "private", switch, None)
         .await
         .unwrap();
     drop(lease);
