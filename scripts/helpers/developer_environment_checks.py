@@ -3619,6 +3619,27 @@ class FetchResult:
         return f"exit {self.exit}, body {self.body!r}, receipt {self.receipt_raw[:300]!r}"
 
 
+def peer_address(text):
+    """One address as the ORIGIN wrote it, in the form the host planned it.
+
+    BusyBox `httpd` accepts on an IPv6 socket, so `REMOTE_ADDR` for an IPv4 peer
+    arrives as the bracketed IPv4-mapped literal `[::ffff:10.0.0.2]`. That is
+    the same address written another way, and unwrapping it is exact rather
+    than lenient: only the brackets and the `::ffff:` mapping prefix are
+    removed, and anything that is not then a dotted quad is returned untouched
+    so a comparison against it still fails.
+    """
+    if not isinstance(text, str):
+        return text
+    unwrapped = text.strip()
+    if unwrapped.startswith("[") and unwrapped.endswith("]"):
+        unwrapped = unwrapped[1:-1]
+    lowered = unwrapped.lower()
+    if lowered.startswith("::ffff:"):
+        unwrapped = unwrapped[len("::ffff:"):]
+    return unwrapped if _is_ipv4(unwrapped) else text
+
+
 def _reported(receipt, key: str):
     """A `KEY value` line out of a plaintext CGI response on stdout."""
     if receipt is None:
@@ -3891,13 +3912,14 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
             if direct.exit_code == 0 and token.encode() in direct.stdout:
                 break
             time.sleep(LISTENER_INTERVAL)
-        direct_peer = _reported(direct, "PEER")
+        direct_reported = _reported(direct, "PEER")
+        direct_peer = peer_address(direct_reported)
         check.check(direct.exit_code == 0 and token.encode() in direct.stdout,
                     f"the declared origin answers on its own fabric address after {attempt} "
                     f"attempt(s) (exit {direct.exit_code}, {direct.stdout[:120]!r})")
         check.check(direct_peer == origin_address,
                     f"spoken to directly, the origin reports the caller as its peer "
-                    f"(reported {direct_peer}, caller {origin_address})")
+                    f"(reported {direct_reported!r} -> {direct_peer}, caller {origin_address})")
         if check.status != "PASS":
             return check.finish()
 
@@ -3932,13 +3954,14 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
                     f"(token {through.reported('TOKEN')!r}, expected {token!r})")
         # The translation. The origin's own kernel says its peer was the edge;
         # the client's address appears nowhere on that connection.
-        through_peer = through.reported("PEER")
+        through_reported = through.reported("PEER")
+        through_peer = peer_address(through_reported)
         check.check(through_peer == edge,
                     f"the origin's peer on the ingress path is the edge "
-                    f"(origin reported {through_peer}, edge {edge})")
+                    f"(origin reported {through_reported!r} -> {through_peer}, edge {edge})")
         check.check(through_peer != client_address,
                     f"the client's own address never reached the origin "
-                    f"(origin reported {through_peer}, client {client_address})")
+                    f"(origin reported {through_reported!r} -> {through_peer}, client {client_address})")
 
         # The negatives, without which the positive proves only that bytes
         # moved. Both are the SAME request over the SAME path; only the trust

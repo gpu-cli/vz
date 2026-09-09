@@ -976,7 +976,8 @@ peer=$edge_addr
 [ "$mode" = edge_origin_shortcut ] && peer=$fabric_addr
 
 printf 'TOKEN %s\n' "$(cat "$root/token")"
-printf 'PEER %s\n' "$peer"
+# The IPv4-mapped literal BusyBox httpd's CGI actually receives.
+printf 'PEER [::ffff:%s]\n' "$peer"
 # The receipt reports the guest path it was pointed at, not the host path this
 # stand-in was rewritten to use.
 guest_ca=$(printf '%s' "$ca" | sed "s#^$state/vz-edge#/run/vz-edge#")
@@ -1194,10 +1195,13 @@ case "$applet" in
     # peer is the caller, which is the control the translation claim needs: if
     # this reported the edge too, "the origin's peer is the edge" would be a
     # property of the CGI rather than of the path.
+    # Written the way BusyBox httpd writes it: it accepts on an IPv6 socket, so
+    # an IPv4 peer reaches CGI as a bracketed IPv4-mapped literal. Modelling the
+    # bare address would let the caller's unwrapping go unexercised here.
     case "$url" in
       */cgi-bin/peer)
         printf 'TOKEN %s\n' "$(cat "$root/token")"
-        printf 'PEER %s\n' "$fabric_addr" ;;
+        printf 'PEER [::ffff:%s]\n' "$fabric_addr" ;;
       *) cat "$root/index.html" ;;
     esac
     exit 0 ;;
