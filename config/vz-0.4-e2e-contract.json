@@ -32,9 +32,9 @@
     "ipsw_pin": "config/macos-26.3.1-25D2128-ipsw.json",
     "guest_version": "26.3.1",
     "guest_build": "25D2128",
-    "guest_agent_sha256": "76a5c8d93762f126e79e19d968a702fca0825fffe991602f21e858c76fdee3a3",
-    "prepared_image_sha256": "21818773a98bd4287120ac4a80934a0469464806666ead459017685872a49f7e",
-    "xcode_toolchain_sha256": "4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c",
+    "guest_agent_sha256": "9330418f5431d1d01f38f6b16084da91391dd3dea152e17e8c8ded11b5870dc9",
+    "prepared_image_sha256": "4960a3b43d4904ab5b7fd9a2cca238f2b452f4c0f743bd99eb1c5848dd7c1716",
+    "xcode_toolchain_sha256": "df1d81a8ce7f3df32c707690af11bbb3b271d170ffc7793a53bbe7c1e15a8be9",
     "setup_recipe": "planning/developer-environments/macos-local-setup.md",
     "privilege_steps": [
       "vz-macos-setup requests administrator access once, to install the startup loader inside the newly provisioned guest disk: sudo -- vz --provision-disk <disk> when stdin is a terminal, otherwise the standard macOS administrator dialog via /usr/bin/osascript (crates/vz-cli/src/native_setup/mod.rs)",
