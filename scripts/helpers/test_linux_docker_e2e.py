@@ -1143,7 +1143,14 @@ class ParallelSliceTests(unittest.TestCase):
         recorders = [seen[i][0] for i in range(3)]
         self.assertEqual(len({id(item) for item in recorders}), 3, "each slice needs a Recorder of its own")
         self.assertNotIn(id(harness.shared_record), {id(item) for item in recorders})
-        self.assertEqual(harness.slice_records, recorders)
+        # The run registers each slice's Recorder under `slice_lock` as that
+        # slice reaches it, so the list holds the same three objects in an
+        # order the scheduler chooses. Comparing it to the index-ordered list
+        # asserts an ordering this test deliberately does not have, and fails
+        # intermittently under load for that reason and no other. The claim is
+        # membership; `item.root` below pins each Recorder to its own index.
+        self.assertEqual({id(item) for item in harness.slice_records}, {id(item) for item in recorders})
+        self.assertEqual(len(harness.slice_records), len(recorders))
         for index, item in enumerate(recorders):
             # Numbering a receipt by list length is exactly what makes a shared
             # Recorder unsafe, so each slice records into a directory of its own.
