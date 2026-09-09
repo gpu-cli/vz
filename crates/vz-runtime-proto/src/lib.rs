@@ -1228,7 +1228,13 @@ mod tests {
             ),
             (
                 "GetProjectStateResponse",
-                &[("request_id", 1), ("project", 2)],
+                // `machine_health` rides beside the aggregate rather than inside
+                // it: a MachineInstance is a durable record and supervision
+                // belongs to the process that answered, so a persisted reading
+                // would be stale the moment the daemon exits. Tag 3 is a pure
+                // append -- 1 and 2 are unmoved, so an older client decodes this
+                // response unchanged.
+                &[("request_id", 1), ("project", 2), ("machine_health", 3)],
             ),
             (
                 "UpEnvironmentRequest",
