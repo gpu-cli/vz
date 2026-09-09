@@ -963,10 +963,18 @@ if [ "$mode" = edge_foreign_anchor_accepted ] && [ -n "$presented" ]; then trust
 [ "$trusted" = 1 ] || fail certificate_rejected 7
 
 # A listener lives exactly as long as the invocation holding it; a marker left
-# by a process that is gone is not a service.
-[ -f "$state/httpd" ] || fail connect_failed 6
-pid=$(cut -d' ' -f1 < "$state/httpd")
-root=$(cut -d' ' -f2- < "$state/httpd")
+# by a process that is gone is not a service. Criterion 2 runs one listener per
+# Machine at once, so the markers are per-Machine and carry the address served;
+# the edge reaches whichever Machine is serving the declared origin.
+marker=""
+for candidate in "$state"/httpd-*; do
+  [ -f "$candidate" ] || continue
+  marker=$candidate
+  break
+done
+[ -n "$marker" ] || fail connect_failed 6
+pid=$(cut -d' ' -f1 < "$marker")
+root=$(cut -d' ' -f3- < "$marker")
 kill -0 "$pid" 2>/dev/null || fail connect_failed 6
 
 # The edge opens the origin connection itself, so the ORIGIN's peer is the
