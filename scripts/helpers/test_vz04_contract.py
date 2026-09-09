@@ -1,5 +1,7 @@
 import copy
+import json
 from pathlib import Path
+import re
 import sys
 import unittest
 
@@ -70,3 +72,93 @@ class ContractTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class NativeMacosPinTests(unittest.TestCase):
+    """The `native_macos` pins must attest a macOS build the product can produce.
+
+    The contract previously declared 26.6.2/25G83 while the installer hardcodes
+    26.3.1/25D2128 and refuses to boot a template newer than the host, so the
+    pinned build was one no shipped code path could produce and no 26.3.1 host
+    could run. Nothing noticed, because `vz04_contract` only checks these values
+    for non-null. These tests read the truth out of the Rust source and the
+    recorded hardware evidence, so a pin that drifts from either fails offline.
+    """
+
+    SETUP = common.REPO_ROOT / "crates/vz-cli/src/native_setup/mod.rs"
+    EVIDENCE = common.REPO_ROOT / "planning/developer-environments/macos-swift-dev-evidence.json"
+
+    @classmethod
+    def setUpClass(cls):
+        cls.native = contract_module.load_contract()["native_macos"]
+        cls.evidence = json.loads(cls.EVIDENCE.read_text())
+
+    @staticmethod
+    def _rust_const(source: str, name: str) -> str:
+        match = re.search(r'const ' + name + r': &str = "([^"]+)"', source)
+        if match is None:
+            raise AssertionError(f"{name} is no longer a string constant in native_setup/mod.rs")
+        return match.group(1)
+
+    def test_pinned_build_is_the_one_the_installer_produces(self):
+        source = self.SETUP.read_text()
+        self.assertEqual(self.native["guest_version"], self._rust_const(source, "VERSION"))
+        self.assertEqual(self.native["guest_build"], self._rust_const(source, "BUILD"))
+
+    def test_the_reader_notices_a_drifting_installer_constant(self):
+        # Vacuity: the comparison above is only meaningful if a changed constant
+        # would actually be seen. Rewrite VERSION and confirm the reader follows.
+        source = self.SETUP.read_text().replace('const VERSION: &str = "26.3.1"',
+                                                'const VERSION: &str = "26.6.2"')
+        self.assertEqual(self._rust_const(source, "VERSION"), "26.6.2")
+        self.assertNotEqual(self.native["guest_version"], self._rust_const(source, "VERSION"))
+
+    def test_ipsw_pin_names_the_same_build_and_exists(self):
+        pin = common.REPO_ROOT / self.native["ipsw_pin"]
+        self.assertTrue(pin.is_file(), f"ipsw_pin does not exist: {self.native['ipsw_pin']}")
+        self.assertIn(f"{self.native['guest_version']}-{self.native['guest_build']}", pin.name)
+        body = json.loads(pin.read_text())
+        self.assertIn(f"{self.native['guest_version']}_{self.native['guest_build']}", body["url"])
+        self.assertRegex(body["sha256"], r"^[0-9a-f]{64}$")
+
+    def test_digests_attest_the_pinned_build(self):
+        # The digests are only evidence if they came from a run of THIS build;
+        # three hex strings from another macOS version would satisfy the schema.
+        self.assertTrue(self.evidence["passed"])
+        self.assertEqual(self.evidence["guest"]["version"], self.native["guest_version"])
+        self.assertEqual(self.evidence["guest"]["build"], self.native["guest_build"])
+        manifest = self.evidence["manifest"]
+        self.assertEqual(manifest["macos_version"], self.native["guest_version"])
+        self.assertEqual(manifest["macos_build"], self.native["guest_build"])
+        self.assertEqual(self.native["prepared_image_sha256"], manifest["prepared_image"]["sha256"])
+        self.assertEqual(self.native["guest_agent_sha256"], manifest["guest_agent_sha256"])
+        self.assertEqual(self.native["xcode_toolchain_sha256"], manifest["toolchain_sha256"])
+
+    def test_host_could_boot_the_pinned_template(self):
+        # `native_macos::artifacts::prepare` refuses a template whose
+        # minimum_host_version exceeds the host, and setup stamps that field
+        # with VERSION, so a pin above the recipe's own floor is unbootable.
+        floor = self.evidence["manifest"]["platform"]["minimum_host_version"]
+        self.assertEqual(floor, self.native["guest_version"])
+
+    def test_setup_recipe_and_declared_steps_name_real_files(self):
+        recipe = common.REPO_ROOT / self.native["setup_recipe"]
+        self.assertTrue(recipe.is_file(), f"setup_recipe does not exist: {self.native['setup_recipe']}")
+        self.assertIn("vz-macos-setup", recipe.read_text())
+        steps = self.native["privilege_steps"] + self.native["license_steps"]
+        self.assertTrue(steps)
+        for step in steps:
+            cited = re.findall(r"crates/[A-Za-z0-9._/-]+\.rs", step)
+            self.assertTrue(cited, f"step cites no source file: {step}")
+            for relative in cited:
+                self.assertTrue((common.REPO_ROOT / relative).is_file(), f"step cites a missing file: {relative}")
+
+    def test_declared_steps_describe_what_the_code_does(self):
+        source = self.SETUP.read_text()
+        self.assertIn("--provision-disk", source)
+        self.assertIn("/usr/bin/osascript", source)
+        self.assertIn("/usr/bin/sudo", source)
+        toolchain = (common.REPO_ROOT / "crates/vz-cli/src/native_setup/toolchain_install.rs").read_text()
+        self.assertIn("xcodebuild -license accept", toolchain)
+        self.assertIn("accept_xcode_license", toolchain)
+

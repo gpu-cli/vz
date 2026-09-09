@@ -29,15 +29,21 @@
     "prohibited_invocations": ["cargo run", "debug binaries", "PATH fallback", "Docker Desktop", "host system dockerd", "runc", "crun", "arbitrary SSH hosts"]
   },
   "native_macos": {
-    "ipsw_pin": "config/macos-26.6.2-25G83-ipsw.json",
-    "guest_version": "26.6.2",
-    "guest_build": "25G83",
-    "guest_agent_sha256": null,
-    "prepared_image_sha256": null,
-    "xcode_toolchain_sha256": null,
-    "setup_recipe": null,
-    "privilege_steps": [],
-    "license_steps": []
+    "ipsw_pin": "config/macos-26.3.1-25D2128-ipsw.json",
+    "guest_version": "26.3.1",
+    "guest_build": "25D2128",
+    "guest_agent_sha256": "76a5c8d93762f126e79e19d968a702fca0825fffe991602f21e858c76fdee3a3",
+    "prepared_image_sha256": "21818773a98bd4287120ac4a80934a0469464806666ead459017685872a49f7e",
+    "xcode_toolchain_sha256": "4cd4a2882de582db89715646939aeef6504ff53f639ebf753536c51af189d67c",
+    "setup_recipe": "planning/developer-environments/macos-local-setup.md",
+    "privilege_steps": [
+      "vz-macos-setup requests administrator access once, to install the startup loader inside the newly provisioned guest disk: sudo -- vz --provision-disk <disk> when stdin is a terminal, otherwise the standard macOS administrator dialog via /usr/bin/osascript (crates/vz-cli/src/native_setup/mod.rs)",
+      "the privileged child refuses to run unless setup invoked it through sudo, and provisioning is the only privileged operation (crates/vz-cli/src/native_setup/mod.rs)"
+    ],
+    "license_steps": [
+      "--accept-xcode-license is required whenever --xcode selects a toolchain, and is rejected without it (crates/vz-cli/src/native_setup/mod.rs)",
+      "acceptance runs xcodebuild -license accept inside the guest and requires an Xcode-layout receipt (crates/vz-cli/src/native_setup/toolchain_install.rs)"
+    ]
   },
   "migration": {
     "barriers_path": "config/vz-0.4-migration-barriers.json",
