@@ -72,6 +72,14 @@ FLAG_SPELLINGS = ((["-c"], "-c"), (["-hc"], "-c"), (["-vc"], "-c"), (["-qc"], "-
 MAX_REPORTED_FAILURES = 25
 
 
+class ReattachError(Exception):
+    """An earlier phase left no isolate for this one to address.
+
+    Raised rather than returned so a post-wake check cannot mistake an
+    Environment that never survived for one that came back empty.
+    """
+
+
 class SubCheck:
     def __init__(self, top: str, slug: str):
         self.id = f"{top}__{slug}"
@@ -174,6 +182,8 @@ class CheckContext:
         project = root / "project"
         project.mkdir(mode=0o700)
         self.state.socket_root.mkdir(mode=0o700, exist_ok=True)
+        # `isolate_paths` derives this same path from the same function below;
+        # the provisioning branch needs it here to create the directory first.
         runtime = self.state.isolate_runtime(name)
         overrides = {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon if provision else self.state.absent_daemon}
         if provision:
@@ -196,10 +206,41 @@ class CheckContext:
                     destination.chmod(0o500)
         for filename, data in project_files.items():
             write_exclusive(project / filename, data)
+        return self.isolate_paths(name, overrides)
+
+    def isolate_paths(self, name: str, overrides: dict) -> dict:
+        """One isolate's paths and environment, derived and never stored.
+
+        `isolated` and `reattach` both come through here so the two spellings of
+        one isolate cannot drift: a phase that rebuilt the environment slightly
+        differently would address a different state database or socket and read
+        the absence as a recovery failure.
+        """
+        root = self.state.root / name
+        state_dir, project = root / "state", root / "project"
+        runtime = self.state.isolate_runtime(name)
         env = self.state.env(HOME=root / "absent-home", VZ_RUNTIME_STATE_DB=state_dir / "stack-state.db",
                              VZ_RUNTIME_DATA_DIR=runtime, VZ_RUNTIME_DAEMON_SOCKET=runtime / "d.sock",
                              VZ_DOCKER_CONFIG=state_dir / "docker", **overrides)
         return {"root": root, "state": state_dir, "project": project, "runtime": runtime, "env": env}
+
+    def reattach(self, name: str) -> dict:
+        """The isolate an earlier phase created, addressed again and unchanged.
+
+        persisted-recovery spans two lane invocations either side of a hardware
+        sleep/wake checkpoint. The Environments pre-sleep leaves running are
+        exactly the ones post-wake has to find, so this creates nothing: a
+        missing directory is the phase's finding, not something to repair.
+        `developer_environment_recorder.socket_root_for` derives the AF_UNIX
+        root from the state root for the same reason -- both phases of one run
+        address the same one rather than a random per-invocation path.
+        """
+        iso = self.isolate_paths(name, {"CARGO_BIN_EXE_vz-runtimed": self.state.daemon})
+        absent = [str(path) for path in (iso["root"], iso["state"], iso["project"])
+                  if not path.is_dir() or path.is_symlink()]
+        if absent:
+            raise ReattachError(f"{name}: no isolate survived the earlier phase at " + ", ".join(absent))
+        return iso
 
 
 def _single_json_line(data: bytes):
@@ -1735,4 +1776,170 @@ def check_grpc_agreement(ctx: CheckContext, top: str) -> SubCheck:
                           ["--json", "delete", "--environment", "default", "--timeout", "120"],
                           cwd=project, env=env, timeout=DELETE_TIMEOUT)
         check.check(removed.exit_code == 0, f"deleted (exit {removed.exit_code})")
+    return check.finish()
+
+
+# ---------------------------------------------------------------------------
+# persisted-recovery: the Environments that must survive the sleep/wake edge
+# ---------------------------------------------------------------------------
+RECOVERY_RECORD_KIND = "vz-0.4-persisted-recovery-environments"
+
+
+def establish_recovery_environments(ctx: CheckContext, names: tuple) -> tuple:
+    """Bring up the Environments the post-wake phase has to find again.
+
+    Every other phase deletes what it creates. This one deliberately leaves its
+    Environments running: they are the subject of criterion 10, and an
+    Environment that was torn down cannot demonstrate that its identity and
+    state survived anything. Each gets its own project so criterion 8's
+    isolation claims have three mutually foreign Environments to make, and each
+    carries a sentinel so post-wake can prove Machine-local state came back
+    rather than merely that a record still exists.
+
+    Returns (record, check). The record is written into the retained state root,
+    because the post-wake phase is a separate lane invocation with its own
+    evidence directory and needs to be told what it is looking for.
+    """
+    check = SubCheck("gate.lifecycle.recovery_including_sleep_wake", "establish_recovery_environments")
+    try:
+        base = minimal_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return None, check.finish()
+    environments = []
+    for name in names:
+        definition = copy.deepcopy(base)
+        definition["project_id"] = "prj_" + uuid.uuid4().hex
+        instance = provision(ctx, check, name, definition)
+        if instance.get("unsupported"):
+            check.not_implemented = "this runtime refused the definition: " + instance["unsupported"][:200]
+            return None, check.finish()
+        if check.status != "PASS" or not instance["status"]:
+            return None, check.finish()
+        token = "vzrec-" + uuid.uuid4().hex[:16]
+        if not sentinel_write(ctx, check, name, instance, token):
+            return None, check.finish()
+        payload = instance["status"]
+        reported = payload.get("environments") or []
+        if not check.check(len(reported) == 1, f"{name}: one Environment (observed {len(reported)})"):
+            return None, check.finish()
+        environment = reported[0]
+        environments.append({
+            "isolate": name, "token": token, "project_id": payload.get("project_id"),
+            "definition_digest": payload.get("persisted_definition_digest"),
+            "environment_id": environment.get("environment_id"), "environment_name": environment.get("name"),
+            "state": environment.get("state"), "lifecycle_generation": environment.get("lifecycle_generation"),
+            "machines": [{"name": machine.get("name"), "machine_id": machine.get("machine_id"),
+                          "incarnation_id": machine.get("incarnation_id"),
+                          "incarnation_generation": machine.get("incarnation_generation"),
+                          "state": machine.get("state"),
+                          "docker_context": (machine.get("docker_context") or {}).get("name")}
+                         for machine in environment.get("machines") or []],
+        })
+    identities = [environment["environment_id"] for environment in environments]
+    check.check(len(set(identities)) == len(identities),
+                f"the {len(environments)} Environments have distinct identities ({identities})")
+    record = {"schema_version": 1, "kind": RECOVERY_RECORD_KIND, "environments": environments}
+    return record, check.finish()
+
+
+# Clauses of criterion 10 that nothing in this repository can exercise yet. They
+# are named here rather than left out so the check reports what it did not
+# observe instead of passing on the part that worked.
+RECOVERY_UNEXERCISED = (
+    "declared volumes (no Volume resource exists in schemas/vz-project-definition-v1.schema.json)",
+    "DNS reconstruction (environment-local split DNS arrives with criterion 6's gateway)",
+    "daemon, adapter and guest crash recovery (no crash injection exists in this lane)",
+    "manifest recovery deadlines (the contract pins none for this lane)",
+)
+
+
+def check_lifecycle_recovery(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """The Environments pre-sleep left are the same ones, still serving.
+
+    Criterion 10 claims stop/up preserves identity and declared state, and that
+    a sleep/wake reconstructs routes, sockets and port state. What is proven
+    here is the part that has a subject: each Environment pre-sleep established
+    is found again with the identity it had, answers an exec (so it is serving,
+    not merely recorded ready), returns its sentinel bytes unchanged, and keeps
+    all of that across an explicit stop/up. Identity is read from the record
+    written before the checkpoint, so a Machine silently recreated during the
+    wake would read as a new incarnation and fail here rather than pass as a
+    Machine that "came back".
+    """
+    check = SubCheck(top, "lifecycle_recovery")
+    expected = established.get("environments") or []
+    if not check.check(expected, "pre-sleep recorded at least one Environment to recover"):
+        return check.finish()
+    for entry in expected:
+        name = entry["isolate"]
+        try:
+            instance = ctx.reattach(name)
+        except ReattachError as error:
+            check.fail(str(error))
+            return check.finish()
+        payload = read_status(ctx, check, "wake-" + name, project=instance["project"], env=instance["env"])
+        if check.status != "PASS" or not payload:
+            return check.finish()
+        reported = payload.get("environments") or []
+        if not check.check(len(reported) == 1, f"{name}: one Environment after wake (observed {len(reported)})"):
+            return check.finish()
+        environment = reported[0]
+        for field, want in (("environment_id", entry["environment_id"]), ("name", entry["environment_name"]),
+                            ("lifecycle_generation", entry["lifecycle_generation"])):
+            check.check(environment.get(field) == want,
+                        f"{name}: Environment {field} survived the checkpoint ({want!r} observed "
+                        f"{environment.get(field)!r})")
+        check.check(payload.get("persisted_definition_digest") == entry["definition_digest"],
+                    f"{name}: the persisted definition digest is unchanged")
+        observed = {machine.get("name"): machine for machine in environment.get("machines") or []}
+        check.check(set(observed) == {machine["name"] for machine in entry["machines"]},
+                    f"{name}: the same Machines are reported ({sorted(observed)})")
+        for machine in entry["machines"]:
+            after = observed.get(machine["name"]) or {}
+            for field in ("machine_id", "incarnation_id", "incarnation_generation"):
+                check.check(after.get(field) == machine[field],
+                            f"{name}/{machine['name']}: {field} survived ({machine[field]!r} observed "
+                            f"{after.get(field)!r})")
+            check.check((after.get("docker_context") or {}).get("name") == machine["docker_context"],
+                        f"{name}/{machine['name']}: the Docker context is the one it had")
+        if check.status != "PASS":
+            return check.finish()
+        row = sentinel_read(ctx, check, "wake-" + name, instance)
+        check.check(row.exit_code == 0 and row.stdout.strip() == (entry["token"] + "END").encode(),
+                    f"{name}: Machine-local state came back byte-identical (observed {row.stdout[:60]!r})")
+    if check.status != "PASS":
+        return check.finish()
+    # Stop/up is the criterion's own words, and it is a separate claim from
+    # surviving the checkpoint: a Machine can come back from sleep and still
+    # lose its identity when deliberately stopped and started.
+    for entry in expected:
+        name = entry["isolate"]
+        instance = ctx.reattach(name)
+        stopped = ctx.run(check, "wake-" + name + "-stop",
+                          ["--json", "stop", "--environment", entry["environment_name"], "--timeout", "120"],
+                          cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+        if not check.check(stopped.exit_code == 0, f"{name}: stopped (exit {stopped.exit_code})"):
+            return check.finish()
+        started = ctx.run(check, "wake-" + name + "-up", ["--json", "up"],
+                          cwd=instance["project"], env=instance["env"], timeout=UP_TIMEOUT)
+        if not check.check(started.exit_code == 0, f"{name}: up again (exit {started.exit_code})"):
+            return check.finish()
+        payload = read_status(ctx, check, "wake-" + name + "-after", project=instance["project"], env=instance["env"])
+        if check.status != "PASS" or not payload:
+            return check.finish()
+        environment = (payload.get("environments") or [{}])[0]
+        check.check(environment.get("environment_id") == entry["environment_id"],
+                    f"{name}: stop/up preserved the Environment identity")
+        check.check({machine.get("machine_id") for machine in environment.get("machines") or []} ==
+                    {machine["machine_id"] for machine in entry["machines"]},
+                    f"{name}: stop/up preserved every Machine identity")
+        row = sentinel_read(ctx, check, "wake-" + name + "-after", instance)
+        check.check(row.exit_code == 0 and row.stdout.strip() == (entry["token"] + "END").encode(),
+                    f"{name}: declared state survived stop/up (observed {row.stdout[:60]!r})")
+    if check.status == "PASS":
+        check.not_implemented = ("criterion 10 also claims " + "; ".join(RECOVERY_UNEXERCISED) +
+                                 ". The recovery of Environment and Machine identity, Docker context, "
+                                 "Machine-local state and stop/up above did pass; these clauses were "
+                                 "not exercised and are not claimed.")
     return check.finish()

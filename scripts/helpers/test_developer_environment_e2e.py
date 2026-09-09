@@ -320,22 +320,75 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertIn("no positively identified daemon", result["cleanup_errors"][0])
 
     # -- later phases -----------------------------------------------------------------
-    def test_persisted_recovery_and_final_cleanup_are_honest(self):
+    def test_persisted_recovery_provisions_and_recovers_across_the_checkpoint(self):
+        """pre-sleep leaves Environments running; post-wake finds those exact ones.
+
+        The phase used to be a skeleton that provisioned nothing and stamped
+        every scenario `not_implemented: needs provisioned Machines`. It now
+        establishes three Environments, deliberately does not delete them, and
+        the post-wake invocation -- a separate lane run with its own evidence
+        directory, on the far side of the sleep/wake checkpoint -- addresses the
+        same isolates through the state root both phases derive.
+        """
         evidence = self.evidence()
         code, _result = self.run_lane(self.argv("clean-provision", evidence), evidence)
         self.assertEqual(code, 3)
         handoff = self.tmp / "state-handoff.deadbeef.json"
         handoff.write_bytes(b"{}\n")
+        established = None
         for phase in ("persisted-recovery/pre-sleep", "persisted-recovery/post-wake"):
             evidence = self.evidence()
             code, result = self.run_lane(self.argv(phase, evidence, handoff=str(handoff)), evidence)
-            self.assertEqual((code, result["failure"]["reason"], result["phase"]), (3, "not_implemented", phase))
+            self.assertEqual((code, result["failure"]["reason"], result["phase"]), (3, "not_implemented", phase),
+                             result["failure"]["detail"])
             self.assertEqual(result["handoff"]["consumed"], handoff.name)
             self.assertEqual(result["handoff"]["consumed_sha256"], common.digest_file(handoff))
             self.assertEqual(result["retained_root"], str(self.state_root / "topology"))
-            self.assertTrue(all(s["status"] == "FAIL" for s in result["scenarios"]))
-            self.assertEqual({s["id"] for s in result["scenarios"]},
-                             {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == phase})
+            assigned = {s["id"] for s in self.contract["scenarios"]
+                        if s["lane"] == "topology" and s["phase"] == phase}
+            tops = {s["id"] for s in result["scenarios"] if "__" not in s["id"]}
+            self.assertEqual(tops, assigned)
+            record = common.load_json(evidence / e2e.RECOVERY_RECORD)
+            self.assertEqual(record["kind"], checks.RECOVERY_RECORD_KIND)
+            self.assertEqual([e["isolate"] for e in record["environments"]], list(e2e.RECOVERY_ISOLATES))
+            if phase.endswith("pre-sleep"):
+                established = record
+                # Left running on purpose: an Environment that was torn down
+                # cannot demonstrate that anything survived.
+                for name in e2e.RECOVERY_ISOLATES:
+                    self.assertTrue((self.state_root / "topology" / name / "project" / "vz.json").is_file(), name)
+                self.assertTrue((evidence / "checks" / "establish_recovery_environments.txt").is_file())
+            else:
+                # Same Environments, addressed again after the checkpoint.
+                self.assertEqual(record, established)
+                recovery = self.by_slug(result)["lifecycle_recovery"]
+                self.assertEqual(recovery["status"], "FAIL", recovery["assertions"])
+                self.assertTrue(any(a.startswith("not_implemented:") for a in recovery["assertions"]),
+                                recovery["assertions"])
+                # Everything it *did* exercise passed; only the unexercised
+                # clauses keep it from claiming the criterion.
+                self.assertFalse([a for a in recovery["assertions"] if a.startswith("FAILED:")],
+                                 recovery["assertions"])
+                for entry in established["environments"]:
+                    self.assertTrue(any(f"{entry['isolate']}: stop/up preserved the Environment identity" in a
+                                        for a in recovery["assertions"]), entry["isolate"])
+
+    def test_post_wake_without_a_pre_sleep_record_is_a_prerequisite_failure(self):
+        """Post-wake must not invent what should have survived."""
+        evidence = self.evidence()
+        code, _result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        self.assertEqual(code, 3)
+        evidence = self.evidence()
+        code, result = self.run_lane(self.argv("persisted-recovery/post-wake", evidence), evidence)
+        self.assertEqual((code, result["outcome"], result["failure"]["reason"]), (1, "failed", "prerequisite"))
+        self.assertIn(e2e.RECOVERY_RECORD, result["failure"]["detail"])
+
+    def test_final_cleanup_is_honest(self):
+        evidence = self.evidence()
+        code, _result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        self.assertEqual(code, 3)
+        handoff = self.tmp / "state-handoff.deadbeef.json"
+        handoff.write_bytes(b"{}\n")
         evidence = self.evidence()
         code, result = self.run_lane(self.argv("final-cleanup", evidence, handoff=str(handoff)), evidence)
         # final-cleanup is assigned exactly two scenarios and implements both,

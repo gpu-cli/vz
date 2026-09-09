@@ -51,7 +51,14 @@ CRITERION_1 = "gate.instances.three_concurrent_no_collision"
 CRITERION_16 = "gate.reproducibility.recreate_from_definition"
 CRITERION_11 = "gate.delete.single_environment_safety"
 CRITERION_5 = "gate.network.private_topology_paths"
+CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
+# The Environments pre-sleep leaves running and post-wake must find again.
+# Criterion 8 wants three mutually isolated Environments and criterion 10 wants
+# their identity preserved across the checkpoint, so three are established once
+# and both phases address them by these names.
+RECOVERY_ISOLATES = ("rec-a", "rec-b", "rec-c")
+RECOVERY_RECORD = "persisted-recovery-environments.json"
 
 
 class Rejected(Exception):
@@ -219,17 +226,160 @@ class Lane:
         path = Path(handoff)
         return {"produced": None, "consumed": path.name, "consumed_sha256": digest_file(path)}
 
+    def check_context(self, state: LaneState, recorder: Recorder) -> checks.CheckContext:
+        """One CheckContext, built the same way in every phase.
+
+        Three phases used to construct this inline. A phase that assembled it
+        differently would hand its checks a different Docker client or plugin
+        set, and the difference would surface as a criterion failing in one
+        phase and passing in another for no reason a reader could find.
+        """
+        return checks.CheckContext(repo_root=self.repo_root, release_dir=self.ctx.release_dir, state=state,
+                                   recorder=recorder, evidence_dir=self.evidence_dir, cli_removal=self.cli_removal,
+                                   docker_client=self.options.get("docker", "none"),
+                                   plugins={"compose": self.options.get("compose-plugin"),
+                                            "buildx": self.options.get("buildx-plugin")})
+
+    def compose_result(self, subchecks: dict, crash, recorder: Recorder, *, moment: int, extra: dict) -> tuple:
+        """Scenario rows and a phase outcome from this phase's sub-checks.
+
+        The rules are `run_clean_provision`'s, in one place so a phase cannot
+        quietly grade itself more kindly than its neighbours: a crash or an
+        observer with uncertain effects fails; a failing sub-check fails; a
+        scenario this lane assigns but does not implement, or a sub-check that
+        reported `not_implemented`, keeps the phase at `not_implemented`; and
+        only a phase whose every assigned scenario passed is `passed`.
+        """
+        scenarios, summary = [], {"PASS": [], "FAIL": [], "not_implemented": []}
+        for scenario in self.assigned():
+            subs = subchecks.get(scenario["id"])
+            if not subs:
+                scenarios.append(self.not_implemented_scenario(scenario, moment))
+                continue
+            status = "PASS" if all(sub.status == "PASS" for sub in subs) and not crash else "FAIL"
+            assertions = [f"{sub.id}: {sub.status}" + (" (not_implemented)" if sub.not_implemented else "") for sub in subs]
+            if crash:
+                assertions.append("lane crashed before every sub-check completed; see crash.txt")
+            scenarios.append({"id": scenario["id"], "status": status,
+                              "started_unix_ns": min(sub.started for sub in subs),
+                              "ended_unix_ns": max(sub.ended or now_ns() for sub in subs), "assertions": assertions,
+                              "evidence": sorted({item for sub in subs for item in sub.evidence}), "readiness_polls": []})
+        checks_dir = self.evidence_dir / "checks"
+        checks_dir.mkdir(mode=0o700, exist_ok=True)
+        for subs in subchecks.values():
+            for sub in subs:
+                scenarios.append(sub.scenario())
+                text = "\n".join([f"{sub.id}: {sub.status}", *sub.scenario()["assertions"]]) + "\n"
+                write_exclusive(checks_dir / f"{sub.slug}.txt", text.encode())
+                summary["not_implemented" if sub.not_implemented else sub.status].append(sub.slug)
+        detail = (f"sub-checks PASS={summary['PASS']} FAIL={summary['FAIL']} not_implemented={summary['not_implemented']}; "
+                  f"top-level FAIL={[s['id'] for s in scenarios if s['status'] == 'FAIL' and '__' not in s['id']]}")
+        if crash:
+            return scenarios, self.failed("crash", f"topology lane {self.phase} crashed; see crash.txt: " + detail,
+                                          EXIT_FAILED, scenarios=scenarios, extra=extra), EXIT_FAILED
+        if recorder.uncertain:
+            names = [receipt.name for receipt in recorder.uncertain]
+            return scenarios, self.failed("uncertain_effects", f"topology lane {self.phase}: observers with uncertain "
+                                          f"effects: {names[:10]}; " + detail, EXIT_FAILED, scenarios=scenarios,
+                                          extra=extra), EXIT_FAILED
+        if summary["FAIL"]:
+            return scenarios, self.failed("assertion", f"topology lane {self.phase}: " + detail, EXIT_FAILED,
+                                          scenarios=scenarios, extra=extra), EXIT_FAILED
+        if any(scenario["status"] == "FAIL" for scenario in scenarios):
+            return scenarios, self.failed("not_implemented", f"topology lane {self.phase}: " + detail,
+                                          EXIT_NOT_IMPLEMENTED, scenarios=scenarios, extra=extra), EXIT_NOT_IMPLEMENTED
+        result = lanes.base_result(LANE, self.phase, self.ctx, self.entry)
+        result.update(scenarios=scenarios, outcome="passed", failure=None, **extra)
+        return scenarios, result, EXIT_PASSED
+
     def run_persisted_recovery(self) -> int:
-        moment = now_ns()
         state = LaneState(self.ctx.state_root, self.ctx.release_dir / "bin")
-        rows, path = write_inventory(self.evidence_dir, "lane-state-root", state.root)
-        scenarios = [self.not_implemented_scenario(s, moment) for s in self.assigned()]
-        result = self.failed("not_implemented", f"topology lane {self.phase}: no scenario implemented; lane state root inventory retained "
-                             f"({len(rows)} entries)", EXIT_NOT_IMPLEMENTED, scenarios=scenarios,
-                             extra={"handoff": self.handoff_record(), "retained_root": str(state.root) if state.root.exists() else None,
-                                    "evidence_files": self.evidence_files()})
+        if self.phase == "persisted-recovery/pre-sleep":
+            return self.run_pre_sleep(state)
+        return self.run_post_wake(state)
+
+    def run_pre_sleep(self, state: LaneState) -> int:
+        """Provision the Environments the sleep/wake checkpoint has to preserve.
+
+        Every other phase deletes what it creates. This one deliberately does
+        not: the Environments it leaves running in the retained state root are
+        the subject of the post-wake phase, and criterion 10's claim is about
+        exactly those. `socket_root_for` derives the AF_UNIX root from the state
+        root so both phases of one run address the same sockets.
+        """
+        moment = now_ns()
+        # In the gate clean-provision already made this root; a standalone
+        # pre-sleep makes its own, exactly as final-cleanup does. Establishing
+        # Environments is meaningful on a fresh root -- recovering them is not,
+        # which is why post-wake refuses instead of creating anything.
+        if not state.root.exists():
+            state.create()
+        recorder = Recorder(self.evidence_dir, self.ctx.run_id)
+        ctx = self.check_context(state, recorder)
+        subchecks, crash, established, establish = {}, None, None, None
+        try:
+            established, establish = checks.establish_recovery_environments(ctx, RECOVERY_ISOLATES)
+        except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
+            crash = traceback.format_exc()
+            write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
+        if establish is not None:
+            (self.evidence_dir / "checks").mkdir(mode=0o700, exist_ok=True)
+            text = "\n".join([f"{establish.id}: {establish.status}", *establish.scenario()["assertions"]]) + "\n"
+            write_exclusive(self.evidence_dir / "checks" / f"{establish.slug}.txt", text.encode())
+        if established is not None:
+            document(self.evidence_dir / RECOVERY_RECORD, established)
+            document(state.root / RECOVERY_RECORD, established)
+        rows, _path = write_inventory(self.evidence_dir, "lane-state-root", state.root)
+        extra = {"handoff": self.handoff_record(), "retained_root": str(state.root),
+                 "evidence_files": self.evidence_files(), "process_starts": recorder.process_starts}
+        # Establishing the Environments is this phase's precondition, not one of
+        # its criteria: a pre-sleep that could not bring them up has nothing for
+        # post-wake to recover, which is a different failure from a criterion
+        # this lane has not implemented.
+        if crash is None and established is None:
+            detail = "; ".join(establish.scenario()["assertions"][-4:]) if establish is not None else "no result"
+            result = self.failed("prerequisite", f"topology lane {self.phase}: could not establish the Environments "
+                                 f"post-wake must recover: {detail[:500]}", EXIT_FAILED, scenarios=[], extra=extra)
+            self.write_result(result)
+            return EXIT_FAILED
+        _scenarios, result, code = self.compose_result(subchecks, crash, recorder, moment=moment, extra=extra)
+        if result["failure"] is not None:
+            result["failure"]["detail"] += (f"; {len(established['environments']) if established else 0} Environment(s) left "
+                                            f"running for post-wake, lane state root inventory {len(rows)} entries")
         self.write_result(result)
-        return EXIT_NOT_IMPLEMENTED
+        print(f"topology lane {self.phase}: outcome={result['outcome']} "
+              f"reason={None if result['failure'] is None else result['failure']['reason']}", file=sys.stderr)
+        return code
+
+    def run_post_wake(self, state: LaneState) -> int:
+        """Address the Environments pre-sleep left, across the sleep/wake edge."""
+        moment = now_ns()
+        record_path = state.root / RECOVERY_RECORD
+        if not record_path.is_file() or record_path.is_symlink():
+            result = self.failed("prerequisite", f"pre-sleep left no {RECOVERY_RECORD} in {state.root}; there is no "
+                                 "record of what should have survived", EXIT_FAILED)
+            self.write_result(result)
+            return EXIT_FAILED
+        established = load_json(record_path)
+        document(self.evidence_dir / RECOVERY_RECORD, established)
+        recorder = Recorder(self.evidence_dir, self.ctx.run_id)
+        ctx = self.check_context(state, recorder)
+        subchecks, crash = {CRITERION_10: []}, None
+        try:
+            subchecks[CRITERION_10].append(checks.check_lifecycle_recovery(ctx, CRITERION_10, established))
+        except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
+            crash = traceback.format_exc()
+            write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
+        rows, _path = write_inventory(self.evidence_dir, "lane-state-root", state.root)
+        extra = {"handoff": self.handoff_record(), "retained_root": str(state.root),
+                 "evidence_files": self.evidence_files(), "process_starts": recorder.process_starts}
+        _scenarios, result, code = self.compose_result(subchecks, crash, recorder, moment=moment, extra=extra)
+        if result["failure"] is not None:
+            result["failure"]["detail"] += f"; lane state root inventory {len(rows)} entries"
+        self.write_result(result)
+        print(f"topology lane {self.phase}: outcome={result['outcome']} "
+              f"reason={None if result['failure'] is None else result['failure']['reason']}", file=sys.stderr)
+        return code
 
     def run_final_cleanup(self) -> int:
         moment = now_ns()

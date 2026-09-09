@@ -84,6 +84,24 @@ if [ -n "$verb" ]; then
   # A real Up persists topology; `status` succeeds only afterwards, which is
   # what the bootstrap-creates-default check depends on.
   topology="$VZ_RUNTIME_DATA_DIR/topology.json"
+  # Up is idempotent reconcile, not recreate. A second Up of an Environment
+  # that already exists must hand back the identities it already has --
+  # criterion 10 claims stop/up preserves them, and criterion 15's typed
+  # channel must name the ones the CLI published. Only a fresh Environment
+  # (topology removed by `delete`) mints new ones, which is what criterion 16
+  # reads.
+  if [ "$verb" = up ] && [ -f "$topology" ]; then
+    rm -f "$VZ_RUNTIME_DATA_DIR/stopped"
+    printf '{"schema_version":1,"progress":{"completion":{}}}\n'
+    exit 0
+  fi
+  if [ "$verb" = stop ] && [ -f "$topology" ]; then
+    # Stop preserves identity and declared state: the topology record stays
+    # exactly as it is and only the reported state changes.
+    : > "$VZ_RUNTIME_DATA_DIR/stopped"
+    printf '{"schema_version":1,"stopped":["default"]}\n'
+    exit 0
+  fi
   if [ "$verb" = up ] && [ -f vz.json ]; then
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
     mkdir -p "$VZ_RUNTIME_DATA_DIR"; : > "$VZ_RUNTIME_STATE_DB"
@@ -106,6 +124,10 @@ if [ -n "$verb" ]; then
     printf '%s %s %s' "$pid" "$inc" "$names" > "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
+  fi
+  if [ "$verb" = exec ] && [ -f "$VZ_RUNTIME_DATA_DIR/stopped" ]; then
+    printf '{"error":{"code":"machine_not_ready","message":"the Environment is stopped"},"schema_version":1}\n' >&2
+    exit 2
   fi
   if [ "$verb" = exec ] && [ -f "$topology" ]; then
     # Model Machine-local mutable state: run the script with the sentinel path
@@ -155,7 +177,9 @@ if [ -n "$verb" ]; then
     printf ' "daemon": {"backend_name": "macos-vz", "version": "0.1.0"},\n'
     printf ' "desired_definition_digest": "%s",\n "persisted_definition_digest": "%s",\n' "$dg" "$dg"
     printf ' "definition_drift": false,\n "selection_source": "workspace",\n "project_id": "%s",\n' "$pid"
-    printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
+    estate=ready
+    [ -f "$VZ_RUNTIME_DATA_DIR/stopped" ] && estate=stopped
+    printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "%s",\n' "$sfx" "$estate"
     printf '   "definition_digest": "%s",\n   "lifecycle_generation": 1,\n' "$dg"
     printf '   "machines": ['
     sep=""
@@ -164,7 +188,7 @@ if [ -n "$verb" ]; then
       # no-collision check reads: the exact-field-set check compares this object
       # against the declared Machine set, so a fake emitting less than the
       # installed binaries do would let that comparison pass on absence.
-      printf '%s{"name": "%s", "state": "ready", "docker_context": {' "$sep" "$m"
+      printf '%s{"name": "%s", "state": "%s", "docker_context": {' "$sep" "$m" "$estate"
       printf '"owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
       printf '"name": "vzr1-ctx-%s-%s", "endpoint": "unix:///tmp/vz-%s-%s.sock",' "$sfx" "$m" "$sfx" "$m"
       printf '"engine_id": "eng-%s-%s"}, "machine_id": "mch_%s_%s",' "$sfx" "$m" "$sfx" "$m"
