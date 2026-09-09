@@ -139,8 +139,23 @@ def startup_identity(raw, *, authority):
     """Startup rows before any client connection: all JSON, one instance, TLS listener."""
     require(type(raw) is bytes and 0 < len(raw) <= route.MAX_BYTES and raw.endswith(b'\n'), 'registry startup bounds')
     rows = [fixture.decode(line) for line in raw.split(b'\n')[:-1]]
-    require(all(type(row) is dict and set(row) == STARTUP_KEYS and
-                all(type(value) is str for value in row.values()) for row in rows), 'registry startup fields')
+    # Name what differs. This assertion rejected two 45-minute runs without
+    # retaining the rows it rejected, so the one fact needed to fix it -- WHICH
+    # key or value is wrong -- was destroyed with the run. An exact key set over
+    # a third party's log is worth keeping; discarding the counter-example is not.
+    faults = []
+    for index, row in enumerate(rows):
+        if type(row) is not dict:
+            faults.append({'row': index, 'reason': 'not an object', 'observed': repr(row)[:200]})
+            continue
+        if set(row) != STARTUP_KEYS:
+            faults.append({'row': index, 'reason': 'key set differs',
+                           'unexpected': sorted(set(row) - STARTUP_KEYS),
+                           'missing': sorted(STARTUP_KEYS - set(row))})
+        wrong = {key: type(value).__name__ for key, value in row.items() if type(value) is not str}
+        if wrong:
+            faults.append({'row': index, 'reason': 'non-string values', 'observed': wrong})
+    require(not faults, 'registry startup fields: ' + json.dumps(faults[:5], sort_keys=True))
     instances = {row['instance.id'] for row in rows}
     require(len(instances) == 1, 'one registry process instance required')
     instance_id = route.token(next(iter(instances)), route.UUID)
