@@ -3,7 +3,7 @@
 //! in-flight backend future. Uncertain effects keep their original ownership.
 use crate::machine_runtime_activation::MachineRuntimeActivation;
 use crate::{RuntimeDaemon, current_unix_secs};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::sync::{OwnedMutexGuard, watch};
@@ -202,21 +202,13 @@ impl RuntimeDaemon {
         metadata: &RequestMetadata,
         environment: &EnvironmentInstance,
     ) -> Result<(), StackError> {
-        if environment.legacy_migration.is_some() || !environment.networks.is_empty() || !environment.endpoints.is_empty()
-            || environment.ownership.iter().any(|record| !matches!(&record.resource_kind,
-                OwnedResourceKind::Machine | OwnedResourceKind::Incarnation | OwnedResourceKind::Disk)
-                && !matches!(&record.resource_kind,OwnedResourceKind::Other(kind) if kind=="machine_runtime_store" || kind=="runtime_vm")
-                && !(record.resource_kind == OwnedResourceKind::DockerContext
-                    && environment.machines.iter().any(|machine| machine.docker_context.as_ref().is_some_and(|context|
-                        context.name == record.resource_id
-                        && context.owner.environment_id == record.environment_id
-                        && context.owner.machine_id == record.machine_id
-                        && context.owner.project_id == environment.project_id
-                        && context.owner.environment_id == environment.environment_id
-                        && context.owner.machine_id.as_ref() == Some(&machine.machine_id))))) {
-            return Err(StackError::Machine {code:MachineErrorCode::UnsupportedOperation,
-                message:"Up cannot apply unknown or unsupported existing topology resources".into()});
+        if environment.legacy_migration.is_some() {
+            return Err(StackError::Machine {
+                code: MachineErrorCode::UnsupportedOperation,
+                message: "Up cannot apply a legacy Sandbox migration".into(),
+            });
         }
+        authorize_ownership(environment)?;
         let mut machine_ids = environment
             .machines
             .iter()
@@ -244,6 +236,112 @@ impl RuntimeDaemon {
     }
 }
 
+/// Refuse an Environment whose persisted ownership graph names a resource this
+/// Up cannot serve, or a declared-fabric record with no instance behind it.
+///
+/// Declared `Network`, `Endpoint` and `NetworkAttachment` ownership is admitted
+/// here (vz-9vv.7), which is only sound because those records are minted once by
+/// `ProjectDefinition::instantiate_environment` alongside the instances they
+/// name and are never added afterwards: the switch registry that
+/// `install_environment_fabric` writes to is process-local and persists no
+/// ownership. The fabric half of the graph is therefore comparable as an exact
+/// set at admission — the same comparison `environment_delete` makes before it
+/// reclaims. Making it here as well, and not only in Delete, is what stops Up
+/// booting every Machine of an Environment that could then never be deleted.
+///
+/// Records with no adapter behind them stay refused: `HostExport`, `HostImport`,
+/// `Socket`, `PortRange`, `Credential`, `Fault`, `LegacySandbox` and any
+/// unrecognised `Other` kind.
+fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackError> {
+    fn unsupported(message: &str) -> StackError {
+        StackError::Machine {
+            code: MachineErrorCode::UnsupportedOperation,
+            message: message.into(),
+        }
+    }
+    let mut expected: Vec<OwnershipRecord> = environment
+        .networks
+        .iter()
+        .map(|network| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Network,
+            resource_id: network.network_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: None,
+        })
+        .collect();
+    expected.extend(
+        environment
+            .endpoints
+            .iter()
+            .map(|endpoint| OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::Endpoint,
+                resource_id: endpoint.endpoint_id.to_string(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(endpoint.machine_id.clone()),
+            }),
+    );
+    expected.extend(
+        environment
+            .network_attachments
+            .iter()
+            .map(|attachment| OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::NetworkAttachment,
+                resource_id: attachment.attachment_id.to_string(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(attachment.machine_id.clone()),
+            }),
+    );
+    // Two instances sharing one identity would emit one record twice. That is
+    // state corruption, and it is refused rather than deduplicated: a silent
+    // dedup would leave the slot the duplicate vacated free for an unaccounted
+    // resource to occupy, exactly as `environment_delete` reasons.
+    let expected_set = expected.iter().collect::<BTreeSet<_>>();
+    if expected_set.len() != expected.len() {
+        return Err(unsupported(
+            "Up fabric ownership plan minted one resource identity twice; no effects admitted",
+        ));
+    }
+    let mut declared = BTreeSet::new();
+    for record in &environment.ownership {
+        let supported = match &record.resource_kind {
+            OwnedResourceKind::Machine
+            | OwnedResourceKind::Incarnation
+            | OwnedResourceKind::Disk => true,
+            OwnedResourceKind::Network
+            | OwnedResourceKind::Endpoint
+            | OwnedResourceKind::NetworkAttachment => declared.insert(record),
+            OwnedResourceKind::DockerContext => environment.machines.iter().any(|machine| {
+                machine.docker_context.as_ref().is_some_and(|context| {
+                    context.name == record.resource_id
+                        && context.owner.environment_id == record.environment_id
+                        && context.owner.machine_id == record.machine_id
+                        && context.owner.project_id == environment.project_id
+                        && context.owner.environment_id == environment.environment_id
+                        && context.owner.machine_id.as_ref() == Some(&machine.machine_id)
+                })
+            }),
+            OwnedResourceKind::Other(kind) => {
+                kind == "machine_runtime_store" || kind == "runtime_vm"
+            }
+            _ => false,
+        };
+        if !supported {
+            return Err(unsupported(
+                "Up cannot apply unknown, unsupported, or repeated existing topology resources",
+            ));
+        }
+    }
+    if declared != expected_set {
+        return Err(unsupported(
+            "Up declared-fabric ownership does not account for exactly the persisted network, endpoint and attachment instances; no effects admitted",
+        ));
+    }
+    Ok(())
+}
+
 fn validate_supported(
     request: &EnvironmentUpRequest,
     metadata: &RequestMetadata,
@@ -256,18 +354,69 @@ fn validate_supported(
             "Up requires 1..128 Machines",
         ));
     }
-    if !spec.networks.is_empty()
-        || !spec.endpoints.is_empty()
-        || spec
-            .machines
-            .iter()
-            .any(|machine| machine.workspace.is_some())
+    // Declared networks, endpoints and workspace projections are applied:
+    // `install_environment_fabric` starts every switch and mints every port, and
+    // `workspace_projection` resolves every share, both before the boot loop.
+    // What is refused below is only what no adapter implements, named one case
+    // at a time so the refusal says which declaration it cannot serve.
+    //
+    // `NetworkKind::SimulatedPublic` is a private fabric plus external egress,
+    // and no egress path off the fabric exists. The shared vmnet NAT segment is
+    // disqualified by the product contract (a NAT alias is not authorization),
+    // so a per-Environment gateway has to be built first (vz-9vv.6). The switch
+    // planner already reserves the address such a gateway would take, but
+    // nothing answers on it.
+    if let Some(network) = spec
+        .networks
+        .iter()
+        .find(|network| network.kind == NetworkKind::SimulatedPublic)
     {
         return Err(failure(
             metadata,
             MachineErrorCode::UnsupportedOperation,
-            "declared network, endpoint and workspace projection adapters remain required; this Up cannot apply them and performs no admission",
+            format!(
+                "network `{}` declares kind `simulated_public`, whose per-Environment egress gateway is not implemented; this Up applies `private` networks only and performs no admission",
+                network.name
+            ),
         ));
+    }
+    for machine in &spec.machines {
+        let Some(workspace) = &machine.workspace else {
+            continue;
+        };
+        // Snapshot has neither a directory-tree copy primitive (only the
+        // single-file `clone_file` in `vz-macos-provision`) nor an
+        // `OwnedResourceKind` variant, so a snapshot Delete could neither
+        // reclaim nor account for would leak on the first successful Up.
+        if workspace.mode == WorkspaceProjectionMode::Snapshot {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::UnsupportedOperation,
+                format!(
+                    "Machine `{}` requests `snapshot` workspace projection, which has no directory-copy primitive and no owned-resource kind; this Up applies `read_write` and `read_only` only and performs no admission",
+                    machine.name
+                ),
+            ));
+        }
+        // A projection is carried by a VirtioFS share whose `vz-mount-{N}` tag
+        // `linux/initramfs/init` bind-mounts. `boot_or_inspect_machine` hands
+        // the native macOS backend no `StackResourceHint` at all, so admitting
+        // one there would boot a Machine whose declared workspace silently
+        // never appears. Hardened is the restricted profile and declares none
+        // of this topology, matching the contract's refusal of network
+        // attachments on it.
+        if machine.target.os != OperatingSystem::Linux
+            || machine.profile != MachineProfile::Developer
+        {
+            return Err(failure(
+                metadata,
+                MachineErrorCode::UnsupportedOperation,
+                format!(
+                    "Machine `{}` declares a workspace projection, which only a Developer Linux Machine carries; this Up performs no admission",
+                    machine.name
+                ),
+            ));
+        }
     }
     // Host relays and non-offline egress are declarable but not yet applied by
     // any adapter. Admitting them would start a Machine that silently lacks the

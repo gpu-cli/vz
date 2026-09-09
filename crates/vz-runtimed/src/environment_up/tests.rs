@@ -2,6 +2,12 @@
 use super::*;
 use crate::RuntimedConfig;
 
+fn definition() -> ProjectDefinition {
+    serde_json::from_value(serde_json::json!({"schema_version":1,"project_id":ProjectId::generate(),"name":"up-tests","environment":{"schema_version":1,"machines":[
+        {"schema_version":1,"name":"app","profile":"developer","target":{"os":"linux","arch":"aarch64","image":"vz-linux-appliance","digest":format!("sha256:{}","a".repeat(64))}}
+    ]}})).unwrap()
+}
+
 fn fixture() -> (
     tempfile::TempDir,
     Arc<RuntimeDaemon>,
@@ -20,15 +26,12 @@ fn fixture() -> (
         })
         .unwrap(),
     );
-    let definition=serde_json::from_value(serde_json::json!({"schema_version":1,"project_id":ProjectId::generate(),"name":"up-tests","environment":{"schema_version":1,"machines":[
-        {"schema_version":1,"name":"app","profile":"developer","target":{"os":"linux","arch":"aarch64","image":"vz-linux-appliance","digest":format!("sha256:{}","a".repeat(64))}}
-    ]}})).unwrap();
     (
         root,
         daemon,
         EnvironmentUpRequest {
             workspace_root: None,
-            definition,
+            definition: definition(),
             selection: EnvironmentSelectionContext {
                 workspace_key: Some("opaque-worktree".into()),
                 ..Default::default()
@@ -185,42 +188,221 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
     }
 }
 
-/// Stop and Delete now account for Network/Endpoint/NetworkAttachment ownership
-/// (vz-9vv.1), but Up is a second, independent guard and must keep refusing the
-/// declarations until the rest of the network adapter epic lands (vz-9vv.7).
+/// Attach one Developer Linux Machine to one declared private network and give
+/// it a declared endpoint. This is the smallest topology the whole vz-9vv epic
+/// exists to serve.
+fn declare_private_fabric(request: &mut EnvironmentUpRequest, kind: NetworkKind) {
+    request.definition.environment.networks.push(NetworkSpec {
+        schema_version: 1,
+        name: "private".into(),
+        kind,
+        cidr: None,
+    });
+    request.definition.environment.machines[0]
+        .networks
+        .push("private".into());
+    request.definition.environment.endpoints.push(EndpointSpec {
+        schema_version: 1,
+        name: "api".into(),
+        machine: request.definition.environment.machines[0].name.clone(),
+        network: "private".into(),
+        protocol: EndpointProtocol::Tcp,
+        port: 8080,
+        hostname: None,
+    });
+}
+
+/// The admitted half of the boundary vz-9vv.7 moved.
+///
+/// This replaces the test that pinned declared networks and endpoints as
+/// refused. It exists for the same reason — to make the gate move by decision
+/// rather than by accident — but now pins where the gate actually stands: a
+/// private network, an endpoint on it and a read/write workspace projection are
+/// admitted, and their instances and ownership edges are persisted for Stop and
+/// Delete to reconcile.
+///
+/// Admission is all this asserts. This build has no verified image, so the Up
+/// still terminates in a preparation failure before `install_environment_fabric`
+/// or the workspace binding reservation ever run; a switch actually coming up is
+/// hardware evidence, not a unit-test claim.
 #[tokio::test]
-async fn declared_networks_and_endpoints_still_reject_before_project_creation() {
+async fn declared_networks_endpoints_and_workspaces_are_admitted_and_persisted() {
+    let (root, daemon, mut request, metadata) = fixture();
+    request.workspace_root = Some(root.path().to_string_lossy().into_owned());
+    declare_private_fabric(&mut request, NetworkKind::Private);
+    request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+        binding: "source".into(),
+        source_path: ".".into(),
+        target_path: "/workspace".into(),
+        mode: WorkspaceProjectionMode::ReadWrite,
+    });
+    let completion = terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert!(completion.error.is_some());
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("a declared fabric is now admitted, so its project exists");
+    let environment = &project.environments[0];
+    assert_eq!(environment.networks.len(), 1);
+    assert_eq!(environment.networks[0].kind, NetworkKind::Private);
+    assert_eq!(environment.endpoints.len(), 1);
+    assert_eq!(environment.endpoints[0].port, 8080);
+    assert_eq!(environment.network_attachments.len(), 1);
+    assert_eq!(
+        environment.network_attachments[0].machine_id,
+        environment.machines[0].machine_id
+    );
+    // `authorize_up` admitted at all only because these edges matched the
+    // instances exactly; assert they are the edges Delete will look for.
+    for kind in [
+        OwnedResourceKind::Network,
+        OwnedResourceKind::Endpoint,
+        OwnedResourceKind::NetworkAttachment,
+    ] {
+        assert_eq!(
+            environment
+                .ownership
+                .iter()
+                .filter(|record| record.resource_kind == kind)
+                .count(),
+            1,
+            "exactly one {kind:?} ownership edge"
+        );
+    }
+}
+
+/// `authorize_up`'s ownership guard, exercised directly on the graph.
+///
+/// Admitting declared fabric is only sound while every fabric ownership edge
+/// names a persisted instance and every instance carries exactly one edge. An
+/// edge with no instance is the unaccounted resource `environment_delete`
+/// refuses to reclaim, so an Up that admitted one would boot every Machine of an
+/// Environment that could then never be deleted. Kinds with no adapter behind
+/// them stay refused whatever else the graph holds.
+#[test]
+fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
+    fn code(environment: &EnvironmentInstance) -> MachineErrorCode {
+        match authorize_ownership(environment).unwrap_err() {
+            StackError::Machine { code, .. } => code,
+            other => panic!("expected a Machine error, got {other:?}"),
+        }
+    }
+    let mut request = EnvironmentUpRequest {
+        workspace_root: None,
+        definition: definition(),
+        selection: EnvironmentSelectionContext::default(),
+        path_hint: None,
+        timeout_millis: 5000,
+    };
+    declare_private_fabric(&mut request, NetworkKind::Private);
+    let environment = request
+        .definition
+        .instantiate_environment("default", 0)
+        .unwrap();
+    authorize_ownership(&environment).expect("minted fabric ownership matches its instances");
+
+    let mut orphaned = environment.clone();
+    orphaned.networks.clear();
+    assert_eq!(code(&orphaned), MachineErrorCode::UnsupportedOperation);
+
+    let mut unaccounted = environment.clone();
+    unaccounted
+        .ownership
+        .retain(|record| record.resource_kind != OwnedResourceKind::Endpoint);
+    assert_eq!(code(&unaccounted), MachineErrorCode::UnsupportedOperation);
+
+    let mut duplicated = environment.clone();
+    let repeated = duplicated
+        .ownership
+        .iter()
+        .find(|record| record.resource_kind == OwnedResourceKind::NetworkAttachment)
+        .unwrap()
+        .clone();
+    duplicated.ownership.push(repeated);
+    assert_eq!(code(&duplicated), MachineErrorCode::UnsupportedOperation);
+
+    for kind in [
+        OwnedResourceKind::HostExport,
+        OwnedResourceKind::HostImport,
+        OwnedResourceKind::Socket,
+        OwnedResourceKind::PortRange,
+        OwnedResourceKind::Credential,
+        OwnedResourceKind::Fault,
+        OwnedResourceKind::LegacySandbox,
+        OwnedResourceKind::Other("some_unimplemented_adapter".into()),
+    ] {
+        let mut adapterless = environment.clone();
+        let environment_id = adapterless.environment_id.clone();
+        adapterless.ownership.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: kind.clone(),
+            resource_id: "resource".into(),
+            environment_id,
+            machine_id: None,
+        });
+        assert_eq!(
+            code(&adapterless),
+            MachineErrorCode::UnsupportedOperation,
+            "{kind:?} has no adapter and must stay refused"
+        );
+    }
+}
+
+/// The refused half of the same boundary: declarations no adapter implements
+/// must still be rejected, and rejected before any project row exists, so an Up
+/// that cannot be served never leaves state behind.
+#[tokio::test]
+async fn declarations_without_adapters_still_reject_before_project_creation() {
     for mutate in [
+        // No egress path off a private fabric exists, and the shared vmnet NAT
+        // segment is disqualified by the contract, so nothing can serve this
+        // until vz-9vv.6 builds a per-Environment gateway.
         (|request: &mut EnvironmentUpRequest| {
-            request.definition.environment.networks.push(NetworkSpec {
-                schema_version: 1,
-                name: "private".into(),
-                kind: NetworkKind::Private,
-                cidr: None,
-            });
+            declare_private_fabric(request, NetworkKind::SimulatedPublic);
         }) as fn(&mut EnvironmentUpRequest),
+        // No directory-tree copy primitive and no `OwnedResourceKind` variant,
+        // so Delete could neither reclaim nor account for a snapshot.
         |request: &mut EnvironmentUpRequest| {
-            request.definition.environment.networks.push(NetworkSpec {
-                schema_version: 1,
-                name: "private".into(),
-                kind: NetworkKind::Private,
-                cidr: None,
+            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+                binding: "source".into(),
+                source_path: ".".into(),
+                target_path: "/workspace".into(),
+                mode: WorkspaceProjectionMode::Snapshot,
             });
-            request.definition.environment.machines[0]
-                .networks
-                .push("private".into());
-            request.definition.environment.endpoints.push(EndpointSpec {
-                schema_version: 1,
-                name: "api".into(),
-                machine: request.definition.environment.machines[0].name.clone(),
-                network: "private".into(),
-                protocol: EndpointProtocol::Tcp,
-                port: 8080,
-                hostname: None,
+        },
+        // The share is carried by a `vz-mount-{N}` VirtioFS tag that only
+        // `linux/initramfs/init` bind-mounts, and the native macOS backend is
+        // handed no resource hint at all, so the projection would silently
+        // never appear.
+        |request: &mut EnvironmentUpRequest| {
+            request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
+            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+                binding: "source".into(),
+                source_path: ".".into(),
+                target_path: "/workspace".into(),
+                mode: WorkspaceProjectionMode::ReadOnly,
+            });
+        },
+        // Hardened is the restricted profile and declares none of this
+        // topology, matching the contract's refusal of network attachments.
+        |request: &mut EnvironmentUpRequest| {
+            request.definition.environment.machines[0].profile = MachineProfile::Hardened;
+            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+                binding: "source".into(),
+                source_path: ".".into(),
+                target_path: "/workspace".into(),
+                mode: WorkspaceProjectionMode::ReadOnly,
             });
         },
     ] {
-        let (_root, daemon, mut request, metadata) = fixture();
+        let (root, daemon, mut request, metadata) = fixture();
+        request.workspace_root = Some(root.path().to_string_lossy().into_owned());
         mutate(&mut request);
         assert_eq!(
             daemon
@@ -244,19 +426,19 @@ async fn declared_networks_and_endpoints_still_reject_before_project_creation() 
 #[tokio::test(flavor = "multi_thread")]
 async fn unsupported_topology_and_invalid_ids_reject_before_project_creation() {
     let (_root, daemon, mut request, mut metadata) = fixture();
+    // A workspace projection whose declared source path escapes the worktree
+    // root is refused by the contract before Up ever reserves a project.
     request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
-        source_path: "src".to_string(),
+        source_path: "../outside".to_string(),
         binding: "source".into(),
         target_path: "/src".into(),
         mode: WorkspaceProjectionMode::ReadOnly,
     });
-    assert_eq!(
+    assert!(
         daemon
             .up_environment(request.clone(), metadata.clone())
             .await
-            .unwrap_err()
-            .code,
-        MachineErrorCode::UnsupportedOperation
+            .is_err()
     );
     request.definition.environment.machines[0].workspace = None;
     metadata.request_id = Some("bad\nrequest".into());
