@@ -49,3 +49,19 @@ dolt-access.lock
 # contributors to accidentally commit upstream issue databases.
 # The JSONL files (issues.jsonl, interactions.jsonl) and config files
 # are tracked by git by default since no pattern above ignores them.
+
+# Credential material. Never committed, in any clone.
+.beads-credential-key
+
+# Dolt server runtime files (the daemon.* patterns above predate this server).
+dolt-server.lock
+dolt-server.log
+dolt-server.pid
+dolt-server.port
+embeddeddolt/
+
+# Local backup blobs and per-machine sync state. `export-state/` above covers
+# the directory form only; this build writes the single-file form.
+backup/
+export-state.json
+push-state.json

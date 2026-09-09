@@ -16,3 +16,9 @@ __pycache__/
 # Agent worktrees live inside the repo. They are git worktrees, so `git add -A`
 # records each as a gitlink and sweeps a nested checkout into the index.
 .claude/worktrees/
+
+# Local tool state, not part of the product.
+.impeccable/
+
+# The owner's private working notes, kept beside the checkout by name.
+private-vz/
