@@ -749,3 +749,102 @@ async fn stop_accounts_for_exact_failed_up_non_dispatch_without_reconstructing_a
             .unwrap();
     }
 }
+
+/// Two Machines projecting one writable host source are refused at admission,
+/// before any project row or workspace binding exists.
+///
+/// The supervisor reserves a durable `WorkspaceBinding` before it resolves
+/// shares, so a refusal that only happened at resolution would already have
+/// mutated state. This asserts the earlier refusal directly: the state store
+/// still has no project for the definition afterwards.
+#[tokio::test]
+async fn a_writable_host_source_shared_by_two_machines_rejects_before_project_creation() {
+    for (label, first_mode, second_mode, second_source) in [
+        (
+            "two writers of one source",
+            WorkspaceProjectionMode::ReadWrite,
+            WorkspaceProjectionMode::ReadWrite,
+            "src",
+        ),
+        (
+            "a writer and a reader of one source",
+            WorkspaceProjectionMode::ReadWrite,
+            WorkspaceProjectionMode::ReadOnly,
+            "src",
+        ),
+        (
+            "a writer of the root containing another writer's subtree",
+            WorkspaceProjectionMode::ReadWrite,
+            WorkspaceProjectionMode::ReadWrite,
+            ".",
+        ),
+    ] {
+        let (root, daemon, mut request, metadata) = fixture();
+        request.workspace_root = Some(root.path().to_string_lossy().into_owned());
+        let machines = &mut request.definition.environment.machines;
+        machines[0].workspace = Some(WorkspaceProjection {
+            binding: "source".into(),
+            source_path: "src".into(),
+            target_path: "/workspace".into(),
+            mode: first_mode,
+        });
+        let mut second = machines[0].clone();
+        second.name = "app-two".into();
+        second.workspace = Some(WorkspaceProjection {
+            binding: "source".into(),
+            source_path: second_source.into(),
+            target_path: "/workspace".into(),
+            mode: second_mode,
+        });
+        machines.push(second);
+        let error = daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code,
+            MachineErrorCode::ValidationError,
+            "{label} must be refused"
+        );
+        assert!(
+            error.message.contains("writable host source"),
+            "{label}: refusal must say why: {}",
+            error.message
+        );
+        assert!(
+            daemon
+                .with_state_store(
+                    |store| store.load_project_state(request.definition.project_id.as_str())
+                )
+                .unwrap()
+                .is_none(),
+            "{label}: refused before any project row exists"
+        );
+    }
+}
+
+/// The control for the rule above: two Machines READING one host source is an
+/// ordinary declaration and must still be admitted. Without this the admission
+/// rule could pass by refusing every shared source rather than every writer.
+#[tokio::test]
+async fn two_read_only_projections_of_one_source_are_still_admitted() {
+    let (root, daemon, mut request, metadata) = fixture();
+    request.workspace_root = Some(root.path().to_string_lossy().into_owned());
+    let machines = &mut request.definition.environment.machines;
+    machines[0].workspace = Some(WorkspaceProjection {
+        binding: "source".into(),
+        source_path: "src".into(),
+        target_path: "/workspace".into(),
+        mode: WorkspaceProjectionMode::ReadOnly,
+    });
+    let mut second = machines[0].clone();
+    second.name = "app-two".into();
+    machines.push(second);
+    // `up_environment` returns once admission has decided; the boot runs
+    // behind the returned progress stream. So `Ok` here is precisely the
+    // statement that admission accepted two readers of one source.
+    daemon
+        .up_environment(request, metadata)
+        .await
+        .expect("two read-only readers of one source must pass admission");
+}

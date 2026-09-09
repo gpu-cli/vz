@@ -418,6 +418,22 @@ fn validate_supported(
             ));
         }
     }
+    // Two Machines sharing one host source with either of them writable is the
+    // "no silent multi-attach" rule of the workspace and storage policy. It is
+    // enforced here, at admission, because the supervisor reserves a durable
+    // workspace binding before it resolves shares: refusing only at resolution
+    // would already have mutated state. `resolve_environment_workspace_mounts`
+    // repeats the rule over canonicalised paths to catch two declarations that
+    // become one directory through a symlink.
+    if let Err(error) =
+        workspace_projection::refuse_declared_writable_multi_attach(&request.definition.environment)
+    {
+        return Err(failure(
+            metadata,
+            MachineErrorCode::ValidationError,
+            error.to_string(),
+        ));
+    }
     // Host relays and non-offline egress are declarable but not yet applied by
     // any adapter. Admitting them would start a Machine that silently lacks the
     // boundary its definition asks for, so they are refused here until the

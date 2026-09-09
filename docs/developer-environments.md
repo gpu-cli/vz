@@ -133,11 +133,24 @@ identity and declared state. Delete traverses only the selected Environment's
 ownership graph.
 
 Workspace projection is explicit per Machine: read-write, read-only, or
-snapshot. Shared-writer and shared-volume semantics require a declared
-consistency contract. vz never silently multi-attaches a writable block disk.
+snapshot. A Machine declares `source_path` relative to the worktree root, and
+the runtime joins it to the authoritative root, canonicalises the result, and
+refuses anything that leaves the root.
+
+Shared-writer and shared-volume semantics require a declared consistency
+contract. vz never silently multi-attaches a writable disk: within one
+Environment, a host source that any Machine projects writable is projected into
+no other Machine, and Up refuses such a declaration at admission, before it
+allocates identities or reserves a workspace binding. Two read-only projections
+of one source are allowed, because there is no writer to serialise.
+
 Every workspace projection is
 <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer workspace_read_write,workspace_read_only,workspace_snapshot -->**PLANNED**;
-Up currently rejects Machines that declare one.
+promotion waits on gate evidence, not on the adapter. Up applies `read_write`
+and `read_only` on Developer Linux Machines, and rejects `snapshot` (no
+directory-copy primitive and no owned-resource kind, so Delete could neither
+reclaim nor account for one) along with any projection declared on a Hardened or
+non-Linux Machine, which carries no VirtioFS share to serve it.
 
 ## Machine contract
 

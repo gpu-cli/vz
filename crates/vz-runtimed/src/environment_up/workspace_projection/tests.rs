@@ -540,3 +540,171 @@ fn the_supervisors_pre_boot_sequence_resolves_shares_from_durable_state() {
         WorkspaceProjectionError::EscapesWorktreeRoot { .. }
     ));
 }
+
+// ---------------------------------------------------------------------------
+// Writable multi-attach: one host source, two Machines.
+// ---------------------------------------------------------------------------
+//
+// Every case below builds a real tree and asks the real resolver, so a refusal
+// cannot pass because nothing was ever shared twice. The read-only case and the
+// distinct-sources case are the controls: without them the rule could pass by
+// refusing all sharing rather than refusing unserialised writers.
+
+fn writable_at(source: &str) -> WorkspaceProjection {
+    let mut projection = projection(WorkspaceProjectionMode::ReadWrite);
+    projection.source_path = source.to_string();
+    projection
+}
+
+fn readable_at(source: &str) -> WorkspaceProjection {
+    let mut projection = projection(WorkspaceProjectionMode::ReadOnly);
+    projection.source_path = source.to_string();
+    projection
+}
+
+fn resolve_pair(
+    tree: &Worktree,
+    first: WorkspaceProjection,
+    second: WorkspaceProjection,
+) -> Result<BTreeMap<MachineId, Vec<StackVolumeMount>>, WorkspaceProjectionError> {
+    let spec = spec(vec![
+        machine_spec("dev-a", Some(first)),
+        machine_spec("dev-b", Some(second)),
+    ]);
+    let machines = vec![machine_instance("dev-a"), machine_instance("dev-b")];
+    let slots = BTreeSet::from(["src".to_string()]);
+    resolve_environment_workspace_mounts(
+        &spec,
+        &machines,
+        &slots,
+        Some(tree.root.to_str().expect("utf-8 root")),
+    )
+}
+
+fn admit_pair(
+    first: WorkspaceProjection,
+    second: WorkspaceProjection,
+) -> Result<(), WorkspaceProjectionError> {
+    refuse_declared_writable_multi_attach(&spec(vec![
+        machine_spec("dev-a", Some(first)),
+        machine_spec("dev-b", Some(second)),
+    ]))
+}
+
+fn assert_multi_attach(error: WorkspaceProjectionError) {
+    assert!(
+        matches!(
+            error,
+            WorkspaceProjectionError::WritableSourceMultiAttach { .. }
+        ),
+        "expected a multi-attach refusal, got: {error}"
+    );
+}
+
+#[test]
+fn two_machines_writing_one_host_source_are_refused_rather_than_silently_attached() {
+    let tree = worktree();
+    assert_multi_attach(
+        resolve_pair(&tree, writable_at("inside"), writable_at("inside"))
+            .expect_err("a second writable attach of one host source must be refused"),
+    );
+    assert_multi_attach(
+        admit_pair(writable_at("inside"), writable_at("inside"))
+            .expect_err("and it must be refused at admission, before any binding is reserved"),
+    );
+}
+
+#[test]
+fn a_writer_and_a_reader_of_one_host_source_are_refused_too() {
+    // The reader observes a tree the writer mutates underneath it, with no
+    // coherence protocol between the two VirtioFS shares.
+    let tree = worktree();
+    assert_multi_attach(
+        resolve_pair(&tree, writable_at("inside"), readable_at("inside"))
+            .expect_err("a writer plus a reader of one host source must be refused"),
+    );
+    assert_multi_attach(
+        admit_pair(readable_at("inside"), writable_at("inside"))
+            .expect_err("in either declaration order"),
+    );
+}
+
+#[test]
+fn two_machines_reading_one_host_source_read_only_are_allowed() {
+    // The control: with no writer there is nothing to serialise, so the rule
+    // must not simply refuse all sharing.
+    let tree = worktree();
+    let mounts = resolve_pair(&tree, readable_at("inside"), readable_at("inside"))
+        .expect("two read-only readers of one source are not a multi-attach");
+    assert_eq!(mounts.len(), 2);
+    assert!(mounts.values().flatten().all(|mount| mount.read_only));
+    admit_pair(readable_at("inside"), readable_at("inside")).expect("admitted");
+}
+
+#[test]
+fn distinct_sources_under_one_root_are_not_a_multi_attach() {
+    // `inside` and `inside-two` share a string prefix but no directory. A
+    // comparison that is not per-component refuses this pair wrongly.
+    let tree = worktree();
+    fs::create_dir_all(tree.root.join("inside-two")).expect("sibling");
+    let mounts = resolve_pair(&tree, writable_at("inside"), writable_at("inside-two"))
+        .expect("distinct writable sources are not a multi-attach");
+    assert_eq!(mounts.len(), 2);
+    admit_pair(writable_at("inside"), writable_at("inside-two")).expect("admitted");
+}
+
+#[test]
+fn a_symlink_alias_of_one_source_is_still_the_same_writable_attach() {
+    // Two declarations that differ as strings become one directory once the
+    // link is followed. Only the resolved-path half of the rule can see this,
+    // which is why the syntactic half is not the whole rule.
+    let tree = worktree();
+    std::os::unix::fs::symlink(tree.root.join("inside"), tree.root.join("alias"))
+        .expect("alias symlink");
+    assert_multi_attach(
+        resolve_pair(&tree, writable_at("inside"), writable_at("alias"))
+            .expect_err("a symlink alias names the same host directory"),
+    );
+    // The declaration-level rule cannot see through the link, and says so by
+    // admitting the pair; the resolver above is what refuses it.
+    admit_pair(writable_at("inside"), writable_at("alias"))
+        .expect("two distinct declared strings pass the syntactic half");
+}
+
+#[test]
+fn a_writable_source_nested_inside_another_writable_source_is_refused() {
+    // Overlap, not equality: one Machine's share contains the other's.
+    let tree = worktree();
+    assert_multi_attach(
+        resolve_pair(&tree, writable_at("."), writable_at("inside/nested"))
+            .expect_err("an overlapping writable source must be refused"),
+    );
+    assert_multi_attach(
+        admit_pair(writable_at("."), writable_at("inside/nested"))
+            .expect_err("and the containment is visible syntactically"),
+    );
+    assert_multi_attach(
+        admit_pair(writable_at("inside/nested"), writable_at("."))
+            .expect_err("in either declaration order"),
+    );
+}
+
+#[test]
+fn a_single_writable_projection_is_untouched_by_the_rule() {
+    // The regression guard for the ordinary one-Machine case the rule must not
+    // disturb.
+    let tree = worktree();
+    let spec = spec(vec![machine_spec("dev-a", Some(writable_at("inside")))]);
+    let machines = vec![machine_instance("dev-a")];
+    let slots = BTreeSet::from(["src".to_string()]);
+    let mounts = resolve_environment_workspace_mounts(
+        &spec,
+        &machines,
+        &slots,
+        Some(tree.root.to_str().expect("utf-8 root")),
+    )
+    .expect("one writer is not a multi-attach");
+    assert_eq!(mounts.len(), 1);
+    assert!(mounts.values().flatten().all(|mount| !mount.read_only));
+    refuse_declared_writable_multi_attach(&spec).expect("admitted");
+}

@@ -51,13 +51,14 @@
     },
     "workspace": {
       "type": "object", "additionalProperties": false,
-      "required": ["binding", "target_path", "mode"],
+      "required": ["binding", "target_path", "mode", "source_path"],
       "properties": {
         "binding": {"type": "string"},
         "target_path": {"type": "string"},
-        "mode": {"enum": ["read_write", "read_only", "snapshot"]}
+        "mode": {"enum": ["read_write", "read_only", "snapshot"]},
+        "source_path": {"type": "string", "minLength": 1, "maxLength": 1024, "pattern": "^(\\.|[^/\\u0000-\\u001f][^\\u0000-\\u001f]*)$", "not": {"pattern": "(^|/)(\\.\\.)?(/|$)"}, "description": "Host source declared RELATIVE to the worktree root; `.` is the root itself. Absolute paths, control characters, empty components and `..` traversal are refused here, matching `validate_workspace_source_path`; the runtime then canonicalises the joined path and refuses symlinks that leave the root."}
       },
-      "description": "Binding names refer to opaque worktree associations, not path-derived Environment identity. Runtime admission validates projection paths and writer policy."
+      "description": "Binding names refer to opaque worktree associations, not path-derived Environment identity. Runtime admission validates projection paths and writer policy: a host source that is writable in one Machine is projected into no other Machine of the Environment."
     },
     "machine": {
       "type": "object", "additionalProperties": false,

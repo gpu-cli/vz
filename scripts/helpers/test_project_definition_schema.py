@@ -7,6 +7,7 @@ through the production parser and semantic validator.
 
 import copy
 import json
+import re
 from pathlib import Path
 import unittest
 
@@ -52,7 +53,7 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
         value = copy.deepcopy(EXAMPLE)
         environment = value["environment"]
         machine = environment["machines"][0]
-        machine["workspace"] = {"binding": "source", "target_path": "/workspace", "mode": "read_only"}
+        machine["workspace"] = {"binding": "source", "target_path": "/workspace", "mode": "read_only", "source_path": "."}
         machine["requested_capabilities"] = {"capabilities": ["posix_exec"]}
         environment["networks"] = [{"schema_version": 1, "name": "private", "kind": "private"}]
         environment["endpoints"] = [{"schema_version": 1, "name": "api", "machine": "dev", "network": "private", "protocol": "tcp", "port": 8080}]
@@ -111,6 +112,50 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
             value["environment"]["endpoints"] = [{"schema_version": 1, "name": "api", "machine": "dev", "network": "private", "protocol": "tcp", "port": port}]
             self.assertFalse(self.validator.is_valid(value))
 
+
+    def test_workspace_projection_field_set_matches_the_production_parser(self):
+        """The authoring schema and `WorkspaceProjection` must agree exactly.
+
+        This drifted once and made the feature unreachable: the Rust type gained
+        a required `source_path` while the schema kept
+        `additionalProperties: false` without it, so no vz.json declaring a
+        workspace could both validate here and deserialize there. The field set
+        is read out of the Rust struct rather than restated, so the next field
+        added on either side fails this test instead of shipping.
+        """
+        source = (ROOT / "crates/vz-runtime-contract/src/types/topology.rs").read_text()
+        body = source.split("pub struct WorkspaceProjection {", 1)[1].split("\n}", 1)[0]
+        rust_fields = set(re.findall(r"^    pub (\w+):", body, re.MULTILINE))
+        self.assertTrue(rust_fields, "could not read WorkspaceProjection fields")
+        self.assertNotIn(
+            "#[serde(default", body,
+            "a defaulted field would weaken this comparison; teach the test about it first")
+        schema_fields = set(SCHEMA["$defs"]["workspace"]["properties"])
+        self.assertEqual(schema_fields, rust_fields)
+        # `deny_unknown_fields` plus no serde defaults means every Rust field is
+        # required, so the schema's `required` list must name all of them too.
+        self.assertEqual(set(SCHEMA["$defs"]["workspace"]["required"]), rust_fields)
+
+    def test_workspace_source_path_is_relative_and_traversal_free(self):
+        """The schema half of decision 7's containment rule.
+
+        `validate_workspace_source_path` refuses absolute paths, `..` and empty
+        components before the filesystem is touched; the authoring schema must
+        refuse the same declarations rather than accept a definition the runtime
+        will reject later.
+        """
+        for source_path, expected in [
+            (".", True), ("src", True), ("a/b/c", True), ("..dotfile", True), ("a/..b", True), ("a b/c", True),
+            ("", False), ("/abs", False), ("..", False), ("../x", False), ("a/../b", False),
+            ("a/..", False), ("a//b", False), ("a/\x00b", False), ("\x01lead", False),
+            ("a/", False), ("/", False), ("x" * 1024, True), ("x" * 1025, False),
+        ]:
+            with self.subTest(source_path=source_path):
+                value = copy.deepcopy(EXAMPLE)
+                value["environment"]["machines"][0]["workspace"] = {
+                    "binding": "source", "target_path": "/workspace", "mode": "read_write",
+                    "source_path": source_path}
+                self.assertEqual(self.validator.is_valid(value), expected)
 
     def test_optional_default_machine_name_shape(self):
         for default, expected in [(None, True), ("dev", True), ("", False), (" ", False), (False, False), (42, False)]:
