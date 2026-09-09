@@ -203,7 +203,10 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
     };
     let attachments = vec![crate::config::DeclaredAttachment {
         network_id: "net-frontend".to_string(),
-        address: "02:11:22:33:44:55".to_string(),
+        mac: "02:11:22:33:44:55".to_string(),
+        ipv4: std::net::Ipv4Addr::new(10, 4, 7, 2),
+        prefix: 24,
+        gateway: None,
         mtu: 1500,
     }];
     assert!(
@@ -235,7 +238,13 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
     let mut drifted_network = attachments.clone();
     drifted_network[0].network_id = "net-backend".to_string();
     let mut drifted_address = attachments.clone();
-    drifted_address[0].address = "02:11:22:33:44:56".to_string();
+    drifted_address[0].mac = "02:11:22:33:44:56".to_string();
+    let mut drifted_ipv4 = attachments.clone();
+    drifted_ipv4[0].ipv4 = std::net::Ipv4Addr::new(10, 4, 7, 3);
+    let mut drifted_prefix = attachments.clone();
+    drifted_prefix[0].prefix = 16;
+    let mut drifted_gateway = attachments.clone();
+    drifted_gateway[0].gateway = Some(std::net::Ipv4Addr::new(10, 4, 7, 1));
     let mut drifted_mtu = attachments.clone();
     drifted_mtu[0].mtu = 9000;
     for (requested_ports, requested_attachments, requested_resources) in [
@@ -246,6 +255,14 @@ fn managed_shared_vm_reuse_rejects_every_boot_request_drift() {
         (ports.clone(), attachments.clone(), drifted_disk),
         (ports.clone(), drifted_network, resources.clone()),
         (ports.clone(), drifted_address, resources.clone()),
+        // A Machine that comes back at a different L3 address is as much a
+        // different boot request as one on a different network: its address is
+        // baked into the cmdline the kernel booted with, so reusing the active
+        // VM would leave the guest configured for the address it was asked to
+        // stop holding.
+        (ports.clone(), drifted_ipv4, resources.clone()),
+        (ports.clone(), drifted_prefix, resources.clone()),
+        (ports.clone(), drifted_gateway, resources.clone()),
         (ports.clone(), drifted_mtu, resources.clone()),
         (ports.clone(), Vec::new(), resources.clone()),
     ] {
@@ -282,16 +299,12 @@ fn a_reboot_of_the_same_machine_on_the_same_network_is_not_drift() {
     // must present again. Comparing sockets would make every idempotent Up of
     // an attached Machine look like a request for a different VM.
     let first = crate::config::SharedVmAttachment::new(
-        "net-frontend",
-        "02:11:22:33:44:55",
-        1500,
+        declared_attachment(),
         std::os::unix::net::UnixDatagram::unbound().unwrap().into(),
     )
     .unwrap();
     let second = crate::config::SharedVmAttachment::new(
-        "net-frontend",
-        "02:11:22:33:44:55",
-        1500,
+        declared_attachment(),
         std::os::unix::net::UnixDatagram::unbound().unwrap().into(),
     )
     .unwrap();
@@ -308,6 +321,18 @@ fn a_reboot_of_the_same_machine_on_the_same_network_is_not_drift() {
     .expect("the same declaration through a different descriptor is the same boot request");
 }
 
+/// One well-formed port on a `/24`, the shape every case below varies from.
+fn declared_attachment() -> crate::config::DeclaredAttachment {
+    crate::config::DeclaredAttachment {
+        network_id: "net-frontend".to_string(),
+        mac: "02:11:22:33:44:55".to_string(),
+        ipv4: std::net::Ipv4Addr::new(10, 4, 7, 2),
+        prefix: 24,
+        gateway: None,
+        mtu: 1500,
+    }
+}
+
 #[test]
 fn an_attachment_refuses_an_address_the_vm_configuration_would_only_reject_later() {
     let socket = || std::os::unix::net::UnixDatagram::unbound().unwrap().into();
@@ -319,13 +344,154 @@ fn an_attachment_refuses_an_address_the_vm_configuration_would_only_reject_later
         "02:11:22:33:44:zz",
         "2:11:22:33:44:55",
     ] {
-        let error = crate::config::SharedVmAttachment::new("net", address, 1500, socket())
-            .expect_err("a malformed address must be refused before a VM exists");
+        let error = crate::config::SharedVmAttachment::new(
+            crate::config::DeclaredAttachment {
+                mac: address.to_string(),
+                ..declared_attachment()
+            },
+            socket(),
+        )
+        .expect_err("a malformed address must be refused before a VM exists");
         assert!(error.to_string().contains("six colon-separated hex bytes"));
     }
-    let error = crate::config::SharedVmAttachment::new("", "02:11:22:33:44:55", 1500, socket())
-        .expect_err("an attachment must name its network");
+    let error = crate::config::SharedVmAttachment::new(
+        crate::config::DeclaredAttachment {
+            network_id: String::new(),
+            ..declared_attachment()
+        },
+        socket(),
+    )
+    .expect_err("an attachment must name its network");
     assert!(error.to_string().contains("requires a network id"));
+}
+
+#[test]
+fn an_attachment_refuses_an_l3_configuration_the_guest_would_apply_and_then_be_mute_on() {
+    // Each of these produces a NIC that comes up and carries nothing, which
+    // surfaces as an application fault rather than a configuration one, so it
+    // has to be refused on the host where it is still attributable.
+    let socket = || std::os::unix::net::UnixDatagram::unbound().unwrap().into();
+    let refuse = |declaration: crate::config::DeclaredAttachment, expected: &str| {
+        let error = crate::config::SharedVmAttachment::new(declaration, socket())
+            .expect_err("an unusable L3 configuration must be refused before a VM exists");
+        assert!(
+            error.to_string().contains(expected),
+            "expected `{expected}` in: {error}"
+        );
+    };
+
+    // /0 claims every address; /31 and /32 leave a range whose every address is
+    // its subnet or its broadcast address. Both would also make `u32::MAX >>
+    // prefix` the wrong shape to reason about at all.
+    for prefix in [0, 31, 32] {
+        refuse(
+            crate::config::DeclaredAttachment {
+                prefix,
+                ..declared_attachment()
+            },
+            "leaves no addressable range",
+        );
+    }
+    // The subnet address and the broadcast address of the port's own range.
+    for ipv4 in [
+        std::net::Ipv4Addr::new(10, 4, 7, 0),
+        std::net::Ipv4Addr::new(10, 4, 7, 255),
+    ] {
+        refuse(
+            crate::config::DeclaredAttachment {
+                ipv4,
+                ..declared_attachment()
+            },
+            "subnet or broadcast address of its own range",
+        );
+    }
+    refuse(
+        crate::config::DeclaredAttachment {
+            gateway: Some(std::net::Ipv4Addr::new(10, 4, 8, 1)),
+            ..declared_attachment()
+        },
+        "is not on 10.4.7.2/24",
+    );
+    refuse(
+        crate::config::DeclaredAttachment {
+            gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 2)),
+            ..declared_attachment()
+        },
+        "this port's own address",
+    );
+
+    // A gateway that is on the range is accepted, and so is the last usable
+    // host address, which the broadcast rule must not have swallowed.
+    for accepted in [
+        crate::config::DeclaredAttachment {
+            gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 1)),
+            ..declared_attachment()
+        },
+        crate::config::DeclaredAttachment {
+            ipv4: std::net::Ipv4Addr::new(10, 4, 7, 254),
+            ..declared_attachment()
+        },
+    ] {
+        crate::config::SharedVmAttachment::new(accepted, socket())
+            .expect("a usable L3 configuration must be accepted");
+    }
+}
+
+#[test]
+fn a_port_reaches_the_guest_as_one_kernel_argument_keyed_on_its_mac() {
+    // The exact string is the contract with `linux/initramfs/init`, which
+    // splits on `,` and matches the first field against sysfs. Both halves are
+    // pinned so neither can drift without this failing.
+    let declaration = declared_attachment();
+    assert_eq!(
+        declaration.kernel_argument(0),
+        "vz.net.0=02:11:22:33:44:55,10.4.7.2/24"
+    );
+    assert_eq!(
+        crate::config::DeclaredAttachment {
+            gateway: Some(std::net::Ipv4Addr::new(10, 4, 7, 1)),
+            ..declared_attachment()
+        }
+        .kernel_argument(3),
+        "vz.net.3=02:11:22:33:44:55,10.4.7.2/24,10.4.7.1"
+    );
+    // The guest compares against sysfs, which the kernel renders lowercase,
+    // and folds no case of its own, so the host has to.
+    assert_eq!(
+        crate::config::DeclaredAttachment {
+            mac: "0A:BB:22:33:44:FF".to_string(),
+            ..declared_attachment()
+        }
+        .kernel_argument(1),
+        "vz.net.1=0a:bb:22:33:44:ff,10.4.7.2/24"
+    );
+    // No argument may carry a space or the kernel would read it as two.
+    assert!(!declaration.kernel_argument(0).contains(' '));
+}
+
+#[test]
+fn every_port_a_machine_boots_with_reaches_its_cmdline_in_nic_order() {
+    // This is what `boot_or_inspect_shared_vm` appends to the cmdline, so a
+    // port dropped here is a NIC the guest brings up and never addresses.
+    // Indices follow NIC attachment order, which is the order the ports were
+    // minted in, so the second port is `vz.net.1` and not `vz.net.0` again.
+    assert_eq!(
+        crate::config::fabric_cmdline_suffix(&[
+            declared_attachment(),
+            crate::config::DeclaredAttachment {
+                network_id: "net-backend".to_string(),
+                mac: "02:11:22:33:44:56".to_string(),
+                ipv4: std::net::Ipv4Addr::new(10, 9, 0, 3),
+                prefix: 16,
+                gateway: Some(std::net::Ipv4Addr::new(10, 9, 0, 1)),
+                ..declared_attachment()
+            },
+        ]),
+        " vz.net.0=02:11:22:33:44:55,10.4.7.2/24 vz.net.1=02:11:22:33:44:56,10.9.0.3/16,10.9.0.1"
+    );
+    // A Machine with no declared attachment must contribute nothing at all,
+    // not a stray separator the kernel would have to tolerate.
+    assert_eq!(crate::config::fabric_cmdline_suffix(&[]), "");
 }
 
 #[tokio::test]

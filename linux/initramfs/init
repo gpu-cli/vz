@@ -179,6 +179,77 @@ if [ -d /sys/class/net/eth0 ] && [ -x /sbin/udhcpc ]; then
   /sbin/udhcpc -i eth0 -s /etc/udhcpc.script -q -b -t 5 -T 1 >/dev/console 2>&1 &
 fi
 
+# --- BEGIN vz.net fabric ports (extracted verbatim by vz-linux tests) ---
+# Configure every Environment-network port named on the kernel cmdline.
+#
+# Each `vz.net.N=<mac>,<addr>/<prefix>[,<gw>]` is one port on an Environment
+# switch. The address is derived on the host from persisted records and cannot
+# be discovered from in here: there is no DHCP server on a fabric, by design,
+# because a Machine that stops and comes back must present the address its
+# switch and its own saved state already expect. It also has to be live before
+# the guest agent starts, which is why it arrives on the cmdline and not over
+# an RPC. Configuration is therefore reboot-only.
+#
+# The interface is found by MAC and never by name. Interface enumeration order
+# is not guaranteed, so the host cannot predict which name this NIC gets, while
+# the MAC is exactly what the host configured the NIC with. Matching on it also
+# means eth0 is untouched: eth0 is the default NAT NIC and its address is never
+# a fabric port's.
+configure_fabric_nic() {
+  cfn_mac="$1"
+  cfn_cidr="$2"
+  cfn_gateway="$3"
+  cfn_iface=""
+  # The host lowercases the MAC before it reaches the cmdline and sysfs is
+  # lowercase by kernel convention, so both sides compare without a case fold
+  # and without depending on a `tr` applet being compiled into this BusyBox.
+  for cfn_path in /sys/class/net/*; do
+    [ -r "$cfn_path/address" ] || continue
+    cfn_found=$(/bin/busybox cat "$cfn_path/address" 2>/dev/null)
+    if [ "$cfn_found" = "$cfn_mac" ]; then
+      cfn_iface="${cfn_path##*/}"
+      break
+    fi
+  done
+  if [ -z "$cfn_iface" ]; then
+    echo "[vz-init] no interface has address $cfn_mac; fabric port left unconfigured"
+    return 1
+  fi
+  /bin/busybox ip address add "$cfn_cidr" dev "$cfn_iface" || return 1
+  /bin/busybox ip link set dev "$cfn_iface" up || return 1
+  if [ -n "$cfn_gateway" ]; then
+    # A fabric gateway is the egress path for NetworkKind::SimulatedPublic,
+    # so it is a default route rather than an on-link one. Nothing emits a
+    # gateway yet; when egress lands it must also settle which NIC owns the
+    # default route, because udhcpc may install one for eth0 from Apple's NAT.
+    /bin/busybox ip route add default via "$cfn_gateway" dev "$cfn_iface" || return 1
+  fi
+  echo "[vz-init] fabric port $cfn_iface ($cfn_mac) $cfn_cidr${cfn_gateway:+ via $cfn_gateway}"
+  return 0
+}
+
+configure_fabric_ports_from_cmdline() {
+  for cfp_param in $(/bin/busybox cat /proc/cmdline); do
+    case "$cfp_param" in
+      vz.net.*=*)
+        cfp_value="${cfp_param#*=}"
+        cfp_mac="${cfp_value%%,*}"
+        cfp_rest="${cfp_value#*,}"
+        cfp_cidr="${cfp_rest%%,*}"
+        case "$cfp_rest" in
+          *,*) cfp_gateway="${cfp_rest#*,}" ;;
+          *) cfp_gateway="" ;;
+        esac
+        configure_fabric_nic "$cfp_mac" "$cfp_cidr" "$cfp_gateway" ||
+          echo "[vz-init] warning: could not apply $cfp_param"
+        ;;
+    esac
+  done
+}
+
+configure_fabric_ports_from_cmdline >/dev/console 2>&1 || true
+# --- END vz.net fabric ports ---
+
 switch_root_into_overlay_rootfs() {
   echo "[vz-init] preparing overlay rootfs"
 

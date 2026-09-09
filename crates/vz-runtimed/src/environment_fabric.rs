@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use thiserror::Error;
 use tracing::info;
-use vz_oci_macos::SharedVmAttachment;
+use vz_oci_macos::{DeclaredAttachment, SharedVmAttachment};
 use vz_runtime_contract::{EnvironmentInstance, MachineId, ResourceOwner};
 
 use crate::RuntimeDaemon;
@@ -149,9 +149,20 @@ impl RuntimeDaemon {
                     ))
                 })?;
                 let attachment = SharedVmAttachment::new(
-                    network.network_id.as_str(),
-                    port.mac.to_string(),
-                    FABRIC_MTU,
+                    DeclaredAttachment {
+                        network_id: network.network_id.to_string(),
+                        mac: port.mac.to_string(),
+                        ipv4: port.address,
+                        prefix: network.cidr.prefix(),
+                        // A private fabric has no route off itself, so there
+                        // is no gateway to name. The offset one address is
+                        // reserved for the one `NetworkKind::SimulatedPublic`
+                        // will need, but nothing occupies it until an egress
+                        // path exists, and pointing a guest at an address no
+                        // one answers on would be worse than no route at all.
+                        gateway: None,
+                        mtu: FABRIC_MTU,
+                    },
                     socket,
                 )
                 .map_err(|error| EnvironmentFabricError::Port {

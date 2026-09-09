@@ -150,6 +150,13 @@ impl Ipv4Cidr {
         Ok(Self { base, prefix })
     }
 
+    /// How wide this range is. A port carries this alongside its own address,
+    /// because an address without its prefix does not tell the guest which
+    /// peers are on-link.
+    pub const fn prefix(&self) -> u8 {
+        self.prefix
+    }
+
     /// How many addresses in this range may be assigned to a Machine.
     pub const fn host_capacity(&self) -> u32 {
         // A /30 holds four addresses: subnet, gateway, one host, broadcast.

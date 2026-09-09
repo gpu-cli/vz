@@ -1690,10 +1690,18 @@ esac
             let (declaration, socket) = attachment.into_parts();
             let network = vz::FileHandleNetwork::new(socket, declaration.mtu)
                 .map_err(|error| OciError::InvalidConfig(error.to_string()))?;
-            attachment_nics
-                .push(vz::Nic::file_handle(network).with_mac(declaration.address.clone()));
+            attachment_nics.push(vz::Nic::file_handle(network).with_mac(declaration.mac.clone()));
             boot_attachments.push(declaration);
         }
+        // The NICs alone give the guest live links and no addresses. Each
+        // address is derived on the host and cannot be discovered from inside,
+        // and it has to be configured before the guest agent starts, so it
+        // rides the cmdline the kernel is booted with — the same channel
+        // `vz.mount.N` above uses, and for the same reason: it is in place
+        // before anything in the guest is.
+        vm_config
+            .cmdline
+            .push_str(&crate::config::fabric_cmdline_suffix(&boot_attachments));
         if !self.config.default_network_enabled {
             vm_config.nics = Some(attachment_nics);
         } else if !attachment_nics.is_empty() {

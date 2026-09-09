@@ -155,8 +155,33 @@ async fn a_declared_network_becomes_a_running_switch_with_one_port_per_attached_
         // the assigned address, so a NIC configured with anything else would be
         // silently mute rather than misdelivered.
         assert_eq!(
-            declaration.address,
+            declaration.mac,
             MacAddress::derive(ENVIRONMENT, machine.as_str(), NETWORK).to_string()
+        );
+    }
+
+    // The derived L3 address reaches the Machine that boots. Until this
+    // adapter existed the plan computed an address and nothing carried it, so
+    // the assertion that matters is that each declaration holds the address
+    // the plan assigned that Machine's port, with the range's prefix, rendered
+    // as the one kernel argument the guest parses.
+    let plan = crate::environment_switch::plan::plan_environment_fabric(&environment)
+        .expect("the same Environment plans");
+    let planned = &plan.networks[0];
+    for port in &planned.ports {
+        let declaration = minted[&port.machine_id][0].declaration();
+        assert_eq!(declaration.ipv4, port.address);
+        assert_eq!(declaration.prefix, planned.cidr.prefix());
+        // Nothing routes off a private fabric yet, so no gateway is named.
+        assert_eq!(declaration.gateway, None);
+        assert_eq!(
+            declaration.kernel_argument(0),
+            format!(
+                "vz.net.0={},{}/{}",
+                port.mac,
+                port.address,
+                planned.cidr.prefix()
+            )
         );
     }
     daemon

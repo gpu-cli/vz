@@ -623,4 +623,202 @@ mod tests {
         // can be rw for the OCI runtime.
         assert!(!script.contains("remount,ro /mnt/rootfs"));
     }
+
+    fn initramfs_init_source() -> String {
+        let init_script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join("linux/initramfs/init");
+        fs::read_to_string(&init_script).expect("read initramfs init script")
+    }
+
+    /// The `vz.net.N` block of the guest init script, relocated so it can run
+    /// on this host against a fixture instead of a booted guest.
+    ///
+    /// The block is lifted verbatim between its markers and only its absolute
+    /// paths are rewritten, so what runs below is the shell the guest runs and
+    /// not a restatement of it.
+    fn relocated_fabric_block(root: &std::path::Path, busybox: &std::path::Path) -> String {
+        let source = initramfs_init_source();
+        let (_, rest) = source
+            .split_once(
+                "# --- BEGIN vz.net fabric ports (extracted verbatim by vz-linux tests) ---",
+            )
+            .expect("the initramfs init script carries the vz.net block markers");
+        let (block, _) = rest
+            .split_once("# --- END vz.net fabric ports ---")
+            .expect("the vz.net block is closed");
+        block
+            .replace("/bin/busybox", &busybox.display().to_string())
+            .replace("/sys/class/net", &root.join("net").display().to_string())
+            .replace("/proc/cmdline", &root.join("cmdline").display().to_string())
+            .replace("/dev/console", &root.join("console").display().to_string())
+    }
+
+    #[test]
+    fn the_guest_configures_a_fabric_port_by_matching_its_mac_and_leaves_eth0_alone() {
+        // Interface enumeration order is not guaranteed, so the fixture below
+        // deliberately inverts it: `vz.net.0` names the MAC that sysfs
+        // enumerates last and `vz.net.1` the one before it. If the script ever
+        // selected by index, by position or by name, the assertions on which
+        // device each address landed on would swap.
+        let root = tempfile::Builder::new()
+            .prefix("vz-fabric-init-")
+            .tempdir()
+            .expect("temp root");
+        let root = root.path();
+        for (name, address) in [
+            ("eth0", "5a:11:22:33:44:00"),
+            ("eth1", "02:aa:bb:cc:dd:02"),
+            ("eth2", "02:aa:bb:cc:dd:03"),
+        ] {
+            fs::create_dir_all(root.join("net").join(name)).expect("fake sysfs device");
+            fs::write(root.join("net").join(name).join("address"), address)
+                .expect("fake sysfs address");
+        }
+        fs::write(
+            root.join("cmdline"),
+            "console=hvc0 vz.mount.0=/workspace \
+             vz.net.0=02:aa:bb:cc:dd:03,10.9.0.5/24 \
+             vz.net.1=02:aa:bb:cc:dd:02,10.9.1.7/16,10.9.0.1\n",
+        )
+        .expect("fake cmdline");
+
+        // Any applet beyond `cat` and `ip` fails the run: the guest BusyBox is
+        // not guaranteed to carry more than the Makefile's applet list, and a
+        // missing applet in a booted guest is a silent unconfigured NIC.
+        let busybox = root.join("busybox");
+        let log = root.join("ip.log");
+        fs::write(
+            &busybox,
+            format!(
+                "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+                 cat) exec /bin/cat \"$@\" ;;\n\
+                 ip) echo \"ip $*\" >> {log} ;;\n\
+                 *) echo \"unexpected applet: $applet\" >&2; exit 127 ;;\nesac\n",
+                log = log.display()
+            ),
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+
+        // The block's own trailing invocation is what runs it, so the harness
+        // adds no call of its own: that the definitions are actually applied
+        // at boot is part of what this pins.
+        let script = root.join("fabric.sh");
+        fs::write(&script, relocated_fabric_block(root, &busybox)).expect("write harness script");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .output()
+            .expect("run the guest fabric block");
+        assert!(
+            output.status.success(),
+            "guest fabric block failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+
+        let applied = fs::read_to_string(&log).unwrap_or_default();
+        let applied: Vec<&str> = applied.lines().collect();
+        assert_eq!(
+            applied,
+            vec![
+                // Matched on MAC, so the first argument lands on eth2.
+                "ip address add 10.9.0.5/24 dev eth2",
+                "ip link set dev eth2 up",
+                "ip address add 10.9.1.7/16 dev eth1",
+                "ip link set dev eth1 up",
+                // Only the port that named a gateway gets a route.
+                "ip route add default via 10.9.0.1 dev eth1",
+            ],
+            "console: {console}"
+        );
+        // eth0 carries Apple's NAT address and is configured by udhcpc. A
+        // fabric port must never touch it.
+        assert!(!applied.iter().any(|line| line.contains("eth0")));
+    }
+
+    #[test]
+    fn a_fabric_port_whose_mac_no_interface_has_is_reported_and_does_not_stop_the_others() {
+        // A NIC that failed to attach must not cost the Machine every other
+        // port, and must not pass silently either: an unconfigured port looks
+        // exactly like an application that cannot reach its peer.
+        let root = tempfile::Builder::new()
+            .prefix("vz-fabric-init-missing-")
+            .tempdir()
+            .expect("temp root");
+        let root = root.path();
+        fs::create_dir_all(root.join("net").join("eth1")).expect("fake sysfs device");
+        fs::write(
+            root.join("net").join("eth1").join("address"),
+            "02:aa:bb:cc:dd:02",
+        )
+        .expect("fake sysfs address");
+        fs::write(
+            root.join("cmdline"),
+            "vz.net.0=02:aa:bb:cc:dd:99,10.9.0.5/24 \
+             vz.net.1=02:aa:bb:cc:dd:02,10.9.1.7/16\n",
+        )
+        .expect("fake cmdline");
+
+        let busybox = root.join("busybox");
+        let log = root.join("ip.log");
+        fs::write(
+            &busybox,
+            format!(
+                "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+                 cat) exec /bin/cat \"$@\" ;;\n\
+                 ip) echo \"ip $*\" >> {log} ;;\n\
+                 *) exit 127 ;;\nesac\n",
+                log = log.display()
+            ),
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+
+        let script = root.join("fabric.sh");
+        fs::write(&script, relocated_fabric_block(root, &busybox)).expect("write harness script");
+
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .output()
+            .expect("run the guest fabric block");
+        // An unmatched port must not take the boot down with it: the block is
+        // reached before the guest agent starts, and a non-zero exit here
+        // would cost the Machine everything, not just one NIC.
+        assert!(
+            output.status.success(),
+            "an unmatched port must not fail the boot: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+        assert!(
+            console.contains("no interface has address 02:aa:bb:cc:dd:99"),
+            "the unmatched port must say so: {console}"
+        );
+        assert!(
+            console.contains("could not apply vz.net.0="),
+            "the unmatched port must name the argument it could not apply: {console}"
+        );
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "ip address add 10.9.1.7/16 dev eth1",
+                "ip link set dev eth1 up",
+            ],
+            "the port that did match must still be configured"
+        );
+    }
 }

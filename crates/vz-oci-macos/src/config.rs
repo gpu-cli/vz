@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -185,17 +186,80 @@ pub(crate) async fn ensure_kernel_for_config(
 ///
 /// Descriptors do not survive comparison: a second boot presents a different
 /// socket for the same port, so idempotency is decided on the declaration —
-/// which network, at which address, with which MTU — and never on the
+/// which network, at which addresses, with which MTU — and never on the
 /// descriptor.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclaredAttachment {
     /// The Environment network this port belongs to.
     pub network_id: String,
-    /// The address the switch assigned this port, `"XX:XX:XX:XX:XX:XX"`.
-    pub address: String,
+    /// The link-layer address the switch assigned this port,
+    /// `"xx:xx:xx:xx:xx:xx"`.
+    ///
+    /// Also the only identifier the host and the guest agree on. Interface
+    /// enumeration order inside the guest is not guaranteed, so the name this
+    /// NIC ends up with is not something the host can predict; the MAC is
+    /// exactly what the host configured the NIC with, so it is what the guest
+    /// matches on.
+    pub mac: String,
+    /// The host address this port holds on its network.
+    pub ipv4: Ipv4Addr,
+    /// The prefix length of the range `ipv4` sits in, so the guest lays down
+    /// the on-link route from the same argument rather than being told the
+    /// range separately and having to agree with it.
+    pub prefix: u8,
+    /// The fabric gateway, when this network has one. `None` for a purely
+    /// private fabric, which has no route off itself to describe.
+    pub gateway: Option<Ipv4Addr>,
     /// The MTU the attachment was sized for.
     pub mtu: u32,
 }
+
+impl DeclaredAttachment {
+    /// This attachment rendered as the kernel argument that configures it in
+    /// the guest: `vz.net.{index}={mac},{ipv4}/{prefix}[,{gateway}]`.
+    ///
+    /// The address travels on the kernel cmdline rather than over the guest
+    /// agent for two reasons that an RPC cannot satisfy. The agent is not yet
+    /// running at the point this NIC has to work, and a checkpoint restored
+    /// later replays the cmdline it was booted with but replays no past RPC —
+    /// the same reasoning that makes the MAC and the address derived rather
+    /// than leased. Configuration is therefore reboot-only by design.
+    ///
+    /// `index` only keeps one Machine's arguments distinct from each other. It
+    /// is deliberately not an interface selector: the guest matches on `mac`,
+    /// never on this index and never on an interface name.
+    pub fn kernel_argument(&self, index: usize) -> String {
+        // Lowercased here rather than trusted from the caller, because the
+        // guest compares this against sysfs, which the kernel always renders
+        // in lowercase, and a shell-side case fold would need a `tr` applet
+        // that the initramfs BusyBox is not guaranteed to carry.
+        let mac = self.mac.to_ascii_lowercase();
+        let (ipv4, prefix) = (self.ipv4, self.prefix);
+        match self.gateway {
+            Some(gateway) => format!("vz.net.{index}={mac},{ipv4}/{prefix},{gateway}"),
+            None => format!("vz.net.{index}={mac},{ipv4}/{prefix}"),
+        }
+    }
+}
+
+/// The kernel cmdline suffix one Machine's ports contribute, in NIC order.
+///
+/// The index each port is rendered with is its position in this list, which is
+/// the order the NICs are attached in, so a Machine's arguments stay distinct
+/// from each other without any of them having to know what the others are.
+pub(crate) fn fabric_cmdline_suffix(attachments: &[DeclaredAttachment]) -> String {
+    attachments
+        .iter()
+        .enumerate()
+        .map(|(index, declaration)| format!(" {}", declaration.kernel_argument(index)))
+        .collect()
+}
+
+/// Prefix lengths a port may be declared with. A `/0` port claims every address
+/// there is, and a `/31` or longer leaves its range with no address that is
+/// neither the subnet nor the broadcast address, so no interface could hold one.
+const MIN_ATTACHMENT_PREFIX: u8 = 1;
+const MAX_ATTACHMENT_PREFIX: u8 = 30;
 
 /// One Environment-network port a Machine boots attached to.
 ///
@@ -211,36 +275,66 @@ pub struct SharedVmAttachment {
 }
 
 impl SharedVmAttachment {
-    /// Declare a port, refusing an address the VM configuration would only
-    /// reject later, once a VM already existed.
+    /// Declare a port, refusing anything the VM configuration or the guest
+    /// would only reject later, once a VM already existed.
+    ///
+    /// Every rule here is one whose violation is silent rather than loud: a
+    /// malformed MAC is rejected by the VM configuration only after a VM is
+    /// built around it, and an unusable address or an off-subnet gateway
+    /// produces a NIC that comes up and then simply never carries traffic,
+    /// which reads as an application fault rather than a configuration one.
     pub fn new(
-        network_id: impl Into<String>,
-        address: impl Into<String>,
-        mtu: u32,
+        declaration: DeclaredAttachment,
         socket: std::os::fd::OwnedFd,
     ) -> Result<Self, OciError> {
-        let (network_id, address) = (network_id.into(), address.into());
-        if network_id.is_empty() {
+        if declaration.network_id.is_empty() {
             return Err(OciError::InvalidConfig(
                 "network attachment requires a network id".to_string(),
             ));
         }
-        let octets: Vec<&str> = address.split(':').collect();
+        let octets: Vec<&str> = declaration.mac.split(':').collect();
         if octets.len() != 6
             || !octets
                 .iter()
                 .all(|octet| octet.len() == 2 && octet.bytes().all(|b| b.is_ascii_hexdigit()))
         {
             return Err(OciError::InvalidConfig(format!(
-                "network attachment address must be six colon-separated hex bytes: {address}"
+                "network attachment address must be six colon-separated hex bytes: {}",
+                declaration.mac
             )));
         }
+        // Checked before the mask is computed: `u32::MAX >> 32` is not a
+        // shift this can perform, so the range check is what makes the
+        // arithmetic below total rather than a separate nicety.
+        if !(MIN_ATTACHMENT_PREFIX..=MAX_ATTACHMENT_PREFIX).contains(&declaration.prefix) {
+            return Err(OciError::InvalidConfig(format!(
+                "network attachment prefix /{} leaves no addressable range; expected /{MIN_ATTACHMENT_PREFIX}..=/{MAX_ATTACHMENT_PREFIX}",
+                declaration.prefix
+            )));
+        }
+        let host_mask = u32::MAX >> declaration.prefix;
+        let host_bits = declaration.ipv4.to_bits() & host_mask;
+        if host_bits == 0 || host_bits == host_mask {
+            return Err(OciError::InvalidConfig(format!(
+                "network attachment address {}/{} is the subnet or broadcast address of its own range, which no interface can hold",
+                declaration.ipv4, declaration.prefix
+            )));
+        }
+        if let Some(gateway) = declaration.gateway {
+            if gateway.to_bits() & !host_mask != declaration.ipv4.to_bits() & !host_mask {
+                return Err(OciError::InvalidConfig(format!(
+                    "network attachment gateway {gateway} is not on {}/{}, so the guest would have no route to reach it",
+                    declaration.ipv4, declaration.prefix
+                )));
+            }
+            if gateway == declaration.ipv4 {
+                return Err(OciError::InvalidConfig(format!(
+                    "network attachment gateway {gateway} is this port's own address, so it names no route off the fabric"
+                )));
+            }
+        }
         Ok(Self {
-            declaration: DeclaredAttachment {
-                network_id,
-                address,
-                mtu,
-            },
+            declaration,
             socket,
         })
     }
