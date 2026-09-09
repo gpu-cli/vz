@@ -18,6 +18,7 @@ import linux_docker_compose_evidence as evidence
 
 
 FIXTURE = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"
+FOREIGN_ALIAS = "vz04-0123456789abcdef01234567" + evidence.DNS_SUFFIX
 
 
 def data(value):
@@ -30,6 +31,7 @@ class SyntheticEngine:
         self.inputs = inputs
         self.owner = inputs.owner
         self.projects, self.markers = {}, {}
+        self.generations = {}
         self.external = {kind: [] for kind in ("container", "network", "volume")}
 
     def identity(self, name):
@@ -77,18 +79,52 @@ class SyntheticEngine:
             lines.append(f"{name:<{width}} | vz04|{role}|{self.owner}|{event}\n".encode())
         return b"".join(lines)
 
-    def container(self, project, role, number=1):
-        identity = self.identity(project + role + str(number))
+    # Addressing is per network, not per container: two services sharing one
+    # network must hold distinct addresses, or a name that resolved to the wrong
+    # container would be indistinguishable from one that resolved to the right
+    # one. `generation` separates a replacement container from the one it
+    # replaced, in identity and in address.
+    NETWORKS = {"frontend": 0, "backend": 1, "isolated": 2}
+    HOSTS = {"db": 20, "api": 30, "worker": 40, "isolated": 50, "failure": 60}
+
+    def container(self, project, role, number=1, generation=0):
+        suffix = "" if not generation else "#" + str(generation)
+        identity = self.identity(project + role + str(number) + suffix)
         names = {"db": ("backend",), "api": ("frontend", "backend"), "worker": ("frontend",),
                  "isolated": ("isolated",), "failure": ("frontend",)}[role]
+        host = self.HOSTS[role] + number - 1 + generation
         return {"Id": identity, "Name": f"/{project}-{role}-{number}", "Image": self.inputs.raw["images"]["compose"]["id"],
                 "Config": {"Hostname": identity[:12], "Labels": self.labels(project) | {"com.docker.compose.service": role}},
                 "State": {"Status": "created", "Running": False, "ExitCode": 0,
                           **({} if role == "failure" else {"Health": {"Status": "starting"}})},
                 "Mounts": [{"Destination": "/data", "Type": "volume", "Name": project + "_state", "RW": True}] if role == "db" else [],
-                "NetworkSettings": {"Networks": {project + "_" + name: {"IPAddress": f"172.{18 + index}.0.{10 + number}",
+                "NetworkSettings": {"Networks": {project + "_" + name: {"IPAddress": f"172.{18 + self.NETWORKS[name]}.0.{host}",
                                                                          "NetworkID": self.identity(project + name)}
-                                                  for index, name in enumerate(names)}}}
+                                                  for name in names}}}
+
+    def resolve(self, item, name):
+        """Docker's embedded DNS as a property, never a recorded answer.
+
+        A name answers only when a *running* container of the asking container's
+        own project shares a network with it and carries that name, either as
+        its Compose service alias or as its exact container name. A removed
+        container therefore stops answering, and a name no container in this
+        Engine holds never answers at all.
+        """
+        project = item["Config"]["Labels"]["com.docker.compose.project"]
+        asking = set(item["NetworkSettings"]["Networks"])
+        for other in self.projects.get(project, {}).get("container", []):
+            if not other["State"].get("Running"):
+                continue
+            aliases = {other["Config"]["Labels"]["com.docker.compose.service"], other["Name"].lstrip("/")}
+            if name not in aliases:
+                continue
+            shared = sorted(asking & set(other["NetworkSettings"]["Networks"]))
+            if shared:
+                return {"schema_version": 1, "name": name, "outcome": "resolved", "errno": None, "exception": None,
+                        "addresses": [other["NetworkSettings"]["Networks"][shared[0]]["IPAddress"]]}
+        return {"schema_version": 1, "name": name, "outcome": "unresolved", "addresses": [],
+                "errno": -2, "exception": "gaierror"}
 
     def __call__(self, argv, **_kwargs):
         args = argv[5:]
@@ -139,6 +175,13 @@ class SyntheticEngine:
             action = tail[0]
             if action == "down":
                 self.projects.pop(project, None)
+            elif action == "rm":
+                assert tail[:3] == ["rm", "--stop", "--force"], tail
+                for role in tail[3:]:
+                    items = self.projects[project]["container"]
+                    self.projects[project]["container"] = [
+                        x for x in items if x["Config"]["Labels"]["com.docker.compose.service"] != role]
+                    self.generations[(project, role)] = self.generations.get((project, role), 0) + 1
             elif action == "exec":
                 code = 37
                 stdout, stderr = (f"vz04|api|{self.owner}|exec-{stream}\n".encode() for stream in ("stdout", "stderr"))
@@ -150,6 +193,14 @@ class SyntheticEngine:
                 stdout = self.compose_config()
             else:
                 self.install(project, failure="--exit-code-from" in tail)
+                # Compose recreates a service whose container is gone, under the
+                # same name and with a new identity and address.
+                present = {x["Config"]["Labels"]["com.docker.compose.service"]
+                           for x in self.projects[project]["container"]}
+                for role in ("db", "api", "worker", "isolated"):
+                    if role not in present:
+                        self.projects[project]["container"].append(
+                            self.container(project, role, generation=self.generations[(project, role)]))
                 items = self.projects[project]["container"]
                 if "--scale" in tail:
                     count = int(tail[tail.index("--scale") + 1].split("=")[1])
@@ -186,7 +237,9 @@ class SyntheticEngine:
             item = next(x for inventory in self.projects.values() for x in inventory["container"] if x["Id"] == args[1])
             role = item["Config"]["Labels"]["com.docker.compose.service"]
             tail = args[2:]
-            if tail[1] == "-c":
+            if tail[1] == "-c" and tail[2] == evidence.RESOLVE:
+                stdout = data(self.resolve(item, tail[3]))
+            elif tail[1] == "-c":
                 if tail[2] == evidence.WRITE:
                     self.markers[(item["Id"], tail[3])] = tail[4].encode()
                 elif tail[3].endswith("/sentinel.txt"):
@@ -220,6 +273,75 @@ class SyntheticEngine:
         else:
             raise AssertionError(f"unexpected synthetic command: {args}")
         return subprocess.CompletedProcess(argv, code, stdout, stderr)
+
+
+class TamperedEngine(SyntheticEngine):
+    """The synthetic Engine with exactly one DNS property broken.
+
+    Each mode is a way `docker.network.dns` could be false while every other
+    assertion in the subset still passed, so a Driver that accepts one of these
+    is a Driver whose DNS recipe proves nothing.
+    """
+
+    def __init__(self, inputs, mode):
+        super().__init__(inputs)
+        self.mode, self.removal_seen = mode, False
+
+    def __call__(self, argv, **kwargs):
+        args = argv[5:]
+        removal = args[0] == "compose" and "rm" in args
+        if removal and self.mode == "no-removal":
+            return subprocess.CompletedProcess(argv, 0, b"", b"")
+        result = super().__call__(argv, **kwargs)
+        if removal:
+            self.removal_seen = True
+        return result
+
+    def resolve(self, item, name):
+        row = super().resolve(item, name)
+        own = self.owner + evidence.DNS_SUFFIX
+        answered = {"schema_version": 1, "name": name, "outcome": "resolved", "errno": None, "exception": None}
+        if self.mode == "foreign-resolves" and name == FOREIGN_ALIAS:
+            return answered | {"addresses": ["172.18.0.99"]}
+        if self.mode == "stale-record" and self.removal_seen and name in ("api", own):
+            return answered | {"addresses": ["172.18.0.30"]}
+        if self.mode == "dead-resolver" and self.removal_seen:
+            return {"schema_version": 1, "name": name, "outcome": "unresolved", "addresses": [],
+                    "errno": -2, "exception": "gaierror"}
+        if self.mode == "connect-deadline" and row["outcome"] == "unresolved":
+            return {"schema_version": 1, "name": name, "outcome": "deadline", "addresses": [],
+                    "errno": None, "exception": "TimeoutError"}
+        if self.mode == "unclassified-failure" and row["outcome"] == "unresolved":
+            # No address, but not "no such name" either: something else in the
+            # probe went wrong, which is not evidence that the name is absent.
+            return {"schema_version": 1, "name": name, "outcome": "unresolved", "addresses": [],
+                    "errno": None, "exception": "OSError"}
+        if self.mode == "wrong-address" and name == "api" and row["outcome"] == "resolved":
+            return answered | {"addresses": ["172.18.0.40"]}
+        return row
+
+
+def execute_driver(fixture, raw_inputs, output, engine=None):
+    """One Driver run against an in-memory Engine; never real Docker."""
+    inputs = driver.Inputs(raw_inputs, suite="compose")
+    original_stat = Path.stat
+    socket_path = raw_inputs["scope"]["docker_endpoint"][7:]
+
+    def fake_stat(path, *args, **kwargs):
+        if str(path) == socket_path:
+            return types.SimpleNamespace(st_mode=stat.S_IFSOCK)
+        return original_stat(path, *args, **kwargs)
+
+    def persist(_recorder, path, value, **_kwargs):
+        # Synthetic fixtures make no fsync/durability claim.
+        path.write_bytes(data(value))
+
+    with patch.object(driver.sys, "platform", "darwin"), \
+            patch.object(driver.os, "uname", return_value=types.SimpleNamespace(machine="arm64")), \
+            patch.object(Path, "stat", fake_stat), \
+            patch.object(driver, "execute", side_effect=engine or SyntheticEngine(inputs)), \
+            patch.object(driver.Recorder, "persist", persist):
+        return driver.Driver(inputs, fixture, output).run("compose")
 
 
 class NetworkBindingTests(unittest.TestCase):
@@ -318,46 +440,44 @@ class NetworkBindingTests(unittest.TestCase):
                     evidence.network_bindings(inventory)
 
 
+def synthetic_environment(root):
+    """A private fixture copy, client pins and admitted inputs, for one test class."""
+    fixture_root = root / "fixture"
+    shutil.copytree(FIXTURE, fixture_root, ignore=shutil.ignore_patterns("__pycache__"))
+    config = root / "config"
+    config.mkdir(mode=0o700)
+    plugins = config / "cli-plugins"
+    plugins.mkdir(mode=0o700)
+    (config / "config.json").write_text('{"currentContext":"default"}')
+    clients = {}
+    for name in ("docker", "compose", "buildx"):
+        path = root / "docker" if name == "docker" else plugins / ("docker-" + name)
+        path.write_bytes(b"synthetic-never-executed")
+        path.chmod(0o500)
+        clients[name] = {"path": str(path), "sha256": evidence.sha(path.read_bytes())}
+    inputs = {"schema_version": 1, "run_id": "synthetic-compose-123", "release_sha256": "a" * 64,
+              "fixture_sha256": driver.tree_digest(fixture_root), "docker_config": str(config), "clients": clients,
+              "scope": {"project_id": "project", "environment_id": "environment", "machine_id": "machine",
+                        "machine_incarnation": "incarnation", "runtime_identity": "runtime", "docker_context": "owned-context",
+                        "docker_endpoint": "unix://" + str(root / "machine.sock"), "engine_id": "engine"},
+              "images": {"base": {"reference": "fixture.invalid/base@sha256:" + "b" * 64, "id": "sha256:" + "c" * 64, "platform": "linux/arm64"},
+                         "compose": {"reference": "sha256:" + "d" * 64, "id": "sha256:" + "d" * 64, "platform": "linux/arm64"}},
+              # Another Environment's live Compose alias. No container in this
+              # synthetic Engine holds it, which is the only reason it is denied
+              # here; whether it was live where it belongs is a cross-Machine
+              # claim this replay deliberately cannot decide.
+              "foreign_environments": [{"environment_id": "neighbour-environment", "alias": FOREIGN_ALIAS}]}
+    return fixture_root, inputs
+
+
 class ComposeEvidenceTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.temp = tempfile.TemporaryDirectory(prefix="vz-compose-raw-offline-")
         cls.root = Path(cls.temp.name).resolve()
-        cls.fixture = cls.root / "fixture"
-        fixture = Path(__file__).resolve().parents[2] / "tests/fixtures/vz-0.4/docker"
-        shutil.copytree(fixture, cls.fixture, ignore=shutil.ignore_patterns("__pycache__"))
-        config = cls.root / "config"
-        config.mkdir(mode=0o700)
-        plugins = config / "cli-plugins"
-        plugins.mkdir(mode=0o700)
-        (config / "config.json").write_text('{"currentContext":"default"}')
-        clients = {}
-        for name in ("docker", "compose", "buildx"):
-            path = cls.root / "docker" if name == "docker" else plugins / ("docker-" + name)
-            path.write_bytes(b"synthetic-never-executed")
-            path.chmod(0o500)
-            clients[name] = {"path": str(path), "sha256": evidence.sha(path.read_bytes())}
-        cls.fixture_inputs = {"schema_version": 1, "run_id": "synthetic-compose-123", "release_sha256": "a" * 64,
-                   "fixture_sha256": driver.tree_digest(cls.fixture), "docker_config": str(config), "clients": clients,
-                   "scope": {"project_id": "project", "environment_id": "environment", "machine_id": "machine",
-                             "machine_incarnation": "incarnation", "runtime_identity": "runtime", "docker_context": "owned-context",
-                             "docker_endpoint": "unix://" + str(cls.root / "machine.sock"), "engine_id": "engine"},
-                   "images": {"base": {"reference": "fixture.invalid/base@sha256:" + "b" * 64, "id": "sha256:" + "c" * 64, "platform": "linux/arm64"},
-                              "compose": {"reference": "sha256:" + "d" * 64, "id": "sha256:" + "d" * 64, "platform": "linux/arm64"}}}
-        inputs = driver.Inputs(cls.fixture_inputs, suite="compose")
+        cls.fixture, cls.fixture_inputs = synthetic_environment(cls.root)
         cls.base = cls.root / "baseline"
-        original_stat = Path.stat
-        def fake_stat(path, *args, **kwargs):
-            if str(path) == cls.fixture_inputs["scope"]["docker_endpoint"][7:]:
-                return types.SimpleNamespace(st_mode=stat.S_IFSOCK)
-            return original_stat(path, *args, **kwargs)
-        def persist(_recorder, path, value, **_kwargs):
-            # Synthetic fixtures make no fsync/durability claim.
-            path.write_bytes(data(value))
-        with patch.object(driver.sys, "platform", "darwin"), patch.object(driver.os, "uname", return_value=types.SimpleNamespace(machine="arm64")), \
-                patch.object(Path, "stat", fake_stat), patch.object(driver, "execute", side_effect=SyntheticEngine(inputs)), \
-                patch.object(driver.Recorder, "persist", persist):
-            result = driver.Driver(inputs, cls.fixture, cls.base).run("compose")
+        result = execute_driver(cls.fixture, cls.fixture_inputs, cls.base)
         if result["outcome"] != "fixture_assertions_passed":
             raise AssertionError(result)
         evidence.validate(cls.base, cls.fixture_inputs)
@@ -410,13 +530,29 @@ class ComposeEvidenceTests(unittest.TestCase):
     def raw_inputs(self):
         return copy.deepcopy(self.__class__.fixture_inputs)
 
-    def test_complete_synthetic_evidence_replays_nine_without_certification(self):
+    def test_complete_synthetic_evidence_replays_ten_without_certification(self):
         value = evidence.validate(self.directory, self.raw_inputs())
         self.assertEqual(value["recipes_validated"], list(evidence.RECIPES))
-        self.assertEqual(len(evidence.RECIPES), 9)
+        self.assertEqual(len(evidence.RECIPES), 10)
         self.assertEqual(evidence.RELATED[evidence.RECIPES.index("compose-logs")], ["docker.compose.logs"])
+        self.assertEqual(evidence.RELATED[evidence.RECIPES.index("compose-dns-boundary")], ["docker.network.dns"])
         self.assertIs(value["compatibility_certified"], False)
         self.assertEqual(len(value["owned_projects"]), 3)
+        # What one slice can say on its own: the names it resolved, the foreign
+        # name it did not, and the window it holds that denial inside. Whether
+        # the foreign Environment was live is decided elsewhere, from every
+        # slice together, and is deliberately absent here.
+        dns = value["dns_boundary"]
+        owner = driver.Inputs(self.raw_inputs(), suite="compose").owner
+        self.assertEqual(dns["own_alias"], owner + "-compose-api-1")
+        self.assertEqual(dns["local_resolutions"], 6)
+        self.assertEqual([entry["alias"] for entry in dns["foreign_denials"]], [FOREIGN_ALIAS])
+        self.assertEqual(dns["foreign_denials"][0]["environment_id"], "neighbour-environment")
+        self.assertLessEqual(dns["resolved_from_unix_ns"], dns["foreign_denials"][0]["at_unix_ns"])
+        self.assertLessEqual(dns["foreign_denials"][0]["at_unix_ns"], dns["resolved_until_unix_ns"])
+        self.assertNotEqual(dns["stale"]["removed_container"], dns["stale"]["replacement_container"])
+        self.assertEqual(dns["stale"]["names_unresolved_after_remove"], ["api", dns["own_alias"]])
+        self.assertNotEqual(dns["stale"]["names_restored_at"], dns["own_address"])
 
     def logs_row(self, row):
         return row["argv"][5] == "compose" and row["argv"][-len(evidence.LOGS):] == evidence.LOGS
@@ -683,6 +819,174 @@ class ComposeEvidenceTests(unittest.TestCase):
         path.unlink()
         path.symlink_to(self.root / "docker")
         self.rejected()
+
+    def resolve_receipts(self):
+        """Every recorded in-container resolution, in the order the recipe asked."""
+        rows = []
+        for path, receipt in self.receipts():
+            argv = receipt["argv"]
+            if len(argv) == 11 and argv[5] == "exec" and argv[7:10] == ["python3", "-c", evidence.RESOLVE]:
+                rows.append((receipt["index"], argv[10]))
+        return rows
+
+    def rewrite_resolution(self, position, value):
+        index, name = self.resolve_receipts()[position]
+        self.raw(lambda row: row["index"] == index, lambda _raw: data(dict(value, name=name)))
+        return name
+
+    ANSWERED = {"schema_version": 1, "outcome": "resolved", "addresses": ["172.18.0.99"],
+                "errno": None, "exception": None}
+    DENIED = {"schema_version": 1, "outcome": "unresolved", "addresses": [], "errno": -2, "exception": "gaierror"}
+    DEADLINE = {"schema_version": 1, "outcome": "deadline", "addresses": [], "errno": None, "exception": "TimeoutError"}
+    # No address, but not "no such name": the probe failed for some other
+    # reason, which says nothing about whether the name exists.
+    UNCLASSIFIED = {"schema_version": 1, "outcome": "unresolved", "addresses": [],
+                    "errno": None, "exception": "OSError"}
+
+    def test_the_recorded_resolutions_are_the_recipe_the_claim_describes(self):
+        owner = driver.Inputs(self.raw_inputs(), suite="compose").owner
+        own = owner + "-compose-api-1"
+        self.assertEqual([name for _index, name in self.resolve_receipts()],
+                         # bracket, denial, bracket, then remove/deny/control/restore
+                         ["api", own, "worker", FOREIGN_ALIAS, "api", own, "worker",
+                          "api", own, "worker", "api", own])
+
+    def test_a_foreign_environment_alias_that_answered_is_rejected(self):
+        # The boundary leaking is the failure this row exists to catch.
+        self.rewrite_resolution(3, self.ANSWERED)
+        self.rejected()
+
+    def test_a_denial_without_an_address_but_without_a_resolver_answer_is_rejected(self):
+        # `deadline` means the probe gave up, which is what a stale record whose
+        # container is gone looks like when it is measured by connecting;
+        # `unresolved` without a name-resolution error is a probe that broke.
+        for value in (self.DEADLINE, self.UNCLASSIFIED):
+            for position in (3, 7, 8):
+                with self.subTest(position=position, outcome=value["outcome"], exception=value["exception"]):
+                    self.fresh()
+                    self.rewrite_resolution(position, value)
+                    self.rejected()
+
+    def test_a_name_that_survived_the_removal_of_its_container_is_rejected(self):
+        for position in (7, 8):
+            with self.subTest(position=position):
+                self.fresh()
+                self.rewrite_resolution(position, self.ANSWERED)
+                self.rejected()
+
+    def test_a_stale_denial_beside_a_dead_resolver_is_rejected(self):
+        # Without the live control, "api no longer resolves" is satisfied by a
+        # container whose resolver stopped answering anything at all.
+        self.rewrite_resolution(9, self.DENIED)
+        self.rejected()
+
+    def test_an_own_alias_that_did_not_answer_before_or_after_a_denial_is_rejected(self):
+        for position in (0, 1, 2, 4, 5, 6):
+            with self.subTest(position=position):
+                self.fresh()
+                self.rewrite_resolution(position, self.DENIED)
+                self.rejected()
+
+    def test_an_own_alias_answering_the_wrong_container_address_is_rejected(self):
+        for position in (0, 1, 10, 11):
+            with self.subTest(position=position):
+                self.fresh()
+                self.rewrite_resolution(position, self.ANSWERED)
+                self.rejected()
+
+    def test_the_replay_refuses_evidence_that_declares_no_foreign_environment(self):
+        inputs = self.raw_inputs()
+        inputs.pop("foreign_environments")
+        with self.assertRaises(evidence.Invalid):
+            evidence.validate(self.directory, inputs)
+
+    def test_the_replay_refuses_a_foreign_alias_the_slice_did_not_probe(self):
+        inputs = self.raw_inputs()
+        inputs["foreign_environments"] = [{"environment_id": "neighbour-environment",
+                                           "alias": "vz04-ffffffffffffffffffffffff-compose-api-1"}]
+        with self.assertRaises(evidence.Invalid):
+            evidence.validate(self.directory, inputs)
+
+
+class ComposeDnsDriverTests(unittest.TestCase):
+    """The Driver's own refusals: an Engine whose DNS boundary does not hold."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="vz-compose-dns-offline-")
+        cls.root = Path(cls.temp.name).resolve()
+        cls.fixture, cls.inputs = synthetic_environment(cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def run_mode(self, mode):
+        inputs = copy.deepcopy(self.inputs)
+        engine = TamperedEngine(driver.Inputs(inputs, suite="compose"), mode)
+        return execute_driver(self.fixture, inputs, self.root / ("case-" + mode), engine=engine)
+
+    def test_each_broken_dns_property_fails_the_subset_with_its_own_cause(self):
+        for mode, reason in (("foreign-resolves", "address-free denial"),
+                             ("stale-record", "address-free denial"),
+                             ("dead-resolver", "exact container address: worker"),
+                             ("connect-deadline", "address-free denial"),
+                             ("unclassified-failure", "address-free denial"),
+                             ("wrong-address", "exact container address: api"),
+                             ("no-removal", "expected 1")):
+            with self.subTest(mode=mode):
+                result = self.run_mode(mode)
+                self.assertEqual(result["outcome"], "failed", mode)
+                self.assertIn(reason, result["failure"] or "", mode)
+                # The failure belongs to the DNS recipe and nothing after it ran.
+                recipes = [item["recipe"] for item in result["observations"]]
+                self.assertEqual(recipes[-1], "compose-dns-boundary", mode)
+
+    def test_the_subset_refuses_to_start_without_a_foreign_environment(self):
+        inputs = copy.deepcopy(self.inputs)
+        inputs.pop("foreign_environments")
+        result = execute_driver(self.fixture, inputs, self.root / "case-absent")
+        self.assertEqual(result["outcome"], "failed")
+        self.assertIn("live foreign Environment alias", result["failure"])
+        self.assertEqual(result["observations"], [])
+
+
+class ForeignAliasInputTests(unittest.TestCase):
+    """Admission of the foreign-alias input, which fixes the names in advance."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.temp = tempfile.TemporaryDirectory(prefix="vz-compose-alias-offline-")
+        cls.root = Path(cls.temp.name).resolve()
+        cls.fixture, cls.inputs = synthetic_environment(cls.root)
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.temp.cleanup()
+
+    def raw(self, rows):
+        inputs = copy.deepcopy(self.inputs)
+        inputs["foreign_environments"] = rows
+        return inputs
+
+    def test_an_admitted_list_names_other_environments_and_distinct_aliases(self):
+        driver.Inputs(self.raw([{"environment_id": "neighbour-environment", "alias": FOREIGN_ALIAS}]), suite="compose")
+
+    def test_rejections(self):
+        own = driver.owner_token(self.inputs["run_id"], self.inputs["scope"]) + evidence.DNS_SUFFIX
+        cases = {
+            "empty": [],
+            "own-environment": [{"environment_id": "environment", "alias": FOREIGN_ALIAS}],
+            "own-alias": [{"environment_id": "neighbour-environment", "alias": own}],
+            "duplicate": [{"environment_id": "neighbour-environment", "alias": FOREIGN_ALIAS},
+                          {"environment_id": "third-environment", "alias": FOREIGN_ALIAS}],
+            "extra-field": [{"environment_id": "neighbour-environment", "alias": FOREIGN_ALIAS, "live": True}],
+            "bad-alias": [{"environment_id": "neighbour-environment", "alias": "Not An Alias"}],
+        }
+        for name, rows in cases.items():
+            with self.subTest(case=name):
+                with self.assertRaises(driver.Rejected):
+                    driver.Inputs(self.raw(rows), suite="compose")
 
 
 if __name__ == "__main__":

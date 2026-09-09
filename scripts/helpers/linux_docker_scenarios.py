@@ -71,7 +71,8 @@ def _recovery_samples(item):
 
 
 SUITES = {suite.name: suite for suite in (
-    Suite("compose", "docker_host_driver.py", ("compose-machine-{index}/result.json",), (), "docker.compose.up"),
+    Suite("compose", "docker_host_driver.py", ("compose-machine-{index}/result.json",), (), "docker.compose.up",
+          ("compose-cross-machine.json",)),
     Suite("build", "docker_host_driver.py", ("build-machine-{index}/result.json",), (), "docker.build.cache_reuse",
           ("build-cross-machine.json",)),
     Suite("artifacts", "linux_docker_build_artifacts.py", ("artifacts-machine-{index}/machine-artifact-validation.json",), (),
@@ -166,7 +167,7 @@ TABLE = (
     _c("docker.compose.exec", "compose", "compose-exec"),
     _c("docker.compose.networks", "compose", "compose-network-paths"),
     _c("docker.network.user_defined_networks", "compose", "compose-network-paths"),
-    _c("docker.network.dns", "compose", "compose-network-paths", "partial", ("foreign_environment_alias", "stale_alias_after_remove")),
+    _c("docker.network.dns", "compose", ("compose-network-paths", "compose-dns-boundary", "verify_dns_boundary")),
     _c("docker.compose.volumes", "compose", ("compose-volume-persistence", "persisted_digest")),
     _c("docker.compose.scaling", "compose", "compose-scale"),
     _c("docker.compose.failure_propagation", "compose", ("compose-failure", "assert_failure_health")),

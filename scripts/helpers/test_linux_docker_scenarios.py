@@ -1,5 +1,6 @@
 """Coverage table invariants and lane scenario translation; never Docker evidence."""
 import unittest
+import unittest.mock
 
 import linux_docker_scenarios as subject
 
@@ -28,6 +29,25 @@ class TableTests(unittest.TestCase):
             if claim.status == "secondary":
                 primary = subject.PRIMARY[claim.id]
                 self.assertNotEqual(primary.suite, claim.suite, claim.id)
+
+    def test_the_dns_row_is_proven_by_the_recipe_and_the_cross_machine_document(self):
+        # `foreign_environment_alias` cannot be decided by one Machine, so the
+        # claim is only whole while it cites both the per-Machine recipe and the
+        # run-level document that holds each denial against a live peer.
+        claim = subject.PRIMARY["docker.network.dns"]
+        self.assertEqual(claim.status, "proven")
+        self.assertEqual(claim.suite, "compose")
+        self.assertIn("compose-dns-boundary", claim.sources)
+        self.assertIn("verify_dns_boundary", claim.sources)
+        self.assertEqual(subject.SUITES["compose"].suite_evidence, ("compose-cross-machine.json",))
+        entries = subject.lane_scenarios("compose", [{"started_unix_ns": 1, "ended_unix_ns": 2}],
+                                         phase="clean-provision", passed=True, evidence_prefix="h")
+        entry = next(e for e in entries if e["id"] == "docker.network.dns")
+        self.assertEqual(entry["status"], "PASS")
+        self.assertFalse([a for a in entry["assertions"] if a.startswith("UNPROVEN")])
+        self.assertEqual({"foreign_environment_alias", "stale_alias_after_remove", "declared_alias_resolution"},
+                         set(self.rows["docker.network.dns"]["expected"]))
+        self.assertIn("h/compose-cross-machine.json", entry["evidence"])
 
     def test_partial_claims_name_real_manifest_fields_only(self):
         for claim in subject.TABLE:
@@ -120,17 +140,22 @@ class LaneScenarioTests(unittest.TestCase):
         self.assertEqual(by_id["docker.engine.version"]["status"], "PASS")
         self.assertEqual(by_id["docker.engine.info"]["status"], "PASS")
         self.assertEqual(by_id["docker.engine.context"]["status"], "PASS")
-        # Whichever claims are still partial, a passed run reports them FAIL and
-        # names the expected fields no suite asserts. Kept independent of the
-        # table so promoting a claim does not need an edit here.
+        # A partial claim is FAIL even in a passed run, and names the expected
+        # fields no suite asserts. The table currently holds none, so the claim
+        # is constructed here: the translation has to keep behaving this way
+        # whether or not one happens to be outstanding, and a table with no
+        # partial left must not quietly stop testing it.
         rows = subject.manifest()
-        claim = next(c for c in subject.TABLE if c.status == "partial" and rows[c.id]["phase"] == "clean-provision")
-        entries = subject.lane_scenarios(claim.suite, [{"started_unix_ns": 1, "ended_unix_ns": 2}],
-                                         phase="clean-provision", passed=True, rows=rows)
-        entry = next(e for e in entries if e["id"] == claim.id)
+        self.assertEqual([c.id for c in subject.TABLE if c.status == "partial"], [])
+        field = sorted(rows["docker.engine.info"]["expected"])[0]
+        table = tuple(c for c in subject.TABLE if c.id != "docker.engine.info") + (
+            subject._c("docker.engine.info", "handshake", "run_machine", "partial", (field,)),)
+        with unittest.mock.patch.object(subject, "TABLE", table):
+            entries = subject.lane_scenarios("handshake", [{"started_unix_ns": 1, "ended_unix_ns": 2}],
+                                             phase="clean-provision", passed=True, rows=rows)
+        entry = next(e for e in entries if e["id"] == "docker.engine.info")
         self.assertEqual(entry["status"], "FAIL")
-        for field in claim.unproven:
-            self.assertIn("UNPROVEN expected." + field + " (no assertion in " + claim.suite + ")", entry["assertions"])
+        self.assertIn("UNPROVEN expected." + field + " (no assertion in handshake)", entry["assertions"])
         # The cross-Machine document is cited once for the whole suite.
         self.assertEqual(by_id["docker.engine.info"]["evidence"].count("harness/handshake-cross-machine.json"), 1)
         self.assertEqual(by_id["docker.engine.version"]["readiness_polls"], [])

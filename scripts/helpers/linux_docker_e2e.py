@@ -198,6 +198,13 @@ def preflight(args, require_host=True):
               "recovery": RECOVERY_SCOPE, "all": ALL_SCOPE}
     machines = getattr(args, "machines", len(GATE_MACHINES))
     require(machines in (1, 2, 3), "unsupported Machine selection")
+    # The gate selects both primary Machines before the neighbour's, so a
+    # reduced selection holds one Environment -- and `docker.network.dns` asks
+    # whether a *foreign Environment's* Compose alias is denied, which no such
+    # selection can answer. Say so here rather than let the suite start and
+    # fail two Machines in, and never by quietly proving less.
+    require(machines == len(GATE_MACHINES) or args.suite not in ("compose", "all"),
+            "the compose suite needs two Environments among its Machines, so it requires the full selection")
     scope = scopes[args.suite]
     if machines != len(GATE_MACHINES):
         # Say it in the scope itself: a reduced selection cannot prove the
@@ -215,7 +222,8 @@ def preflight(args, require_host=True):
                  ca_path, REPO / "linux/ca-trust/cacert.pem", REPO / "linux/ca-trust/install.sh",
                  REPO / "linux/ca-trust.py", REPO / "linux/initramfs/init",
                  REPO / "scripts/helpers/linux_docker_image_input.py",
-                 REPO / "scripts/helpers/linux_docker_compose_evidence.py"):
+                 REPO / "scripts/helpers/linux_docker_compose_evidence.py",
+                 REPO / "scripts/helpers/linux_docker_compose_dns.py"):
         info["inputs"][str(path)] = startup.digest(path)
     if composed or args.suite in {"build", "artifacts", "parallel", "ssh", "concurrency"}:
         import linux_docker_buildkit_builder as builder
@@ -624,6 +632,10 @@ class ComposeHarness(startup.Harness):
         self.builders_removed, self.live_cleanup = False, False
         self.registry_controls = None
         self.registry_project = None
+        # Compose DNS boundary: which Machine scopes this run's compose slices
+        # cover, and the shared ordering they pass through.
+        self.compose_scopes = []
+        self.compose_rendezvous = None
         # Concurrent per-Machine slices.
         self.slice_records = []
         self.slice_concurrency_records = {}
@@ -776,6 +788,18 @@ class ComposeHarness(startup.Harness):
         inputs = input_mapping(self, scope, proof, images)
         if suite == "build":
             inputs["builder"] = self.prepare_builder(descriptor).mapping
+        if suite == "compose":
+            # Every other Environment's Compose alias, derived from that
+            # Machine's own admitted run id and scope before either slice runs.
+            # The driver denies them; `verify_dns_boundary` decides afterwards
+            # whether each one was live where it belongs at that instant. A
+            # selection holding one Environment offers a slice nothing, and the
+            # key is then absent so the driver refuses with that cause rather
+            # than with a malformed-input one.
+            from linux_docker_compose_dns import foreign_aliases
+            rows = foreign_aliases(self.info["run_id"], getattr(self, "compose_scopes", []), scope)
+            if rows:
+                inputs["foreign_environments"] = rows
         return inputs
 
     def validate_driver(self, output, inputs, suite=None):
@@ -1106,6 +1130,13 @@ class ComposeHarness(startup.Harness):
         after every slice, however they were scheduled.
         """
         self.active_suite = suite
+        if suite == "compose":
+            # Fixed before any slice runs: which Machine owns which Compose
+            # alias, and the shared ordering that keeps every peer project up
+            # while its alias is being denied elsewhere.
+            from linux_docker_compose_dns import Rendezvous
+            self.compose_scopes = [bindings[machine["machine_id"]][0] for _environment, machine in selected_machines]
+            self.compose_rendezvous = Rendezvous(len(selected_machines)) if len(selected_machines) > 1 else None
         if suite in PARALLEL_SUITES and len(selected_machines) > 1:
             observations = self.run_concurrent_slices(suite, selected_machines, bindings)
         else:
@@ -1175,6 +1206,11 @@ class ComposeHarness(startup.Harness):
                                                              own_exclusion=False)
             except BaseException as error:
                 errors[index] = error
+                # A slice that failed will never reach the next shared point, so
+                # release the peers now instead of making them wait it out.
+                rendezvous = getattr(self, "compose_rendezvous", None)
+                if suite == "compose" and rendezvous is not None:
+                    rendezvous.abort()
             finally:
                 local.record = None
                 rows[index] = {"index": index, "context": names[index],
@@ -1286,7 +1322,8 @@ class ComposeHarness(startup.Harness):
         admitted = driver.Inputs(inputs, suite=suite)
         admitted.verify_runtime_evidence()
         output = self.evidence / (suite + "-machine-" + str(index))
-        selected = driver.Driver(admitted, Path(self.info["fixture"]), output)
+        rendezvous = getattr(self, "compose_rendezvous", None) if suite == "compose" else None
+        selected = driver.Driver(admitted, Path(self.info["fixture"]), output, rendezvous=rendezvous)
         position = self.register_driver(selected)
         with exclusion:
             begin = time.time_ns()
@@ -1325,6 +1362,10 @@ class ComposeHarness(startup.Harness):
             startup.document(self.evidence / "build-cross-machine.json",
                              verify_cache_isolation([row["builder_runtime"] for row in observations],
                                                     [row["scope"] for row in observations]))
+        elif suite == "compose":
+            from linux_docker_compose_dns import verify_dns_boundary
+            startup.document(self.evidence / "compose-cross-machine.json",
+                             verify_dns_boundary(observations, self.info["run_id"]))
         elif suite == "mounts":
             from linux_docker_mounts_machine import verify_machines as verify_volume_isolation
             startup.document(self.evidence / "mounts-cross-machine.json",

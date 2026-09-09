@@ -61,22 +61,23 @@ class ResultSchemaTests(unittest.TestCase):
             with self.subTest(changed=changed), self.assertRaises(Rejected):
                 validate_result(self.result | changed)
 
-    def test_compose_suite_requires_exactly_nine_recipes_and_no_all_alias(self):
+    def test_compose_suite_requires_exactly_ten_recipes_and_no_all_alias(self):
         observations = [{"recipe": recipe, "related_scenario_ids": ["docker.compose.logs" if recipe == "compose-logs" else "docker.compose.up"],
                          "first_command": index * 2 + 1, "last_command": index * 2 + 2,
                          "outcome": "fixture_assertions_passed", "assertions": ["synthetic schema test only"]}
                         for index, recipe in enumerate(COMPOSE_RECIPES)]
         result = self.result | {"suite": "compose", "observations": observations, "command_count": len(observations) * 2}
-        self.assertEqual(len(observations), 9)
+        self.assertEqual(len(observations), 10)
+        self.assertIn("compose-dns-boundary", COMPOSE_RECIPES)
         self.validator.validate(result)
         validate_result(result)
         with self.assertRaises(ValidationError):
-            self.validator.validate(result | {"observations": observations[:-1], "command_count": 16})
+            self.validator.validate(result | {"observations": observations[:-1], "command_count": 18})
         with self.assertRaises(ValidationError):
             self.validator.validate(result | {"suite": "all"})
         union = self.result["observations"] + [x | {"first_command": x["first_command"] + 10, "last_command": x["last_command"] + 10}
                                               for x in observations]
-        combined = self.result | {"suite": "build_compose", "observations": union, "command_count": 28}
+        combined = self.result | {"suite": "build_compose", "observations": union, "command_count": 30}
         self.validator.validate(combined)
         validate_result(combined)
         with self.assertRaises(ValidationError):

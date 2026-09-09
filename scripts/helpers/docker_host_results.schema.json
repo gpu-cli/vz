@@ -38,7 +38,7 @@
         "type": "object", "additionalProperties": false,
         "required": ["recipe", "related_scenario_ids", "first_command", "last_command", "outcome", "assertions"],
         "properties": {
-          "recipe": {"enum": ["build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount", "compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths", "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure"]},
+          "recipe": {"enum": ["build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount", "compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths", "compose-dns-boundary", "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure"]},
           "related_scenario_ids": {"type": "array", "minItems": 1, "uniqueItems": true,
                                    "items": {"type": "string", "pattern": "^docker\\.[a-z_]+\\.[a-z_]+$"}},
           "first_command": {"type": "integer", "minimum": 1},
@@ -94,10 +94,10 @@
     "then": {"properties": {"observations": {"minItems": 5, "maxItems": 5}}}
   }, {
     "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "compose"}}},
-    "then": {"properties": {"observations": {"minItems": 9, "maxItems": 9}}}
+    "then": {"properties": {"observations": {"minItems": 10, "maxItems": 10}}}
   }, {
     "if": {"properties": {"outcome": {"const": "fixture_assertions_passed"}, "suite": {"const": "build_compose"}}},
-    "then": {"properties": {"observations": {"minItems": 14, "maxItems": 14}}}
+    "then": {"properties": {"observations": {"minItems": 15, "maxItems": 15}}}
   }],
   "$defs": {
     "digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

@@ -1036,13 +1036,29 @@ class BuildDispatchTests(unittest.TestCase):
             harness.remove_owned()
         builder.remove_owned.assert_not_called()
 
-    def test_compose_never_provisions_build_builder(self):
+    def test_compose_never_provisions_build_builder_and_carries_foreign_aliases(self):
+        import linux_docker_compose_dns as compose_dns
+        own = {"project_id": "p", "environment_id": "env-a", "machine_id": "m0", "machine_incarnation": "i",
+               "runtime_identity": "r", "docker_context": "c0", "docker_endpoint": "unix:///tmp/a.sock",
+               "engine_id": "e0"}
+        sibling = dict(own, machine_id="m1", docker_context="c1", docker_endpoint="unix:///tmp/b.sock", engine_id="e1")
+        neighbour = dict(sibling, environment_id="env-b", machine_id="m2", docker_context="c2",
+                         docker_endpoint="unix:///tmp/c.sock", engine_id="e2")
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)
-        harness.info = {"suite": "compose"}
+        harness.info = {"suite": "compose", "run_id": "run-abcdefgh"}
         harness.builders = []
+        harness.compose_scopes = [own, sibling, neighbour]
         with patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
-            self.assertEqual(harness.driver_inputs({}, {}, {}, {}), {"scope": "exact"})
+            inputs = harness.driver_inputs({}, own, {}, {})
         self.assertEqual(harness.builders, [])
+        # Only the other Environment, never this Machine's own sibling.
+        self.assertEqual(inputs["foreign_environments"],
+                         [{"environment_id": "env-b", "alias": compose_dns.machine_alias("run-abcdefgh", neighbour)}])
+        # A selection holding one Environment carries no key at all, so the
+        # Driver refuses with that cause instead of proving less.
+        harness.compose_scopes = [own, sibling]
+        with patch.object(gate, "input_mapping", return_value={"scope": "exact"}):
+            self.assertEqual(harness.driver_inputs({}, own, {}, {}), {"scope": "exact"})
 
     def test_replay_dispatch_uses_only_selected_suite_validator(self):
         harness = gate.ComposeHarness.__new__(gate.ComposeHarness)

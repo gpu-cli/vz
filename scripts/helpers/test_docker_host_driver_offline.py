@@ -138,10 +138,10 @@ class BoundaryTests(unittest.TestCase):
 
     def test_driver_union_suite_is_never_named_all(self):
         # The contract's ``all`` is the 63-scenario release lane; the driver's
-        # fourteen-recipe union must not be mistakable for it.
+        # fifteen-recipe union must not be mistakable for it.
         self.assertNotIn("all", driver.SUITE_RECIPES)
         self.assertEqual(driver.SUITE_RECIPES["build_compose"], driver.BUILD_RECIPES + driver.COMPOSE_RECIPES)
-        self.assertEqual(len(driver.SUITE_RECIPES["build_compose"]), 14)
+        self.assertEqual(len(driver.SUITE_RECIPES["build_compose"]), 15)
         self.assertEqual(driver.Inputs(copy.deepcopy(self.raw)).suite, "build_compose")
         with self.assertRaises(driver.Rejected):
             driver.Inputs(copy.deepcopy(self.raw), suite="all")

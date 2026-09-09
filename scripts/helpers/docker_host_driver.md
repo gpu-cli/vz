@@ -54,6 +54,18 @@ Required JSON keys (unknown keys fail):
 | `images` | `base` and `compose`, each `{ "reference": <immutable reference>, "id": <verified sha256 image config ID>, "platform": "linux/arm64" }` |
 | `builder` | Required for `build`/`build_compose`; optional (not null) for `compose`. Exact `name`, `node`, `container_id` and `image_id` of a fresh, already-running owned docker-container buildx builder |
 | `runtime_evidence` | Optional exact `receipt_path`, `receipt_sha256`, `inventory_path`, `inventory_sha256`, `youki_sha256`; required when Engine advertises inert stock runc metadata |
+| `foreign_environments` | Required for any suite that runs the Compose recipes. 1–8 rows of exact `{ "environment_id", "alias" }`, each naming another Environment of the same run and the Compose container name that Environment's own Machine slice will hold live. Never this Machine's Environment or its own alias |
+
+`foreign_environments` fixes those names before any slice runs, from each peer
+Machine's own admitted `run_id` and `scope` (`linux_docker_compose_dns.foreign_aliases`),
+so a slice cannot nominate whichever foreign name happened to suit it. The
+Compose recipes refuse to start without it: `docker.network.dns` asks whether a
+*foreign Environment's* alias is denied, and a slice with no foreign Environment
+cannot answer that. This driver only observes that those names produced no
+address; that each was live where it belongs at that instant is decided across
+slices by `linux_docker_compose_dns.verify_dns_boundary`, which holds every
+denial inside the owning slice's own proof window. A standalone invocation
+therefore has to be given real peers, or it is not running this claim.
 
 `images.base.reference` must be a repository `@sha256:` digest and provide Python
 3 and `/bin/sh`. `images.compose` is built from the fixture `compose/Dockerfile`;
@@ -118,9 +130,9 @@ PYTHONDONTWRITEBYTECODE=1 python3 scripts/helpers/docker_host_driver.py \
 `--suite compose` and `--suite build` select subsets, not release-lane waivers;
 `--suite build_compose` is their union. There is deliberately **no** driver
 suite named `all`: the contract's `all` is the 63-scenario release lane, and a
-green fourteen-recipe driver run must never be mistaken for it. The result
+green fifteen-recipe driver run must never be mistaken for it. The result
 records the selected suite. A successful subset requires exactly its ordered
-inventory: five BuildKit recipes, nine Compose recipes, or all fourteen.
+inventory: five BuildKit recipes, ten Compose recipes, or all fifteen.
 Every successful recipe must have a nonempty, non-overlapping command range
 within `1..command_count`; unexecuted, missing, extra or duplicate recipes cannot
 pass. These inventories do not replace the full 63-scenario release contract.
@@ -148,6 +160,30 @@ Only an exact expected-negative semantic proof can write a separate durable
 The terminal receipt itself retains its original uncertainty; consumers must
 verify the acknowledgement and replay its proof, never treat host exit alone as
 daemon-side quiescence.
+
+The `compose-dns-boundary` recipe runs on the healthy project, straight after
+`compose-network-paths`, and asks names rather than opening connections: each
+probe is a bounded `getaddrinfo` inside an exact owned container, so a record
+that outlived its container cannot read as a denial by timing out on connect,
+and an absent name cannot read as a reachable but silent address. Every denial
+is taken between two proofs of the positive it is supposed to contradict.
+
+* *Foreign Environment.* The Compose container names other Environments of this
+  run hold live produce no address here, asked between two rounds in which this
+  Machine's own `api` alias and `<project>-api-1` name resolve to exactly the
+  `api` endpoint. Each denial's timestamp and each slice's own window go into
+  the result; `verify_dns_boundary` requires every denial to fall inside the
+  window of the slice that owns the denied name, which is what a peer that was
+  never running would fail. When the harness supplies a rendezvous, all slices
+  hold at the same four points, so that containment is arranged rather than
+  hoped for.
+* *Stale alias.* `compose rm --stop --force api` removes the alias owner, its
+  absence is proven by an exact `container inspect` miss, and the same container
+  then gets no address for either `api` or `<project>-api-1` while still
+  resolving `worker` -- so the denial is about the removed service and not about
+  a resolver that stopped answering. `compose up` recreates the service under
+  the same Compose name with a new identity, the other three containers keep
+  theirs, and both names answer again at the replacement's address.
 
 The `compose-logs` recipe runs immediately after the healthy up, when every
 container holds exactly one startup sequence, and mutates nothing. It re-inspects

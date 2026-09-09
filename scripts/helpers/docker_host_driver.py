@@ -40,10 +40,11 @@ import linux_docker_artifact_layout as layout
 MAX_STREAM_BYTES = 4 * 1024 * 1024
 BUILD_RECIPES = ("build-multi-stage", "build-cache-reuse", "build-arguments", "build-cache-mount", "build-secret-mount")
 COMPOSE_RECIPES = ("compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths",
-                   "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure")
+                   "compose-dns-boundary", "compose-volume-persistence", "compose-scale", "compose-blocked-health",
+                   "compose-failure")
 # The driver-level combined suite is deliberately NOT called ``all``: the
 # contract's ``all`` means the 63-scenario release lane, which this DEV runner
-# can never satisfy. A green ``build_compose`` run is fourteen fixture recipes.
+# can never satisfy. A green ``build_compose`` run is fifteen fixture recipes.
 SUITE_RECIPES = {"build": BUILD_RECIPES, "compose": COMPOSE_RECIPES, "build_compose": BUILD_RECIPES + COMPOSE_RECIPES}
 # Compose operations here are gated by the fixture's own health intervals and by
 # `--wait-timeout 30`, so their duration is a property of the fixture, not of the
@@ -62,6 +63,42 @@ COMPOSE_UP = ["up", "--detach", "--no-build", "--pull", "never", "--wait", "--wa
 OCI_OPTIONS = ",tar=false,oci-mediatypes=true,compression=gzip,force-compression=true"
 OCI_FLAGS = ["--provenance=false", "--sbom=false"]
 COMPOSE_LOGS = ["logs", "--no-color"]
+# One bounded DNS resolution, run inside an exact owned container and printed as
+# canonical JSON. Resolution only: it opens no socket, so an absent name can
+# never be confused with a reachable-but-silent address, and a record that
+# outlived its container cannot pass as a denial by timing out on connect. Both
+# this driver and the independent replay state this program; if they disagree
+# the recorded argv does not match and the evidence is rejected.
+RESOLVE = """import json, signal, socket, sys
+
+def expired(_signal, _frame):
+    raise TimeoutError("resolution deadline")
+
+row = {"schema_version": 1, "name": sys.argv[1], "outcome": "deadline",
+       "addresses": [], "errno": None, "exception": None}
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(20)
+try:
+    row["addresses"] = sorted({info[4][0] for info in socket.getaddrinfo(
+        sys.argv[1], 8080, socket.AF_INET, socket.SOCK_STREAM)})
+    row["outcome"] = "resolved"
+except socket.gaierror as error:
+    row["outcome"] = "unresolved"
+    row["errno"] = error.errno if type(error.errno) is int else None
+    row["exception"] = type(error).__name__[:64]
+except TimeoutError as error:
+    row["exception"] = type(error).__name__[:64]
+finally:
+    signal.alarm(0)
+sys.stdout.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\\n")
+"""
+# The Compose service whose alias this lane removes and restores, and the exact
+# container name Compose gives it in a project.
+DNS_ROLE = "api"
+DNS_SUFFIX = "-compose-" + DNS_ROLE + "-1"
+# glibc EAI_NONAME/EAI_AGAIN/EAI_FAIL/EAI_NODATA: every one of them is "this
+# name produced no address", which is the only thing a denial may mean here.
+RESOLUTION_DENIED_ERRNO = frozenset({-2, -3, -4, -5})
 COMPOSE_LOG_LINE = re.compile(rb"([^\s|]+) +\| (.*)")
 COMPOSE_GLOBAL_OPTIONS = {"--project-name", "--file", "--profile"}
 
@@ -133,6 +170,17 @@ def digest(value: Any) -> str:
     return checked_text(value, r"[0-9a-f]{64}", "SHA-256")
 
 
+def owner_token(run_id: str, scope: dict[str, str]) -> str:
+    """The fixture owner token a Machine slice derives from its own admitted inputs.
+
+    A caller that has to name another Machine's Compose project -- the foreign
+    Environment aliases the DNS boundary is asserted against -- derives it here
+    rather than reading it back out of that Machine's evidence, so the name is
+    fixed before either slice runs.
+    """
+    return "vz04-" + sha256(json.dumps([run_id, scope], sort_keys=True).encode())[:24]
+
+
 def absolute(value: Any) -> Path:
     require(isinstance(value, str) and Path(value).is_absolute(), "absolute path required")
     path = Path(value)
@@ -154,7 +202,7 @@ class Inputs:
         required = {"schema_version", "run_id", "release_sha256", "fixture_sha256",
                     "scope", "docker_config", "clients", "images"}
         require(self.suite in SUITE_RECIPES, "unknown input suite")
-        optional = {"runtime_evidence"}
+        optional = {"runtime_evidence", "foreign_environments"}
         if self.suite == "compose":
             optional.add("builder")
         else:
@@ -207,6 +255,28 @@ class Inputs:
                 checked_text(builder[key], r"[a-z0-9][a-z0-9-]{0,62}", "owned builder name")
             checked_text(builder["container_id"], r"[0-9a-f]{64}", "builder container ID")
             checked_text(builder["image_id"], r"sha256:[0-9a-f]{64}", "builder image ID")
+        if "foreign_environments" in self.raw:
+            # Live Compose aliases owned by *other* Environments of this run.
+            # This slice only denies them. That each one actually resolved in
+            # the Environment that owns it, at the moment it was denied here,
+            # is a cross-Machine claim decided from every slice's evidence
+            # together -- a denial on its own would be satisfied by a peer that
+            # was never running.
+            rows = self.raw["foreign_environments"]
+            require(isinstance(rows, list) and 1 <= len(rows) <= 8,
+                    "bounded non-empty foreign Environment aliases required")
+            aliases = set()
+            for row in rows:
+                require(isinstance(row, dict) and set(row) == {"environment_id", "alias"},
+                        "exact foreign Environment alias fields required")
+                checked_text(row["alias"], r"[a-z0-9][a-z0-9-]{0,126}", "foreign Compose alias")
+                checked_text(row["environment_id"], r"[^\s\x00-\x1f]{1,256}", "foreign environment id")
+                require(row["environment_id"] != scope["environment_id"],
+                        "a foreign alias must name an Environment other than this Machine's")
+                require(row["alias"] not in aliases, "duplicate foreign Environment alias")
+                aliases.add(row["alias"])
+            require(owner_token(self.raw["run_id"], scope) + DNS_SUFFIX not in aliases,
+                    "this Machine's own Compose alias cannot be one of its foreign aliases")
         if "runtime_evidence" in self.raw:
             proof = self.raw["runtime_evidence"]
             require(isinstance(proof, dict) and set(proof) == {
@@ -224,8 +294,7 @@ class Inputs:
 
     @property
     def owner(self) -> str:
-        material = json.dumps([self.raw["run_id"], self.scope], sort_keys=True).encode()
-        return "vz04-" + sha256(material)[:24]
+        return owner_token(self.raw["run_id"], self.scope)
 
     def verify_runtime_evidence(self) -> dict[str, Any] | None:
         """Recheck parent-authenticated startup receipts, not a live cache audit."""
@@ -636,9 +705,14 @@ class Recorder:
 
 
 class Driver:
-    def __init__(self, inputs: Inputs, fixture: Path, output: Path):
+    def __init__(self, inputs: Inputs, fixture: Path, output: Path, *, rendezvous: Any = None):
         require(sys.platform == "darwin" and os.uname().machine == "arm64", "this DEV runner requires Apple-silicon macOS")
         self.inputs, self.fixture, self.output = inputs, fixture, output
+        # Optional: the object every concurrently running Machine slice of this
+        # run shares, so the foreign-alias denial below happens while every peer
+        # project is up. It only makes the window reliable; the window itself is
+        # still proven from the recorded timestamps, never assumed.
+        self.rendezvous_point = rendezvous
         require(tree_digest(fixture) == inputs.raw["fixture_sha256"], "fixture tree digest mismatch")
         require(not output.exists() and output.is_absolute(), "fresh absolute output directory required")
         require(output.parent == output.parent.resolve(), "output ancestor symlink rejected")
@@ -1000,6 +1074,26 @@ class Driver:
         self.guard()
         return self.command(["exec", item["Id"], *args], expected=expected)
 
+    def rendezvous(self, label: str) -> None:
+        """Hold here until every Machine slice of this run reaches the same point."""
+        if self.rendezvous_point is not None:
+            self.rendezvous_point.wait(label)
+
+    def resolve_name(self, item: dict[str, Any], name: str) -> dict[str, Any]:
+        """One bounded DNS resolution, made from inside an exact owned container."""
+        row = json.loads(self.exec_container(item, ["python3", "-c", RESOLVE, name]).stdout)
+        require(isinstance(row, dict) and set(row) == {"schema_version", "name", "addresses",
+                                                       "outcome", "errno", "exception"} and
+                row["schema_version"] == 1 and row["name"] == name and
+                row["outcome"] in {"resolved", "unresolved", "deadline"} and
+                isinstance(row["addresses"], list) and
+                all(isinstance(value, str) and value for value in row["addresses"]) and
+                (row["errno"] is None or type(row["errno"]) is int) and
+                (row["exception"] is None or (isinstance(row["exception"], str) and
+                                              0 < len(row["exception"]) <= 64)),
+                "malformed container DNS observation for " + name)
+        return row
+
     def persisted_digest(self, container, read) -> str:
         """SHA-256 of the volume's service-written state, digested on the host.
 
@@ -1011,6 +1105,90 @@ class Driver:
         data = self.exec_container(container, read).stdout
         require(data, "persisted state is empty")
         return sha256(data)
+
+    def dns_boundary(self, project: str) -> list[str]:
+        """Two DNS denials, each held against the positive that makes it mean something.
+
+        *Foreign Environment*: the exact Compose alias another Environment of
+        this run declares does not resolve here. On its own that is satisfied by
+        a peer that never started, so the denial is taken between two proofs
+        that this Machine's own equivalent alias resolves, and the peer's own
+        slice proves the same for its alias on both sides of the same instant
+        (`linux_docker_compose_dns.verify_dns_boundary` decides that from the
+        recorded timestamps of every slice; the shared rendezvous only makes the
+        window reliable).
+
+        *Stale alias*: the alias answers, its container is removed, and the same
+        container asks again and gets nothing -- while a live control name in
+        that same container still resolves, so the second answer is about the
+        removed service and not about a resolver that stopped working. The
+        service is then recreated and both names answer again, at the
+        replacement's address.
+
+        Resolution here is resolution only: no socket is opened, so a record
+        that outlived its container cannot be mistaken for a denial by timing
+        out on connect.
+        """
+        inventory = self.capture(project)
+        services = {role: items[0] for role, items in self.by_service(inventory).items()}
+        require(set(services) == {"db", "api", "worker", "isolated"}, "the DNS boundary needs the exact ready project")
+        frontend = project + "_frontend"
+        worker, api = services["worker"], services[DNS_ROLE]
+        api_address = api["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+        worker_address = worker["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+        own = project + "-" + DNS_ROLE + "-1"
+        require(api["Name"] == "/" + own and own == self.inputs.owner + DNS_SUFFIX,
+                "the alias under test is not this project's exact Compose container name")
+        require(api_address and worker_address and api_address != worker_address,
+                "distinct source and destination frontend addresses required")
+        foreign = self.inputs.raw["foreign_environments"]
+
+        def own_names() -> None:
+            """This Environment's own declared names, asked from this very container."""
+            for name, address in ((DNS_ROLE, api_address), (own, api_address), ("worker", worker_address)):
+                assert_resolved(self.resolve_name(worker, name), name, [address])
+
+        self.rendezvous("compose-dns-live")
+        own_names()
+        self.rendezvous("compose-dns-probe")
+        for entry in foreign:
+            assert_unresolved(self.resolve_name(worker, entry["alias"]), entry["alias"])
+        self.rendezvous("compose-dns-denied")
+        own_names()
+        self.rendezvous("compose-dns-bracket")
+
+        removed = api["Id"]
+        self.compose(project, ["rm", "--stop", "--force", DNS_ROLE], timeout=COMPOSE_DEADLINE)
+        missing = self.command(["container", "inspect", removed], expected=1)
+        require(json.loads(missing.stdout) == [] and missing.stderr.decode().strip() in {
+            "Error response from daemon: No such container: " + removed,
+            "Error: No such container: " + removed,
+            "Error: No such object: " + removed}, "the removed alias owner's absence was not proven")
+        for name in (DNS_ROLE, own):
+            assert_unresolved(self.resolve_name(worker, name), name)
+        assert_resolved(self.resolve_name(worker, "worker"), "worker", [worker_address])
+        self.compose(project, COMPOSE_UP, timeout=COMPOSE_DEADLINE)
+        restored = {role: items[0] for role, items in self.by_service(self.capture(project)).items()}
+        require(set(restored) == {"db", "api", "worker", "isolated"}, "the recreated project is not the exact fixture")
+        require(restored[DNS_ROLE]["Id"] != removed and restored[DNS_ROLE]["Name"] == "/" + own,
+                "the removed service was not replaced under the same Compose name")
+        require(all(restored[role]["Id"] == services[role]["Id"] for role in ("db", "worker", "isolated")),
+                "removing one service replaced a container it does not own")
+        require(all(item["State"]["Running"] is True and
+                    item["State"].get("Health", {}).get("Status") == "healthy" for item in restored.values()),
+                "the project is not healthy again after the alias owner was recreated")
+        replacement = restored[DNS_ROLE]["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+        require(replacement, "the replacement service has no frontend address")
+        for name in (DNS_ROLE, own):
+            assert_resolved(self.resolve_name(worker, name), name, [replacement])
+        return ["declared alias " + DNS_ROLE + " and Compose container name " + own +
+                " resolved to exactly " + api_address + " before and after every foreign probe",
+                "foreign Environment Compose aliases produced no address: " +
+                json.dumps(sorted(entry["alias"] for entry in foreign), separators=(",", ":")) +
+                " over " + str(len({entry["environment_id"] for entry in foreign})) + " foreign Environment(s)",
+                "removing the alias owner left " + DNS_ROLE + " and " + own +
+                " unresolvable in the same container that still resolved worker at " + worker_address,
+                "recreating the service restored both names, at the replacement address " + replacement]
 
     def volume_persistence(self, project: str) -> list[str]:
         before = self.capture(project)
@@ -1114,6 +1292,13 @@ class Driver:
         return {"services": sorted(services), "edges": sorted(edges), "image": image}
 
     def compose_workloads(self) -> None:
+        # `docker.network.dns` asks whether a *foreign Environment's* alias is
+        # denied. A slice with no foreign Environment to be denied by cannot
+        # answer that, and a subset that quietly skipped the question would
+        # report the same green result as one that answered it, so the recipes
+        # refuse to start rather than prove less than they claim.
+        require(self.inputs.raw.get("foreign_environments"),
+                "the Compose subset requires at least one live foreign Environment alias")
         project = self.new_project("compose")
         started = str(int(time.time()))
 
@@ -1222,6 +1407,8 @@ class Driver:
                     "forbidden paths denied by DNS name and every inspected destination IP"]
 
         self.observe("compose-network-paths", ["docker.compose.networks"], networks)
+
+        self.observe("compose-dns-boundary", ["docker.network.dns"], lambda: self.dns_boundary(project))
 
         self.observe("compose-volume-persistence", ["docker.compose.volumes"], lambda: self.volume_persistence(project))
 
@@ -1561,6 +1748,20 @@ def assert_transport_denied(command: Command, url: str, *, dns_name: bool) -> No
             row["outcome"] in ({"timeout", "network_unreachable", "connection_refused", "dns_failure"} if dns_name else
                                {"timeout", "network_unreachable", "connection_refused"}),
             "HTTP/application errors and unclassified observations are not isolation evidence")
+
+
+def assert_resolved(row: dict[str, Any], name: str, addresses: list[str]) -> None:
+    """A name answered with exactly the addresses its owner is known to hold."""
+    require(row["outcome"] == "resolved" and row["name"] == name and row["addresses"] and
+            row["addresses"] == sorted(addresses) and row["errno"] is None and row["exception"] is None,
+            "name did not resolve to its exact container address: " + name)
+
+
+def assert_unresolved(row: dict[str, Any], name: str) -> None:
+    """A name produced no address at all -- not a refused or slow connection."""
+    require(row["outcome"] == "unresolved" and row["name"] == name and row["addresses"] == [] and
+            row["exception"] == "gaierror" and row["errno"] in RESOLUTION_DENIED_ERRNO,
+            "name resolution was not an address-free denial: " + name)
 
 
 def assert_blocked_events(events: list[dict[str, Any]], ids: dict[str, str], project: str) -> None:
@@ -1982,7 +2183,7 @@ def main() -> int:
     parser.add_argument("--fixture", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True, help="fresh absolute private evidence directory")
     parser.add_argument("--suite", choices=("compose", "build", "build_compose"), required=True,
-                        help="fixture recipe subset; build_compose is the driver's fourteen-recipe union, never the contract's 63-scenario all")
+                        help="fixture recipe subset; build_compose is the driver's fifteen-recipe union, never the contract's 63-scenario all")
     args = parser.parse_args()
     try:
         inputs = Inputs(json.loads(regular(args.inputs)), suite=args.suite)

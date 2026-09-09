@@ -15,13 +15,15 @@ import stat
 
 RECIPES = (
     "compose-create", "compose-up-order", "compose-logs", "compose-exec", "compose-network-paths",
-    "compose-volume-persistence", "compose-scale", "compose-blocked-health", "compose-failure",
+    "compose-dns-boundary", "compose-volume-persistence", "compose-scale", "compose-blocked-health",
+    "compose-failure",
 )
 RELATED = (
     ["docker.compose.create"],
     ["docker.compose.up", "docker.compose.dependency_ordering", "docker.compose.health_ordering"],
     ["docker.compose.logs"],
-    ["docker.compose.exec"], ["docker.compose.networks"], ["docker.compose.volumes"],
+    ["docker.compose.exec"], ["docker.compose.networks"], ["docker.network.dns"],
+    ["docker.compose.volumes"],
     ["docker.compose.scaling"], ["docker.compose.health_ordering"], ["docker.compose.failure_propagation"],
 )
 ROLES = {"db", "api", "worker", "isolated"}
@@ -41,6 +43,36 @@ WRITE = "import os,sys;f=open(sys.argv[1],'xb');f.write(sys.argv[2].encode());f.
 # `restart_data_sha256` independently of the driver that recorded the evidence.
 SENTINEL = "/data/sentinel.txt"
 PERSISTED = "vz04|db|{owner}|persisted\n"
+# The DNS-boundary contract, restated here so the replay checks the recorded
+# probes against what the claim requires rather than against the driver that
+# recorded them. The program is resolution only -- it opens no socket -- so a
+# record that outlived its container cannot read as a denial by connect timeout.
+DNS_ROLE = "api"
+DNS_SUFFIX = "-compose-" + DNS_ROLE + "-1"
+DENIED_ERRNO = frozenset({-2, -3, -4, -5})
+RESOLVE = """import json, signal, socket, sys
+
+def expired(_signal, _frame):
+    raise TimeoutError("resolution deadline")
+
+row = {"schema_version": 1, "name": sys.argv[1], "outcome": "deadline",
+       "addresses": [], "errno": None, "exception": None}
+signal.signal(signal.SIGALRM, expired)
+signal.alarm(20)
+try:
+    row["addresses"] = sorted({info[4][0] for info in socket.getaddrinfo(
+        sys.argv[1], 8080, socket.AF_INET, socket.SOCK_STREAM)})
+    row["outcome"] = "resolved"
+except socket.gaierror as error:
+    row["outcome"] = "unresolved"
+    row["errno"] = error.errno if type(error.errno) is int else None
+    row["exception"] = type(error).__name__[:64]
+except TimeoutError as error:
+    row["exception"] = type(error).__name__[:64]
+finally:
+    signal.alarm(0)
+sys.stdout.write(json.dumps(row, sort_keys=True, separators=(",", ":")) + "\\n")
+"""
 MAX = 4 * 1024 * 1024
 
 
@@ -230,6 +262,7 @@ class Replay:
         self.scope = inputs["scope"]
         self.owner = "vz04-" + sha(json.dumps([inputs["run_id"], self.scope], sort_keys=True).encode())[:24]
         self.projects, self.rows, self.acknowledged = {}, [], set()
+        self.dns = None
         self.i = 0
         count = result["command_count"]
         require(type(count) is int and 1 <= count <= 3000, "invalid command inventory")
@@ -515,6 +548,7 @@ class Replay:
             require(row["_stdout"] == f"vz04|api|{self.owner}|exec-stdout\n".encode()
                     and row["_stderr"] == f"vz04|api|{self.owner}|exec-stderr\n".encode(), "exec stream mismatch")
         self.networks(project)
+        self.dns_boundary(project)
         self.persistence(project)
         self.scale(project)
         with self.observation("compose-blocked-health"):
@@ -574,9 +608,11 @@ class Replay:
                 "unrelated-resource witness receipt differs from the independent replay")
         require(self.result["owned_projects"] == {p: {k: sorted(v) for k, v in kinds.items()} for p, kinds in self.projects.items()}, "owned resource receipt mismatch")
         require(self.acknowledged == {row["index"] for row in self.rows if row["effects_uncertain"]}, "unreconciled or extra negative mutation")
+        require(self.dns is not None, "the replay produced no DNS-boundary evidence")
         return {"schema_version": 1, "kind": "installed_compose_raw_evidence", "outcome": "fixture_assertions_passed",
                 "scope": self.scope, "recipes_validated": list(RECIPES), "command_count": self.i,
                 "owned_projects": self.result["owned_projects"], "compatibility_certified": False,
+                "dns_boundary": self.dns,
                 "release_scenarios_passed": []}
 
     def logs(self, project, row, containers):
@@ -635,6 +671,113 @@ class Replay:
                     require(value["exception"] in classes and value["errno"] in numbers,
                             "network outcome does not match observed Linux exception/errno")
                     controls()
+
+    def resolve(self, item, name):
+        """One recorded in-container DNS resolution, decoded and shape-checked."""
+        row = self.execute(item, ["python3", "-c", RESOLVE, name])
+        value = decode(row["_stdout"])
+        require(not row["_stderr"] and set(value) == {"schema_version", "name", "addresses", "outcome",
+                                                      "errno", "exception"} and
+                value["schema_version"] == 1 and value["name"] == name and
+                value["outcome"] in {"resolved", "unresolved", "deadline"} and
+                isinstance(value["addresses"], list) and
+                all(isinstance(address, str) and address for address in value["addresses"]),
+                "malformed recorded DNS observation for " + name)
+        return value, row
+
+    def dns_boundary(self, project):
+        """Replay both DNS denials and the positives that keep them from being vacuous.
+
+        The foreign half is only half decidable here: this slice can show that a
+        name produced no address, but not that the Environment owning it was
+        live at that instant. So the bracketing timestamps are carried out to
+        `linux_docker_compose_dns.verify_dns_boundary`, which holds each denial
+        against the owning slice's own proof window.
+        """
+        with self.observation("compose-dns-boundary"):
+            services = {role: values[0] for role, values in self.services(self.inventory(project)).items()}
+            frontend = project + "_frontend"
+            worker, api = services["worker"], services[DNS_ROLE]
+            api_address = api["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+            worker_address = worker["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+            own = project + "-" + DNS_ROLE + "-1"
+            require(api["Name"] == "/" + own and own == self.owner + DNS_SUFFIX,
+                    "the alias under test is not this project's exact Compose container name")
+            require(api_address and worker_address and api_address != worker_address,
+                    "distinct source and destination frontend addresses required")
+            foreign = self.inputs.get("foreign_environments")
+            require(isinstance(foreign, list) and foreign, "the replayed subset declares no foreign Environment alias")
+
+            def own_names():
+                rows = []
+                for name, address in ((DNS_ROLE, api_address), (own, api_address), ("worker", worker_address)):
+                    value, row = self.resolve(worker, name)
+                    require(value["outcome"] == "resolved" and value["addresses"] == [address] and
+                            value["errno"] is None and value["exception"] is None,
+                            "a declared name did not resolve to its exact container address: " + name)
+                    rows.append(row)
+                return rows
+
+            def denied(value, name):
+                require(value["outcome"] == "unresolved" and value["addresses"] == [] and
+                        value["exception"] == "gaierror" and value["errno"] in DENIED_ERRNO,
+                        "name resolution was not an address-free denial: " + name)
+
+            before = own_names()
+            denials = []
+            for entry in foreign:
+                require(isinstance(entry, dict) and set(entry) == {"environment_id", "alias"},
+                        "exact foreign Environment alias fields required")
+                require(entry["alias"] != own, "a foreign alias must not be this slice's own alias")
+                value, row = self.resolve(worker, entry["alias"])
+                denied(value, entry["alias"])
+                denials.append({"alias": entry["alias"], "environment_id": entry["environment_id"],
+                                "at_unix_ns": row["started_unix_ns"]})
+            after = own_names()
+            window = (before[-1]["started_unix_ns"] + before[-1]["elapsed_ns"], after[0]["started_unix_ns"])
+            require(window[0] <= window[1], "the local proof window closed before it opened")
+            require(all(window[0] <= entry["at_unix_ns"] <= window[1] for entry in denials),
+                    "a foreign denial fell outside this slice's own proof of the same name shape")
+
+            # Stale alias: remove the owner, ask again from the same container,
+            # and keep a live control name in the same probe sequence.
+            removed = api["Id"]
+            self.compose(project, ["rm", "--stop", "--force", DNS_ROLE])
+            row = self.take(["container", "inspect", removed], code=1)
+            require(decode(row["_stdout"]) == [] and row["_stderr"].strip() in {
+                f"Error response from daemon: No such container: {removed}".encode(),
+                f"Error: No such container: {removed}".encode(),
+                f"Error: No such object: {removed}".encode()},
+                "the removed alias owner's absence was not proven")
+            for name in (DNS_ROLE, own):
+                value, _row = self.resolve(worker, name)
+                denied(value, name)
+            control, _row = self.resolve(worker, "worker")
+            require(control["outcome"] == "resolved" and control["addresses"] == [worker_address],
+                    "the live control name did not resolve, so the denial above proves nothing about the removal")
+            self.compose(project, UP)
+            restored = {role: values[0] for role, values in self.services(self.inventory(project)).items()}
+            require(restored[DNS_ROLE]["Id"] != removed and restored[DNS_ROLE]["Name"] == "/" + own,
+                    "the removed service was not replaced under the same Compose name")
+            require(all(restored[role]["Id"] == services[role]["Id"] for role in ("db", "worker", "isolated")),
+                    "removing one service replaced a container it does not own")
+            require(all(item["State"]["Running"] is True and
+                        item["State"].get("Health", {}).get("Status") == "healthy"
+                        for item in restored.values()),
+                    "the project is not healthy again after the alias owner was recreated")
+            replacement = restored[DNS_ROLE]["NetworkSettings"]["Networks"][frontend]["IPAddress"]
+            require(replacement, "the replacement service has no frontend address")
+            for name in (DNS_ROLE, own):
+                value, _row = self.resolve(worker, name)
+                require(value["outcome"] == "resolved" and value["addresses"] == [replacement],
+                        "the recreated service did not restore its name: " + name)
+            self.dns = {"schema_version": 1, "own_alias": own, "own_address": api_address,
+                        "resolved_from_unix_ns": window[0], "resolved_until_unix_ns": window[1],
+                        "local_resolutions": len(before) + len(after), "foreign_denials": denials,
+                        "stale": {"removed_container": removed, "replacement_container": restored[DNS_ROLE]["Id"],
+                                  "names_unresolved_after_remove": [DNS_ROLE, own],
+                                  "control_name_resolved": "worker",
+                                  "names_restored_at": replacement}}
 
     def configuration(self, project):
         """Replay `compose config`: the resolved services and their dependency edges."""
