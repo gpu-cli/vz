@@ -477,10 +477,14 @@ class CriterionFiveCrossingTests(unittest.TestCase):
         """A release dir carrying only the catalog these definitions read."""
         release = root / "release"
         release.mkdir(parents=True, exist_ok=True)
+        # The macOS entry is the shape `vz-macos-setup` actually registers:
+        # image/version/channels naming a template bundle, with no `profile`
+        # and no `digest`. An earlier fixture invented those two fields and the
+        # helper agreed with the fixture rather than with a real catalog.
         catalog = {"linux": [{"profile": "developer", "image": "vz-linux",
                               "digest": "sha256:" + "a" * 64}],
-                   "macos": ([{"profile": "developer", "image": "vz-macos",
-                               "digest": "sha256:" + "b" * 64, "channels": ["xcode"]}] if macos else [])}
+                   "macos": ([{"image": "vz-macos", "version": "26.3.1",
+                               "channels": ["latest", "xcode"]}] if macos else [])}
         (release / "machine-target-catalog.json").write_text(json.dumps(catalog))
         return release
 

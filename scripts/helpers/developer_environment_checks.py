@@ -865,6 +865,11 @@ def two_machine_definition(release_dir: Path) -> dict:
     return definition
 
 
+# Criterion 4 needs the Swift toolchain, so the crossing resolves the xcode
+# channel rather than `latest`, which may point at a clean template.
+MACOS_CHANNEL = "xcode"
+
+
 def macos_target(release_dir: Path):
     """The Developer macOS target this release registers, or None.
 
@@ -881,8 +886,15 @@ def macos_target(release_dir: Path):
     entries = catalog.get("macos")
     if not isinstance(entries, list):
         return None
+    # A macOS catalog entry is shaped unlike a Linux one: it carries `image`,
+    # `version` and `channels` naming a registered template bundle, and no
+    # `profile` or `digest` at all. `TargetSpec.digest` is optional precisely so
+    # a native target can be resolved by image/version/channel instead.
     for entry in entries:
-        if isinstance(entry, dict) and entry.get("profile") == "developer" and entry.get("digest"):
+        if not isinstance(entry, dict) or entry.get("image") != "vz-macos":
+            continue
+        channels = entry.get("channels")
+        if isinstance(channels, list) and MACOS_CHANNEL in channels:
             return entry
     return None
 
@@ -901,9 +913,12 @@ def crossing_definition(release_dir: Path, macos_entry: dict) -> dict:
     """
     definition = two_machine_definition(release_dir)
     environment = definition["environment"]
+    target = {"os": "macos", "arch": "aarch64", "image": macos_entry["image"],
+              "channel": MACOS_CHANNEL}
+    if macos_entry.get("version"):
+        target["version"] = macos_entry["version"]
     native = {"schema_version": 1, "name": "machine-mac", "profile": "developer",
-              "target": {"os": "macos", "arch": "aarch64",
-                         "image": macos_entry["image"], "digest": macos_entry["digest"]},
+              "target": target,
               "resources": {"cpus": 2, "memory_mb": 4096},
               "networks": [PRIVATE_NETWORK]}
     environment["machines"] = [*environment["machines"], native]

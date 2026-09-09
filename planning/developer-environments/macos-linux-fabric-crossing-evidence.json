@@ -1,0 +1,59 @@
+{
+ "schema_version": 1,
+ "scope": "INSTALLED_LINUX_MACOS_FABRIC_CROSSING",
+ "passed": true,
+ "aggregate_release_certified": false,
+ "recorded_at": "2026-09-09T15:53:06.901344+00:00",
+ "implementation_commit": "221e3f607b58487699fc3b8ae79583dcae8e1b75",
+ "criterion": "GOAL-0.4.0.md criterion 5: at least one required service path crosses between a Linux Machine and a native macOS Machine in both directions permitted by its declarations",
+ "environment": {
+  "machines": [
+   {
+    "name": "machine-0",
+    "target_os": "linux",
+    "profile": "developer",
+    "fabric_interface": "eth1",
+    "fabric_ipv4": "10.85.187.218"
+   },
+   {
+    "name": "machine-1",
+    "target_os": "linux",
+    "profile": "developer",
+    "fabric_interface": "eth1",
+    "fabric_ipv4": "10.85.187.53"
+   },
+   {
+    "name": "machine-mac",
+    "target_os": "macos",
+    "profile": "developer",
+    "fabric_interface": "en1",
+    "fabric_ipv4": "10.85.187.215",
+    "fabric_mac": "72:38:8c:71:14:00"
+   }
+  ],
+  "network": {
+   "name": "backend",
+   "kind": "private",
+   "prefix": 24
+  }
+ },
+ "crossing": {
+  "linux_to_macos": {
+   "from": "machine-0",
+   "to": "10.85.187.215:7777",
+   "observed": "MACSERVED",
+   "passed": true
+  },
+  "macos_to_linux": {
+   "from": "machine-mac",
+   "to": "10.85.187.218:7778",
+   "observed": "LINUXSERVED",
+   "passed": true
+  }
+ },
+ "notes": [
+  "The macOS guest was addressed by native_macos::fabric over the vsock agent channel, which matches the interface by MAC and applies the IPv4 the fabric plan derived. macOS has no kernel-cmdline hook, and there is deliberately no DHCP, so this is the only channel that exists before a Machine has an address. This is the first successful execution of that path.",
+  "All three Machines hold addresses on one derived /24; the target OS is not an input to any address derivation.",
+  "NOT a gate row. check_private_topology_paths does not yet drive this crossing itself, and the topology lane credits nothing until every sub-check passes."
+ ]
+}
