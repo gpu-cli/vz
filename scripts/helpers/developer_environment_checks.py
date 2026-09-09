@@ -1452,6 +1452,15 @@ CACHE_WRITES = 8
 BARRIER_ATTEMPTS = 60
 BARRIER_INTERVAL = 0.5
 CONSISTENCY_POLL_INTERVAL = 0.1
+# How long the held writer is given to finish once its peer has. This is a
+# liveness bound on the exec, deliberately not the consistency bound: it is
+# waited out by asking that Machine about a file IT wrote, so no cross-Machine
+# visibility is involved and the declared staleness bound is not being spent
+# here. Releasing a still-running writer would SIGTERM it mid-write, which is
+# how this check first came to fail intermittently for a reason that had
+# nothing to do with the storage policy.
+WRITER_COMPLETION_ATTEMPTS = 60
+WRITER_COMPLETION_INTERVAL = 0.5
 # Host-side seed content, written into the worktree before Up so every read
 # below has something to observe that this check did not write from inside.
 SEED = b"seed written on the host before Up\n"
@@ -1799,6 +1808,7 @@ def check_workspace_projection_policy(ctx: CheckContext, top: str) -> SubCheck:
         writer = hold_machine_exec(ctx, check, "storage-cache-write-0", inside, "machine-0",
                                    cache_writer_script("machine-0", "machine-1"),
                                    timeout=BARRIER_ATTEMPTS * 2)
+        finished = False
         try:
             peer = machine_exec(ctx, check, "storage-cache-write-1", inside, "machine-1",
                                 cache_writer_script("machine-1", "machine-0"),
@@ -1806,10 +1816,28 @@ def check_workspace_projection_policy(ctx: CheckContext, top: str) -> SubCheck:
             check.check(peer.exit_code == 0,
                         f"machine-1's concurrent cache writer completed (exit {peer.exit_code}); "
                         "exit 3 means it never saw machine-0 start, so the two never overlapped")
+            # machine-1 returning does not mean machine-0 has finished: it was
+            # released from the barrier at most one poll interval ago and still
+            # has its own files to write. Waiting for machine-0's own marker, on
+            # machine-0, is what makes the release below a no-op on a process
+            # that has already exited.
+            for attempt in range(1, WRITER_COMPLETION_ATTEMPTS + 1):
+                marker = machine_exec(ctx, check, "storage-cache-settle", inside, "machine-0",
+                                      f"/bin/busybox cat {CACHE_TARGET}/done-machine-0")
+                if marker.exit_code == 0 and marker.stdout.strip() == b"done":
+                    finished = True
+                    break
+                time.sleep(WRITER_COMPLETION_INTERVAL)
+            check.check(finished,
+                        f"machine-0's writer finished its own writes after {attempt} poll(s)"
+                        if finished else
+                        f"machine-0's writer never wrote its own completion marker within "
+                        f"{WRITER_COMPLETION_ATTEMPTS * WRITER_COMPLETION_INTERVAL:.0f}s")
         finally:
             released = ctx.release(check, writer)
         check.check(released.exit_code == 0,
-                    f"machine-0's concurrent cache writer completed (exit {released.exit_code})")
+                    f"machine-0's concurrent cache writer completed (exit {released.exit_code}); "
+                    "a negative status is the release signal, meaning it was still running")
         if check.status != "PASS":
             return check.finish()
         expected = ({f"machine-0-{index}" for index in range(CACHE_WRITES)} |
