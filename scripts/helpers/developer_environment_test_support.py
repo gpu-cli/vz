@@ -146,13 +146,24 @@ if [ -n "$verb" ]; then
     printf ' "desired_definition_digest": "%s",\n "persisted_definition_digest": "%s",\n' "$dg" "$dg"
     printf ' "definition_drift": false,\n "selection_source": "workspace",\n "project_id": "%s",\n' "$pid"
     printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "ready",\n' "$sfx"
+    printf '   "definition_digest": "%s",\n   "lifecycle_generation": 1,\n' "$dg"
     printf '   "machines": ['
     sep=""
     for m in $names; do
+      # The complete per-Machine projection, not just the identities the
+      # no-collision check reads: the exact-field-set check compares this object
+      # against the declared Machine set, so a fake emitting less than the
+      # installed binaries do would let that comparison pass on absence.
       printf '%s{"name": "%s", "state": "ready", "docker_context": {' "$sep" "$m"
       printf '"owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
       printf '"name": "vzr1-ctx-%s-%s", "endpoint": "unix:///tmp/vz-%s-%s.sock",' "$sfx" "$m" "$sfx" "$m"
       printf '"engine_id": "eng-%s-%s"}, "machine_id": "mch_%s_%s",' "$sfx" "$m" "$sfx" "$m"
+      printf '"docker_context_availability": "persisted_ready_not_live_probed",'
+      printf '"profile": "developer", "backend": "macos_virtualization_linux",'
+      printf '"target": {"os": "linux", "arch": "aarch64", "image": "vz-linux",'
+      printf ' "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},'
+      printf '"requested_capabilities": {"capabilities": ["posix_exec", "docker_engine"]},'
+      printf '"negotiated_capabilities": {"capabilities": ["posix_exec", "docker_engine"]},'
       printf '"incarnation_id": "inc_%s_%s", "incarnation_generation": 1}' "$sfx" "$m"
       sep=", "
     done
