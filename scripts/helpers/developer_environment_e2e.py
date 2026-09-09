@@ -324,10 +324,19 @@ class Lane:
         detail = (f"sub-checks PASS={summary['PASS']} FAIL={summary['FAIL']} not_implemented={summary['not_implemented']}; "
                   "lane state root and socket root removed, nothing of this lane remains outside the retained "
                   "evidence directory")
-        extra = {"handoff": self.handoff_record(), "retained_root": None, "evidence_files": self.evidence_files()}
+        # This phase runs Up, exec and delete several times over; reporting an
+        # empty process_starts would hide every one of them from the receipt.
+        extra = {"handoff": self.handoff_record(), "retained_root": None, "evidence_files": self.evidence_files(),
+                 "process_starts": recorder.process_starts}
         if crash:
             result = self.failed("crash", "topology lane final-cleanup crashed; see crash.txt: " + detail,
                                  EXIT_FAILED, scenarios=scenarios, extra=extra)
+            self.write_result(result)
+            return EXIT_FAILED
+        if recorder.uncertain:
+            names = [receipt.name for receipt in recorder.uncertain]
+            result = self.failed("uncertain_effects", f"topology lane final-cleanup: observers with uncertain effects: "
+                                 f"{names[:10]}; " + detail, EXIT_FAILED, scenarios=scenarios, extra=extra)
             self.write_result(result)
             return EXIT_FAILED
         if summary["FAIL"]:
@@ -335,12 +344,21 @@ class Lane:
                                  scenarios=scenarios, extra=extra)
             self.write_result(result)
             return EXIT_FAILED
-        # Scenarios this lane still does not implement keep the phase honest even
-        # when every implemented one passed.
-        result = self.failed("not_implemented", "topology lane final-cleanup: " + detail, EXIT_NOT_IMPLEMENTED,
-                             scenarios=scenarios, extra=extra)
+        # A scenario this lane assigns but does not implement, or a sub-check
+        # that reported not_implemented, keeps the phase honest -- both land as
+        # a FAIL scenario. When every assigned scenario is implemented and
+        # passes, the phase passes: deciding that in advance, as this did while
+        # criterion 11 was still unimplemented, denies the rows their own
+        # evidence once the implementation arrives.
+        if any(s["status"] == "FAIL" for s in scenarios):
+            result = self.failed("not_implemented", "topology lane final-cleanup: " + detail, EXIT_NOT_IMPLEMENTED,
+                                 scenarios=scenarios, extra=extra)
+            self.write_result(result)
+            return EXIT_NOT_IMPLEMENTED
+        result = lanes.base_result(LANE, self.phase, self.ctx, self.entry)
+        result.update(scenarios=scenarios, outcome="passed", failure=None, **extra)
         self.write_result(result)
-        return EXIT_NOT_IMPLEMENTED
+        return EXIT_PASSED
 
     def run_clean_provision(self) -> int:
         state = LaneState(self.ctx.state_root, self.ctx.release_dir / "bin")

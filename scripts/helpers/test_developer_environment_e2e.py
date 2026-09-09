@@ -329,11 +329,18 @@ class TopologyLaneTests(unittest.TestCase):
                              {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == phase})
         evidence = self.evidence()
         code, result = self.run_lane(self.argv("final-cleanup", evidence, handoff=str(handoff)), evidence)
-        # Reproducibility is implemented and passes; the phase still reports
-        # not_implemented because its other scenarios are not.
-        self.assertEqual((code, result["failure"]["reason"]), (3, "not_implemented"))
+        # final-cleanup is assigned exactly two scenarios and implements both,
+        # so it passes. It reported not_implemented unconditionally while
+        # criterion 11 was still unimplemented and kept doing so after criterion
+        # 11 landed, which stamped both rows MISSING on evidence that had
+        # already been produced.
+        self.assertEqual((code, result["outcome"], result["failure"]), (0, "passed", None))
         self.assertEqual(self.top(result, TOP16)["status"], "PASS")
         self.assertEqual(self.top(result, TOP11)["status"], "PASS")
+        self.assertEqual({s["id"] for s in result["scenarios"] if "__" not in s["id"]}, {TOP16, TOP11})
+        # The phase runs Up, exec and delete several times over; a receipt
+        # claiming it started no process would be false.
+        self.assertTrue(result["process_starts"])
         self.assertIsNone(result["retained_root"])
         self.assertFalse((self.state_root / "topology").exists())
         # The socket root is owned state too: final-cleanup removes it, or the
@@ -342,6 +349,29 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual((result["cleanup_errors"], result["leaks"]), ([], []))
         for name in ("lane-state-root-before-cleanup.txt", "lane-socket-root-before-cleanup.txt"):
             self.assertTrue((evidence / "inventories" / name).is_file(), name)
+
+    def test_final_cleanup_stays_not_implemented_when_a_scenario_is_not(self):
+        """The passing outcome is earned by the scenarios, not by the phase.
+
+        With criterion 11 reporting `not_implemented` the phase must go back to
+        exit 3 and stamp both its rows MISSING, which is what the removed
+        unconditional stamp did for every input. A phase that passes no matter
+        what its checks say certifies nothing.
+        """
+        evidence = self.evidence()
+
+        def unimplemented(ctx, top):
+            check = checks.SubCheck(top, "single_environment_safety")
+            check.not_implemented = "stand-in for an unimplemented criterion 11"
+            return check.finish()
+
+        with mock.patch.object(checks, "check_delete_single_environment_safety", unimplemented):
+            code, result = self.run_lane(self.argv("final-cleanup", evidence), evidence)
+        self.assertEqual((code, result["outcome"], result["failure"]["reason"]), (3, "failed", "not_implemented"))
+        self.assertEqual(self.top(result, TOP16)["status"], "PASS")
+        self.assertEqual(self.top(result, TOP11)["status"], "FAIL")
+        rows = lanes.account([s for s in self.contract["scenarios"] if s["id"] in (TOP16, TOP11)], [result])["rows"]
+        self.assertEqual({row["status"] for row in rows}, {"MISSING"})
 
     def test_final_cleanup_reports_live_process_as_leak(self):
         root = self.state_root / "topology"
