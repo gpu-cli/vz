@@ -39,6 +39,7 @@ import re
 from pathlib import Path
 import socket
 import stat
+import time
 import uuid
 
 from jsonschema import Draft202012Validator
@@ -130,6 +131,16 @@ class CheckContext:
 
     def run(self, check: SubCheck, label: str, argv: list, *, cwd: Path, env: dict, timeout: int = 5):
         receipt = self.recorder.run(label, [self.state.cli, *argv], cwd=cwd, env=env, scenario_id=check.id, timeout=timeout)
+        check.evidence.extend(self.recorder.receipt_paths(receipt))
+        return receipt
+
+    def start(self, check: SubCheck, label: str, argv: list, *, cwd: Path, env: dict, timeout: int = 120):
+        """Start a CLI invocation this check holds open until it releases it."""
+        return self.recorder.start(label, [self.state.cli, *argv], cwd=cwd, env=env, scenario_id=check.id,
+                                   timeout=timeout)
+
+    def release(self, check: SubCheck, held):
+        receipt = self.recorder.release(held)
         check.evidence.extend(self.recorder.receipt_paths(receipt))
         return receipt
 
@@ -744,25 +755,97 @@ def check_delete_single_environment_safety(ctx: CheckContext, top: str) -> SubCh
 
 
 PRIVATE_NETWORK = "backend"
-# One probe, run on EVERY Machine on the network. Reporting only the server left
-# the sibling's fabric NIC unobserved, so a missing NIC there was indistinguishable
-# from a forwarding fault.
-FABRIC_PROBE = ("/bin/busybox cat /proc/cmdline "
-                "| /bin/busybox tr ' ' '\\n' "
-                "| /bin/busybox grep '^vz.net.' ; printf '|' ; "
-                "/bin/busybox ip -o -4 addr show "
-                "| /bin/busybox awk '$2!=\"lo\"{print $2\" \"$4}'")
+# One probe, run on EVERY Machine on the network, before and after the fetch.
+#
+# Every line is a fact about ONE link in the chain, because the whole chain
+# failing looks the same from the outside whichever link is broken:
+#
+#   CMDLINE <mac> <cidr>   what the HOST derived and wrote to this Machine.
+#   IFACE <name> <cidr> <mac> <operstate> <carrier> <rx> <tx>
+#                          what the GUEST configured. The MAC decides the pairing
+#                          question: the switch assigns one address per port and
+#                          drops every frame whose source is not it, so a NIC
+#                          carrying a different MAC than its cmdline declared is
+#                          a mis-paired descriptor and not a forwarding fault.
+#                          operstate/carrier decide whether the link came up at
+#                          all -- an address configured on a dead link prints
+#                          identically to one on a live link. rx/tx decide the
+#                          direction: frames counted out with none counted back
+#                          is the host switch; none counted out is the guest.
+#   ARP <ip> <flags> <mac> <dev>
+#                          whether L2 resolved. ARP must resolve before IPv4
+#                          flows, so an unresolved peer is a link-layer fact and
+#                          a resolved one moves the question above the fabric.
+#
+# Everything reads a kernel file or one applet; nothing here needs a raw socket,
+# so no applet beyond what the initramfs already relies on has to exist.
+#
+# `printf` is the shell's own, never an applet: the probe is run by `sh -c`, so
+# the builtin is there by construction, while an applet is only there if this
+# BusyBox was compiled with it. `ip`, `awk` and `cat` are addressed as
+# `/bin/busybox <applet>` for the reason the initramfs already does -- a
+# VirtioFS-backed overlay does not expose the applet symlinks.
+FABRIC_PROBE = (
+    'for p in $(/bin/busybox cat /proc/cmdline); do '
+    '  case "$p" in vz.net.*=*) printf "CMDLINE %s\\n" "${p#*=}" ;; esac; '
+    'done; '
+    '/bin/busybox ip -o -4 addr show | /bin/busybox awk \'$2!="lo"{print $2, $4}\' '
+    '| while read -r i c; do '
+    '    s=/sys/class/net/"$i"; '
+    '    m=$(/bin/busybox cat "$s"/address 2>/dev/null) || m="?"; '
+    '    o=$(/bin/busybox cat "$s"/operstate 2>/dev/null) || o="?"; '
+    '    k=$(/bin/busybox cat "$s"/carrier 2>/dev/null) || k="?"; '
+    '    rx=$(/bin/busybox cat "$s"/statistics/rx_packets 2>/dev/null) || rx="?"; '
+    '    tx=$(/bin/busybox cat "$s"/statistics/tx_packets 2>/dev/null) || tx="?"; '
+    '    printf "IFACE %s %s %s %s %s %s %s\\n" "$i" "$c" "$m" "$o" "$k" "$rx" "$tx"; '
+    '  done; '
+    '/bin/busybox cat /proc/net/arp 2>/dev/null '
+    '| /bin/busybox awk \'NR>1{print "ARP", $1, $3, $4, $6}\''
+)
 
 
-def fabric_state(receipt):
-    """(declared cmdline addresses, [[iface, cidr], ...]) from one FABRIC_PROBE run."""
-    declared_part, _, observed_part = receipt.stdout.decode("ascii", "replace").partition("|")
-    declared = [item.split(",")[1].split("/")[0] for item in declared_part.split()
-                if item.startswith("vz.net.") and "," in item]
-    observed = [line.split() for line in observed_part.strip().splitlines() if line.split()]
-    return declared, observed
+class FabricState:
+    """One Machine's whole fabric-port state, as the probe reported it."""
+
+    def __init__(self, receipt):
+        self.declared = []   # [(mac, address, prefix), ...] from the kernel cmdline
+        self.ifaces = []     # [{name, address, mac, operstate, carrier, rx, tx}, ...]
+        self.arp = []        # [(address, flags, mac, device), ...]
+        for line in receipt.stdout.decode("ascii", "replace").splitlines():
+            row = line.split()
+            if row[:1] == ["CMDLINE"] and len(row) == 2 and "," in row[1]:
+                mac, _, cidr = row[1].partition(",")
+                address, _, prefix = cidr.partition("/")
+                self.declared.append((mac.lower(), address, prefix))
+            elif row[:1] == ["IFACE"] and len(row) == 8:
+                self.ifaces.append(dict(zip(("name", "address", "mac", "operstate", "carrier", "rx", "tx"),
+                                            [row[1], row[2].split("/")[0], row[3].lower(), *row[4:]])))
+            elif row[:1] == ["ARP"] and len(row) == 5:
+                self.arp.append(tuple(row[1:]))
+
+    def port(self):
+        """The one interface carrying the one address the host derived, or None.
+
+        Matched by address and never by name: a Machine carries Apple's NAT NIC,
+        the fabric NIC and Docker's bridge, and which name the fabric NIC gets is
+        not something the host can predict.
+        """
+        if len(self.declared) != 1:
+            return None
+        _, address, _ = self.declared[0]
+        return next((row for row in self.ifaces if row["address"] == address), None)
+
+    def evidence(self) -> str:
+        return f"cmdline {self.declared!r}, interfaces {self.ifaces!r}, arp {self.arp!r}"
+
+
 PRIVATE_PORT = 8080
 WGET_TIMEOUT = 5
+# How long the sibling's fetch may take to be attempted at all, and how long the
+# listener is given to answer its own address before the fabric is blamed for a
+# service that was never up.
+LISTENER_ATTEMPTS = 10
+LISTENER_INTERVAL = 1.0
 
 
 def two_machine_definition(release_dir: Path) -> dict:
@@ -781,10 +864,27 @@ def two_machine_definition(release_dir: Path) -> dict:
     return definition
 
 
+def machine_exec_argv(machine: str, script: str) -> list:
+    return ["exec", "--environment", "default", "--machine", machine, "--", "/bin/busybox", "sh", "-c", script]
+
+
 def machine_exec(ctx, check, label, instance, machine, script, *, timeout=120):
-    return ctx.run(check, label, ["exec", "--environment", "default", "--machine", machine, "--",
-                                  "/bin/busybox", "sh", "-c", script],
+    return ctx.run(check, label, machine_exec_argv(machine, script),
                    cwd=instance["project"], env=instance["env"], timeout=timeout)
+
+
+def hold_machine_exec(ctx, check, label, instance, machine, script, *, timeout=120):
+    """Run a foreground process on a Machine for as long as the caller needs it.
+
+    A Machine `exec` is bounded on purpose: the guest supervises the command as
+    a child subreaper and SIGKILLs its whole process group and every descendant
+    it adopted before the invocation reports, so `httpd` backgrounding itself is
+    dead before `vz exec` prints `0`. A listener a sibling has to reach is
+    therefore a foreground process held open across the sibling's fetch, and its
+    death when the hold is released is the same mechanism doing its job.
+    """
+    return ctx.start(check, label, machine_exec_argv(machine, script),
+                     cwd=instance["project"], env=instance["env"], timeout=timeout)
 
 
 def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
@@ -795,6 +895,15 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
     Environment must fail to reach the very same address. The foreign probe uses
     the address rather than a name, so its failure is a routing fact and not an
     unresolved hostname.
+
+    The claims are ordered so that the first one to fail names the broken link
+    rather than the whole chain. Each Machine's port must carry the MAC its own
+    cmdline declared, on a link that is up with carrier, before either is asked
+    to carry traffic; the server must answer its OWN fabric address before the
+    sibling is asked to reach it, because a listener that is not there presents
+    exactly as a fabric that does not forward; and every fetch is bracketed by
+    the probe, so a failure carries the ARP table and the interface counters
+    that say whether frames crossed.
     """
     check = SubCheck(top, "private_topology_paths")
     try:
@@ -827,60 +936,93 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
     check.check(sorted(names) == ["machine-0", "machine-1"], f"both declared Machines are present (observed {names})")
     if check.status != "PASS":
         return check.finish()
-    served = machine_exec(ctx, check, "net-serve", inside, "machine-0",
-                          f"/bin/busybox mkdir -p /www; printf %s {token} > /www/index.html; "
-                          f"/bin/busybox httpd -p {PRIVATE_PORT} -h /www; printf STARTED")
-    check.check(served.exit_code == 0 and served.stdout.strip().endswith(b"STARTED"),
-                f"the private endpoint is serving on machine-0 (exit {served.exit_code})")
+    # Both ports are judged BEFORE anything is asked to carry traffic. Every
+    # value compared here is one the host derived and wrote to that Machine's
+    # own kernel cmdline, so a mismatch names the mis-paired descriptor rather
+    # than leaving it to look like a forwarding fault. Name-based selection is
+    # not sound -- a Machine carries Apple's NAT eth0, the fabric NIC and
+    # Docker's bridge, and the host cannot predict which name the fabric NIC
+    # gets -- so the interface is found by the address the cmdline declared.
+    ports = {}
+    for machine in ("machine-0", "machine-1"):
+        probed = machine_exec(ctx, check, "net-port-" + machine, inside, machine, FABRIC_PROBE)
+        state = FabricState(probed)
+        port = state.port()
+        check.check(probed.exit_code == 0 and port is not None,
+                    f"{machine} carries the one fabric address the host derived ({state.evidence()})")
+        if port is None:
+            return check.finish()
+        declared_mac = state.declared[0][0]
+        # The switch assigns one address per port and refuses every frame whose
+        # source is not it, so a NIC holding a different MAC than the cmdline
+        # declared is handed a port the switch assigned to somebody else.
+        check.check(port["mac"] == declared_mac,
+                    f"{machine}'s fabric NIC {port['name']} carries the MAC the host planned "
+                    f"(cmdline {declared_mac}, interface {port['mac']})")
+        # An address on a link that never came up prints exactly like an address
+        # on a live one, which is why this is asserted and not merely reported.
+        check.check(port["operstate"] == "up" and port["carrier"] == "1",
+                    f"{machine}'s fabric NIC {port['name']} is up with carrier "
+                    f"(operstate {port['operstate']}, carrier {port['carrier']})")
+        ports[machine] = port
+    address, sibling_address = ports["machine-0"]["address"], ports["machine-1"]["address"]
+    check.check(address != sibling_address,
+                f"the two Machines hold distinct fabric addresses ({address}, {sibling_address})")
+    macs = {machine: port["mac"] for machine, port in ports.items()}
+    check.check(len(set(macs.values())) == 2, f"the two fabric ports hold distinct MACs ({macs})")
     if check.status != "PASS":
         return check.finish()
-    # The address comes from the serving Machine itself: the foreign probe must
-    # target the same address, so its refusal is about routing and not a name.
-    #
-    # Every Machine now has TWO IPv4 interfaces: Apple's NAT `eth0`, and the
-    # fabric NIC the declared network gives it. Taking the first non-lo entry
-    # returned eth0's 192.168.64.x, so the sibling probe was routed over the
-    # host-shared NAT segment instead of the private fabric -- which is not what
-    # this check claims to test, and would be a false pass if NAT ever carried it.
-    # Report every interface so a missing fabric NIC is legible in the evidence.
-    # Name-based selection is not sound: a Machine carries Apple's NAT eth0, the
-    # fabric NIC, and Docker's own bridge. Ask the guest which address the HOST
-    # derived -- vz.net.N=<mac>,<ipv4>/<prefix> is on its kernel cmdline -- and
-    # require an interface to actually carry it. That proves the derived address
-    # reached the guest, which name matching never could.
-    addressed = machine_exec(ctx, check, "net-address", inside, "machine-0",
-                             FABRIC_PROBE)
-    declared, observed = fabric_state(addressed)
-    carried = {addr.split("/")[0] for _, addr in observed}
-    check.check(addressed.exit_code == 0 and len(declared) == 1 and declared[0] in carried,
-                "machine-0 carries the fabric address the host derived "
-                f"(cmdline {declared!r}, interfaces {observed!r})")
-    address = declared[0] if len(declared) == 1 and declared[0] in carried else ""
-    # The sibling is the one that must REACH that address, so its own fabric port
-    # is part of the claim. Observing only the server made a missing NIC here look
-    # like a forwarding fault.
-    sibling_state = machine_exec(ctx, check, "net-sibling-address", inside, "machine-1", FABRIC_PROBE)
-    sib_declared, sib_observed = fabric_state(sibling_state)
-    sib_carried = {addr.split("/")[0] for _, addr in sib_observed}
-    check.check(sibling_state.exit_code == 0 and len(sib_declared) == 1
-                and sib_declared[0] in sib_carried and sib_declared[0] != address,
-                "machine-1 carries its own distinct fabric address "
-                f"(cmdline {sib_declared!r}, interfaces {sib_observed!r})")
-    if check.status != "PASS":
-        return check.finish()
-    sibling = machine_exec(ctx, check, "net-sibling", inside, "machine-1",
-                           f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/")
-    check.check(sibling.exit_code == 0 and sibling.stdout.strip() == token.encode(),
-                f"the sibling Machine reads the declared private path (exit {sibling.exit_code})")
-    outside = provision(ctx, check, "net-b", minimal_definition(ctx.release_dir))
-    if check.status != "PASS" or not outside["status"]:
-        return check.finish()
-    foreign = machine_exec(ctx, check, "net-foreign", outside, "machine-0",
-                           f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/; "
-                           "printf ':%s' $?")
-    check.check(foreign.exit_code == 0 and token.encode() not in foreign.stdout and
-                not foreign.stdout.strip().endswith(b":0"),
-                f"a Machine in another Environment cannot reach that address (observed {foreign.stdout[:80]!r})")
+    # Held open, not backgrounded. A Machine exec supervises its command as a
+    # child subreaper and SIGKILLs every descendant before it reports, so a
+    # daemonised `httpd` is already dead when the sibling fetches -- which reads
+    # exactly like a fabric that does not forward. The listener lives for as
+    # long as this invocation is held and no longer.
+    server = hold_machine_exec(ctx, check, "net-serve", inside, "machine-0",
+                               f"/bin/busybox mkdir -p /www; printf %s {token} > /www/index.html; "
+                               f"/bin/busybox httpd -f -p {PRIVATE_PORT} -h /www")
+    try:
+        # The server answering its OWN fabric address settles the listener
+        # before the fabric is asked to carry anything: this fetch never leaves
+        # machine-0, so it fails only if nothing is bound.
+        for attempt in range(1, LISTENER_ATTEMPTS + 1):
+            local = machine_exec(ctx, check, "net-serve-local", inside, "machine-0",
+                                 f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/")
+            if local.exit_code == 0 and local.stdout.strip() == token.encode():
+                break
+            time.sleep(LISTENER_INTERVAL)
+        check.check(local.exit_code == 0 and local.stdout.strip() == token.encode(),
+                    f"the private endpoint answers on machine-0's own fabric address after {attempt} "
+                    f"attempt(s) (exit {local.exit_code}, {local.stdout[:80]!r})")
+        if check.status != "PASS":
+            return check.finish()
+        sibling = machine_exec(ctx, check, "net-sibling", inside, "machine-1",
+                               f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/")
+        # Read back on both sides whatever the fetch did or did not do. Counted
+        # frames and a resolved ARP entry are the difference between a fabric
+        # that never carried the frame and a guest that refused it, so they are
+        # recorded on the pass as well: the numbers are the claim's evidence,
+        # not only its post-mortem.
+        after = {machine: FabricState(machine_exec(ctx, check, "net-after-" + machine, inside, machine, FABRIC_PROBE))
+                 for machine in ("machine-0", "machine-1")}
+        for machine, state in after.items():
+            check.ok(f"{machine} after the sibling fetch: {state.evidence()}")
+        check.check(sibling.exit_code == 0 and sibling.stdout.strip() == token.encode(),
+                    f"the sibling Machine reads the declared private path (exit {sibling.exit_code})")
+        outside = provision(ctx, check, "net-b", minimal_definition(ctx.release_dir))
+        if check.status != "PASS" or not outside["status"]:
+            return check.finish()
+        foreign = machine_exec(ctx, check, "net-foreign", outside, "machine-0",
+                               f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{PRIVATE_PORT}/; "
+                               "printf ':%s' $?")
+        check.check(foreign.exit_code == 0 and token.encode() not in foreign.stdout and
+                    not foreign.stdout.strip().endswith(b":0"),
+                    f"a Machine in another Environment cannot reach that address (observed {foreign.stdout[:80]!r})")
+    finally:
+        released = ctx.release(check, server)
+        # `None` is the one uncertain outcome: the invocation outlived SIGKILL,
+        # so something this lane started may still be running.
+        check.check(released.exit_code is not None,
+                    f"the held listener was released (exit {released.exit_code})")
     if check.status == "PASS":
         for name, instance in (("net-a", inside), ("net-b", outside)):
             removed = ctx.run(check, name + "-delete",

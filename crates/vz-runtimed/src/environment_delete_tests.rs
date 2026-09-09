@@ -729,7 +729,7 @@ async fn declared_fabric_is_expected_and_delete_reclaims_switches_and_records() 
         })
         .collect::<Vec<_>>();
     let (switch, guests) =
-        crate::environment_switch::runtime::NetworkSwitch::start(members).unwrap();
+        crate::environment_switch::runtime::NetworkSwitch::start("declared", members).unwrap();
     drop(guests);
     fixture
         .daemon

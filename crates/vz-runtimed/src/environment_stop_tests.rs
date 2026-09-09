@@ -386,7 +386,7 @@ async fn declared_fabric_ownership_is_accounted_and_stop_completes() {
         })
         .collect::<Vec<_>>();
     let (switch, guests) =
-        crate::environment_switch::runtime::NetworkSwitch::start(members).unwrap();
+        crate::environment_switch::runtime::NetworkSwitch::start("declared", members).unwrap();
     drop(guests);
     fixture
         .daemon

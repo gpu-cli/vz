@@ -108,15 +108,21 @@ if [ -n "$verb" ]; then
     # Model Machine-local mutable state: run the script with the sentinel path
     # rewritten into this isolated runtime dir, so a recreated Environment with
     # a fresh state directory genuinely has none of it.
+    # One script file per exec, not one per Machine: a Machine can be running a
+    # held foreground process while another exec probes it, and a shared path
+    # would rewrite the running script underneath its own interpreter.
+    script="$VZ_RUNTIME_DATA_DIR/script.$$.sh"
     printf '%s' "$command_tail" \
       | sed -e "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" \
             -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
-            -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$VZ_RUNTIME_DATA_DIR/script.sh"
+            -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$script"
     # The shim needs the Machine identity: every Machine on a declared network
     # gets its OWN derived address, so a fake that keys addressing on the project
     # alone would hand two Machines one address and model the wrong property.
-    VZ_FAKE_MACHINE="$machine" /bin/sh "$VZ_RUNTIME_DATA_DIR/script.sh"
-    exit $?
+    VZ_FAKE_MACHINE="$machine" /bin/sh "$script"
+    code=$?
+    rm -f "$script"
+    exit $code
   fi
   if [ "$verb" = delete ] && [ -f "$topology" ]; then
     rm -f "$topology"; printf '{"schema_version":1,"deleted":["default"]}\n'; exit 0
@@ -268,32 +274,92 @@ int main(int argc, char **argv) {
 
 BUSYBOX_SHIM = r'''#!/bin/sh
 # Stand-in for the guest BusyBox. Applets that only touch files delegate to the
-# host; `httpd`, `wget` and `ip` model one Environment's private reachability:
-# an address belongs to the project whose runtime directory serves it, so a
-# probe from another project's directory cannot reach it. That is the property
-# under test, modelled at the granularity this fake has (project == Environment).
+# host; `httpd`, `wget`, `ip` and the `/proc`+`/sys` reads model one
+# Environment's private reachability: an address belongs to the project whose
+# runtime directory serves it, so a probe from another project's directory
+# cannot reach it. That is the property under test, modelled at the granularity
+# this fake has (project == Environment).
 state="$VZ_RUNTIME_DATA_DIR"
+machine="${VZ_FAKE_MACHINE:-machine-0}"
 applet=$1
 shift
+
+# One identity per (Environment, Machine), from which BOTH the address and the
+# MAC are derived. That is the invariant the real derivation has to hold: the
+# switch assigns a port one address and refuses any frame whose source is not
+# it, so the MAC on the cmdline and the MAC on the NIC can only ever agree by
+# coming from one identity. A fake that made up an unrelated NIC address would
+# make the pairing claim unfalsifiable here.
+net_seed=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
+host_seed=$(printf '%s' "$machine" | cksum | cut -d' ' -f1)
+octet_a=$(( (net_seed / 256) % 254 + 1 ))
+octet_b=$(( net_seed % 254 + 1 ))
+octet_c=$(( host_seed % 200 + 2 ))
+fabric_iface=enp0s5
+fabric_addr="10.$octet_a.$octet_b.$octet_c"
+fabric_mac=$(printf '02:00:00:%02x:%02x:%02x' "$octet_a" "$octet_b" "$octet_c")
+nat_addr="192.168.64.$(( host_seed % 200 + 20 ))"
+nat_mac=$(printf '02:00:01:%02x:%02x:%02x' "$octet_a" "$octet_b" "$octet_c")
+
+# A peer's MAC is derived from its address by the same rule, so an ARP row names
+# the address the peer genuinely carries rather than an invented one.
+peer_mac() {
+  printf '02:00:00:%02x:%02x:%02x' "$(echo "$1" | cut -d. -f2)" \
+    "$(echo "$1" | cut -d. -f3)" "$(echo "$1" | cut -d. -f4)"
+}
+
+# Counters belong to a PORT, not to whoever is running: a frame that crossed
+# left one port and arrived at the other, so both ends count it. Keying them on
+# the Machine that happened to run the probe would let one side's silence read
+# as the other side's traffic, which is the very distinction they exist to make.
+counter() {
+  file="$state/stat-$1-$2"
+  value=0
+  [ -f "$file" ] && value=$(cat "$file")
+  value=$(( value + ${3:-0} ))
+  printf '%s' "$value" > "$file"
+  printf '%s' "$value"
+}
+
 case "$applet" in
   httpd)
-    root=""
-    while [ $# -gt 0 ]; do case "$1" in -h) root=$2; shift 2 ;; *) shift ;; esac; done
-    printf '%s' "$root" > "$state/httpd-root"
-    exit 0 ;;
+    root=""; foreground=0
+    while [ $# -gt 0 ]; do
+      case "$1" in -h) root=$2; shift 2 ;; -f) foreground=1; shift ;; *) shift ;; esac
+    done
+    # A listener lives exactly as long as the invocation that started it. A
+    # Machine exec supervises its command as a child subreaper and SIGKILLs
+    # every descendant before it reports, so a backgrounded httpd leaves nothing
+    # behind -- modelled by refusing to record one at all.
+    [ "$foreground" = 1 ] || exit 0
+    printf '%s %s' "$$" "$root" > "$state/httpd"
+    trap 'rm -f "$state/httpd"; exit 0' TERM INT HUP EXIT
+    while : ; do sleep 1; done ;;
   cat)
-    # /proc/cmdline: the host writes vz.net.N=<mac>,<ipv4>/<prefix> for each
-    # fabric port. Derived from the same seed as the NIC below, so the guest
-    # genuinely carries the address its cmdline declares -- a stub that returned
-    # an address no interface held would model the answer, not the property.
-    net=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
-    host=$(printf '%s' "${VZ_FAKE_MACHINE:-machine-0}" | cksum | cut -d' ' -f1)
     case "${1:-}" in
       /proc/cmdline)
-        printf 'console=hvc0 vz.net.0=02:00:00:%02x:%02x:%02x,10.%s.%s.%s/24\n' \
-          "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))" \
-          "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))"
+        # The host writes vz.net.N=<mac>,<ipv4>/<prefix> for each fabric port.
+        printf 'console=hvc0 vz.net.0=%s,%s/24\n' "$fabric_mac" "$fabric_addr"
         exit 0 ;;
+      /proc/net/arp)
+        # L2 resolves for peers on this Machine's own fabric network and for
+        # nothing else, which is the same boundary the switch enforces.
+        printf 'IP address       HW type     Flags       HW address            Mask     Device\n'
+        [ -f "$state/arp-$machine" ] || exit 0
+        sort -u "$state/arp-$machine" | while read -r peer; do
+          printf '%-16s0x1         0x2         %s     *        %s\n' \
+            "$peer" "$(peer_mac "$peer")" "$fabric_iface"
+        done
+        exit 0 ;;
+      /sys/class/net/"$fabric_iface"/address) printf '%s\n' "$fabric_mac"; exit 0 ;;
+      /sys/class/net/eth0/address) printf '%s\n' "$nat_mac"; exit 0 ;;
+      /sys/class/net/*/operstate) printf 'up\n'; exit 0 ;;
+      /sys/class/net/*/carrier) printf '1\n'; exit 0 ;;
+      # Counted where traffic actually crossed: a fetch this Machine attempted
+      # is transmitted, and one it was answered on is received.
+      /sys/class/net/"$fabric_iface"/statistics/tx_packets) counter "$fabric_addr" tx 0; printf '\n'; exit 0 ;;
+      /sys/class/net/"$fabric_iface"/statistics/rx_packets) counter "$fabric_addr" rx 0; printf '\n'; exit 0 ;;
+      /sys/class/net/*/statistics/*) printf '0\n'; exit 0 ;;
     esac
     exec "$applet" "$@" ;;
   ip)
@@ -301,22 +367,16 @@ case "$applet" in
     # NAT eth0, which every Machine gets whether or not it declares a network,
     # and the fabric NIC the declared network gives it. Modelling only one hid
     # that distinction and let a probe over the host-shared NAT segment look
-    # like a private-fabric proof.
-    net=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
-    host=$(printf '%s' "${VZ_FAKE_MACHINE:-machine-0}" | cksum | cut -d' ' -f1)
-    # `ip -o -4 addr show` field layout, so the caller parses the shim exactly
-    # the way it parses the real tool.
-    printf '2: eth0    inet 192.168.64.%s/24 brd 192.168.64.255 scope global eth0\n' \
-      "$(( host % 200 + 20 ))"
-    # One subnet per Environment network; the host octet is the Machine's own.
-    printf '3: enp0s5    inet 10.%s.%s.%s/24 brd 10.%s.%s.255 scope global enp0s5\n' \
-      "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))" \
-      "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))"
+    # like a private-fabric proof. `ip -o -4 addr show` field layout, so the
+    # caller parses the shim exactly the way it parses the real tool.
+    printf '2: eth0    inet %s/24 brd 192.168.64.255 scope global eth0\n' "$nat_addr"
+    printf '3: %s    inet %s/24 brd 10.%s.%s.255 scope global %s\n' \
+      "$fabric_iface" "$fabric_addr" "$octet_a" "$octet_b" "$fabric_iface"
     exit 0 ;;
   wget)
     url=""
     while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done
-    host=${url#http://}; host=${host%%:*}
+    target=${url#http://}; target=${target%%:*}
     # Served on the FABRIC address only. A request to the NAT address must not
     # be answered: the declared private path serves inside its Environment, and
     # the host-shared NAT segment is not that path.
@@ -326,10 +386,30 @@ case "$applet" in
     # reaches it and a different Environment (a different /24) does not. Matching
     # only the caller's own address modelled a Machine talking to itself, which
     # passed by accident while every Machine shared one address.
-    mine=$("$0" ip -o -4 addr show | awk '$2!="eth0"{print $4}' | cut -d/ -f1 | head -1)
-    subnet=${mine%.*}
-    if [ "${host%.*}" != "$subnet" ] || [ ! -f "$state/httpd-root" ]; then exit 1; fi
-    cat "$(cat "$state/httpd-root")/index.html"
+    [ "${target%.*}" = "${fabric_addr%.*}" ] || exit 1
+    # On-network is a link-layer fact and does not depend on anything listening:
+    # ARP resolves for a peer whose port exists, and the fetch still fails when
+    # no listener answers. Collapsing the two is what let a dead listener read
+    # as a fabric that does not forward.
+    # A Machine reaching its OWN address never leaves the Machine, so it resolves
+    # nothing and counts nothing on the wire. That is what makes the self-fetch
+    # a statement about the listener alone.
+    if [ "$target" != "$fabric_addr" ]; then
+      printf '%s\n' "$target" >> "$state/arp-$machine"
+      counter "$fabric_addr" tx 1 > /dev/null
+      counter "$target" rx 1 > /dev/null
+    fi
+    [ -f "$state/httpd" ] || exit 1
+    pid=$(cut -d' ' -f1 < "$state/httpd")
+    root=$(cut -d' ' -f2- < "$state/httpd")
+    # The listener is only there while its own invocation is: a marker left by a
+    # process that is gone is not a service.
+    kill -0 "$pid" 2>/dev/null || exit 1
+    if [ "$target" != "$fabric_addr" ]; then
+      counter "$target" tx 1 > /dev/null
+      counter "$fabric_addr" rx 1 > /dev/null
+    fi
+    cat "$root/index.html"
     exit 0 ;;
   *) exec "$applet" "$@" ;;
 esac

@@ -23,8 +23,9 @@ use rustix::net::sockopt;
 use tokio::net::UnixDatagram;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::{JoinHandle, JoinSet};
+use tracing::{info, warn};
 
-use super::{Counters, Disposition, Fabric, FabricError, MacAddress, PortId};
+use super::{Counters, Disposition, Fabric, FabricError, FrameHeader, MacAddress, PortId};
 
 /// The largest datagram a port will read. The file-handle attachment allows an
 /// MTU up to 65535, and a read shorter than the frame truncates it silently, so
@@ -88,7 +89,13 @@ impl NetworkSwitch {
     /// The fabric is built before any socket, so a duplicate port or a repeated
     /// address is refused without first creating descriptors that would then
     /// need unwinding.
+    ///
+    /// `network` names this switch in its diagnostics. Two Environments may
+    /// declare the same network name and a Machine may hold ports on several
+    /// networks, so a refusal that did not say which switch decided it could
+    /// not be attributed to a fabric at all.
     pub fn start(
+        network: &str,
         members: impl IntoIterator<Item = (PortId, MacAddress)>,
     ) -> Result<(Self, Vec<GuestPort>), SwitchError> {
         let members: Vec<(PortId, MacAddress)> = members.into_iter().collect();
@@ -132,6 +139,7 @@ impl NetworkSwitch {
         drop(sender);
 
         let ports: BTreeMap<PortId, MacAddress> = members.into_iter().collect();
+        let network = network.to_string();
         let task = tokio::spawn(async move {
             let mut receipt = SwitchShutdown::default();
             loop {
@@ -145,14 +153,46 @@ impl NetworkSwitch {
                 let targets = match fabric.forward(ingress, &frame) {
                     Disposition::Unicast(port) => vec![port],
                     Disposition::Group(ports) => ports,
-                    Disposition::Drop(_) => continue,
+                    Disposition::Drop(reason) => {
+                        // Once per reason, not once per frame: the rules are
+                        // what a refusal has to be attributed to, and a fabric
+                        // that refuses everything would otherwise say so
+                        // thousands of times or, as it did, not at all. The
+                        // counters are only reported at shutdown, and an
+                        // Environment under investigation is exactly the one
+                        // that is not being torn down.
+                        if fabric.counters().dropped.get(&reason) == Some(&1) {
+                            warn!(
+                                network = %network,
+                                ingress = %ingress,
+                                assigned = ?fabric.address_of(ingress),
+                                header = ?FrameHeader::parse(&frame),
+                                ?reason,
+                                "Environment network switch refused a frame"
+                            );
+                        }
+                        continue;
+                    }
                 };
                 for target in targets {
                     // A full receive buffer means that Machine is not keeping up.
                     // The frame is dropped and counted, never retried, so one slow
                     // Machine cannot stall the network.
                     match hosts.get(&target).map(|socket| socket.try_send(&frame)) {
-                        Some(Ok(_)) => receipt.frames_delivered += 1,
+                        Some(Ok(_)) => {
+                            receipt.frames_delivered += 1;
+                            // The first delivery is the one fact that says a
+                            // guest end is really attached at both ends; every
+                            // later one says the same thing again.
+                            if receipt.frames_delivered == 1 {
+                                info!(
+                                    network = %network,
+                                    ingress = %ingress,
+                                    egress = %target,
+                                    "Environment network switch carried its first frame"
+                                );
+                            }
+                        }
                         Some(Err(_)) | None => receipt.undeliverable += 1,
                     }
                 }

@@ -122,12 +122,13 @@ impl RuntimeDaemon {
 
         let mut minted = MintedAttachments::new();
         for network in &plan.networks {
-            let (switch, guests) = NetworkSwitch::start(network.members()).map_err(|error| {
-                EnvironmentFabricError::Switch {
-                    network: network.name.clone(),
-                    error,
-                }
-            })?;
+            let (switch, guests) =
+                NetworkSwitch::start(&network.name, network.members()).map_err(|error| {
+                    EnvironmentFabricError::Switch {
+                        network: network.name.clone(),
+                        error,
+                    }
+                })?;
             // Ownership before the descriptors are handed out: a switch this
             // Environment does not own is one Stop and Delete cannot reclaim.
             self.environment_switches

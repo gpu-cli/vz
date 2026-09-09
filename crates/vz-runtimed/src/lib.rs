@@ -746,11 +746,21 @@ impl RuntimeDaemon {
             machine_id: None,
         };
         let receipt = self.environment_switches.stop(lease, &owner).await?;
-        if !receipt.networks.is_empty() {
+        // Per network and with the whole receipt, not a count. A switch keeps a
+        // per-rule tally precisely so a refused frame is a number rather than
+        // only an absence of delivery, and reporting how many switches stopped
+        // threw away the one record of what they had decided.
+        for (network, stopped) in &receipt.networks {
             info!(
                 environment_id = %environment_id,
-                networks = receipt.networks.len(),
-                "reclaimed Environment switches"
+                network = %network,
+                frames_read = stopped.frames_read,
+                frames_delivered = stopped.frames_delivered,
+                undeliverable = stopped.undeliverable,
+                unicast_forwarded = stopped.counters.unicast_forwarded,
+                group_forwarded = stopped.counters.group_forwarded,
+                dropped = ?stopped.counters.dropped,
+                "reclaimed Environment network switch"
             );
         }
         Ok(())

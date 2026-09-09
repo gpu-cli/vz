@@ -66,7 +66,7 @@ fn started(count: u8) -> (NetworkSwitch, Vec<StdUnixDatagram>) {
     let members: Vec<(PortId, MacAddress)> = (1..=count)
         .map(|index| (PortId(u32::from(index)), mac(index)))
         .collect();
-    let (switch, guests) = NetworkSwitch::start(members).unwrap();
+    let (switch, guests) = NetworkSwitch::start("declared", members).unwrap();
     let sockets = guests.into_iter().map(|port| guest(port.socket)).collect();
     (switch, sockets)
 }
@@ -149,12 +149,14 @@ async fn two_networks_with_identical_addressing_deliver_nothing_to_each_other() 
 #[tokio::test(flavor = "multi_thread")]
 async fn a_port_and_an_address_are_each_refused_twice_before_any_socket_exists() {
     // Refusing before creating descriptors is why the fabric is built first.
-    let duplicate_port = NetworkSwitch::start([(PortId(1), mac(1)), (PortId(1), mac(2))]);
+    let duplicate_port =
+        NetworkSwitch::start("declared", [(PortId(1), mac(1)), (PortId(1), mac(2))]);
     assert!(matches!(
         duplicate_port,
         Err(SwitchError::Fabric(FabricError::PortAlreadyAttached(1)))
     ));
-    let duplicate_address = NetworkSwitch::start([(PortId(1), mac(1)), (PortId(2), mac(1))]);
+    let duplicate_address =
+        NetworkSwitch::start("declared", [(PortId(1), mac(1)), (PortId(2), mac(1))]);
     assert!(matches!(
         duplicate_address,
         Err(SwitchError::Fabric(FabricError::AddressAlreadyAssigned(
@@ -190,7 +192,7 @@ async fn guest_ends_carry_the_addresses_the_switch_assigned() {
         (PortId(7), MacAddress::derive("env", "machine-a", "net")),
         (PortId(9), MacAddress::derive("env", "machine-b", "net")),
     ];
-    let (mut switch, ports) = NetworkSwitch::start(members).unwrap();
+    let (mut switch, ports) = NetworkSwitch::start("declared", members).unwrap();
     assert_eq!(ports.len(), 2);
     for (port, expected) in ports.iter().zip(members.iter()) {
         assert_eq!((port.port, port.address), *expected);

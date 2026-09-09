@@ -149,6 +149,50 @@ class Receipt:
         return f"{self.index:03}-{self.label}"
 
 
+class Held:
+    """An invocation started and still running, awaiting its deliberate end.
+
+    The process group, not the process: `start_new_session` gave the CLI its own
+    group, and a signal to the leader alone would leave whatever it spawned
+    holding the inherited pipes, so the drain would then block for that child's
+    lifetime instead of returning what the invocation produced.
+    """
+
+    def __init__(self, index: int, label: str, name: str, argv: list, row: dict, process, started: int, timeout: int):
+        self.index = index
+        self.label = label
+        self.name = name
+        self.argv = argv
+        self.row = row
+        self.process = process
+        self.started = started
+        self.timeout = timeout
+
+    def _signal(self, number: int) -> None:
+        try:
+            os.killpg(self.process.pid, number)
+        except (ProcessLookupError, PermissionError):
+            try:
+                self.process.send_signal(number)
+            except ProcessLookupError:
+                pass
+
+    def terminate(self) -> tuple:
+        """`(stdout, stderr, signal)`; `signal` is `None` if it outlived SIGKILL."""
+        self._signal(signal.SIGTERM)
+        try:
+            stdout, stderr = self.process.communicate(timeout=self.timeout)
+            return stdout, stderr, signal.SIGTERM
+        except subprocess.TimeoutExpired:
+            pass
+        self._signal(signal.SIGKILL)
+        try:
+            stdout, stderr = self.process.communicate(timeout=self.timeout)
+            return stdout, stderr, signal.SIGKILL
+        except subprocess.TimeoutExpired:
+            return b"", b"", None
+
+
 class Recorder:
     """Per-command intent/result receipts (kind `vz-0.4-receipt`)."""
 
@@ -161,25 +205,50 @@ class Recorder:
         self.process_starts = []
         self._first_start = set()
         self.uncertain = []
+        # Issued rather than derived from `len(self.receipts)`: a held
+        # invocation reserves its index when it starts and files its receipt
+        # when it is released, so ordinary runs happen in between.
+        self._issued = 0
+
+    def _issue(self, label: str) -> tuple:
+        self._issued += 1
+        label = label_for(label)
+        return self._issued, label, f"{self._issued:03}-{label}"
+
+    def _intent(self, index: int, label: str, argv: list, cwd: Path, timeout: int) -> dict:
+        return {"schema_version": 1, "kind": "vz-0.4-receipt", "run_id": self.run_id, "index": index, "label": label,
+                "argv": argv, "executable": argv[0], "cwd": str(cwd), "timeout_seconds": int(timeout), "state": "intent",
+                "started_unix_ns": now_ns(), "ended_unix_ns": None, "exit_code": None, "stdout_path": None,
+                "stderr_path": None, "stdout_sha256": None, "stderr_sha256": None, "error": None,
+                "effects_uncertain": True, "canary_withheld": False, "not_executed_reason": None}
+
+    def _file(self, name: str, row: dict, stdout: bytes, stderr: bytes) -> None:
+        row["ended_unix_ns"] = now_ns()
+        row["stdout_sha256"] = sha256_bytes(stdout)
+        row["stderr_sha256"] = sha256_bytes(stderr)
+        if stdout:
+            write_exclusive(self.receipts_dir / (name + ".stdout"), stdout)
+            row["stdout_path"] = f"receipts/{name}.stdout"
+        if stderr:
+            write_exclusive(self.receipts_dir / (name + ".stderr"), stderr)
+            row["stderr_path"] = f"receipts/{name}.stderr"
+        document(self.receipts_dir / (name + ".json"), row)
+
+    def _note_start(self, scenario_id: str, argv: list, pid: int) -> None:
+        if scenario_id not in self._first_start:
+            self._first_start.add(scenario_id)
+            self.process_starts.append({"scenario_id": scenario_id, "argv0": argv[0], "pid": pid})
 
     def run(self, label: str, argv: list, *, cwd: Path, env: dict, scenario_id: str, timeout: int = 5) -> Receipt:
-        index = len(self.receipts) + 1
-        label = label_for(label)
-        name = f"{index:03}-{label}"
+        index, label, name = self._issue(label)
         argv = [str(item) for item in argv]
-        row = {"schema_version": 1, "kind": "vz-0.4-receipt", "run_id": self.run_id, "index": index, "label": label,
-               "argv": argv, "executable": argv[0], "cwd": str(cwd), "timeout_seconds": int(timeout), "state": "intent",
-               "started_unix_ns": now_ns(), "ended_unix_ns": None, "exit_code": None, "stdout_path": None, "stderr_path": None,
-               "stdout_sha256": None, "stderr_sha256": None, "error": None, "effects_uncertain": True, "canary_withheld": False,
-               "not_executed_reason": None}
+        row = self._intent(index, label, argv, cwd, timeout)
         started = time.monotonic_ns()
         # The observer runs in its own session so a deadline kill never reaches
         # a daemon the CLI might have spawned (that is handled by stop_daemon).
         process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, start_new_session=True)
-        if scenario_id not in self._first_start:
-            self._first_start.add(scenario_id)
-            self.process_starts.append({"scenario_id": scenario_id, "argv0": argv[0], "pid": process.pid})
+        self._note_start(scenario_id, argv, process.pid)
         timed_out = False
         try:
             stdout, stderr = process.communicate(timeout=timeout)
@@ -196,24 +265,61 @@ class Recorder:
             stdout, stderr = process.communicate()
         exit_code = None if timed_out else process.returncode
         stdout, stderr = stdout[:STREAM_LIMIT], stderr[:STREAM_LIMIT]
-        row["ended_unix_ns"] = now_ns()
         row["exit_code"] = exit_code
-        row["stdout_sha256"] = sha256_bytes(stdout)
-        row["stderr_sha256"] = sha256_bytes(stderr)
-        if stdout:
-            write_exclusive(self.receipts_dir / (name + ".stdout"), stdout)
-            row["stdout_path"] = f"receipts/{name}.stdout"
-        if stderr:
-            write_exclusive(self.receipts_dir / (name + ".stderr"), stderr)
-            row["stderr_path"] = f"receipts/{name}.stderr"
         if timed_out:
             row.update(state="error", error=f"TimeoutExpired: observer killed after {timeout}s; effects uncertain", effects_uncertain=True)
         else:
             row.update(state="completed", effects_uncertain=exit_code < 0)
-        document(self.receipts_dir / (name + ".json"), row)
+        self._file(name, row, stdout, stderr)
         receipt = Receipt(index, label, argv, exit_code, stdout, stderr, time.monotonic_ns() - started, process.pid, timed_out)
         self.receipts.append(receipt)
         if row["effects_uncertain"]:
+            self.uncertain.append(receipt)
+        return receipt
+
+    def start(self, label: str, argv: list, *, cwd: Path, env: dict, scenario_id: str, timeout: int = 120) -> "Held":
+        """Begin an invocation the caller holds open, and release deliberately.
+
+        A Machine `exec` is a bounded foreground process, not a way to leave a
+        daemon behind: the guest trampoline makes itself a child subreaper and
+        SIGKILLs the exec's whole process group and every adopted descendant
+        before it reports, so a backgrounded listener is dead before the CLI
+        prints its exit code (`crates/vz-guest-agent/src/container_exec/machine.rs`,
+        `reap_until_proven`). A listener that has to answer while some other
+        Machine reaches it therefore has to be a foreground process held open
+        for exactly that long, which is what this records.
+
+        `timeout` is the ceiling the release enforces, not a deadline the caller
+        waits on: nothing here blocks until [`release`].
+        """
+        index, label, name = self._issue(label)
+        argv = [str(item) for item in argv]
+        row = self._intent(index, label, argv, cwd, timeout)
+        process = subprocess.Popen(argv, cwd=str(cwd), env=env, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.PIPE, start_new_session=True)
+        self._note_start(scenario_id, argv, process.pid)
+        return Held(index, label, name, argv, row, process, time.monotonic_ns(), timeout)
+
+    def release(self, held: "Held") -> Receipt:
+        """End a held invocation and file its receipt.
+
+        Ending it is the point, so an invocation that stops on the signal is
+        `completed` with certain effects. Only one that outlives SIGKILL is
+        uncertain, because then something the lane started is still running.
+        """
+        stdout, stderr, signalled = held.terminate()
+        stdout, stderr = stdout[:STREAM_LIMIT], stderr[:STREAM_LIMIT]
+        held.row["exit_code"] = held.process.returncode
+        if signalled is None:
+            held.row.update(state="error", effects_uncertain=True,
+                            error=f"held invocation outlived SIGKILL after {held.timeout}s; effects uncertain")
+        else:
+            held.row.update(state="completed", effects_uncertain=False)
+        self._file(held.name, held.row, stdout, stderr)
+        receipt = Receipt(held.index, held.label, held.argv, held.process.returncode, stdout, stderr,
+                          time.monotonic_ns() - held.started, held.process.pid, False)
+        self.receipts.append(receipt)
+        if held.row["effects_uncertain"]:
             self.uncertain.append(receipt)
         return receipt
 

@@ -304,7 +304,8 @@ async fn a_planned_membership_is_a_fabric_two_machines_actually_reach_each_other
     let plan = plan_environment_fabric(&environment).unwrap();
     let network = &plan.networks[0];
     let (mut switch, guests) =
-        crate::environment_switch::runtime::NetworkSwitch::start(network.members()).unwrap();
+        crate::environment_switch::runtime::NetworkSwitch::start(&network.name, network.members())
+            .unwrap();
     assert_eq!(guests.len(), 2);
     let mut fabric = crate::environment_switch::Fabric::new();
     for (port, address) in network.members() {

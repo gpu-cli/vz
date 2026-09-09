@@ -36,7 +36,7 @@ fn switch(ports: u32) -> NetworkSwitch {
             )
         })
         .collect();
-    NetworkSwitch::start(members).unwrap().0
+    NetworkSwitch::start("declared", members).unwrap().0
 }
 
 async fn lease(
