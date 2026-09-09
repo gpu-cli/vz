@@ -17,7 +17,8 @@ use thiserror::Error;
 use vz_linux::{KernelBundleArtifactIdentity, KernelProfile, verify_kernel_bundle_read_only};
 use vz_runtime_contract::{
     Architecture, EnvironmentSpec, HostSpec, MachineBackend, MachineCapability, MachineProfile,
-    MachineSpec, OperatingSystem, ProjectDefinition, TOPOLOGY_SCHEMA_VERSION,
+    MachineSpec, NetworkKind, NetworkSpec, OperatingSystem, ProjectDefinition,
+    TOPOLOGY_SCHEMA_VERSION,
 };
 
 pub const MACHINE_TARGET_CATALOG_SCHEMA_VERSION: u32 = 1;
@@ -278,13 +279,31 @@ impl ResolvedMachineConfiguration {
         if self.schema_version != RESOLVED_MACHINE_CONFIGURATION_SCHEMA_VERSION {
             return Err(invalid("unsupported resolved configuration schema"));
         }
+        // A persisted configuration carries one Machine and no Environment, so the
+        // synthetic spec below must declare the networks that Machine references.
+        // Leaving them empty rejected every Machine attached to a declared network
+        // -- harmless while Up refused such definitions, wrong once it admitted
+        // them. The cross-reference is not this function's invariant to hold: the
+        // real EnvironmentSpec is validated against the whole definition at
+        // admission (topology.rs `validate`), which is where a genuinely dangling
+        // reference is caught. Everything else MachineSpec asserts still applies.
+        let referenced = machine
+            .networks
+            .iter()
+            .map(|name| NetworkSpec {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                name: name.clone(),
+                kind: NetworkKind::Private,
+                cidr: None,
+            })
+            .collect();
         EnvironmentSpec {
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             default_machine: None,
             machines: vec![machine.clone()],
-            networks: Vec::new(),
+            networks: referenced,
             endpoints: Vec::new(),
         }
         .validate()
@@ -1165,6 +1184,29 @@ mod tests {
         restored
             .validate_for_machine(host(), &definition.environment.machines[0])
             .unwrap();
+
+        // A Machine attached to a declared network must validate. The synthetic
+        // EnvironmentSpec used above once carried `networks: Vec::new()`, which
+        // rejected every such Machine -- invisible while Up refused networked
+        // definitions, and the first thing a real networked Up hit once it did not.
+        let mut networked = restored.clone();
+        networked.machine.networks = vec!["backend".to_string()];
+        let networked_machine = networked.machine.clone();
+        networked
+            .validate_for_machine(host(), &networked_machine)
+            .expect("a Machine attached to a declared network validates");
+
+        // The invariant this must NOT lose: the Machine is still validated. A
+        // duplicate reference is a MachineSpec fault whatever the Environment says.
+        let mut duplicated = restored.clone();
+        duplicated.machine.networks = vec!["backend".to_string(), "backend".to_string()];
+        let duplicated_machine = duplicated.machine.clone();
+        assert!(
+            duplicated
+                .validate_for_machine(host(), &duplicated_machine)
+                .is_err(),
+            "a repeated network reference must still be refused"
+        );
 
         let mut digest_only = restored.clone();
         digest_only.machine.target.version = None;
