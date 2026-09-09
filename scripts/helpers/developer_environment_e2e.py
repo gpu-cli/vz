@@ -267,6 +267,18 @@ class Lane:
         live = processes_referencing(state)
         for pid, command in live:
             leaks.append({"kind": "process", "identifier": f"pid {pid}: {command[:200]}"})
+        # The daemon writes its log inside the socket root, which the rmtree below
+        # removes. The switch's drop-reason and first-carried-frame diagnostics
+        # live there, and an Environment under investigation is exactly the one
+        # whose evidence must outlive its runtime directory.
+        for root in state.roots():
+            for log in sorted(root.rglob("*.log")) if root.exists() else []:
+                try:
+                    target = self.evidence_dir / "daemon-logs" / log.relative_to(root)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.copy2(log, target)
+                except OSError as error:
+                    cleanup_errors.append(f"cannot retain daemon log {log}: {error}")
         if not cleanup_errors and not leaks:
             for root in state.roots():
                 if not root.exists():
