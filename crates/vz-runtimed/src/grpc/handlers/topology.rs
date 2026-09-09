@@ -253,9 +253,32 @@ impl runtime_v2::topology_service_server::TopologyService for TopologyServiceImp
                 ))
             })?;
 
+        // Health is taken after the aggregate is loaded and from this daemon's
+        // own registry, one reading per Machine in the answer. It is computed
+        // here rather than inside `project_state_to_proto` because it is not
+        // part of the aggregate: the translation of a persisted record must
+        // stay a pure function of that record, or an observation valid only for
+        // this reply would ride along into whatever writes the record next.
+        let machine_health = project
+            .environments
+            .iter()
+            .flat_map(|environment| {
+                environment.machines.iter().map(|machine| {
+                    vz_runtime_translate::machine_health_observation_to_proto(
+                        &vz_runtime_contract::MachineHealthObservation::new(
+                            environment.environment_id.clone(),
+                            machine.machine_id.clone(),
+                            self.daemon.machine_live_sessions().observe_health(machine),
+                        ),
+                    )
+                })
+            })
+            .collect();
+
         Ok(Response::new(runtime_v2::GetProjectStateResponse {
             request_id,
             project: Some(vz_runtime_translate::project_state_to_proto(&project)),
+            machine_health,
         }))
     }
 }

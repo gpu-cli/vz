@@ -143,7 +143,7 @@ pub(super) fn require_identity<S: EnvironmentStateStore>(
     Ok(())
 }
 
-fn mismatched_identity(
+pub(super) fn mismatched_identity(
     machine: &MachineInstance,
     identity: &StackRuntimeIdentity,
 ) -> Result<bool, MachineLiveSessionError> {

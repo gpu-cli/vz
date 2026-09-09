@@ -1292,20 +1292,36 @@ def check_error_envelope(ctx: CheckContext, top: str) -> SubCheck:
 # projection at all under `environments`, so the per-Machine identity, profile,
 # target and capability projection that criterion 2 reads was unpinned.
 # `*_OPTIONAL` names the fields the Rust structs mark `skip_serializing_if`;
-# every other field must appear. `test_developer_environment_e2e` reads all six
-# sets out of `crates/vz-cli/src/commands/dev_status.rs` rather than restating
-# them, so the next drift fails offline instead of on the gate host.
+# every other field must appear. `test_developer_environment_e2e` reads all
+# twelve sets out of `crates/vz-cli/src/commands/dev_status.rs` rather than
+# restating them, so the next drift fails offline instead of on the gate host.
+#
+# The network, attachment and endpoint sets are declared for the same reason the
+# Machine set is: criterion 2 reads topology and endpoints out of this document,
+# and a comparison that stopped at `environments` would accept a `networks` list
+# of empty objects.
 STATUS_FIELDS = {"schema_version", "request_id", "topology_state_source", "definition_path", "project_id",
                  "project_name", "host", "daemon", "desired_definition_digest", "persisted_definition_digest",
                  "definition_drift", "selection_source", "environments"}
 STATUS_OPTIONAL_FIELDS = {"selection_source"}
-ENVIRONMENT_FIELDS = {"environment_id", "name", "state", "definition_digest", "lifecycle_generation", "machines"}
+ENVIRONMENT_FIELDS = {"environment_id", "name", "state", "definition_digest", "lifecycle_generation", "machines",
+                      "networks", "network_attachments", "endpoints"}
 ENVIRONMENT_OPTIONAL_FIELDS: set[str] = set()
 MACHINE_FIELDS = {"machine_id", "name", "state", "profile", "target", "requested_capabilities",
-                  "negotiated_capabilities", "backend", "incarnation_id", "incarnation_generation",
+                  "negotiated_capabilities", "health", "backend", "incarnation_id", "incarnation_generation",
                   "docker_context", "docker_context_availability"}
 MACHINE_OPTIONAL_FIELDS = {"backend", "incarnation_id", "incarnation_generation", "docker_context",
                            "docker_context_availability"}
+NETWORK_FIELDS = {"network_id", "name", "kind", "cidr"}
+NETWORK_OPTIONAL_FIELDS = {"cidr"}
+ATTACHMENT_FIELDS = {"attachment_id", "machine_id", "network_id"}
+ATTACHMENT_OPTIONAL_FIELDS: set[str] = set()
+ENDPOINT_FIELDS = {"endpoint_id", "name", "machine_id", "network_id", "protocol", "port", "hostname"}
+ENDPOINT_OPTIONAL_FIELDS = {"hostname"}
+# Every reading `MachineHealth` can take. `supervised` is the only one a Machine
+# this lane just brought up may report; the rest exist so a check can say which
+# wrong answer it saw instead of only that the answer was wrong.
+MACHINE_HEALTH_READINGS = {"supervised", "unsupervised", "diverged", "inactive", "unobservable"}
 
 
 def _compare_field_set(check: SubCheck, label: str, observed: set, declared: set, optional: set) -> None:
@@ -1416,4 +1432,435 @@ def check_grpc_agreement(top: str) -> SubCheck:
     # daemon's own channel, not inferred from the CLI's JSON of the same state.
     check.not_implemented = ("CLI vs typed gRPC/API agreement (identities, transitions, events, receipts) needs a pinned "
                              "gRPC client for the daemon channel; the lane provisions Machines but speaks only the CLI.")
+    return check.finish()
+
+
+# ── Criterion 2: mixed-profile topology status ────────────────────────────────
+#
+# One Environment holding two Developer Linux Machines, one Hardened Linux
+# Machine, and one native macOS Machine, read back through `vz status --json`.
+
+MIXED_NETWORK = "backend"
+MIXED_PORT = PRIVATE_PORT
+# The three capabilities a Developer-profile Linux Machine implicitly acquires,
+# and that nothing else in the product may hold.
+DOCKER_CAPABILITIES = {"docker_engine", "compose", "buildx"}
+AMBIGUOUS_SENTINEL = "vz04-ambiguous-exec-must-not-run"
+
+
+def mixed_profile_definition(release_dir: Path, macos_entry) -> dict:
+    """Criterion 2's topology: two Developer Linux, one Hardened Linux, one macOS.
+
+    The Hardened Machine declares no `networks`, because it may not: both the
+    project-definition schema (`machine.allOf[2]`) and
+    `validate_machine_network_support` refuse Environment-network membership to
+    the restricted profile. That is what makes the endpoint denial below
+    structural rather than a firewall rule -- the Machine is given no port on
+    the switch at all -- and it is why the denial is proved against a Developer
+    endpoint that a Developer sibling really can reach.
+
+    `macos_entry` is None on a host with no registered Developer macOS template.
+    The Linux Machines are still exercised; the criterion's macOS clause is then
+    reported unimplemented by name rather than quietly dropped.
+    """
+    catalog = load_json(release_dir / "machine-target-catalog.json")
+    developer = next(item for item in catalog["linux"] if item["profile"] == "developer")
+    hardened = next(item for item in catalog["linux"] if item["profile"] == "hardened")
+
+    def linux(name: str, profile: str, entry: dict, networks: list) -> dict:
+        machine = {"schema_version": 1, "name": name, "profile": profile,
+                   "target": {"os": "linux", "arch": "aarch64", "image": entry["image"],
+                              "digest": entry["digest"]},
+                   "resources": {"cpus": 2, "memory_mb": 4096}}
+        if networks:
+            machine["networks"] = networks
+        return machine
+
+    machines = [linux("dev-0", "developer", developer, [MIXED_NETWORK]),
+                linux("dev-1", "developer", developer, [MIXED_NETWORK]),
+                linux("hardened-0", "hardened", hardened, [])]
+    if macos_entry is not None:
+        target = {"os": "macos", "arch": "aarch64", "image": macos_entry["image"], "channel": MACOS_CHANNEL}
+        if macos_entry.get("version"):
+            target["version"] = macos_entry["version"]
+        machines.append({"schema_version": 1, "name": "mac-0", "profile": "developer", "target": target,
+                         "resources": {"cpus": 2, "memory_mb": 4096}, "networks": [MIXED_NETWORK]})
+    return {"schema_version": 1, "project_id": "prj_" + uuid.uuid4().hex,
+            "name": "vz04-mixed-profile-topology",
+            "environment": {"schema_version": 1, "machines": machines,
+                            "networks": [{"schema_version": 1, "name": MIXED_NETWORK, "kind": "private"}],
+                            "endpoints": [{"schema_version": 1, "name": "probe", "machine": "dev-0",
+                                           "network": MIXED_NETWORK, "protocol": "tcp", "port": MIXED_PORT}]}}
+
+
+def _capabilities(machine: dict, field: str) -> set:
+    value = machine.get(field)
+    if not isinstance(value, dict) or not isinstance(value.get("capabilities"), list):
+        return set()
+    return {row for row in value["capabilities"] if isinstance(row, str)}
+
+
+def _machines_by_name(environment: dict) -> dict:
+    return {machine.get("name"): machine for machine in environment.get("machines") or []
+            if isinstance(machine, dict)}
+
+
+def _identity_map(payload) -> dict:
+    """`{environment name: (environment id, {machine name: machine id})}`.
+
+    Reduced to identity alone so that two reads can be compared for stability
+    without a difference in some unrelated live field looking like an identity
+    change.
+    """
+    if not isinstance(payload, dict):
+        return {}
+    identities = {}
+    for environment in payload.get("environments") or []:
+        if not isinstance(environment, dict):
+            continue
+        identities[environment.get("name")] = (
+            environment.get("environment_id"),
+            {machine.get("name"): machine.get("machine_id")
+             for machine in environment.get("machines") or [] if isinstance(machine, dict)})
+    return identities
+
+
+def check_mixed_profile_topology_status(ctx: CheckContext, top: str) -> SubCheck:
+    """Criterion 2, read out of one live mixed-profile Environment.
+
+    The claims are ordered so the first failure names the broken link: the
+    Environment must exist and hold exactly the declared Machines before their
+    projections are judged; each Machine's profile, target, capabilities and
+    Docker context are compared against what the definition declared rather than
+    checked for presence; the denial is proved only after the endpoint it is
+    denied has been shown to work from a Developer sibling; and health is proved
+    to be an observation by making it change.
+
+    Nothing here accepts a key as evidence of a value. Every comparison is an
+    equality against something the definition, the profile rule or a previous
+    read already fixed.
+    """
+    check = SubCheck(top, "mixed_profile_topology_status")
+    macos_entry = macos_target(ctx.release_dir)
+    try:
+        definition = mixed_profile_definition(ctx.release_dir, macos_entry)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail("cannot derive both Linux profiles from the release machine-target-catalog: "
+                   f"{error}")
+        return check.finish()
+    declared = {machine["name"]: machine for machine in definition["environment"]["machines"]}
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if schema_path.is_file():
+        problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                          key=lambda error: list(map(str, error.absolute_path)))
+        check.check(not problems, f"the mixed-profile definition validates ({len(declared)} Machines)"
+                    if not problems else f"definition invalid: {problems[0].message[:200]}")
+        if problems:
+            return check.finish()
+    else:
+        check.fail(f"project definition schema absent: {PROJECT_DEFINITION_SCHEMA}")
+        return check.finish()
+
+    instance = provision(ctx, check, "mix", definition)
+    if instance.get("unsupported"):
+        check.not_implemented = ("this runtime refused the mixed-profile definition: " +
+                                 instance["unsupported"][:300])
+        return check.finish()
+    if check.status != "PASS" or not instance["status"]:
+        return check.finish()
+    payload = instance["status"]
+
+    # ── the document's own shape, at every level ──────────────────────────────
+    _compare_field_set(check, "status", set(payload), STATUS_FIELDS, STATUS_OPTIONAL_FIELDS)
+    environments = payload.get("environments")
+    if not check.check(isinstance(environments, list) and len(environments) == 1,
+                       "exactly one Environment is reported (observed "
+                       f"{len(environments) if isinstance(environments, list) else None})"):
+        return check.finish()
+    environment = environments[0]
+    _compare_field_set(check, "environment", set(environment), ENVIRONMENT_FIELDS,
+                       ENVIRONMENT_OPTIONAL_FIELDS)
+    machines = _machines_by_name(environment)
+    if not check.check(sorted(machines) == sorted(declared),
+                       f"every declared Machine is reported (declared {sorted(declared)}, "
+                       f"observed {sorted(machines)})"):
+        return check.finish()
+    for name in sorted(machines):
+        _compare_field_set(check, f"machine {name}", set(machines[name]), MACHINE_FIELDS,
+                           MACHINE_OPTIONAL_FIELDS)
+    for network in environment.get("networks") or []:
+        _compare_field_set(check, "network", set(network), NETWORK_FIELDS, NETWORK_OPTIONAL_FIELDS)
+    for attachment in environment.get("network_attachments") or []:
+        _compare_field_set(check, "attachment", set(attachment), ATTACHMENT_FIELDS,
+                           ATTACHMENT_OPTIONAL_FIELDS)
+    for endpoint in environment.get("endpoints") or []:
+        _compare_field_set(check, "endpoint", set(endpoint), ENDPOINT_FIELDS, ENDPOINT_OPTIONAL_FIELDS)
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── stable Environment and Machine IDs ────────────────────────────────────
+    environment_id = environment.get("environment_id")
+    identities = {name: machine.get("machine_id") for name, machine in machines.items()}
+    check.check(isinstance(environment_id, str) and environment_id != "",
+                f"the Environment names a non-empty immutable ID ({environment_id!r})")
+    check.check(all(isinstance(value, str) and value for value in identities.values()) and
+                len(set(identities.values())) == len(identities),
+                f"every Machine names a distinct non-empty immutable ID ({identities})")
+    # Stability is only meaningful across reads, and across two ways of naming
+    # the same Environment: an ID minted per answer would pass a single read.
+    first = _identity_map(payload)
+    again = read_status(ctx, check, "mix-again", project=instance["project"], env=instance["env"])
+    by_name = ctx.run(check, "mix-status-by-name", ["--json", "status", "--environment", "default"],
+                      cwd=instance["project"], env=instance["env"], timeout=60)
+    try:
+        selected = json.loads(by_name.stdout.decode("utf-8")) if by_name.exit_code == 0 else None
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        selected = None
+    check.check(_identity_map(again) == first,
+                f"a second read reports the same identities ({_identity_map(again) == first})")
+    check.check(selected is not None and _identity_map(selected) == first,
+                "selecting the Environment by name reports the same identities "
+                f"(exit {by_name.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── target-qualified profiles and capabilities ────────────────────────────
+    for name in sorted(declared):
+        want, machine = declared[name], machines[name]
+        target = machine.get("target") if isinstance(machine.get("target"), dict) else {}
+        check.check(machine.get("profile") == want["profile"] and
+                    target.get("os") == want["target"]["os"] and
+                    target.get("arch") == want["target"]["arch"],
+                    f"{name} is target-qualified as declared (want {want['profile']}/"
+                    f"{want['target']['os']}/{want['target']['arch']}, observed "
+                    f"{machine.get('profile')!r}/{target.get('os')!r}/{target.get('arch')!r})")
+        negotiated = _capabilities(machine, "negotiated_capabilities")
+        requested = _capabilities(machine, "requested_capabilities")
+        developer_linux = want["profile"] == "developer" and want["target"]["os"] == "linux"
+        if developer_linux:
+            check.check(DOCKER_CAPABILITIES <= negotiated,
+                        f"{name} implicitly negotiated the private Docker capabilities "
+                        f"(missing {sorted(DOCKER_CAPABILITIES - negotiated)})")
+        else:
+            # Criterion 2's Hardened clause, and the product rule that native
+            # Machines never acquire Docker. Asserted on requested as well:
+            # a capability that was asked for and refused still tells the reader
+            # this Machine was meant to have Docker.
+            check.check(not (DOCKER_CAPABILITIES & (negotiated | requested)),
+                        f"{name} holds no Docker capability at all (observed negotiated "
+                        f"{sorted(DOCKER_CAPABILITIES & negotiated)}, requested "
+                        f"{sorted(DOCKER_CAPABILITIES & requested)})")
+
+    # ── Docker contexts, present exactly where the profile grants them ────────
+    contexts = {}
+    for name in sorted(declared):
+        want, machine = declared[name], machines[name]
+        developer_linux = want["profile"] == "developer" and want["target"]["os"] == "linux"
+        context = machine.get("docker_context")
+        if developer_linux:
+            if not check.check(isinstance(context, dict), f"{name} reports a Docker context "
+                               f"(observed {context!r})"):
+                continue
+            contexts[name] = tuple(context.get(field) for field in ("name", "endpoint", "engine_id"))
+            check.check(all(isinstance(value, str) and value for value in contexts[name]),
+                        f"{name}'s Docker context names itself, its endpoint and its engine "
+                        f"({contexts[name]})")
+            check.check(machine.get("docker_context_availability") == "persisted_ready_not_live_probed",
+                        f"{name}'s Docker context is a persisted Ready projection (observed "
+                        f"{machine.get('docker_context_availability')!r})")
+        else:
+            check.check("docker_context" not in machine and
+                        "docker_context_availability" not in machine,
+                        f"{name} omits every Docker context field (observed "
+                        f"{sorted(set(machine) & {'docker_context', 'docker_context_availability'})})")
+    check.check(len(set(contexts.values())) == len(contexts),
+                f"each Developer Machine's Docker context is its own ({contexts})")
+
+    # ── topology and endpoints ────────────────────────────────────────────────
+    networks = environment.get("networks") or []
+    if not check.check(len(networks) == 1 and networks[0].get("name") == MIXED_NETWORK and
+                       networks[0].get("kind") == "private",
+                       f"the declared private network is reported (observed {networks})"):
+        return check.finish()
+    network_id = networks[0].get("network_id")
+    check.check(isinstance(network_id, str) and network_id != "",
+                f"the network names an immutable ID ({network_id!r})")
+    attached = {name for name, machine in declared.items() if machine.get("networks")}
+    observed_attached = {}
+    for attachment in environment.get("network_attachments") or []:
+        observed_attached[attachment.get("machine_id")] = attachment.get("network_id")
+    expected_attached = {identities[name]: network_id for name in attached}
+    check.check(observed_attached == expected_attached,
+                f"exactly the network-declaring Machines hold a port ({sorted(attached)}); "
+                f"observed {observed_attached}, expected {expected_attached}")
+    endpoints = environment.get("endpoints") or []
+    declared_endpoint = definition["environment"]["endpoints"][0]
+    check.check(len(endpoints) == 1 and endpoints[0].get("name") == declared_endpoint["name"] and
+                endpoints[0].get("machine_id") == identities[declared_endpoint["machine"]] and
+                endpoints[0].get("network_id") == network_id and
+                endpoints[0].get("protocol") == declared_endpoint["protocol"] and
+                endpoints[0].get("port") == declared_endpoint["port"],
+                f"the declared endpoint is reported on its own Machine and network (observed "
+                f"{endpoints})")
+
+    # ── health, as this daemon observed it ────────────────────────────────────
+    readings = {name: machine.get("health") for name, machine in machines.items()}
+    states = {name: machine.get("state") for name, machine in machines.items()}
+    check.check(set(readings.values()) <= MACHINE_HEALTH_READINGS,
+                f"every health reading is one this contract defines ({readings})")
+    check.check(all(state == "ready" for state in states.values()) and
+                all(reading == "supervised" for reading in readings.values()),
+                f"every Machine is Ready and supervised by the daemon that answered "
+                f"(states {states}, health {readings})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── ambiguous exec fails closed ───────────────────────────────────────────
+    # Proved in both directions: the ambiguous form must refuse AND must not
+    # have run, and the same command with `--machine` must succeed, or "fails
+    # closed" is indistinguishable from "exec is broken".
+    # Deliberately the same command shape `machine_exec_argv` uses, minus
+    # `--machine`: a different shape could refuse for a different reason.
+    ambiguous = ctx.run(check, "mix-exec-ambiguous",
+                        ["--json", "exec", "--environment", "default", "--", "/bin/busybox", "sh",
+                         "-c", f"/bin/busybox echo {AMBIGUOUS_SENTINEL}"],
+                        cwd=instance["project"], env=instance["env"], timeout=120)
+    detail = ambiguous.stderr.decode("utf-8", "replace")
+    check.check(ambiguous.exit_code != 0 and AMBIGUOUS_SENTINEL.encode() not in ambiguous.stdout,
+                f"`vz exec` without --machine refuses and runs nothing (exit "
+                f"{ambiguous.exit_code}, stdout {ambiguous.stdout[:80]!r})")
+    check.check("ambiguous" in detail and all(name in detail for name in declared),
+                "the refusal says the selection is ambiguous and lists every candidate "
+                f"({detail[:300]!r})")
+    resolved = machine_exec(ctx, check, "mix-exec-resolved", instance, "dev-0",
+                            f"/bin/busybox echo {AMBIGUOUS_SENTINEL}")
+    check.check(resolved.exit_code == 0 and AMBIGUOUS_SENTINEL.encode() in resolved.stdout,
+                f"the same command with --machine runs (exit {resolved.exit_code}, "
+                f"stdout {resolved.stdout[:80]!r})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── the Hardened Machine cannot use a sibling Developer endpoint ──────────
+    # First the structural fact: the restricted profile is handed no port on the
+    # switch, so there is no fabric NIC on its kernel cmdline at all.
+    hardened_fabric = FabricState(machine_exec(ctx, check, "mix-hardened-fabric", instance,
+                                               "hardened-0", FABRIC_PROBE))
+    check.check(hardened_fabric.declared == [],
+                f"the Hardened Machine holds no Environment fabric port ({hardened_fabric.evidence()})")
+    server_state = FabricState(machine_exec(ctx, check, "mix-dev0-fabric", instance, "dev-0",
+                                            FABRIC_PROBE))
+    port = server_state.port()
+    if not check.check(port is not None, "dev-0 carries the fabric address the host derived "
+                       f"({server_state.evidence()})"):
+        return check.finish()
+    address = port["address"]
+    token = "vzmix-" + uuid.uuid4().hex[:16]
+    # Held open, not backgrounded: a Machine exec SIGKILLs its whole process
+    # group before reporting, so a daemonised httpd is already dead when the
+    # sibling fetches -- which reads exactly like a denial.
+    server = hold_machine_exec(ctx, check, "mix-serve", instance, "dev-0",
+                               f"/bin/busybox mkdir -p /www; printf %s {token} > /www/index.html; "
+                               f"/bin/busybox httpd -f -p {MIXED_PORT} -h /www")
+    try:
+        local = None
+        for attempt in range(1, LISTENER_ATTEMPTS + 1):
+            local = machine_exec(ctx, check, "mix-serve-local", instance, "dev-0",
+                                 f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{MIXED_PORT}/")
+            if local.exit_code == 0 and local.stdout.strip() == token.encode():
+                break
+            time.sleep(LISTENER_INTERVAL)
+        if not check.check(local is not None and local.exit_code == 0 and
+                           local.stdout.strip() == token.encode(),
+                           f"the endpoint answers on dev-0's own fabric address after {attempt} "
+                           f"attempt(s) (exit {None if local is None else local.exit_code})"):
+            return check.finish()
+        sibling = machine_exec(ctx, check, "mix-sibling", instance, "dev-1",
+                               f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{address}:{MIXED_PORT}/")
+        if not check.check(sibling.exit_code == 0 and sibling.stdout.strip() == token.encode(),
+                           f"a Developer sibling reads the endpoint (exit {sibling.exit_code}, "
+                           f"{sibling.stdout[:80]!r})"):
+            return check.finish()
+        # The denial must not rest on a missing applet. Prove the Hardened
+        # Machine's own wget works by fetching a listener it holds itself; only
+        # then is its failure against the sibling a routing fact.
+        control_token = "vzmix-hardened-" + uuid.uuid4().hex[:8]
+        control = hold_machine_exec(ctx, check, "mix-hardened-serve", instance, "hardened-0",
+                                    f"/bin/busybox mkdir -p /www; printf %s {control_token} > /www/index.html; "
+                                    f"/bin/busybox httpd -f -p {MIXED_PORT} -h /www")
+        try:
+            loopback = None
+            for attempt in range(1, LISTENER_ATTEMPTS + 1):
+                loopback = machine_exec(ctx, check, "mix-hardened-loopback", instance, "hardened-0",
+                                        f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - "
+                                        f"http://127.0.0.1:{MIXED_PORT}/")
+                if loopback.exit_code == 0 and loopback.stdout.strip() == control_token.encode():
+                    break
+                time.sleep(LISTENER_INTERVAL)
+            if not check.check(loopback is not None and loopback.exit_code == 0 and
+                               loopback.stdout.strip() == control_token.encode(),
+                               "the Hardened Machine's own HTTP client and server work, so its "
+                               "failure below is a routing fact (exit "
+                               f"{None if loopback is None else loopback.exit_code})"):
+                return check.finish()
+            denied = machine_exec(ctx, check, "mix-hardened-denied", instance, "hardened-0",
+                                  f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - "
+                                  f"http://{address}:{MIXED_PORT}/; printf ':%s' $?")
+            check.check(denied.exit_code == 0 and token.encode() not in denied.stdout and
+                        not denied.stdout.strip().endswith(b":0"),
+                        "the Hardened Machine cannot reach the sibling Developer endpoint "
+                        f"(observed {denied.stdout[:120]!r})")
+        finally:
+            released = ctx.release(check, control)
+            check.check(released.exit_code is not None,
+                        f"the Hardened control listener was released (exit {released.exit_code})")
+    finally:
+        released = ctx.release(check, server)
+        check.check(released.exit_code is not None,
+                    f"the held endpoint listener was released (exit {released.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── health is an observation, not a constant ──────────────────────────────
+    # Every reading above was `supervised`, which a hard-coded field would also
+    # produce. Stop retires the daemon's sessions, so the same Machines must now
+    # read `inactive` -- and the identities must not have moved.
+    stopped = ctx.run(check, "mix-stop", ["--json", "stop", "--environment", "default",
+                                          "--timeout", "120"],
+                      cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+    check.check(stopped.exit_code == 0, f"the Environment stopped (exit {stopped.exit_code})")
+    after = read_status(ctx, check, "mix-after-stop", project=instance["project"], env=instance["env"])
+    if check.check(after is not None, "status is readable after Stop"):
+        rows = _machines_by_name(after["environments"][0]) if after.get("environments") else {}
+        after_states = {name: machine.get("state") for name, machine in rows.items()}
+        after_health = {name: machine.get("health") for name, machine in rows.items()}
+        check.check(sorted(rows) == sorted(declared) and _identity_map(after) == first,
+                    f"Stop preserved every Machine and its identity ({sorted(rows)})")
+        check.check(all(state == "stopped" for state in after_states.values()),
+                    f"every Machine is Stopped ({after_states})")
+        check.check(all(reading == "inactive" for reading in after_health.values()),
+                    f"every Machine now reads inactive, so health tracked the change "
+                    f"({after_health})")
+
+    if check.status == "PASS":
+        removed = ctx.run(check, "mix-delete", ["--json", "delete", "--environment", "default",
+                                                "--timeout", "120"],
+                          cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+        check.check(removed.exit_code == 0, f"deleted (exit {removed.exit_code})")
+
+    # Everything above is the Linux half plus, when a template is registered,
+    # the native macOS Machine. Criterion 2 names "one native macOS Machine"
+    # explicitly, so a host that cannot build one has not satisfied the
+    # criterion, and saying so by name is the only honest close.
+    if check.status == "PASS" and macos_entry is None:
+        check.not_implemented = (
+            "criterion 2 requires the Environment to hold one native macOS Machine alongside the "
+            "two Developer Linux Machines and the Hardened Linux Machine. This release's "
+            "machine-target-catalog.json registers no Developer macOS target, so no macOS Machine "
+            "was declared, built, or reported, and none of the macOS clause -- its target-qualified "
+            "profile and capabilities, its health, its absence of a Docker context -- was "
+            "exercised. The three Linux Machines above passed in full. The catalog a "
+            "release candidate ships is written by its own vz-runtimed with the Linux profiles "
+            "only (scripts/build-vz-0.4-release-candidate.sh step 7); a locally installed template "
+            "registered by vz-macos-setup lives in a separate installation prefix and does not "
+            "reach it. This check never provisions or registers a template.")
     return check.finish()

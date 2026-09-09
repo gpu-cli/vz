@@ -1,5 +1,5 @@
 use tonic::{Code, Request, Status};
-use vz_runtime_contract::{ProjectId, ProjectState};
+use vz_runtime_contract::{MachineHealthObservation, ProjectId, ProjectState};
 use vz_runtime_proto::runtime_v2;
 use vz_runtime_translate::project_state_from_proto;
 
@@ -164,10 +164,17 @@ impl StopEventValidator {
 }
 
 /// Canonically validated Project topology returned by the runtime daemon.
+///
+/// `machine_health` is not part of `project`: it is what the answering daemon
+/// could see of each Machine's supervision at reply time, joined to the
+/// persisted record by `machine_id` and never written back into it. The client
+/// requires exactly one reading per Machine in `project`, so a caller never has
+/// to decide what a missing one meant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectStateSnapshot {
     pub request_id: String,
     pub project: ProjectState,
+    pub machine_health: Vec<MachineHealthObservation>,
 }
 
 impl DaemonClient {
@@ -269,9 +276,29 @@ impl DaemonClient {
                 ),
             });
         }
+        let expected: Vec<_> = project
+            .environments
+            .iter()
+            .flat_map(|environment| {
+                environment.machines.iter().map(|machine| {
+                    (
+                        environment.environment_id.clone(),
+                        machine.machine_id.clone(),
+                    )
+                })
+            })
+            .collect();
+        let machine_health = vz_runtime_translate::machine_health_observations_from_proto(
+            &response.machine_health,
+            &expected,
+        )
+        .map_err(|error| DaemonClientError::IncompatibleProtocol {
+            reason: format!("GetProjectState returned invalid Machine health: {error}"),
+        })?;
         Ok(ProjectStateSnapshot {
             request_id: response.request_id,
             project,
+            machine_health,
         })
     }
 
