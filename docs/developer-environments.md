@@ -315,6 +315,28 @@ capabilities, health, endpoints, and a Docker context for each Developer-profile
 Linux Machine; Hardened Machines omit Docker contexts. Bare `vz` prints static
 top-level help, exits zero, and does not inspect or create resources.
 
+Every field of `status` but one is a projection of persisted state. The
+exception is each Machine's `health`, which the answering daemon recomputes for
+every reply from its own supervision registry: `supervised` when it still holds
+the live session it registered when it booted that Machine and that session
+names the persisted runtime identity, `unsupervised` when the record is Ready
+but this daemon holds no session for it, `diverged` when a session exists but
+disagrees with the record, `inactive` when no live supervision is expected and
+none is claimed — no session under a record that does not claim Ready, or the
+spent session a positive Stop leaves behind — and `unobservable` when the
+daemon could not read its own registry. Health reaches
+into no guest: it is not a ping, a guest-agent round trip, a Docker Engine
+probe, or a service check, so a `supervised` Machine is one the daemon is still
+running rather than one whose workload is known to be serving. It is never
+persisted, and `docker_context_availability` is likewise a persisted
+lifecycle/capability projection and never a live Engine probe.
+
+Routine `status` reports the Environment's shape — its networks, which Machines
+hold a port on them, and the declared endpoints — because those are what the
+definition asked for and what makes the Environment legible. It does not report
+workspace bindings, the internal owned-resource graph, host imports and exports,
+or egress policy.
+
 There is no canonical `vz dev` namespace and no public or hidden `run`, `shell`,
 `list`, `logs`, `restart`, `docker`, `stack`, `network`, `machine`, or `vm`
 compatibility family in 0.4. Advanced lifecycle, topology, files, logs,

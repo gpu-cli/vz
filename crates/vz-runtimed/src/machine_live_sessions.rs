@@ -6,7 +6,7 @@
 //! This trusted controller API does not authorize RPCs or acknowledge journals.
 
 mod failed_up;
-use failed_up::{FailedUpRuntime, require_session_identity};
+use failed_up::{FailedUpRuntime, mismatched_identity, require_session_identity};
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -18,9 +18,9 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tokio::sync::{OwnedMutexGuard, watch};
 use vz_runtime_contract::{
-    EnvironmentLifecycleKind, EnvironmentLifecycleOperation, MachineId, ResourceOwner,
-    STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION, StackRuntimeIdentity,
-    StackRuntimeShutdownOutcome, StackRuntimeShutdownRequest,
+    EnvironmentLifecycleKind, EnvironmentLifecycleOperation, MachineHealth, MachineId,
+    MachineState, ResourceOwner, STACK_RUNTIME_SHUTDOWN_REQUEST_SCHEMA_VERSION,
+    StackRuntimeIdentity, StackRuntimeShutdownOutcome, StackRuntimeShutdownRequest,
 };
 
 use crate::environment_runtime_controller::{EnvironmentControllerLease, EnvironmentStateStore};
@@ -1003,6 +1003,69 @@ impl MachineLiveSessions {
         Ok(())
     }
 
+    /// Read this daemon's own supervision registry for one persisted Machine.
+    ///
+    /// Read-only and lease-free by design. Every other entry point here demands
+    /// an `EnvironmentControllerLease` because it is about to change something;
+    /// this one changes nothing and is answered while `status` holds no
+    /// lifecycle fence at all, so requiring a lease would make routine status
+    /// contend with Up, Stop and Delete for the right to describe them.
+    ///
+    /// It observes only what this process holds: a registered session, whether
+    /// that session still owns its live resources, whether a teardown of it has
+    /// already completed positively, and whether its runtime identity is exactly
+    /// the one persisted on the record. It reaches into no guest, opens no
+    /// socket, and never blocks on I/O.
+    ///
+    /// A poisoned registry is reported as `Unobservable` rather than as any of
+    /// the four readings: status must not invent a supervision answer it could
+    /// not actually take.
+    pub fn observe_health(&self, machine: &vz_runtime_contract::MachineInstance) -> MachineHealth {
+        let Ok(sessions) = self.sessions.lock() else {
+            return MachineHealth::Unobservable;
+        };
+        let Some(session) = sessions.machines.get(&machine.machine_id) else {
+            return supervision_reading(machine.state, None);
+        };
+        let Ok(resources) = session.resources.lock() else {
+            return MachineHealth::Unobservable;
+        };
+        let Ok(failed_up) = session.failed_up.lock() else {
+            return MachineHealth::Unobservable;
+        };
+        // A public Stop does not remove the registration -- only Delete's
+        // quiescence does -- so the entry that outlives a successful Stop is a
+        // spent receipt rather than a live supervision, and reading it as one
+        // would report every stopped Machine as a divergence.
+        let Ok(attempt) = session.attempt.lock() else {
+            return MachineHealth::Unobservable;
+        };
+        let teardown_succeeded = attempt.as_ref().is_some_and(|attempt| {
+            attempt
+                .result
+                .borrow()
+                .as_ref()
+                .is_some_and(|result| result.is_ok())
+        });
+        supervision_reading(
+            machine.state,
+            Some(SessionFacts {
+                holds_live_resources: resources.is_some(),
+                teardown_succeeded,
+                failed_up_bound: failed_up.is_some(),
+                // A persisted identity that will not parse, or an incarnation
+                // with no identity at all, is a record this session cannot be
+                // matched against. That is a disagreement about the Machine,
+                // not an unreadable registry, so it is `false` and not
+                // `Unobservable`.
+                identity_agrees: matches!(
+                    mismatched_identity(machine, &session.identity),
+                    Ok(false)
+                ),
+            }),
+        )
+    }
+
     /// Transfer authoritative live ownership to the daemon. Duplicate entries,
     /// including an equal owner with a different Runtime, are rejected. The
     /// endpoint must originate from this pointer-identical activation.
@@ -1687,6 +1750,54 @@ fn rebind_completed_stop<S: EnvironmentStateStore>(
         docker_shutdown: None,
         outcome: StackRuntimeShutdownOutcome::AlreadyAbsent,
     })
+}
+
+/// What the registry held for one Machine, reduced to the four facts the
+/// reading turns on. Separated from the lookup so the decision itself is a pure
+/// function: a live session exists only after a real boot, so a rule kept
+/// inside the lookup could not be exercised without one.
+#[derive(Debug, Clone, Copy)]
+struct SessionFacts {
+    holds_live_resources: bool,
+    /// A Stop or Delete teardown of this exact session finished positively.
+    teardown_succeeded: bool,
+    failed_up_bound: bool,
+    identity_agrees: bool,
+}
+
+/// The supervision reading for one Machine.
+///
+/// `Ready` is the only persisted state a successful activation produces, so it
+/// is the only state whose missing session is a disagreement rather than the
+/// expected answer. Everything else -- creating, stopped, failed -- is expected
+/// to have no session, and calling that `Unsupervised` would report every
+/// stopped Machine as a problem.
+///
+/// The mirror of that is a session that outlives its Machine. A public Stop
+/// consumes the session's resources but leaves the registration in place (only
+/// Delete's quiescence retires it), so the ordinary post-Stop entry has no live
+/// resources and a positive teardown receipt. Read against a record that agrees
+/// the Machine is down, that is `Inactive`; read against a record still
+/// claiming `Ready`, the two genuinely disagree.
+fn supervision_reading(state: MachineState, session: Option<SessionFacts>) -> MachineHealth {
+    let Some(facts) = session else {
+        return if state == MachineState::Ready {
+            MachineHealth::Unsupervised
+        } else {
+            MachineHealth::Inactive
+        };
+    };
+    if facts.failed_up_bound || !facts.identity_agrees {
+        return MachineHealth::Diverged;
+    }
+    match (facts.holds_live_resources, facts.teardown_succeeded) {
+        (true, _) => MachineHealth::Supervised,
+        (false, true) if state != MachineState::Ready => MachineHealth::Inactive,
+        // Resources released with no positive receipt is a teardown in flight
+        // or one that failed; a positive receipt under a still-Ready record is
+        // a Machine the daemon has already torn down.
+        (false, _) => MachineHealth::Diverged,
+    }
 }
 
 fn require_available_session(
@@ -2986,5 +3097,107 @@ mod tests {
                 .contains("replacement preserved")
         );
         assert!(fence.lock().unwrap().is_some());
+    }
+
+    fn facts(live: bool, teardown: bool, failed_up: bool, identity: bool) -> SessionFacts {
+        SessionFacts {
+            holds_live_resources: live,
+            teardown_succeeded: teardown,
+            failed_up_bound: failed_up,
+            identity_agrees: identity,
+        }
+    }
+
+    #[test]
+    fn a_machine_with_no_session_reads_ready_and_every_other_state_differently() {
+        // Ready is the only state a successful activation produces, so it is
+        // the only one whose missing session is a disagreement. If the two arms
+        // ever collapse the reading becomes a constant and stops observing.
+        assert_eq!(
+            supervision_reading(MachineState::Ready, None),
+            MachineHealth::Unsupervised
+        );
+        for state in [
+            MachineState::Creating,
+            MachineState::Stopped,
+            MachineState::Failed,
+        ] {
+            assert_eq!(
+                supervision_reading(state, None),
+                MachineHealth::Inactive,
+                "{state:?} expects no session"
+            );
+        }
+    }
+
+    #[test]
+    fn only_a_live_agreeing_session_reads_supervised() {
+        assert_eq!(
+            supervision_reading(MachineState::Ready, Some(facts(true, false, false, true))),
+            MachineHealth::Supervised
+        );
+        // Each of these alone is enough to make the session disagree with the
+        // record, and the reading must say so on every one of them.
+        for (live, teardown, failed_up, identity) in [
+            (false, false, false, true),
+            (true, false, true, true),
+            (true, false, false, false),
+            (false, false, true, false),
+        ] {
+            assert_eq!(
+                supervision_reading(
+                    MachineState::Ready,
+                    Some(facts(live, teardown, failed_up, identity))
+                ),
+                MachineHealth::Diverged,
+                "live={live} teardown={teardown} failed_up={failed_up} identity={identity}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_positively_stopped_session_reads_inactive_and_an_unfinished_one_diverged() {
+        // A public Stop leaves the registration in place with its resources
+        // consumed, so the ordinary post-Stop entry has to read `Inactive`; a
+        // reading that called it `Diverged` would flag every stopped Machine.
+        assert_eq!(
+            supervision_reading(MachineState::Stopped, Some(facts(false, true, false, true))),
+            MachineHealth::Inactive
+        );
+        // Released resources with no positive receipt is a teardown in flight,
+        // which is exactly the window Stop and Delete care about.
+        assert_eq!(
+            supervision_reading(
+                MachineState::Stopped,
+                Some(facts(false, false, false, true))
+            ),
+            MachineHealth::Diverged
+        );
+        // A positive teardown under a record that still claims Ready is a real
+        // disagreement: the daemon has torn down a Machine the record calls up.
+        assert_eq!(
+            supervision_reading(MachineState::Ready, Some(facts(false, true, false, true))),
+            MachineHealth::Diverged
+        );
+    }
+
+    #[test]
+    fn a_poisoned_registry_is_unobservable_rather_than_a_guessed_reading() {
+        let sessions = MachineLiveSessions::default();
+        let machine = delete_fixture().0.machines.remove(0);
+        assert_eq!(
+            sessions.observe_health(&machine),
+            MachineHealth::Inactive,
+            "a readable empty registry answers from the record"
+        );
+        let poisoner = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _held = sessions.sessions.lock().unwrap();
+            panic!("poison the supervision registry");
+        }));
+        assert!(poisoner.is_err());
+        assert_eq!(
+            sessions.observe_health(&machine),
+            MachineHealth::Unobservable
+        );
     }
 }

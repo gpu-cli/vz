@@ -51,6 +51,7 @@ CRITERION_1 = "gate.instances.three_concurrent_no_collision"
 CRITERION_16 = "gate.reproducibility.recreate_from_definition"
 CRITERION_11 = "gate.delete.single_environment_safety"
 CRITERION_5 = "gate.network.private_topology_paths"
+CRITERION_2 = "gate.machines.mixed_profile_topology_status"
 CRITERION_10 = "gate.lifecycle.recovery_including_sleep_wake"
 CRITERION_19 = "gate.migration.install_upgrade_rollback_uninstall"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
@@ -372,9 +373,30 @@ class Lane:
             crash = traceback.format_exc()
             write_exclusive(self.evidence_dir / "crash.txt", crash.encode())
         rows, _path = write_inventory(self.evidence_dir, "lane-state-root", state.root)
+        # pre-sleep leaves its daemons running on purpose: post-wake has to find
+        # the Environments they supervise. Post-wake has now observed that, so
+        # the Machines it woke are stopped here rather than left running through
+        # the gap until final-cleanup removes the state root underneath them.
+        cleanup_errors = []
+        try:
+            daemons = stop_daemons(state)
+            write_exclusive(self.evidence_dir / "cleanup.txt",
+                            (f"daemons stopped after recovery was observed: "
+                             f"{daemons if daemons else 'none present'}\n").encode())
+        except CleanupError as error:
+            cleanup_errors.append(str(error))
+        leaks = [{"kind": "process", "identifier": f"pid {pid}: {command[:200]}"}
+                 for pid, command in processes_referencing(state)]
         extra = {"handoff": self.handoff_record(), "retained_root": str(state.root),
-                 "evidence_files": self.evidence_files(), "process_starts": recorder.process_starts}
+                 "evidence_files": self.evidence_files(), "process_starts": recorder.process_starts,
+                 "cleanup_errors": cleanup_errors, "leaks": leaks}
         _scenarios, result, code = self.compose_result(subchecks, crash, recorder, moment=moment, extra=extra)
+        if (cleanup_errors or leaks) and result["failure"] is None:
+            result["outcome"] = "failed"
+            result["failure"] = {"reason": "cleanup", "detail": "; ".join(cleanup_errors) or
+                                 f"{len(leaks)} live processes still reference the lane state root",
+                                 "exit_code": EXIT_FAILED}
+            code = EXIT_FAILED
         if result["failure"] is not None:
             result["failure"]["detail"] += f"; lane state root inventory {len(rows)} entries"
         self.write_result(result)
@@ -549,7 +571,8 @@ class Lane:
                                   docker_client=self.options.get("docker", "none"),
                                   plugins={"compose": self.options.get("compose-plugin"),
                                            "buildx": self.options.get("buildx-plugin")})
-        subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: [], CRITERION_19: []}
+        subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: [],
+                     CRITERION_2: [], CRITERION_19: []}
         crash = None
         started = now_ns()
         try:
@@ -564,6 +587,7 @@ class Lane:
             subchecks[CRITERION_15].append(checks.check_grpc_agreement(ctx, CRITERION_15))
             subchecks[CRITERION_1].append(checks.check_three_concurrent_environments(ctx, CRITERION_1))
             subchecks[CRITERION_5].append(checks.check_private_topology_paths(ctx, CRITERION_5))
+            subchecks[CRITERION_2].append(checks.check_mixed_profile_topology_status(ctx, CRITERION_2))
             subchecks[CRITERION_19].append(checks.check_migration_install_upgrade_rollback_uninstall(ctx, CRITERION_19))
         except Exception:  # noqa: BLE001 - recorded as a crash, never swallowed
             crash = traceback.format_exc()

@@ -38,6 +38,7 @@ TOP21 = e2e.CRITERION_21
 TOP15 = e2e.CRITERION_15
 TOP1 = "gate.instances.three_concurrent_no_collision"
 TOP5 = "gate.network.private_topology_paths"
+TOP2 = e2e.CRITERION_2
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 TOP19 = e2e.CRITERION_19
@@ -56,9 +57,18 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # from inside a check. These tests deliberately unstage it (see `setUp`), so
 # offline the check reports the gap by name instead of claiming the criterion.
 #
+# `mixed_profile_topology_status` proves criterion 2 for two Developer Linux
+# Machines and one Hardened Linux Machine, including the Hardened Machine's
+# denial of a sibling Developer endpoint. The criterion also requires one native
+# macOS Machine in the same Environment, and the fake release registers no macOS
+# target -- as no release candidate built by `build-vz-0.4-release-candidate.sh`
+# does. The check declines to claim PASS on the Linux subset rather than
+# certifying the criterion on evidence that never built a macOS Machine.
+#
 # `grpc_api_live_agreement` is deliberately absent from this set: the release
 # now ships vz-runtime-probe, so criterion 15's typed channel is exercised.
-NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall"}
+NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall",
+                   "mixed_profile_topology_status"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -80,6 +90,13 @@ class TopologyLaneTests(unittest.TestCase):
         self.counter = 0
         self.socket_root = recorder.socket_root_for(self.state_root)
         self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
+        # persisted-recovery/pre-sleep leaves its daemons running on purpose, and
+        # a standalone phase can too. Left alive they outlive tearDown's rmtree
+        # and keep writing into a tree the next test is using -- which showed up
+        # as a different test failing each run with the same signature, its own
+        # temp directory vanishing underneath it. The lane's own stopper is used
+        # so this cleans up exactly what the lane started.
+        self.addCleanup(self.stop_lane_daemons)
         # Criterion 19 runs the pinned v0.3.20 daemon over the store it restored
         # when it is staged. Point it at a path that is not, so these tests
         # observe one outcome whatever this machine has cached.
@@ -104,6 +121,18 @@ class TopologyLaneTests(unittest.TestCase):
         budget = state.socket_budget()
         self.assertTrue(budget["bindable"], budget)
         self.assertFalse(str(state.socket).startswith(str(self.state_root)))
+
+    def stop_lane_daemons(self):
+        """Stop any daemon this test's lane left supervising Machines."""
+        state = e2e.LaneState(self.state_root, self.release / "bin")
+        if not state.root.exists():
+            return
+        try:
+            e2e.stop_daemons(state)
+        except e2e.CleanupError:
+            # Reported by the phase that owns cleanup; a test teardown that
+            # raised here would mask the failure the test was making.
+            pass
 
     def set_mode(self, mode: str):
         self.mode_file.write_text(mode)
@@ -200,6 +229,7 @@ class TopologyLaneTests(unittest.TestCase):
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
+        self.assertEqual(self.top(result, TOP2)["status"], "FAIL")
         for identifier in assigned - {TOP21, TOP15, TOP1}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
@@ -222,7 +252,8 @@ class TopologyLaneTests(unittest.TestCase):
                           f"{TOP1}__three_concurrent_no_collision",
                           f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set",
                           f"{TOP15}__grpc_api_live_agreement",
-                          f"{TOP19}__install_upgrade_rollback_uninstall"})
+                          f"{TOP19}__install_upgrade_rollback_uninstall",
+                          f"{TOP2}__mixed_profile_topology_status"})
         receipts = sorted((evidence / "receipts").glob("*.json"))
         self.assertGreater(len(receipts), expected)
         for path in receipts[:5] + receipts[-5:]:
@@ -595,6 +626,86 @@ class TopologyLaneTests(unittest.TestCase):
                                      env={**env, "VZ_INSTALL_DIR": unsafe}, capture_output=True, timeout=120)
             self.assertEqual(refused.returncode, 1, (unsafe, refused.stdout.decode()))
             self.assertIn(message, refused.stderr)
+    # -- criterion 2: the mixed-profile topology status check -------------------
+    #
+    # Three failing-before cases, one per claim the check makes that nothing
+    # else in the lane makes. Each drives a stand-in that breaks exactly one of
+    # them, so a check that asserted key presence instead of values, or that
+    # read a health field it never compared, would pass here and must not.
+
+    def assert_criterion_two_regression(self, mode: str, needle: str):
+        self.set_mode(mode)
+        evidence = self.evidence()
+        code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        self.assertEqual((code, result["outcome"], result["failure"]["reason"]),
+                         (1, "failed", "assertion"), mode)
+        sub = self.by_slug(result)["mixed_profile_topology_status"]
+        self.assertEqual(sub["status"], "FAIL", mode)
+        self.assertTrue(any(a.startswith("FAILED: ") and needle in a for a in sub["assertions"]),
+                        (mode, sub["assertions"]))
+        # A genuine regression must not be dressed up as the criterion's own
+        # unexercised macOS clause.
+        self.assertFalse(any(a.startswith("not_implemented:") for a in sub["assertions"]), mode)
+        self.assertEqual(self.top(result, TOP2)["status"], "FAIL")
+        return sub
+
+    def test_a_hardened_machine_holding_docker_fails_criterion_2(self):
+        """The criterion's Hardened clause, made falsifiable."""
+        sub = self.assert_criterion_two_regression(
+            "hardened_docker", "hardened-0 holds no Docker capability at all")
+        self.assertTrue(any(a.startswith("FAILED: ") and "omits every Docker context field" in a
+                            for a in sub["assertions"]), sub["assertions"])
+
+    def test_a_health_field_that_never_changes_fails_criterion_2(self):
+        """Health has to be an observation. A written-in constant reads the same
+        on a Ready Machine, so the check stops the Environment and requires the
+        reading to follow the state."""
+        self.assert_criterion_two_regression(
+            "constant_health", "every Machine now reads inactive")
+
+    def test_an_exec_that_guesses_a_machine_fails_criterion_2(self):
+        """Fails closed means refused AND not run: a stand-in that silently
+        picks the first Machine must break the first of those, not only the
+        message."""
+        sub = self.assert_criterion_two_regression(
+            "ambiguous_exec_runs", "`vz exec` without --machine refuses and runs nothing")
+        self.assertTrue(any("the same command with --machine runs (exit 0" in a
+                            for a in sub["assertions"]), sub["assertions"])
+
+    def test_the_mixed_profile_definition_is_the_topology_the_criterion_names(self):
+        """The definition itself, before any runtime is involved.
+
+        Criterion 2 names a Machine count and a profile mix. A definition that
+        quietly dropped the Hardened Machine, or gave it a network it may not
+        declare, would make every later assertion true of the wrong topology.
+        """
+        schema_document = common.load_json(
+            common.REPO_ROOT / "schemas/vz-project-definition-v1.schema.json")
+
+        def problems(document):
+            return sorted(Draft202012Validator(schema_document).iter_errors(document),
+                          key=lambda error: list(map(str, error.absolute_path)))
+
+        definition = checks.mixed_profile_definition(self.release, None)
+        machines = {machine["name"]: machine for machine in definition["environment"]["machines"]}
+        self.assertEqual(sorted((machine["profile"], machine["target"]["os"])
+                                for machine in machines.values()),
+                         [("developer", "linux"), ("developer", "linux"), ("hardened", "linux")])
+        hardened = [machine for machine in machines.values() if machine["profile"] == "hardened"]
+        self.assertNotIn("networks", hardened[0])
+        self.assertEqual(problems(definition), [])
+
+        # With a registered macOS target the fourth Machine appears, is a
+        # Developer native Machine, and joins the same declared network.
+        entry = {"image": "vz-macos", "version": "26.3.1", "channels": ["latest", "xcode"]}
+        with_macos = checks.mixed_profile_definition(self.release, entry)
+        native = [machine for machine in with_macos["environment"]["machines"]
+                  if machine["target"]["os"] == "macos"]
+        self.assertEqual(len(native), 1)
+        self.assertEqual(native[0]["profile"], "developer")
+        self.assertEqual(native[0]["target"]["channel"], checks.MACOS_CHANNEL)
+        self.assertEqual(native[0]["networks"], [checks.MIXED_NETWORK])
+        self.assertEqual(problems(with_macos), [])
 
     def test_wrapper_script_runs_the_lane(self):
         evidence = self.evidence()
@@ -662,7 +773,10 @@ class StatusFieldSetAgreementTests(unittest.TestCase):
         for struct, declared, optional in (
                 ("StatusOutput", checks.STATUS_FIELDS, checks.STATUS_OPTIONAL_FIELDS),
                 ("EnvironmentStatus", checks.ENVIRONMENT_FIELDS, checks.ENVIRONMENT_OPTIONAL_FIELDS),
-                ("MachineStatus", checks.MACHINE_FIELDS, checks.MACHINE_OPTIONAL_FIELDS)):
+                ("MachineStatus", checks.MACHINE_FIELDS, checks.MACHINE_OPTIONAL_FIELDS),
+                ("NetworkStatus", checks.NETWORK_FIELDS, checks.NETWORK_OPTIONAL_FIELDS),
+                ("NetworkAttachmentStatus", checks.ATTACHMENT_FIELDS, checks.ATTACHMENT_OPTIONAL_FIELDS),
+                ("EndpointStatus", checks.ENDPOINT_FIELDS, checks.ENDPOINT_OPTIONAL_FIELDS)):
             with self.subTest(struct=struct):
                 fields, skipped = _rust_serialized_fields(self.source, struct)
                 self.assertEqual(fields, declared)
@@ -677,9 +791,14 @@ class StatusFieldSetAgreementTests(unittest.TestCase):
         self.assertNotEqual(drifted, self.source)
         fields, _ = _rust_serialized_fields(drifted, "MachineStatus")
         self.assertEqual(fields - checks.MACHINE_FIELDS, {"topology"})
+        # Anchored on the field *pair*, because `machine_id: String,` now also
+        # opens `NetworkAttachmentStatus` and appears in `EndpointStatus`: a
+        # single-field anchor would silently drift a different struct and this
+        # falsification would stop testing what it names.
         newly_optional = self.source.replace(
-            "    machine_id: String,",
-            '    #[serde(skip_serializing_if = "String::is_empty")]\n    machine_id: String,', 1)
+            "    machine_id: String,\n    name: String,",
+            '    #[serde(skip_serializing_if = "String::is_empty")]\n'
+            "    machine_id: String,\n    name: String,", 1)
         _, skipped = _rust_serialized_fields(newly_optional, "MachineStatus")
         self.assertEqual(skipped - checks.MACHINE_OPTIONAL_FIELDS, {"machine_id"})
 

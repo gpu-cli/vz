@@ -1,5 +1,6 @@
 //! `vz status` — read one project's persisted Developer Environment topology.
 
+use std::collections::BTreeMap;
 use std::env;
 use std::ffi::OsString;
 use std::fmt;
@@ -12,11 +13,11 @@ use vz_cli::developer_environment_context::{
 };
 use vz_cli::project_definition::{DefinitionDiscoveryError, discover_project_definition};
 use vz_runtime_contract::{
-    CapabilitySet, EnvironmentId, EnvironmentInstance, EnvironmentSelectionContext,
-    EnvironmentSelectionSource, EnvironmentSelector, EnvironmentState,
+    CapabilitySet, EndpointProtocol, EnvironmentId, EnvironmentInstance,
+    EnvironmentSelectionContext, EnvironmentSelectionSource, EnvironmentSelector, EnvironmentState,
     MAX_TOPOLOGY_SELECTION_CANDIDATES, MachineBackend, MachineCapability,
-    MachineDockerContextDescriptor, MachineId, MachineProfile, MachineState, TargetSpec,
-    TopologyCandidate, TopologyResolutionError,
+    MachineDockerContextDescriptor, MachineHealth, MachineId, MachineProfile, MachineState,
+    NetworkKind, TargetSpec, TopologyCandidate, TopologyResolutionError,
 };
 use vz_runtime_proto::runtime_v2;
 use vz_runtimed_client::{DaemonClientError, ProjectStateSnapshot};
@@ -85,8 +86,37 @@ struct StatusDaemon {
     version: String,
 }
 
-/// Deliberately bounded persisted-state projection. Workspace paths, ownership
-/// internals, and endpoint material are not part of routine CLI status output.
+/// A bounded persisted-state projection, now including the Environment's shape.
+///
+/// The previous position was that networks, attachments and endpoints were
+/// "endpoint material" and belonged outside routine status alongside workspace
+/// paths and ownership internals. That reading does not survive the release
+/// contract: `docs/developer-environments.md` says `status` reports "topology,
+/// identities, targets, capabilities, health, endpoints, and a Docker context
+/// for each Developer-profile Linux Machine", and an Environment whose networks
+/// and endpoints are invisible cannot be read for what it is. The identity, the
+/// shape and the declared service coordinates are the answer to "what is this
+/// Environment"; they are declared by the user in `vz.json` and tell a reader
+/// nothing they did not write.
+///
+/// What stays out, and why it is not the same category:
+///
+/// * `bindings` — host workspace paths. Filesystem layout of the machine the
+///   command ran on, not Environment shape.
+/// * `ownership` — the internal owned-resource graph: store paths, socket
+///   paths, context names keyed by resource id. This is how the runtime finds
+///   and reclaims what it made, and printing it invites reading a private
+///   implementation path as a public address.
+/// * `host_exports` / `host_imports` — the host boundary. Their persisted form
+///   is identity and a name only: the bound loopback port and the import
+///   credential are runtime state that is deliberately never persisted. Routine
+///   status could therefore print a grant's name while being structurally
+///   unable to say whether the grant is live or what it reaches, and a named
+///   grant reads as an authorized one.
+/// * `egress` — external reachability policy, and a Machine property rather
+///   than Environment topology.
+/// * `active_operation_id`, `legacy_migration` — lifecycle fencing and
+///   migration provenance internals.
 #[derive(Debug, Serialize)]
 struct EnvironmentStatus {
     environment_id: String,
@@ -95,6 +125,48 @@ struct EnvironmentStatus {
     definition_digest: String,
     lifecycle_generation: u64,
     machines: Vec<MachineStatus>,
+    networks: Vec<NetworkStatus>,
+    network_attachments: Vec<NetworkAttachmentStatus>,
+    endpoints: Vec<EndpointStatus>,
+}
+
+/// One Environment-owned network, by identity and declared shape.
+#[derive(Debug, Serialize)]
+struct NetworkStatus {
+    network_id: String,
+    name: String,
+    kind: NetworkKind,
+    /// Absent means the runtime chose the range rather than the declaration.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cidr: Option<String>,
+}
+
+/// Which Machine holds a port on which network. This is the topology proper:
+/// networks alone say what exists, and attachments say what is connected.
+#[derive(Debug, Serialize)]
+struct NetworkAttachmentStatus {
+    attachment_id: String,
+    machine_id: String,
+    network_id: String,
+}
+
+/// One declared service coordinate inside the Environment.
+///
+/// The persisted record carries the protocol and port precisely so that "which
+/// port is endpoint `api` on" is answerable from durable state; reporting them
+/// is reporting the declaration, not a live listener or any credential.
+#[derive(Debug, Serialize)]
+struct EndpointStatus {
+    endpoint_id: String,
+    name: String,
+    machine_id: String,
+    network_id: String,
+    protocol: EndpointProtocol,
+    port: u16,
+    /// The in-Environment hostname, when the declaration named one that is not
+    /// simply the endpoint `name`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hostname: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -113,6 +185,14 @@ struct MachineStatus {
     /// or the capabilities of a neighboring Machine or the daemon itself.
     requested_capabilities: CapabilitySet,
     negotiated_capabilities: CapabilitySet,
+    /// What the answering daemon could see of this Machine's supervision when
+    /// it replied: whether it still holds the live session it registered when
+    /// it booted the Machine, and whether that session names the persisted
+    /// runtime identity. It is the one field here that is not read out of the
+    /// persisted record, and it is deliberately not a guest probe -- nothing is
+    /// asked of the Machine itself, so a `supervised` Machine is one the daemon
+    /// is still running, not one whose workload is known to be serving.
+    health: MachineHealth,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend: Option<MachineBackend>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -121,8 +201,19 @@ struct MachineStatus {
     incarnation_generation: Option<u64>,
 }
 
-impl From<EnvironmentInstance> for EnvironmentStatus {
-    fn from(environment: EnvironmentInstance) -> Self {
+impl EnvironmentStatus {
+    /// Project one persisted Environment, joining each Machine to the health
+    /// reading the daemon took for it in the same reply.
+    ///
+    /// A Machine the daemon returned no reading for becomes `Unobservable`
+    /// rather than being silently omitted or defaulted to a healthy value. In
+    /// practice the client refuses such a response outright; this is the second
+    /// door on the same rule.
+    fn project(
+        environment: EnvironmentInstance,
+        health: &BTreeMap<(String, String), MachineHealth>,
+    ) -> Self {
+        let environment_key = environment.environment_id.to_string();
         Self {
             environment_id: environment.environment_id.to_string(),
             name: environment.name,
@@ -133,6 +224,10 @@ impl From<EnvironmentInstance> for EnvironmentStatus {
                 .machines
                 .into_iter()
                 .map(|machine| MachineStatus {
+                    health: health
+                        .get(&(environment_key.clone(), machine.machine_id.to_string()))
+                        .copied()
+                        .unwrap_or(MachineHealth::Unobservable),
                     docker_context_availability: machine.docker_context.as_ref().map(|_| {
                         if machine.state == MachineState::Stopped {
                             "stopped_unavailable"
@@ -164,6 +259,38 @@ impl From<EnvironmentInstance> for EnvironmentStatus {
                         .map(|incarnation| incarnation.generation),
                 })
                 .collect(),
+            networks: environment
+                .networks
+                .into_iter()
+                .map(|network| NetworkStatus {
+                    network_id: network.network_id.to_string(),
+                    name: network.name,
+                    kind: network.kind,
+                    cidr: network.cidr,
+                })
+                .collect(),
+            network_attachments: environment
+                .network_attachments
+                .into_iter()
+                .map(|attachment| NetworkAttachmentStatus {
+                    attachment_id: attachment.attachment_id.to_string(),
+                    machine_id: attachment.machine_id.to_string(),
+                    network_id: attachment.network_id.to_string(),
+                })
+                .collect(),
+            endpoints: environment
+                .endpoints
+                .into_iter()
+                .map(|endpoint| EndpointStatus {
+                    endpoint_id: endpoint.endpoint_id.to_string(),
+                    name: endpoint.name,
+                    machine_id: endpoint.machine_id.to_string(),
+                    network_id: endpoint.network_id.to_string(),
+                    protocol: endpoint.protocol,
+                    port: endpoint.port,
+                    hostname: endpoint.hostname,
+                })
+                .collect(),
         }
     }
 }
@@ -174,6 +301,10 @@ struct SelectedStatus {
     project_name: String,
     selection_source: Option<EnvironmentSelectionSource>,
     environments: Vec<EnvironmentInstance>,
+    /// The daemon's readings for the whole reply, keyed by
+    /// `(environment_id, machine_id)`. Selection narrows the Environments that
+    /// are reported; it never re-takes or re-interprets an observation.
+    machine_health: BTreeMap<(String, String), MachineHealth>,
 }
 
 impl StatusCommandError {
@@ -306,7 +437,7 @@ pub async fn cmd_dev_status(args: DevStatusArgs, json: bool) -> Result<(), Statu
         environments: selected
             .environments
             .into_iter()
-            .map(EnvironmentStatus::from)
+            .map(|environment| EnvironmentStatus::project(environment, &selected.machine_health))
             .collect(),
     };
 
@@ -336,7 +467,20 @@ fn select_status_environments(
     let ProjectStateSnapshot {
         request_id,
         project,
+        machine_health,
     } = snapshot;
+    let machine_health: BTreeMap<(String, String), MachineHealth> = machine_health
+        .into_iter()
+        .map(|observation| {
+            (
+                (
+                    observation.environment_id.to_string(),
+                    observation.machine_id.to_string(),
+                ),
+                observation.health,
+            )
+        })
+        .collect();
     let project_name = project.definition.name.clone();
     if args.all {
         let mut environments = project.environments;
@@ -346,6 +490,7 @@ fn select_status_environments(
             project_name,
             selection_source: None,
             environments,
+            machine_health,
         });
     }
 
@@ -377,6 +522,12 @@ fn select_status_environments(
         environment
             .endpoints
             .retain(|endpoint| endpoint.machine_id == machine_id);
+        // Attachments are per-Machine exactly as endpoints are, so a
+        // Machine-scoped report must narrow them the same way; the networks
+        // themselves stay whole because they belong to the Environment.
+        environment
+            .network_attachments
+            .retain(|attachment| attachment.machine_id == machine_id);
         environment.ownership.retain(|record| {
             record
                 .machine_id
@@ -391,6 +542,7 @@ fn select_status_environments(
         project_name,
         selection_source: Some(selection.source),
         environments: vec![environment],
+        machine_health,
     })
 }
 
@@ -586,6 +738,9 @@ fn sort_environment_children(environment: &mut EnvironmentInstance) {
     environment
         .endpoints
         .sort_by(|left, right| left.endpoint_id.cmp(&right.endpoint_id));
+    environment
+        .network_attachments
+        .sort_by(|left, right| left.attachment_id.cmp(&right.attachment_id));
     environment.ownership.sort_by(|left, right| {
         left.resource_id
             .cmp(&right.resource_id)
@@ -630,6 +785,10 @@ fn print_text_status(output: &StatusOutput) {
                 machine.profile
             );
             println!(
+                "    Supervision health (this daemon, not a guest probe): {}",
+                machine.health
+            );
+            println!(
                 "    Capabilities (persisted): requested={:?} negotiated={:?}",
                 machine.requested_capabilities.capabilities,
                 machine.negotiated_capabilities.capabilities
@@ -651,6 +810,33 @@ fn print_text_status(output: &StatusOutput) {
                 );
             }
         }
+        for network in &environment.networks {
+            println!(
+                "  Network: {} ({}) [{:?}] cidr={}",
+                network.name,
+                network.network_id,
+                network.kind,
+                network.cidr.as_deref().unwrap_or("runtime-derived")
+            );
+        }
+        for attachment in &environment.network_attachments {
+            println!(
+                "  Attachment: {} machine={} network={}",
+                attachment.attachment_id, attachment.machine_id, attachment.network_id
+            );
+        }
+        for endpoint in &environment.endpoints {
+            println!(
+                "  Endpoint: {} ({}) machine={} network={} {:?}/{} hostname={}",
+                endpoint.name,
+                endpoint.endpoint_id,
+                endpoint.machine_id,
+                endpoint.network_id,
+                endpoint.protocol,
+                endpoint.port,
+                endpoint.hostname.as_deref().unwrap_or(&endpoint.name)
+            );
+        }
     }
 }
 
@@ -659,10 +845,10 @@ mod tests {
     #![allow(clippy::unwrap_used)]
     use super::*;
     use vz_runtime_contract::{
-        Architecture, CapabilitySet, EnvironmentSpec, EnvironmentState, MachineInstance,
-        MachineProfile, MachineResources, MachineSpec, MachineState, OperatingSystem,
-        ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION, TargetSpec,
-        WorkspaceBinding, WorkspaceBindingId,
+        Architecture, CapabilitySet, EnvironmentSpec, EnvironmentState, MachineHealthObservation,
+        MachineInstance, MachineProfile, MachineResources, MachineSpec, MachineState,
+        OperatingSystem, ProjectDefinition, ProjectId, ProjectState, TOPOLOGY_SCHEMA_VERSION,
+        TargetSpec, WorkspaceBinding, WorkspaceBindingId,
     };
 
     fn environment_with_machines(id: &str, name: &str) -> EnvironmentInstance {
@@ -715,6 +901,182 @@ mod tests {
         }
     }
 
+    /// One Environment with a declared private network, both Machines attached
+    /// to it, and one endpoint on the first.
+    fn environment_with_shape(id: &str, name: &str) -> EnvironmentInstance {
+        let mut environment = environment_with_machines(id, name);
+        let network_id = vz_runtime_contract::NetworkId::new("net-backend").unwrap();
+        environment
+            .networks
+            .push(vz_runtime_contract::NetworkInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                network_id: network_id.clone(),
+                environment_id: environment.environment_id.clone(),
+                name: "backend".to_string(),
+                kind: NetworkKind::Private,
+                cidr: Some("10.85.0.0/24".to_string()),
+            });
+        for (index, machine) in environment.machines.iter().enumerate() {
+            environment
+                .network_attachments
+                .push(vz_runtime_contract::NetworkAttachmentInstance {
+                    schema_version: TOPOLOGY_SCHEMA_VERSION,
+                    attachment_id: vz_runtime_contract::NetworkAttachmentId::new(format!(
+                        "att-{index}"
+                    ))
+                    .unwrap(),
+                    environment_id: environment.environment_id.clone(),
+                    machine_id: machine.machine_id.clone(),
+                    network_id: network_id.clone(),
+                });
+        }
+        let served_by = environment.machines[0].machine_id.clone();
+        environment
+            .endpoints
+            .push(vz_runtime_contract::EndpointInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                endpoint_id: vz_runtime_contract::EndpointId::new("end-probe").unwrap(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: served_by,
+                network_id,
+                name: "probe".to_string(),
+                protocol: EndpointProtocol::Tcp,
+                port: 8080,
+                hostname: None,
+            });
+        environment
+    }
+
+    #[test]
+    fn status_reports_the_declared_networks_attachments_and_endpoints() {
+        // Criterion 2 reads topology and endpoints out of `vz status --json`,
+        // and every value below is one the definition declared: the projection
+        // must carry them across rather than merely emit the keys.
+        let environment = environment_with_shape("env-shape", "shape");
+        let expected_machine = environment.machines[0].machine_id.to_string();
+        let json = serde_json::to_value(project_without_readings(environment)).unwrap();
+        assert_eq!(json["networks"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["networks"][0]["network_id"], "net-backend");
+        assert_eq!(json["networks"][0]["name"], "backend");
+        assert_eq!(json["networks"][0]["kind"], "private");
+        assert_eq!(json["networks"][0]["cidr"], "10.85.0.0/24");
+        assert_eq!(
+            json["network_attachments"].as_array().map(Vec::len),
+            Some(2)
+        );
+        for attachment in json["network_attachments"].as_array().unwrap() {
+            assert_eq!(attachment["network_id"], "net-backend");
+        }
+        assert_eq!(json["endpoints"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["endpoints"][0]["endpoint_id"], "end-probe");
+        assert_eq!(json["endpoints"][0]["name"], "probe");
+        assert_eq!(
+            json["endpoints"][0]["machine_id"],
+            expected_machine.as_str()
+        );
+        assert_eq!(json["endpoints"][0]["network_id"], "net-backend");
+        assert_eq!(json["endpoints"][0]["protocol"], "tcp");
+        assert_eq!(json["endpoints"][0]["port"], 8080);
+        // An absent hostname is skipped rather than emitted as null: the
+        // endpoint resolves under its own name, which is already reported.
+        assert!(json["endpoints"][0].get("hostname").is_none());
+    }
+
+    #[test]
+    fn status_keeps_ownership_bindings_and_host_boundary_records_out_of_routine_output() {
+        // The deliberate exclusions, asserted rather than left to the doc
+        // comment: an aggregate field that starts being projected by accident
+        // has to fail here.
+        let environment = environment_with_shape("env-shape", "shape");
+        let json = serde_json::to_value(project_without_readings(environment)).unwrap();
+        let object = json.as_object().unwrap();
+        for excluded in [
+            "bindings",
+            "ownership",
+            "host_exports",
+            "host_imports",
+            "egress",
+            "active_operation_id",
+            "legacy_migration",
+            "project_id",
+            "created_at",
+            "updated_at",
+        ] {
+            assert!(
+                !object.contains_key(excluded),
+                "{excluded} reached routine status output"
+            );
+        }
+    }
+
+    #[test]
+    fn each_machine_reports_the_reading_taken_for_it_and_nothing_reaches_the_record() {
+        // Health is a per-Machine join, so a single environment-wide value or a
+        // reading applied to the wrong Machine has to be visible here.
+        let environment = environment_with_shape("env-health", "health");
+        let first = environment.machines[0].machine_id.to_string();
+        let second = environment.machines[1].machine_id.to_string();
+        let readings = BTreeMap::from([
+            (
+                (environment.environment_id.to_string(), first.clone()),
+                MachineHealth::Supervised,
+            ),
+            (
+                (environment.environment_id.to_string(), second.clone()),
+                MachineHealth::Diverged,
+            ),
+        ]);
+        let output = EnvironmentStatus::project(environment, &readings);
+        let json = serde_json::to_value(&output).unwrap();
+        for (index, machine) in output.machines.iter().enumerate() {
+            let expected = if machine.machine_id == first {
+                "supervised"
+            } else {
+                "diverged"
+            };
+            assert_eq!(json["machines"][index]["health"], expected);
+        }
+        // The reading is answer-time only. Nothing about it may appear on the
+        // Machine's persisted projection under another name.
+        assert!(json["machines"][0].get("runtime_identity").is_none());
+    }
+
+    #[test]
+    fn a_machine_with_no_reading_is_unobservable_rather_than_assumed_healthy() {
+        let environment = environment_with_shape("env-health", "health");
+        let first = environment.machines[0].machine_id.to_string();
+        let readings = BTreeMap::from([(
+            (environment.environment_id.to_string(), first.clone()),
+            MachineHealth::Supervised,
+        )]);
+        let output = EnvironmentStatus::project(environment, &readings);
+        for machine in &output.machines {
+            let expected = if machine.machine_id == first {
+                MachineHealth::Supervised
+            } else {
+                MachineHealth::Unobservable
+            };
+            assert_eq!(machine.health, expected, "machine {}", machine.machine_id);
+        }
+    }
+
+    #[test]
+    fn a_reading_taken_in_another_environment_is_never_borrowed() {
+        // The join is keyed by (environment_id, machine_id) because machine
+        // ids are unique only within an Environment. A key that dropped the
+        // Environment would let a sibling's reading answer for this one.
+        let environment = environment_with_shape("env-health", "health");
+        let machine = environment.machines[0].machine_id.to_string();
+        let readings = BTreeMap::from([(
+            ("env-somewhere-else".to_string(), machine.clone()),
+            MachineHealth::Supervised,
+        )]);
+        let output = EnvironmentStatus::project(environment, &readings);
+        for row in &output.machines {
+            assert_eq!(row.health, MachineHealth::Unobservable);
+        }
+    }
+
     #[test]
     fn docker_context_status_is_exact_and_explicitly_persisted_not_live_health() {
         let mut environment = environment_with_machines("env-context", "one");
@@ -734,7 +1096,7 @@ mod tests {
             incarnation_generation: 1,
         });
         machine.negotiated_capabilities = CapabilitySet::new([MachineCapability::DockerEngine]);
-        let ready = serde_json::to_value(EnvironmentStatus::from(environment.clone())).unwrap();
+        let ready = serde_json::to_value(project_without_readings(environment.clone())).unwrap();
         assert_eq!(
             ready["machines"][0]["docker_context"]["engine_id"],
             "exact-engine"
@@ -745,7 +1107,7 @@ mod tests {
         );
         assert!(ready["machines"][1].get("docker_context").is_none());
         environment.machines[0].state = MachineState::Stopped;
-        let stopped = serde_json::to_value(EnvironmentStatus::from(environment.clone())).unwrap();
+        let stopped = serde_json::to_value(project_without_readings(environment.clone())).unwrap();
         assert_eq!(
             stopped["machines"][0]["docker_context"],
             ready["machines"][0]["docker_context"]
@@ -756,11 +1118,18 @@ mod tests {
         );
         environment.machines[0].state = MachineState::Ready;
         environment.machines[0].negotiated_capabilities = CapabilitySet::default();
-        let unverified = serde_json::to_value(EnvironmentStatus::from(environment)).unwrap();
+        let unverified = serde_json::to_value(project_without_readings(environment)).unwrap();
         assert_eq!(
             unverified["machines"][0]["docker_context_availability"],
             "persisted_unavailable"
         );
+    }
+
+    /// Project without any daemon reading, for the tests that are about the
+    /// persisted projection alone. Every Machine then reports `unobservable`,
+    /// which is exactly what "nobody took a reading" has to mean.
+    fn project_without_readings(environment: EnvironmentInstance) -> EnvironmentStatus {
+        EnvironmentStatus::project(environment, &BTreeMap::new())
     }
 
     fn status_args(environment: Option<&str>, machine: Option<&str>, all: bool) -> DevStatusArgs {
@@ -829,13 +1198,28 @@ mod tests {
             path_hint: None,
             slots: std::collections::BTreeSet::new(),
         });
+        let project = ProjectState {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            definition,
+            environments: vec![dev, staging],
+        };
+        let machine_health = project
+            .environments
+            .iter()
+            .flat_map(|environment| {
+                environment.machines.iter().map(|machine| {
+                    MachineHealthObservation::new(
+                        environment.environment_id.clone(),
+                        machine.machine_id.clone(),
+                        MachineHealth::Supervised,
+                    )
+                })
+            })
+            .collect();
         ProjectStateSnapshot {
             request_id: "req-status".to_string(),
-            project: ProjectState {
-                schema_version: TOPOLOGY_SCHEMA_VERSION,
-                definition,
-                environments: vec![dev, staging],
-            },
+            project,
+            machine_health,
         }
     }
 
@@ -884,7 +1268,7 @@ mod tests {
         environment.machines[1].negotiated_capabilities =
             CapabilitySet::new([MachineCapability::PosixExec]);
 
-        let output = EnvironmentStatus::from(environment);
+        let output = project_without_readings(environment);
         assert_eq!(output.machines[0].requested_capabilities, requested);
         assert_eq!(output.machines[0].negotiated_capabilities, negotiated);
         for machine in &output.machines[1..] {
@@ -908,7 +1292,7 @@ mod tests {
         for machine in &mut environment.machines {
             machine.state = MachineState::Creating;
         }
-        let output = EnvironmentStatus::from(environment);
+        let output = project_without_readings(environment);
         for machine in &output.machines {
             assert_eq!(machine.profile, MachineProfile::Developer);
             assert_eq!(machine.target.os, OperatingSystem::Linux);

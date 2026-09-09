@@ -953,6 +953,11 @@ pub struct GetProjectStateResponse {
     pub request_id: ::prost::alloc::string::String,
     #[prost(message, optional, tag = "2")]
     pub project: ::core::option::Option<ProjectState>,
+    /// Recomputed on every reply from this daemon's own supervision registry, one
+    /// entry per Machine in `project`. Never persisted and never round-tripped
+    /// back into the aggregate.
+    #[prost(message, repeated, tag = "3")]
+    pub machine_health: ::prost::alloc::vec::Vec<MachineHealthObservation>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct TopologyCandidate {
@@ -3114,6 +3119,20 @@ pub struct GetCapabilitiesResponse {
     #[prost(message, repeated, tag = "2")]
     pub capabilities: ::prost::alloc::vec::Vec<Capability>,
 }
+/// One Machine's health as the answering daemon saw it, at reply time. Carries
+/// its own environment_id because a project answer spans several Environments
+/// and a machine_id is unique only within one.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct MachineHealthObservation {
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    #[prost(string, tag = "2")]
+    pub environment_id: ::prost::alloc::string::String,
+    #[prost(string, tag = "3")]
+    pub machine_id: ::prost::alloc::string::String,
+    #[prost(enumeration = "MachineHealth", tag = "4")]
+    pub health: i32,
+}
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
 #[repr(i32)]
 pub enum OperatingSystem {
@@ -3800,6 +3819,64 @@ impl SpaceCacheTrustOutcome {
                 Some(Self::RemoteVerifiedMaterialized)
             }
             "SPACE_CACHE_TRUST_OUTCOME_REMOTE_MISS_UNTRUSTED" => Some(Self::RemoteMissUntrusted),
+            _ => None,
+        }
+    }
+}
+/// What the answering daemon can see of one Machine's supervision.
+///
+/// Observes exactly one question: does the daemon that produced this answer
+/// still hold the live supervised runtime session it registered when it booted
+/// this Machine, and does that session name the runtime identity the persisted
+/// record names.
+///
+/// Observes nothing inside the guest: not a ping, not a guest-agent round trip,
+/// not a Docker Engine probe, and not a service or endpoint health check.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum MachineHealth {
+    Unspecified = 0,
+    /// A live session, still owning its runtime resources, whose runtime identity
+    /// is exactly the persisted one.
+    Supervised = 1,
+    /// Persisted Ready -- which only a successful activation produces -- but this
+    /// daemon holds no session for the Machine.
+    Unsupervised = 2,
+    /// A session exists but names a different runtime identity, has a failed Up
+    /// bound to it, released its resources without a positive teardown receipt, or
+    /// holds one for a Machine the record still calls Ready.
+    Diverged = 3,
+    /// No live supervision is expected and none is claimed: either no session and
+    /// a record that does not claim Ready, or the spent session a positive Stop
+    /// leaves behind under a record that agrees the Machine is down.
+    Inactive = 4,
+    /// The daemon could not read its own supervision registry.
+    Unobservable = 5,
+}
+impl MachineHealth {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "MACHINE_HEALTH_UNSPECIFIED",
+            Self::Supervised => "MACHINE_HEALTH_SUPERVISED",
+            Self::Unsupervised => "MACHINE_HEALTH_UNSUPERVISED",
+            Self::Diverged => "MACHINE_HEALTH_DIVERGED",
+            Self::Inactive => "MACHINE_HEALTH_INACTIVE",
+            Self::Unobservable => "MACHINE_HEALTH_UNOBSERVABLE",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "MACHINE_HEALTH_UNSPECIFIED" => Some(Self::Unspecified),
+            "MACHINE_HEALTH_SUPERVISED" => Some(Self::Supervised),
+            "MACHINE_HEALTH_UNSUPERVISED" => Some(Self::Unsupervised),
+            "MACHINE_HEALTH_DIVERGED" => Some(Self::Diverged),
+            "MACHINE_HEALTH_INACTIVE" => Some(Self::Inactive),
+            "MACHINE_HEALTH_UNOBSERVABLE" => Some(Self::Unobservable),
             _ => None,
         }
     }

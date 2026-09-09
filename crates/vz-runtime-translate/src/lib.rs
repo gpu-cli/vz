@@ -45,6 +45,8 @@ mod machine_execution;
 pub use machine_execution::*;
 mod environment_up;
 pub use environment_up::*;
+mod machine_health;
+pub use machine_health::*;
 
 /// Conversion failures between Runtime V2 wire messages and domain entities.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]

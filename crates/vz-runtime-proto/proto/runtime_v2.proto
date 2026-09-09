@@ -780,6 +780,10 @@ message GetProjectStateRequest {
 message GetProjectStateResponse {
   string request_id = 1;
   ProjectState project = 2;
+  // Recomputed on every reply from this daemon's own supervision registry, one
+  // entry per Machine in `project`. Never persisted and never round-tripped
+  // back into the aggregate.
+  repeated MachineHealthObservation machine_health = 3;
 }
 
 message TopologyCandidate {
@@ -2268,4 +2272,51 @@ message Capability {
 message GetCapabilitiesResponse {
   string request_id = 1;
   repeated Capability capabilities = 2;
+}
+
+// ── 11. Machine supervision health ────────────────────────────────
+//
+// Answer-time supervision health, carried beside the persisted aggregate
+// rather than on MachineInstance. A MachineInstance is durable record;
+// supervision belongs to the process that answered and is valid only for that
+// answer, so persisting it would produce a field that is stale the moment the
+// daemon exits and true-looking forever after.
+
+// What the answering daemon can see of one Machine's supervision.
+//
+// Observes exactly one question: does the daemon that produced this answer
+// still hold the live supervised runtime session it registered when it booted
+// this Machine, and does that session name the runtime identity the persisted
+// record names.
+//
+// Observes nothing inside the guest: not a ping, not a guest-agent round trip,
+// not a Docker Engine probe, and not a service or endpoint health check.
+enum MachineHealth {
+  MACHINE_HEALTH_UNSPECIFIED = 0;
+  // A live session, still owning its runtime resources, whose runtime identity
+  // is exactly the persisted one.
+  MACHINE_HEALTH_SUPERVISED = 1;
+  // Persisted Ready -- which only a successful activation produces -- but this
+  // daemon holds no session for the Machine.
+  MACHINE_HEALTH_UNSUPERVISED = 2;
+  // A session exists but names a different runtime identity, has a failed Up
+  // bound to it, released its resources without a positive teardown receipt, or
+  // holds one for a Machine the record still calls Ready.
+  MACHINE_HEALTH_DIVERGED = 3;
+  // No live supervision is expected and none is claimed: either no session and
+  // a record that does not claim Ready, or the spent session a positive Stop
+  // leaves behind under a record that agrees the Machine is down.
+  MACHINE_HEALTH_INACTIVE = 4;
+  // The daemon could not read its own supervision registry.
+  MACHINE_HEALTH_UNOBSERVABLE = 5;
+}
+
+// One Machine's health as the answering daemon saw it, at reply time. Carries
+// its own environment_id because a project answer spans several Environments
+// and a machine_id is unique only within one.
+message MachineHealthObservation {
+  uint32 schema_version = 1;
+  string environment_id = 2;
+  string machine_id = 3;
+  MachineHealth health = 4;
 }

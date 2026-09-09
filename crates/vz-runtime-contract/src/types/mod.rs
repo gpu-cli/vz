@@ -16,6 +16,7 @@ mod events;
 mod io;
 mod isolation;
 mod machine_execution;
+mod machine_health;
 pub use environment_up::{
     EnvironmentPreparationProgress, EnvironmentUpAdmission, EnvironmentUpCompletion,
     EnvironmentUpProgress, EnvironmentUpRequest,
@@ -36,6 +37,7 @@ pub use self::events::*;
 pub use self::io::*;
 pub use self::isolation::*;
 pub use self::machine_execution::*;
+pub use self::machine_health::*;
 pub use self::operations::*;
 pub use self::sandbox::*;
 pub use self::shared_vm::*;

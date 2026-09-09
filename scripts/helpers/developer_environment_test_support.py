@@ -11,7 +11,13 @@ drift (help gains a line), alias (`create` executes), provisions (`up` writes
 state and exits 0 without a definition), hang (`ls` sleeps past the
 deadline), autospawn (`status --all` spawns a fake daemon that shuts down
 gracefully on SIGTERM), bogus_pid (`status --all` leaves an unattributable
-PID file).
+PID file), hardened_docker (the Hardened Machine is given a Docker context and
+the Docker capabilities), constant_health (every Machine reads `supervised`
+whatever its state), ambiguous_exec_runs (`exec` without `--machine` silently
+picks the first Machine and runs).
+
+The last three exist to make criterion 2's check falsifiable offline: each one
+breaks exactly one of its claims, and the check has to notice.
 """
 from __future__ import annotations
 
@@ -91,15 +97,8 @@ if [ -n "$verb" ]; then
   # (topology removed by `delete`) mints new ones, which is what criterion 16
   # reads.
   if [ "$verb" = up ] && [ -f "$topology" ]; then
-    rm -f "$VZ_RUNTIME_DATA_DIR/stopped"
+    sed 's/^E stopped$/E ready/' "$topology" > "$topology.next" && mv "$topology.next" "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
-    exit 0
-  fi
-  if [ "$verb" = stop ] && [ -f "$topology" ]; then
-    # Stop preserves identity and declared state: the topology record stays
-    # exactly as it is and only the reported state changes.
-    : > "$VZ_RUNTIME_DATA_DIR/stopped"
-    printf '{"schema_version":1,"stopped":["default"]}\n'
     exit 0
   fi
   if [ "$verb" = up ] && [ -f vz.json ]; then
@@ -118,16 +117,76 @@ if [ -n "$verb" ]; then
     # Runtime identities are minted per Up, not derived from the definition:
     # recreating one pinned definition must hand out entirely new ones.
     inc=$(od -An -N8 -tx1 /dev/urandom | tr -d ' \n')
-    # Status must reflect the Machines the definition declares, not a fixed one.
-    names=$(grep -o '"name": *"machine-[^"]*"' vz.json | sed 's/.*"\(machine-[^"]*\)"/\1/' | sort -u | tr '\n' ' ')
-    [ -n "$names" ] || names="machine-0 "
-    printf '%s %s %s' "$pid" "$inc" "$names" > "$topology"
+    # Status must reflect the topology the definition declares, not a fixed one:
+    # every Machine with its own profile and target OS, plus the declared
+    # networks and endpoints. Reading it out of vz.json is what stops the fake
+    # from agreeing with an invented shape instead of with the definition.
+    { printf 'P %s\n' "$pid"; printf 'S %s\n' "$inc"; printf 'E ready\n'
+      awk '
+        { match($0, /^ */); depth = RLENGTH }
+        depth == 4 && /^ *"[a-z_]+": \[/ { split($0, k, "\""); section = k[2]; next }
+        section == "machines" && depth == 6 && /\{/ {
+          name = ""; profile = ""; os = ""; nets = ""; innets = 0; intarget = 0; next }
+        section == "machines" && depth == 6 && /\}/ {
+          if (name != "") printf "M %s %s %s %s\n", name, profile, os, (nets == "" ? "-" : nets)
+          name = ""; next }
+        section == "machines" && depth == 8 {
+          innets = ($0 ~ /^ *"networks": \[/); intarget = ($0 ~ /^ *"target": \{/)
+          split($0, k, "\"")
+          if (k[2] == "name") name = k[4]
+          if (k[2] == "profile") profile = k[4]
+          next }
+        section == "machines" && depth == 10 && innets { split($0, k, "\""); nets = (nets == "" ? k[2] : nets "," k[2]); next }
+        section == "machines" && depth == 10 && intarget {
+          split($0, k, "\""); if (k[2] == "os") os = k[4]; next }
+        section == "networks" && depth == 6 && /\{/ { nname = ""; nkind = ""; next }
+        section == "networks" && depth == 6 && /\}/ {
+          if (nname != "") printf "N %s %s\n", nname, nkind
+          nname = ""; next }
+        section == "networks" && depth == 8 {
+          split($0, k, "\""); if (k[2] == "name") nname = k[4]; if (k[2] == "kind") nkind = k[4]; next }
+        section == "endpoints" && depth == 6 && /\{/ { ename = ""; emach = ""; enet = ""; eproto = ""; eport = ""; next }
+        section == "endpoints" && depth == 6 && /\}/ {
+          if (ename != "") printf "X %s %s %s %s %s\n", ename, emach, enet, eproto, eport
+          ename = ""; next }
+        section == "endpoints" && depth == 8 {
+          split($0, k, "\"")
+          if (k[2] == "name") ename = k[4]
+          if (k[2] == "machine") emach = k[4]
+          if (k[2] == "network") enet = k[4]
+          if (k[2] == "protocol") eproto = k[4]
+          if (k[2] == "port") { p = k[3]; gsub(/[^0-9]/, "", p); eport = p }
+          next }
+      ' vz.json
+    } > "$topology"
+    grep -q '^M ' "$topology" || printf 'M machine-0 developer linux -\n' >> "$topology"
     printf '{"schema_version":1,"progress":{"completion":{}}}\n'
     exit 0
   fi
-  if [ "$verb" = exec ] && [ -f "$VZ_RUNTIME_DATA_DIR/stopped" ]; then
+  if [ "$verb" = stop ] && [ -f "$topology" ]; then
+    sed 's/^E ready$/E stopped/' "$topology" > "$topology.next" && mv "$topology.next" "$topology"
+    printf '{"schema_version":1,"stopped":["default"]}\n'
+    exit 0
+  fi
+  # A stopped Machine runs nothing. Without this, `stop` would be a no-op that
+  # a recovery check could pass straight through.
+  if [ "$verb" = exec ] && [ -f "$topology" ] && grep -q '^E stopped$' "$topology"; then
     printf '{"error":{"code":"machine_not_ready","message":"the Environment is stopped"},"schema_version":1}\n' >&2
     exit 2
+  fi
+  if [ "$verb" = exec ] && [ -f "$topology" ] && [ -z "$machine" ]; then
+    # Selection is ambiguous whenever the Environment holds more than one
+    # Machine and no default was declared, and it must refuse before running
+    # anything. `ambiguous_exec_runs` is the deliberately wrong stand-in: it
+    # picks the first Machine instead, which is exactly the failure this must
+    # be able to detect.
+    count=$(grep -c '^M ' "$topology")
+    if [ "$count" -gt 1 ] && [ "$mode" != ambiguous_exec_runs ]; then
+      cands=$(awk '$1=="M"{printf "%s%s (mch_x_%s)", sep, $2, $2; sep=", "}' "$topology")
+      printf '{"error":{"code":"validation_error","message":"Machine selection is ambiguous; specify --machine (candidates: %s)"},"schema_version":1}\n' "$cands" >&2
+      exit 1
+    fi
+    machine=$(awk '$1=="M"{print $2; exit}' "$topology")
   fi
   if [ "$verb" = exec ] && [ -f "$topology" ]; then
     # Model Machine-local mutable state: run the script with the sentinel path
@@ -144,7 +203,9 @@ if [ -n "$verb" ]; then
     # The shim needs the Machine identity: every Machine on a declared network
     # gets its OWN derived address, so a fake that keys addressing on the project
     # alone would hand two Machines one address and model the wrong property.
-    VZ_FAKE_MACHINE="$machine" /bin/sh "$script"
+    nets=$(awk -v m="$machine" '$1=="M" && $2==m {print $5}' "$topology")
+    [ "$nets" = "-" ] && nets=""
+    VZ_FAKE_MACHINE="$machine" VZ_FAKE_NETWORKS="$nets" /bin/sh "$script"
     code=$?
     rm -f "$script"
     exit $code
@@ -165,40 +226,80 @@ if [ -n "$verb" ]; then
     # below is derived from this project's own id, so two projects declaring
     # identical names still report distinct Environment, Machine, context and
     # endpoint identities -- which is what the no-collision check reads.
-    pid=$(cut -d' ' -f1 < "$topology")
-    sfx=$(cut -d' ' -f2 < "$topology")
-    names=$(cut -d' ' -f3- < "$topology")
+    pid=$(awk '$1=="P"{print $2}' "$topology")
+    sfx=$(awk '$1=="S"{print $2}' "$topology")
+    estate=$(awk '$1=="E"{print $2}' "$topology")
     dg="sha256:$(printf '%s' "$pid" | shasum -a 256 | cut -c1-64)"
+    if [ "$estate" = stopped ]; then mstate=stopped; health=inactive; else mstate=ready; health=supervised; fi
+    # `constant_health` is the deliberately wrong stand-in for a health field
+    # that is written rather than observed: it never changes with the state.
+    [ "$mode" = constant_health ] && health=supervised
     # The full declared success-payload field set, so an exact comparison of it
     # is exercised here and not only against the installed binaries.
     printf '{\n "schema_version": 1,\n "request_id": "req-%s",\n "topology_state_source": "persisted",\n' "$sfx"
     printf ' "definition_path": "%s/vz.json",\n "project_name": "vz04-topology-bootstrap",\n' "$PWD"
-    printf ' "host": {"os": "macos", "arch": "aarch64"},\n' 
+    printf ' "host": {"os": "macos", "arch": "aarch64"},\n'
     printf ' "daemon": {"backend_name": "macos-vz", "version": "0.1.0"},\n'
     printf ' "desired_definition_digest": "%s",\n "persisted_definition_digest": "%s",\n' "$dg" "$dg"
     printf ' "definition_drift": false,\n "selection_source": "workspace",\n "project_id": "%s",\n' "$pid"
-    estate=ready
-    [ -f "$VZ_RUNTIME_DATA_DIR/stopped" ] && estate=stopped
     printf ' "environments": [\n  {\n   "environment_id": "env_%s",\n   "name": "default",\n   "state": "%s",\n' "$sfx" "$estate"
     printf '   "definition_digest": "%s",\n   "lifecycle_generation": 1,\n' "$dg"
     printf '   "machines": ['
     sep=""
-    for m in $names; do
+    awk '$1=="M"{print $2, $3, $4, $5}' "$topology" | while read -r m profile os nets; do
       # The complete per-Machine projection, not just the identities the
       # no-collision check reads: the exact-field-set check compares this object
       # against the declared Machine set, so a fake emitting less than the
       # installed binaries do would let that comparison pass on absence.
-      printf '%s{"name": "%s", "state": "%s", "docker_context": {' "$sep" "$m" "$estate"
-      printf '"owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
-      printf '"name": "vzr1-ctx-%s-%s", "endpoint": "unix:///tmp/vz-%s-%s.sock",' "$sfx" "$m" "$sfx" "$m"
-      printf '"engine_id": "eng-%s-%s"}, "machine_id": "mch_%s_%s",' "$sfx" "$m" "$sfx" "$m"
-      printf '"docker_context_availability": "persisted_ready_not_live_probed",'
-      printf '"profile": "developer", "backend": "macos_virtualization_linux",'
-      printf '"target": {"os": "linux", "arch": "aarch64", "image": "vz-linux",'
+      #
+      # A Docker context and the Docker capabilities belong to a
+      # Developer-profile LINUX Machine and to nothing else. `hardened_docker`
+      # is the deliberately wrong stand-in that hands them to the restricted
+      # profile as well.
+      docker=no
+      [ "$profile" = developer ] && [ "$os" = linux ] && docker=yes
+      [ "$mode" = hardened_docker ] && docker=yes
+      printf '%s{"name": "%s", "state": "%s", "health": "%s",' "$sep" "$m" "$mstate" "$health"
+      if [ "$docker" = yes ]; then
+        printf '"docker_context": {'
+        printf '"owner": {"project_id": "%s", "environment_id": "env_%s", "machine_id": "mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
+        printf '"name": "vzr1-ctx-%s-%s", "endpoint": "unix:///tmp/vz-%s-%s.sock",' "$sfx" "$m" "$sfx" "$m"
+        printf '"engine_id": "eng-%s-%s"},' "$sfx" "$m"
+        printf '"docker_context_availability": "persisted_ready_not_live_probed",'
+        printf '"requested_capabilities": {"capabilities": ["posix_exec", "docker_engine", "compose", "buildx"]},'
+        printf '"negotiated_capabilities": {"capabilities": ["posix_exec", "docker_engine", "compose", "buildx"]},'
+      else
+        printf '"requested_capabilities": {"capabilities": ["posix_exec"]},'
+        printf '"negotiated_capabilities": {"capabilities": ["posix_exec"]},'
+      fi
+      printf '"machine_id": "mch_%s_%s",' "$sfx" "$m"
+      printf '"profile": "%s", "backend": "macos_virtualization_linux",' "$profile"
+      printf '"target": {"os": "%s", "arch": "aarch64", "image": "vz-linux",' "$os"
       printf ' "digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000"},'
-      printf '"requested_capabilities": {"capabilities": ["posix_exec", "docker_engine"]},'
-      printf '"negotiated_capabilities": {"capabilities": ["posix_exec", "docker_engine"]},'
       printf '"incarnation_id": "inc_%s_%s", "incarnation_generation": 1}' "$sfx" "$m"
+      sep=", "
+    done
+    printf '],\n'
+    printf '   "networks": ['
+    sep=""
+    awk '$1=="N"{print $2, $3}' "$topology" | while read -r n kind; do
+      printf '%s{"network_id": "net_%s_%s", "name": "%s", "kind": "%s", "cidr": "10.85.0.0/24"}' "$sep" "$sfx" "$n" "$n" "$kind"
+      sep=", "
+    done
+    printf '],\n'
+    printf '   "network_attachments": ['
+    sep=""
+    awk '$1=="M" && $5!="-"{print $2, $5}' "$topology" | while read -r m nets; do
+      printf '%s{"attachment_id": "att_%s_%s", "machine_id": "mch_%s_%s", "network_id": "net_%s_%s"}' \
+        "$sep" "$sfx" "$m" "$sfx" "$m" "$sfx" "${nets%%,*}"
+      sep=", "
+    done
+    printf '],\n'
+    printf '   "endpoints": ['
+    sep=""
+    awk '$1=="X"{print $2, $3, $4, $5, $6}' "$topology" | while read -r e em en proto port; do
+      printf '%s{"endpoint_id": "end_%s_%s", "name": "%s", "machine_id": "mch_%s_%s",' "$sep" "$sfx" "$e" "$e" "$sfx" "$em"
+      printf ' "network_id": "net_%s_%s", "protocol": "%s", "port": %s}' "$sfx" "$en" "$proto" "$port"
       sep=", "
     done
     printf ']\n'
@@ -264,51 +365,93 @@ fail() {
 }
 topology="$(dirname "$socket")/topology.json"
 [ -f "$topology" ] || fail daemon_unavailable "no daemon state at $topology"
-pid=$(cut -d' ' -f1 < "$topology")
-sfx=$(cut -d' ' -f2 < "$topology")
-names=$(cut -d' ' -f3- < "$topology")
+pid=$(awk '$1=="P"{print $2}' "$topology")
+sfx=$(awk '$1=="S"{print $2}' "$topology")
+estate=$(awk '$1=="E"{print $2}' "$topology")
+if [ "$estate" = stopped ]; then mstate=stopped; else mstate=ready; fi
 dg="sha256:$(printf '%s' "$pid" | shasum -a 256 | cut -c1-64)"
 [ -z "$project_id" ] || [ "$project_id" = "$pid" ] || fail get_project_state_failed "no project $project_id"
 # probe_drift makes the typed channel mint an Environment identity the CLI
 # never published. Everything else about the two documents still matches, so a
 # check that passed here would be reading field presence rather than agreement.
-[ "$fmode" = probe_drift ] && sfx="${sfx}drift"
+esfx="$sfx"
+[ "$fmode" = probe_drift ] && esfx="${sfx}drift"
+# The typed aggregate, not the CLI's projection of it: `incarnation` is nested
+# here and flattened there, and health is absent because it rides beside the
+# aggregate on the response rather than inside it.
 machines() {
   sep=""
-  for m in $names; do
-    printf '%s{"schema_version":1,"machine_id":"mch_%s_%s","environment_id":"env_%s","name":"%s",' "$sep" "$sfx" "$m" "$sfx" "$m"
-    printf '"profile":"developer","target":{"os":"linux","arch":"aarch64","image":"vz-linux",'
+  awk '$1=="M"{print $2, $3, $4, $5}' "$topology" | while read -r m profile os nets; do
+    docker=no
+    [ "$profile" = developer ] && [ "$os" = linux ] && docker=yes
+    [ "$fmode" = hardened_docker ] && docker=yes
+    printf '%s{"schema_version":1,"machine_id":"mch_%s_%s","environment_id":"env_%s","name":"%s",' "$sep" "$sfx" "$m" "$esfx" "$m"
+    printf '"profile":"%s","target":{"os":"%s","arch":"aarch64","image":"vz-linux",' "$profile" "$os"
     printf '"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},'
-    printf '"requested_capabilities":{"capabilities":["posix_exec","docker_engine"]},'
-    printf '"negotiated_capabilities":{"capabilities":["posix_exec","docker_engine"]},'
+    if [ "$docker" = yes ]; then
+      printf '"requested_capabilities":{"capabilities":["posix_exec","docker_engine","compose","buildx"]},'
+      printf '"negotiated_capabilities":{"capabilities":["posix_exec","docker_engine","compose","buildx"]},'
+      printf '"docker_context":{"owner":{"project_id":"%s","environment_id":"env_%s","machine_id":"mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
+      printf '"name":"vzr1-ctx-%s-%s","endpoint":"unix:///tmp/vz-%s-%s.sock","engine_id":"eng-%s-%s"},' "$sfx" "$m" "$sfx" "$m" "$sfx" "$m"
+    else
+      printf '"requested_capabilities":{"capabilities":["posix_exec"]},'
+      printf '"negotiated_capabilities":{"capabilities":["posix_exec"]},'
+    fi
     printf '"backend":"macos_virtualization_linux",'
     printf '"incarnation":{"schema_version":1,"incarnation_id":"inc_%s_%s","machine_id":"mch_%s_%s","generation":1,"created_at":1},' "$sfx" "$m" "$sfx" "$m"
-    printf '"docker_context":{"owner":{"project_id":"%s","environment_id":"env_%s","machine_id":"mch_%s_%s"},' "$pid" "$sfx" "$sfx" "$m"
-    printf '"name":"vzr1-ctx-%s-%s","endpoint":"unix:///tmp/vz-%s-%s.sock","engine_id":"eng-%s-%s"},' "$sfx" "$m" "$sfx" "$m" "$sfx" "$m"
-    printf '"state":"ready"}'
+    printf '"state":"%s"}' "$mstate"
+    sep=","
+  done
+}
+networks() {
+  sep=""
+  awk '$1=="N"{print $2, $3}' "$topology" | while read -r n kind; do
+    printf '%s{"network_id":"net_%s_%s","name":"%s","kind":"%s","cidr":"10.85.0.0/24"}' "$sep" "$sfx" "$n" "$n" "$kind"
+    sep=","
+  done
+}
+attachments() {
+  sep=""
+  awk '$1=="M" && $5!="-"{print $2, $5}' "$topology" | while read -r m nets; do
+    printf '%s{"attachment_id":"att_%s_%s","machine_id":"mch_%s_%s","network_id":"net_%s_%s"}' \
+      "$sep" "$sfx" "$m" "$sfx" "$m" "$sfx" "${nets%%,*}"
+    sep=","
+  done
+}
+endpoints() {
+  sep=""
+  awk '$1=="X"{print $2, $3, $4, $5, $6}' "$topology" | while read -r e em en proto port; do
+    printf '%s{"endpoint_id":"end_%s_%s","name":"%s","machine_id":"mch_%s_%s",' "$sep" "$sfx" "$e" "$e" "$sfx" "$em"
+    printf '"network_id":"net_%s_%s","protocol":"%s","port":%s}' "$sfx" "$en" "$proto" "$port"
     sep=","
   done
 }
 machine_ids() {
   sep=""
-  for m in $names; do printf '%s"mch_%s_%s"' "$sep" "$sfx" "$m"; sep=","; done
+  awk '$1=="M"{print $2}' "$topology" | while read -r m; do printf '%s"mch_%s_%s"' "$sep" "$sfx" "$m"; sep=","; done
 }
 if [ "$mode" = state ]; then
   printf '{"schema_version":1,"kind":"vz-runtime-probe-state","request_id":"req-%s","project":' "$sfx"
   printf '{"schema_version":1,"definition":{"schema_version":1,"project_id":"%s","name":"vz04-topology-bootstrap"},' "$pid"
-  printf '"environments":[{"schema_version":1,"environment_id":"env_%s","project_id":"%s","name":"%s",' "$sfx" "$pid" "$environment"
-  printf '"definition_digest":"%s","state":"ready","lifecycle_generation":1,"machines":[' "$dg"
+  printf '"environments":[{"schema_version":1,"environment_id":"env_%s","project_id":"%s","name":"%s",' "$esfx" "$pid" "$environment"
+  printf '"definition_digest":"%s","state":"%s","lifecycle_generation":1,"machines":[' "$dg" "$estate"
   machines
+  printf '],"networks":['
+  networks
+  printf '],"network_attachments":['
+  attachments
+  printf '],"endpoints":['
+  endpoints
   printf ']}]}}\n'
   exit 0
 fi
 if [ "$mode" = up ]; then
-  admission=$(printf '{"schema_version":1,"project_id":"%s","environment_id":"env_%s","machine_ids":[%s],"definition_digest":"%s","request_id":"req-up-%s","idempotency_key":"key-up-%s","request_hash":"sha256:%s","workspace_key":null,"created_at":1}' "$pid" "$sfx" "$(machine_ids)" "$dg" "$sfx" "$sfx" "$(printf '%064d' 0)")
+  admission=$(printf '{"schema_version":1,"project_id":"%s","environment_id":"env_%s","machine_ids":[%s],"definition_digest":"%s","request_id":"req-up-%s","idempotency_key":"key-up-%s","request_hash":"sha256:%s","workspace_key":null,"created_at":1}' "$pid" "$esfx" "$(machine_ids)" "$dg" "$sfx" "$sfx" "$(printf '%064d' 0)")
   seq=0
   for phase in admitted preparing ready; do
     printf '{"schema_version":1,"kind":"vz-runtime-probe-up-event","event":{"schema_version":1,"sequence":%s,"admission":%s,"phase":"%s","operation":null,' "$seq" "$admission" "$phase"
     if [ "$phase" = ready ]; then
-      printf '"completion":{"schema_version":1,"environment_id":"env_%s","state":"ready"}}}\n' "$sfx"
+      printf '"completion":{"schema_version":1,"environment_id":"env_%s","state":"ready"}}}\n' "$esfx"
     else
       printf '"completion":null}}\n'
     fi
@@ -570,6 +713,13 @@ octet_c=$(( host_seed % 200 + 2 ))
 fabric_iface=enp0s5
 fabric_addr="10.$octet_a.$octet_b.$octet_c"
 fabric_mac=$(printf '02:00:00:%02x:%02x:%02x' "$octet_a" "$octet_b" "$octet_c")
+# A Machine that declares no Environment network is given no port on the switch:
+# the Hardened profile may not declare one, and the runtime writes it no
+# `vz.net.N` cmdline entry and configures it no fabric NIC. Modelled by having
+# no fabric address at all rather than by filtering traffic, because that is the
+# shape of the real denial.
+on_fabric=1
+[ -n "${VZ_FAKE_NETWORKS:-}" ] || on_fabric=0
 nat_addr="192.168.64.$(( host_seed % 200 + 20 ))"
 nat_mac=$(printf '02:00:01:%02x:%02x:%02x' "$octet_a" "$octet_b" "$octet_c")
 
@@ -604,14 +754,24 @@ case "$applet" in
     # every descendant before it reports, so a backgrounded httpd leaves nothing
     # behind -- modelled by refusing to record one at all.
     [ "$foreground" = 1 ] || exit 0
-    printf '%s %s' "$$" "$root" > "$state/httpd"
-    trap 'rm -f "$state/httpd"; exit 0' TERM INT HUP EXIT
+    # One marker per Machine, naming the address it answers on. A single shared
+    # marker could not tell two Machines' listeners apart, and criterion 2 runs
+    # one on a Developer Machine and one on the Hardened Machine at once.
+    serve_addr=127.0.0.1
+    [ "$on_fabric" = 1 ] && serve_addr="$fabric_addr"
+    printf '%s %s %s' "$$" "$serve_addr" "$root" > "$state/httpd-$machine"
+    trap 'rm -f "$state/httpd-$machine"; exit 0' TERM INT HUP EXIT
     while : ; do sleep 1; done ;;
   cat)
     case "${1:-}" in
       /proc/cmdline)
-        # The host writes vz.net.N=<mac>,<ipv4>/<prefix> for each fabric port.
-        printf 'console=hvc0 vz.net.0=%s,%s/24\n' "$fabric_mac" "$fabric_addr"
+        # The host writes vz.net.N=<mac>,<ipv4>/<prefix> for each fabric port,
+        # and writes none at all for a Machine that holds no port.
+        if [ "$on_fabric" = 1 ]; then
+          printf 'console=hvc0 vz.net.0=%s,%s/24\n' "$fabric_mac" "$fabric_addr"
+        else
+          printf 'console=hvc0\n'
+        fi
         exit 0 ;;
       /proc/net/arp)
         # L2 resolves for peers on this Machine's own fabric network and for
@@ -642,13 +802,27 @@ case "$applet" in
     # like a private-fabric proof. `ip -o -4 addr show` field layout, so the
     # caller parses the shim exactly the way it parses the real tool.
     printf '2: eth0    inet %s/24 brd 192.168.64.255 scope global eth0\n' "$nat_addr"
-    printf '3: %s    inet %s/24 brd 10.%s.%s.255 scope global %s\n' \
+    [ "$on_fabric" = 1 ] && printf '3: %s    inet %s/24 brd 10.%s.%s.255 scope global %s\n' \
       "$fabric_iface" "$fabric_addr" "$octet_a" "$octet_b" "$fabric_iface"
     exit 0 ;;
   wget)
     url=""
     while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done
     target=${url#http://}; target=${target%%:*}
+    # A Machine's own loopback never touches the fabric: it is the control that
+    # says this Machine's HTTP client and server work at all, which is what
+    # makes its failure to reach a sibling a routing fact rather than a missing
+    # applet.
+    if [ "$target" = 127.0.0.1 ]; then
+      [ -f "$state/httpd-$machine" ] || exit 1
+      pid=$(cut -d' ' -f1 < "$state/httpd-$machine")
+      kill -0 "$pid" 2>/dev/null || exit 1
+      cat "$(cut -d' ' -f3- < "$state/httpd-$machine")/index.html"
+      exit 0
+    fi
+    # No port on the switch means no route to any Environment address, whatever
+    # is listening on it.
+    [ "$on_fabric" = 1 ] || exit 1
     # Served on the FABRIC address only. A request to the NAT address must not
     # be answered: the declared private path serves inside its Environment, and
     # the host-shared NAT segment is not that path.
@@ -671,9 +845,15 @@ case "$applet" in
       counter "$fabric_addr" tx 1 > /dev/null
       counter "$target" rx 1 > /dev/null
     fi
-    [ -f "$state/httpd" ] || exit 1
-    pid=$(cut -d' ' -f1 < "$state/httpd")
-    root=$(cut -d' ' -f2- < "$state/httpd")
+    # Which Machine answers is decided by the address, not by who asked: the
+    # sibling reaches the listener on the server's address, and nothing else.
+    pid=""; root=""
+    for marker in "$state"/httpd-*; do
+      [ -f "$marker" ] || continue
+      [ "$(cut -d' ' -f2 < "$marker")" = "$target" ] || continue
+      pid=$(cut -d' ' -f1 < "$marker"); root=$(cut -d' ' -f3- < "$marker")
+    done
+    [ -n "$pid" ] || exit 1
     # The listener is only there while its own invocation is: a marker left by a
     # process that is gone is not a service.
     kill -0 "$pid" 2>/dev/null || exit 1
