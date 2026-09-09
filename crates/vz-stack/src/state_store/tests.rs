@@ -20643,6 +20643,142 @@ fn refreshing_a_binding_preserves_its_durable_slot_resolution_table() {
     );
 }
 
+/// `delete_exact_environment` names four tables and counts their rows exactly;
+/// `environment_host_exports` is not one of them. It is reclaimed by the
+/// `ON DELETE CASCADE` from `machine_instances`, which IS counted. That is a
+/// schema-level guarantee rather than a statement in the delete path, so it is
+/// asserted rather than assumed: an export row surviving Delete would be a leak
+/// with no counter to catch it, and one vanishing early would make the
+/// `machine_instances` count wrong.
+#[test]
+fn deleting_an_environment_reclaims_its_host_export_rows_through_the_machine_cascade() {
+    let store = StateStore::in_memory().unwrap();
+    assert!(
+        store.foreign_keys_enabled().unwrap(),
+        "the cascade this test relies on is inert without the pragma"
+    );
+    let mut state = topology_project_state("prj_export_delete", &["agent"], "/checkout");
+    // `save_project_state` runs `verify_environment_matches_definition`, so the
+    // declaration and the instance must agree before either is persisted.
+    state
+        .definition
+        .environment
+        .host_exports
+        .push(HostExportSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            name: "api".to_string(),
+            machine: "linux".to_string(),
+            protocol: TransportProtocol::Tcp,
+            machine_port: 8080,
+            host_port: Some(18080),
+        });
+    let refreshed_digest = state.definition.digest().unwrap();
+    let environment = &mut state.environments[0];
+    environment.definition_digest = refreshed_digest;
+    let environment_id = environment.environment_id.clone();
+    let machine_id = environment.machines[0].machine_id.clone();
+    let export_id = HostExportId::new("hxp_agent").unwrap();
+    environment.host_exports.push(HostExportInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        export_id: export_id.clone(),
+        environment_id: environment_id.clone(),
+        machine_id: machine_id.clone(),
+        name: "api".to_string(),
+    });
+    environment.ownership.push(OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::HostExport,
+        resource_id: export_id.to_string(),
+        environment_id: environment_id.clone(),
+        machine_id: Some(machine_id),
+    });
+    store.save_project_state(&state).unwrap();
+
+    let export_rows = |store: &StateStore| {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM environment_host_exports WHERE environment_id = ?1",
+                params![environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap()
+    };
+    assert_eq!(export_rows(&store), 1, "the export row must exist first");
+
+    let mut operation = store
+        .begin_environment_lifecycle(
+            environment_id.as_str(),
+            EnvironmentLifecycleKind::Delete,
+            "req-export-delete",
+            "idem-export-delete",
+            "sha256:export-delete",
+            600,
+        )
+        .unwrap();
+    // The export's cleanup step is Machine-scoped, so it must be planned like an
+    // endpoint's; `delete_exact_environment` refuses a plan that does not match
+    // the persisted ownership exactly.
+    assert!(
+        operation.cleanup_steps.iter().any(|step| {
+            step.ownership.resource_kind == OwnedResourceKind::HostExport
+                && step.ownership.resource_id == export_id.to_string()
+        }),
+        "Delete must plan a cleanup step for the export"
+    );
+    for step in operation.machine_steps.clone() {
+        operation = store
+            .acknowledge_environment_machine_step(
+                &MachineLifecycleStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    machine_id: step.machine_id,
+                    initial_state: step.initial_state,
+                    target_state: step.target_state,
+                    expected_incarnation: step.expected_incarnation,
+                    resulting_incarnation: None,
+                    resulting_activation: None,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                601,
+            )
+            .unwrap();
+    }
+    for step in operation.cleanup_steps.clone() {
+        operation = store
+            .acknowledge_environment_cleanup_step(
+                &OwnershipCleanupStepAcknowledgement {
+                    operation_id: operation.operation_id.clone(),
+                    generation: operation.generation,
+                    ownership: step.ownership,
+                    result: LifecycleStepResult::Succeeded,
+                },
+                602,
+            )
+            .unwrap();
+    }
+    store
+        .finish_environment_delete(operation.operation_id.as_str(), operation.generation, 603)
+        .expect("exact delete succeeds with a host export present");
+    assert_eq!(
+        export_rows(&store),
+        0,
+        "the export row must be reclaimed with its Machine"
+    );
+    assert_eq!(
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM topology_ownership WHERE environment_id = ?1",
+                params![environment_id.as_str()],
+                |row| row.get::<_, i64>(0),
+            )
+            .unwrap(),
+        0,
+        "and so must its ownership edge"
+    );
+}
+
 #[test]
 fn the_slot_resolution_table_adds_no_ownership_record_and_no_extra_delete_row() {
     // Decision 8's table lives inside `binding_json`, so Delete's exact

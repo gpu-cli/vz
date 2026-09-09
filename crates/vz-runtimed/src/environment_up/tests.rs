@@ -133,22 +133,16 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
     // These are declarable records with no adapter behind them yet. Admitting
     // one would start a Machine that silently lacks the boundary its definition
     // asks for, so Up must refuse and create no project.
+    //
+    // A host EXPORT is no longer in this list: `start_port_forwarding` carries
+    // it on a loopback-only listener and `authorize_ownership` accounts for it,
+    // so the admitted case is asserted by
+    // `a_fixed_port_host_export_is_admitted_and_persisted` below. What remains
+    // refused about exports is only the shape no surface can serve, which
+    // `an_export_this_up_cannot_serve_is_refused_for_its_own_named_reason`
+    // covers one case at a time.
     for mutate in [
         (|request: &mut EnvironmentUpRequest| {
-            request
-                .definition
-                .environment
-                .host_exports
-                .push(HostExportSpec {
-                    schema_version: 1,
-                    name: "api".into(),
-                    machine: request.definition.environment.machines[0].name.clone(),
-                    protocol: TransportProtocol::Tcp,
-                    machine_port: 8080,
-                    host_port: None,
-                });
-        }) as fn(&mut EnvironmentUpRequest),
-        |request: &mut EnvironmentUpRequest| {
             request
                 .definition
                 .environment
@@ -162,7 +156,7 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
                     guest_port: None,
                     alias: None,
                 });
-        },
+        }) as fn(&mut EnvironmentUpRequest),
         |request: &mut EnvironmentUpRequest| {
             request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
         },
@@ -184,6 +178,177 @@ async fn declared_host_relays_and_egress_reject_before_project_creation() {
                 )
                 .unwrap()
                 .is_none()
+        );
+    }
+}
+
+/// Declare one fixed-port host export on a Developer Linux Machine.
+fn declare_host_export(request: &mut EnvironmentUpRequest, name: &str, host_port: u16) {
+    request
+        .definition
+        .environment
+        .host_exports
+        .push(HostExportSpec {
+            schema_version: 1,
+            name: name.into(),
+            machine: request.definition.environment.machines[0].name.clone(),
+            protocol: TransportProtocol::Tcp,
+            machine_port: 8080,
+            host_port: Some(host_port),
+        });
+}
+
+/// The admitted half of criterion 7's export clauses.
+///
+/// This is the positive every export denial below is measured against: without
+/// it, "an export is refused" would be indistinguishable from "exports are not
+/// implemented", which is what the refusal this replaced actually meant. The Up
+/// still fails afterwards, because the test backend cannot boot a Machine — what
+/// is asserted is that the failure is no longer an admission refusal, and that
+/// the export instance and its ownership edge were persisted, because that edge
+/// is what `environment_delete` will demand before it will reclaim anything.
+#[tokio::test]
+async fn a_fixed_port_host_export_is_admitted_and_persisted() {
+    let (_root, daemon, mut request, metadata) = fixture();
+    declare_host_export(&mut request, "api", 18080);
+    let completion = terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    // The Up does not succeed in this fixture; it must not fail at admission.
+    assert!(completion.error.is_some());
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("a fixed-port export is now admitted, so its project exists");
+    let environment = &project.environments[0];
+    assert_eq!(environment.host_exports.len(), 1);
+    assert_eq!(environment.host_exports[0].name, "api");
+    assert_eq!(
+        environment.host_exports[0].machine_id,
+        environment.machines[0].machine_id
+    );
+    let edges = environment
+        .ownership
+        .iter()
+        .filter(|record| record.resource_kind == OwnedResourceKind::HostExport)
+        .collect::<Vec<_>>();
+    assert_eq!(edges.len(), 1, "exactly one HostExport ownership edge");
+    assert_eq!(
+        edges[0].resource_id,
+        environment.host_exports[0].export_id.to_string()
+    );
+    assert_eq!(
+        edges[0].machine_id.as_ref(),
+        Some(&environment.machines[0].machine_id),
+        "the edge must be Machine-scoped or Delete dispatches its cleanup with no store"
+    );
+    // The join the boot loop performs, on the persisted instances rather than a
+    // restatement of them: one loopback mapping, no destination address.
+    let resolved = super::host_exports::resolve_environment_host_exports(
+        &request.definition.environment,
+        &environment.machines,
+        &environment.host_exports,
+    )
+    .expect("the persisted export joins its declaration");
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(resolved[0].mapping.host, 18080);
+    assert_eq!(resolved[0].mapping.container, 8080);
+    assert_eq!(resolved[0].mapping.target_service, None);
+}
+
+/// Each export shape Up cannot serve is refused by its own name, before any
+/// project row exists. Paired with the admitted case above, so each refusal is
+/// evidence about that shape rather than about exports as a whole.
+///
+/// Two of these are refused by the portable definition itself rather than by
+/// this Up: `validate_machine_network_support`
+/// (`vz-runtime-contract/src/types/topology.rs:4727-4746`) already refuses an
+/// export on a Hardened or non-Linux Machine, so they arrive as
+/// `ValidationError` and never reach `refuse_unsupported_host_exports`. That
+/// module's own matching rule is therefore the second of two and is exercised
+/// directly by its unit tests; asserting the code actually produced, rather than
+/// the one this Up would have produced, is the point.
+#[tokio::test]
+async fn an_export_this_up_cannot_serve_is_refused_for_its_own_named_reason() {
+    for (mutate, code, expected) in [
+        // Nothing reports a dynamically allocated loopback port back to the
+        // caller, so the caller could not use the export it asked for.
+        (
+            (|request: &mut EnvironmentUpRequest| {
+                request
+                    .definition
+                    .environment
+                    .host_exports
+                    .push(HostExportSpec {
+                        schema_version: 1,
+                        name: "api".into(),
+                        machine: request.definition.environment.machines[0].name.clone(),
+                        protocol: TransportProtocol::Tcp,
+                        machine_port: 8080,
+                        host_port: None,
+                    });
+            }) as fn(&mut EnvironmentUpRequest),
+            MachineErrorCode::UnsupportedOperation,
+            "dynamically allocated loopback port",
+        ),
+        // The native macOS arm of `boot_or_inspect_machine` is handed no
+        // `PortMapping` at all, so the listener would silently never exist.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
+                declare_host_export(request, "api", 18080);
+            },
+            MachineErrorCode::ValidationError,
+            "native Macos target cannot declare host exports",
+        ),
+        // Hardened is the restricted profile and declares none of this topology.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request.definition.environment.machines[0].profile = MachineProfile::Hardened;
+                declare_host_export(request, "api", 18080);
+            },
+            MachineErrorCode::ValidationError,
+            "Hardened Machines cannot declare host exports",
+        ),
+        // Two exports on one loopback port is a definition defect, refused
+        // before any Machine of the Environment has been started.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                declare_host_export(request, "api", 18080);
+                declare_host_export(request, "web", 18080);
+            },
+            MachineErrorCode::UnsupportedOperation,
+            "one loopback port carries at most one export",
+        ),
+    ] {
+        let (_root, daemon, mut request, metadata) = fixture();
+        mutate(&mut request);
+        let error = daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            error.code, code,
+            "case `{expected}` produced {:?}: {}",
+            error.code, error.message
+        );
+        assert!(
+            error.message.contains(expected),
+            "expected a refusal naming `{expected}`, got {:?}",
+            error.message
+        );
+        assert!(
+            daemon
+                .with_state_store(
+                    |store| store.load_project_state(request.definition.project_id.as_str())
+                )
+                .unwrap()
+                .is_none(),
+            "a refused export must leave no project row behind"
         );
     }
 }
@@ -327,8 +492,57 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
     duplicated.ownership.push(repeated);
     assert_eq!(code(&duplicated), MachineErrorCode::UnsupportedOperation);
 
+    // `HostExport` now has an adapter, so it is admitted the way the fabric
+    // kinds are: only when the record names a persisted export instance. The
+    // positive and its negative are asserted together, because an admitted kind
+    // whose set comparison were dropped would be a leak Delete could not reclaim.
+    let mut exported = EnvironmentUpRequest {
+        workspace_root: None,
+        definition: definition(),
+        selection: EnvironmentSelectionContext::default(),
+        path_hint: None,
+        timeout_millis: 5000,
+    };
+    exported
+        .definition
+        .environment
+        .host_exports
+        .push(HostExportSpec {
+            schema_version: 1,
+            name: "api".into(),
+            machine: exported.definition.environment.machines[0].name.clone(),
+            protocol: TransportProtocol::Tcp,
+            machine_port: 8080,
+            host_port: Some(18080),
+        });
+    let exported = exported
+        .definition
+        .instantiate_environment("default", 0)
+        .unwrap();
+    assert_eq!(exported.host_exports.len(), 1);
+    authorize_ownership(&exported).expect("a minted host export matches its instance");
+    let mut unaccounted_export = exported.clone();
+    unaccounted_export.host_exports.clear();
+    assert_eq!(
+        code(&unaccounted_export),
+        MachineErrorCode::UnsupportedOperation,
+        "an export ownership edge with no instance behind it must stay refused"
+    );
+    let mut duplicated_export = exported.clone();
+    let repeated_export = duplicated_export
+        .ownership
+        .iter()
+        .find(|record| record.resource_kind == OwnedResourceKind::HostExport)
+        .unwrap()
+        .clone();
+    duplicated_export.ownership.push(repeated_export);
+    assert_eq!(
+        code(&duplicated_export),
+        MachineErrorCode::UnsupportedOperation,
+        "a repeated export identity must be refused, never deduplicated"
+    );
+
     for kind in [
-        OwnedResourceKind::HostExport,
         OwnedResourceKind::HostImport,
         OwnedResourceKind::Socket,
         OwnedResourceKind::PortRange,

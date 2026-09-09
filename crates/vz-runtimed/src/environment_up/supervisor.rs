@@ -1,5 +1,6 @@
 use std::collections::BTreeSet;
 
+use super::host_exports;
 use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
 use super::workspace_projection;
 use super::*;
@@ -258,6 +259,37 @@ impl RuntimeDaemon {
             )
             .await
             .map_err(|error| backend_error(error.to_string()))?;
+        // Host exports are resolved here for a different reason than the fabric.
+        // A port relay is not fixed at `LinuxVm::create` — `start_port_forwarding`
+        // binds it inside the boot — so the mapping need not be minted early.
+        // What must happen before the first boot is the collision proof: a
+        // Machine that started before a sibling Environment's listener was found
+        // holding the port is an effect admitted for an Up that then failed.
+        let resolved_host_exports = host_exports::resolve_environment_host_exports(
+            &request.definition.environment,
+            &environment.machines,
+            &environment.host_exports,
+        )
+        .map_err(|error| {
+            failure(
+                &metadata,
+                MachineErrorCode::ValidationError,
+                error.to_string(),
+            )
+        })?;
+        host_exports::probe_exportable_host_ports(
+            &resolved_host_exports,
+            &existing.keys().cloned().collect(),
+        )
+        .await
+        .map_err(|error| {
+            failure(
+                &metadata,
+                MachineErrorCode::StateConflict,
+                error.to_string(),
+            )
+        })?;
+        let mut host_export_ports = host_exports::boot_port_mappings(&resolved_host_exports);
         // Workspace projections are resolved here for the same reason the
         // fabric is: a VirtioFS share is fixed when `LinuxVm::create` runs, so
         // a share cannot be minted inside the loop that boots the Machine
@@ -352,7 +384,13 @@ impl RuntimeDaemon {
                     }
                     self.with_state_store(|_|self.authorize_up(&metadata,&environment)).map_err(state_error)?;
                     self.with_state_store(|store|store.consume_machine_boot_non_dispatch(&operation,&step.machine_id)).map_err(state_error)?;
-                    let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,vec![],attachments,StackResourceHint {
+                    // Taken, not borrowed, for the same reason as the guest
+                    // descriptors above: a mapping handed to a boot that does
+                    // not happen must not be handed to a second boot as well.
+                    // A Machine reused from `existing` never reaches here, so
+                    // its listener is the one its original boot bound.
+                    let export_ports=host_export_ports.remove(&step.machine_id).unwrap_or_default();
+                    let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,export_ports,attachments,StackResourceHint {
                         cpus:Some(cpus),memory_mb:Some(memory_mb),
                         volume_mounts:workspace_mounts.remove(&step.machine_id).unwrap_or_default(),
                         ..Default::default()

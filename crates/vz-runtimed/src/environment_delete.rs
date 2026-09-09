@@ -771,6 +771,29 @@ fn validate_supported(
             machine_id: Some(attachment.machine_id.clone()),
         });
     }
+    // A host export is reclaimed with its Machine: the loopback listener is
+    // owned by that Machine's VM and dies when `start_port_forwarding`'s
+    // registry entry is shut down, and the persisted row is removed by the
+    // `ON DELETE CASCADE` from `machine_instances`
+    // (`vz-stack/src/state_store/topology.rs:872-884`). Its cleanup step is
+    // therefore acknowledged with that Machine's store, like an endpoint, which
+    // is only correct while the record carries that Machine's id — an export
+    // attributed to an absent Machine would be dispatched with no store at all.
+    for export in &environment.host_exports {
+        if !known_machines.contains(&&export.machine_id) {
+            return Err(conflict(
+                input,
+                "Delete host export references absent topology",
+            ));
+        }
+        expected.push(OwnershipRecord {
+            schema_version: 1,
+            resource_kind: OwnedResourceKind::HostExport,
+            resource_id: export.export_id.to_string(),
+            environment_id: environment.environment_id.clone(),
+            machine_id: Some(export.machine_id.clone()),
+        });
+    }
     // Exact set equality, compared as sets rather than inferred from a length
     // and a membership test. `expected` is minted from the persisted instances,
     // so two instances sharing one identity would emit one record twice; that is

@@ -824,6 +824,86 @@ fn ownership_outside_the_expected_set_is_still_refused() {
     }
 }
 
+/// Delete's expected set must account for a host export, or an Environment that
+/// declared one could never be deleted.
+///
+/// This is the accounted half of `ownership_outside_the_expected_set_is_still_refused`
+/// above, which still refuses an export record with no instance behind it. Both
+/// have to hold together: without the positive, "Delete refuses an export" would
+/// be indistinguishable from "Delete never learned about exports", which is what
+/// it meant before `authorize_ownership` began admitting them at Up. Delete would
+/// then have refused every Environment Up had just successfully created.
+#[test]
+fn an_accounted_host_export_is_expected_and_an_unaccounted_one_is_not() {
+    let fixture = Fixture::networked(Arc::new(DeleteOnlyPolicy::default()));
+    let mut accounted = fixture.first().clone();
+    let machine_id = accounted.machines[0].machine_id.clone();
+    let export = vz_runtime_contract::HostExportInstance {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        export_id: vz_runtime_contract::HostExportId::generate(),
+        environment_id: accounted.environment_id.clone(),
+        machine_id: machine_id.clone(),
+        name: "api".into(),
+    };
+    let record = OwnershipRecord {
+        schema_version: 1,
+        resource_kind: OwnedResourceKind::HostExport,
+        resource_id: export.export_id.to_string(),
+        environment_id: accounted.environment_id.clone(),
+        machine_id: Some(machine_id.clone()),
+    };
+    accounted.host_exports.push(export.clone());
+    accounted.ownership.push(record.clone());
+    validate_supported(&fixture.input(), &accounted)
+        .expect("an export with its ownership edge is exactly accounted for");
+
+    // The record without its instance: the unaccounted resource the whole check
+    // exists to refuse.
+    let mut orphan_record = accounted.clone();
+    orphan_record.host_exports.clear();
+    assert_eq!(
+        validate_supported(&fixture.input(), &orphan_record)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+
+    // The instance without its record: nothing would ever reclaim the listener.
+    let mut orphan_instance = accounted.clone();
+    orphan_instance
+        .ownership
+        .retain(|candidate| candidate.resource_kind != OwnedResourceKind::HostExport);
+    assert_eq!(
+        validate_supported(&fixture.input(), &orphan_instance)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::UnsupportedOperation
+    );
+
+    // An export attributed to a Machine outside this Environment: its cleanup
+    // step is dispatched with that Machine's store, so it could never run.
+    let mut foreign = accounted.clone();
+    let absent = MachineId::generate();
+    foreign.host_exports[0].machine_id = absent.clone();
+    assert_eq!(
+        validate_supported(&fixture.input(), &foreign)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::StateConflict
+    );
+
+    // A repeated export identity is refused, never deduplicated.
+    let mut duplicated = accounted.clone();
+    duplicated.host_exports.push(export);
+    duplicated.ownership.push(record);
+    assert_eq!(
+        validate_supported(&fixture.input(), &duplicated)
+            .unwrap_err()
+            .code,
+        MachineErrorCode::StateConflict
+    );
+}
+
 /// The expected set is derived from the persisted instances, so a fabric
 /// ownership record without its instance, and an instance without its record,
 /// are both refused rather than silently reclaimed.

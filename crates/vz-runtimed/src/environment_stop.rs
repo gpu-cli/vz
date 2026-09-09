@@ -578,6 +578,25 @@ fn validate_supported_topology(
                 OwnedResourceKind::Network
                 | OwnedResourceKind::Endpoint
                 | OwnedResourceKind::NetworkAttachment => true,
+                // A host export is durable Environment identity for the same
+                // reason: the record survives a Stop so the next Up rebinds the
+                // same loopback port, while the runtime half — the listener
+                // `start_port_forwarding` bound — is owned by the Machine's VM
+                // and released with it when Stop shuts that VM down. Nothing is
+                // left listening once the Machine is gone, so Stop reclaims no
+                // host resource of its own here.
+                //
+                // Unlike the three kinds above, this is not a bare kind
+                // allowlist: the record must name a persisted export instance on
+                // the Machine it claims. An export record with no instance behind
+                // it is the unaccounted resource Delete would later refuse, and
+                // letting Stop pass it would move that discovery to the one verb
+                // that cannot decline.
+                OwnedResourceKind::HostExport => environment.host_exports.iter().any(|export| {
+                    export.export_id.to_string() == record.resource_id
+                        && export.environment_id == record.environment_id
+                        && Some(&export.machine_id) == record.machine_id.as_ref()
+                }),
                 OwnedResourceKind::Other(kind) => {
                     kind == "machine_runtime_store" || kind == "runtime_vm"
                 }
@@ -587,7 +606,7 @@ fn validate_supported_topology(
         return Err(failure(
             input,
             MachineErrorCode::UnsupportedOperation,
-            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints and network attachments; additional topology resources remain unsupported",
+            "Stop supports up to 128 owned Linux/native macOS ARM64 Machines, registered Linux Docker endpoints, and declared Environment networks, endpoints, network attachments and host exports; additional topology resources remain unsupported",
         ));
     }
     Ok(())

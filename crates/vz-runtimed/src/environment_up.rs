@@ -10,6 +10,7 @@ use tokio::sync::{OwnedMutexGuard, watch};
 use vz_runtime_contract::*;
 use vz_stack::StackError;
 
+pub mod host_exports;
 mod native_readiness;
 mod readiness;
 mod supervisor;
@@ -239,19 +240,20 @@ impl RuntimeDaemon {
 /// Refuse an Environment whose persisted ownership graph names a resource this
 /// Up cannot serve, or a declared-fabric record with no instance behind it.
 ///
-/// Declared `Network`, `Endpoint` and `NetworkAttachment` ownership is admitted
-/// here (vz-9vv.7), which is only sound because those records are minted once by
-/// `ProjectDefinition::instantiate_environment` alongside the instances they
-/// name and are never added afterwards: the switch registry that
-/// `install_environment_fabric` writes to is process-local and persists no
-/// ownership. The fabric half of the graph is therefore comparable as an exact
+/// Declared `Network`, `Endpoint`, `NetworkAttachment` and `HostExport`
+/// ownership is admitted here, which is only sound because those records are
+/// minted once by `ProjectDefinition::instantiate_environment` alongside the
+/// instances they name and are never added afterwards: the switch registry that
+/// `install_environment_fabric` writes to, and the port-forward registry that
+/// `start_port_forwarding` writes to, are both process-local and persist no
+/// ownership. The declared half of the graph is therefore comparable as an exact
 /// set at admission — the same comparison `environment_delete` makes before it
 /// reclaims. Making it here as well, and not only in Delete, is what stops Up
 /// booting every Machine of an Environment that could then never be deleted.
 ///
-/// Records with no adapter behind them stay refused: `HostExport`, `HostImport`,
-/// `Socket`, `PortRange`, `Credential`, `Fault`, `LegacySandbox` and any
-/// unrecognised `Other` kind.
+/// Records with no adapter behind them stay refused: `HostImport`, `Socket`,
+/// `PortRange`, `Credential`, `Fault`, `LegacySandbox` and any unrecognised
+/// `Other` kind.
 fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackError> {
     fn unsupported(message: &str) -> StackError {
         StackError::Machine {
@@ -294,6 +296,18 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
                 machine_id: Some(attachment.machine_id.clone()),
             }),
     );
+    expected.extend(
+        environment
+            .host_exports
+            .iter()
+            .map(|export| OwnershipRecord {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                resource_kind: OwnedResourceKind::HostExport,
+                resource_id: export.export_id.to_string(),
+                environment_id: environment.environment_id.clone(),
+                machine_id: Some(export.machine_id.clone()),
+            }),
+    );
     // Two instances sharing one identity would emit one record twice. That is
     // state corruption, and it is refused rather than deduplicated: a silent
     // dedup would leave the slot the duplicate vacated free for an unaccounted
@@ -312,7 +326,8 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
             | OwnedResourceKind::Disk => true,
             OwnedResourceKind::Network
             | OwnedResourceKind::Endpoint
-            | OwnedResourceKind::NetworkAttachment => declared.insert(record),
+            | OwnedResourceKind::NetworkAttachment
+            | OwnedResourceKind::HostExport => declared.insert(record),
             OwnedResourceKind::DockerContext => environment.machines.iter().any(|machine| {
                 machine.docker_context.as_ref().is_some_and(|context| {
                     context.name == record.resource_id
@@ -336,7 +351,7 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
     }
     if declared != expected_set {
         return Err(unsupported(
-            "Up declared-fabric ownership does not account for exactly the persisted network, endpoint and attachment instances; no effects admitted",
+            "Up declared-topology ownership does not account for exactly the persisted network, endpoint, attachment and host export instances; no effects admitted",
         ));
     }
     Ok(())
@@ -434,21 +449,49 @@ fn validate_supported(
             error.to_string(),
         ));
     }
-    // Host relays and non-offline egress are declarable but not yet applied by
-    // any adapter. Admitting them would start a Machine that silently lacks the
-    // boundary its definition asks for, so they are refused here until the
-    // relay and egress adapters exist.
-    if !spec.host_exports.is_empty()
-        || !spec.host_imports.is_empty()
-        || spec
-            .machines
-            .iter()
-            .any(|machine| machine.egress != EgressPolicy::Offline)
+    // Host EXPORTS are applied: `resolve_environment_host_exports` joins each
+    // persisted export identity to its declared ports and the boot loop hands
+    // them to `start_port_forwarding`, whose listener is loopback-only by
+    // construction. What cannot be served is refused here, one case at a time,
+    // so the refusal says which declaration it could not carry.
+    if let Err(error) =
+        host_exports::refuse_unsupported_host_exports(&request.definition.environment)
     {
         return Err(failure(
             metadata,
             MachineErrorCode::UnsupportedOperation,
-            "declared host import/export and non-offline egress adapters remain required; this Up cannot apply them and performs no admission",
+            error.to_string(),
+        ));
+    }
+    // Host IMPORTS are not. An import is the opposite direction: a guest-initiated
+    // stream that the host terminates against exactly one stored `127.0.0.1`
+    // service. Nothing in the workspace carries that direction — `Vm::vsock_listen`
+    // has no caller and no test, the guest agent only ever accepts on vsock and
+    // never dials out, and there is no per-import credential to authenticate one
+    // with. Admitting an import would start a Machine whose definition asks for a
+    // boundary that does not exist, which is strictly worse than refusing it.
+    if !spec.host_imports.is_empty() {
+        return Err(failure(
+            metadata,
+            MachineErrorCode::UnsupportedOperation,
+            "declared host imports require the guest-initiated authenticated relay adapter, which is not implemented; this Up cannot apply them and performs no admission",
+        ));
+    }
+    // Egress is likewise unapplied. `EgressPolicy::Offline` is the only policy
+    // this Up can honour, because a non-offline Machine would need the
+    // per-Environment gateway that `simulated_public` is refused for above.
+    if let Some(machine) = spec
+        .machines
+        .iter()
+        .find(|machine| machine.egress != EgressPolicy::Offline)
+    {
+        return Err(failure(
+            metadata,
+            MachineErrorCode::UnsupportedOperation,
+            format!(
+                "Machine `{}` declares a non-offline egress policy, whose adapter is not implemented; this Up applies `offline` only and performs no admission",
+                machine.name
+            ),
         ));
     }
     for machine in &spec.machines {
