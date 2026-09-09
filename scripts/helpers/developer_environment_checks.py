@@ -744,6 +744,23 @@ def check_delete_single_environment_safety(ctx: CheckContext, top: str) -> SubCh
 
 
 PRIVATE_NETWORK = "backend"
+# One probe, run on EVERY Machine on the network. Reporting only the server left
+# the sibling's fabric NIC unobserved, so a missing NIC there was indistinguishable
+# from a forwarding fault.
+FABRIC_PROBE = ("/bin/busybox cat /proc/cmdline "
+                "| /bin/busybox tr ' ' '\\n' "
+                "| /bin/busybox grep '^vz.net.' ; printf '|' ; "
+                "/bin/busybox ip -o -4 addr show "
+                "| /bin/busybox awk '$2!=\"lo\"{print $2\" \"$4}'")
+
+
+def fabric_state(receipt):
+    """(declared cmdline addresses, [[iface, cidr], ...]) from one FABRIC_PROBE run."""
+    declared_part, _, observed_part = receipt.stdout.decode("ascii", "replace").partition("|")
+    declared = [item.split(",")[1].split("/")[0] for item in declared_part.split()
+                if item.startswith("vz.net.") and "," in item]
+    observed = [line.split() for line in observed_part.strip().splitlines() if line.split()]
+    return declared, observed
 PRIVATE_PORT = 8080
 WGET_TIMEOUT = 5
 
@@ -819,12 +836,36 @@ def check_private_topology_paths(ctx: CheckContext, top: str) -> SubCheck:
         return check.finish()
     # The address comes from the serving Machine itself: the foreign probe must
     # target the same address, so its refusal is about routing and not a name.
+    #
+    # Every Machine now has TWO IPv4 interfaces: Apple's NAT `eth0`, and the
+    # fabric NIC the declared network gives it. Taking the first non-lo entry
+    # returned eth0's 192.168.64.x, so the sibling probe was routed over the
+    # host-shared NAT segment instead of the private fabric -- which is not what
+    # this check claims to test, and would be a false pass if NAT ever carried it.
+    # Report every interface so a missing fabric NIC is legible in the evidence.
+    # Name-based selection is not sound: a Machine carries Apple's NAT eth0, the
+    # fabric NIC, and Docker's own bridge. Ask the guest which address the HOST
+    # derived -- vz.net.N=<mac>,<ipv4>/<prefix> is on its kernel cmdline -- and
+    # require an interface to actually carry it. That proves the derived address
+    # reached the guest, which name matching never could.
     addressed = machine_exec(ctx, check, "net-address", inside, "machine-0",
-                             "/bin/busybox ip -o -4 addr show | /bin/busybox awk '$2!=\"lo\"{print $4}' "
-                             "| /bin/busybox cut -d/ -f1 | /bin/busybox head -1")
-    address = addressed.stdout.decode("ascii", "replace").strip()
-    check.check(addressed.exit_code == 0 and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", address or ""),
-                f"machine-0 reported its private address (observed {address!r})")
+                             FABRIC_PROBE)
+    declared, observed = fabric_state(addressed)
+    carried = {addr.split("/")[0] for _, addr in observed}
+    check.check(addressed.exit_code == 0 and len(declared) == 1 and declared[0] in carried,
+                "machine-0 carries the fabric address the host derived "
+                f"(cmdline {declared!r}, interfaces {observed!r})")
+    address = declared[0] if len(declared) == 1 and declared[0] in carried else ""
+    # The sibling is the one that must REACH that address, so its own fabric port
+    # is part of the claim. Observing only the server made a missing NIC here look
+    # like a forwarding fault.
+    sibling_state = machine_exec(ctx, check, "net-sibling-address", inside, "machine-1", FABRIC_PROBE)
+    sib_declared, sib_observed = fabric_state(sibling_state)
+    sib_carried = {addr.split("/")[0] for _, addr in sib_observed}
+    check.check(sibling_state.exit_code == 0 and len(sib_declared) == 1
+                and sib_declared[0] in sib_carried and sib_declared[0] != address,
+                "machine-1 carries its own distinct fabric address "
+                f"(cmdline {sib_declared!r}, interfaces {sib_observed!r})")
     if check.status != "PASS":
         return check.finish()
     sibling = machine_exec(ctx, check, "net-sibling", inside, "machine-1",

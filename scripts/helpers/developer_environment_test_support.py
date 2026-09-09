@@ -41,8 +41,10 @@ reject() {
   printf '{"error":{"code":"legacy_command_removed","command":"%s","message":"`vz %s` was removed from the 0.4 public CLI","migration":"%s","typed_api_migration":"__TYPED__"}}\n' "$1" "$1" "$mig" >&2
   exit 2
 }
-verb=""; sawhelp=0; version=0; all=0; endopts=0; command_tail=""
+verb=""; sawhelp=0; version=0; all=0; endopts=0; command_tail=""; machine=""; wantmachine=0
 for arg in "$@"; do
+  if [ "$wantmachine" = 1 ]; then machine=$arg; wantmachine=0; continue; fi
+  if [ "$arg" = "--machine" ] && [ "$endopts" != 1 ]; then wantmachine=1; continue; fi
   # Only `exec` takes a command payload after `--`, so a `-c` there is the
   # shell's flag rather than one of this CLI's removed ones. Everywhere else
   # `--` is just a separator and a removed root after it is still rejected.
@@ -110,7 +112,10 @@ if [ -n "$verb" ]; then
       | sed -e "s#/run/vz-reproducibility-sentinel#$VZ_RUNTIME_DATA_DIR/sentinel#g" \
             -e "s#/bin/busybox#$(dirname "$0")/busybox-shim#g" \
             -e "s#/www#$VZ_RUNTIME_DATA_DIR/www#g" > "$VZ_RUNTIME_DATA_DIR/script.sh"
-    /bin/sh "$VZ_RUNTIME_DATA_DIR/script.sh"
+    # The shim needs the Machine identity: every Machine on a declared network
+    # gets its OWN derived address, so a fake that keys addressing on the project
+    # alone would hand two Machines one address and model the wrong property.
+    VZ_FAKE_MACHINE="$machine" /bin/sh "$VZ_RUNTIME_DATA_DIR/script.sh"
     exit $?
   fi
   if [ "$verb" = delete ] && [ -f "$topology" ]; then
@@ -276,20 +281,54 @@ case "$applet" in
     while [ $# -gt 0 ]; do case "$1" in -h) root=$2; shift 2 ;; *) shift ;; esac; done
     printf '%s' "$root" > "$state/httpd-root"
     exit 0 ;;
+  cat)
+    # /proc/cmdline: the host writes vz.net.N=<mac>,<ipv4>/<prefix> for each
+    # fabric port. Derived from the same seed as the NIC below, so the guest
+    # genuinely carries the address its cmdline declares -- a stub that returned
+    # an address no interface held would model the answer, not the property.
+    net=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
+    host=$(printf '%s' "${VZ_FAKE_MACHINE:-machine-0}" | cksum | cut -d' ' -f1)
+    case "${1:-}" in
+      /proc/cmdline)
+        printf 'console=hvc0 vz.net.0=02:00:00:%02x:%02x:%02x,10.%s.%s.%s/24\n' \
+          "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))" \
+          "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))"
+        exit 0 ;;
+    esac
+    exec "$applet" "$@" ;;
   ip)
-    # A deterministic private address per project runtime directory.
-    n=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
+    # A Machine attached to a declared network has TWO IPv4 interfaces: Apple's
+    # NAT eth0, which every Machine gets whether or not it declares a network,
+    # and the fabric NIC the declared network gives it. Modelling only one hid
+    # that distinction and let a probe over the host-shared NAT segment look
+    # like a private-fabric proof.
+    net=$(printf '%s' "$state" | cksum | cut -d' ' -f1)
+    host=$(printf '%s' "${VZ_FAKE_MACHINE:-machine-0}" | cksum | cut -d' ' -f1)
     # `ip -o -4 addr show` field layout, so the caller parses the shim exactly
     # the way it parses the real tool.
-    printf '2: eth0    inet 10.%s.%s.2/24 brd 10.%s.%s.255 scope global eth0\n' \
-      "$(( (n / 256) % 254 + 1 ))" "$(( n % 254 + 1 ))" "$(( (n / 256) % 254 + 1 ))" "$(( n % 254 + 1 ))"
+    printf '2: eth0    inet 192.168.64.%s/24 brd 192.168.64.255 scope global eth0\n' \
+      "$(( host % 200 + 20 ))"
+    # One subnet per Environment network; the host octet is the Machine's own.
+    printf '3: enp0s5    inet 10.%s.%s.%s/24 brd 10.%s.%s.255 scope global enp0s5\n' \
+      "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))" "$(( host % 200 + 2 ))" \
+      "$(( (net / 256) % 254 + 1 ))" "$(( net % 254 + 1 ))"
     exit 0 ;;
   wget)
     url=""
     while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done
     host=${url#http://}; host=${host%%:*}
-    mine=$("$0" ip -o -4 addr show | awk '{print $4}' | cut -d/ -f1)
-    if [ "$host" != "$mine" ] || [ ! -f "$state/httpd-root" ]; then exit 1; fi
+    # Served on the FABRIC address only. A request to the NAT address must not
+    # be answered: the declared private path serves inside its Environment, and
+    # the host-shared NAT segment is not that path.
+    #
+    # Reachability is the SWITCH, not one Machine's own address: every Machine on
+    # one Environment's declared network shares that network's /24, so a sibling
+    # reaches it and a different Environment (a different /24) does not. Matching
+    # only the caller's own address modelled a Machine talking to itself, which
+    # passed by accident while every Machine shared one address.
+    mine=$("$0" ip -o -4 addr show | awk '$2!="eth0"{print $4}' | cut -d/ -f1 | head -1)
+    subnet=${mine%.*}
+    if [ "${host%.*}" != "$subnet" ] || [ ! -f "$state/httpd-root" ]; then exit 1; fi
     cat "$(cat "$state/httpd-root")/index.html"
     exit 0 ;;
   *) exec "$applet" "$@" ;;
