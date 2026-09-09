@@ -1657,10 +1657,18 @@ impl EnvironmentSpec {
                 }
             }
             if !declared.is_empty() {
-                validate_machine_network_support(machine, "network attachments")?;
+                validate_machine_network_support(
+                    machine,
+                    NetworkDeclarationSide::EnvironmentFabric,
+                    "network attachments",
+                )?;
             }
             if machine.egress != EgressPolicy::Offline {
-                validate_machine_network_support(machine, "allowed egress")?;
+                validate_machine_network_support(
+                    machine,
+                    NetworkDeclarationSide::EnvironmentFabric,
+                    "allowed egress",
+                )?;
             }
             attachments.insert(machine.name.as_str(), declared);
         }
@@ -1706,7 +1714,11 @@ impl EnvironmentSpec {
                     value: export.machine.clone(),
                 });
             };
-            validate_machine_network_support(machine, "host exports")?;
+            validate_machine_network_support(
+                machine,
+                NetworkDeclarationSide::HostBoundary,
+                "host exports",
+            )?;
             validate_port("host_export.machine_port", export.machine_port)?;
             if let Some(host_port) = export.host_port {
                 validate_port("host_export.host_port", host_port)?;
@@ -1720,7 +1732,11 @@ impl EnvironmentSpec {
                     value: import.machine.clone(),
                 });
             };
-            validate_machine_network_support(machine, "host imports")?;
+            validate_machine_network_support(
+                machine,
+                NetworkDeclarationSide::HostBoundary,
+                "host imports",
+            )?;
             validate_port("host_import.host_port", import.host_port)?;
             if let Some(guest_port) = import.guest_port {
                 validate_port("host_import.guest_port", guest_port)?;
@@ -4717,14 +4733,47 @@ fn validate_requested_capabilities(
     })
 }
 
+/// Which side of the Environment boundary a network declaration lives on.
+///
+/// The two sides admit different targets, so they cannot share one rule. A
+/// Machine's own NIC on an Environment network is a property of that Machine's
+/// VM, which every shipped target has; a host relay is a second, separately
+/// implemented adapter on the host side of the boundary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NetworkDeclarationSide {
+    /// Internal to the Environment: `machine.networks` attachments, and the
+    /// `machine.egress` policy of the Machine's own NIC.
+    EnvironmentFabric,
+    /// Crossing the host boundary: host exports and host imports.
+    HostBoundary,
+}
+
 /// Reject declared network topology on Machines whose target cannot carry it.
 ///
 /// Hardened Machines mirror the existing Docker-capability rejection: the
-/// restricted profile declares none of this. Native (non-Linux) targets have no
-/// switch, relay or egress implementation yet and are rejected the same way the
-/// file already rejects implicit Docker capabilities on those targets.
+/// restricted profile declares none of this, on either side of the boundary.
+///
+/// Targets split by side. A **Developer macOS** Machine may hold an
+/// Environment-fabric attachment and declare egress: `virtio-net` is a
+/// Virtualization.framework device for macOS guests exactly as it is for Linux
+/// guests, and acceptance criterion 5 requires a service path that crosses
+/// between a Linux Machine and a native macOS Machine in both directions, so a
+/// macOS Machine with no NIC a switch could attach to cannot satisfy the
+/// product contract. Refusing it was policy, not capability.
+///
+/// **Host exports and imports stay Linux-only.** They are criterion 7, not
+/// criterion 5, and they are the host half of the boundary rather than the
+/// Machine's NIC: the native arm of `boot_or_inspect_machine` is handed no
+/// `PortMapping` at all, so an export admitted here would name a loopback
+/// listener that silently never exists, and no import adapter exists for any
+/// target. `refuse_unsupported_host_exports` states the same rule at the Up
+/// layer; both are kept so a persisted record cannot reach a relay through
+/// either alone.
+///
+/// **Native Windows is refused on both sides.** It is PLANNED, not shipped.
 fn validate_machine_network_support(
     machine: &MachineSpec,
+    side: NetworkDeclarationSide,
     declaration: &str,
 ) -> Result<(), TopologyValidationError> {
     if machine.profile == MachineProfile::Hardened {
@@ -4734,7 +4783,16 @@ fn validate_machine_network_support(
             reason: format!("Hardened Machines cannot declare {declaration}"),
         });
     }
-    if machine.target.os != OperatingSystem::Linux {
+    // Matched exhaustively rather than compared against Linux: a target added
+    // to `OperatingSystem` must be admitted here deliberately, per side, rather
+    // than inheriting whichever answer a `!=` happened to give it.
+    let supported = match (side, machine.target.os) {
+        (_, OperatingSystem::Linux) => true,
+        (NetworkDeclarationSide::EnvironmentFabric, OperatingSystem::Macos) => true,
+        (NetworkDeclarationSide::HostBoundary, OperatingSystem::Macos) => false,
+        (_, OperatingSystem::Windows) => false,
+    };
+    if !supported {
         return Err(TopologyValidationError::InvalidCapabilityDeclaration {
             machine_id: machine.name.clone(),
             reason: format!(
@@ -8099,87 +8157,306 @@ mod tests {
     }
 
     #[test]
-    fn hardened_and_native_machines_declare_no_network_topology() {
-        for mutate in [
-            |definition: &mut ProjectDefinition| {
+    fn network_declarability_is_exact_by_profile_target_and_declaration_side() {
+        // Every (profile, target, declaration) cell, stated once. This replaces
+        // `hardened_and_native_machines_declare_no_network_topology`, whose
+        // premise became false when Developer macOS gained Environment-network
+        // membership: it asserted that macOS declared NO network topology, and
+        // two of the four shapes it looped over are now admitted.
+        //
+        // The replacement is strictly stronger than what it replaces:
+        //   * native Windows had no coverage at all here and is now refused on
+        //     all four shapes,
+        //   * Hardened is asserted on all three targets rather than on Linux
+        //     alone,
+        //   * every admitted cell is asserted to VALIDATE, not merely to fail
+        //     differently, so no cell can pass by being refused for an
+        //     unrelated reason, and
+        //   * the two macOS host-boundary refusals that the old test covered as
+        //     part of a blanket rule are kept as their own named cells.
+        #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+        enum Expect {
+            Accepted,
+            /// `InvalidMachineProfile`: the Hardened profile declares none of
+            /// this, on either side of the Environment boundary.
+            RefusedByProfile,
+            /// `InvalidCapabilityDeclaration`: this target cannot carry this
+            /// side of the boundary.
+            RefusedByTarget,
+        }
+        use Expect::{Accepted, RefusedByProfile, RefusedByTarget};
+
+        // One Machine, one network, and nothing else declared, so each mutation
+        // below is the only network declaration in the definition and the error
+        // names that declaration rather than a leftover from the fixture.
+        fn bare(profile: MachineProfile, os: OperatingSystem) -> ProjectDefinition {
+            let mut definition = project_definition();
+            let environment = &mut definition.environment;
+            environment.endpoints.clear();
+            environment.machines.truncate(1);
+            let machine = &mut environment.machines[0];
+            machine.networks.clear();
+            machine.egress = EgressPolicy::Offline;
+            machine.profile = profile;
+            machine.target.os = os;
+            if os != OperatingSystem::Linux {
+                // Implicit Docker is refused on every non-Linux target and on
+                // Hardened, by a rule this test is not about. Leaving it
+                // declared would make every non-Linux cell fail for that reason
+                // instead of the one under test.
+                for capability in [
+                    MachineCapability::DockerEngine,
+                    MachineCapability::Compose,
+                    MachineCapability::Buildx,
+                ] {
+                    machine
+                        .requested_capabilities
+                        .capabilities
+                        .remove(&capability);
+                }
+                machine.target.image = "native".to_string();
+            }
+            if profile == MachineProfile::Hardened {
+                for capability in [
+                    MachineCapability::DockerEngine,
+                    MachineCapability::Compose,
+                    MachineCapability::Buildx,
+                ] {
+                    machine
+                        .requested_capabilities
+                        .capabilities
+                        .remove(&capability);
+                }
+            }
+            definition
+        }
+
+        type Mutation = fn(&mut ProjectDefinition);
+        // `side` records which half of `validate_machine_network_support` each
+        // declaration reaches, so the expectation table below reads as the rule
+        // rather than as four unrelated answers.
+        let declarations: [(&str, Mutation); 4] = [
+            ("network attachment", |definition| {
                 definition.environment.machines[0].networks = vec!["private".to_string()];
-            },
-            |definition: &mut ProjectDefinition| {
+            }),
+            ("allowed egress", |definition| {
                 definition.environment.machines[0].egress = EgressPolicy::Allowed;
-            },
-            |definition: &mut ProjectDefinition| {
+            }),
+            ("host export", |definition| {
                 definition.environment.host_exports = vec![HostExportSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "api".to_string(),
-                    machine: "api".to_string(),
+                    machine: definition.environment.machines[0].name.clone(),
                     protocol: TransportProtocol::Tcp,
                     machine_port: 443,
-                    host_port: None,
+                    host_port: Some(18443),
                 }];
-            },
-            |definition: &mut ProjectDefinition| {
+            }),
+            ("host import", |definition| {
                 definition.environment.host_imports = vec![HostImportSpec {
                     schema_version: TOPOLOGY_SCHEMA_VERSION,
                     name: "registry".to_string(),
-                    machine: "api".to_string(),
+                    machine: definition.environment.machines[0].name.clone(),
                     protocol: TransportProtocol::Tcp,
                     host_port: 5000,
-                    guest_port: None,
-                    alias: None,
+                    guest_port: Some(15000),
+                    alias: Some("registry".to_string()),
                 }];
-            },
-        ] {
-            let mut hardened = project_definition();
-            hardened.environment.endpoints.clear();
-            hardened.environment.machines[0].networks.clear();
-            hardened.environment.machines[0].profile = MachineProfile::Hardened;
-            for capability in [
-                MachineCapability::DockerEngine,
-                MachineCapability::Compose,
-                MachineCapability::Buildx,
-            ] {
-                hardened.environment.machines[0]
-                    .requested_capabilities
-                    .capabilities
-                    .remove(&capability);
-            }
-            mutate(&mut hardened);
-            assert!(
-                matches!(
-                    hardened.validate(),
-                    Err(TopologyValidationError::InvalidMachineProfile {
-                        profile: MachineProfile::Hardened,
-                        ..
-                    })
-                ),
-                "Hardened Machine accepted declared network topology"
-            );
+            }),
+        ];
 
-            let mut native = project_definition();
-            native.environment.endpoints.clear();
-            native.environment.machines[0].networks.clear();
-            native.environment.machines[0].target.os = OperatingSystem::Macos;
-            for capability in [
-                MachineCapability::DockerEngine,
-                MachineCapability::Compose,
-                MachineCapability::Buildx,
-            ] {
-                native.environment.machines[0]
-                    .requested_capabilities
-                    .capabilities
-                    .remove(&capability);
+        // [network attachment, allowed egress, host export, host import]
+        let table = [
+            (
+                MachineProfile::Developer,
+                OperatingSystem::Linux,
+                [Accepted, Accepted, Accepted, Accepted],
+            ),
+            // The decision this test exists for: a native macOS Machine is on
+            // the Environment fabric (criterion 5) and still off the host
+            // boundary (criterion 7, whose relay adapters do not exist).
+            (
+                MachineProfile::Developer,
+                OperatingSystem::Macos,
+                [Accepted, Accepted, RefusedByTarget, RefusedByTarget],
+            ),
+            // Native Windows is PLANNED, not shipped.
+            (
+                MachineProfile::Developer,
+                OperatingSystem::Windows,
+                [
+                    RefusedByTarget,
+                    RefusedByTarget,
+                    RefusedByTarget,
+                    RefusedByTarget,
+                ],
+            ),
+            (
+                MachineProfile::Hardened,
+                OperatingSystem::Linux,
+                [
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                ],
+            ),
+            // Hardened on a native target is refused before the network rule is
+            // reached at all ("native targets support only the Developer
+            // profile"), which is the same error variant; asserted so that
+            // lifting the target rule alone can never admit Hardened.
+            (
+                MachineProfile::Hardened,
+                OperatingSystem::Macos,
+                [
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                ],
+            ),
+            (
+                MachineProfile::Hardened,
+                OperatingSystem::Windows,
+                [
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                    RefusedByProfile,
+                ],
+            ),
+        ];
+
+        for (profile, os, expectations) in table {
+            // A definition with none of these declarations must validate for
+            // every admitted (profile, target) pair, or an "Accepted" cell
+            // below would be evidence about the fixture and not the rule.
+            if profile == MachineProfile::Developer {
+                bare(profile, os).validate().unwrap_or_else(|error| {
+                    panic!("undeclared baseline for {profile:?} {os:?} is invalid: {error}")
+                });
             }
-            mutate(&mut native);
-            assert!(
-                matches!(
-                    native.validate(),
-                    Err(TopologyValidationError::InvalidCapabilityDeclaration { .. })
-                ),
-                "native macOS Machine accepted declared network topology"
-            );
+            for ((declaration, mutate), expected) in declarations.iter().zip(expectations) {
+                let mut definition = bare(profile, os);
+                mutate(&mut definition);
+                let result = definition.validate();
+                let observed = match &result {
+                    Ok(()) => Accepted,
+                    Err(TopologyValidationError::InvalidMachineProfile { .. }) => RefusedByProfile,
+                    Err(TopologyValidationError::InvalidCapabilityDeclaration { .. }) => {
+                        RefusedByTarget
+                    }
+                    Err(other) => panic!(
+                        "{profile:?} {os:?} declaring a {declaration} failed for an unrelated reason: {other}"
+                    ),
+                };
+                assert_eq!(
+                    observed, expected,
+                    "{profile:?} {os:?} declaring a {declaration}: {result:?}"
+                );
+            }
         }
     }
 
+    #[test]
+    fn a_developer_macos_machine_joins_the_environment_fabric_it_declares() {
+        // Criterion 5 requires a service path that crosses between a Linux
+        // Machine and a native macOS Machine in both directions, so the macOS
+        // Machine must reach an INSTANTIATED attachment and egress record, not
+        // merely survive validation. `validate` returning `Ok` would say only
+        // that the refusal was lifted; this says the topology was built.
+        let mut definition = project_definition();
+        let environment = &mut definition.environment;
+        assert_eq!(environment.machines[1].name, "ios");
+        assert_eq!(environment.machines[1].target.os, OperatingSystem::Macos);
+        environment.machines[1].networks = vec!["private".to_string()];
+        environment.machines[1].egress = EgressPolicy::Allowed;
+        // An endpoint the macOS Machine serves on the shared private network:
+        // the Linux -> macOS direction of the required crossing, declared.
+        environment.endpoints.push(EndpointSpec {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            name: "simctl".to_string(),
+            machine: "ios".to_string(),
+            network: "private".to_string(),
+            protocol: EndpointProtocol::Tcp,
+            port: 8100,
+            hostname: Some("ios.shop.test".to_string()),
+        });
+        definition.validate().unwrap();
+
+        let instance = definition.instantiate_environment("agent", 7).unwrap();
+        let macos_id = instance.machines[1].machine_id.clone();
+        assert_eq!(instance.machines[1].target.os, OperatingSystem::Macos);
+
+        // Both Machines are on the one network, which is what makes the path
+        // between them a declared path rather than two isolated attachments.
+        assert_eq!(instance.networks.len(), 1);
+        let network_id = instance.networks[0].network_id.clone();
+        assert_eq!(instance.network_attachments.len(), 2);
+        let macos_attachment = instance
+            .network_attachments
+            .iter()
+            .find(|attachment| attachment.machine_id == macos_id)
+            .expect("the macOS Machine holds an attachment to the network it declared");
+        assert_eq!(macos_attachment.network_id, network_id);
+        assert!(
+            instance
+                .network_attachments
+                .iter()
+                .any(
+                    |attachment| attachment.machine_id == instance.machines[0].machine_id
+                        && attachment.network_id == network_id
+                ),
+            "the Linux Machine must be on the same network for the crossing to exist"
+        );
+
+        // The attachment is owned, so Stop and Delete reclaim it: an unowned
+        // attachment is one nothing tears down.
+        assert_eq!(
+            instance
+                .ownership
+                .iter()
+                .filter(
+                    |record| record.resource_kind == OwnedResourceKind::NetworkAttachment
+                        && record.resource_id == macos_attachment.attachment_id.to_string()
+                        && record.machine_id.as_ref() == Some(&macos_id)
+                )
+                .count(),
+            1
+        );
+
+        // Egress is a policy record on the Machine's own NIC, never owned.
+        let macos_egress = instance
+            .egress
+            .iter()
+            .find(|egress| egress.machine_id == macos_id)
+            .expect("the macOS Machine's declared egress is instantiated");
+        assert_eq!(macos_egress.policy, EgressPolicy::Allowed);
+
+        // Both endpoints resolve on the shared network, including the one the
+        // macOS Machine serves.
+        assert_eq!(instance.endpoints.len(), 2);
+        let macos_endpoint = instance
+            .endpoints
+            .iter()
+            .find(|endpoint| endpoint.name == "simctl")
+            .expect("the endpoint the macOS Machine serves is instantiated");
+        assert_eq!(macos_endpoint.machine_id, macos_id);
+        assert_eq!(macos_endpoint.network_id, network_id);
+        assert_eq!(macos_endpoint.port, 8100);
+
+        // Membership does not hand macOS implicit Docker; that rule is
+        // untouched and refuses the request from the same definition.
+        let mut with_docker = definition.clone();
+        with_docker.environment.machines[1]
+            .requested_capabilities
+            .capabilities
+            .insert(MachineCapability::DockerEngine);
+        assert!(matches!(
+            with_docker.validate(),
+            Err(TopologyValidationError::InvalidCapabilityDeclaration { .. })
+        ));
+    }
     #[test]
     fn network_topology_instances_require_exact_references_and_uniqueness() {
         let definition = network_topology_definition();

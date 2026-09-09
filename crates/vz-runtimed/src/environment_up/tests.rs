@@ -266,8 +266,10 @@ async fn a_fixed_port_host_export_is_admitted_and_persisted() {
 ///
 /// Two of these are refused by the portable definition itself rather than by
 /// this Up: `validate_machine_network_support`
-/// (`vz-runtime-contract/src/types/topology.rs:4727-4746`) already refuses an
-/// export on a Hardened or non-Linux Machine, so they arrive as
+/// (`vz-runtime-contract/src/types/topology.rs`) already refuses an export on a
+/// Hardened or non-Linux Machine -- a native macOS Machine may now hold an
+/// Environment-fabric attachment, but host exports and imports are the host
+/// half of the boundary and stay Linux-only -- so they arrive as
 /// `ValidationError` and never reach `refuse_unsupported_host_exports`. That
 /// module's own matching rule is therefore the second of two and is exercised
 /// directly by its unit tests; asserting the code actually produced, rather than

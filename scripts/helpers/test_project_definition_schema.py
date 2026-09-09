@@ -88,6 +88,104 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
                             expected = expected and target == "linux" and profile == "developer"
                         self.assertEqual(self.validator.is_valid(value), expected)
 
+    def test_machine_network_membership_is_a_separate_grant_from_implicit_docker(self):
+        """Which Machines may declare `networks` and `egress`, cell by cell.
+
+        The third machine conditional used to withhold both from `macos` and
+        `windows` alike, which made a native macOS Machine undeclarable on any
+        Environment network. Acceptance criterion 5 requires a service path that
+        crosses between a Linux Machine and a native macOS Machine in both
+        directions, so a Developer macOS Machine now declares them; Hardened and
+        native Windows still declare neither. Nothing tested this conditional
+        before -- `test_profile_and_target_docker_rules` covers only the Docker
+        one -- so every cell below is new coverage.
+
+        The last two cells are the reason the two conditionals had to be split:
+        a macOS Machine on a network still gets no implicit Docker, which the
+        product contract forbids and which `native_macos_cannot_request_implicit_docker`
+        asserts on the Rust side.
+        """
+        for target in ["linux", "macos", "windows"]:
+            for profile in ["developer", "hardened"]:
+                # A separate rule pins Hardened to Linux; without it every
+                # "expected True" below would be about that rule instead.
+                profile_target_ok = not (profile == "hardened" and target != "linux")
+                on_the_fabric = profile == "developer" and target in ("linux", "macos")
+                for declaration, expected in [
+                    ({}, profile_target_ok),
+                    ({"networks": []}, profile_target_ok),
+                    ({"egress": "offline"}, profile_target_ok),
+                    ({"networks": ["private"]}, profile_target_ok and on_the_fabric),
+                    ({"networks": ["private", "public"]}, profile_target_ok and on_the_fabric),
+                    ({"egress": "allowed"}, profile_target_ok and on_the_fabric),
+                    ({"networks": ["private"], "egress": "allowed"},
+                     profile_target_ok and on_the_fabric),
+                    # Membership is not a Docker grant: the Docker conditional
+                    # is untouched and still refuses every non-Linux target.
+                    ({"networks": ["private"],
+                      "requested_capabilities": {"capabilities": ["docker_engine"]}},
+                     profile_target_ok and on_the_fabric and target == "linux"),
+                    ({"egress": "allowed",
+                      "requested_capabilities": {"capabilities": ["compose"]}},
+                     profile_target_ok and on_the_fabric and target == "linux"),
+                ]:
+                    with self.subTest(target=target, profile=profile, declaration=declaration):
+                        value = copy.deepcopy(EXAMPLE)
+                        machine = value["environment"]["machines"][0]
+                        machine["target"]["os"] = target
+                        machine["profile"] = profile
+                        machine.update(copy.deepcopy(declaration))
+                        self.assertEqual(self.validator.is_valid(value), expected)
+
+    def test_machine_field_set_matches_the_production_parser(self):
+        """The authoring schema and `MachineSpec` must agree exactly.
+
+        Same defect class as the `WorkspaceProjection` pin below: a projection
+        shipped that no vz.json could declare, because the Rust type gained a
+        field the schema never learned about. `networks` and `egress` are the
+        two fields this change makes newly declarable on a macOS Machine, so the
+        field set is read out of the Rust struct rather than restated here, and
+        the next field added on either side fails this test instead of shipping.
+
+        `deny_unknown_fields` plus `additionalProperties: false` means neither
+        side may carry a field the other does not, and a field with no
+        `#[serde(default)]` has no deserializable absence, so the schema's
+        `required` list must name exactly the undefaulted fields.
+        """
+        source = (ROOT / "crates/vz-runtime-contract/src/types/topology.rs").read_text()
+        declaration = source.split("pub struct MachineSpec {", 1)
+        self.assertEqual(len(declaration), 2, "MachineSpec is no longer a struct here")
+        self.assertIn("#[serde(deny_unknown_fields)]",
+                      declaration[0][-400:],
+                      "MachineSpec no longer denies unknown fields; this comparison assumes it")
+        body = declaration[1].split("\n}", 1)[0]
+
+        rust_fields, required_fields, pending = set(), set(), []
+        for line in body.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("#["):
+                pending.append(stripped)
+                continue
+            match = re.match(r"pub (\w+):", stripped)
+            if match is None:
+                continue  # doc comments and blank lines
+            field = match.group(1)
+            rust_fields.add(field)
+            if not any("serde(default" in attribute for attribute in pending):
+                required_fields.add(field)
+            pending = []
+
+        self.assertTrue(rust_fields, "could not read MachineSpec fields")
+        self.assertEqual(set(SCHEMA["$defs"]["machine"]["properties"]), rust_fields)
+        self.assertEqual(set(SCHEMA["$defs"]["machine"]["required"]), required_fields)
+        # Vacuity: the parse above is only evidence if it actually distinguishes
+        # a defaulted field from an undefaulted one.
+        self.assertIn("networks", rust_fields)
+        self.assertIn("egress", rust_fields)
+        self.assertNotIn("networks", required_fields)
+        self.assertNotIn("egress", required_fields)
+        self.assertIn("schema_version", required_fields)
+
     def test_invalid_identity_capabilities_and_wire_ranges(self):
         for project_id in ["", "../../project", "a" * 129, "prj_é", "prj_x\n", "prj_x\r", "prj_x\t", "prj_\x00x"]:
             value = copy.deepcopy(EXAMPLE)

@@ -89,12 +89,13 @@
         {
           "if": {"anyOf": [
             {"properties": {"profile": {"const": "hardened"}}, "required": ["profile"]},
-            {"properties": {"target": {"properties": {"os": {"enum": ["macos", "windows"]}}, "required": ["os"]}}, "required": ["target"]}
+            {"properties": {"target": {"properties": {"os": {"const": "windows"}}, "required": ["os"]}}, "required": ["target"]}
           ]},
-          "then": {"properties": {"networks": {"maxItems": 0}, "egress": {"const": "offline"}}}
+          "then": {"properties": {"networks": {"maxItems": 0}, "egress": {"const": "offline"}}},
+          "description": "Who may declare Environment-network membership. This is a SEPARATE grant from implicit Docker, which the preceding conditional governs, and the two no longer withhold from the same set. Hardened is the restricted profile and declares none of this topology; native Windows is PLANNED, not shipped, so it declares none of it either. A Developer macOS Machine may declare `networks` and `egress`, because it is a target-native Machine on the Environment fabric, and still gets no implicit Docker: the preceding conditional continues to refuse `docker_engine`, `compose` and `buildx` on every non-Linux target."
         }
       ],
-      "description": "Developer Linux implicitly owns Docker; no Docker flag, global socket or Linux sidecar exists for other profiles/targets."
+      "description": "Developer Linux implicitly owns Docker; no Docker flag, global socket or Linux sidecar exists for other profiles/targets. Network membership does not follow that line: see the third conditional below."
     },
     "network": {
       "type": "object", "additionalProperties": false,

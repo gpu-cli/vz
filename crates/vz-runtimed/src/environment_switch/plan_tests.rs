@@ -457,13 +457,23 @@ fn an_attachment_that_names_an_absent_machine_or_network_is_refused() {
 
 #[test]
 fn a_machine_that_cannot_hold_a_fabric_port_is_refused_rather_than_planned_one() {
-    // Hardened and native-target Machines have no NIC a switch could attach to.
-    // The topology contract refuses the declaration, so a persisted record like
-    // this is corruption; planning a port for it would build a switch whose
-    // member never appears.
+    // Hardened is the restricted profile and declares none of this topology;
+    // native Windows is PLANNED rather than shipped and has no NIC a switch
+    // could attach to. The topology contract refuses either declaration, so a
+    // persisted record like this is corruption; planning a port for it would
+    // build a switch whose member never appears.
+    //
+    // Windows was not covered here before — the old loop paired Hardened Linux
+    // with Developer macOS, and macOS is now admitted — so this stands beside
+    // `a_developer_macos_machine_holds_a_fabric_port_like_a_linux_one` rather
+    // than being weakened by it: one refused shape was replaced by a refused
+    // shape that had no coverage at all, and Hardened is asserted on both
+    // targets instead of one.
     for (profile, os) in [
         (MachineProfile::Hardened, OperatingSystem::Linux),
-        (MachineProfile::Developer, OperatingSystem::Macos),
+        (MachineProfile::Hardened, OperatingSystem::Macos),
+        (MachineProfile::Developer, OperatingSystem::Windows),
+        (MachineProfile::Hardened, OperatingSystem::Windows),
     ] {
         let mut environment = pair_on_one_network();
         environment.machines[1].profile = profile;
@@ -477,6 +487,77 @@ fn a_machine_that_cannot_hold_a_fabric_port_is_refused_rather_than_planned_one()
             })
         );
     }
+}
+
+#[test]
+fn a_developer_macos_machine_holds_a_fabric_port_like_a_linux_one() {
+    // Criterion 5 needs a service path that crosses between a Linux Machine and
+    // a native macOS Machine, so a macOS Machine must be planned a real port —
+    // "no longer refused" would not say the fabric was built.
+    //
+    // The plan for the mixed pair is asserted to be byte-identical to the plan
+    // for the all-Linux pair. That is the strongest available statement of the
+    // module's own rule that addresses are derived and never leased: the
+    // Machine's target is not an input to any derivation, so flipping it moves
+    // no port number, no MAC and no address, and a persisted Environment whose
+    // Machine is macOS plans the fabric its saved guests already believe in.
+    let linux_plan = plan_environment_fabric(&pair_on_one_network()).unwrap();
+
+    let mut mixed = pair_on_one_network();
+    mixed.machines[1].target.os = OperatingSystem::Macos;
+    mixed.machines[1].target.image = "macos-26".to_string();
+    let macos_plan = plan_environment_fabric(&mixed).unwrap();
+
+    assert_eq!(macos_plan, linux_plan);
+
+    // Stated positively as well, so this test still says what the fabric IS if
+    // the Linux baseline it is compared against ever changes.
+    assert_eq!(macos_plan.networks.len(), 1);
+    let ports = &macos_plan.networks[0].ports;
+    assert_eq!(ports.len(), 2);
+    assert_eq!(
+        macos_plan.attached_machines(),
+        BTreeSet::from([machine_id(1), machine_id(2)])
+    );
+    let macos_port = ports
+        .iter()
+        .find(|port| port.machine_id == machine_id(2))
+        .expect("the macOS Machine holds a port on the network it declared");
+    assert_eq!(macos_port.attachment_id, attachment_id(2));
+    let octets = macos_port.address.octets();
+    assert_eq!(
+        [octets[0], octets[1], octets[2]],
+        [10, 42, 0],
+        "{} is outside the declared range {}",
+        macos_port.address,
+        macos_plan.networks[0].cidr
+    );
+    // Offsets 0 and 1 are the subnet address and the reserved gateway; neither
+    // is assignable, and 255 is the broadcast address.
+    assert!((2..255).contains(&octets[3]), "{}", macos_port.address);
+    // One address per port: a switch that assigned the same address twice would
+    // drop one member's frames rather than forward them.
+    assert_ne!(ports[0].address, ports[1].address);
+    assert_ne!(ports[0].mac, ports[1].mac);
+    assert_eq!(
+        macos_port.mac,
+        MacAddress::derive(ENVIRONMENT, machine_id(2).as_str(), network_id(1).as_str()),
+        "the macOS port's MAC must be the derivation over its own identifiers"
+    );
+}
+
+#[test]
+fn an_all_macos_environment_plans_a_whole_fabric() {
+    // The mixed pair above could pass with a rule that admitted macOS only
+    // alongside a Linux Machine. Every Machine here is macOS, and the plan is
+    // still the same fabric, because the target is not an input at all.
+    let linux_plan = plan_environment_fabric(&pair_on_one_network()).unwrap();
+    let mut all_macos = pair_on_one_network();
+    for machine in &mut all_macos.machines {
+        machine.target.os = OperatingSystem::Macos;
+        machine.target.image = "macos-26".to_string();
+    }
+    assert_eq!(plan_environment_fabric(&all_macos).unwrap(), linux_plan);
 }
 
 #[test]
