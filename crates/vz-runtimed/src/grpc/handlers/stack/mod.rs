@@ -635,6 +635,7 @@ mod runtime_error_mapping_tests {
             project_id: project_id.clone(),
             name: "daemon-scope".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -655,6 +656,7 @@ mod runtime_error_mapping_tests {
             },
         };
         let environment = EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

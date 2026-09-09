@@ -906,6 +906,9 @@ async fn boot_runtime_sandbox_resources(
         memory_mb,
         volume_mounts,
         disk_image_path,
+        // The legacy sandbox surface declares no Environment topology, so it
+        // never carries a declared volume.
+        block_volumes: Vec::new(),
     };
 
     let ports: Vec<ContractPortMapping> = port_mappings

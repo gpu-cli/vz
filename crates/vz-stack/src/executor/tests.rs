@@ -160,6 +160,7 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
         project_id: project_id.clone(),
         name: "executor-fixture".to_string(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -204,6 +205,7 @@ fn scoped_topology(stack_id: &str) -> (ProjectState, vz_runtime_contract::Machin
         legacy_sandbox_id: None,
     };
     let environment = EnvironmentInstance {
+        volumes: Vec::new(),
         network_attachments: Vec::new(),
         host_exports: Vec::new(),
         host_imports: Vec::new(),

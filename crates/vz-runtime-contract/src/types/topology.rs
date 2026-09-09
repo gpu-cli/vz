@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use super::{
     SANDBOX_LABEL_PROJECT_DIR, SANDBOX_LABEL_SPACE_MODE, SANDBOX_SPACE_MODE_REQUIRED, Sandbox,
-    SandboxBackend, SandboxState,
+    SandboxBackend, SandboxState, VolumeInstance, VolumeSpec, validate_volume,
 };
 
 /// Current schema version for Developer Environment topology records.
@@ -86,6 +86,7 @@ topology_id!(NetworkAttachmentId, "network_attachment_id", "att_");
 topology_id!(HostExportId, "host_export_id", "hxp_");
 topology_id!(HostImportId, "host_import_id", "hmp_");
 topology_id!(EgressId, "egress_id", "egr_");
+topology_id!(VolumeId, "volume_id", "vol_");
 topology_id!(LifecycleOperationId, "lifecycle_operation_id", "lop_");
 
 /// Host or Machine operating system.
@@ -272,6 +273,32 @@ pub fn validate_workspace_source_path(
     Ok(())
 }
 
+/// Where a projection or a volume appears INSIDE a Machine.
+///
+/// Shared by workspace projections and by [`VolumeAttachment`](super::VolumeAttachment)
+/// because the rule is the same one: the guest-side mount point is an absolute,
+/// bounded, `..`-free path, and nothing about it is relative to the host. Two
+/// copies of this rule would let the two declarations drift into accepting
+/// different paths for the same guest mount namespace.
+pub fn validate_machine_target_path(
+    kind: &str,
+    machine: &str,
+    target_path: &str,
+) -> Result<(), TopologyValidationError> {
+    if !target_path.starts_with('/')
+        || target_path.len() > 1024
+        || target_path.chars().any(char::is_control)
+        || target_path.split('/').any(|c| c == "..")
+    {
+        return Err(TopologyValidationError::InvalidIdentifier {
+            kind: kind.to_string(),
+            value: format!("{machine}:{target_path}"),
+            reason: "must be a bounded absolute `..`-free Machine path".to_string(),
+        });
+    }
+    Ok(())
+}
+
 /// Validate one declared workspace projection.
 pub fn validate_workspace_projection(
     machine: &str,
@@ -279,17 +306,11 @@ pub fn validate_workspace_projection(
 ) -> Result<(), TopologyValidationError> {
     validate_name("machine.workspace.binding", &projection.binding)?;
     validate_workspace_source_path(machine, &projection.source_path)?;
-    if !projection.target_path.starts_with('/')
-        || projection.target_path.len() > 1024
-        || projection.target_path.chars().any(char::is_control)
-        || projection.target_path.split('/').any(|c| c == "..")
-    {
-        return Err(TopologyValidationError::InvalidIdentifier {
-            kind: "machine.workspace.target_path".to_string(),
-            value: format!("{machine}:{}", projection.target_path),
-            reason: "must be a bounded absolute `..`-free Machine path".to_string(),
-        });
-    }
+    validate_machine_target_path(
+        "machine.workspace.target_path",
+        machine,
+        &projection.target_path,
+    )?;
     Ok(())
 }
 
@@ -434,6 +455,13 @@ pub struct EnvironmentSpec {
     pub host_exports: Vec<HostExportSpec>,
     #[serde(default)]
     pub host_imports: Vec<HostImportSpec>,
+    /// Environment-owned storage: block volumes and shared caches.
+    ///
+    /// Separate from `MachineSpec::workspace` on purpose. A projection shows a
+    /// Machine part of the user's worktree; a volume is storage the Environment
+    /// itself owns and no host path outside it backs.
+    #[serde(default)]
+    pub volumes: Vec<VolumeSpec>,
 }
 
 /// Versioned, portable project definition.
@@ -810,6 +838,12 @@ pub enum OwnedResourceKind {
     PortRange,
     Credential,
     Fault,
+    /// One declared Environment-owned volume: a block image or a shared cache
+    /// directory. Environment-scoped rather than Machine-scoped, because a
+    /// shared cache legitimately outlives and spans the Machines attached to
+    /// it, and a block volume's image is reclaimed by the Environment that
+    /// allocated it rather than by whichever Machine happened to mount it.
+    Volume,
     LegacySandbox,
     Other(String),
 }
@@ -1054,6 +1088,8 @@ pub struct EnvironmentInstance {
     pub host_imports: Vec<HostImportInstance>,
     #[serde(default)]
     pub egress: Vec<EgressInstance>,
+    #[serde(default)]
+    pub volumes: Vec<VolumeInstance>,
     #[serde(default)]
     pub ownership: Vec<OwnershipRecord>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1559,6 +1595,30 @@ impl ProjectDefinition {
                     machine_id: Some(attachment.machine_id.clone()),
                 }),
         );
+        let volumes: Vec<_> = self
+            .environment
+            .volumes
+            .iter()
+            .map(|volume| VolumeInstance {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                volume_id: VolumeId::generate(),
+                environment_id: environment_id.clone(),
+                name: volume.name.clone(),
+                kind: volume.kind,
+            })
+            .collect();
+        // Environment-scoped, so `machine_id` is None. A shared cache spans
+        // several Machines and a block volume outlives the incarnation that
+        // mounted it, so naming one owning Machine here would misstate both
+        // lifetimes and would make Delete dispatch the reclamation with the
+        // wrong Machine's store.
+        ownership.extend(volumes.iter().map(|volume| OwnershipRecord {
+            schema_version: TOPOLOGY_SCHEMA_VERSION,
+            resource_kind: OwnedResourceKind::Volume,
+            resource_id: volume.volume_id.to_string(),
+            environment_id: environment_id.clone(),
+            machine_id: None,
+        }));
         ownership.extend(host_exports.iter().map(|export| OwnershipRecord {
             schema_version: TOPOLOGY_SCHEMA_VERSION,
             resource_kind: OwnedResourceKind::HostExport,
@@ -1591,6 +1651,7 @@ impl ProjectDefinition {
             host_exports,
             host_imports,
             egress,
+            volumes,
             ownership,
             legacy_migration: None,
             created_at: now,
@@ -1626,6 +1687,7 @@ impl EnvironmentSpec {
         validate_unique_names("endpoint", self.endpoints.iter().map(|e| &e.name))?;
         validate_unique_names("host_export", self.host_exports.iter().map(|e| &e.name))?;
         validate_unique_names("host_import", self.host_imports.iter().map(|i| &i.name))?;
+        validate_unique_names("volume", self.volumes.iter().map(|v| &v.name))?;
         let mut attachments: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
         let machines_by_name: BTreeMap<&str, &MachineSpec> = self
             .machines
@@ -1743,6 +1805,18 @@ impl EnvironmentSpec {
             }
             if let Some(alias) = &import.alias {
                 validate_name("host_import.alias", alias)?;
+            }
+        }
+        for volume in &self.volumes {
+            validate_name("volume", &volume.name)?;
+            validate_volume(volume)?;
+            for attachment in &volume.attachments {
+                if !machine_names.contains(attachment.machine.as_str()) {
+                    return Err(TopologyValidationError::MissingReference {
+                        kind: "volume.attachment.machine".to_string(),
+                        value: attachment.machine.clone(),
+                    });
+                }
             }
         }
         Ok(())
@@ -2340,6 +2414,31 @@ impl EnvironmentInstance {
                 return Err(TopologyValidationError::Duplicate {
                     kind: "host_export_name".to_string(),
                     value: export.name.clone(),
+                });
+            }
+        }
+        let mut volume_ids = BTreeSet::new();
+        let mut volume_names = BTreeSet::new();
+        for volume in &self.volumes {
+            validate_schema(volume.schema_version)?;
+            volume.volume_id.validate()?;
+            validate_name("volume", &volume.name)?;
+            if volume.environment_id != self.environment_id {
+                return Err(TopologyValidationError::OwnershipMismatch {
+                    kind: "volume.environment".to_string(),
+                    value: volume.volume_id.to_string(),
+                });
+            }
+            if !volume_ids.insert(volume.volume_id.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "volume_id".to_string(),
+                    value: volume.volume_id.to_string(),
+                });
+            }
+            if !volume_names.insert(volume.name.as_str()) {
+                return Err(TopologyValidationError::Duplicate {
+                    kind: "volume_name".to_string(),
+                    value: volume.name.clone(),
                 });
             }
         }
@@ -4360,6 +4459,19 @@ fn validate_exact_topology_ownership(
             ));
         }
     }
+    for volume in &environment.volumes {
+        // `machine_id.is_none()` is asserted rather than ignored: a volume
+        // record that acquired a Machine would be reclaimed by that Machine's
+        // teardown and would silently stop being an Environment-scoped resource.
+        let exact = environment.ownership.iter().filter(|record| {
+            record.resource_kind == OwnedResourceKind::Volume
+                && record.resource_id == volume.volume_id.as_str()
+                && record.machine_id.is_none()
+        });
+        if exact.count() != 1 {
+            return Err(ownership_mismatch("volume", volume.volume_id.to_string()));
+        }
+    }
 
     for import in &environment.host_imports {
         let exact = environment.ownership.iter().filter(|record| {
@@ -4408,6 +4520,13 @@ fn validate_exact_topology_ownership(
             OwnedResourceKind::HostImport => environment.host_imports.iter().any(|import| {
                 record.resource_id == import.import_id.as_str()
                     && record.machine_id.as_ref() == Some(&import.machine_id)
+            }),
+            // Explicit, not left to the `_ => true` arm below: that arm accepts
+            // any record it does not recognise, so a Volume record naming a
+            // volume this Environment does not have would be admitted as
+            // "unknown kind, assume fine" rather than refused.
+            OwnedResourceKind::Volume => environment.volumes.iter().any(|volume| {
+                record.resource_id == volume.volume_id.as_str() && record.machine_id.is_none()
             }),
             OwnedResourceKind::LegacySandbox => {
                 environment
@@ -4642,6 +4761,35 @@ fn validate_definition_instance(
             return definition_topology_mismatch(
                 &environment_id,
                 format!("host export `{}` Machine differs", desired.name),
+            );
+        }
+    }
+    // A volume instance is identity only, so the definition comparison is over
+    // the names and kinds: a definition whose `cache` became a block volume
+    // must not be reconciled onto an instance still recorded as a shared cache,
+    // because the two are different carriers with different mount semantics.
+    let volumes: BTreeMap<_, _> = environment
+        .volumes
+        .iter()
+        .map(|volume| (volume.name.as_str(), volume))
+        .collect();
+    if volumes.len() != spec.volumes.len() {
+        return definition_topology_mismatch(
+            &environment_id,
+            "Volume names/count differ from the project definition",
+        );
+    }
+    for desired in &spec.volumes {
+        let Some(actual) = volumes.get(desired.name.as_str()) else {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("missing volume `{}`", desired.name),
+            );
+        };
+        if actual.kind != desired.kind {
+            return definition_topology_mismatch(
+                &environment_id,
+                format!("volume `{}` kind differs", desired.name),
             );
         }
     }
@@ -4975,6 +5123,9 @@ pub fn migrate_legacy_developer_sandbox(
     let environment_spec = EnvironmentSpec {
         host_exports: Vec::new(),
         host_imports: Vec::new(),
+        // A legacy sandbox declared no Environment-owned storage; migration
+        // never invents one, exactly as it never invents a network.
+        volumes: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         default_machine: None,
         machines: vec![machine_spec],
@@ -5026,6 +5177,7 @@ pub fn migrate_legacy_developer_sandbox(
         host_exports: Vec::new(),
         host_imports: Vec::new(),
         egress: Vec::new(),
+        volumes: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id.clone(),
         project_id: project_id.clone(),
@@ -5152,6 +5304,7 @@ fn resource_kind_identity(kind: &OwnedResourceKind) -> String {
         OwnedResourceKind::PortRange => "port_range".to_string(),
         OwnedResourceKind::Credential => "credential".to_string(),
         OwnedResourceKind::Fault => "fault".to_string(),
+        OwnedResourceKind::Volume => "volume".to_string(),
         OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
         OwnedResourceKind::Other(value) => format!("other:{value}"),
     }
@@ -5310,6 +5463,7 @@ mod tests {
             environment: EnvironmentSpec {
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
+                volumes: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,
                 default_machine: None,
                 machines: vec![
@@ -8653,6 +8807,7 @@ mod tests {
             OwnedResourceKind::PortRange,
             OwnedResourceKind::Credential,
             OwnedResourceKind::Fault,
+            OwnedResourceKind::Volume,
             OwnedResourceKind::LegacySandbox,
             OwnedResourceKind::Other("audit".to_string()),
         ];
@@ -8672,6 +8827,7 @@ mod tests {
                 OwnedResourceKind::PortRange => "port_range".to_string(),
                 OwnedResourceKind::Credential => "credential".to_string(),
                 OwnedResourceKind::Fault => "fault".to_string(),
+                OwnedResourceKind::Volume => "volume".to_string(),
                 OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
                 OwnedResourceKind::Other(value) => format!("other:{value}"),
             };
@@ -8696,5 +8852,9 @@ mod tests {
         ] {
             assert!(resource_kind_requires_machine(&kind));
         }
+        // A volume is Environment-scoped: it must NOT require a Machine, or an
+        // Environment-owned record with `machine_id: None` would be refused as
+        // malformed the moment one was minted.
+        assert!(!resource_kind_requires_machine(&OwnedResourceKind::Volume));
     }
 }

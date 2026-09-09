@@ -144,13 +144,48 @@ no other Machine, and Up refuses such a declaration at admission, before it
 allocates identities or reserves a workspace binding. Two read-only projections
 of one source are allowed, because there is no writer to serialise.
 
+Environment-owned storage is declared as a `Volume`, which is separate from a
+workspace projection: a projection shows a Machine part of the user's worktree,
+while a volume is storage the Environment itself owns and no host path outside
+it backs. A volume declares one of two kinds, and the kind decides the
+multi-attach rule.
+
+A `block` volume is one sparse disk image carrying one ext4 filesystem,
+attached as a virtio-block device and mounted at its declared path. It declares
+`size_bytes`. Because ext4 is not a cluster filesystem, a writable block volume
+attached to more than one Machine is refused at admission, before any identity
+is reserved and before any image is allocated; read-only multi-attach is
+allowed, because no writer exists to serialise.
+
+A `shared_cache` volume is one host directory exported to every attached
+Machine over its own VirtioFS device, and multi-attach is its purpose rather
+than its hazard: there is no shared block layer to corrupt and the host
+filesystem serialises the writes. What the carrier does not provide for free is
+*when* one Machine observes another's write, so a shared cache must declare its
+`consistency` explicitly. The only model is `bounded_staleness` with a
+`staleness_bound_millis`: a write closed on one attached Machine becomes visible
+to every other attached Machine within that bound, and nothing is promised
+before it, because each Machine runs its own virtio-fs attribute and dentry
+cache over the one host directory.
+
+A volume is Environment-scoped rather than Machine-scoped, so its ownership
+record carries no `machine_id`: a shared cache spans several Machines and a
+block volume outlives the incarnation that mounted it. Stop preserves a volume,
+and Delete reclaims its storage as part of the selected Environment's ownership
+graph.
+
 Every workspace projection is
 <!-- capability-matrix: macos-arm64/linux/*,macos-arm64/macos/developer workspace_read_write,workspace_read_only,workspace_snapshot -->**PLANNED**;
-promotion waits on gate evidence, not on the adapter. Up applies `read_write`
-and `read_only` on Developer Linux Machines, and rejects `snapshot` (no
-directory-copy primitive and no owned-resource kind, so Delete could neither
-reclaim nor account for one) along with any projection declared on a Hardened or
-non-Linux Machine, which carries no VirtioFS share to serve it.
+promotion waits on gate evidence, not on the adapter. Up applies all three
+modes on Developer Linux Machines. A `snapshot` is a private copy-on-write clone
+of the declared source, made with `clonefile` and shared writable: the Machine
+may write into its own copy and nothing it writes reaches the worktree, and the
+copy is remade on every Up so the tree is the source as it was at that boot. It
+lives inside that Machine's own runtime store, which is already an accounted
+owned resource, so Delete reclaims it without a resource kind of its own. A
+projection declared on a Hardened or non-Linux Machine is still rejected, because
+neither carries a VirtioFS share to serve it. Declared volumes follow the same
+rule and for the same reason.
 
 ## Machine contract
 

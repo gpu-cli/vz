@@ -459,28 +459,11 @@ fn publish_directory(source: &Path, destination: &Path) -> Result<()> {
     }
 }
 
+/// Copy-on-write clone of one validated immutable image file.
+///
+/// The syscall wrapper lives in [`crate::clone`], which also serves the
+/// directory-tree case; keeping one wrapper is what stops the two uses drifting
+/// into different failure behaviour.
 fn clone_file(source: &Path, destination: &Path) -> Result<()> {
-    #[cfg(target_os = "macos")]
-    {
-        use std::ffi::CString;
-        use std::os::unix::ffi::OsStrExt;
-        let source = CString::new(source.as_os_str().as_bytes())?;
-        let destination = CString::new(destination.as_os_str().as_bytes())?;
-        // SAFETY: paths are live NUL-terminated strings. The source is a
-        // validated immutable file and destination is new private staging.
-        // clonefile creates a separate COW inode, never a hard link to source.
-        #[allow(unsafe_code)]
-        let result = unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) };
-        ensure!(
-            result == 0,
-            "APFS clone failed (no full-copy fallback): {}",
-            std::io::Error::last_os_error()
-        );
-        Ok(())
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (source, destination);
-        anyhow::bail!("native macOS disk cloning requires a macOS host")
-    }
+    crate::clone::clone_path(source, destination)
 }

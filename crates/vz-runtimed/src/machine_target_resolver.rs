@@ -298,6 +298,7 @@ impl ResolvedMachineConfiguration {
             })
             .collect();
         EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: TOPOLOGY_SCHEMA_VERSION,
@@ -841,6 +842,7 @@ mod tests {
             project_id: ProjectId::new("prj_resolution").unwrap(),
             name: "resolution".into(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,

@@ -57,6 +57,13 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
         machine["requested_capabilities"] = {"capabilities": ["posix_exec"]}
         environment["networks"] = [{"schema_version": 1, "name": "private", "kind": "private"}]
         environment["endpoints"] = [{"schema_version": 1, "name": "api", "machine": "dev", "network": "private", "protocol": "tcp", "port": 8080}]
+        environment["volumes"] = [
+            {"schema_version": 1, "name": "data", "kind": "block", "size_bytes": 16 * 1024 * 1024,
+             "attachments": [{"machine": "dev", "target_path": "/data", "mode": "read_write"}]},
+            {"schema_version": 1, "name": "cache", "kind": "shared_cache",
+             "consistency": {"model": "bounded_staleness", "staleness_bound_millis": 2000},
+             "attachments": [{"machine": "dev", "target_path": "/cache", "mode": "read_write"}]},
+        ]
         self.validator.validate(value)
 
         def objects(item):
@@ -185,6 +192,108 @@ class ProjectDefinitionSchemaTests(unittest.TestCase):
         self.assertNotIn("networks", required_fields)
         self.assertNotIn("egress", required_fields)
         self.assertIn("schema_version", required_fields)
+
+    def test_volume_field_set_matches_the_production_parser(self):
+        """The authoring schema and `VolumeSpec` must agree exactly.
+
+        Same defect class as the `MachineSpec` and `WorkspaceProjection` pins
+        above. `d416c071` added a required `source_path` to a
+        `deny_unknown_fields` struct without touching the schema, and a
+        projection shipped that no vz.json could declare: with the field the
+        schema rejected it, without it the parser did. A `Volume` has the same
+        exposure and more of it, because two of its fields are conditionally
+        required, so the field set is read out of the Rust struct rather than
+        restated here.
+        """
+        source = (ROOT / "crates/vz-runtime-contract/src/types/volume.rs").read_text()
+        for struct, definition in [("VolumeSpec", "volume"), ("VolumeAttachment", "volumeAttachment"),
+                                   ("SharedCacheConsistency", "sharedCacheConsistency")]:
+            with self.subTest(struct=struct):
+                declaration = source.split(f"pub struct {struct} {{", 1)
+                self.assertEqual(len(declaration), 2, f"{struct} is no longer a struct here")
+                self.assertIn("#[serde(deny_unknown_fields)]", declaration[0][-400:],
+                              f"{struct} no longer denies unknown fields; this comparison assumes it")
+                body = declaration[1].split("\n}", 1)[0]
+                rust_fields, required_fields, pending = set(), set(), []
+                for line in body.splitlines():
+                    stripped = line.strip()
+                    if stripped.startswith("#["):
+                        pending.append(stripped)
+                        continue
+                    match = re.match(r"pub (\w+):", stripped)
+                    if match is None:
+                        continue  # doc comments and blank lines
+                    field = match.group(1)
+                    rust_fields.add(field)
+                    if not any("serde(default" in attribute for attribute in pending):
+                        required_fields.add(field)
+                    pending = []
+                self.assertTrue(rust_fields, f"could not read {struct} fields")
+                self.assertEqual(set(SCHEMA["$defs"][definition]["properties"]), rust_fields)
+                self.assertEqual(set(SCHEMA["$defs"][definition]["required"]), required_fields)
+        # Vacuity: the parse is only evidence if it distinguishes a defaulted
+        # field from an undefaulted one. `size_bytes` and `consistency` are the
+        # two optional fields, and each is required by exactly one `kind` via
+        # the schema's `allOf`, which the case below exercises.
+        volume = SCHEMA["$defs"]["volume"]
+        self.assertNotIn("size_bytes", volume["required"])
+        self.assertNotIn("consistency", volume["required"])
+        self.assertIn("attachments", volume["required"])
+
+    def test_volume_kind_conditional_fields_and_declarable_shapes(self):
+        """Each kind requires its own field and refuses the other's.
+
+        A `size_bytes` on a shared cache would cap nothing and a `consistency`
+        on a block volume would advertise a model the single-writer rule makes
+        vacuous, so the schema refuses both rather than ignoring them. The
+        positive cases come first: a rule that refused everything would pass
+        every negative case here.
+        """
+        block = {"schema_version": 1, "name": "data", "kind": "block", "size_bytes": 16 * 1024 * 1024,
+                 "attachments": [{"machine": "dev", "target_path": "/data", "mode": "read_write"}]}
+        cache = {"schema_version": 1, "name": "cache", "kind": "shared_cache",
+                 "consistency": {"model": "bounded_staleness", "staleness_bound_millis": 2000},
+                 "attachments": [{"machine": "dev", "target_path": "/cache", "mode": "read_write"}]}
+        for declared in ([block], [cache], [block, cache]):
+            value = copy.deepcopy(EXAMPLE)
+            value["environment"]["volumes"] = copy.deepcopy(declared)
+            self.validator.validate(value)
+
+        def refuse(volume, note):
+            value = copy.deepcopy(EXAMPLE)
+            value["environment"]["volumes"] = [volume]
+            self.assertFalse(self.validator.is_valid(value), note)
+
+        without_size = copy.deepcopy(block)
+        del without_size["size_bytes"]
+        refuse(without_size, "a block volume must declare size_bytes")
+        with_consistency = copy.deepcopy(block)
+        with_consistency["consistency"] = cache["consistency"]
+        refuse(with_consistency, "a block volume must not declare consistency")
+        without_consistency = copy.deepcopy(cache)
+        del without_consistency["consistency"]
+        refuse(without_consistency, "a shared cache must declare consistency")
+        with_size = copy.deepcopy(cache)
+        with_size["size_bytes"] = 16 * 1024 * 1024
+        refuse(with_size, "a shared cache must not declare size_bytes")
+        for size in [1024 * 1024 - 1, 1024 ** 4 + 1, "16MiB", 1.5]:
+            sized = copy.deepcopy(block)
+            sized["size_bytes"] = size
+            refuse(sized, f"size_bytes {size!r} is outside the declarable domain")
+        for millis in [0, 60001, "2s"]:
+            stale = copy.deepcopy(cache)
+            stale["consistency"] = {"model": "bounded_staleness", "staleness_bound_millis": millis}
+            refuse(stale, f"staleness_bound_millis {millis!r} is outside the declarable domain")
+        refuse({**copy.deepcopy(block), "attachments": []}, "a volume with no attachment is refused")
+        for target in ["relative", "/escapes/../..", ""]:
+            bad = copy.deepcopy(block)
+            bad["attachments"] = [{"machine": "dev", "target_path": target, "mode": "read_write"}]
+            refuse(bad, f"target_path {target!r} is not a bounded absolute Machine path")
+        for mode in ["snapshot", "rw", ""]:
+            bad = copy.deepcopy(block)
+            bad["attachments"] = [{"machine": "dev", "target_path": "/data", "mode": mode}]
+            refuse(bad, f"access mode {mode!r} is not declarable")
+        refuse({**copy.deepcopy(block), "kind": "tmpfs"}, "an unknown volume kind is refused")
 
     def test_invalid_identity_capabilities_and_wire_ranges(self):
         for project_id in ["", "../../project", "a" * 129, "prj_é", "prj_x\n", "prj_x\r", "prj_x\t", "prj_\x00x"]:

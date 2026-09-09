@@ -436,6 +436,7 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
             memory_mb: spec.memory_mb,
             volume_mounts: Vec::new(),
             disk_image_path: None,
+            block_volumes: Vec::new(),
         };
         self.backend
             .boot_shared_vm(sandbox_id, ports, resources)

@@ -573,49 +573,148 @@ fn fabric_ownership_is_admitted_only_when_it_matches_the_persisted_instances() {
 /// The refused half of the same boundary: declarations no adapter implements
 /// must still be rejected, and rejected before any project row exists, so an Up
 /// that cannot be served never leaves state behind.
+/// Declare a second Developer Linux Machine so a volume can name two.
+fn add_sibling_machine(request: &mut EnvironmentUpRequest, name: &str) {
+    let mut sibling = request.definition.environment.machines[0].clone();
+    sibling.name = name.to_string();
+    sibling.workspace = None;
+    request.definition.environment.machines.push(sibling);
+}
+
+/// One writable block volume attached to two Machines: the declaration the
+/// workspace-and-storage policy refuses.
+fn declare_writable_block_volume(request: &mut EnvironmentUpRequest, first: &str, second: &str) {
+    if !request
+        .definition
+        .environment
+        .machines
+        .iter()
+        .any(|machine| machine.name == second)
+    {
+        add_sibling_machine(request, second);
+    }
+    request.definition.environment.volumes = vec![VolumeSpec {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        name: "data".to_string(),
+        kind: VolumeKind::Block,
+        size_bytes: Some(16 * 1024 * 1024),
+        consistency: None,
+        attachments: vec![
+            VolumeAttachment {
+                machine: first.to_string(),
+                target_path: "/data".to_string(),
+                mode: VolumeAccessMode::ReadWrite,
+            },
+            VolumeAttachment {
+                machine: second.to_string(),
+                target_path: "/data".to_string(),
+                mode: VolumeAccessMode::ReadOnly,
+            },
+        ],
+    }];
+}
+
+/// One shared cache attached to the named Machines.
+fn declare_shared_cache(request: &mut EnvironmentUpRequest, first: &str, second: &str) {
+    let mut attachments = vec![VolumeAttachment {
+        machine: first.to_string(),
+        target_path: "/cache".to_string(),
+        mode: VolumeAccessMode::ReadWrite,
+    }];
+    if second != first {
+        if !request
+            .definition
+            .environment
+            .machines
+            .iter()
+            .any(|machine| machine.name == second)
+        {
+            add_sibling_machine(request, second);
+        }
+        attachments.push(VolumeAttachment {
+            machine: second.to_string(),
+            target_path: "/cache".to_string(),
+            mode: VolumeAccessMode::ReadWrite,
+        });
+    }
+    request.definition.environment.volumes = vec![VolumeSpec {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        name: "cache".to_string(),
+        kind: VolumeKind::SharedCache,
+        size_bytes: None,
+        consistency: Some(SharedCacheConsistency {
+            model: SharedCacheConsistencyModel::BoundedStaleness,
+            staleness_bound_millis: 2_000,
+        }),
+        attachments,
+    }];
+}
+
 #[tokio::test]
 async fn declarations_without_adapters_still_reject_before_project_creation() {
-    for mutate in [
+    for (mutate, expected) in [
         // No egress path off a private fabric exists, and the shared vmnet NAT
         // segment is disqualified by the contract, so nothing can serve this
         // until vz-9vv.6 builds a per-Environment gateway.
-        (|request: &mut EnvironmentUpRequest| {
-            declare_private_fabric(request, NetworkKind::SimulatedPublic);
-        }) as fn(&mut EnvironmentUpRequest),
-        // No directory-tree copy primitive and no `OwnedResourceKind` variant,
-        // so Delete could neither reclaim nor account for a snapshot.
-        |request: &mut EnvironmentUpRequest| {
-            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
-                binding: "source".into(),
-                source_path: ".".into(),
-                target_path: "/workspace".into(),
-                mode: WorkspaceProjectionMode::Snapshot,
-            });
-        },
+        (
+            (|request: &mut EnvironmentUpRequest| {
+                declare_private_fabric(request, NetworkKind::SimulatedPublic);
+            }) as fn(&mut EnvironmentUpRequest),
+            MachineErrorCode::UnsupportedOperation,
+        ),
+        // A volume is carried by the same VirtioFS/virtio-block hint the native
+        // macOS backend is never handed, so a volume on a native Machine would
+        // boot storage that silently never appears.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
+                declare_shared_cache(request, "app", "app");
+            },
+            MachineErrorCode::UnsupportedOperation,
+        ),
         // The share is carried by a `vz-mount-{N}` VirtioFS tag that only
         // `linux/initramfs/init` bind-mounts, and the native macOS backend is
         // handed no resource hint at all, so the projection would silently
         // never appear.
-        |request: &mut EnvironmentUpRequest| {
-            request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
-            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
-                binding: "source".into(),
-                source_path: ".".into(),
-                target_path: "/workspace".into(),
-                mode: WorkspaceProjectionMode::ReadOnly,
-            });
-        },
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request.definition.environment.machines[0].target.os = OperatingSystem::Macos;
+                request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+                    binding: "source".into(),
+                    source_path: ".".into(),
+                    target_path: "/workspace".into(),
+                    mode: WorkspaceProjectionMode::ReadOnly,
+                });
+            },
+            MachineErrorCode::UnsupportedOperation,
+        ),
         // Hardened is the restricted profile and declares none of this
         // topology, matching the contract's refusal of network attachments.
-        |request: &mut EnvironmentUpRequest| {
-            request.definition.environment.machines[0].profile = MachineProfile::Hardened;
-            request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
-                binding: "source".into(),
-                source_path: ".".into(),
-                target_path: "/workspace".into(),
-                mode: WorkspaceProjectionMode::ReadOnly,
-            });
-        },
+        (
+            |request: &mut EnvironmentUpRequest| {
+                request.definition.environment.machines[0].profile = MachineProfile::Hardened;
+                request.definition.environment.machines[0].workspace = Some(WorkspaceProjection {
+                    binding: "source".into(),
+                    source_path: ".".into(),
+                    target_path: "/workspace".into(),
+                    mode: WorkspaceProjectionMode::ReadOnly,
+                });
+            },
+            MachineErrorCode::UnsupportedOperation,
+        ),
+        // The criterion-17 refusal, asserted here for its ORDERING rather than
+        // its message: a writable block volume on two Machines must be refused
+        // before `reserve_environment_up_admission` runs, and the project-state
+        // assertion below is what proves nothing was written. Unlike the cases
+        // above this is a `ValidationError`, because the product contract
+        // forbids the declaration outright rather than the runtime lacking an
+        // adapter for it -- it will still be refused when every adapter exists.
+        (
+            |request: &mut EnvironmentUpRequest| {
+                declare_writable_block_volume(request, "app", "sibling");
+            },
+            MachineErrorCode::ValidationError,
+        ),
     ] {
         let (root, daemon, mut request, metadata) = fixture();
         request.workspace_root = Some(root.path().to_string_lossy().into_owned());
@@ -626,7 +725,7 @@ async fn declarations_without_adapters_still_reject_before_project_creation() {
                 .await
                 .unwrap_err()
                 .code,
-            MachineErrorCode::UnsupportedOperation
+            expected
         );
         assert!(
             daemon

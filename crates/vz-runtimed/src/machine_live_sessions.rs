@@ -2094,6 +2094,7 @@ mod tests {
             legacy_sandbox_id: None,
         };
         let environment = vz_runtime_contract::EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),

@@ -56,6 +56,7 @@ fn machine(suffix: u8) -> MachineInstance {
 fn environment(network: &str, kind: NetworkKind) -> EnvironmentInstance {
     let network_id = NetworkId::new(network.to_string()).unwrap();
     EnvironmentInstance {
+        volumes: Vec::new(),
         schema_version: TOPOLOGY_SCHEMA_VERSION,
         environment_id: environment_id(),
         project_id: ProjectId::new(PROJECT.to_string()).unwrap(),

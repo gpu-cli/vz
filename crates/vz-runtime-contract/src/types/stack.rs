@@ -1694,6 +1694,34 @@ pub struct StackResourceHint {
     /// Used for persistent named volumes: the image contains an ext4
     /// filesystem mounted at `/run/vz-oci/volumes` inside the guest VM.
     pub disk_image_path: Option<PathBuf>,
+    /// Declared Environment-owned block volumes, in declaration order.
+    ///
+    /// Each becomes one further VirtioBlock device after the private Docker
+    /// data disk and the legacy named-volume disk, is formatted once if it
+    /// carries no filesystem, and is mounted at its own declared guest path.
+    /// Order is load-bearing: the guest names these devices `/dev/vdX` by
+    /// attachment order and has no other way to tell them apart.
+    pub block_volumes: Vec<StackBlockVolume>,
+}
+
+/// One Environment-owned block volume attached to a shared VM.
+///
+/// Unlike [`StackVolumeMount`], which is a VirtioFS share of a host directory,
+/// this is a whole block device: the host contributes an image file and the
+/// guest owns the filesystem inside it. That is why it carries a size (used
+/// once, when the image is first made) and why at most one Machine may hold it
+/// writable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StackBlockVolume {
+    /// Stable host-side identifier, for diagnostics only. The guest sees
+    /// `/dev/vdX` by attachment order.
+    pub id: String,
+    /// Absolute host path of the backing image.
+    pub host_path: PathBuf,
+    /// Absolute path inside the guest where the filesystem is mounted.
+    pub guest_path: String,
+    /// Whether the guest may write it.
+    pub read_only: bool,
 }
 
 /// A host directory to expose inside the shared VM via VirtioFS.

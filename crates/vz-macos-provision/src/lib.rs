@@ -14,6 +14,7 @@ use tracing::{debug, info, warn};
 pub mod artifact_cache;
 #[cfg(unix)]
 pub mod bootstrap;
+pub mod clone;
 pub mod image_delta;
 pub mod toolchain;
 

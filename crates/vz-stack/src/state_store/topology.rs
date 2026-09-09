@@ -1194,6 +1194,7 @@ fn lifecycle_ownership_digest(
             OwnedResourceKind::PortRange => "port_range".to_string(),
             OwnedResourceKind::Credential => "credential".to_string(),
             OwnedResourceKind::Fault => "fault".to_string(),
+            OwnedResourceKind::Volume => "volume".to_string(),
             OwnedResourceKind::LegacySandbox => "legacy_sandbox".to_string(),
             OwnedResourceKind::Other(value) => format!("other:{value}"),
         }
@@ -4507,6 +4508,16 @@ impl StateStore {
         environment.host_exports = host_exports;
         environment.host_imports = host_imports;
         environment.egress = egress;
+        // `volumes` is deliberately absent from this list. Every other
+        // collection is overwritten from a normalized child table because the
+        // runtime queries it by a column: an endpoint by Machine, an export by
+        // Machine, an attachment by network. Nothing queries a volume by
+        // anything but its Environment, which is the key of the parent row
+        // itself, so a child table would add a schema version and a migration
+        // to project a column no query reads. The volume identities therefore
+        // ride the parent `instance_json` this function has already parsed, and
+        // `EnvironmentInstance::validate` enforces the uniqueness a
+        // `UNIQUE(environment_id, name)` constraint would have.
         environment.ownership = ownership;
         Ok(())
     }

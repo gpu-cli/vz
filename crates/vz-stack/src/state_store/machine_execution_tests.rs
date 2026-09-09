@@ -10,6 +10,7 @@ fn fixture() -> (tempfile::TempDir, StateStore, MachineExecutionReceipt) {
         project_id: ProjectId::generate(),
         name: "exec-test".into(),
         environment: EnvironmentSpec {
+            volumes: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
             schema_version: 1,

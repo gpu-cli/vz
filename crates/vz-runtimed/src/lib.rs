@@ -1697,6 +1697,7 @@ mod tests {
             project_id: ProjectId::new("prj_startup_catalog").expect("valid Project ID"),
             name: "startup-catalog".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,

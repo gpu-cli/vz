@@ -31,6 +31,7 @@ fn spec_with(
     machines: Vec<vz_runtime_contract::MachineSpec>,
 ) -> EnvironmentSpec {
     EnvironmentSpec {
+        volumes: Vec::new(),
         schema_version: 1,
         default_machine: None,
         machines,

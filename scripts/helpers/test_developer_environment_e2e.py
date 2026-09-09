@@ -39,12 +39,13 @@ TOP15 = e2e.CRITERION_15
 TOP1 = "gate.instances.three_concurrent_no_collision"
 TOP5 = "gate.network.private_topology_paths"
 TOP2 = e2e.CRITERION_2
+TOP17 = e2e.CRITERION_17
 TOP16 = "gate.reproducibility.recreate_from_definition"
 TOP11 = "gate.delete.single_environment_safety"
 TOP19 = e2e.CRITERION_19
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
-               "status_json_field_set", "grpc_api_live_agreement"}
+               "status_json_field_set", "grpc_api_live_agreement", "workspace_storage_policy"}
 # `private_topology_paths` proves criterion 5's Linux-to-Linux half and stops
 # there. The criterion also requires a service path crossing between a Linux
 # Machine and a native macOS Machine in both directions, and no fake CLI can
@@ -220,6 +221,10 @@ class TopologyLaneTests(unittest.TestCase):
         # release shipped a typed client for the daemon channel.
         self.assertEqual(self.top(result, TOP21)["status"], "PASS")
         self.assertEqual(self.top(result, TOP1)["status"], "PASS")
+        # Criterion 17 has one sub-check and it covers every clause: the three
+        # projection modes, the forbidden write, the pre-mutation refusal of a
+        # writable block multi-attach, and the shared-cache fixture.
+        self.assertEqual(self.top(result, TOP17)["status"], "PASS")
         # The fake applies declared networks, so criterion 5's Linux half runs to
         # completion -- and that is exactly why it must not be read as the
         # criterion. The crossing to a native macOS Machine is unexercised, so
@@ -230,7 +235,7 @@ class TopologyLaneTests(unittest.TestCase):
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
         self.assertEqual(self.top(result, TOP2)["status"], "FAIL")
-        for identifier in assigned - {TOP21, TOP15, TOP1}:
+        for identifier in assigned - {TOP21, TOP15, TOP1, TOP17}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
         # Criterion 19's own sub-check ran; what it could not do is named.
@@ -249,7 +254,7 @@ class TopologyLaneTests(unittest.TestCase):
                                        if s in ("bare_help", "legacy_rejection", "clean_up_refuses",
                                                 "bootstrap_read_only", "bootstrap_creates_default")} |
                          {f"{TOP15}__help_surface_exact", f"{TOP15}__error_envelope_agreement",
-                          f"{TOP1}__three_concurrent_no_collision",
+                          f"{TOP1}__three_concurrent_no_collision", f"{TOP17}__workspace_storage_policy",
                           f"{TOP5}__private_topology_paths", f"{TOP15}__status_json_field_set",
                           f"{TOP15}__grpc_api_live_agreement",
                           f"{TOP19}__install_upgrade_rollback_uninstall",
@@ -304,7 +309,10 @@ class TopologyLaneTests(unittest.TestCase):
         sub = self.by_slug(result)[slug]
         self.assertEqual(sub["status"], "FAIL", mode)
         self.assertTrue(any(needle in a for a in sub["assertions"]), (mode, sub["assertions"]))
-        self.assertEqual(self.top(result, TOP21 if slug in ("bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only") else TOP15)["status"], "FAIL")
+        owner = {"bare_help": TOP21, "legacy_rejection": TOP21, "clean_up_refuses": TOP21,
+                 "bootstrap_read_only": TOP21, "bootstrap_creates_default": TOP21,
+                 "workspace_storage_policy": TOP17}.get(slug, TOP15)
+        self.assertEqual(self.top(result, owner)["status"], "FAIL")
         return result
 
     def test_bare_mutation_fails_bare_help(self):
@@ -720,6 +728,112 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual(result["entry_point"]["path"], "scripts/run-developer-environment-e2e.sh")
         rejected = subprocess.run([str(script), "--suite", "lifecycle"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
         self.assertEqual(rejected.returncode, 2)
+
+    # -- criterion 17 -------------------------------------------------------------------
+    def test_a_silently_multi_attached_block_volume_fails_criterion_17(self):
+        """The vacuity test for `workspace_storage_policy`.
+
+        `leaky_multi_attach` makes the stand-in admit a writable block volume on
+        two Machines and write state on the way. Both halves of the criterion's
+        clause must be caught: the refusal that did not happen, and the mutation
+        that did. A check that asserted only "up exited non-zero" would pass on
+        the first half of this input, and one that asserted only field presence
+        would pass on all of it.
+        """
+        result = self.assert_regression("leaky_multi_attach", "workspace_storage_policy",
+                                        "a writable block volume on two Machines is refused")
+        sub = self.by_slug(result)["workspace_storage_policy"]
+        failures = [a for a in sub["assertions"] if a.startswith("FAILED:")]
+        self.assertTrue(any("vz up exit 0" in a for a in failures), failures)
+        # The ordering half, which is the part a weaker check would miss: the
+        # admitted declaration went on to allocate storage and persist an
+        # Environment, and both are reported rather than only the absent
+        # refusal. A check that stopped at the exit code would report one of
+        # these four failures and none of the mutations.
+        self.assertTrue(any("allocated storage under" in a for a in failures), failures)
+        self.assertTrue(any("no Environment was persisted by the refused Up" in a for a in failures), failures)
+        self.assertEqual(len([a for a in failures if "refusal names the volume" in a]), 1, failures)
+        # Nothing beyond the refusal ran, so the file-semantics assertions are
+        # absent rather than passing on an Environment that should not exist.
+        self.assertFalse(any("read_write projection" in a for a in sub["assertions"]), sub["assertions"])
+
+    def test_criterion_17_proves_each_projection_mode_by_its_own_host_side_evidence(self):
+        """The three modes must be told apart, not merely mounted.
+
+        This reads the passing run's own assertions back. `read_write` is only
+        proved by the HOST file carrying the Machine's bytes, `read_only` by the
+        write failing AND the host file surviving, and `snapshot` by the write
+        succeeding while the host file is unchanged. If the check ever collapsed
+        into "all three mounted", these disappear.
+        """
+        evidence = self.evidence()
+        _code, result = self.run_lane(self.argv("clean-provision", evidence), evidence)
+        sub = self.by_slug(result)["workspace_storage_policy"]
+        self.assertEqual(sub["status"], "PASS", sub["assertions"])
+        assertions = sub["assertions"]
+
+        def stated(needle):
+            self.assertTrue(any(needle in a for a in assertions), (needle, assertions))
+
+        stated("the read_write projection is the worktree itself")
+        stated("a write into a read_only projection fails")
+        stated("the read_only source is byte-identical after the refused write")
+        stated("creating a file in a read_only projection fails too")
+        stated("machine-2 may write into its own snapshot")
+        stated("the snapshot source is byte-identical on the host")
+        stated("a writable block volume on two Machines is refused")
+        stated("the refusal names the volume and both Machines")
+        stated("the worktree across the refused Up unchanged")
+        stated("no volume storage was allocated for the refused declaration")
+        stated("no Environment was persisted by the refused Up")
+        stated("the Machine the block volume is NOT attached to cannot read it")
+        stated("observed every concurrent write within the declared")
+        stated("out of the shared cache, not a")
+        # Both Machines are asserted about by name, so a fixture that checked
+        # one side twice would not satisfy this.
+        for machine in ("machine-0", "machine-1"):
+            self.assertTrue(
+                any(f"{machine} observed every concurrent write" in a for a in assertions),
+                (machine, assertions))
+
+    def test_criterion_17_declares_its_own_staleness_bound_and_polls_to_it(self):
+        """The fixture's deadline must come from the definition it declared.
+
+        A bound restated in the check could drift from the one the definition
+        carries, and the fixture would then be polling to a number nothing
+        promised.
+        """
+        definition = checks.storage_definition(
+            self.release, block_attachments=[checks.block_attachment("machine-0", "read_write")])
+        cache = next(v for v in definition["environment"]["volumes"] if v["kind"] == "shared_cache")
+        self.assertEqual(cache["consistency"],
+                         {"model": "bounded_staleness",
+                          "staleness_bound_millis": checks.STALENESS_BOUND_MILLIS})
+        self.assertEqual({a["machine"] for a in cache["attachments"]}, {"machine-0", "machine-1"})
+        self.assertTrue(all(a["mode"] == "read_write" for a in cache["attachments"]))
+        # The refused definition differs from the accepted one in exactly one
+        # respect: the block volume's attachment set. Anything else and the
+        # refusal would not be evidence about multi-attach.
+        refused = checks.storage_definition(
+            self.release,
+            block_attachments=[checks.block_attachment("machine-0", "read_write"),
+                               checks.block_attachment("machine-1", "read_only")])
+        accepted_block = next(v for v in definition["environment"]["volumes"] if v["kind"] == "block")
+        refused_block = next(v for v in refused["environment"]["volumes"] if v["kind"] == "block")
+        self.assertEqual(refused["environment"]["machines"], definition["environment"]["machines"])
+        self.assertEqual({k: v for k, v in refused_block.items() if k != "attachments"},
+                         {k: v for k, v in accepted_block.items() if k != "attachments"})
+        self.assertEqual(len(accepted_block["attachments"]), 1)
+        self.assertEqual(len(refused_block["attachments"]), 2)
+
+    def test_criterion_17_declares_all_three_projection_modes_once_each(self):
+        definition = checks.storage_definition(
+            self.release, block_attachments=[checks.block_attachment("machine-0", "read_write")])
+        modes = [m["workspace"]["mode"] for m in definition["environment"]["machines"]]
+        self.assertEqual(sorted(modes), ["read_only", "read_write", "snapshot"])
+        # A Machine carries at most one projection, so three modes need three
+        # Machines; a definition with fewer could not exercise all three.
+        self.assertEqual(len(definition["environment"]["machines"]), 3)
 
 
 # One `#[derive(...)]`-preceded struct body out of the Rust source, as

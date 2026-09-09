@@ -878,6 +878,7 @@ mod tests {
             legacy_sandbox_id: None,
         };
         EnvironmentInstance {
+            volumes: Vec::new(),
             network_attachments: Vec::new(),
             host_exports: Vec::new(),
             host_imports: Vec::new(),
@@ -1154,6 +1155,7 @@ mod tests {
             project_id: ProjectId::new("prj-status").unwrap(),
             name: "status-project".to_string(),
             environment: EnvironmentSpec {
+                volumes: Vec::new(),
                 host_exports: Vec::new(),
                 host_imports: Vec::new(),
                 schema_version: TOPOLOGY_SCHEMA_VERSION,

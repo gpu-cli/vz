@@ -16,6 +16,7 @@ mod readiness;
 mod supervisor;
 #[cfg(test)]
 mod tests;
+pub mod volumes;
 pub mod workspace_projection;
 
 /// Exact, authorized boot boundary for trusted backend instrumentation. This
@@ -240,8 +241,8 @@ impl RuntimeDaemon {
 /// Refuse an Environment whose persisted ownership graph names a resource this
 /// Up cannot serve, or a declared-fabric record with no instance behind it.
 ///
-/// Declared `Network`, `Endpoint`, `NetworkAttachment` and `HostExport`
-/// ownership is admitted here, which is only sound because those records are
+/// Declared `Network`, `Endpoint`, `NetworkAttachment`, `HostExport` and
+/// `Volume` ownership is admitted here, which is only sound because those records are
 /// minted once by `ProjectDefinition::instantiate_environment` alongside the
 /// instances they name and are never added afterwards: the switch registry that
 /// `install_environment_fabric` writes to, and the port-forward registry that
@@ -308,6 +309,16 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
                 machine_id: Some(export.machine_id.clone()),
             }),
     );
+    // Environment-scoped: `machine_id: None` is part of the expected record, so
+    // a volume record that acquired a Machine does not match and is refused
+    // rather than admitted with the wrong owner.
+    expected.extend(environment.volumes.iter().map(|volume| OwnershipRecord {
+        schema_version: TOPOLOGY_SCHEMA_VERSION,
+        resource_kind: OwnedResourceKind::Volume,
+        resource_id: volume.volume_id.to_string(),
+        environment_id: environment.environment_id.clone(),
+        machine_id: None,
+    }));
     // Two instances sharing one identity would emit one record twice. That is
     // state corruption, and it is refused rather than deduplicated: a silent
     // dedup would leave the slot the duplicate vacated free for an unaccounted
@@ -327,7 +338,8 @@ fn authorize_ownership(environment: &EnvironmentInstance) -> Result<(), StackErr
             OwnedResourceKind::Network
             | OwnedResourceKind::Endpoint
             | OwnedResourceKind::NetworkAttachment
-            | OwnedResourceKind::HostExport => declared.insert(record),
+            | OwnedResourceKind::HostExport
+            | OwnedResourceKind::Volume => declared.insert(record),
             OwnedResourceKind::DockerContext => environment.machines.iter().any(|machine| {
                 machine.docker_context.as_ref().is_some_and(|context| {
                     context.name == record.resource_id
@@ -396,23 +408,14 @@ fn validate_supported(
         ));
     }
     for machine in &spec.machines {
-        let Some(workspace) = &machine.workspace else {
+        if machine.workspace.is_none() {
             continue;
-        };
-        // Snapshot has neither a directory-tree copy primitive (only the
-        // single-file `clone_file` in `vz-macos-provision`) nor an
-        // `OwnedResourceKind` variant, so a snapshot Delete could neither
-        // reclaim nor account for would leak on the first successful Up.
-        if workspace.mode == WorkspaceProjectionMode::Snapshot {
-            return Err(failure(
-                metadata,
-                MachineErrorCode::UnsupportedOperation,
-                format!(
-                    "Machine `{}` requests `snapshot` workspace projection, which has no directory-copy primitive and no owned-resource kind; this Up applies `read_write` and `read_only` only and performs no admission",
-                    machine.name
-                ),
-            ));
         }
+        // Every mode is applied. `snapshot` is a private per-Machine clone of
+        // the source, made with `clonefile` inside that Machine's own runtime
+        // store; see `workspace_projection` for why that needs no
+        // `OwnedResourceKind` of its own.
+        //
         // A projection is carried by a VirtioFS share whose `vz-mount-{N}` tag
         // `linux/initramfs/init` bind-mounts. `boot_or_inspect_machine` hands
         // the native macOS backend no `StackResourceHint` at all, so admitting
@@ -448,6 +451,24 @@ fn validate_supported(
             MachineErrorCode::ValidationError,
             error.to_string(),
         ));
+    }
+    // Declared Environment-owned storage. A writable block volume attached to
+    // more than one Machine is refused HERE, before
+    // `reserve_environment_up_admission` runs, so no identity is reserved and no
+    // image is allocated when the refusal fires: the "rejected before mutation"
+    // half of the workspace-and-storage policy. The rule itself is the same one
+    // `refuse_declared_writable_multi_attach` applies to workspace sources, and
+    // both call `workspace_projection::first_writable_multi_attach`.
+    if let Err(error) = volumes::refuse_unsupported_volumes(&request.definition.environment) {
+        let code = match error {
+            // A multi-attach is a declaration the product contract forbids, not
+            // a capability the runtime lacks, so it is a validation failure and
+            // will still be one when every adapter exists.
+            volumes::VolumeError::WritableBlockMultiAttach { .. }
+            | volumes::VolumeError::UnknownMachine { .. } => MachineErrorCode::ValidationError,
+            _ => MachineErrorCode::UnsupportedOperation,
+        };
+        return Err(failure(metadata, code, error.to_string()));
     }
     // Host EXPORTS are applied: `resolve_environment_host_exports` joins each
     // persisted export identity to its declared ports and the boot loop hands

@@ -139,6 +139,18 @@ fn unknown_definition_fields_fail_instead_of_silently_dropping_policy() {
     base["environment"]["endpoints"] = serde_json::json!([
         {"schema_version": 1, "name": "api", "machine": "dev", "network": "private", "protocol": "tcp", "port": 8080}
     ]);
+    // One volume of each kind, so the unknown-field walk below reaches the
+    // `block`-only `size_bytes` branch, the `shared_cache`-only `consistency`
+    // object and an attachment. A misspelling inside any of them must fail the
+    // load rather than silently leaving the volume unsized or its consistency
+    // undeclared.
+    base["environment"]["volumes"] = serde_json::json!([
+        {"schema_version": 1, "name": "data", "kind": "block", "size_bytes": 16 * 1024 * 1024,
+         "attachments": [{"machine": "dev", "target_path": "/data", "mode": "read_write"}]},
+        {"schema_version": 1, "name": "cache", "kind": "shared_cache",
+         "consistency": {"model": "bounded_staleness", "staleness_bound_millis": 2000},
+         "attachments": [{"machine": "dev", "target_path": "/cache", "mode": "read_write"}]}
+    ]);
     serde_json::from_value::<vz_runtime_contract::ProjectDefinition>(base.clone())
         .unwrap()
         .validate()
@@ -153,6 +165,10 @@ fn unknown_definition_fields_fail_instead_of_silently_dropping_policy() {
         "/environment/machines/0/requested_capabilities",
         "/environment/networks/0",
         "/environment/endpoints/0",
+        "/environment/volumes/0",
+        "/environment/volumes/0/attachments/0",
+        "/environment/volumes/1",
+        "/environment/volumes/1/consistency",
     ] {
         let mut invalid = base.clone();
         invalid

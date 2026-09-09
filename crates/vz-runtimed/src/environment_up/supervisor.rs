@@ -2,6 +2,7 @@ use std::collections::BTreeSet;
 
 use super::host_exports;
 use super::readiness::{MeasuredLinuxReadiness, ReadinessEvidenceProvider};
+use super::volumes;
 use super::workspace_projection;
 use super::*;
 use crate::machine_backend::MachineBackendRuntime as MacosRuntimeBackend;
@@ -298,8 +299,8 @@ impl RuntimeDaemon {
         // the last one.
         let declared_slots =
             workspace_projection::declared_workspace_slots(&request.definition.environment);
-        let mut workspace_mounts = if declared_slots.is_empty() {
-            BTreeMap::new()
+        let resolved_workspace = if declared_slots.is_empty() {
+            workspace_projection::ResolvedWorkspaceMounts::default()
         } else {
             let workspace_key = request.selection.workspace_key.as_deref().ok_or_else(|| {
                 failure(
@@ -348,6 +349,41 @@ impl RuntimeDaemon {
                 )
             })?
         };
+        let mut workspace_mounts = resolved_workspace.mounts;
+        // A `snapshot` Machine's share still points at its SOURCE here. The
+        // private clone is made inside the boot loop, where the Machine's own
+        // runtime store finally exists to hold it.
+        let snapshot_sources = resolved_workspace.snapshot_sources;
+        // Declared Environment-owned storage is materialised here for the same
+        // reason the fabric and the workspace shares are: a VirtioFS share and a
+        // virtio-block device are both fixed when `LinuxVm::create` runs and
+        // cannot be added to a running VM. A shared cache joins the Machine's
+        // existing mount sequence, so its VirtioFS index starts after whatever
+        // the workspace projection already claimed — reusing `vz-mount-0` would
+        // silently replace the Machine's workspace share.
+        let mut volume_attachments = if volumes::declares_volumes(&request.definition.environment) {
+            let next_index = workspace_mounts
+                .iter()
+                .map(|(machine_id, mounts)| (machine_id.clone(), mounts.len()))
+                .collect();
+            volumes::resolve_environment_volumes(
+                &request.definition.environment,
+                &environment.volumes,
+                &environment.machines,
+                &self.config.runtime_data_dir,
+                &environment.environment_id,
+                &next_index,
+            )
+            .map_err(|error| {
+                failure(
+                    &metadata,
+                    MachineErrorCode::StateConflict,
+                    error.to_string(),
+                )
+            })?
+        } else {
+            BTreeMap::new()
+        };
         let mut first_error = None;
         let mut uncertain = false;
         for step in operation.machine_steps.clone() {
@@ -390,9 +426,34 @@ impl RuntimeDaemon {
                     // A Machine reused from `existing` never reaches here, so
                     // its listener is the one its original boot bound.
                     let export_ports=host_export_ports.remove(&step.machine_id).unwrap_or_default();
+                    // Taken, not borrowed, for the same reason as the guest
+                    // descriptors: storage handed to a boot that does not happen
+                    // must not be handed to a second boot as well.
+                    let machine_volumes=volume_attachments.remove(&step.machine_id).unwrap_or_default();
+                    let mut volume_mounts=workspace_mounts.remove(&step.machine_id).unwrap_or_default();
+                    // A snapshot projection becomes a private copy INSIDE this
+                    // Machine's own runtime store, which only exists now that
+                    // `attach_machine` has leased it. Cloning here rather than
+                    // before the loop is what lets the copy be reclaimed by the
+                    // store's own ownership record instead of needing a new
+                    // resource kind, and re-cloning on every Up is the mode's
+                    // semantics: the tree is the source as it was at THIS boot.
+                    if let Some(source)=snapshot_sources.get(&step.machine_id) {
+                        let clone=workspace_projection::materialise_snapshot(
+                            &machine.name,source,entry.data_path(),
+                        ).map_err(|error|failure(&metadata,MachineErrorCode::StateConflict,error.to_string()))?;
+                        for mount in &mut volume_mounts {
+                            if mount.host_path==*source { mount.host_path=clone.clone(); }
+                        }
+                    }
+                    volume_mounts.extend(machine_volumes.shares);
+                    let block_volumes=machine_volumes.blocks.into_iter().map(|volume|StackBlockVolume{
+                        id:volume.id,host_path:volume.host_path,guest_path:volume.guest_path,read_only:volume.read_only,
+                    }).collect();
                     let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,export_ports,attachments,StackResourceHint {
                         cpus:Some(cpus),memory_mb:Some(memory_mb),
-                        volume_mounts:workspace_mounts.remove(&step.machine_id).unwrap_or_default(),
+                        volume_mounts,
+                        block_volumes,
                         ..Default::default()
                     }).await {
                         Ok(activation)=>(Arc::new(activation),None),

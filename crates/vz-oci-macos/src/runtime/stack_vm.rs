@@ -19,6 +19,42 @@ const DOCKER_DATA_DEVICE: &str = "/dev/vda";
 const DOCKER_GUEST_SOCKET: &str = "/run/vz-docker/docker.sock";
 const NAMED_VOLUME_DEVICE_WITH_DOCKER: &str = "/dev/vdb";
 const NAMED_VOLUME_DEVICE_WITHOUT_DOCKER: &str = "/dev/vda";
+/// How many declared block volumes one Machine can carry.
+///
+/// The guest names virtio-block devices `vda`..`vdz`, so past the 26th letter
+/// there is no name to mount. Refusing at the boundary is better than emitting
+/// `/dev/vd{` and letting the mount fail with a message about a missing file.
+pub(super) const MAX_DECLARED_BLOCK_VOLUMES: usize = 26;
+
+/// The guest device name of the `index`-th declared block volume.
+///
+/// Apple presents storage devices in the order `setStorageDevices_` received
+/// them, and `bridge.rs` builds that array from `vm_config.disks` in append
+/// order followed by `disk_image`. So the letter is decided entirely by how many
+/// disks were appended first: the private Docker data disk when a Developer
+/// Machine has one, then the legacy named-volume disk when the caller asked for
+/// one. Both are optional and independent, which is why this is computed rather
+/// than assumed — hardcoding `/dev/vdc` would mount the Docker data disk over
+/// the declared volume's path on a Machine that has no named-volume disk.
+pub(super) fn declared_block_device(
+    has_docker_disk: bool,
+    has_named_volume_disk: bool,
+    index: usize,
+) -> Result<String, OciError> {
+    if index >= MAX_DECLARED_BLOCK_VOLUMES {
+        return Err(OciError::InvalidConfig(format!(
+            "declared block volume {index} exceeds the {MAX_DECLARED_BLOCK_VOLUMES} virtio-block devices a Machine can name"
+        )));
+    }
+    let offset = usize::from(has_docker_disk) + usize::from(has_named_volume_disk) + index;
+    if offset >= MAX_DECLARED_BLOCK_VOLUMES {
+        return Err(OciError::InvalidConfig(format!(
+            "declared block volume {index} would be device {offset}, past the {MAX_DECLARED_BLOCK_VOLUMES} virtio-block devices a Machine can name"
+        )));
+    }
+    let letter = char::from(b'a' + offset as u8);
+    Ok(format!("/dev/vd{letter}"))
+}
 const DOCKER_DATA_DISK_SIZE_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 const DOCKER_FORMAT_INTENT_VERSION: &str = "vz-private-docker-disk-format-v1";
 
@@ -180,7 +216,11 @@ pub(super) fn require_matching_shared_vm_boot_request(
     let resources_match = actual_resources.cpus == requested_resources.cpus
         && actual_resources.memory_mb == requested_resources.memory_mb
         && actual_resources.volume_mounts == requested_resources.volume_mounts
-        && actual_resources.disk_image_path == requested_resources.disk_image_path;
+        && actual_resources.disk_image_path == requested_resources.disk_image_path
+        // Compared, not ignored: block devices are named `/dev/vdX` by
+        // attachment order, so a reused VM whose block set differs from the one
+        // requested would mount the wrong image at the requested path.
+        && actual_resources.block_volumes == requested_resources.block_volumes;
     // Attachments compare by declaration. The descriptor a caller presents is
     // new on every boot, so comparing sockets would make every retry drift and
     // comparing nothing would let a Machine be re-attached to a different
@@ -1668,6 +1708,22 @@ esac
             vm_config.disk_image = Some(disk_path.clone());
         }
 
+        // Declared Environment-owned block volumes come last, in declaration
+        // order. `vm_config.disks` is presented to the guest as `/dev/vda`,
+        // `/dev/vdb`, ... in append order and `disk_image` is appended after
+        // them, so the device letter of each declared volume is
+        // (docker disk?) + (named-volume disk?) + its own index. That arithmetic
+        // is done once, in `declared_block_device`, and both the attach here and
+        // the format/mount below read it from there rather than each computing
+        // its own.
+        for volume in &resources.block_volumes {
+            vm_config.disks.push(DiskConfig {
+                id: volume.id.clone(),
+                path: volume.host_path.clone(),
+                read_only: volume.read_only,
+            });
+        }
+
         // Capture one serial log per shared VM when the E2E harness provides
         // an artifact directory. Preserve the older exact-path override for
         // focused/manual debugging.
@@ -1797,6 +1853,67 @@ esac
                 }
                 _ => {
                     tracing::info!("persistent volume disk mounted at /run/vz-oci/volumes");
+                }
+            }
+        }
+
+        // Declared Environment-owned block volumes. Each carries its own ext4
+        // filesystem, made once on first use and never remade: `allow_unformatted`
+        // formats an image with no filesystem, and an image that already has one
+        // is mounted as it is, which is what makes a volume's contents survive
+        // `vz stop` and the next `vz up`.
+        //
+        // A read-only attachment is mounted `-o ro` and is never formatted: a
+        // reader that formatted the image would destroy exactly the data it was
+        // attached to read, and an unformatted image handed only to readers is a
+        // declaration error rather than something to repair silently.
+        for (index, volume) in resources.block_volumes.iter().enumerate() {
+            let device = declared_block_device(
+                docker_provisioning.is_some(),
+                resources.disk_image_path.is_some(),
+                index,
+            )?;
+            if !volume.read_only {
+                Self::ensure_guest_ext4_disk(&vm, &device, "declared block volume", true, false)
+                    .await?;
+            }
+            let options = if volume.read_only { "-o ro " } else { "" };
+            let guest_path = &volume.guest_path;
+            let mount = vm
+                .exec_collect(
+                    "/bin/busybox".to_string(),
+                    vec![
+                        "sh".to_string(),
+                        "-c".to_string(),
+                        format!(
+                            "/bin/busybox mkdir -p {guest_path} && \
+                             /bin/busybox mount {options}-t ext4 {device} {guest_path}"
+                        ),
+                    ],
+                    Duration::from_secs(30),
+                )
+                .await;
+            match &mount {
+                Ok(output) if output.exit_code != 0 => {
+                    return Err(OciError::InvalidConfig(format!(
+                        "failed to mount declared block volume `{}` at {guest_path}: {}{}",
+                        volume.id, output.stdout, output.stderr
+                    )));
+                }
+                Err(err) => {
+                    return Err(OciError::InvalidConfig(format!(
+                        "failed to mount declared block volume `{}` at {guest_path}: {err}",
+                        volume.id
+                    )));
+                }
+                _ => {
+                    tracing::info!(
+                        volume = %volume.id,
+                        device = %device,
+                        guest_path = %guest_path,
+                        read_only = volume.read_only,
+                        "declared block volume mounted"
+                    );
                 }
             }
         }

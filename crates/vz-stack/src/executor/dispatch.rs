@@ -1437,6 +1437,10 @@ impl<R: ContainerRuntime> StackExecutor<R> {
                 vz_runtime_contract::StackResourceHint {
                     cpus: max_cpus,
                     memory_mb: total_memory_mb,
+                    // The legacy Compose path declares no Environment-owned
+                    // volumes; named volumes there are the single
+                    // `disk_image_path` below.
+                    block_volumes: Vec::new(),
                     volume_mounts: all_volume_mounts,
                     disk_image_path,
                 }
