@@ -341,13 +341,27 @@ pub fn plan_environment_fabric(
                 id: attachment.machine_id.to_string(),
             });
         };
-        // Only a Developer Linux Machine can hold a fabric port: a Hardened or
-        // native-target Machine has no NIC a switch could attach to. The
-        // topology contract already refuses such a declaration; refusing it
-        // again here keeps the runtime independently safe rather than trusting
-        // that every persisted record passed through that validation.
+        // A fabric port is a NIC on the Machine's own VM, so the rule is which
+        // Machines have one, not which target the Environment is hosted on.
+        // Developer Linux and Developer macOS both do: `virtio-net` is a
+        // Virtualization.framework device for either guest, and criterion 5
+        // requires a service path that crosses between the two. Hardened is the
+        // restricted profile and declares none of this topology at all, and
+        // native Windows is PLANNED rather than shipped, so neither has a port
+        // to plan. The topology contract already refuses such a declaration;
+        // refusing it again here keeps the runtime independently safe rather
+        // than trusting that every persisted record passed through that
+        // validation.
+        //
+        // Nothing past this point reads `target.os`: a Machine admitted here
+        // takes its address from `assign_host_offset` over the Environment,
+        // network and attachment identifiers alone, so a macOS Machine and a
+        // Linux Machine carrying the same identifiers plan to the same address.
         if machine.profile != MachineProfile::Developer
-            || machine.target.os != OperatingSystem::Linux
+            || !matches!(
+                machine.target.os,
+                OperatingSystem::Linux | OperatingSystem::Macos
+            )
         {
             return Err(FabricPlanError::UnsupportedMachine {
                 machine: machine.name.clone(),
