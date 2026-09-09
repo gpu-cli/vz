@@ -122,11 +122,16 @@ pub fn refuse_unsupported_host_exports(spec: &EnvironmentSpec) -> Result<(), Hos
                 machine: export.machine.clone(),
             });
         };
-        // A native macOS Machine is booted with no ports at all: the native arm
-        // of `boot_or_inspect_machine` takes no `PortMapping`
-        // (`machine_runtime_activation.rs:205-226`). Hardened is the restricted
+        // A native macOS Machine now holds Environment-network ports, but a
+        // host export is not one: the native arm of `boot_or_inspect_machine`
+        // is handed `ports: Vec<PortMapping>` and ignores it, so no host-side
+        // relay is ever created for that Machine. Hardened is the restricted
         // profile that declares none of this topology. Admitting either would
         // start a Machine whose declared export silently never exists.
+        //
+        // This is the host boundary (criterion 7), not the Environment fabric
+        // (criterion 5). Lifting it needs a native `PortMapping` adapter, not
+        // just a NIC; until one exists the refusal stands on its own merits.
         if machine.target.os != OperatingSystem::Linux
             || machine.profile != MachineProfile::Developer
         {
