@@ -19,7 +19,8 @@ Criterion 15 (`gate.cli_api.agreement`):
   help_surface_exact   root/subcommand help is exactly the five verbs
   error_envelope_agreement   `up` and `status` agree on `definition_not_found`
   status_json_field_set      `vz --json status` over a live topology emits
-                       exactly its declared field set
+                       exactly its declared field set, at the top level and for
+                       the Environment and Machine objects under it
   grpc_api_live_agreement    NOT IMPLEMENTED
 
 Every AF_UNIX path the installed binaries bind lives in the lane's short socket
@@ -1198,19 +1199,51 @@ def check_error_envelope(ctx: CheckContext, top: str) -> SubCheck:
 
 
 # The exact success-payload field set of `vz status --json` over a live
-# topology, observed on the installed 0.4 binaries.
+# topology, observed on the installed 0.4 binaries. The nested Environment and
+# Machine sets are declared here too: comparing only the top level accepts any
+# projection at all under `environments`, so the per-Machine identity, profile,
+# target and capability projection that criterion 2 reads was unpinned.
+# `*_OPTIONAL` names the fields the Rust structs mark `skip_serializing_if`;
+# every other field must appear. `test_developer_environment_e2e` reads all six
+# sets out of `crates/vz-cli/src/commands/dev_status.rs` rather than restating
+# them, so the next drift fails offline instead of on the gate host.
 STATUS_FIELDS = {"schema_version", "request_id", "topology_state_source", "definition_path", "project_id",
                  "project_name", "host", "daemon", "desired_definition_digest", "persisted_definition_digest",
                  "definition_drift", "selection_source", "environments"}
+STATUS_OPTIONAL_FIELDS = {"selection_source"}
+ENVIRONMENT_FIELDS = {"environment_id", "name", "state", "definition_digest", "lifecycle_generation", "machines"}
+ENVIRONMENT_OPTIONAL_FIELDS: set[str] = set()
+MACHINE_FIELDS = {"machine_id", "name", "state", "profile", "target", "requested_capabilities",
+                  "negotiated_capabilities", "backend", "incarnation_id", "incarnation_generation",
+                  "docker_context", "docker_context_availability"}
+MACHINE_OPTIONAL_FIELDS = {"backend", "incarnation_id", "incarnation_generation", "docker_context",
+                           "docker_context_availability"}
+
+
+def _compare_field_set(check: SubCheck, label: str, observed: set, declared: set, optional: set) -> None:
+    """One object's keys against its declared set, honouring skipped optionals.
+
+    A skipped optional may be absent, but nothing may be present that is not
+    declared: an undeclared key is exactly how a field reaches users without the
+    harness ever having been told about it.
+    """
+    missing = sorted((declared - optional) - observed)
+    unexpected = sorted(observed - declared)
+    check.check(not missing and not unexpected,
+                f"{label} emits exactly its declared field set" if not missing and not unexpected else
+                f"{label} field set differs: missing {missing}, unexpected {unexpected}")
 
 
 def check_status_field_set(ctx: CheckContext, top: str) -> SubCheck:
     """`vz status --json` over a live topology emits exactly its declared fields.
 
     Extra fields are as much a contract break as missing ones, so the set is
-    compared exactly rather than by presence. The digests must agree with each
-    other and with an undrifted definition, which is what makes them evidence
-    rather than two unrelated strings.
+    compared exactly rather than by presence, at every level of the document and
+    not only the top: criterion 2 reads per-Machine profile, target, capabilities
+    and Docker context, and a top-level-only comparison would accept a Machine
+    projection missing all four. The digests must agree with each other and with
+    an undrifted definition, which is what makes them evidence rather than two
+    unrelated strings.
     """
     check = SubCheck(top, "status_json_field_set")
     try:
@@ -1225,10 +1258,46 @@ def check_status_field_set(ctx: CheckContext, top: str) -> SubCheck:
     if check.status != "PASS" or not instance["status"]:
         return check.finish()
     payload = instance["status"]
-    check.check(set(payload) == STATUS_FIELDS,
-                "status emits exactly its declared field set" if set(payload) == STATUS_FIELDS else
-                f"field set differs: missing {sorted(STATUS_FIELDS - set(payload))}, "
-                f"unexpected {sorted(set(payload) - STATUS_FIELDS)}")
+    _compare_field_set(check, "status", set(payload), STATUS_FIELDS, STATUS_OPTIONAL_FIELDS)
+    environments = payload.get("environments")
+    check.check(isinstance(environments, list) and len(environments) == 1,
+                f"one Environment is reported (observed {len(environments) if isinstance(environments, list) else None})")
+    machines = None
+    if check.status == "PASS":
+        environment = environments[0]
+        _compare_field_set(check, "environment", set(environment), ENVIRONMENT_FIELDS, ENVIRONMENT_OPTIONAL_FIELDS)
+        machines = environment.get("machines")
+        check.check(isinstance(machines, list) and len(machines) == 1,
+                    f"one Machine is reported (observed {len(machines) if isinstance(machines, list) else None})")
+    if check.status == "PASS" and machines:
+        machine = machines[0]
+        _compare_field_set(check, "machine", set(machine), MACHINE_FIELDS, MACHINE_OPTIONAL_FIELDS)
+        # A Ready Machine is one activation produced, and activation records a
+        # backend and an incarnation together (`machine_matches_activation`);
+        # a persisted Ready Machine without a current incarnation is refused
+        # outright. So for this Machine the two are not optional, and asserting
+        # that is what stops the optional allowance above from excusing a
+        # projection that simply dropped them.
+        check.check(machine.get("state") == "ready", f"the Machine is Ready (observed {machine.get('state')!r})")
+        check.check(isinstance(machine.get("backend"), str) and isinstance(machine.get("incarnation_id"), str)
+                    and isinstance(machine.get("incarnation_generation"), int),
+                    "a Ready Machine names its backend and current incarnation (observed "
+                    f"{machine.get('backend')!r}, {machine.get('incarnation_id')!r}, "
+                    f"{machine.get('incarnation_generation')!r})")
+        # Target-qualified, per criterion 2: the profile and the target OS are
+        # reported for this Machine and are the ones the definition declared,
+        # not a daemon-wide or sibling-derived value.
+        declared = definition["environment"]["machines"][0]
+        check.check(machine.get("profile") == declared["profile"] and
+                    isinstance(machine.get("target"), dict) and
+                    machine["target"].get("os") == declared["target"]["os"] and
+                    machine["target"].get("arch") == declared["target"]["arch"],
+                    f"the Machine is target-qualified as declared (observed {machine.get('profile')!r} "
+                    f"{(machine.get('target') or {}).get('os')!r}/{(machine.get('target') or {}).get('arch')!r})")
+        for field in ("requested_capabilities", "negotiated_capabilities"):
+            value = machine.get(field)
+            check.check(isinstance(value, dict) and isinstance(value.get("capabilities"), list),
+                        f"{field} is a capability set (observed {value!r})")
     check.check(payload.get("schema_version") == 1 and isinstance(payload.get("request_id"), str) and
                 payload["request_id"], "schema_version 1 and a request_id")
     check.check(payload.get("definition_path", "").endswith("/vz.json"),

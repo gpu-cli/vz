@@ -19,6 +19,7 @@ import sys
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
+import developer_environment_checks as checks  # noqa: E402
 import developer_environment_e2e as e2e  # noqa: E402
 import developer_environment_recorder as recorder  # noqa: E402
 import developer_environment_test_support as support  # noqa: E402
@@ -366,6 +367,79 @@ class TopologyLaneTests(unittest.TestCase):
         self.assertEqual(result["entry_point"]["path"], "scripts/run-developer-environment-e2e.sh")
         rejected = subprocess.run([str(script), "--suite", "lifecycle"], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=600, check=False)
         self.assertEqual(rejected.returncode, 2)
+
+
+# One `#[derive(...)]`-preceded struct body out of the Rust source, as
+# (all serialized fields, the `skip_serializing_if` subset). The parser is
+# deliberately literal: it refuses a `flatten`, `rename` or unconditional `skip`
+# attribute rather than silently reporting a field set the wire never carries.
+def _rust_serialized_fields(source: str, name: str) -> tuple[set, set]:
+    marker = "struct " + name + " {"
+    assert marker in source, "no struct " + name
+    body = source.split(marker, 1)[1].split("\n}", 1)[0]
+    for hostile in ("serde(flatten", "serde(rename", "serde(skip)", "serde(skip_serializing)"):
+        assert hostile not in body, name + " carries " + hostile + ", which this comparison cannot model"
+    fields, optional = set(), set()
+    skipped_next = False
+    for line in body.splitlines():
+        line = line.strip()
+        if line.startswith("#["):
+            skipped_next = skipped_next or "skip_serializing_if" in line
+            continue
+        if not line or line.startswith("//"):
+            continue
+        field = line.split(":", 1)[0].strip()
+        if not field.isidentifier():
+            continue
+        fields.add(field)
+        if skipped_next:
+            optional.add(field)
+        skipped_next = False
+    assert fields, "could not read " + name + " fields"
+    return fields, optional
+
+
+class StatusFieldSetAgreementTests(unittest.TestCase):
+    """The harness's declared status field sets must be the CLI's actual ones.
+
+    `check_status_field_set` compares an observed `vz status --json` payload
+    against constants in `developer_environment_checks`. Those constants are the
+    only thing that says what the document is supposed to contain, so a field
+    added to the Rust structs and not to them leaves the gate check passing on a
+    document it no longer fully describes -- and, for a `skip_serializing_if`
+    field, passing without ever having seen it. Each set is therefore read out of
+    `dev_status.rs` here rather than restated, so that drift fails offline.
+    """
+
+    SOURCE = "crates/vz-cli/src/commands/dev_status.rs"
+
+    def setUp(self):
+        self.source = (common.REPO_ROOT / self.SOURCE).read_text()
+
+    def test_declared_field_sets_match_the_status_command_structs(self):
+        for struct, declared, optional in (
+                ("StatusOutput", checks.STATUS_FIELDS, checks.STATUS_OPTIONAL_FIELDS),
+                ("EnvironmentStatus", checks.ENVIRONMENT_FIELDS, checks.ENVIRONMENT_OPTIONAL_FIELDS),
+                ("MachineStatus", checks.MACHINE_FIELDS, checks.MACHINE_OPTIONAL_FIELDS)):
+            with self.subTest(struct=struct):
+                fields, skipped = _rust_serialized_fields(self.source, struct)
+                self.assertEqual(fields, declared)
+                self.assertEqual(skipped, optional)
+                self.assertLessEqual(optional, declared)
+
+    def test_the_parser_would_notice_an_added_or_newly_optional_field(self):
+        """Failing-before, in process: neither comparison above is vacuous."""
+        drifted = self.source.replace(
+            "    machine_id: String,\n    name: String,",
+            "    machine_id: String,\n    topology: Vec<String>,\n    name: String,", 1)
+        self.assertNotEqual(drifted, self.source)
+        fields, _ = _rust_serialized_fields(drifted, "MachineStatus")
+        self.assertEqual(fields - checks.MACHINE_FIELDS, {"topology"})
+        newly_optional = self.source.replace(
+            "    machine_id: String,",
+            '    #[serde(skip_serializing_if = "String::is_empty")]\n    machine_id: String,', 1)
+        _, skipped = _rust_serialized_fields(newly_optional, "MachineStatus")
+        self.assertEqual(skipped - checks.MACHINE_OPTIONAL_FIELDS, {"machine_id"})
 
 
 if __name__ == "__main__":
