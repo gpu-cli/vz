@@ -1,209 +1,116 @@
-# vz 0.4.0 status
+# vz 0.4.0: where it stands
 
-Status: current picture as of 2026-09-07. Normative source:
-[`GOAL-0.4.0.md`](GOAL-0.4.0.md). This document says what exists, what is
-proven, and what remains. It is written to be read on its own.
+Status: living summary, rewritten when a gate run changes it
+Last measured: 2026-09-10, release candidate `0.4.0-rc2`, Apple-silicon macOS 26.3.1
 
-## The one-line answer
+This is the short answer to "what's left". The gate itself is
+[GOAL-0.4.0.md](GOAL-0.4.0.md); this file says which of its claims are proved,
+which are disproved, and what is in the way.
 
-The release gate now exists and runs, and it says FAIL. That is the honest
-result: of the 85 scenarios the contract requires, none yet passes through the
-aggregate. Two of the four lanes are unimplemented, the Docker lane's own
-coverage has known gaps, and — found 2026-09-07 — **the Docker lane could not be
-invoked by the gate at all**: the contract gives it `["--suite", "all"]`, and
-the harness rejects that argv until eight more required options are supplied
-(`vz-ao8`). Only `--dry-lanes` runs had taken that path, and a dry lane
-substitutes its result without starting the process, so the rejection had never
-been observed. That is the gap between a composed candidate passing every suite
-directly and zero scenarios passing the aggregate.
+## The one-line version
 
-Seven and a half of those eight now land. Five are facts about the candidate
-and are derived from it by a `linux_docker` argv contract; `--tmux` is resolved
-by the gate like the Docker clients; the registry archive and layout are
-acquired from `config/docker-registry-artifact-v3.1.1.json`, reproducing the
-byte-identical artifact the candidates use. `--ssh-packages` is the remainder:
-its pin now carries a verified `repository_path` for every locatable row and an
-acquirer fetches them, but the base-image extracts, one derived stanza and about
-38 KB of generated provenance still stand between that and a supplied option.
+The **harness is finished** -- all eighteen topology-lane scenarios have real
+checks, and nothing in that lane reports "needs provisioned Machines" any more.
+What remains is **product work**, and the gate now names it precisely instead of
+failing in a heap.
 
-The Docker lane owns 66 of the 85 scenarios — 63 `docker.*` plus three `gate.*`
-— so this one defect stands in front of 78% of the release gate. The topology
-lane owns 18 and native-macOS owns 1.
+## What the last hardware run proved
 
-What changed recently is that the gate, its validator, its frozen inputs and
-three of its four lanes are real, so every remaining piece now lands against a
-mechanical verdict instead of accumulating as separate focused passes.
+Topology lane, clean-provision phase, against a locally signed release candidate
+with a registered native macOS target. **Eleven of fifteen sub-checks pass.**
 
-## Tracked work
-
-| State | Count |
+| Passing on hardware | |
 |---|---|
-| Closed | 63 |
-| In progress | 48 |
-| Open | 100 |
+| criterion 1 | three concurrent Environments, no collision |
+| criterion 2 | mixed Linux + native macOS topology and status |
+| criterion 15 | CLI/API agreement, including live gRPC and the status field set |
+| criterion 21 | legacy CLI removal, bare help, bootstrap rules |
 
-## What is proven today
+Criterion 2 is the notable one: a native macOS Machine boots, is supervised, and
+reports correctly beside Linux Machines in one Environment.
 
-Everything below is DEV evidence from an installed, signed, local Apple-silicon
-build driving public interfaces. None of it is release certification: every
-record carries `aggregate_release_certified: false`.
+## What is in the way, in the order it blocks things
 
-**Rust gates.** `cargo fmt --check`, `cargo clippy --workspace --all-targets
---all-features -- -D warnings` and `cargo nextest run --workspace
---all-features` all pass (2,914 tests). The clippy gate is the exact command the
-release contract names, and it went from 2,733 findings to zero.
+Each of these is a filed issue, and each is the reason a specific criterion
+cannot pass. None of them is a harness gap.
 
-**Docker slices.** Installed candidates pass compose, build, artifacts, parallel,
-ssh, lifecycle, images, registry, handshake, limits and recovery. The registry
-slice proves wrong-CA rejection, invalid-password rejection, unauthenticated
-push denial, an authenticated login with a server-side route witness, push,
-pull-by-digest, export re-verification, independent receipt replay, secret
-canary scans and exact cleanup, across three Machines at the same private
-authority with the fourth as a neighbor sentinel.
+### P0
 
-**Capability honesty.** A checked-in host×target×profile matrix records what each
-pair actually supports, a Rust test fails if the capability enum drifts from it,
-and a linter binds all 133 capability claims across README, docs, site, skills
-and CLI help to that matrix. No capability is labeled ACTIVE, because no 0.4
-release exists.
+1. **There is no reconciliation.** `vz up` refuses *every* ProjectDefinition
+   change before admission -- `project definition drift`, `StackError::InvalidSpec`.
+   No plan is derived, no durable claim is taken, and a mutable field change gets
+   the same code as an immutable one. Neither of criterion 22's two normative
+   sub-documents has an implementation subject at all: `admit_reconcile_round`,
+   `ReconcileInputSnapshot` and `effective_digest` exist nowhere in `crates/`.
+   *Blocks criterion 22 entirely.*
 
-**The gate itself.** The entry point, the read-only validator, the release
-candidate builder, fifteen JSON schemas and the frozen-input drafts exist. A run
-captures host, toolchain and client facts, listener, process, socket and
-Docker-context inventories before and after, and a leak diff; sleep and wake are
-proven by the discontinuity between the monotonic and uptime-raw clocks bound to
-a nonce and boot session. The validator reproduces the gate's verdict
-independently from the retained evidence.
+2. **No machine-scoped lifecycle operation.** Every runtime teardown primitive is
+   fenced on a persisted Environment-wide `EnvironmentLifecycleOperation` whose
+   structure check requires one machine step per Machine, so `vz delete --machine`
+   resolves a fork and then refuses. The refusal is deliberate: a partial teardown
+   leaks a host Docker context and a runtime store *while the ownership rows claim
+   reclamation*. *Blocks criterion 23's delete clause.*
 
-## What the gate reports, and why
+### P1
 
-The dry run's 109 findings are all correct:
+3. **Native macOS Machines take no fabric address.** The declaration is accepted
+   at every layer now and the Environment comes up; the guest just never gets an
+   address on the subnet. A Linux guest reads its address off the kernel cmdline;
+   a macOS guest is given it over the agent channel during readiness, and that
+   half does not work. *Blocks criterion 5's crossing and criterion 12's
+   cooperating Linux-to-macOS pair.*
 
-- **85 scenarios missing.** The topology lane proves six sub-checks of the CLI
-  criteria and honestly reports the rest not implemented; the native-macOS lane
-  is still a stub; the Docker lane has ten uncovered scenario IDs, needing four
-  gap-suites: `mounts` for the five storage IDs, `netpolicy` for published ports
-  and network cleanup, `concurrency` for concurrent clients, and `isolation` for
-  the two cross-Environment IDs. Only the first two are blocked on product
-  features; concurrency and isolation need a three-Environment topology and
-  nothing else.
-- **Inputs are drafts.** Four frozen-input files are `draft_unverified` and
-  eleven contract values are still null, mostly native-macOS pins that are not
-  yet knowable.
-- **The candidate is development evidence.** It is locally test-signed, not
-  Developer-ID signed and notarized, and it was built from a dirty checkout.
-- **Sleep and wake were not observed**, because the dry run substitutes lanes.
+4. **Guests resolve through public DNS.** `resolv.conf` comes up as
+   `[1.1.1.1, 8.8.8.8]` instead of the Environment's declared gateway. Resolution
+   is not broken -- it works, through the wrong resolver, which is the shape that
+   passes a smoke test and fails the criterion. *Blocks criterion 6's split-DNS
+   clause and half of criterion 8's resolve clause.*
 
-## What remains, in rough order of size
+5. **A refused `vz up` mutates the worktree**, minting `.git/vz/workspace-id`.
+   Fail-before-mutation is stated for definition changes and for bootstrap, and
+   this is the same contract. It leaves a binding artifact a later Up will adopt.
 
-1. **Network fabric and host boundaries.** Declared private paths, an
-   Environment-owned switch, host imports and exports, published ports, egress
-   policy, split DNS, TLS ingress, faults with numeric tolerances, peering with
-   expiry, and the exhaustive denial matrix. Today `vz up` rejects any declared
-   network, endpoint or workspace projection, and now also refuses declared host
-   relays and non-offline egress rather than admitting a boundary it cannot
-   apply. Step 1 of [`NETWORK-INCREMENT-PLAN.md`](NETWORK-INCREMENT-PLAN.md) has
-   landed, with its typed records, state-store schema v10 and both migration
-   barriers, and so has the first half of step 2's substrate: the file-handle
-   network attachment and a VM that can hold a list of NICs instead of one. The
-   switch itself, the guest addressing, and the three admission gates remain.
-2. **Native macOS Machines.** Ownership adaptation, workspace, exec and
-   services, mixed Linux and macOS topologies, and the release gate for them.
-   The local setup path is in progress and its evidence still records a failure.
-3. **Topology reconciliation and streaming.** Generation fencing, replica
-   identity, crash-atomic batches and private runtime ownership.
-4. **The remaining Docker coverage.** Bind mounts and published ports are
-   blocked on the two product features above; concurrency and cross-Environment
-   isolation are not blocked but need a three-Environment topology.
-5. **Migration and GA.** Upgrade from the pinned v0.3.20 fixture, injected
-   failure and rollback, uninstall preservation, and a Developer-ID signed and
-   notarized distribution whose pre-signing digests match the local candidate.
-6. **Freezing the inputs and certifying.** Only once the fixtures and harness
-   are stable, and last of all the staged clean-provision, persisted-recovery
-   with a real hardware sleep, and final-cleanup run against one candidate.
+6. **Capability negotiation is a rubber stamp.** `negotiated_capabilities =
+   requested_capabilities.clone()`, so a Machine asking for `snapshot` is granted
+   it while the capability matrix says PLANNED. Every consumer that trusts
+   capability discovery -- help, docs, site copy, status -- inherits the false
+   claim. *Blocks criterion 18's snapshot clause.*
 
-## Composing the Docker lane
+7. **No `SecretBinding` exists** -- not in the project schema, not in
+   `vz-runtime-contract`. The gate check for it is written and waiting: it plants
+   a high-entropy sentinel through the CLI environment, reads it back only as a
+   digest, and sweeps seven artifact groups for the literal bytes.
+   *Blocks criterion 18's secrets clause.*
 
-`--suite all` now provisions the topology once and walks the suites in order.
-Twenty-one installed candidates took it from refusing outright to a run that
-executed all ten composed suites, handshake through recovery, with no workload
-error. Every candidate exposed exactly one real cross-suite coupling, each fixed
-and committed with its reason:
+8. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`.** The
+   handshake that exists to refuse a stale guest passed, and the guest answered
+   `Unimplemented` deep inside `up` instead. The revision is a hand-maintained
+   constant with nothing tying it to the surface it describes.
 
-- The executing suite was not threaded through the driver helpers, so a composed
-  run built without a builder mapping and refused its own replays.
-- The builder registry, the BuildKit object names and the health evidence
-  directory were all keyed without the suite, so the second suite to want them
-  collided with the first.
-- Builder identity was hashed in two places that then disagreed.
-- Compose recipe timeouts had no margin over the fixture's own health intervals,
-  and the parallel barrier could not tolerate builder startup skew.
-- Parallel source vertices were modelled as an ordered stream, but BuildKit
-  replays a vertex's history and four concurrent slots genuinely overlap and
-  supersede solves of one source. Three assertions the rows cannot support were
-  narrowed, each with its reason, and the new rule was checked against every
-  source vertex of a real candidate before running.
-- The health container was recorded on the shared fixture ownership row.
-- Owned builders were not reconciled before the recovery suite restarts the
-  Machine they live in, and the final-cleanup certainty guard, which requires a
-  stopped monitor, was being applied to that mid-run removal.
+## What the gate will not tell you yet
 
-Candidates 17 to 21 continued the same pattern, each exposing one real coupling:
+- **The fork check has never run against real VMs.** Two bounds a first real run
+  must settle: `FORK_SPEEDUP_MIN = 2.0` and `FORK_FREE_SPACE_FRACTION = 0.25`.
+  The free-space window spans the whole `up`, so it carries the fork's own boot
+  writes. The check records the cold Up's wall time and free-space delta beside
+  the fork's so those bounds can be judged from evidence; revising them is a
+  product decision, not a repair to the measurement.
+- **No aggregate run has completed.** The four-phase gate needs a real Mac sleep
+  between pre-sleep and post-wake, so it is an attended run.
+- **The pinned macOS template lives in `/private/tmp`.** Rebuilding it costs an
+  IPSW download and an administrator authorisation. It is one purge away from
+  gone and should be moved somewhere durable.
 
-- The recovery module's monitor subclass builds its own state and predated the
-  probe cache the fast path added, and a non-idempotent `stop()` then masked that
-  real failure behind an exclusive write. Candidate 20 executed all ten suites
-  before failing there, so the fast path holds across the whole composition.
-- Candidate 21 failed in **limits** on a 21 millisecond race. The validator
-  requires every workload envelope to open after the health probe's first sample
-  has finished, and the suite satisfied that only by assuming its first command
-  was slow. On a warm Engine it was not, and the first bracket opened 21 ms
-  early. The probe now announces its first completed sample and the suite waits
-  for it, so the precondition is checked rather than assumed. Candidate 20 had
-  won the same coin flip.
+## Measured facts worth keeping
 
-Candidate 23 passed all ten composed suites with no non-zero exit outside the
-run's own negative assertions, so the fast path and every coupling above hold
-together across one provisioning.
+| | |
+|---|---|
+| `clonefile(2)` of an 80 GiB template holding 32.9 GiB | **0.029 s, 28 KB of volume free space** |
+| the same file, held open by a writer mid-`fsync` | clone exit 0 in **0.077 s** |
+| a Machine's Docker `data.img` | 64 GiB logical, **29 MB of data in 78 extents** |
+| APFS `st_blocks` of a clone versus its parent | **exactly equal** -- which is why the criterion measures free space |
 
-**lifecycle** was the last suite excluded from `--suite all`, because its
-evidence is a youki runtime-audit journal bounded at 2,048 records per Machine
-and a whole-run window overruns that on sentinel sampling alone — about 1,488
-records per Machine in 25 minutes, measured on candidate 21. Two changes compose
-it (`vz-mzs.7.1.16`), unit-tested but **not yet proven by a composed candidate**;
-the count of audit records on the lifecycle Machine is what will prove it:
-
-- The monitor no longer samples the Machine running the workload. Both liveness
-  assertions already excluded that Machine — `close_interval` subtracts it and
-  `check_interval` skips it — so the per-second exec into it produced evidence
-  no check ever read while spending the exact journal lifecycle needs. Sampling
-  resumes the moment another Machine is active, where it is a sibling and its
-  samples are used, so no sibling liveness is lost anywhere in the run.
-- A composed run opens the audit window immediately before the lifecycle suite
-  and closes it immediately after, with the monitor paused for the capture
-  alone. That is complete evidence for the suite, because it removes its own
-  containers and image before it returns. `--suite lifecycle` keeps the
-  whole-run window it always had.
-
-`lifecycle` now runs second to last in `SUITE_ORDER`, before `recovery`, which
-must stay last because it cycles Stop/Up and replaces the monitor. A composed
-run therefore carries `--tmux`, and may pin `--container-fixture`.
-
-The limits window coupling recorded here earlier is closed: the suite now runs
-180 one-second samples, and the reasoning is recorded beside the constant.
-
-## How to run what exists
-
-```bash
-scripts/build-vz-0.4-release-candidate.sh --output <new dir> --version 0.4.0-dev
-scripts/run-vz-0.4-release-gate.sh --suite all --release-dir <dir> --run-id <id> \
-  --docker <path> --compose-plugin <path> --buildx-plugin <path>
-scripts/validate-vz-0.4-evidence.sh <evidence>/manifest.json
-```
-
-The Docker lane can also be driven directly for one suite or composed:
-
-```bash
-scripts/run-linux-docker-e2e.sh --suite registry ...   # one DEV slice
-scripts/run-linux-docker-e2e.sh --suite all ...        # every suite, one topology
-```
+The last row is the one that keeps being rediscovered. A per-file allocated-size
+comparison reads a *correct* copy-on-write clone as a deep copy. Criterion 23 was
+rewritten around it once and the fork check asserts the per-file equality
+alongside the free-space bound so it cannot be undone by accident.
