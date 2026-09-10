@@ -269,9 +269,15 @@ required E2E scenario and retained evidence:
     image digests with a pull count of zero. Performance is part of the claim,
     because a fork that costs a cold boot has no value -- the fork reaches ready
     substantially faster than a cold `up` of the same definition measured in the
-    same run, and host allocated-size growth is a fraction of the parent's
-    logical disk, which is what makes copy-on-write observable rather than
-    assumed. Forks are owned resources: `vz delete` reclaims one completely and
+    same run, and the volume's free space falls by a small fraction of the
+    parent's allocated size, which is what makes copy-on-write observable
+    rather than assumed. Free space, not the clone's own allocated size: APFS
+    reports both inodes as fully allocated because they share blocks, so a
+    per-file comparison reads a correct clone as a deep copy. Measured on a
+    real 80 GiB template disk holding 32.9 GiB: 0.029 s and 28 KB. The fork
+    quiesces the guest's filesystems immediately before cloning, so what it
+    proves is application consistency rather than the crash consistency a bare
+    clone of a running Machine would give. Forks are owned resources: `vz delete` reclaims one completely and
     `vz up` does not prune the others. Two forks of one parent are mutually
     isolated and individually addressable by their labels; an ambiguous
     `--machine` fails closed listing them. See

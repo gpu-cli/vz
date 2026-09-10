@@ -135,12 +135,36 @@ proves nothing. The gate criterion pins measured bounds:
   fraction of the parent's logical size, which is what makes copy-on-write
   observable rather than assumed.
 
-The third is the assumption most likely to be wrong and the one that decides
-whether the design works at all. `clonefile(2)` clones a hierarchy recursively
-on APFS -- verified while implementing snapshot projections -- but whether a
-*running* Machine's disk image can be cloned safely, or whether the parent must
-first be stopped or checkpointed, is unknown and must be established by
-measurement before the rest is built.
+### Measured, 2026-09-09
+
+The third property was the design's load-bearing assumption. It holds.
+
+A real native macOS Machine template disk -- 80 GiB logical, **32.9 GiB actually
+allocated** -- cloned with `clonefile(2)`:
+
+| | |
+|---|---|
+| wall time | **0.029 s** |
+| volume free-space delta | **28 KB** |
+
+And a file held open by a process writing and `fsync`ing continuously (10,288
+writes completed before the call) cloned in **0.077 s**, exit 0. So a fork does
+not require the parent stopped: `clonefile` operates on the path and does not
+contend with an open writer.
+
+Two findings that change how the criterion must be written:
+
+- **Measure volume free space, not per-file allocated size.** APFS reports both
+  inodes as fully allocated -- the clone's `st_blocks` matched the parent's
+  32.9 GiB exactly -- because they reference the same blocks. A check comparing
+  per-file allocated size would read a perfect copy-on-write clone as a deep
+  copy and fail. Free-space delta is the observable that distinguishes them.
+- **A clone of a running Machine is crash-consistent, not application-
+  consistent.** It is the state a power cut would leave: the guest's ext4
+  journal replays on mount, but a write in flight when the clone was taken may
+  be partial. The fork should therefore ask the guest agent to sync its
+  filesystems immediately before the clone -- quiescing without stopping -- and
+  the criterion should say which of the two consistencies it proves.
 
 ## Ownership and reconciliation
 
@@ -159,8 +183,10 @@ measurement before the rest is built.
 
 ## Open questions
 
-1. **Can a running Machine's disk be cloned?** Decides whether a fork is seconds
-   or tens of seconds. Needs an experiment, not a discussion. *Highest priority.*
+1. ~~**Can a running Machine's disk be cloned?**~~ **Answered above: yes, in
+   milliseconds, for kilobytes, without stopping the parent.** What remains is
+   the narrower question of quiescing the guest before the clone so the fork is
+   application-consistent rather than merely crash-consistent.
 2. **What seeds the first Machine of a project?** Cloning a running sibling is
    implicit and surprising; a declared baseline is explicit but needs a way to
    promote a warmed Machine, which is imperative and wants a verb the CLI
