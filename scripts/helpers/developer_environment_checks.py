@@ -4620,3 +4620,919 @@ def check_host_import_export_boundaries(ctx: CheckContext, top: str) -> SubCheck
             except OSError as error:
                 check.fail(f"{name}: could not be deleted: {type(error).__name__}: {error}")
     return check.finish()
+
+
+# --------------------------------------------------------------------- criterion 22
+#
+# `gate.definition.reconciliation_fencing`: the definition-reconciliation and
+# generation-fencing clauses of criterion 22, each proved against one of the
+# three Environments `establish_recovery_environments` left running.
+#
+# The criterion cites two normative sub-documents by name, and they -- not the
+# summary paragraph -- are the contract:
+#
+#   planning/developer-environments/reconcile-generation-fencing.md
+#     "Action schema v3": every ServiceCreate/ServiceRecreate/ServiceRemove
+#     carries a `ReplicaPrecondition` naming the exact workload scope,
+#     `environment_generation` and journal head it was planned against.
+#     "Durable claim and exact StateStore CAS": the exact batch audit row is the
+#     durable claim, and `start_reconcile_batch` revalidates every precondition
+#     in one transaction before any effect.
+#     "Strict mutation ordering": nothing but the inert pre-claim planning
+#     manifest may touch state before the claims are acquired.
+#
+#   planning/developer-environments/reconcile-effective-inputs.md
+#     "Snapshot model": one immutable operation-owned `ReconcileInputSnapshot`
+#     with a `vz-reconcile-input-manifest-v1` manifest digest and per-service
+#     `vz-effective-service-input-v1` effective digests.
+#     "Capture and atomic admission": `admit_reconcile_round` finalizes that
+#     snapshot and derives the plan in one transaction.
+#     "Planning and execution": execution resolves its inputs through the
+#     persisted manifest and never rereads the caller's current spec.
+#     "Recovery, retention, and cleanup": any digest/inventory disagreement is a
+#     state conflict before mutation.
+#
+# Both sub-documents are written about SERVICE REPLICAS inside a Machine. The
+# 0.4 public CLI has five verbs and the 0.4 ProjectDefinition
+# (schemas/vz-project-definition-v1.schema.json) declares no services, secrets or
+# volumes, so a black-box gate has no scoped service create/recreate/remove to
+# fence and no effective-service input to snapshot. What it does have is the
+# Environment-level reconciliation the criterion's own paragraph is about. Every
+# clause below is either proved at that layer against exact values, or reported
+# `not_implemented` by name with the runtime's own refusal quoted.
+#
+# One hard constraint on all of it: these sub-checks run in
+# `persisted-recovery/pre-sleep`, and the post-wake phase must find these exact
+# Environments with the identity `establish_recovery_environments` recorded --
+# including `lifecycle_generation`. Nothing here may consume a generation. Every
+# Up attempted below therefore carries a CHANGED definition, which is precisely
+# the input this criterion is about; each sub-check restores the exact
+# definition bytes it found and re-asserts the recorded identity afterwards, on
+# every exit path including failure.
+RECONCILE_FENCING_DOC = "planning/developer-environments/reconcile-generation-fencing.md"
+RECONCILE_INPUTS_DOC = "planning/developer-environments/reconcile-effective-inputs.md"
+DEFINITION_FILE = "vz.json"
+# `validate_definition_instance` (crates/vz-runtime-contract/src/types/topology.rs)
+# is the function that decides which ProjectDefinition fields a live Environment
+# is compared against: Machine name/count, `target`, `profile` and
+# `requested_capabilities`, plus the declared networks and endpoints. `resources`
+# is not among them, so `memory_mb` is a mutable field and `target.digest` is an
+# immutable one. Both spellings below stay schema-valid, so what is under test is
+# the reconciliation decision and not a rejected document.
+MUTABLE_FIELD = "environment.machines[0].resources.memory_mb"
+IMMUTABLE_FIELD = "environment.machines[0].target.digest"
+MUTATED_MEMORY_MB = 6144
+FOREIGN_ARTIFACT_DIGEST = "sha256:" + "9" * 64
+DIGEST_SPELLING = re.compile(r"^sha256:[0-9a-f]{64}$")
+ERROR_CODE_SPELLING = re.compile(r"^[a-z][a-z0-9_]*$")
+RECONCILE_UP_TIMEOUT = UP_TIMEOUT
+RECONCILE_STATUS_TIMEOUT = 60
+# Removed from a plan value by name before two runs are compared: everything
+# that identifies THIS invocation rather than the plan it announced. A lifecycle
+# `generation` is excluded because a second accepted Up legitimately consumes the
+# next one; it is asserted separately, and exactly, instead.
+PLAN_VOLATILE = frozenset(("request_id", "idempotency_key", "request_hash", "trace_id", "created_at",
+                           "started_at", "completed_at", "finished_at", "updated_at", "operation_id",
+                           "generation", "elapsed_millis", "elapsed_nanos"))
+# Every key by which a runtime that had implemented `reconcile-effective-inputs.md`
+# would publish its operation-owned snapshot identity on a public interface.
+# Their absence is what makes that contract's clauses unexercisable here, so the
+# absence is asserted rather than assumed.
+EFFECTIVE_INPUT_KEYS = ("manifest_id", "manifest_digest", "effective_digest", "snapshot_id",
+                        "applied_config_digest", "plan_hash", "secret_blobs", "stack_projection",
+                        "reconcile_actions", "replica_precondition")
+
+
+def _strip_volatile(value):
+    if isinstance(value, dict):
+        return {key: _strip_volatile(item) for key, item in value.items() if key not in PLAN_VOLATILE}
+    if isinstance(value, list):
+        return [_strip_volatile(item) for item in value]
+    return value
+
+
+def reconcile_plan(receipt) -> dict:
+    """One `vz --json up` reduced to the plan it announced, as a comparable value.
+
+    `vz --json up` writes one JSON document per line on stdout (a
+    `request_started` record, then one `operation_progress` per transition, each
+    carrying the admission's project/Environment/Machine identities and the
+    definition digest it was admitted under) and, when it refuses, one error
+    envelope on stderr. `PLAN_VOLATILE` removes by name everything that
+    identifies the invocation rather than the plan. What survives is what two
+    runs of one definition change against one Environment must agree on exactly.
+    """
+    records, unparsed = [], []
+    for line in receipt.stdout.decode("utf-8", "replace").splitlines():
+        if not line.strip():
+            continue
+        try:
+            records.append(_strip_volatile(json.loads(line)))
+        except json.JSONDecodeError:
+            unparsed.append(line[:160])
+    envelope = None
+    if receipt.stderr:
+        try:
+            envelope = _strip_volatile(json.loads(receipt.stderr.decode("utf-8")))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            envelope = None
+    return {"exit_code": receipt.exit_code, "records": records, "error_envelope": envelope,
+            "unparsed_stdout_lines": unparsed,
+            "unparsed_stderr": None if envelope is not None else receipt.stderr.decode("utf-8", "replace")[:400]}
+
+
+def reconcile_error(receipt):
+    """The structured refusal `vz --json` writes to stderr, or None."""
+    if not receipt.stderr:
+        return None
+    try:
+        payload = json.loads(receipt.stderr.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        return None
+    error = payload.get("error") if isinstance(payload, dict) else None
+    return error if isinstance(error, dict) else None
+
+
+def reconcile_refusal_text(error) -> str:
+    """Every string the runtime put in one refusal, joined for exact search."""
+    if not error:
+        return ""
+    parts = [str(error.get("code") or ""), str(error.get("message") or "")]
+    details = error.get("details")
+    if isinstance(details, dict):
+        parts.extend(f"{key}={value}" for key, value in sorted(details.items()))
+    return " ".join(parts)
+
+
+def reconcile_identity(payload) -> dict:
+    """Every stable identity `vz status --json` publishes, as one comparable value.
+
+    Criterion 22 claims a reconcile does not change stable identity, so the
+    comparison has to be of identities and not of a success flag: Environment and
+    Machine IDs, the Machine incarnation that would change if a Machine were
+    silently replaced, the lifecycle generation a refused plan must not consume,
+    and the declared-fabric IDs an orphan would show up as.
+    """
+    environments = []
+    for environment in payload.get("environments") or []:
+        environments.append({
+            "environment_id": environment.get("environment_id"),
+            "name": environment.get("name"),
+            "state": environment.get("state"),
+            "definition_digest": environment.get("definition_digest"),
+            "lifecycle_generation": environment.get("lifecycle_generation"),
+            "machines": [{"machine_id": machine.get("machine_id"), "name": machine.get("name"),
+                          "state": machine.get("state"), "profile": machine.get("profile"),
+                          "target": machine.get("target"),
+                          "incarnation_id": machine.get("incarnation_id"),
+                          "incarnation_generation": machine.get("incarnation_generation")}
+                         for machine in environment.get("machines") or []],
+            "networks": sorted(str(row.get("network_id")) for row in environment.get("networks") or []),
+            "network_attachments": sorted(str(row.get("attachment_id"))
+                                          for row in environment.get("network_attachments") or []),
+            "endpoints": sorted(str(row.get("endpoint_id")) for row in environment.get("endpoints") or []),
+        })
+    return {"project_id": payload.get("project_id"),
+            "persisted_definition_digest": payload.get("persisted_definition_digest"),
+            "environments": environments}
+
+
+def reconcile_owned_resources(payload) -> dict:
+    """`<kind>:<resource id>` -> the Environment id that owns it, from one status.
+
+    Deliberately scoped to the resources the status document itself attributes to
+    an owner, and compared before against after. It is NOT compared against the
+    definition's Machine list: a forked Machine is a runtime object the definition
+    does not declare, reconcile must leave it alone, and only `vz delete` removes
+    it. A plan that created nothing must leave this value byte-identical, which is
+    what "no orphaned resources" means for a refused or converged reconcile.
+    """
+    owned = {}
+    for environment in payload.get("environments") or []:
+        owner = str(environment.get("environment_id"))
+        owned[f"environment:{owner}"] = owner
+        for machine in environment.get("machines") or []:
+            owned[f"machine:{machine.get('machine_id')}"] = owner
+            context = machine.get("docker_context") or {}
+            if context.get("name"):
+                owned[f"docker_context:{context.get('name')}"] = str((context.get("owner") or {}).get("environment_id"))
+        for row in environment.get("networks") or []:
+            owned[f"network:{row.get('network_id')}"] = owner
+        for row in environment.get("network_attachments") or []:
+            owned[f"network_attachment:{row.get('attachment_id')}"] = owner
+        for row in environment.get("endpoints") or []:
+            owned[f"endpoint:{row.get('endpoint_id')}"] = owner
+    return owned
+
+
+def definition_bytes(definition: dict) -> bytes:
+    """The spelling `provision` writes, so a restored file is byte-identical."""
+    return json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+
+
+def replace_definition(project: Path, data: bytes) -> None:
+    """Rewrite `vz.json` in place, atomically, leaving no temporary behind.
+
+    In place because the CLI reads the NEAREST definition: a copy beside it would
+    not be the file Up discovers, and a half-written one would be refused as an
+    invalid document rather than as the changed field under test.
+    """
+    target = project / DEFINITION_FILE
+    temporary = target.with_name(DEFINITION_FILE + ".reconcile-tmp")
+    if os.path.lexists(temporary):
+        os.unlink(temporary)
+    write_exclusive(temporary, data)
+    os.replace(temporary, target)
+    descriptor = os.open(project, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def mutable_change(definition: dict) -> dict:
+    """The same definition with one field no instance record is compared against."""
+    changed = copy.deepcopy(definition)
+    machine = changed["environment"]["machines"][0]
+    machine.setdefault("resources", {})["memory_mb"] = MUTATED_MEMORY_MB
+    return changed
+
+
+def immutable_change(definition: dict) -> dict:
+    """The same definition with one field the persisted instance IS compared against.
+
+    `actual.target != desired.target` is a definition/topology mismatch, so a
+    Machine's pinned artifact digest cannot be reconciled in place: honouring it
+    would mean replacing the Machine, which is exactly what "immutable/unsafe
+    changes fail before mutation" forbids doing silently.
+    """
+    changed = copy.deepcopy(definition)
+    changed["environment"]["machines"][0]["target"]["digest"] = FOREIGN_ARTIFACT_DIGEST
+    return changed
+
+
+def reordered_bytes(definition: dict) -> bytes:
+    """The same definition value, serialized to different bytes.
+
+    Reversed key order and a different separator style. A canonical desired digest
+    must be identical over these bytes; a digest over the file would not be, which
+    is the difference this distinguishes.
+    """
+    def reorder(value):
+        if isinstance(value, dict):
+            return {key: reorder(value[key]) for key in reversed(list(value))}
+        if isinstance(value, list):
+            return [reorder(item) for item in value]
+        return value
+    return json.dumps(reorder(definition), separators=(", ", ": ")).encode() + b"\n"
+
+
+def reconcile_status(ctx: CheckContext, check: SubCheck, label: str, instance: dict):
+    row = ctx.run(check, label, ["--json", "status"], cwd=instance["project"], env=instance["env"],
+                  timeout=RECONCILE_STATUS_TIMEOUT)
+    if row.exit_code != 0:
+        check.fail(f"{label}: vz --json status exit {row.exit_code} (expected 0); stderr {row.stderr[:200]!r}")
+        return None
+    try:
+        return json.loads(row.stdout.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        check.fail(f"{label}: status is not a JSON document: {error}")
+        return None
+
+
+class ReconcileSubject:
+    """One pre-sleep Environment, its recorded identity, and its definition bytes.
+
+    `restore` puts the exact bytes back and is called on every exit path,
+    including failure: the post-wake phase has to find these Environments as
+    `establish_recovery_environments` recorded them.
+    """
+
+    def __init__(self, entry: dict, instance: dict, original: bytes, definition: dict, before: dict):
+        self.entry = entry
+        self.name = entry["isolate"]
+        self.instance = instance
+        self.project = instance["project"]
+        self.env = instance["env"]
+        self.original = original
+        self.definition = definition
+        self.before = before
+        self.identity = reconcile_identity(before)
+        self.owned = reconcile_owned_resources(before)
+        self.desired = before.get("desired_definition_digest")
+        self.persisted = before.get("persisted_definition_digest")
+
+    def write(self, data: bytes) -> None:
+        replace_definition(self.project, data)
+
+    def restore(self) -> None:
+        replace_definition(self.project, self.original)
+
+
+def reconcile_subject(ctx: CheckContext, check: SubCheck, established, index: int):
+    """Reattach pre-sleep's Environment `index` and record what must not change."""
+    entries = (established or {}).get("environments") or []
+    if not check.check(len(entries) > index,
+                       f"pre-sleep recorded {len(entries)} Environment(s); this sub-check addresses index {index}"):
+        return None
+    entry = entries[index]
+    try:
+        instance = ctx.reattach(entry["isolate"])
+    except ReattachError as error:
+        check.fail(str(error))
+        return None
+    definition_path = instance["project"] / DEFINITION_FILE
+    if not check.check(definition_path.is_file() and not definition_path.is_symlink(),
+                       f"{entry['isolate']}: a regular {DEFINITION_FILE} to change at {definition_path}"):
+        return None
+    original = read_regular(definition_path)
+    try:
+        definition = json.loads(original.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        check.fail(f"{entry['isolate']}: {DEFINITION_FILE} is not a JSON document: {error}")
+        return None
+    before = reconcile_status(ctx, check, entry["isolate"] + "-recon-before", instance)
+    if before is None:
+        return None
+    subject = ReconcileSubject(entry, instance, original, definition, before)
+    check.check(subject.desired == subject.persisted and DIGEST_SPELLING.match(str(subject.desired or "")) is not None,
+                f"{subject.name}: before any change the desired and persisted definition digests are one canonical "
+                f"value (desired {subject.desired!r}, persisted {subject.persisted!r})")
+    check.check(before.get("definition_drift") is False,
+                f"{subject.name}: before any change definition_drift is False (observed "
+                f"{before.get('definition_drift')!r})")
+    check.check(bool(subject.identity["environments"]) and
+                subject.identity["environments"][0]["environment_id"] == subject.entry["environment_id"],
+                f"{subject.name}: the Environment pre-sleep recorded is the one addressed here "
+                f"({subject.entry['environment_id']!r} observed "
+                f"{(subject.identity['environments'] or [{}])[0].get('environment_id')!r})")
+    return subject
+
+
+def desired_digest_responds(ctx: CheckContext, check: SubCheck, subject: "ReconcileSubject", changed: dict):
+    """Write `changed` and report the desired digest the CLI then publishes.
+
+    Returns `(status, responded)`. A runtime whose desired digest does not move
+    when a declared field moves has no desired-input identity for planning to
+    consume, and every clause after it would be asserted against a value the
+    definition cannot influence -- so the caller reports that by name instead of
+    continuing.
+    """
+    subject.write(definition_bytes(changed))
+    after = reconcile_status(ctx, check, subject.name + "-recon-changed", subject.instance)
+    if after is None:
+        return None, False
+    desired = after.get("desired_definition_digest")
+    return after, bool(desired) and desired != subject.desired
+
+
+def reconcile_unimplemented(check: SubCheck, clause: str, quote: str) -> None:
+    """Name the sub-document clause with no subject, in the runtime's own words."""
+    check.not_implemented = (clause + " The runtime's own answer to the definition change this sub-check made "
+                             "was: " + (quote or "<no structured refusal and no reconcile: the CLI said nothing "
+                                                 "about the changed definition>")[:600])
+
+
+def _reconcile_generation(identity) -> object:
+    return ((identity or {}).get("environments") or [{}])[0].get("lifecycle_generation")
+
+
+def _reconcile_without_generation(identity):
+    """One identity value with the lifecycle counter removed, and nothing else."""
+    stripped = copy.deepcopy(identity) if identity is not None else None
+    for environment in (stripped or {}).get("environments") or []:
+        environment.pop("lifecycle_generation", None)
+    return stripped
+
+
+def _reconcile_restored(ctx: CheckContext, check: SubCheck, subject: "ReconcileSubject") -> None:
+    """Put the definition back and prove pre-sleep's record still describes reality.
+
+    Post-wake compares Environment id, name, `lifecycle_generation`, every
+    Machine id/incarnation and the persisted definition digest against the record
+    `establish_recovery_environments` wrote before the checkpoint. If anything
+    here moved them, that has to be said in this sub-check rather than left for
+    criterion 10 to fail over a change that belongs to criterion 22.
+
+    A runtime that ACCEPTS the definition change is still activated under it once
+    the file is put back, so the file alone is not a restore: it is reconciled
+    back, which legitimately consumes lifecycle generations. Only that counter is
+    refreshed in pre-sleep's record, and only after the reconcile back has been
+    asserted -- every identity post-wake reads, and the digest, must come back on
+    their own.
+    """
+    subject.restore()
+    restored = reconcile_status(ctx, check, subject.name + "-recon-restored", subject.instance)
+    reconverged = False
+    if restored is not None and restored.get("definition_drift") is True:
+        reconverged = True
+        again = ctx.run(check, subject.name + "-recon-reconverge", ["--json", "up"], cwd=subject.project,
+                        env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        check.check(again.exit_code == 0,
+                    f"{subject.name}: this runtime accepted the change, so the Environment is reconciled back to "
+                    f"the definition pre-sleep recorded (exit {again.exit_code}, expected 0)")
+        restored = reconcile_status(ctx, check, subject.name + "-recon-reconverged", subject.instance)
+    identity = reconcile_identity(restored) if restored is not None else None
+    comparable = (_reconcile_without_generation(identity), _reconcile_without_generation(subject.identity))
+    check.check(comparable[0] == comparable[1],
+                f"{subject.name}: pre-sleep's recorded identity is byte-identical after this sub-check "
+                f"(persisted digest {subject.persisted!r} observed "
+                f"{(restored or {}).get('persisted_definition_digest')!r})"
+                if comparable[0] == comparable[1] else
+                f"{subject.name}: this sub-check changed pre-sleep's recorded identity: "
+                f"{json.dumps(comparable[1])[:260]} vs {json.dumps(comparable[0])[:260]}")
+    before_generation, after_generation = _reconcile_generation(subject.identity), _reconcile_generation(identity)
+    if reconverged:
+        # Named in the assertions and written back into pre-sleep's record, so
+        # post-wake compares against what pre-sleep actually left running rather
+        # than against a counter this sub-check advanced.
+        check.check(isinstance(after_generation, int) and isinstance(before_generation, int)
+                    and after_generation > before_generation,
+                    f"{subject.name}: reconciling back advanced the lifecycle generation "
+                    f"({before_generation!r} -> {after_generation!r}); pre-sleep's record is updated to the "
+                    f"generation it is leaving running")
+        subject.entry["lifecycle_generation"] = after_generation
+    else:
+        check.check(after_generation == before_generation,
+                    f"{subject.name}: the lifecycle generation pre-sleep recorded is unchanged "
+                    f"({before_generation!r} observed {after_generation!r})")
+    check.check(restored is not None and restored.get("desired_definition_digest") == subject.desired
+                and restored.get("definition_drift") is False,
+                f"{subject.name}: the definition file is restored byte-identical (desired {subject.desired!r} "
+                f"observed {(restored or {}).get('desired_definition_digest')!r}, drift "
+                f"{(restored or {}).get('definition_drift')!r})")
+
+
+def check_definition_change_plan_determinism(ctx: CheckContext, top: str, established) -> SubCheck:
+    """One mutable-field change, applied twice, producing the same plan twice.
+
+    Criterion 22's first clause. The two plans are compared as values, not as two
+    exit codes: `reconcile_plan` keeps every record `vz --json up` emitted and the
+    structured refusal it ended with, and removes only the fields that name the
+    invocation. Stable identity is read before and after and compared field by
+    field, because "reconciles without changing its stable identity" is a claim
+    about IDs and not about a state word.
+    """
+    check = SubCheck(top, "definition_change_plan_determinism")
+    subject = reconcile_subject(ctx, check, established, 0)
+    if subject is None:
+        return check.finish()
+    try:
+        changed = mutable_change(subject.definition)
+        original_memory = (subject.definition["environment"]["machines"][0].get("resources") or {}).get("memory_mb")
+        if not check.check(original_memory != MUTATED_MEMORY_MB,
+                           f"{subject.name}: {MUTABLE_FIELD} changes value ({original_memory!r} -> "
+                           f"{MUTATED_MEMORY_MB!r})"):
+            return check.finish()
+        after_write, responded = desired_digest_responds(ctx, check, subject, changed)
+        if after_write is None:
+            return check.finish()
+        desired_now = after_write.get("desired_definition_digest")
+        if not responded:
+            check.check(False, f"{subject.name}: the desired definition digest must follow {MUTABLE_FIELD} "
+                               f"(before {subject.desired!r}, after the change {desired_now!r})")
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_INPUTS_DOC} 'Snapshot model' requires the desired inputs a "
+                                    f"reconcile plans from to be an identity that changes when the inputs change; "
+                                    f"this runtime published the same desired_definition_digest {desired_now!r} "
+                                    f"before and after {MUTABLE_FIELD} changed, so there is no desired-input "
+                                    f"identity for planning to consume and no plan to compare.", "")
+            return check.finish()
+        check.check(True, f"{subject.name}: the desired definition digest followed {MUTABLE_FIELD} "
+                          f"({subject.desired} -> {desired_now})")
+        check.check(after_write.get("persisted_definition_digest") == subject.persisted,
+                    f"{subject.name}: reading the changed definition did not persist it "
+                    f"({subject.persisted!r} observed {after_write.get('persisted_definition_digest')!r})")
+        check.check(after_write.get("definition_drift") is True,
+                    f"{subject.name}: the changed definition is reported as drift (observed "
+                    f"{after_write.get('definition_drift')!r})")
+        first = ctx.run(check, subject.name + "-recon-up-1", ["--json", "up"], cwd=subject.project,
+                        env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        second = ctx.run(check, subject.name + "-recon-up-2", ["--json", "up"], cwd=subject.project,
+                         env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        plans = (reconcile_plan(first), reconcile_plan(second))
+        check.check(plans[0] == plans[1],
+                    f"{subject.name}: the same definition change produced the same plan twice (exit "
+                    f"{plans[0]['exit_code']}/{plans[1]['exit_code']}, {len(plans[0]['records'])}/"
+                    f"{len(plans[1]['records'])} records; fields removed by name: {sorted(PLAN_VOLATILE)})"
+                    if plans[0] == plans[1] else
+                    f"{subject.name}: the two plans differ: {json.dumps(plans[0])[:300]} vs "
+                    f"{json.dumps(plans[1])[:300]}")
+        after = reconcile_status(ctx, check, subject.name + "-recon-after-up", subject.instance)
+        if after is None:
+            return check.finish()
+        identity = reconcile_identity(after)
+        observed_environment = (identity["environments"] or [{}])[0]
+        expected_environment = (subject.identity["environments"] or [{}])[0]
+        for field in ("environment_id", "name", "machines", "networks", "network_attachments", "endpoints"):
+            check.check(observed_environment.get(field) == expected_environment.get(field),
+                        f"{subject.name}: the Environment kept its {field} across the reconcile "
+                        f"({json.dumps(expected_environment.get(field))[:160]} observed "
+                        f"{json.dumps(observed_environment.get(field))[:160]})")
+        if first.exit_code == 0 and second.exit_code == 0:
+            check.check(after.get("persisted_definition_digest") == desired_now,
+                        f"{subject.name}: an accepted reconcile persisted the definition it planned from "
+                        f"({desired_now!r} observed {after.get('persisted_definition_digest')!r})")
+            check.check(after.get("definition_drift") is False,
+                        f"{subject.name}: an accepted reconcile converged (definition_drift observed "
+                        f"{after.get('definition_drift')!r})")
+        else:
+            check.check(after.get("persisted_definition_digest") == subject.persisted,
+                        f"{subject.name}: a refused reconcile persisted nothing ({subject.persisted!r} observed "
+                        f"{after.get('persisted_definition_digest')!r})")
+            check.check(observed_environment.get("lifecycle_generation") ==
+                        expected_environment.get("lifecycle_generation"),
+                        f"{subject.name}: a refused reconcile consumed no lifecycle generation "
+                        f"({expected_environment.get('lifecycle_generation')!r} observed "
+                        f"{observed_environment.get('lifecycle_generation')!r})")
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_INPUTS_DOC} 'Capture and atomic admission' requires "
+                                    f"`admit_reconcile_round` to derive a plan from the changed inputs and return "
+                                    f"`BatchCreated`, and {RECONCILE_FENCING_DOC} 'Action schema v3' requires that "
+                                    f"plan's create/recreate/remove actions to carry a `ReplicaPrecondition`. This "
+                                    f"runtime derives no plan at all from a changed mutable field: it refuses the "
+                                    f"Up before admission, so the deterministic-plan and reconcile clauses have "
+                                    f"no subject and only the identity-preservation half is proved.",
+                                    reconcile_refusal_text(reconcile_error(first)))
+    finally:
+        _reconcile_restored(ctx, check, subject)
+    return check.finish()
+
+
+def check_immutable_change_refused_before_mutation(ctx: CheckContext, top: str, established) -> SubCheck:
+    """An immutable-field change is refused, and nothing moved while it was.
+
+    Criterion 22's second clause has two halves and both are proved. "Fails" is
+    the structured envelope: exactly one machine-readable code, a nonempty
+    explanation, and the exact persisted and requested digests the refusal was
+    decided against -- which is what makes it a decision at the fencing boundary
+    rather than an incidental error. "Before mutation" is the isolate's
+    state-root inventory taken immediately either side of the refused Up, plus
+    every identity `vz status --json` publishes.
+    """
+    check = SubCheck(top, "immutable_change_refused_before_mutation")
+    subject = reconcile_subject(ctx, check, established, 1)
+    if subject is None:
+        return check.finish()
+    try:
+        changed = immutable_change(subject.definition)
+        original_digest = subject.definition["environment"]["machines"][0]["target"].get("digest")
+        if not check.check(original_digest != FOREIGN_ARTIFACT_DIGEST,
+                           f"{subject.name}: {IMMUTABLE_FIELD} changes value ({original_digest!r} -> "
+                           f"{FOREIGN_ARTIFACT_DIGEST!r})"):
+            return check.finish()
+        after_write, responded = desired_digest_responds(ctx, check, subject, changed)
+        if after_write is None:
+            return check.finish()
+        desired_now = after_write.get("desired_definition_digest")
+        if not responded:
+            check.check(False, f"{subject.name}: the desired definition digest must follow {IMMUTABLE_FIELD} "
+                               f"(before {subject.desired!r}, after the change {desired_now!r})")
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_INPUTS_DOC} 'Snapshot model' requires a desired-input identity "
+                                    f"that changes when the inputs change; this runtime published the same "
+                                    f"desired_definition_digest {desired_now!r} before and after "
+                                    f"{IMMUTABLE_FIELD} changed, so an immutable change is indistinguishable from "
+                                    f"no change and there is nothing for it to refuse.", "")
+            return check.finish()
+        before_rows, path = write_inventory(ctx.evidence_dir, f"recon-{subject.name}-state-before",
+                                            subject.instance["state"])
+        check.evidence.append(path)
+        refused = ctx.run(check, subject.name + "-recon-immutable-up", ["--json", "up"], cwd=subject.project,
+                          env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        after_rows, path = write_inventory(ctx.evidence_dir, f"recon-{subject.name}-state-after",
+                                           subject.instance["state"])
+        check.evidence.append(path)
+        check.check(refused.exit_code not in (0, None),
+                    f"{subject.name}: the immutable change to {IMMUTABLE_FIELD} was refused (exit "
+                    f"{refused.exit_code}, expected non-zero)")
+        error = reconcile_error(refused)
+        code = (error or {}).get("code")
+        check.check(isinstance(code, str) and ERROR_CODE_SPELLING.match(code) is not None,
+                    f"{subject.name}: the refusal carries a machine-readable code (observed {code!r})")
+        check.check(isinstance((error or {}).get("message"), str) and str((error or {}).get("message")).strip() != "",
+                    f"{subject.name}: the refusal carries a structured explanation (observed "
+                    f"{str((error or {}).get('message'))[:160]!r})")
+        spoken = reconcile_refusal_text(error)
+        check.check(str(subject.persisted) in spoken and str(desired_now) in spoken,
+                    f"{subject.name}: the refusal names the exact precondition it was decided against -- persisted "
+                    f"digest {subject.persisted!r} against requested digest {desired_now!r} -- rather than failing "
+                    f"incidentally (refusal: {spoken[:300]!r})")
+        diff = inventory_diff(before_rows, after_rows)
+        check.check(not diff,
+                    f"{subject.name}: the isolate state root is byte-identical across the refused Up "
+                    f"({len(before_rows)} entries)" if not diff else
+                    f"{subject.name}: the refused Up mutated the state root: " + "; ".join(diff[:6]))
+        after = reconcile_status(ctx, check, subject.name + "-recon-immutable-after", subject.instance)
+        if after is None:
+            return check.finish()
+        identity = reconcile_identity(after)
+        check.check(identity == subject.identity,
+                    f"{subject.name}: every published identity is byte-identical after the refusal"
+                    if identity == subject.identity else
+                    f"{subject.name}: identities changed despite the refusal: "
+                    f"{json.dumps(subject.identity)[:260]} vs {json.dumps(identity)[:260]}")
+        check.check(after.get("persisted_definition_digest") == subject.persisted,
+                    f"{subject.name}: the persisted definition digest is unchanged ({subject.persisted!r} observed "
+                    f"{after.get('persisted_definition_digest')!r})")
+        # The criterion distinguishes mutable changes from immutable ones. A
+        # runtime that answers both with one code has classified nothing, and
+        # that is a finding about the runtime rather than an assertion it passes.
+        subject.write(definition_bytes(mutable_change(subject.definition)))
+        mutable_receipt = ctx.run(check, subject.name + "-recon-mutable-up", ["--json", "up"], cwd=subject.project,
+                                  env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        mutable_code = (reconcile_error(mutable_receipt) or {}).get("code")
+        classified = mutable_receipt.exit_code == 0 or mutable_code != code
+        check.check(classified,
+                    f"{subject.name}: the immutable change is classified apart from the mutable one (immutable "
+                    f"{code!r} exit {refused.exit_code}, mutable {mutable_code!r} exit "
+                    f"{mutable_receipt.exit_code})")
+        if not classified:
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_INPUTS_DOC} 'Planning and execution' requires the planner to "
+                                    f"decide per change what converges and what must be recreated, and criterion "
+                                    f"22 requires immutable/unsafe changes to fail with a structured explanation "
+                                    f"of what makes them unsafe. This runtime answers every definition change -- "
+                                    f"mutable {MUTABLE_FIELD} and immutable {IMMUTABLE_FIELD} alike -- with the "
+                                    f"same {code!r} refusal, so what is proved above is that a changed definition "
+                                    f"fails before mutation, not that the change was classified.",
+                                    reconcile_refusal_text(error))
+    finally:
+        _reconcile_restored(ctx, check, subject)
+    return check.finish()
+
+
+def check_concurrent_stale_reconcile_fail_closed(ctx: CheckContext, top: str, established) -> SubCheck:
+    """Concurrent, interrupted and stale reconciles converge or fail closed.
+
+    Criterion 22's third clause names three negative properties and each is
+    asserted here as a value: no mixed-version topology (every Machine still on
+    the incarnation generation pre-sleep recorded FOR IT -- "they all agree"
+    would be vacuous with one Machine -- plus one lifecycle generation and one
+    definition digest shared by the project and the Environment), no cross-owner
+    adoption
+    (no resource id appears under two owners, across all three of pre-sleep's
+    mutually foreign Environments), and no orphaned resources (the owned-resource
+    map compared before against after, scoped to what the plan itself would have
+    created -- a forked Machine is a runtime object reconcile must leave alone,
+    so nothing here requires an undeclared Machine to disappear).
+    """
+    check = SubCheck(top, "concurrent_stale_reconcile_fail_closed")
+    subject = reconcile_subject(ctx, check, established, 2)
+    if subject is None:
+        return check.finish()
+    siblings, entries = [], (established or {}).get("environments") or []
+    for index in (0, 1):
+        if len(entries) > index:
+            try:
+                siblings.append((entries[index]["isolate"], ctx.reattach(entries[index]["isolate"])))
+            except ReattachError as error:
+                check.fail(str(error))
+                return check.finish()
+    try:
+        changed = mutable_change(subject.definition)
+        after_write, responded = desired_digest_responds(ctx, check, subject, changed)
+        if after_write is None:
+            return check.finish()
+        desired_now = after_write.get("desired_definition_digest")
+        if not responded:
+            check.check(False, f"{subject.name}: the desired definition digest must follow {MUTABLE_FIELD} "
+                               f"(before {subject.desired!r}, after the change {desired_now!r})")
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_FENCING_DOC} 'Authoritative planning snapshot' requires two "
+                                    f"controllers to plan against one consistent snapshot of the same desired "
+                                    f"inputs; this runtime published the same desired_definition_digest "
+                                    f"{desired_now!r} before and after the change, so concurrent updates have no "
+                                    f"competing version to be fenced against.", "")
+            return check.finish()
+        token = uuid.uuid4().hex[:12]
+        identities = ((f"req-recon-{token}-a", f"recon-{token}-a"), (f"req-recon-{token}-b", f"recon-{token}-b"))
+        held = ctx.start(check, subject.name + "-recon-concurrent-a",
+                         ["--json", "up", "--request-id", identities[0][0], "--idempotency-key", identities[0][1]],
+                         cwd=subject.project, env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        second = ctx.run(check, subject.name + "-recon-concurrent-b",
+                         ["--json", "up", "--request-id", identities[1][0], "--idempotency-key", identities[1][1]],
+                         cwd=subject.project, env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        # Releasing signals the held invocation. Whether it had already answered
+        # or was still mid-flight, this is also the criterion's "interrupted
+        # reconciliation"; the assertions below are about the state either
+        # outcome leaves behind.
+        first = ctx.release(check, held)
+        codes = (first.exit_code, second.exit_code)
+        converged = codes == (0, 0)
+        closed = all(code is not None and code > 0 for code in codes)
+        interrupted = [code for code in codes if code is not None and code < 0]
+        check.check(converged or closed,
+                    f"{subject.name}: the two concurrent Ups both converged or both failed closed (exit codes "
+                    f"{list(codes)}; signalled {interrupted})")
+        after = reconcile_status(ctx, check, subject.name + "-recon-concurrent-after", subject.instance)
+        if after is None:
+            return check.finish()
+        identity = reconcile_identity(after)
+        environments = identity["environments"]
+        if not check.check(len(environments) == 1,
+                           f"{subject.name}: exactly one Environment after the concurrent pair (observed "
+                           f"{[row.get('environment_id') for row in environments]})"):
+            return check.finish()
+        environment = environments[0]
+        expected = subject.identity["environments"][0]
+        # No mixed-version topology. With one Machine "they all agree" would be
+        # vacuous, so each Machine is compared against the incarnation generation
+        # pre-sleep recorded for it by name, and the set is reported beside it.
+        recorded = {machine["name"]: machine["incarnation_generation"] for machine in subject.entry["machines"]}
+        observed = {machine["name"]: machine["incarnation_generation"] for machine in environment["machines"]}
+        check.check(observed == recorded,
+                    f"{subject.name}: no mixed-version topology -- every Machine still reports the incarnation "
+                    f"generation pre-sleep recorded ({recorded} observed {observed}; distinct values "
+                    f"{sorted(set(observed.values()), key=str)})")
+        if converged:
+            # Two accepted reconciles legitimately consume generations; what may
+            # not happen is the pair leaving two versions behind.
+            check.check(isinstance(environment["lifecycle_generation"], int)
+                        and isinstance(expected["lifecycle_generation"], int)
+                        and environment["lifecycle_generation"] > expected["lifecycle_generation"],
+                        f"{subject.name}: the accepted pair advanced one lifecycle counter monotonically "
+                        f"({expected['lifecycle_generation']!r} -> {environment['lifecycle_generation']!r})")
+            check.check(environment["definition_digest"] == after.get("persisted_definition_digest") == desired_now,
+                        f"{subject.name}: one definition version across the project and the Environment, and it is "
+                        f"the one the pair planned from (Environment {environment['definition_digest']!r}, project "
+                        f"{after.get('persisted_definition_digest')!r}, planned {desired_now!r})")
+        else:
+            check.check(environment["lifecycle_generation"] == expected["lifecycle_generation"],
+                        f"{subject.name}: the refused pair consumed no lifecycle generation "
+                        f"({expected['lifecycle_generation']!r} observed "
+                        f"{environment['lifecycle_generation']!r})")
+            check.check(environment["definition_digest"] == expected["definition_digest"] ==
+                        after.get("persisted_definition_digest"),
+                        f"{subject.name}: one definition version across the project and the Environment "
+                        f"(Environment {environment['definition_digest']!r}, project "
+                        f"{after.get('persisted_definition_digest')!r}, expected "
+                        f"{expected['definition_digest']!r})")
+        owned_after = reconcile_owned_resources(after)
+        changed_owners = sorted(f"{key}: {subject.owned.get(key)!r} -> {owned_after.get(key)!r}"
+                                for key in set(subject.owned) | set(owned_after)
+                                if subject.owned.get(key) != owned_after.get(key))
+        check.check(not changed_owners,
+                    f"{subject.name}: every owned resource kept its owner ({len(subject.owned)} resources)"
+                    if not changed_owners else
+                    f"{subject.name}: ownership changed: " + "; ".join(changed_owners[:6]))
+        adopted = []
+        for sibling_name, sibling in siblings:
+            payload = reconcile_status(ctx, check, sibling_name + "-recon-foreign", sibling)
+            if payload is None:
+                return check.finish()
+            foreign = reconcile_owned_resources(payload)
+            adopted.extend(f"{key} is claimed by both {sibling_name} ({foreign[key]!r}) and {subject.name} "
+                           f"({owned_after[key]!r})" for key in sorted(set(foreign) & set(owned_after)))
+        check.check(not adopted,
+                    f"{subject.name}: no cross-owner adoption -- none of the {len(siblings)} foreign "
+                    f"Environment(s) shares a resource id with this one"
+                    if not adopted else f"{subject.name}: cross-owner adoption: " + "; ".join(adopted[:6]))
+        terminal = [record for receipt in (first, second) for record in reconcile_plan(receipt)["records"]
+                    if isinstance(record, dict) and (record.get("progress") or {}).get("completion")]
+        check.check(set(owned_after) == set(subject.owned),
+                    f"{subject.name}: no orphaned resources -- the plan created and removed nothing and no owned "
+                    f"resource appeared or vanished ({len(subject.owned)} before, {len(owned_after)} after; "
+                    f"{len(terminal)} terminal plan record(s))"
+                    if set(owned_after) == set(subject.owned) else
+                    f"{subject.name}: orphaned/extra resources: appeared "
+                    f"{sorted(set(owned_after) - set(subject.owned))[:6]}, vanished "
+                    f"{sorted(set(subject.owned) - set(owned_after))[:6]}")
+        # The stale client: the exact request identity of the second Up, replayed
+        # against a definition that has moved again since it was issued.
+        subject.write(definition_bytes(immutable_change(changed)))
+        stale = ctx.run(check, subject.name + "-recon-stale-replay",
+                        ["--json", "up", "--request-id", identities[1][0], "--idempotency-key", identities[1][1]],
+                        cwd=subject.project, env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        stale_code = (reconcile_error(stale) or {}).get("code")
+        check.check(stale.exit_code not in (0, None),
+                    f"{subject.name}: a stale client replaying request {identities[1][0]!r} against a definition "
+                    f"that moved again is refused (exit {stale.exit_code}, expected non-zero)")
+        check.check(isinstance(stale_code, str) and ERROR_CODE_SPELLING.match(stale_code) is not None,
+                    f"{subject.name}: the stale replay carries a machine-readable code (observed {stale_code!r})")
+        stale_after = reconcile_status(ctx, check, subject.name + "-recon-stale-after", subject.instance)
+        if stale_after is None:
+            return check.finish()
+        # Against the state the concurrent pair left, not against the state
+        # before it: an accepted pair legitimately moved the digest and the
+        # counter, and what the stale replay may not do is move them again.
+        stale_identity = reconcile_identity(stale_after)
+        check.check(stale_identity == identity,
+                    f"{subject.name}: the stale replay changed no identity and consumed no generation "
+                    f"(lifecycle generation {_reconcile_generation(identity)!r})"
+                    if stale_identity == identity else
+                    f"{subject.name}: the stale replay changed state: {json.dumps(identity)[:260]} vs "
+                    f"{json.dumps(stale_identity)[:260]}")
+        if not converged:
+            reconcile_unimplemented(check,
+                                    f"{RECONCILE_FENCING_DOC} 'Durable claim and exact StateStore CAS' requires "
+                                    f"the loser of a concurrent claim to be refused by `start_reconcile_batch` "
+                                    f"after the winner has taken the exact `started` audit row, and 'Strict "
+                                    f"mutation ordering' requires an interrupted reconcile to resume that same "
+                                    f"claim. Both need an admitted reconcile to fence. This runtime refuses every "
+                                    f"definition change before admission, so no claim is ever taken: what is "
+                                    f"proved above is that concurrent, interrupted and stale reconciles all fail "
+                                    f"closed with no mixed-version topology, no cross-owner adoption and no "
+                                    f"orphaned resources -- not that the exact-generation claim contract holds.",
+                                    reconcile_refusal_text(reconcile_error(second)))
+    finally:
+        _reconcile_restored(ctx, check, subject)
+    return check.finish()
+
+
+def check_effective_input_snapshot_identity(ctx: CheckContext, top: str, established) -> SubCheck:
+    """One canonical desired-input identity, shared by planning and activation.
+
+    Criterion 22's last clause, reduced to what the 0.4 public surface can carry.
+    `reconcile-effective-inputs.md` requires one immutable operation-owned
+    snapshot whose canonical digest binds planning, the persisted session, the
+    audit and execution, so activation cannot consume different bytes from the
+    ones planning recorded. The public equivalent of that digest is the
+    definition digest, and it is asserted exactly: the digest the project
+    persisted and the digest the Environment was activated under must be one
+    value; it must be canonical over the definition VALUE rather than over its
+    bytes; and it must move when the value moves. The per-service
+    `vz-effective-service-input-v1` digests, the `vz-reconcile-input-manifest-v1`
+    manifest and the tamper rules over staged secret/image blobs have no subject
+    on this surface, and their absence is asserted rather than assumed.
+    """
+    check = SubCheck(top, "effective_input_snapshot_identity")
+    subject = reconcile_subject(ctx, check, established, 0)
+    if subject is None:
+        return check.finish()
+    try:
+        environments = subject.identity["environments"]
+        if not check.check(len(environments) == 1,
+                           f"{subject.name}: one Environment to read the activation digest from (observed "
+                           f"{len(environments)})"):
+            return check.finish()
+        activation = environments[0]["definition_digest"]
+        check.check(activation == subject.persisted == subject.desired,
+                    f"{subject.name}: planning and activation name one desired-input identity (desired "
+                    f"{subject.desired!r}, persisted {subject.persisted!r}, Environment {activation!r})")
+        check.check(DIGEST_SPELLING.match(str(activation or "")) is not None,
+                    f"{subject.name}: that identity is a canonical sha256 digest (observed {activation!r})")
+        # Canonical over the value, not over the file: the same definition
+        # serialized differently must digest to the same thing.
+        subject.write(reordered_bytes(subject.definition))
+        reordered = reconcile_status(ctx, check, subject.name + "-recon-reordered", subject.instance)
+        if reordered is None:
+            return check.finish()
+        check.check(reordered.get("desired_definition_digest") == subject.desired,
+                    f"{subject.name}: reserializing the same definition does not change its digest "
+                    f"({subject.desired!r} observed {reordered.get('desired_definition_digest')!r})")
+        check.check(reordered.get("definition_drift") is False,
+                    f"{subject.name}: reserializing the same definition is not drift (observed "
+                    f"{reordered.get('definition_drift')!r})")
+        # And it must move when the value moves.
+        subject.write(definition_bytes(mutable_change(subject.definition)))
+        moved = reconcile_status(ctx, check, subject.name + "-recon-moved", subject.instance)
+        if moved is None:
+            return check.finish()
+        check.check(moved.get("desired_definition_digest") not in (None, "", subject.desired),
+                    f"{subject.name}: changing {MUTABLE_FIELD} changes the desired-input digest "
+                    f"({subject.desired!r} -> {moved.get('desired_definition_digest')!r})")
+        check.check(moved.get("persisted_definition_digest") == subject.persisted,
+                    f"{subject.name}: activation still names the digest it was activated under "
+                    f"({subject.persisted!r} observed {moved.get('persisted_definition_digest')!r})")
+        refused = ctx.run(check, subject.name + "-recon-inputs-up", ["--json", "up"], cwd=subject.project,
+                          env=subject.env, timeout=RECONCILE_UP_TIMEOUT)
+        # Everything the public surface said, searched for a snapshot identity.
+        spoken = json.dumps([moved, reconcile_plan(refused)])
+        published = sorted(key for key in EFFECTIVE_INPUT_KEYS if f'"{key}"' in spoken)
+        check.check(not published,
+                    f"{subject.name}: the public surface publishes no effective-input snapshot identity, so this "
+                    f"contract's own digests are named as absent rather than assumed (searched for "
+                    f"{list(EFFECTIVE_INPUT_KEYS)})"
+                    if not published else
+                    f"{subject.name}: the public surface publishes {published}; this sub-check does not yet assert "
+                    f"the snapshot contract those keys carry")
+        reconcile_unimplemented(check,
+                                f"{RECONCILE_INPUTS_DOC} 'Snapshot model' requires an immutable operation-owned "
+                                f"`ReconcileInputSnapshot` with a `vz-reconcile-input-manifest-v1` manifest digest "
+                                f"and per-service `vz-effective-service-input-v1` effective digests over each "
+                                f"service's referenced networks, volumes, secret bytes and resolved image content; "
+                                f"'Recovery, retention, and cleanup' requires a tampered or reordered manifest to "
+                                f"be a state conflict before mutation. The 0.4 ProjectDefinition "
+                                f"({PROJECT_DEFINITION_SCHEMA}) declares no services, secrets or volumes and the "
+                                f"public CLI has no scoped service create/recreate/remove, so those digests and "
+                                f"the tamper rules over their staged blobs have no subject here: none of "
+                                f"{list(EFFECTIVE_INPUT_KEYS)} appears on any public interface. What is proved "
+                                f"above is the definition-level identity -- one canonical digest, shared by "
+                                f"planning and activation, canonical over the value and responsive to it.",
+                                reconcile_refusal_text(reconcile_error(refused)))
+    finally:
+        _reconcile_restored(ctx, check, subject)
+    return check.finish()
+
+
+def check_definition_reconciliation_fencing(ctx: CheckContext, top: str, established) -> list:
+    """Criterion 22's four sub-checks, over pre-sleep's three Environments.
+
+    Each addresses one isolate and restores it before returning, so the order
+    below is the order their evidence is recorded in and not a dependency.
+    """
+    return [check_definition_change_plan_determinism(ctx, top, established),
+            check_immutable_change_refused_before_mutation(ctx, top, established),
+            check_concurrent_stale_reconcile_fail_closed(ctx, top, established),
+            check_effective_input_snapshot_identity(ctx, top, established)]
