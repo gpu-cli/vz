@@ -10,11 +10,14 @@ still moves when anything about it moves.
 """
 import hashlib
 import os
+import stat
+import types
 from pathlib import Path
 import tempfile
 import time
 import unittest
 
+import developer_environment_checks as checks
 import developer_environment_recorder as subject
 from vz04_common import GateError
 
@@ -209,6 +212,69 @@ class StopDaemonsTests(unittest.TestCase):
                 subject.daemon_fingerprint, subject._stop_one_daemon = original
             self.assertEqual(sorted(calls), ["mix", "net-a"])
             self.assertEqual(len(stopped), 2)
+
+
+class LegacyArtifactStagingTests(unittest.TestCase):
+    """Criterion 19 EXECUTES the pinned v0.3.20 daemon, so it must be executable.
+
+    The staging instruction the check prints is a plain `curl -o`, which writes
+    0644. Executing the operator's own file therefore raised PermissionError
+    and crashed the entire lane after every other sub-check had already run --
+    following the printed instruction exactly was the way to reproduce it.
+    """
+
+    class Ctx:
+        def __init__(self, repo_root, tmp):
+            self.repo_root = repo_root
+            self.state = types.SimpleNamespace(tmp=tmp)
+
+    def stage(self, tmp, mode):
+        repo = Path(tmp) / "repo"
+        (repo / ".cache" / "vz-0.4-legacy-v0.3.20").mkdir(parents=True)
+        artifact = repo / checks.LEGACY_ARTIFACT_CACHE
+        artifact.write_bytes(b"#!/bin/sh\nexit 0\n")
+        artifact.chmod(mode)
+        return repo, artifact, hashlib.sha256(artifact.read_bytes()).hexdigest()
+
+    def test_a_non_executable_staged_artifact_still_yields_a_runnable_copy(self):
+        with tempfile.TemporaryDirectory(prefix="vz04-legacy-") as tmp:
+            repo, artifact, digest = self.stage(tmp, 0o644)
+            scratch = Path(tmp) / "scratch"
+            check = checks.SubCheck("gate.migration.install_upgrade_rollback_uninstall", "x")
+            runnable = checks._legacy_artifact(self.Ctx(repo, scratch), check, digest, "https://example.invalid/x")
+            self.assertIsNotNone(runnable)
+            self.assertNotEqual(runnable, artifact, "the operator's cache file must not be what gets executed")
+            self.assertTrue(os.access(runnable, os.X_OK), "the copy the lane runs must be executable")
+            # The cache is not mutated: it is the operator's file, and the check
+            # may run against a directory it has no business writing to.
+            self.assertEqual(stat.S_IMODE(artifact.stat().st_mode), 0o644)
+            self.assertEqual(check.status, "PASS")
+
+    def test_a_staged_artifact_with_the_wrong_digest_is_refused(self):
+        with tempfile.TemporaryDirectory(prefix="vz04-legacy-") as tmp:
+            repo, _artifact, _digest = self.stage(tmp, 0o644)
+            check = checks.SubCheck("gate.migration.install_upgrade_rollback_uninstall", "x")
+            runnable = checks._legacy_artifact(self.Ctx(repo, Path(tmp) / "scratch"), check, "0" * 64,
+                                               "https://example.invalid/x")
+            self.assertIsNone(runnable)
+            self.assertEqual(check.status, "FAIL")
+
+    def test_an_absent_artifact_reports_not_implemented_naming_the_live_checkout(self):
+        """The instruction must name a path that still exists after the run.
+
+        A frozen lane's own root is deleted when the run ends, so an
+        instruction resolved against it tells the operator to stage the file
+        somewhere that is about to disappear.
+        """
+        with tempfile.TemporaryDirectory(prefix="vz04-legacy-") as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            check = checks.SubCheck("gate.migration.install_upgrade_rollback_uninstall", "x")
+            runnable = checks._legacy_artifact(self.Ctx(repo, Path(tmp) / "scratch"), check, "0" * 64,
+                                               "https://example.invalid/x")
+            self.assertIsNone(runnable)
+            self.assertIsNotNone(check.not_implemented)
+            self.assertIn(str(repo / checks.LEGACY_ARTIFACT_CACHE), check.not_implemented)
 
 
 if __name__ == "__main__":

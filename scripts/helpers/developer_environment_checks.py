@@ -2172,8 +2172,31 @@ def _legacy_artifact(ctx: CheckContext, check: SubCheck, pinned_digest: str, url
         check.fail(f"the staged v0.3.20 daemon at {path} is not the pinned artifact "
                    f"(pinned {pinned_digest}, staged {observed})")
         return None
-    check.ok(f"the pinned v0.3.20 daemon is staged at {path} with the contract's digest {pinned_digest}")
-    return path
+    # This clause EXECUTES the v0.3.20 daemon, and the staging instruction above
+    # is a plain `curl -o`, which writes 0644. Executing the operator's own file
+    # therefore raised PermissionError and crashed the whole lane -- following
+    # the printed instruction exactly was the way to reproduce it. Run an
+    # executable copy in the lane's own scratch instead: the cache is not
+    # mutated, the cache directory need not be writable, and the clause no
+    # longer depends on how the artifact happened to be staged. The digest above
+    # is checked against the ORIGINAL, and the copy is compared to it again so
+    # the thing that runs is the thing that was verified.
+    runnable = ctx.state.tmp / "vz-runtimed-v0.3.20-darwin-arm64"
+    try:
+        ctx.state.tmp.mkdir(mode=0o700, parents=True, exist_ok=True)
+        shutil.copyfile(path, runnable)
+        runnable.chmod(0o700)
+    except OSError as error:
+        check.fail(f"the pinned v0.3.20 daemon at {path} could not be staged as executable in the lane scratch: {error}")
+        return None
+    copied = digest_file(runnable)
+    if copied != pinned_digest:
+        check.fail(f"the executable copy of the v0.3.20 daemon does not match the pinned artifact "
+                   f"(pinned {pinned_digest}, copied {copied})")
+        return None
+    check.ok(f"the pinned v0.3.20 daemon is staged at {path} with the contract's digest {pinned_digest}, "
+             f"and runs from an executable copy at {runnable}")
+    return runnable
 
 
 def check_migration_install_upgrade_rollback_uninstall(ctx: CheckContext, top: str) -> SubCheck:
