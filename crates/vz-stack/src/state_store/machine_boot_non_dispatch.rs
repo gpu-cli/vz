@@ -249,7 +249,20 @@ impl StateStore {
                 .iter()
                 .find(|item| &item.machine_id == machine)
                 .ok_or_else(|| conflict("Machine absent"))?;
-            let fresh = operation.generation == 1
+            // `generation == 1` is how an Environment says "nothing here has ever
+            // been dispatched". A fork breaks that reading without weakening it:
+            // it is minted into an Environment at whatever generation that
+            // Environment has reached, so its first Up is never generation 1,
+            // yet it has provably never been dispatched -- it did not exist in
+            // any earlier generation to be dispatched in.
+            //
+            // The relaxation is deliberately limited to forks rather than
+            // dropped. For a DECLARED Machine the generation term is doing real
+            // work, and a declared Machine that reaches this state inside a live
+            // Environment is a situation this authority should refuse rather
+            // than assume its way past.
+            let never_existed_before = instance.fork.is_some();
+            let fresh = (operation.generation == 1 || never_existed_before)
                 && machine_step.initial_state == MachineState::Creating
                 && instance.incarnation.is_none()
                 && instance.runtime_identity.is_none()
@@ -263,8 +276,19 @@ impl StateStore {
                 })
                 .transpose()?
                 .flatten();
-            let stopped = if let Some(previous) = &predecessor {
-                let previous_step = step(previous, machine)?;
+            let stopped = if let Some((previous, previous_step)) =
+                predecessor.as_ref().and_then(|previous| {
+                    // A Machine the predecessor never held is not a Machine the
+                    // predecessor stopped. A fork is the case that made this
+                    // reachable -- it has no step in any generation before the
+                    // one that minted it -- and treating the absence as an error
+                    // refused its first Up outright.
+                    previous
+                        .machine_steps
+                        .iter()
+                        .find(|step| &step.machine_id == machine)
+                        .map(|step| (previous, step))
+                }) {
                 previous.kind == EnvironmentLifecycleKind::Stop
                     && matches!(
                         previous.status,
