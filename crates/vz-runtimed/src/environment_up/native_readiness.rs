@@ -202,5 +202,61 @@ async fn configure_fabric_ports(
             "native Environment-network port configured"
         );
     }
+    configure_fabric_hosts(activation, lease, metadata).await
+}
+
+/// Give this Machine the Environment's declared endpoint names, and prove they
+/// landed.
+///
+/// One call for the whole Machine rather than one per port, because a Machine
+/// writes one `/etc/hosts` however many networks it holds a port on. It runs
+/// after every address is on its NIC: a name resolving to an address the Machine
+/// cannot yet reach would be a table that is true about the Environment and
+/// false about this guest.
+///
+/// It runs even for a Machine that declares no endpoint, which is what makes it
+/// a statement of the whole table rather than an addition to it. A native
+/// Machine's disk outlives its boot, so an Up whose Environment has since
+/// dropped an endpoint has to remove that name, not merely stop writing it.
+///
+/// This is the last gap between the two backends' guest-side addressing. A Linux
+/// guest is handed the same table on its kernel cmdline as `vz.host.{N}` and
+/// applies it in `linux/initramfs/init` before its agent starts; without this, a
+/// native macOS Machine held a fabric address that its Linux siblings could
+/// reach by a declared name while it could reach none of theirs.
+async fn configure_fabric_hosts(
+    activation: &Arc<MachineRuntimeActivation>,
+    lease: &crate::native_macos::runtime::NativeMacosLease,
+    metadata: &RequestMetadata,
+) -> Result<(), MachineError> {
+    let bad = |e: String| failure(metadata, MachineErrorCode::BackendUnavailable, e);
+    let rendered = crate::native_macos::fabric::configure_fabric_hosts(lease.attachments());
+    let names = lease
+        .attachments()
+        .iter()
+        .map(|declaration| declaration.hosts.len())
+        .sum::<usize>();
+    let started = std::time::Instant::now();
+    let applied = activation
+        .exec(
+            rendered.command.clone(),
+            rendered.args.clone(),
+            Duration::from_secs(30),
+        )
+        .await
+        .map_err(|e| bad(format!("native Environment endpoint names: {e}")))?;
+    if applied.exit_code != 0
+        || applied.stdout != rendered.expected_stdout
+        || !applied.stderr.is_empty()
+    {
+        return Err(bad(format!(
+            "native Machine did not resolve its {names} declared Environment endpoint name(s): {applied:?}"
+        )));
+    }
+    tracing::info!(
+        names,
+        elapsed_seconds = started.elapsed().as_secs_f64(),
+        "native Environment endpoint names resolved"
+    );
     Ok(())
 }

@@ -1,10 +1,11 @@
-//! Guest-side addressing for a native macOS Machine's Environment-network ports.
+//! Guest-side addressing and naming for a native macOS Machine's
+//! Environment-network ports.
 //!
 //! A Linux Machine is addressed by `linux/initramfs/init`, which reads
-//! `vz.net.{N}={mac},{ipv4}/{prefix}[,{gw}]` off the kernel cmdline before
-//! anything else in the guest runs. A macOS guest has no cmdline hook: Apple's
-//! macOS boot loader takes no arguments this host could write, so the same
-//! information has to reach the guest some other way.
+//! `vz.net.{N}={mac},{ipv4}/{prefix}[,{gw}]` and `vz.host.{N}={ipv4},{name}` off
+//! the kernel cmdline before anything else in the guest runs. A macOS guest has
+//! no cmdline hook: Apple's macOS boot loader takes no arguments this host could
+//! write, so the same information has to reach the guest some other way.
 //!
 //! It reaches it over the vsock channel the guest agent already serves, and it
 //! is applied by the agent, which runs as a root LaunchDaemon
@@ -17,7 +18,10 @@
 //! server on a fabric, by design (`environment_switch::plan`: "Addresses are
 //! derived, never leased"), because a Machine that stops and comes back must
 //! present the address its switch already expects. This module introduces no
-//! second source of addresses; it only applies the one the fabric plan derived.
+//! second source of addresses or names; it only applies the ones the fabric plan
+//! derived. A private network's names are a static table for the same reason:
+//! nothing can be authoritative about an address that never changes while the
+//! Machine lives.
 //!
 //! The interface is found by MAC and never by name or index. Interface
 //! enumeration order inside a guest is not guaranteed, so the host cannot
@@ -79,14 +83,16 @@ $1 == "inet" && $2 == want { print $2, $4; found = 1 }
 END { if (!found) { printf("interface does not hold %s\n", want) > "/dev/stderr"; exit 1 } }
 "#;
 
-/// One `sh -c` program that gives a native macOS guest one fabric port's
-/// address, and the exact stdout a successful run produces.
+/// One `sh -c` program that gives a native macOS guest one piece of its
+/// Environment-network configuration, and the exact stdout a successful run
+/// produces.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct FabricPortConfiguration {
+pub(crate) struct FabricConfiguration {
     pub command: String,
     pub args: Vec<String>,
-    /// What the guest prints when, and only when, the interface holds the
-    /// address afterwards. Compared exactly by the caller.
+    /// What the guest prints when, and only when, the configuration is in place
+    /// afterwards, read back out of the guest rather than echoed from the
+    /// arguments. Compared exactly by the caller.
     pub expected_stdout: String,
 }
 
@@ -109,7 +115,7 @@ fn netmask_hex(prefix: u8) -> String {
 /// six hex bytes, and the address, prefix and gateway are typed rather than
 /// textual. The single quotes are therefore defence in depth rather than the
 /// only thing standing between a declaration and the guest's shell.
-pub(crate) fn configure_fabric_port(declaration: &DeclaredAttachment) -> FabricPortConfiguration {
+pub(crate) fn configure_fabric_port(declaration: &DeclaredAttachment) -> FabricConfiguration {
     // Lowercased here rather than trusted from the caller, for the same reason
     // `DeclaredAttachment::kernel_argument` lowercases: the guest compares this
     // against a rendering the OS controls, and the fold belongs on the side that
@@ -133,10 +139,114 @@ pub(crate) fn configure_fabric_port(declaration: &DeclaredAttachment) -> FabricP
          {route}\
          /sbin/ifconfig \"$iface\" inet | /usr/bin/awk -v want='{ipv4}' '{OBSERVE_ADDRESS_AWK}'\n"
     );
-    FabricPortConfiguration {
+    FabricConfiguration {
         command: "/bin/sh".to_string(),
         args: vec!["-c".to_string(), program],
         expected_stdout: format!("{ipv4} {netmask}\n"),
+    }
+}
+
+/// Where a macOS guest resolves a name from a file, before it asks a resolver.
+const HOSTS_PATH: &str = "/etc/hosts";
+
+/// The two lines that delimit the block this host owns inside `/etc/hosts`.
+///
+/// The Linux side truncates the guest's whole `/etc/hosts` and rewrites it from
+/// the cmdline, which it can afford because the file it is replacing is one this
+/// repository built. A macOS guest's `/etc/hosts` is Apple's, carries entries
+/// the OS expects (`broadcasthost`, an IPv6 loopback) and is not ours to
+/// discard, so the Environment's names live in a delimited block instead: the
+/// block is replaced wholesale on every application and everything outside it is
+/// preserved byte for byte.
+const HOSTS_BEGIN: &str = "# BEGIN vz Environment endpoints (managed; edits are replaced)";
+const HOSTS_END: &str = "# END vz Environment endpoints";
+
+/// Print `/etc/hosts` with this host's block removed, markers included.
+///
+/// Removal is by exact whole-line match on the two markers rather than by
+/// prefix, so a line that merely begins like a marker is data and is preserved.
+/// An unterminated block — a guest that lost power midway through a previous
+/// write — is consumed to end of file rather than left half-present, because the
+/// alternative is a file that grows a new block on every Up while the stale
+/// names above it keep resolving.
+const STRIP_HOSTS_BLOCK_AWK: &str = r#"
+inside { if ($0 == e) inside = 0; next }
+$0 == b { inside = 1; next }
+{ print }
+"#;
+
+/// Print exactly the lines this host's block contains, read back off the file.
+///
+/// The success line is read out of `/etc/hosts` after the write rather than
+/// echoed from the arguments, for the same reason the address is read back off
+/// the interface: a `mv` exiting zero says the file was replaced, and only
+/// reading the names back says the guest resolves them. A block that is missing
+/// entirely prints nothing, which cannot equal a non-empty expectation.
+const OBSERVE_HOSTS_BLOCK_AWK: &str = r#"
+inside { if ($0 == e) exit; print }
+$0 == b { inside = 1 }
+"#;
+
+/// Render the command that gives a native macOS guest its Environment's declared
+/// endpoint names.
+///
+/// This is the macOS half of `linux/initramfs/init`'s `vz.host.{N}` handling. It
+/// resolves names and nothing more: no listener is bound, no port is probed and
+/// nothing waits, so a name landing here is not evidence that anything answers
+/// on it.
+///
+/// The table is the Machine's, not one port's. A Machine writes one `/etc/hosts`
+/// however many networks it holds a port on, so the names of every attachment
+/// are rendered into one block in attachment order — which is the order the
+/// fabric plan minted the ports in, so the file a Machine ends up with depends
+/// only on what is persisted.
+///
+/// A Machine with no declared endpoint still runs this, and gets an empty block.
+/// Skipping it would be wrong rather than merely wasteful: a native Machine's
+/// disk outlives its boot, so an Environment that has since dropped an endpoint
+/// would leave the previous Up's name resolving to an address that now belongs
+/// to nothing.
+///
+/// Every value interpolated here has already been validated into a shape with no
+/// shell metacharacter in it — `DeclaredAttachment` refuses an endpoint name that
+/// is not ASCII letters, digits, `-`, `.` and `_`, and an address is typed rather
+/// than textual — so the single quotes are defence in depth rather than the only
+/// thing standing between a declaration and the guest's shell.
+pub(crate) fn configure_fabric_hosts(attachments: &[DeclaredAttachment]) -> FabricConfiguration {
+    render_fabric_hosts(HOSTS_PATH, attachments)
+}
+
+/// `configure_fabric_hosts` against an arbitrary path, so the program itself can
+/// be run against a file a test owns rather than the host's own `/etc/hosts`.
+fn render_fabric_hosts(path: &str, attachments: &[DeclaredAttachment]) -> FabricConfiguration {
+    let entries: String = attachments
+        .iter()
+        .flat_map(|attachment| attachment.hosts.iter())
+        .map(|host| format!(" '{} {}'", host.address, host.name))
+        .collect();
+    let expected_stdout: String = attachments
+        .iter()
+        .flat_map(|attachment| attachment.hosts.iter())
+        .map(|host| format!("{} {}\n", host.address, host.name))
+        .collect();
+    // `umask` rather than a `chmod`: the replacement file is created here and
+    // `mv` carries its mode, so a guest whose ambient umask hid `/etc/hosts`
+    // from every non-root reader would silently stop resolving anything.
+    // Written beside the file it replaces so the rename is atomic: a reader that
+    // opens `/etc/hosts` at any moment sees the whole previous table or the
+    // whole new one, never a partial write.
+    let program = format!(
+        "set -eu\n\
+         umask 022\n\
+         /usr/bin/awk -v b='{HOSTS_BEGIN}' -v e='{HOSTS_END}' '{STRIP_HOSTS_BLOCK_AWK}' '{path}' > '{path}.vz'\n\
+         printf '%s\\n' '{HOSTS_BEGIN}'{entries} '{HOSTS_END}' >> '{path}.vz'\n\
+         /bin/mv '{path}.vz' '{path}'\n\
+         /usr/bin/awk -v b='{HOSTS_BEGIN}' -v e='{HOSTS_END}' '{OBSERVE_HOSTS_BLOCK_AWK}' '{path}'\n"
+    );
+    FabricConfiguration {
+        command: "/bin/sh".to_string(),
+        args: vec!["-c".to_string(), program],
+        expected_stdout,
     }
 }
 
@@ -145,6 +255,7 @@ mod tests {
     #![allow(clippy::expect_used)]
     use super::*;
     use std::net::Ipv4Addr;
+    use vz_oci_macos::DeclaredHost;
 
     fn declaration() -> DeclaredAttachment {
         DeclaredAttachment {
@@ -319,6 +430,199 @@ mod tests {
         let missing = run_awk(&listing, OBSERVE_ADDRESS_AWK, "10.9.0.5");
         assert_eq!(missing.status.code(), Some(1), "{missing:?}");
         assert!(missing.stdout.is_empty());
+    }
+
+    /// A stock macOS `/etc/hosts`, byte for byte, as the clean template ships it.
+    const APPLE_HOSTS: &str = "##\n\
+                               # Host Database\n\
+                               #\n\
+                               # localhost is used to configure the loopback interface\n\
+                               # when the system is booting.  Do not change this entry.\n\
+                               ##\n\
+                               127.0.0.1\tlocalhost\n\
+                               255.255.255.255\tbroadcasthost\n\
+                               ::1             localhost\n";
+
+    fn attachment_with_hosts(hosts: &[(&str, [u8; 4])]) -> DeclaredAttachment {
+        DeclaredAttachment {
+            hosts: hosts
+                .iter()
+                .map(|(name, address)| DeclaredHost {
+                    name: (*name).to_string(),
+                    address: Ipv4Addr::from(*address),
+                })
+                .collect(),
+            ..declaration()
+        }
+    }
+
+    /// Run a rendered program with `/bin/sh`, the guest's own interpreter.
+    fn run_program(rendered: &FabricConfiguration) -> std::process::Output {
+        std::process::Command::new(&rendered.command)
+            .args(&rendered.args)
+            .output()
+            .expect("this host runs /bin/sh")
+    }
+
+    #[test]
+    fn the_rendered_names_are_the_whole_machine_in_attachment_order() {
+        let rendered = configure_fabric_hosts(&[
+            attachment_with_hosts(&[("api", [10, 9, 0, 5]), ("db", [10, 9, 0, 6])]),
+            attachment_with_hosts(&[("cache", [10, 40, 0, 2])]),
+        ]);
+        assert_eq!(rendered.command, "/bin/sh");
+        // One replacement for the whole Machine, not one per port. A second
+        // write of this file would REPLACE the first port's block rather than
+        // add to it, so a per-port program would leave a Machine on two networks
+        // resolving only the names of whichever port ran last.
+        assert_eq!(rendered.args[1].matches("/bin/mv").count(), 1);
+        assert_eq!(
+            rendered.expected_stdout,
+            "10.9.0.5 api\n10.9.0.6 db\n10.40.0.2 cache\n"
+        );
+        // The path is only ever the guest's own `/etc/hosts`.
+        assert!(
+            rendered.args[1].contains("'/etc/hosts'"),
+            "{}",
+            rendered.args[1]
+        );
+    }
+
+    /// The program really writes the block, and really preserves Apple's file.
+    ///
+    /// Run against a real `/bin/sh` and a real `awk` on a file this test owns,
+    /// because every claim here is about what those two programs do rather than
+    /// about what this module renders: the guest is macOS and so is this host, so
+    /// the interpreter and the awk dialect are the same on both sides.
+    #[test]
+    fn the_program_writes_the_declared_names_and_keeps_apples_own_entries() {
+        let directory = tempfile::tempdir().expect("a temporary guest /etc");
+        let hosts = directory.path().join("hosts");
+        std::fs::write(&hosts, APPLE_HOSTS).expect("seed a stock macOS hosts file");
+        let path = hosts.to_str().expect("a UTF-8 temporary path");
+
+        let rendered = render_fabric_hosts(
+            path,
+            &[attachment_with_hosts(&[
+                ("probe", [10, 88, 215, 209]),
+                ("probe-mac", [10, 88, 215, 193]),
+            ])],
+        );
+        let applied = run_program(&rendered);
+        assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+        assert!(applied.stderr.is_empty(), "{applied:?}");
+        // Judged on the read-back, which is the guest's own file and not this
+        // program's opinion of what it wrote.
+        assert_eq!(
+            String::from_utf8_lossy(&applied.stdout),
+            rendered.expected_stdout
+        );
+        let written = std::fs::read_to_string(&hosts).expect("the guest's hosts file");
+        assert!(
+            written.starts_with(APPLE_HOSTS),
+            "Apple's own entries must survive byte for byte: {written}"
+        );
+        assert!(written.contains("10.88.215.209 probe\n"), "{written}");
+        // The replacement is a rename, so no partial file is left behind for a
+        // later boot to find.
+        assert!(!hosts.with_extension("vz").exists());
+
+        // Applying a CHANGED table replaces the block rather than appending a
+        // second one: the dropped name must stop resolving, and the moved one
+        // must resolve to its new address and only that.
+        let again = render_fabric_hosts(
+            path,
+            &[attachment_with_hosts(&[("probe", [10, 88, 215, 77])])],
+        );
+        let reapplied = run_program(&again);
+        assert_eq!(reapplied.status.code(), Some(0), "{reapplied:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&reapplied.stdout),
+            "10.88.215.77 probe\n"
+        );
+        let rewritten = std::fs::read_to_string(&hosts).expect("the guest's hosts file");
+        assert!(rewritten.starts_with(APPLE_HOSTS), "{rewritten}");
+        assert_eq!(rewritten.matches(HOSTS_BEGIN).count(), 1, "{rewritten}");
+        assert!(!rewritten.contains("probe-mac"), "{rewritten}");
+        assert!(!rewritten.contains("10.88.215.209"), "{rewritten}");
+    }
+
+    /// An Environment that declares no endpoint leaves the guest resolving none.
+    ///
+    /// The block is emptied rather than left alone. A native Machine's disk
+    /// outlives its boot, so a name this host wrote for a previous definition
+    /// would otherwise keep resolving to an address that now belongs to nothing.
+    #[test]
+    fn a_machine_with_no_declared_endpoint_ends_up_with_no_declared_name() {
+        let directory = tempfile::tempdir().expect("a temporary guest /etc");
+        let hosts = directory.path().join("hosts");
+        std::fs::write(&hosts, APPLE_HOSTS).expect("seed a stock macOS hosts file");
+        let path = hosts.to_str().expect("a UTF-8 temporary path");
+
+        let seeded = run_program(&render_fabric_hosts(
+            path,
+            &[attachment_with_hosts(&[("gone", [10, 9, 0, 5])])],
+        ));
+        assert_eq!(seeded.status.code(), Some(0), "{seeded:?}");
+
+        let cleared = render_fabric_hosts(path, &[attachment_with_hosts(&[])]);
+        assert_eq!(cleared.expected_stdout, "");
+        let applied = run_program(&cleared);
+        assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+        assert!(applied.stdout.is_empty(), "{applied:?}");
+        let written = std::fs::read_to_string(&hosts).expect("the guest's hosts file");
+        assert!(written.starts_with(APPLE_HOSTS), "{written}");
+        assert!(!written.contains("gone"), "{written}");
+
+        // A Machine with no port at all is the same claim with nothing to
+        // iterate: it must still be a runnable program, not an empty one.
+        let none = render_fabric_hosts(path, &[]);
+        assert_eq!(none.expected_stdout, "");
+        assert_eq!(run_program(&none).status.code(), Some(0));
+    }
+
+    /// A block a previous boot never closed is consumed, not left behind.
+    ///
+    /// Without this the file grows a block per Up while the stale names above the
+    /// new one keep resolving, and `/etc/hosts` answers with whichever line a
+    /// resolver happened to read first.
+    #[test]
+    fn an_unterminated_block_from_a_lost_write_is_replaced_rather_than_stacked() {
+        let directory = tempfile::tempdir().expect("a temporary guest /etc");
+        let hosts = directory.path().join("hosts");
+        std::fs::write(
+            &hosts,
+            format!("{APPLE_HOSTS}{HOSTS_BEGIN}\n10.9.0.5 half-written\n"),
+        )
+        .expect("seed a torn hosts file");
+        let path = hosts.to_str().expect("a UTF-8 temporary path");
+
+        let rendered =
+            render_fabric_hosts(path, &[attachment_with_hosts(&[("api", [10, 9, 0, 8])])]);
+        let applied = run_program(&rendered);
+        assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+        assert_eq!(String::from_utf8_lossy(&applied.stdout), "10.9.0.8 api\n");
+        let written = std::fs::read_to_string(&hosts).expect("the guest's hosts file");
+        assert_eq!(written.matches(HOSTS_BEGIN).count(), 1, "{written}");
+        assert!(!written.contains("half-written"), "{written}");
+    }
+
+    /// A line that merely looks like a marker is data, and survives.
+    #[test]
+    fn a_line_that_only_begins_like_a_marker_is_left_alone() {
+        let directory = tempfile::tempdir().expect("a temporary guest /etc");
+        let hosts = directory.path().join("hosts");
+        let lookalike = format!("{HOSTS_BEGIN} but not really\n");
+        std::fs::write(&hosts, format!("{APPLE_HOSTS}{lookalike}")).expect("seed a hosts file");
+        let path = hosts.to_str().expect("a UTF-8 temporary path");
+
+        let applied = run_program(&render_fabric_hosts(
+            path,
+            &[attachment_with_hosts(&[("api", [10, 9, 0, 8])])],
+        ));
+        assert_eq!(applied.status.code(), Some(0), "{applied:?}");
+        let written = std::fs::read_to_string(&hosts).expect("the guest's hosts file");
+        assert!(written.contains(&lookalike), "{written}");
     }
 
     fn run_match(listing: &str, mac: &str) -> std::process::Output {
