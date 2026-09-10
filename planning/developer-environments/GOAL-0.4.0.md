@@ -261,6 +261,19 @@ required E2E scenario and retained evidence:
     `definition_not_found` and zero mutation; after schema/API-only bootstrap it
     creates `default`, and new-worktree/multi-instance binding rules match the
     contract without guessing or adoption.
+22. **Definition reconciliation:** changing a mutable ProjectDefinition field
+    produces a deterministic plan and reconciles each selected Environment
+    without changing its stable identity. Immutable/unsafe changes fail before
+    mutation with a structured explanation. Concurrent updates, interrupted
+    reconciliation, and stale clients converge or fail without mixed-version
+    topology, cross-owner adoption, or orphaned resources. Every scoped create,
+    recreate, and remove additionally satisfies the exact-generation
+    precondition, durable-claim, fail-closed migration, and race/crash contract
+    in [`reconcile-generation-fencing.md`](reconcile-generation-fencing.md).
+    Desired planning and activation additionally consume the same immutable,
+    operation-owned effective-input snapshot, canonical service digests, and
+    fail-closed replay/tamper contract in
+    [`reconcile-effective-inputs.md`](reconcile-effective-inputs.md).
 23. **Machine forking for parallel worktrees:** a warm Developer Linux Machine
     is forked inside its Environment. The fork holds a distinct identity, its own
     derived fabric address, and its own Docker context, while its parent keeps
@@ -277,24 +290,13 @@ required E2E scenario and retained evidence:
     real 80 GiB template disk holding 32.9 GiB: 0.029 s and 28 KB. The fork
     quiesces the guest's filesystems immediately before cloning, so what it
     proves is application consistency rather than the crash consistency a bare
-    clone of a running Machine would give. Forks are owned resources: `vz delete` reclaims one completely and
-    `vz up` does not prune the others. Two forks of one parent are mutually
+    clone of a running Machine would give. Forks are owned resources: `vz delete`
+    reclaims one completely and `vz up` does not prune the others, because a
+    fork is a runtime object the definition does not declare and reconcile
+    leaves it alone. Two forks of one parent are mutually
     isolated and individually addressable by their labels; an ambiguous
     `--machine` fails closed listing them. See
     [11-worktree-parallelism.md](11-worktree-parallelism.md).
-22. **Definition reconciliation:** changing a mutable ProjectDefinition field
-    produces a deterministic plan and reconciles each selected Environment
-    without changing its stable identity. Immutable/unsafe changes fail before
-    mutation with a structured explanation. Concurrent updates, interrupted
-    reconciliation, and stale clients converge or fail without mixed-version
-    topology, cross-owner adoption, or orphaned resources. Every scoped create,
-    recreate, and remove additionally satisfies the exact-generation
-    precondition, durable-claim, fail-closed migration, and race/crash contract
-    in [`reconcile-generation-fencing.md`](reconcile-generation-fencing.md).
-    Desired planning and activation additionally consume the same immutable,
-    operation-owned effective-input snapshot, canonical service digests, and
-    fail-closed replay/tamper contract in
-    [`reconcile-effective-inputs.md`](reconcile-effective-inputs.md).
 
 ## Strict E2E release gate
 
