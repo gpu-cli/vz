@@ -16,6 +16,7 @@ import time
 import unittest
 
 import developer_environment_recorder as subject
+from vz04_common import GateError
 
 # Large enough that reading it whole would be unmistakably slow, and larger than
 # any hole-free file a test would otherwise make.
@@ -120,6 +121,94 @@ class InventoryTests(unittest.TestCase):
                 stream.seek(8 * 1024 ** 3)
                 stream.write(b"MOVED")
             self.assertEqual(subject.inventory_diff(before, subject.inventory(root)), ["changed: disk.img"])
+
+
+class StopDaemonsTests(unittest.TestCase):
+    """One unattributable artifact must not excuse the daemons that can be stopped.
+
+    This is the exact shape that leaked eight daemons on a real run. Criterion
+    19's injected migration failure leaves an EMPTY `migf/d.pid`, `migf` sorts
+    before `mix`, `net-a`, `stat` and `store-deny`, and the sweep raised on the
+    first artifact it could not attribute -- so it stopped nothing. On macOS the
+    consequence is not untidiness: the host caps concurrent virtual machines, so
+    leaked daemons holding native Machines make every later Environment fail
+    with `VZErrorDomain:6`.
+    """
+
+    def lane(self, tmp: str, names) -> subject.LaneState:
+        state = subject.LaneState(Path(tmp) / "state", Path(tmp) / "bin")
+        state.create()
+        for name in names:
+            runtime = state.socket_root / name
+            runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # An empty PID file is what the injected migration failure leaves.
+            (runtime / "d.pid").write_text("" if name.startswith("bad") else "4242")
+            os.mkfifo(runtime / "d.sock")   # a placeholder daemon_artifacts will pair
+        return state
+
+    def sweep(self, state):
+        """Run the sweep with attribution and stopping stubbed, recording both."""
+        attempted, stopped = [], []
+
+        def fingerprint(_state, pidfile, socket_path):
+            attempted.append(pidfile.parent.name)
+            if not pidfile.read_text().strip():
+                raise GateError("invalid daemon PID")
+            return {"pid": 4242, "socket": str(socket_path)}
+
+        def stop_one(identity, pidfile, _socket_path):
+            stopped.append(pidfile.parent.name)
+            return identity
+
+        original = (subject.daemon_fingerprint, subject._stop_one_daemon)
+        subject.daemon_fingerprint, subject._stop_one_daemon = fingerprint, stop_one
+        try:
+            with self.assertRaises(subject.CleanupError) as caught:
+                subject.stop_daemons(state)
+        finally:
+            subject.daemon_fingerprint, subject._stop_one_daemon = original
+        return attempted, stopped, str(caught.exception)
+
+    def test_the_daemons_that_can_be_stopped_are_stopped_first(self):
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            # "bad" sorts first, exactly as "migf" does among the real isolates.
+            state = self.lane(tmp, ["bad-migf", "mix", "net-a"])
+            attempted, stopped, message = self.sweep(state)
+            self.assertEqual(sorted(attempted), ["bad-migf", "mix", "net-a"],
+                             "every artifact must be attempted, not just those before the first failure")
+            self.assertEqual(sorted(stopped), ["mix", "net-a"])
+            self.assertIn("2 daemon(s) stopped", message)
+            self.assertIn("invalid daemon PID", message)
+
+    def test_the_unattributable_artifact_is_still_reported(self):
+        """Stopping the rest must not quietly forgive the one that failed."""
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            state = self.lane(tmp, ["bad-migf"])
+            _attempted, stopped, message = self.sweep(state)
+            self.assertEqual(stopped, [])
+            self.assertIn("0 daemon(s) stopped", message)
+            self.assertIn("1 artifact(s) not attributed", message)
+
+    def test_a_clean_sweep_raises_nothing_and_returns_what_it_stopped(self):
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            state = self.lane(tmp, ["mix", "net-a"])
+            calls = []
+
+            def fingerprint(_state, pidfile, socket_path):
+                return {"pid": 4242, "socket": str(socket_path)}
+
+            def stop_one(identity, pidfile, _socket_path):
+                calls.append(pidfile.parent.name)
+                return identity
+
+            original = (subject.daemon_fingerprint, subject._stop_one_daemon)
+            subject.daemon_fingerprint, subject._stop_one_daemon = fingerprint, stop_one
+            try:
+                stopped = subject.stop_daemons(state)
+            finally:
+                subject.daemon_fingerprint, subject._stop_one_daemon = original
+            self.assertEqual(sorted(calls), ["mix", "net-a"])
+            self.assertEqual(len(stopped), 2)
 
 
 if __name__ == "__main__":

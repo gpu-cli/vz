@@ -562,39 +562,71 @@ def stray_sockets(state: LaneState) -> list:
 def stop_daemons(state: LaneState) -> list:
     """SIGTERM every positively identified daemon under the lane root and wait
     for socket/pid removal plus the graceful shutdown log line. Returns the
-    identities stopped (empty when none existed). Raises CleanupError when any
-    daemon artifact cannot be attributed and stopped positively."""
-    stopped = []
+    identities stopped (empty when none existed). Raises CleanupError listing
+    every daemon artifact that could not be attributed and stopped positively --
+    AFTER stopping the ones that could.
+
+    The ordering matters and used to be the other way round. This raised on the
+    first artifact it could not attribute, so it stopped nothing, and the
+    artifact it tripped on was produced on every run: criterion 19's injected
+    migration failure leaves an EMPTY `migf/d.pid`, and `migf` sorts before
+    `mix`, `net-a`, `stat` and `store-deny`. So one zero-byte file left four
+    healthy daemons alive with their Machines, and the next phase inherited
+    them. On this host that is not merely untidy -- macOS caps concurrent
+    virtual machines, so leaked daemons holding native Machines make every later
+    Environment fail with `VZErrorDomain:6`, "the maximum supported number of
+    active virtual machines has been reached". Three sub-checks of one run
+    failed that way before this was found, and their evidence blamed the
+    Environment they were creating rather than the daemons nobody stopped.
+
+    Nothing about the contract per daemon is relaxed: each is still positively
+    identified, still SIGTERMed and never force-killed, and still required to
+    remove its socket and PID file and to have logged its graceful shutdown. The
+    only change is that failing one no longer excuses the rest.
+    """
+    stopped, problems = [], []
     for pidfile, socket_path in daemon_artifacts(state):
         try:
             identity = daemon_fingerprint(state, pidfile, socket_path)
         except GateError as error:
-            raise CleanupError(f"daemon artifacts present but no positively identified daemon: {error}") from error
-        os.kill(identity["pid"], signal.SIGTERM)
-        deadline = time.monotonic() + DAEMON_STOP_DEADLINE_SECONDS
-        while time.monotonic() < deadline:
-            try:
-                os.kill(identity["pid"], 0)
-                alive = True
-            except ProcessLookupError:
-                alive = False
-            if not alive and not os.path.lexists(socket_path) and not os.path.lexists(pidfile):
-                break
-            time.sleep(0.05)
-        if os.path.lexists(socket_path) or os.path.lexists(pidfile):
-            raise CleanupError(f"daemon pid {identity['pid']} did not remove its socket/pid within {DAEMON_STOP_DEADLINE_SECONDS}s; no forced kill")
+            problems.append(f"{pidfile}: {error}")
+            continue
+        try:
+            stopped.append(_stop_one_daemon(identity, pidfile, socket_path))
+        except CleanupError as error:
+            problems.append(str(error))
+    if problems:
+        raise CleanupError(f"{len(stopped)} daemon(s) stopped; {len(problems)} artifact(s) not attributed and "
+                           f"stopped positively: " + "; ".join(problems))
+    return stopped
+
+
+def _stop_one_daemon(identity: dict, pidfile: Path, socket_path: Path) -> dict:
+    """SIGTERM one identified daemon and require its own positive shutdown."""
+    os.kill(identity["pid"], signal.SIGTERM)
+    deadline = time.monotonic() + DAEMON_STOP_DEADLINE_SECONDS
+    while time.monotonic() < deadline:
         try:
             os.kill(identity["pid"], 0)
-            raise CleanupError(f"daemon pid {identity['pid']} still exists after SIGTERM; no forced kill")
+            alive = True
         except ProcessLookupError:
-            pass
-        log_path = socket_path.with_suffix(".log")
-        log = b""
-        if log_path.is_file() and not log_path.is_symlink():
-            with open(log_path, "rb") as stream:
-                log = stream.read(32 * 1024 * 1024)
-        if DAEMON_SHUTDOWN_MARKER not in log:
-            raise CleanupError(f"positive graceful daemon shutdown log line not observed in {log_path}")
-        identity["graceful_shutdown_observed"] = True
-        stopped.append(identity)
-    return stopped
+            alive = False
+        if not alive and not os.path.lexists(socket_path) and not os.path.lexists(pidfile):
+            break
+        time.sleep(0.05)
+    if os.path.lexists(socket_path) or os.path.lexists(pidfile):
+        raise CleanupError(f"daemon pid {identity['pid']} did not remove its socket/pid within {DAEMON_STOP_DEADLINE_SECONDS}s; no forced kill")
+    try:
+        os.kill(identity["pid"], 0)
+        raise CleanupError(f"daemon pid {identity['pid']} still exists after SIGTERM; no forced kill")
+    except ProcessLookupError:
+        pass
+    log_path = socket_path.with_suffix(".log")
+    log = b""
+    if log_path.is_file() and not log_path.is_symlink():
+        with open(log_path, "rb") as stream:
+            log = stream.read(32 * 1024 * 1024)
+    if DAEMON_SHUTDOWN_MARKER not in log:
+        raise CleanupError(f"positive graceful daemon shutdown log line not observed in {log_path}")
+    identity["graceful_shutdown_observed"] = True
+    return identity
