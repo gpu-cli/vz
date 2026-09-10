@@ -10,6 +10,7 @@ still moves when anything about it moves.
 """
 import hashlib
 import os
+import re
 import stat
 import types
 from pathlib import Path
@@ -144,18 +145,28 @@ class StopDaemonsTests(unittest.TestCase):
         for name in names:
             runtime = state.socket_root / name
             runtime.mkdir(mode=0o700, parents=True, exist_ok=True)
-            # An empty PID file is what the injected migration failure leaves.
-            (runtime / "d.pid").write_text("" if name.startswith("bad") else "4242")
+            # Three kinds, because they are no longer the same thing: an EMPTY
+            # PID file is what criterion 19's injected migration failure leaves
+            # on every run and names no process; a GARBAGE one is unreadable and
+            # could name anything; the rest are ordinary running daemons.
+            if name.startswith("empty"):
+                contents = ""
+            elif name.startswith("bad"):
+                contents = "not-a-pid"
+            else:
+                contents = "4242"
+            (runtime / "d.pid").write_text(contents)
             os.mkfifo(runtime / "d.sock")   # a placeholder daemon_artifacts will pair
         return state
 
-    def sweep(self, state):
-        """Run the sweep with attribution and stopping stubbed, recording both."""
+    def sweep(self, state, *, survivors=(), expect_error=True):
+        """Run the sweep with attribution, stopping and the live-process
+        cross-check stubbed, recording what each did."""
         attempted, stopped = [], []
 
         def fingerprint(_state, pidfile, socket_path):
             attempted.append(pidfile.parent.name)
-            if not pidfile.read_text().strip():
+            if not re.fullmatch(r"[0-9]+", pidfile.read_text().strip()):
                 raise GateError("invalid daemon PID")
             return {"pid": 4242, "socket": str(socket_path)}
 
@@ -163,14 +174,23 @@ class StopDaemonsTests(unittest.TestCase):
             stopped.append(pidfile.parent.name)
             return identity
 
-        original = (subject.daemon_fingerprint, subject._stop_one_daemon)
-        subject.daemon_fingerprint, subject._stop_one_daemon = fingerprint, stop_one
+        original = (subject.daemon_fingerprint, subject._stop_one_daemon,
+                    subject.processes_referencing)
+        subject.daemon_fingerprint = fingerprint
+        subject._stop_one_daemon = stop_one
+        subject.processes_referencing = lambda _state, exclude_pids=(): list(survivors)
         try:
-            with self.assertRaises(subject.CleanupError) as caught:
+            if expect_error:
+                with self.assertRaises(subject.CleanupError) as caught:
+                    subject.stop_daemons(state)
+                message = str(caught.exception)
+            else:
                 subject.stop_daemons(state)
+                message = ""
         finally:
-            subject.daemon_fingerprint, subject._stop_one_daemon = original
-        return attempted, stopped, str(caught.exception)
+            (subject.daemon_fingerprint, subject._stop_one_daemon,
+             subject.processes_referencing) = original
+        return attempted, stopped, message
 
     def test_the_daemons_that_can_be_stopped_are_stopped_first(self):
         with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
@@ -191,6 +211,31 @@ class StopDaemonsTests(unittest.TestCase):
             self.assertEqual(stopped, [])
             self.assertIn("0 daemon(s) stopped", message)
             self.assertIn("1 artifact(s) not attributed", message)
+
+    def test_an_empty_pid_file_with_nothing_alive_is_not_a_cleanup_failure(self):
+        """The residue criterion 19 leaves on every run must not fail the lane.
+
+        The injected migration failure dispatches a daemon that refuses to start
+        and never writes its PID. An empty file names no process, so it cannot be
+        a daemon this sweep failed to stop -- and treating it as one failed the
+        whole topology lane on cleanup after all 19 real daemons had been stopped
+        and nothing had leaked, which costs every row the lane would have carried.
+        """
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            state = self.lane(tmp, ["empty-migf", "mix", "net-a"])
+            attempted, stopped, _ = self.sweep(state, expect_error=False)
+            self.assertEqual(sorted(attempted), ["empty-migf", "mix", "net-a"])
+            self.assertEqual(sorted(stopped), ["mix", "net-a"])
+
+    def test_an_empty_pid_file_is_a_failure_when_something_is_still_alive(self):
+        """The exemption is evidence, not a special case for a filename."""
+        with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:
+            state = self.lane(tmp, ["empty-migf", "mix"])
+            _attempted, stopped, message = self.sweep(
+                state, survivors=[(9931, "vz-runtimed --state-db ... --socket ...")])
+            self.assertEqual(stopped, ["mix"])
+            self.assertIn("empty PID file while 1 process(es) still reference", message)
+            self.assertIn("9931", message)
 
     def test_a_clean_sweep_raises_nothing_and_returns_what_it_stopped(self):
         with tempfile.TemporaryDirectory(prefix="vz04-daemons-") as tmp:

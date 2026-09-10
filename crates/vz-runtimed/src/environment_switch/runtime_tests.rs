@@ -1,7 +1,7 @@
 //! Real socket pairs, no VM. Every assertion is about bytes that actually
 //! crossed between two guest ends, so a passing test means the fabric forwards
 //! rather than that a decision function returned the right enum.
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixDatagram as StdUnixDatagram;
@@ -262,4 +262,102 @@ async fn a_machine_whose_guest_end_is_closed_becomes_a_dead_port_and_stalls_noth
     // delivery failure, not a forwarding decision.
     assert_eq!(receipt.counters.unicast_forwarded, 2);
     assert!(receipt.counters.dropped.is_empty());
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_added_to_a_running_fabric_carries_frames_both_ways() {
+    // What a fork needs: its parent is already forwarding and must not be
+    // disturbed, and the new Machine has to be reachable in both directions the
+    // moment it is attached.
+    let (mut switch, guests) = started(2);
+    guests[0].send(&frame(mac(2), mac(1), b"before")).unwrap();
+    assert_eq!(
+        recv(&guests[1]).as_deref(),
+        Some(frame(mac(2), mac(1), b"before").as_slice())
+    );
+
+    let added = switch.add_port(PortId(3), mac(3)).await.unwrap();
+    assert_eq!(added.port, PortId(3));
+    assert_eq!(added.address, mac(3));
+    assert_eq!(switch.ports().len(), 3);
+    let joined = guest(added.socket);
+
+    // Reaching the newcomer.
+    guests[0].send(&frame(mac(3), mac(1), b"to-fork")).unwrap();
+    assert_eq!(
+        recv(&joined).as_deref(),
+        Some(frame(mac(3), mac(1), b"to-fork").as_slice()),
+        "a port attached to a running switch receives"
+    );
+    // And the newcomer reaching a Machine that was already there.
+    joined.send(&frame(mac(1), mac(3), b"from-fork")).unwrap();
+    assert_eq!(
+        recv(&guests[0]).as_deref(),
+        Some(frame(mac(1), mac(3), b"from-fork").as_slice()),
+        "a port attached to a running switch also sends"
+    );
+    // The Machine that was already running kept working throughout, which is
+    // the whole reason the fabric is not rebuilt to add a port.
+    guests[0].send(&frame(mac(2), mac(1), b"after")).unwrap();
+    assert_eq!(
+        recv(&guests[1]).as_deref(),
+        Some(frame(mac(2), mac(1), b"after").as_slice())
+    );
+
+    let receipt = switch.shutdown().await.unwrap();
+    assert_eq!(receipt.frames_read, 4);
+    assert_eq!(receipt.frames_delivered, 4);
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_port_the_running_fabric_refuses_leaves_it_exactly_as_it_was() {
+    // The fabric's rules do not weaken because it is already forwarding: a
+    // duplicate port or a repeated address is refused, the caller is told which,
+    // and the switch keeps carrying frames for everyone already on it.
+    let (mut switch, guests) = started(2);
+
+    let duplicate_port = switch.add_port(PortId(1), mac(9)).await;
+    assert!(
+        matches!(
+            duplicate_port,
+            Err(SwitchError::Fabric(FabricError::PortAlreadyAttached(1)))
+        ),
+        "{duplicate_port:?}"
+    );
+    let duplicate_address = switch.add_port(PortId(4), mac(1)).await;
+    assert!(
+        matches!(
+            duplicate_address,
+            Err(SwitchError::Fabric(FabricError::AddressAlreadyAssigned(
+                _,
+                1
+            )))
+        ),
+        "{duplicate_address:?}"
+    );
+    assert_eq!(switch.ports().len(), 2, "a refused port is not recorded");
+
+    guests[0].send(&frame(mac(2), mac(1), b"still")).unwrap();
+    assert_eq!(
+        recv(&guests[1]).as_deref(),
+        Some(frame(mac(2), mac(1), b"still").as_slice()),
+        "a refusal does not disturb the running fabric"
+    );
+    switch.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_switch_that_can_still_be_added_to_still_stops() {
+    // Retaining the control and frame senders means the frame channel never
+    // closes on its own. Shutdown does not depend on it -- the task selects the
+    // stop signal first -- and this is the test that says so, because a switch
+    // that never stops is a leaked daemon on this host.
+    let (mut switch, guests) = started(2);
+    switch.add_port(PortId(7), mac(7)).await.unwrap();
+    drop(guests);
+    let receipt = tokio::time::timeout(Duration::from_secs(5), switch.shutdown())
+        .await
+        .expect("a switch holding its own senders still observes the stop signal")
+        .unwrap();
+    assert_eq!(receipt.frames_delivered, 0);
 }

@@ -12,12 +12,14 @@
 //! declare several networks and a Machine may be on more than one of them.
 
 use std::collections::BTreeMap;
+use std::net::Ipv4Addr;
 
 use thiserror::Error;
 use tokio::sync::Mutex;
 use vz_runtime_contract::{EnvironmentId, ResourceOwner};
 
-use super::runtime::{NetworkSwitch, SwitchShutdown};
+use super::runtime::{GuestPort, NetworkSwitch, SwitchShutdown};
+use super::{MacAddress, PortId};
 use crate::environment_gateway::{EdgeShutdown, EnvironmentGateway};
 use crate::environment_runtime_controller::EnvironmentControllerLease;
 
@@ -118,6 +120,51 @@ impl EnvironmentSwitches {
     /// Removing them from the registry before joining is what makes this safe to
     /// call once: a second call finds nothing and reports nothing, rather than
     /// joining a task that is already gone.
+    /// Attach one port to a network's switch that is already forwarding, and
+    /// report the edge address that network resolves through.
+    ///
+    /// This is how a Machine joins an Environment whose fabric is already up --
+    /// a fork, whose parent is running and holding its own port. The guest end
+    /// comes back for that Machine's NIC; the edge address comes back with it
+    /// because the caller has to build the same attachment descriptor the fresh
+    /// path builds, and a Machine pointed at a gateway address different from
+    /// its siblings' would be on the same wire with a different idea of how to
+    /// leave it.
+    pub async fn add_port(
+        &self,
+        lease: &EnvironmentControllerLease,
+        owner: &ResourceOwner,
+        network_id: &str,
+        port: PortId,
+        address: MacAddress,
+    ) -> Result<(GuestPort, Option<Ipv4Addr>), SwitchRegistryError> {
+        lease
+            .require_owner(owner)
+            .map_err(|error| conflict(error.to_string()))?;
+        require_named(network_id)?;
+        let mut registry = self.registry.lock().await;
+        bind_controller(&mut registry.controller, lease.controller_identity())?;
+        let installed = registry
+            .switches
+            .get_mut(&owner.environment_id)
+            .and_then(|networks| networks.get_mut(network_id))
+            .ok_or_else(|| {
+                conflict(format!(
+                    "Environment `{}` has no running switch for network `{network_id}`",
+                    owner.environment_id
+                ))
+            })?;
+        let guest = installed
+            .switch
+            .add_port(port, address)
+            .await
+            .map_err(|error| conflict(format!("network `{network_id}`: {error}")))?;
+        Ok((
+            guest,
+            installed.gateway.as_ref().map(EnvironmentGateway::address),
+        ))
+    }
+
     pub async fn stop(
         &self,
         lease: &EnvironmentControllerLease,

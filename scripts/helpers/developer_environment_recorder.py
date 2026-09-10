@@ -584,17 +584,45 @@ def stop_daemons(state: LaneState) -> list:
     remove its socket and PID file and to have logged its graceful shutdown. The
     only change is that failing one no longer excuses the rest.
     """
-    stopped, problems = [], []
+    stopped, problems, vacant = [], [], []
     for pidfile, socket_path in daemon_artifacts(state):
         try:
             identity = daemon_fingerprint(state, pidfile, socket_path)
         except GateError as error:
-            problems.append(f"{pidfile}: {error}")
+            # A ZERO-BYTE PID file names no process, so it cannot be a daemon
+            # this sweep failed to stop. It is the documented residue of
+            # criterion 19's injected migration failure -- the daemon was
+            # dispatched, refused to start, and never wrote its PID -- and it is
+            # produced on EVERY run. Reporting it as an unattributed artifact
+            # failed the whole lane on cleanup even when every real daemon had
+            # been stopped and nothing leaked, which is 18 rows lost to an
+            # expected empty file.
+            #
+            # Held aside rather than excused: the cross-check below is what
+            # decides, and any other unreadable PID file -- garbage contents, a
+            # symlink, an over-long file -- is still a problem here.
+            if not pidfile.is_symlink() and pidfile.is_file() and pidfile.stat().st_size == 0:
+                vacant.append((pidfile, socket_path))
+            else:
+                problems.append(f"{pidfile}: {error}")
             continue
         try:
             stopped.append(_stop_one_daemon(identity, pidfile, socket_path))
         except CleanupError as error:
             problems.append(str(error))
+    if vacant:
+        # One lane-wide question answers all of them: if nothing alive still
+        # references this lane's roots, then no empty PID file can be concealing
+        # a daemon, because a running daemon is dispatched with both roots on its
+        # command line. If something IS alive, every empty file becomes a problem
+        # again -- that is exactly the case where one might be hiding it.
+        survivors = processes_referencing(state)
+        if survivors:
+            problems.extend(
+                f"{pidfile}: empty PID file while {len(survivors)} process(es) still reference this lane: "
+                + "; ".join(f"{pid} {command}" for pid, command in survivors[:4])
+                for pidfile, _ in vacant
+            )
     if problems:
         raise CleanupError(f"{len(stopped)} daemon(s) stopped; {len(problems)} artifact(s) not attributed and "
                            f"stopped positively: " + "; ".join(problems))

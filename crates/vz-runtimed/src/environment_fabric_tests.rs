@@ -359,24 +359,47 @@ async fn a_second_up_over_an_intact_running_fabric_mints_nothing() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn a_machine_that_still_needs_a_boot_cannot_join_a_running_fabric() {
-    // A switch fixes its membership when it is constructed, so the second
-    // Machine cannot be given a port now, and restarting the switch to make room
-    // would disconnect the first. The half-established fabric is reported rather
-    // than a Machine booted silently unattached.
+async fn a_machine_that_still_needs_a_boot_joins_the_running_fabric() {
+    // This used to be a refusal, on the grounds that a switch fixes its
+    // membership when it is constructed. That was true of the switch, not of the
+    // requirement: a fork's parent is already running and holding its port, and
+    // rebuilding the fabric to make room would tear down the very Machine whose
+    // warm state the fork exists to inherit. The switch can now gain a port
+    // while forwarding, so the Machine that still needs a boot is given one.
     let (_root, daemon, lease) = fixture().await;
-    let environment = environment(NETWORK, NetworkKind::Private);
+    // The parent's Up: one Machine, one port. The fork does not exist yet, which
+    // is what makes this the real shape -- an Environment does not hold a fork's
+    // attachment until the fork is minted into it.
+    let mut parent_only = environment(NETWORK, NetworkKind::Private);
+    parent_only
+        .machines
+        .retain(|machine| machine.machine_id == machine_id(1));
+    parent_only
+        .network_attachments
+        .retain(|attachment| attachment.machine_id == machine_id(1));
     daemon
-        .install_environment_fabric(&lease, &environment, &nobody())
+        .install_environment_fabric(&lease, &parent_only, &nobody())
         .await
         .unwrap();
+
+    // The fork's Up: the Environment now holds a second Machine, and the first
+    // is running and must not be disturbed.
+    let environment = environment(NETWORK, NetworkKind::Private);
     let live = BTreeSet::from([machine_id(1)]);
-    assert!(matches!(
-        daemon
-            .install_environment_fabric(&lease, &environment, &live)
-            .await,
-        Err(EnvironmentFabricError::Conflict(_))
-    ));
+    let minted = daemon
+        .install_environment_fabric(&lease, &environment, &live)
+        .await
+        .expect("a Machine that has not booted joins a fabric its sibling is already on");
+
+    // Exactly the Machine that still needs a boot, and only it: a port minted
+    // for the running sibling would reach nothing, because that Machine already
+    // holds the guest end it booted with.
+    assert_eq!(
+        minted.keys().collect::<Vec<_>>(),
+        vec![&machine_id(2)],
+        "only the Machine that is not running is given a port"
+    );
+    assert_eq!(minted[&machine_id(2)].len(), 1);
 }
 
 #[tokio::test(flavor = "multi_thread")]

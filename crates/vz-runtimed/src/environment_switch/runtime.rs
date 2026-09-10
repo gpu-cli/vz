@@ -81,6 +81,26 @@ pub struct NetworkSwitch {
     shutdown: Option<oneshot::Sender<()>>,
     task: Option<JoinHandle<SwitchShutdown>>,
     ports: BTreeMap<PortId, MacAddress>,
+    /// Where [`Self::add_port`] asks the forwarding task to attach a port.
+    ///
+    /// The task owns the fabric, the host ends and the reader set, so a port can
+    /// only be added from inside it. Retaining this sender means the frame
+    /// channel never closes on its own, which is sound because the frame
+    /// channel was never what stopped the switch: the task selects `biased` on
+    /// the shutdown oneshot first, and both `shutdown()` and `Drop` send it.
+    /// Channel closure was only ever a backstop for "every reader died".
+    control: mpsc::Sender<AddPort>,
+}
+
+/// One request to attach a port to a switch that is already forwarding.
+struct AddPort {
+    port: PortId,
+    address: MacAddress,
+    host: Arc<UnixDatagram>,
+    /// Carries the fabric's own refusal back to the caller. A port the fabric
+    /// rejects -- a duplicate id, a repeated address -- must fail the Machine
+    /// that asked for it, not be logged and forgotten inside the task.
+    settled: oneshot::Sender<Result<(), FabricError>>,
 }
 
 impl NetworkSwitch {
@@ -121,22 +141,14 @@ impl NetworkSwitch {
 
         let (stop, mut stopped) = oneshot::channel();
         let (sender, mut received) = mpsc::channel::<(PortId, Vec<u8>)>(QUEUE_DEPTH);
+        let (control, mut controls) = mpsc::channel::<AddPort>(QUEUE_DEPTH);
         let mut readers = JoinSet::new();
         for (port, socket) in &hosts {
-            let (port, socket, sender) = (*port, Arc::clone(socket), sender.clone());
-            readers.spawn(async move {
-                let mut buffer = vec![0_u8; MAX_FRAME_BYTES];
-                loop {
-                    let Ok(read) = socket.recv(&mut buffer).await else {
-                        return;
-                    };
-                    if sender.send((port, buffer[..read].to_vec())).await.is_err() {
-                        return;
-                    }
-                }
-            });
+            spawn_reader(&mut readers, *port, Arc::clone(socket), sender.clone());
         }
-        drop(sender);
+        // The sender is retained rather than dropped, because a port added later
+        // needs a reader and a reader needs a sender. See `NetworkSwitch.control`
+        // for why this does not affect how the switch stops.
 
         let ports: BTreeMap<PortId, MacAddress> = members.into_iter().collect();
         let network = network.to_string();
@@ -146,6 +158,31 @@ impl NetworkSwitch {
                 let frame = tokio::select! {
                     biased;
                     _ = &mut stopped => break,
+                    // Attaching a port is handled where the fabric, the host
+                    // ends and the reader set actually live. Checked before
+                    // frames so a Machine waiting to be attached is not held
+                    // behind a busy network, and it yields immediately when
+                    // there is nothing to attach.
+                    request = controls.recv() => {
+                        let Some(request) = request else { break };
+                        let AddPort { port, address, host, settled } = request;
+                        let outcome = fabric.attach(port, address);
+                        if outcome.is_ok() {
+                            hosts.insert(port, Arc::clone(&host));
+                            spawn_reader(&mut readers, port, host, sender.clone());
+                            info!(
+                                network = %network,
+                                %port,
+                                %address,
+                                "Environment network switch attached a port to a running fabric"
+                            );
+                        }
+                        // A caller that stopped waiting is not a reason to undo
+                        // an attachment the fabric accepted; the port simply has
+                        // no guest yet, which is the state it was in a moment ago.
+                        let _ = settled.send(outcome);
+                        continue;
+                    },
                     frame = received.recv() => frame,
                 };
                 let Some((ingress, frame)) = frame else { break };
@@ -208,9 +245,49 @@ impl NetworkSwitch {
                 shutdown: Some(stop),
                 task: Some(task),
                 ports,
+                control,
             },
             guests,
         ))
+    }
+
+    /// Attach one more port to a switch that is already forwarding.
+    ///
+    /// This is what lets a Machine join an Environment whose fabric is already
+    /// up, which a fork is: its parent is running and holding its own port, so
+    /// rebuilding the switch would mean tearing down the very Machine the fork
+    /// exists to inherit warm state from.
+    ///
+    /// The guest end is created here and returned, so a caller that is refused
+    /// gets no descriptor at all; the host end and the fabric mutation are
+    /// handed to the forwarding task, which owns them. The port is live for
+    /// forwarding when this returns.
+    pub async fn add_port(
+        &mut self,
+        port: PortId,
+        address: MacAddress,
+    ) -> Result<GuestPort, SwitchError> {
+        let (host, guest) = UnixDatagram::pair()?;
+        size_buffers(&host)?;
+        let guest = OwnedFd::from(guest.into_std()?);
+        size_buffers(&guest)?;
+        let (settled, decided) = oneshot::channel();
+        self.control
+            .send(AddPort {
+                port,
+                address,
+                host: Arc::new(host),
+                settled,
+            })
+            .await
+            .map_err(|_| SwitchError::AlreadyStopped)?;
+        decided.await.map_err(|_| SwitchError::AlreadyStopped)??;
+        self.ports.insert(port, address);
+        Ok(GuestPort {
+            port,
+            address,
+            socket: guest,
+        })
     }
 
     /// The address assigned to each attached port.
@@ -237,6 +314,29 @@ impl Drop for NetworkSwitch {
         // The task observes the stop and drains its readers. Aborting it here
         // would skip that joined teardown.
     }
+}
+
+/// Read whole frames off one port's host end into the forwarder.
+///
+/// Shared by construction and by [`NetworkSwitch::add_port`] so a port added to
+/// a running fabric is read exactly the way every other port is.
+fn spawn_reader(
+    readers: &mut JoinSet<()>,
+    port: PortId,
+    socket: Arc<UnixDatagram>,
+    sender: mpsc::Sender<(PortId, Vec<u8>)>,
+) {
+    readers.spawn(async move {
+        let mut buffer = vec![0_u8; MAX_FRAME_BYTES];
+        loop {
+            let Ok(read) = socket.recv(&mut buffer).await else {
+                return;
+            };
+            if sender.send((port, buffer[..read].to_vec())).await.is_err() {
+                return;
+            }
+        }
+    });
 }
 
 /// Size a port's buffers for whole frames, on either end.

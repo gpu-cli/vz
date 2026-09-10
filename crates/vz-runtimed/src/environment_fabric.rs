@@ -68,6 +68,58 @@ pub(crate) type MintedAttachments = BTreeMap<MachineId, Vec<SharedVmAttachment>>
 pub const EDGE_ANCHOR_ROOT: &str = "environment-edges";
 
 impl RuntimeDaemon {
+    /// The attachment descriptor one Machine boots holding, for one port.
+    ///
+    /// Shared by the path that builds a whole fabric and the path that joins a
+    /// Machine to one already running, deliberately: a Machine that joined late
+    /// has to arrive on the wire indistinguishable from one that was there at
+    /// the start -- same prefix, same MTU, same gateway, same name table -- or
+    /// a fork would be a subtly different kind of citizen from its parent.
+    // The error type is this module's own and unchanged; extracting the shared
+    // construction out of a larger function is what made its size visible, not
+    // anything new about the error.
+    #[allow(clippy::result_large_err)]
+    fn attachment_for(
+        &self,
+        network: &crate::environment_switch::plan::NetworkPlan,
+        port: &crate::environment_switch::plan::FabricPort,
+        resolver: Option<std::net::Ipv4Addr>,
+        socket: std::os::fd::OwnedFd,
+    ) -> Result<SharedVmAttachment, EnvironmentFabricError> {
+        SharedVmAttachment::new(
+            DeclaredAttachment {
+                network_id: network.network_id.to_string(),
+                mac: port.mac.to_string(),
+                ipv4: port.address,
+                prefix: network.cidr.prefix(),
+                // A private fabric has no route off itself, so there is no
+                // gateway to name and offset one stays empty. A public-like one
+                // names its edge, which is running by the time this descriptor
+                // is built: a guest is never pointed at an address nothing
+                // answers on.
+                gateway: resolver,
+                dns: resolver,
+                mtu: FABRIC_MTU,
+                // Every Machine on this network gets the same table, including
+                // the Machine that owns an endpoint: a service that reaches a
+                // sibling by its declared name must be able to reach itself by
+                // its own, or the name would mean one thing from outside and
+                // nothing from inside.
+                hosts: network
+                    .hosts()
+                    .into_iter()
+                    .map(|(name, address)| DeclaredHost { name, address })
+                    .collect(),
+            },
+            socket,
+        )
+        .map_err(|error| EnvironmentFabricError::Port {
+            network: network.name.clone(),
+            machine_id: port.machine_id.clone(),
+            error,
+        })
+    }
+
     /// Start every switch this Environment's definition asks for and mint one
     /// port per attached Machine, before any Machine boots.
     ///
@@ -114,14 +166,45 @@ impl RuntimeDaemon {
                     "this Environment already owns switches for {installed:?} but its definition now wants {wanted:?}; a running switch cannot be re-membered"
                 )));
             }
-            if running.len() != attached.len() {
-                return Err(conflict(format!(
-                    "this Environment's switches are already running, so no further port can be minted, but {} of its {} attached Machines are not",
-                    attached.len() - running.len(),
-                    attached.len()
-                )));
+            // A Machine attached in the plan but not running is one this Up
+            // must still give a port to, on a switch that is already
+            // forwarding. That is a fork: its parent is running and holding its
+            // own port, and rebuilding the fabric to make room would tear down
+            // the very Machine whose warm state the fork exists to inherit.
+            //
+            // Every port here goes onto the existing switch, so the running
+            // Machines are not touched at all -- they keep their ends, their
+            // addresses and their traffic across the whole operation.
+            let mut minted = MintedAttachments::new();
+            for network in &plan.networks {
+                for port in &network.ports {
+                    if running.contains(&port.machine_id) {
+                        continue;
+                    }
+                    let (guest, resolver) = self
+                        .environment_switches
+                        .add_port(
+                            lease,
+                            &owner,
+                            network.network_id.as_str(),
+                            port.port,
+                            port.mac,
+                        )
+                        .await?;
+                    minted
+                        .entry(port.machine_id.clone())
+                        .or_default()
+                        .push(self.attachment_for(network, port, resolver, guest.socket)?);
+                    info!(
+                        environment_id = %environment.environment_id,
+                        network = %network.name,
+                        machine_id = %port.machine_id,
+                        port = %port.port,
+                        "joined a Machine to a running Environment fabric"
+                    );
+                }
             }
-            return Ok(MintedAttachments::new());
+            return Ok(minted);
         }
         if !running.is_empty() {
             return Err(conflict(format!(
@@ -184,38 +267,7 @@ impl RuntimeDaemon {
                         network.name, port.port
                     ))
                 })?;
-                let attachment = SharedVmAttachment::new(
-                    DeclaredAttachment {
-                        network_id: network.network_id.to_string(),
-                        mac: port.mac.to_string(),
-                        ipv4: port.address,
-                        prefix: network.cidr.prefix(),
-                        // A private fabric has no route off itself, so there
-                        // is no gateway to name and offset one stays empty. A
-                        // public-like one names its edge, which is running by
-                        // the time this descriptor is built: a guest is never
-                        // pointed at an address nothing answers on.
-                        gateway: resolver,
-                        dns: resolver,
-                        mtu: FABRIC_MTU,
-                        // Every Machine on this network gets the same table,
-                        // including the Machine that owns an endpoint: a service
-                        // that reaches a sibling by its declared name must be
-                        // able to reach itself by its own, or the name would
-                        // mean one thing from outside and nothing from inside.
-                        hosts: network
-                            .hosts()
-                            .into_iter()
-                            .map(|(name, address)| DeclaredHost { name, address })
-                            .collect(),
-                    },
-                    socket,
-                )
-                .map_err(|error| EnvironmentFabricError::Port {
-                    network: network.name.clone(),
-                    machine_id: port.machine_id.clone(),
-                    error,
-                })?;
+                let attachment = self.attachment_for(network, port, resolver, socket)?;
                 minted
                     .entry(port.machine_id.clone())
                     .or_default()
