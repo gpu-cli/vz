@@ -1583,3 +1583,344 @@ class DefinitionReconciliationFencingTests(unittest.TestCase):
         """
         self.assert_falsified("recon_publishes_snapshot_keys", "effective_input_snapshot_identity",
                               "the public surface publishes ['manifest_digest']")
+
+
+TOP18 = e2e.CRITERION_18
+
+
+class CriterionEighteenTests(unittest.TestCase):
+    """Criterion 18's two sub-checks, each claim broken on purpose.
+
+    These call the checks directly against a stand-in release that DOES
+    implement SecretBindings and capability negotiation. The lane's own
+    `FAKE_VZ` models neither -- neither exists in the shipped definition schema
+    or the runtime contract -- so against it both sub-checks report
+    `not_implemented`, which is the last test here and is what keeps the
+    post-wake phase honest. Everything above it exists so that verdict is not
+    the only thing these checks can produce: for every assertion the check makes
+    there is a mode in which the stand-in produces the wrong value, and the
+    check has to report FAIL.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-c18-", dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mode_file = self.tmp / "mode"
+        self.release = support.build_secret_release(self.tmp / "release", mode_file=self.mode_file)
+        self.state = recorder.LaneState(self.tmp / "state", self.release / "bin")
+        self.state.create()
+        self.addCleanup(shutil.rmtree, self.state.socket_root, ignore_errors=True)
+        self.contexts = 0
+
+    def context(self, *, mode="", secret_status="DEV", snapshot_status="PLANNED", schema_secrets=True,
+                release=None, state=None, repo_root=None):
+        self.mode_file.write_text(mode)
+        self.contexts += 1
+        if repo_root is None:
+            repo_root = support.build_secret_repo_root(self.tmp / f"repo-{self.contexts}",
+                                                       secret_status=secret_status,
+                                                       snapshot_status=snapshot_status,
+                                                       schema_secrets=schema_secrets)
+        evidence = self.tmp / f"evidence-{self.contexts}"
+        evidence.mkdir()
+        state = state or self.state
+        return checks.CheckContext(repo_root=repo_root, release_dir=release or self.release, state=state,
+                                   recorder=recorder.Recorder(evidence, RUN_ID), evidence_dir=evidence,
+                                   cli_removal={})
+
+    def secrets(self, **kwargs):
+        return checks.check_secret_bindings_scoped_redacted(self.context(**kwargs), TOP18).scenario()
+
+    def snapshot(self, **kwargs):
+        return checks.check_snapshot_restore_capability(self.context(**kwargs), TOP18).scenario()
+
+    @staticmethod
+    def failures(scenario):
+        return [line for line in scenario["assertions"] if line.startswith("FAILED: ")]
+
+    @staticmethod
+    def unproved(scenario):
+        return [line for line in scenario["assertions"] if line.startswith("not_implemented:")]
+
+    def assert_broken(self, scenario, needle):
+        """FAIL for a stated reason, not for want of having run."""
+        self.assertEqual(scenario["status"], "FAIL", scenario["assertions"])
+        failures = self.failures(scenario)
+        self.assertTrue(any(needle in line for line in failures), (needle, failures))
+        return failures
+
+    # -- the conformant runtime: every claim of the secrets half holds ---------------
+    def test_the_conformant_runtime_proves_every_clause_of_the_secrets_half(self):
+        scenario = self.secrets()
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(self.unproved(scenario), [])
+        self.assertEqual(scenario["status"], "PASS")
+        assertions = "\n".join(scenario["assertions"])
+        for needle in (
+            "advertises secret_bindings as 'DEV'",
+            "declares environment.secret_bindings",
+            "finds the sentinel in a control buffer",
+            "machine-0 reads the binding at /run/vz-secrets/gate-secret",
+            "machine-1, the sibling in the SAME Environment",
+            "a Machine in a sibling Environment cannot read the binding's path",
+            "fails CLOSED with a structured error",
+            "secret_binding_used record names exactly this Environment, Machine and binding",
+            "carries the binding's identity and not its value",
+            "the sweep covers every declared artifact group",
+            "the secret value occurs 0 times across",
+        ):
+            self.assertIn(needle, assertions, needle)
+
+    def test_the_sweep_reads_every_declared_artifact_group_and_says_how_much(self):
+        """The sweep must be non-empty: zero occurrences of nothing is not redaction."""
+        scenario = self.secrets()
+        covered = [line for line in scenario["assertions"] if "the sweep covers every declared artifact group" in line]
+        self.assertEqual(len(covered), 1, scenario["assertions"])
+        for group in checks.SWEEP_GROUPS:
+            self.assertIn(group, covered[0], group)
+        import re
+
+        read = [line for line in scenario["assertions"] if line.startswith("the sweep read ")]
+        self.assertEqual(len(read), 1, scenario["assertions"])
+        count, total = re.search(r"the sweep read (\d+) artifacts totalling (\d+) bytes", read[0]).groups()
+        self.assertGreaterEqual(int(count), len(checks.SWEEP_GROUPS))
+        self.assertGreater(int(total), 0)
+
+    def test_an_artifact_the_sweep_cannot_read_is_reported_not_passed_over(self):
+        """A file the sweep skipped is a hole in the claim, not a clean result."""
+        readable = self.tmp / "readable.txt"
+        readable.write_bytes(b"plain bytes")
+        missing = self.tmp / "absent.txt"
+        skipped = []
+        rows = checks.sweep_group("state-root", [readable, missing], skipped)
+        self.assertEqual([(label, path, data) for label, path, data in rows],
+                         [("state-root", readable, b"plain bytes")])
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn(str(missing), skipped[0])
+        # And an over-bound file is refused by the same path rather than read
+        # short, which would make "the value is not in this file" a guess.
+        oversized = self.tmp / "oversized.txt"
+        oversized.write_bytes(b"x" * 64)
+        skipped = []
+        with mock.patch.object(checks, "read_regular", side_effect=common.GateError("exceeds byte bound")):
+            self.assertEqual(checks.sweep_group("evidence", [oversized], skipped), [])
+        self.assertEqual(len(skipped), 1, skipped)
+        self.assertIn("exceeds byte bound", skipped[0])
+
+    def test_a_swept_artifact_that_cannot_be_read_fails_the_redaction_claim(self):
+        """The runtime is conformant; only the daemon log is unreadable. The
+        check must not report zero occurrences of a file it never opened."""
+        real = checks.read_regular
+
+        def refuse_the_daemon_log(path, *args, **kwargs):
+            if Path(path).name == "d.log":
+                raise common.GateError(f"{path}: exceeds byte bound 2147483648")
+            return real(path, *args, **kwargs)
+
+        with mock.patch.object(checks, "read_regular", side_effect=refuse_the_daemon_log):
+            scenario = self.secrets()
+        failures = self.assert_broken(scenario, "artifact(s) could not be read, so the value was not looked for")
+        self.assertTrue(any("d.log" in line for line in failures), failures)
+
+    def test_the_detector_finds_the_exact_bytes_and_nothing_else(self):
+        sentinel = "vzsec-" + "a" * 64
+        artifacts = [("one", Path("/x/a"), b"before " + sentinel.encode() + b" after " + sentinel.encode()),
+                     ("two", Path("/x/b"), b"nothing here"),
+                     ("three", Path("/x/c"), sentinel.upper().encode())]
+        self.assertEqual(checks.secret_occurrences(artifacts, sentinel), [("one", "/x/a", 2)])
+
+    # -- the declaration surface ----------------------------------------------------
+    def test_the_shipped_schema_declares_no_binding_so_the_criterion_is_reported_unproved(self):
+        """The real repository's verdict: honest, and never a vacuous PASS."""
+        scenario = self.secrets(schema_secrets=False, secret_status="PLANNED")
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(scenario["status"], "FAIL")
+        unproved = self.unproved(scenario)
+        self.assertEqual(len(unproved), 1, scenario["assertions"])
+        self.assertIn("no SecretBinding can be declared", unproved[0])
+        self.assertIn("No SecretBinding type exists in vz-runtime-contract.", unproved[0])
+        self.assertIn("Nothing was planted", unproved[0])
+
+    def test_an_advertised_binding_with_no_declaration_surface_fails(self):
+        """The distinction the criterion draws: advertised-but-absent is a FAILURE,
+        not the same honest gap as a capability nothing advertises."""
+        scenario = self.secrets(schema_secrets=False, secret_status="DEV")
+        self.assert_broken(scenario, "declares no way to bind one")
+        self.assertEqual(self.unproved(scenario), [])
+
+    # -- scope ----------------------------------------------------------------------
+    def test_a_sibling_machine_in_the_same_environment_that_can_read_it_fails(self):
+        scenario = self.secrets(mode="sibling_machine_reads")
+        failures = self.assert_broken(scenario, "machine-1, the sibling in the SAME Environment")
+        # The holder still read it, so the failure is scope and not the fixture.
+        self.assertIn("machine-0 reads the binding at", "\n".join(
+            line for line in scenario["assertions"] if not line.startswith("FAILED: ")))
+        self.assertTrue(any("status '0'" in line for line in failures), failures)
+
+    def test_a_sibling_environment_that_can_read_the_path_fails(self):
+        scenario = self.secrets(mode="foreign_env_reads")
+        self.assert_broken(scenario, "a Machine in a sibling Environment cannot read the binding's path")
+
+    # -- cross-boundary denial ------------------------------------------------------
+    def test_a_cross_boundary_request_served_an_empty_result_fails(self):
+        """Fail-closed means refused. Coming up with the binding quietly dropped
+        is the exact shape the criterion forbids."""
+        scenario = self.secrets(mode="cross_env_empty")
+        failures = self.assert_broken(scenario, "fails CLOSED with a structured error")
+        self.assertTrue(any("exit 0" in line for line in failures), failures)
+
+    def test_a_cross_boundary_refusal_without_a_machine_readable_code_fails(self):
+        scenario = self.secrets(mode="cross_env_unstructured")
+        failures = self.assert_broken(scenario, "fails CLOSED with a structured error")
+        self.assertTrue(any("error.code None" in line for line in failures), failures)
+
+    # -- audit ----------------------------------------------------------------------
+    def test_a_use_that_records_nothing_fails(self):
+        scenario = self.secrets(mode="no_audit")
+        self.assert_broken(scenario, "wrote an audit log at")
+
+    def test_an_audit_record_naming_the_wrong_machine_fails(self):
+        scenario = self.secrets(mode="audit_wrong_machine")
+        failures = self.assert_broken(scenario, "record names exactly this Environment, Machine and binding")
+        self.assertTrue(any("observed [" in line and "expected [" in line for line in failures), failures)
+
+    def test_an_audit_record_carrying_the_value_fails_twice(self):
+        """The audit claim and the redaction claim overlap on purpose: a record
+        that names the value breaks both, and both must say so."""
+        scenario = self.secrets(mode="audit_leaks_value")
+        failures = self.assert_broken(scenario, "carries the binding's identity and not its value")
+        self.assertTrue(any("the secret value leaked" in line and "audit-log" in line for line in failures),
+                        failures)
+
+    # -- redaction, one swept artifact at a time -------------------------------------
+    def assert_leaked_in(self, mode: str, group: str):
+        scenario = self.secrets(mode=mode)
+        failures = self.assert_broken(scenario, "the secret value leaked")
+        leaked = [line for line in failures if "the secret value leaked" in line][0]
+        self.assertIn(f"({group})", leaked)
+        self.assertRegex(leaked, r"observed \d+ in ")
+        return leaked
+
+    def test_the_value_in_the_status_json_is_found(self):
+        self.assert_leaked_in("leak_status_json", "status-json")
+
+    def test_the_value_in_the_human_status_is_found(self):
+        self.assert_leaked_in("leak_status_human", "status-human")
+
+    def test_the_value_in_the_daemon_log_is_found(self):
+        self.assert_leaked_in("leak_daemon_log", "daemon-log")
+
+    def test_the_value_in_the_evidence_directory_is_found(self):
+        """A runtime that prints the value writes it into this lane's receipts."""
+        self.assert_leaked_in("leak_exec_stderr", "evidence")
+
+    def test_the_value_in_the_state_root_is_found(self):
+        self.assert_leaked_in("leak_state_root", "state-root")
+
+    # -- snapshot: the branch the matrix does NOT advertise ---------------------------
+    def test_an_unadvertised_capability_must_come_back_explicitly_unsupported(self):
+        scenario = self.snapshot(snapshot_status="PLANNED")
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(self.unproved(scenario), [])
+        self.assertEqual(scenario["status"], "PASS")
+        assertions = "\n".join(scenario["assertions"])
+        self.assertIn("advertises snapshot as 'PLANNED'", assertions)
+        self.assertIn("the Machine's request is projected exactly as declared", assertions)
+        self.assertIn("EXPLICIT unsupported capability", assertions)
+
+    def test_a_requested_capability_that_is_neither_granted_nor_accounted_fails(self):
+        """Silence is the failure mode this clause exists for."""
+        scenario = self.snapshot(mode="snapshot_silent", snapshot_status="PLANNED")
+        failures = self.assert_broken(scenario, "EXPLICIT unsupported capability")
+        self.assertTrue(any("= None" in line for line in failures), failures)
+
+    def test_granting_a_capability_the_matrix_does_not_advertise_fails(self):
+        scenario = self.snapshot(mode="snapshot_granted", snapshot_status="PLANNED")
+        self.assert_broken(scenario, "does not advertise snapshot (PLANNED), and the Machine did not negotiate it")
+
+    def test_a_structured_up_refusal_naming_the_capability_is_explicit_enough(self):
+        scenario = self.snapshot(mode="snapshot_refuse", snapshot_status="PLANNED")
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(scenario["status"], "PASS")
+        assertions = "\n".join(scenario["assertions"])
+        self.assertIn("error.code 'unsupported_capability'", assertions)
+        self.assertIn("names the 'snapshot' capability", assertions)
+
+    def test_a_generic_up_refusal_is_not_an_explicit_unsupported_capability(self):
+        scenario = self.snapshot(mode="snapshot_refuse_generic", snapshot_status="PLANNED")
+        self.assert_broken(scenario, "the refusal is a structured error envelope")
+
+    def test_a_request_the_runtime_never_projects_is_reported_unproved(self):
+        """No echoed request means nothing to be explicit about. Reported with
+        both sets, never passed over: whether the CLI republishes a declared
+        request is criterion 15's claim, and this says so."""
+        scenario = self.snapshot(mode="drop_request", snapshot_status="PLANNED")
+        self.assertEqual(self.failures(scenario), [])
+        unproved = self.unproved(scenario)
+        self.assertEqual(len(unproved), 1, scenario["assertions"])
+        self.assertIn("declared ['posix_exec', 'snapshot'], reported ['posix_exec']", unproved[0])
+        self.assertIn("criterion 15", unproved[0])
+
+    # -- snapshot: the branch the matrix DOES advertise -------------------------------
+    def test_an_advertised_capability_round_trips_a_sentinel_written_between_them(self):
+        scenario = self.snapshot(mode="snapshot_granted", snapshot_status="DEV")
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(scenario["status"], "PASS")
+        assertions = "\n".join(scenario["assertions"])
+        self.assertIn("snapshot returns an identity", assertions)
+        self.assertIn("a sentinel is written between snapshot and restore", assertions)
+        self.assertIn("restore rewound the Machine past the sentinel", assertions)
+
+    def test_an_advertised_capability_the_runtime_does_not_provide_fails(self):
+        """Advertised-but-absent is a FAILURE, never the honest gap."""
+        scenario = self.snapshot(mode="snapshot_silent", snapshot_status="DEV")
+        self.assert_broken(scenario, "advertises snapshot as DEV")
+        self.assertEqual(self.unproved(scenario), [])
+
+    def test_a_restore_that_rewinds_nothing_fails(self):
+        scenario = self.snapshot(mode="snapshot_granted+restore_noop", snapshot_status="DEV")
+        self.assert_broken(scenario, "restore rewound the Machine past the sentinel")
+
+    # -- the shipped inputs, against the lane's own fake --------------------------------
+    def test_the_shipped_inputs_report_the_criterion_unproved_without_a_single_failure(self):
+        """What the post-wake phase actually produces today.
+
+        The real capability matrix, the real definition schema and the lane's
+        own `FAKE_VZ` -- which models neither SecretBindings nor capability
+        negotiation, exactly as the shipped runtime does not. Both sub-checks
+        must report `not_implemented` with ZERO failed assertions, because a
+        failed assertion here would turn the phase's `not_implemented` outcome
+        into `assertion` and claim a regression that is not there.
+        """
+        release = support.build_fake_release(self.tmp / "lane-release", mode_file=self.tmp / "lane-mode")
+        self.addCleanup(fixtures.make_writable, release)
+        state = recorder.LaneState(self.tmp / "lane-state", release / "bin")
+        state.create()
+        self.addCleanup(shutil.rmtree, state.socket_root, ignore_errors=True)
+        secrets = checks.check_secret_bindings_scoped_redacted(
+            self.context(release=release, state=state, repo_root=common.REPO_ROOT), TOP18).scenario()
+        self.assertEqual(self.failures(secrets), [])
+        self.assertEqual(len(self.unproved(secrets)), 1, secrets["assertions"])
+        self.assertIn("no SecretBinding can be declared", self.unproved(secrets)[0])
+        snapshot = checks.check_snapshot_restore_capability(
+            self.context(release=release, state=state, repo_root=common.REPO_ROOT), TOP18).scenario()
+        self.assertEqual(self.failures(snapshot), [])
+        self.assertEqual(len(self.unproved(snapshot)), 1, snapshot["assertions"])
+        self.assertIn("does not project the Machine's declared capability request", self.unproved(snapshot)[0])
+
+
+class CriterionEighteenWiringTests(unittest.TestCase):
+    """The contract assigns criterion 18 to this phase, and the lane answers it."""
+
+    def test_the_post_wake_phase_answers_the_scenario_the_contract_assigns_it(self):
+        contract = contract_module.load_contract()
+        assigned = [entry for entry in contract["scenarios"]
+                    if entry["lane"] == "topology" and entry["phase"] == "persisted-recovery/post-wake"
+                    and entry["id"] == TOP18]
+        self.assertEqual(len(assigned), 1, [entry["id"] for entry in contract["scenarios"]])
+        self.assertEqual(assigned[0]["criterion"], 18)
+        source = (common.REPO_ROOT / "scripts/helpers/developer_environment_e2e.py").read_text()
+        body = source.split("def run_post_wake", 1)[1].split("def run_final_cleanup", 1)[0]
+        self.assertIn("CRITERION_18: []", body)
+        self.assertIn("check_secret_bindings_scoped_redacted(ctx, CRITERION_18)", body)
+        self.assertIn("check_snapshot_restore_capability(ctx, CRITERION_18)", body)

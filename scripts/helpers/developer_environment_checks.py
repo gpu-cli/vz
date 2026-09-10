@@ -5536,3 +5536,652 @@ def check_definition_reconciliation_fencing(ctx: CheckContext, top: str, establi
             check_immutable_change_refused_before_mutation(ctx, top, established),
             check_concurrent_stale_reconcile_fail_closed(ctx, top, established),
             check_effective_input_snapshot_identity(ctx, top, established)]
+
+
+# --------------------------------------------------------------------- criterion 18
+#
+# `gate.secrets.snapshots_scoped_redacted`, in the persisted-recovery/post-wake
+# phase. Two sub-checks, because the criterion is two claims that fail for
+# unrelated reasons and a single verdict could not say which:
+#
+#   secret_bindings_scoped_redacted   a SecretBinding declared for one
+#                       Environment/Machine is readable from that Machine and
+#                       from nowhere else -- not from its SIBLING in the same
+#                       Environment, not from a Machine in another Environment
+#                       -- its use is audited by identity and never by value,
+#                       a sibling Environment's attempt to bind it is refused
+#                       with a structured error rather than served an empty
+#                       result, and the value itself occurs zero times across
+#                       status (JSON and human), the daemon log, the audit log,
+#                       the whole evidence directory, the state root and its
+#                       inventory.
+#   snapshot_restore_capability   snapshot/restore passes where
+#                       `config/host-target-capabilities-v0.4.json` advertises
+#                       the capability for the host x Machine-target pair under
+#                       test, and where it does not, the runtime accounts the
+#                       request with an EXPLICIT unsupported capability -- a
+#                       machine-readable reason against the capability itself --
+#                       rather than granting it, refusing generically, or saying
+#                       nothing at all.
+#
+# The value planted here never reaches this process's own artifacts by the
+# gate's own hand: the host passes it to the CLI in the environment (never on a
+# command line, which the recorder writes into every receipt), and the guest
+# reports a SHA-256 of what it read rather than the bytes. Any occurrence the
+# sweep finds is therefore the runtime's, which is the only thing that makes a
+# redaction claim mean anything.
+
+CAPABILITY_MATRIX = "config/host-target-capabilities-v0.4.json"
+# The two statuses `status_definitions` defines as shipped-or-demonstrated.
+# PLANNED and NA are the two that are not advertised.
+ADVERTISED_STATUSES = ("ACTIVE", "DEV")
+SECRET_BINDING = "gate-secret"
+SECRET_TARGET_PATH = "/run/vz-secrets/gate-secret"
+# The host-side name the binding reads its value from. An environment variable
+# rather than a file or a literal in vz.json: a literal would put the value into
+# the project the state-root sweep reads back, and the leak would be the gate's
+# own rather than the runtime's.
+SECRET_SOURCE_ENV = "VZ_GATE_SECRET_VALUE"
+SECRET_AUDIT_LOG = "audit.jsonl"
+SECRET_USE_EVENT = "secret_binding_used"
+SNAPSHOT_SENTINEL_PATH = "/run/vz-snapshot-sentinel"
+SNAPSHOT_CAPABILITY = "snapshot"
+BASE_CAPABILITY = "posix_exec"
+SWEEP_MAX_FILES = 20000
+SWEEP_GROUPS = ("audit-log", "daemon-log", "evidence", "state-root", "state-root-inventory",
+                "status-human", "status-json")
+
+
+def host_matrix_key(matrix: dict):
+    """The `hosts` key of the machine this gate is running on, or None.
+
+    Derived from the host rather than passed in: the criterion is qualified by
+    host x Machine-target pair, and a check that had to be told which pair to
+    read could be told the wrong one.
+    """
+    import platform
+
+    system = {"Darwin": "macos", "Linux": "linux", "Windows": "windows"}.get(platform.system())
+    arch = {"arm64": "aarch64", "aarch64": "aarch64", "x86_64": "x86_64", "AMD64": "x86_64"}.get(platform.machine())
+    for key, entry in sorted((matrix.get("hosts") or {}).items()):
+        if entry.get("os") == system and entry.get("arch") == arch:
+            return key
+    return None
+
+
+def capability_pair(repo_root: Path, *, target: str = "linux", profile: str = "developer") -> tuple:
+    """(matrix, host key, pair) for this host and the named Machine target."""
+    matrix = load_json(Path(repo_root) / CAPABILITY_MATRIX)
+    key = host_matrix_key(matrix)
+    for pair in matrix.get("pairs") or []:
+        if pair.get("host") == key and pair.get("target") == target and pair.get("profile") == profile:
+            return matrix, key, pair
+    return matrix, key, None
+
+
+def capability_entry(pair: dict, group: str, name: str) -> tuple:
+    """(status, entry) for one capability of one pair; (None, {}) when absent."""
+    entry = ((pair or {}).get(group) or {}).get(name)
+    if not isinstance(entry, dict):
+        return None, {}
+    return entry.get("status"), entry
+
+
+def regular_files(root: Path, limit: int = SWEEP_MAX_FILES) -> list:
+    """Every regular non-symlink file under `root`, sorted and bounded."""
+    found = []
+    root = Path(root)
+    if not root.is_dir():
+        return found
+    for path in sorted(root.rglob("*")):
+        if len(found) >= limit:
+            break
+        if path.is_file() and not path.is_symlink():
+            found.append(path)
+    return found
+
+
+def sweep_group(label: str, paths, skipped: list = None) -> list:
+    """`[(label, path, bytes)]` for the files read, and what could not be.
+
+    An artifact the sweep could not read is a HOLE in the redaction claim, not a
+    file to pass over: `read_regular` refuses anything over its two-gigabyte
+    bound and anything that changed underneath it, and either would otherwise
+    turn "the value is not in this file" into "this file was never looked at".
+    A file that moved during the read is retried once, because a daemon log
+    being appended to is the ordinary case and not evidence of anything; what
+    still cannot be read is reported to the caller by path and reason.
+    """
+    from vz04_common import GateError
+
+    rows = []
+    for path in paths:
+        path = Path(path)
+        for attempt in (1, 2):
+            try:
+                rows.append((label, path, read_regular(path)))
+                break
+            except (GateError, OSError) as error:
+                if attempt == 2 and skipped is not None:
+                    skipped.append(f"{label} {path}: {type(error).__name__}: {error}")
+    return rows
+
+
+def secret_occurrences(artifacts: list, needle: str) -> list:
+    """`[(label, path, count)]` for every artifact carrying the exact bytes.
+
+    Byte-exact and case-sensitive on purpose: the sentinel is minted at check
+    time, so any occurrence at all is the value itself and never a coincidence.
+    """
+    raw = needle.encode()
+    hits = []
+    for label, path, data in artifacts:
+        count = data.count(raw)
+        if count:
+            hits.append((label, str(path), count))
+    return hits
+
+
+def secret_definition(release_dir: Path, *, from_environment: str = None) -> dict:
+    """Two Developer Linux Machines; only machine-0 is bound to the secret.
+
+    machine-1 exists so "the sibling Machine in the same Environment cannot read
+    it" is a claim about a real sibling rather than about a Machine that is not
+    there. `from_environment` names another Environment's identity, which is the
+    cross-boundary request that has to fail closed.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    first = environment["machines"][0]
+    second = copy.deepcopy(first)
+    second["name"] = "machine-1"
+    environment["machines"] = [first, second]
+    binding = {"schema_version": 1, "name": SECRET_BINDING, "machine": first["name"],
+               "target_path": SECRET_TARGET_PATH, "source_env": SECRET_SOURCE_ENV}
+    if from_environment is not None:
+        binding["from_environment"] = from_environment
+    environment["secret_bindings"] = [binding]
+    return definition
+
+
+def up_reporting_envelope(ctx: CheckContext, check: SubCheck, name: str, definition: dict, *, secret: str = None,
+                          timeout: int = UP_TIMEOUT) -> dict:
+    """`attempt_up`, plus the structured error envelope and the isolate runtime.
+
+    Both criterion-18 sub-checks have a REFUSAL as the subject of one of their
+    claims -- a cross-boundary secret request, and an unadvertised capability --
+    and a refusal is only evidence if its machine-readable code can be read, so
+    the envelope is returned rather than flattened to a message.
+
+    `secret`, when given, is planted in the CLI's environment and never in an
+    argv element: the recorder writes every argv into a receipt under the
+    evidence directory, and the redaction sweep reads those receipts back. A
+    secret placed on a command line would be found by this check's own plumbing,
+    and a leak the gate itself planted says nothing about the runtime.
+    """
+    data = json.dumps(definition, indent=2, sort_keys=True).encode() + b"\n"
+    iso = ctx.isolated(name, project_files={"vz.json": data}, provision=True)
+    env, project = iso["env"], iso["project"]
+    if secret is not None:
+        env[SECRET_SOURCE_ENV] = secret
+    for label, argv in ((name + "-git-init", [GIT, "init", "--quiet", "--initial-branch", "main"]),
+                        (name + "-git-add", [GIT, "add", "vz.json"]),
+                        (name + "-git-commit", [GIT, "-c", "user.name=vz gate", "-c", "user.email=gate@vz.invalid",
+                                                "commit", "--quiet", "-m", "definition"])):
+        receipt = ctx.run_tool(check, label, argv, cwd=project, env=env)
+        check.check(receipt.exit_code == 0, f"{label}: exit {receipt.exit_code} (expected 0)")
+    up = ctx.run(check, name + "-up", ["--json", "up"], cwd=project, env=env, timeout=timeout)
+    try:
+        envelope = _single_json_line(up.stderr)
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        envelope = None
+    if isinstance(envelope, dict):
+        error = envelope.get("error") or {}
+        message, code = error.get("message", ""), error.get("code")
+    else:
+        message, code = up.stderr.decode("utf-8", "replace")[:400], None
+    return {"env": env, "project": project, "runtime": iso["runtime"], "exit_code": up.exit_code,
+            "envelope": envelope, "message": message, "code": code, "stderr": up.stderr,
+            "status": read_status(ctx, check, name, project=project, env=env) if up.exit_code == 0 else None}
+
+
+def secret_digest_script(path: str) -> str:
+    """Report a SHA-256 of what the Machine can read, plus its own exit status.
+
+    The digest, never the bytes: a probe that printed the secret would put it
+    into this check's own receipts, and the redaction sweep would then find the
+    gate's leak instead of the runtime's. `printf ':%s'` keeps "refused" and
+    "read an empty file" distinguishable, exactly as `guest_fetch_script` does.
+    """
+    return (f"out=$(/bin/busybox sha256sum {path} 2>/dev/null); rc=$?; "
+            "printf '%s' \"${out%% *}\"; printf ':%s' \"$rc\"")
+
+
+def digest_probe(receipt) -> tuple:
+    """(digest, status) a `secret_digest_script` probe reported."""
+    text = receipt.stdout.decode("utf-8", "replace").strip()
+    if ":" not in text:
+        return "", None
+    digest, _colon, status = text.rpartition(":")
+    return digest.strip(), status.strip()
+
+
+def audit_records(path: Path) -> tuple:
+    """(records, raw bytes, problem) from one JSON-lines audit log."""
+    from vz04_common import GateError
+
+    try:
+        raw = read_regular(Path(path))
+    except (GateError, OSError) as error:
+        return [], b"", f"no readable audit log at {path}: {error}"
+    records, problems = [], []
+    for number, line in enumerate(raw.decode("utf-8", "replace").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(json.loads(line))
+        except json.JSONDecodeError as error:
+            problems.append(f"line {number}: {error}")
+    return records, raw, ("; ".join(problems[:3]) if problems else None)
+
+
+def check_secret_bindings_scoped_redacted(ctx: CheckContext, top: str) -> SubCheck:
+    """A SecretBinding is readable from its own Machine and from nowhere else.
+
+    The claims are ordered so the first one to fail names the broken one rather
+    than the whole criterion:
+
+      1. the capability matrix is read for the host x Machine-target pair under
+         test, because "advertised" is what decides whether an absent adapter is
+         a gap or a failure;
+      2. the declaration surface exists at all -- a criterion whose subject
+         cannot be written down in a ProjectDefinition has nothing to prove, and
+         says so rather than passing;
+      3. scope: the bound Machine reads exactly the planted value (compared as a
+         SHA-256, so the value never enters this check's own receipts), and its
+         SIBLING in the same Environment does not;
+      4. denial: a Machine in another Environment cannot read the path, and a
+         sibling Environment that declares the same binding is REFUSED with a
+         structured error rather than brought up holding an empty one;
+      5. audit: using it produced a record naming this Environment, this Machine
+         and this binding, carrying the binding's identity and not its value;
+      6. redaction, LAST, so the sweep covers every artifact the claims above
+         produced: zero occurrences of the exact planted bytes across status
+         JSON, human status, the daemon log, the audit log, the evidence
+         directory, the state root, and the state-root inventory.
+    """
+    import hashlib
+
+    check = SubCheck(top, "secret_bindings_scoped_redacted")
+    matrix, host, pair = capability_pair(ctx.repo_root)
+    if not check.check(pair is not None, f"{CAPABILITY_MATRIX} declares the pair under test "
+                       f"(host {host!r} x target 'linux' x profile 'developer')"):
+        return check.finish()
+    status, entry = capability_entry(pair, "topology_capabilities", "secret_bindings")
+    known = sorted(matrix.get("status_definitions") or {})
+    if not check.check(status in known,
+                       f"{host}/linux/developer advertises secret_bindings as {status!r} (one of {known})"):
+        return check.finish()
+    advertised = status in ADVERTISED_STATUSES
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if not check.check(schema_path.is_file() and not schema_path.is_symlink(),
+                       f"the definition schema is present at {PROJECT_DEFINITION_SCHEMA}"):
+        return check.finish()
+    schema_document = load_json(schema_path)
+    properties = sorted((((schema_document.get("$defs") or {}).get("environment") or {}).get("properties") or {}))
+    if "secret_bindings" not in properties:
+        # An advertised capability with no way to declare it is a FAILURE; a
+        # capability the matrix does not advertise is the runtime's own stated
+        # gap, reported in its own words. The two must never collapse.
+        if advertised:
+            check.fail(f"{CAPABILITY_MATRIX} advertises secret_bindings as {status} for {host}/linux/developer, but "
+                       f"{PROJECT_DEFINITION_SCHEMA} declares no way to bind one: the environment properties it "
+                       f"names are {properties}")
+            return check.finish()
+        check.not_implemented = (
+            f"no SecretBinding can be declared: {PROJECT_DEFINITION_SCHEMA} names environment properties "
+            f"{properties}, and {CAPABILITY_MATRIX} reports secret_bindings {status} for {host}/linux/developer "
+            f"-- {entry.get('note') or 'no note'}. Nothing was planted, so nothing about scope, redaction, audit "
+            "or cross-boundary denial is claimed here.")
+        return check.finish()
+    check.ok(f"{PROJECT_DEFINITION_SCHEMA} declares environment.secret_bindings (properties {properties})")
+    try:
+        definition = secret_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    problems = sorted(Draft202012Validator(schema_document).iter_errors(definition),
+                      key=lambda e: list(map(str, e.absolute_path)))
+    if not check.check(not problems, "the secret-binding definition validates against the shipped schema"
+                       if not problems else f"definition invalid: {problems[0].message[:200]}"):
+        return check.finish()
+    # 64 hex characters minted here and nowhere else. A fixed canary could be
+    # left in an artifact by an earlier run and a short one could occur by
+    # chance; neither would make "occurs zero times" mean anything.
+    secret = "vzsec-" + uuid.uuid4().hex + uuid.uuid4().hex
+    expected_digest = hashlib.sha256(secret.encode()).hexdigest()
+    holder = sibling = refused = None
+    try:
+        holder = up_reporting_envelope(ctx, check, "sec-a", definition, secret=secret)
+        if holder["exit_code"] != 0:
+            if advertised:
+                check.fail(f"{CAPABILITY_MATRIX} advertises secret_bindings as {status} for "
+                           f"{host}/linux/developer, but Up refused the declaration: exit "
+                           f"{holder['exit_code']}, error.code {holder['code']!r}, {holder['message'][:200]!r}")
+            else:
+                check.not_implemented = ("this runtime refuses a declared SecretBinding: exit "
+                                         f"{holder['exit_code']}, error.code {holder['code']!r}, "
+                                         f"{holder['message'][:300]!r}")
+            return check.finish()
+        payload = holder["status"]
+        if not check.check(payload is not None, "the Environment holding the binding reports a readable status"):
+            return check.finish()
+        environments = payload.get("environments") or []
+        if not check.check(len(environments) == 1, f"one Environment holds the binding (observed {len(environments)})"):
+            return check.finish()
+        environment = environments[0]
+        machines = {machine.get("name"): machine for machine in environment.get("machines") or []}
+        if not check.check(sorted(machines) == ["machine-0", "machine-1"],
+                           f"both declared Machines are present (observed {sorted(machines)})"):
+            return check.finish()
+        environment_id = environment.get("environment_id")
+        holder_machine_id = (machines.get("machine-0") or {}).get("machine_id")
+
+        # The detector itself, proved against a control the sweep cannot have
+        # produced. A sweep whose comparison never matches anything reports zero
+        # occurrences of everything, which is indistinguishable from redaction.
+        control = [("control", Path("<synthetic control>"), b"leading " + secret.encode() + b" trailing")]
+        found = secret_occurrences(control, secret)
+        if not check.check(found == [("control", "<synthetic control>", 1)],
+                           f"the redaction sweep finds the sentinel in a control buffer (observed {found}, "
+                           "expected exactly one occurrence)"):
+            return check.finish()
+
+        # 3. Scope. The bound Machine, then its sibling in the SAME Environment.
+        read = machine_exec(ctx, check, "sec-a-holder-read", holder, "machine-0",
+                            secret_digest_script(SECRET_TARGET_PATH))
+        digest, reported = digest_probe(read)
+        if not check.check(digest == expected_digest and reported == "0",
+                           f"machine-0 reads the binding at {SECRET_TARGET_PATH}: sha256 {digest!r} status "
+                           f"{reported!r} (expected {expected_digest!r} status '0')"):
+            return check.finish()
+        sibling_read = machine_exec(ctx, check, "sec-a-sibling-machine-read", holder, "machine-1",
+                                    secret_digest_script(SECRET_TARGET_PATH))
+        sibling_digest, sibling_reported = digest_probe(sibling_read)
+        check.check(sibling_digest != expected_digest and sibling_reported not in ("0", None),
+                    "machine-1, the sibling in the SAME Environment that declares no binding, cannot read it: "
+                    f"sha256 {sibling_digest!r} status {sibling_reported!r} (expected neither {expected_digest!r} "
+                    "nor status '0')")
+
+        # 4. Denial across the Environment boundary, in both its shapes.
+        sibling = up_reporting_envelope(ctx, check, "sec-b", minimal_definition(ctx.release_dir), secret=secret)
+        if not check.check(sibling["exit_code"] == 0 and sibling["status"] is not None,
+                           f"a sibling Environment that declares no binding comes up (exit {sibling['exit_code']}); "
+                           "without it no cross-boundary denial was measured"):
+            return check.finish()
+        foreign = machine_exec(ctx, check, "sec-b-foreign-read", sibling, "machine-0",
+                               secret_digest_script(SECRET_TARGET_PATH))
+        foreign_digest, foreign_reported = digest_probe(foreign)
+        check.check(foreign_digest != expected_digest and foreign_reported not in ("0", None),
+                    "a Machine in a sibling Environment cannot read the binding's path: sha256 "
+                    f"{foreign_digest!r} status {foreign_reported!r} (expected neither {expected_digest!r} "
+                    "nor status '0')")
+        crossing = up_reporting_envelope(ctx, check, "sec-c",
+                                         secret_definition(ctx.release_dir, from_environment=environment_id),
+                                         secret=secret)
+        refused = crossing
+        crossing_code = crossing.get("code")
+        check.check(crossing["exit_code"] not in (0, None) and isinstance(crossing_code, str)
+                    and bool(crossing_code.strip()),
+                    f"a sibling Environment requesting Environment {environment_id}'s binding fails CLOSED with a "
+                    f"structured error: exit {crossing['exit_code']}, error.code {crossing_code!r} (expected a "
+                    "nonzero exit and a machine-readable code, never an empty result)")
+        check.check(crossing["status"] is None,
+                    "the refused cross-boundary request left no Environment behind (a readable status after it: "
+                    f"{crossing['status'] is not None})")
+        check.check(secret.encode() not in crossing["stderr"],
+                    f"the cross-boundary refusal names no secret value ({len(crossing['stderr'])} bytes of stderr)")
+
+        # 5. Audit on use: by identity, never by value.
+        audit_path = Path(holder["runtime"]) / SECRET_AUDIT_LOG
+        records, audit_raw, problem = audit_records(audit_path)
+        if not check.check(problem is None and bool(records),
+                           f"using the binding wrote an audit log at {audit_path}: {len(records)} record(s)"
+                           + (f", problem {problem}" if problem else "")):
+            return check.finish()
+        uses = [record for record in records if record.get("event") == SECRET_USE_EVENT]
+        observed = sorted({(record.get("environment_id"), record.get("machine_id"), record.get("binding"))
+                           for record in uses})
+        expected = [(environment_id, holder_machine_id, SECRET_BINDING)]
+        check.check(observed == expected,
+                    f"every {SECRET_USE_EVENT} record names exactly this Environment, Machine and binding: "
+                    f"observed {observed}, expected {expected}")
+        check.check(secret.encode() not in audit_raw,
+                    f"the audit log carries the binding's identity and not its value ({len(audit_raw)} bytes)")
+
+        # 6. Redaction, last, over everything the claims above produced.
+        status_json = ctx.run(check, "sec-a-status-json", ["--json", "status"], cwd=holder["project"],
+                              env=holder["env"], timeout=60)
+        status_human = ctx.run(check, "sec-a-status-human", ["status"], cwd=holder["project"],
+                               env=holder["env"], timeout=60)
+        check.check(status_json.exit_code == 0 and status_human.exit_code == 0,
+                    f"both status spellings answer (json exit {status_json.exit_code}, human exit "
+                    f"{status_human.exit_code})")
+        artifacts = [("status-json", Path("sec-a-status-json.stdout"), status_json.stdout),
+                     ("status-json", Path("sec-a-status-json.stderr"), status_json.stderr),
+                     ("status-human", Path("sec-a-status-human.stdout"), status_human.stdout),
+                     ("status-human", Path("sec-a-status-human.stderr"), status_human.stderr)]
+        logs = [path for path in regular_files(Path(holder["runtime"])) if path.suffix == ".log"]
+        check.check(bool(logs), f"the Environment's daemon wrote a log under {holder['runtime']} "
+                    f"(observed {[path.name for path in logs]})")
+        skipped = []
+        artifacts += sweep_group("daemon-log", logs, skipped)
+        artifacts += sweep_group("audit-log", [audit_path], skipped)
+        _rows, inventory_relative = write_inventory(ctx.evidence_dir, "secret-lane-state-root", ctx.state.root)
+        check.evidence.append(inventory_relative)
+        artifacts += sweep_group("state-root-inventory", [ctx.evidence_dir / inventory_relative], skipped)
+        artifacts += sweep_group("state-root", regular_files(ctx.state.root), skipped)
+        artifacts += sweep_group("evidence", regular_files(ctx.evidence_dir), skipped)
+        check.check(not skipped, "every artifact the sweep addressed could be read (0 unreadable)" if not skipped
+                    else f"{len(skipped)} artifact(s) could not be read, so the value was not looked for in them: "
+                         + "; ".join(skipped[:4]))
+        covered = sorted({label for label, _path, _data in artifacts})
+        check.check(covered == sorted(SWEEP_GROUPS),
+                    f"the sweep covers every declared artifact group (observed {covered}, declared "
+                    f"{sorted(SWEEP_GROUPS)})")
+        total = sum(len(data) for _label, _path, data in artifacts)
+        check.check(len(artifacts) >= len(SWEEP_GROUPS) and total > 0,
+                    f"the sweep read {len(artifacts)} artifacts totalling {total} bytes")
+        hits = secret_occurrences(artifacts, secret)
+        check.check(not hits, f"the secret value occurs 0 times across {len(artifacts)} artifacts in "
+                    f"{len(covered)} groups" if not hits else
+                    "the secret value leaked: " +
+                    "; ".join(f"observed {count} in {path} ({label})" for label, path, count in hits[:6]))
+    finally:
+        # Unconditionally, including on failure: an Environment this check left
+        # running holds a daemon inside a state root the phase is about to
+        # inventory for leaks. What it needs kept is its receipts and its
+        # assertions, and both are recorded by the time we get here.
+        for name, instance in (("sec-a", holder), ("sec-b", sibling), ("sec-c", refused)):
+            if instance is None or instance.get("status") is None:
+                continue
+            try:
+                removed = ctx.run(check, name + "-delete",
+                                  ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                                  cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+                check.check(removed.exit_code == 0, f"{name}: deleted (exit {removed.exit_code})")
+            except OSError as error:
+                check.fail(f"{name}: could not be deleted: {type(error).__name__}: {error}")
+    return check.finish()
+
+
+def snapshot_definition(release_dir: Path) -> dict:
+    """One Developer Linux Machine that requests `snapshot` alongside exec."""
+    definition = minimal_definition(release_dir)
+    machine = definition["environment"]["machines"][0]
+    machine["requested_capabilities"] = {"capabilities": [BASE_CAPABILITY, SNAPSHOT_CAPABILITY]}
+    return definition
+
+
+def snapshot_accounting(machine: dict) -> tuple:
+    """(requested, granted, reason) for `snapshot` on one status Machine.
+
+    `reason` is the runtime's own stable string from
+    `negotiated_capabilities.unsupported`, which is where the contract type
+    (`CapabilitySet`) says a request the backend could not negotiate is
+    accounted. None means it accounted nothing, which is silence rather than an
+    explicit unsupported capability.
+    """
+    requested = set(((machine.get("requested_capabilities") or {}).get("capabilities")) or [])
+    negotiated = machine.get("negotiated_capabilities") or {}
+    granted = SNAPSHOT_CAPABILITY in set(negotiated.get("capabilities") or [])
+    reason = (negotiated.get("unsupported") or {}).get(SNAPSHOT_CAPABILITY)
+    return requested, granted, reason
+
+
+def probe_snapshot(ctx: CheckContext, check: SubCheck, label: str, instance: dict, argv: list):
+    """One typed `vz-runtime-probe` call, recorded like any other observer.
+
+    Snapshot and restore are not among the five public lifecycle verbs, so the
+    typed API is where the contract puts them; the probe is the release's own
+    typed client and criterion 15 already reads the daemon through it.
+    """
+    probe = ctx.release_dir / "bin" / PROBE
+    return ctx.run_tool(check, label, [str(probe), *argv], cwd=instance["project"], env=instance["env"], timeout=120)
+
+
+def check_snapshot_restore_capability(ctx: CheckContext, top: str) -> SubCheck:
+    """Snapshot/restore passes where advertised, and is explicit where it is not.
+
+    The capability matrix decides which branch is under test, and the two are
+    deliberately never collapsed: a capability the matrix ADVERTISES and the
+    runtime does not provide is a FAILURE, while one it does not advertise must
+    come back as an explicit unsupported capability -- the request accounted
+    against the capability itself, with the backend's own stable reason -- and
+    that is a PASS. Granting an unadvertised capability, refusing without a
+    machine-readable code, and saying nothing at all are three separate ways to
+    fail the second branch, and each is asserted on its own.
+    """
+    check = SubCheck(top, "snapshot_restore_capability")
+    matrix, host, pair = capability_pair(ctx.repo_root)
+    if not check.check(pair is not None, f"{CAPABILITY_MATRIX} declares the pair under test "
+                       f"(host {host!r} x target 'linux' x profile 'developer')"):
+        return check.finish()
+    status, _entry = capability_entry(pair, "machine_capabilities", SNAPSHOT_CAPABILITY)
+    known = sorted(matrix.get("status_definitions") or {})
+    if not check.check(status in known,
+                       f"{host}/linux/developer advertises snapshot as {status!r} (one of {known})"):
+        return check.finish()
+    advertised = status in ADVERTISED_STATUSES
+    try:
+        definition = snapshot_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if schema_path.is_file() and not schema_path.is_symlink():
+        problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                          key=lambda e: list(map(str, e.absolute_path)))
+        if not check.check(not problems, "a Machine may request the snapshot capability in a valid definition"
+                           if not problems else f"definition invalid: {problems[0].message[:200]}"):
+            return check.finish()
+    instance = None
+    try:
+        instance = up_reporting_envelope(ctx, check, "snap-a", definition)
+        if instance["exit_code"] != 0:
+            # Refusing the Up is a legitimate way to be explicit, so long as the
+            # refusal is machine-readable and names the capability it refused.
+            envelope, code = instance["envelope"], instance["code"]
+            if advertised:
+                check.fail(f"{CAPABILITY_MATRIX} advertises snapshot as {status} for {host}/linux/developer, but Up "
+                           f"refused a Machine that requested it: exit {instance['exit_code']}, error.code "
+                           f"{code!r}, {instance['message'][:200]!r}")
+                return check.finish()
+            check.check(isinstance(code, str) and bool(code.strip()),
+                        f"the refusal is a structured error envelope: error.code {code!r} (expected a "
+                        "machine-readable code, not a bare nonzero exit)")
+            check.check(SNAPSHOT_CAPABILITY in json.dumps(envelope or {}),
+                        f"the refusal names the {SNAPSHOT_CAPABILITY!r} capability it could not provide "
+                        f"(envelope {json.dumps(envelope or {})[:200]!r})")
+            return check.finish()
+        payload = instance["status"]
+        if not check.check(payload is not None,
+                           "the Environment declaring the capability reports a readable status"):
+            return check.finish()
+        machines = {machine.get("name"): machine for environment in payload.get("environments") or []
+                    for machine in environment.get("machines") or []}
+        machine = machines.get("machine-0")
+        if not check.check(machine is not None, f"machine-0 is present (observed {sorted(machines)})"):
+            return check.finish()
+        requested, granted, reason = snapshot_accounting(machine)
+        declared = {BASE_CAPABILITY, SNAPSHOT_CAPABILITY}
+        if requested != declared:
+            # Without the request in the runtime's own account of the Machine
+            # there is nothing for it to be explicit about, and whether the CLI
+            # republishes what was declared is criterion 15's claim, not this
+            # one. Reported with both sets rather than passed over.
+            check.not_implemented = (
+                "this runtime does not project the Machine's declared capability request, so the snapshot "
+                f"advertisement clause has no subject: declared {sorted(declared)}, reported "
+                f"{sorted(requested)}. Whether the CLI republishes a declared request is criterion 15's claim.")
+            return check.finish()
+        check.ok(f"the Machine's request is projected exactly as declared ({sorted(requested)})")
+        if not advertised:
+            check.check(not granted,
+                        f"{host}/linux/developer does not advertise snapshot ({status}), and the Machine did not "
+                        f"negotiate it (granted {granted})")
+            check.check(isinstance(reason, str) and bool(reason.strip()),
+                        "the runtime accounts the request as an EXPLICIT unsupported capability: "
+                        f"negotiated_capabilities.unsupported[{SNAPSHOT_CAPABILITY!r}] = {reason!r} "
+                        "(expected a stable non-empty reason, not silence)")
+            return check.finish()
+        if not check.check(granted, f"{CAPABILITY_MATRIX} advertises snapshot as {status} for "
+                           f"{host}/linux/developer, and the Machine negotiated it (granted {granted}, "
+                           f"unsupported reason {reason!r})"):
+            return check.finish()
+        probe = ctx.release_dir / "bin" / PROBE
+        if not check.check(probe.is_file() and not probe.is_symlink(),
+                           f"the release ships bin/{PROBE}, the typed client snapshot/restore is reached through"):
+            return check.finish()
+        taken = probe_snapshot(ctx, check, "snap-a-snapshot", instance,
+                               ["snapshot", "--socket", instance["env"]["VZ_RUNTIME_DAEMON_SOCKET"],
+                                "--environment", "default", "--machine", "machine-0"])
+        documents = probe_documents(taken) if taken.exit_code == 0 else []
+        snapshot_id = documents[-1].get("snapshot_id") if documents else None
+        if not check.check(taken.exit_code == 0 and isinstance(snapshot_id, str) and bool(snapshot_id),
+                           f"snapshot returns an identity (exit {taken.exit_code}, snapshot_id {snapshot_id!r})"):
+            return check.finish()
+        token = "vzsnap-" + uuid.uuid4().hex[:16]
+        written = machine_exec(ctx, check, "snap-a-write-after-snapshot", instance, "machine-0",
+                               f"printf %s {token} > {SNAPSHOT_SENTINEL_PATH}; printf ':%s' $?")
+        if not check.check(written.stdout.strip().endswith(b":0"),
+                           f"a sentinel is written between snapshot and restore (observed {written.stdout[:60]!r})"):
+            return check.finish()
+        before = machine_exec(ctx, check, "snap-a-read-before-restore", instance, "machine-0",
+                              f"/bin/busybox cat {SNAPSHOT_SENTINEL_PATH}")
+        if not check.check(before.stdout.strip() == token.encode(),
+                           f"the sentinel is readable before restore (observed {before.stdout[:60]!r}, expected "
+                           f"{token!r})"):
+            return check.finish()
+        restored = probe_snapshot(ctx, check, "snap-a-restore", instance,
+                                  ["restore", "--socket", instance["env"]["VZ_RUNTIME_DAEMON_SOCKET"],
+                                   "--environment", "default", "--machine", "machine-0",
+                                   "--snapshot-id", snapshot_id])
+        if not check.check(restored.exit_code == 0, f"restore of {snapshot_id!r} succeeds (exit "
+                           f"{restored.exit_code})"):
+            return check.finish()
+        after = machine_exec(ctx, check, "snap-a-read-after-restore", instance, "machine-0",
+                             f"/bin/busybox cat {SNAPSHOT_SENTINEL_PATH}")
+        check.check(after.stdout.strip() != token.encode(),
+                    f"restore rewound the Machine past the sentinel written after the snapshot (observed "
+                    f"{after.stdout[:60]!r}, which must not be {token!r})")
+    finally:
+        if instance is not None and instance.get("status") is not None:
+            try:
+                removed = ctx.run(check, "snap-a-delete",
+                                  ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                                  cwd=instance["project"], env=instance["env"], timeout=DELETE_TIMEOUT)
+                check.check(removed.exit_code == 0, f"snap-a: deleted (exit {removed.exit_code})")
+            except OSError as error:
+                check.fail(f"snap-a: could not be deleted: {type(error).__name__}: {error}")
+    return check.finish()
