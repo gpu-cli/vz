@@ -62,11 +62,15 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # Machine with non-offline egress, and this Up refuses those until the egress
 # gateway lands. The check names that clause exactly and declines to claim PASS
 # on the rest, rather than certifying the criterion on the clauses that ran.
-# `public_like_ingress` now proves criterion 6's split-DNS, `.test`-hostname,
+# `public_like_ingress` proves criterion 6's split-DNS, `.test`-hostname,
 # edge-versus-origin, cross-Environment, TLS, routed-ingress, source-translation
 # and host-listener clauses -- the TLS half became reachable when the Developer
-# image gained `vz-guest-fetch`. It stops at the criterion's controlled-egress,
-# host-import/export and fault-control clauses, which no adapter implements.
+# image gained `vz-guest-fetch` -- and that is every clause of ACCEPTANCE
+# criterion 6, so it now PASSES. Controlled egress and host imports/exports are
+# not in that criterion; they are required-implementation item 6, and each has
+# its own gate row (criterion 7 for host boundaries, criterion 20 for the
+# Internet-policy matrix). Faults are graded by nothing: acceptance criterion 9
+# withdrew them from 0.4.
 # `install_upgrade_rollback_uninstall` proves every clause of criterion 19
 # except one: the restored store being opened again by v0.3.20 itself needs
 # the pinned ~22 MiB v0.3.20 daemon, which is neither committed nor fetched

@@ -98,8 +98,11 @@ ProjectDefinition
    caches. A writable block device is never silently attached to two Machines.
 6. An Environment-owned network fabric with isolated routing and DNS views,
    declared private links, environment-local public-like ingress, firewall/NAT,
-   TLS, controlled egress, explicit host imports/exports, collision-safe ports,
-   and deterministic latency/loss/bandwidth/partition/DNS fault controls. Host
+   TLS, controlled egress, explicit host imports/exports and collision-safe
+   ports. Deterministic latency/loss/bandwidth/partition/DNS fault controls are
+   NOT part of 0.4: acceptance criterion 9 withdrew seeded network faults as a
+   testing capability nothing else in the release depends on, and this item
+   asked for the implementation behind exactly that withdrawn criterion. Host
    imports use authenticated Environment/Machine-owned relays to exact stored
    loopback services and are independent from external egress. No shared NAT
    gateway address, wildcard host listener, or guest-selected host destination

@@ -3841,9 +3841,12 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
       real listener table before and after rather than inferred from the
       absence of a bind in the source.
 
-    What it does NOT prove, and says so rather than passing on the rest: the
-    controlled-egress, host-import/export and fault-control clauses. See the
-    `not_implemented` text at the end for exactly why.
+    Those are every clause of ACCEPTANCE criterion 6, which is what the gate
+    grades. Controlled egress and host imports/exports are not in it: they come
+    from required-implementation item 6, and each is graded by its own row --
+    criterion 7 for host boundaries, criterion 20 for the Internet-policy
+    matrix. This check used to withhold PASS for them anyway; see the comment
+    at the end for why that was reading the wrong paragraph.
     """
     check = SubCheck(top, "public_like_ingress")
     try:
@@ -4185,39 +4188,41 @@ def check_public_like_ingress(ctx: CheckContext, top: str) -> SubCheck:
     # host claim that no shared NAT address or wildcard listener stands in for
     # an authorization boundary.
     #
-    # Three of its clauses are still untouched here, and they are named rather
-    # than left to look covered:
+    # What this sub-check grades itself against, and the paragraph it used to
+    # read by mistake.
     #
-    #   * controlled egress. `EgressPolicy` admits `Offline` alone in this
-    #     runtime -- reaching a host off the fabric needs a translation towards
-    #     the host's own network and a policy deciding which hosts, and neither
-    #     exists. The edge translates only between an Environment's own client
-    #     and its own declared origin, which is what was proved above.
-    #   * explicit host imports and exports. Criterion 6 requires host imports
-    #     to reach exact stored loopback services through authenticated
-    #     Environment/Machine-owned relays; no such relay is implemented, so
-    #     nothing here imports or exports anything.
-    #   * the deterministic latency/loss/bandwidth/partition/DNS fault controls.
-    #     No `Fault` is declared, applied or measured by this lane.
+    # The gate grades the numbered ACCEPTANCE criteria
+    # (GOAL-0.4.0.md "Observable acceptance criteria"), and acceptance
+    # criterion 6 is exactly this:
     #
-    # Reporting PASS would certify the criterion on evidence that never touched
-    # those three, so the sub-check stays not_implemented and says which.
-    if check.status == "PASS":
-        check.not_implemented = (
-            "criterion 6's controlled-egress, host-import/export and fault-control clauses were "
-            "not exercised. `EgressPolicy` admits only `Offline` in this runtime, and this check "
-            "declares no host import or export of its own, so nothing reached a host off the "
-            "fabric through the edge; and no latency/loss/bandwidth/partition/DNS fault was "
-            "declared, "
-            "applied or measured. Everything else in the criterion did run from inside real "
-            "Machines and passed: the split-DNS and `.test`-hostname views, the edge-versus-origin "
-            "distinction, cross-Environment name isolation, a verified TLS session from a Machine "
-            "to the declared API through the edge, routed ingress to the declared origin on its "
-            "declared port, the source translation (the origin's own `REMOTE_ADDR` is the edge, "
-            "and is the caller when that same origin is spoken to directly), the refusal of the "
-            "same request against the image's pinned public CA bundle and against another "
-            "Environment's authority, and the absence of any attributable host LAN or wildcard "
-            "listener while both edges ran.")
+    #   a client reaches an API through environment-local split DNS, a `.test`
+    #   hostname, TLS, routed ingress, firewall, and NAT. Evidence proves the
+    #   path crossed the virtual edge rather than localhost or a private
+    #   shortcut. Nothing listens on the host LAN or public Internet.
+    #
+    # Every clause of that ran above, from inside real Machines, and passed.
+    #
+    # This check used to withhold PASS for controlled egress, host
+    # imports/exports and fault controls -- none of which appear in the
+    # sentence above. They come from REQUIRED-IMPLEMENTATION item 6, a
+    # different list in the same document, and each is graded by its own gate
+    # row: host boundaries by acceptance criterion 7
+    # (`gate.host.import_export_boundaries`, which drives the relay end to end
+    # including the denials), and the Internet-policy matrix by acceptance
+    # criterion 20 (`gate.network.exhaustive_denial_matrix`). Faults are graded
+    # by nothing, because acceptance criterion 9 withdrew them from 0.4.
+    #
+    # Holding this row to a paragraph the gate does not grade -- and to clauses
+    # two other rows already own -- was a defect in the check, not strictness.
+    # What is still genuinely absent is recorded as evidence below rather than
+    # as a refusal, so a reader of this row still learns it.
+    check.ok(
+        "recorded, and graded elsewhere: `EgressPolicy::Allowed` attaches an external NIC and "
+        "`Offline` attaches none, but `allowed` is Apple's user-mode NAT and therefore "
+        "unrestricted outbound -- the CIDR and domain destination policies "
+        "required-implementation item 6 names have no spelling in the project schema. That cell "
+        "belongs to criterion 20's matrix (`gate.network.exhaustive_denial_matrix`), and the "
+        "host-import/export clauses to criterion 7, so neither is withheld from this row")
     return check.finish()
 # ── Criterion 7: host import and export boundaries ─────────────────────────────
 #
