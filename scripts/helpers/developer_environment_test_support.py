@@ -2903,10 +2903,24 @@ def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path
 #   fork_delete_leaks       `delete --machine` reports success and leaves the
 #                           fork's disk behind
 #   fork_env_delete_leaks   deleting the Environment leaves a Machine disk
+#   fork_context_unavailable  the Machine reports a context that its own
+#                           `docker_context_availability` says is unusable
+#   fork_context_unresolvable  `vz status` names a context the client cannot
+#                           resolve out of the Machine's config directory --
+#                           the exact shape of the first real-Machine run, where
+#                           the check searched the lane's VZ_DOCKER_CONFIG
+#                           instead of the Machine's own private config
+#   fork_engine_never_ready the context resolves but no Engine ever answers
+#                           `docker version`, so the readiness poll expires
 
 # One Machine disk, big enough that a byte copy of it is unmistakable against
 # the noise of a `statvfs` window and small enough to write in milliseconds.
-FORK_DISK_BYTES = 32 * 1024 * 1024
+#
+# 128 MiB, raised from 32 MiB after the first full-suite run: ambient volume
+# movement on this host reached ±25 MB, which at 32 MiB is the same order as the
+# signal, so the cost assertion decided nothing and failed at random. At 128 MiB
+# a deep copy is five times the noise floor and a clone is a thousandth of it.
+FORK_DISK_BYTES = 128 * 1024 * 1024
 # The disk's first block is its engine's image and volume list. Rewritten in
 # place, so recording an image does not change what the file allocates.
 FORK_DISK_HEADER = 4096
@@ -3006,6 +3020,22 @@ def main(argv):
     if config is None or context is None:
         fail("every invocation is scoped by --config and --context")
     entry = engine(config, context)
+    if rest[:2] == ["context", "inspect"]:
+        # A pure client-side read of the config directory. It does not touch the
+        # engine, which is what lets the check tell "the context is not where I
+        # looked" from "the engine is not answering".
+        sys.stdout.write(entry["name"] + "\n")
+        return 0
+    if rest[:1] == ["version"]:
+        # The server half is only reported by an engine that is actually
+        # serving; `docker version` against a dead endpoint exits non-zero with
+        # no server line, which is the condition poll.docker.engine_ready waits
+        # on.
+        if not entry.get("serving"):
+            sys.stderr.write("Cannot connect to the Docker daemon. Is the docker daemon running?\n")
+            return 1
+        sys.stdout.write("27.4.0\n")
+        return 0
     if rest[:2] == ["image", "import"]:
         source, tag = rest[2], rest[3]
         digest = "sha256:" + hashlib.sha256(Path(source).read_bytes()).hexdigest()
@@ -3195,7 +3225,17 @@ def disk_path(machine):
 
 
 def create_disk(machine):
-    """A Machine disk with real bytes, so cloning it is measurable."""
+    """A Machine disk with real bytes, so cloning it is measurable.
+
+    fsync'd before returning, and this is load-bearing rather than tidy. The
+    check measures the VOLUME's free space across the fork, and unflushed writes
+    are not charged to the volume until writeback runs -- so a disk written here
+    and left dirty is charged to whatever window happens to be open when the
+    kernel gets round to it, which is the fork's. Leaving 64 MiB of these in
+    flight made the fork appear to cost between 24 MB and 280 MB of a 32 MiB
+    parent. Flushing here charges each disk to its own creation, where it
+    belongs.
+    """
     path = disk_path(machine)
     path.parent.mkdir(parents=True, exist_ok=True)
     chunk = os.urandom(1024 * 1024)
@@ -3205,6 +3245,8 @@ def create_disk(machine):
         while written < DISK_BYTES:
             stream.write(chunk[:min(len(chunk), DISK_BYTES - written)])
             written += len(chunk)
+        stream.flush()
+        os.fsync(stream.fileno())
     write_engine_state(machine, {"images": {}, "volumes": []})
 
 
@@ -3219,6 +3261,8 @@ def write_engine_state(machine, state):
     payload = json.dumps(state, sort_keys=True).encode("utf-8")
     with open(disk_path(machine), "r+b") as stream:
         stream.write(payload + b"\0" * (HEADER - len(payload)))
+        stream.flush()
+        os.fsync(stream.fileno())
 
 
 def clone_disk(parent, machine):
@@ -3245,11 +3289,25 @@ def clone_disk(parent, machine):
 
 
 def publish_context(machine, share_with=None):
-    directory = DOCKER_CONFIG / "vzfork-contexts"
+    """Write the context into the MACHINE's own private client config.
+
+    Modelled where the product puts it, which is not where the lane exports
+    `VZ_DOCKER_CONFIG`: vz reads that directory only for the host's CLI plugins
+    and then mints a private, Machine-owned config under the Machine's runtime
+    store. A check that pointed `--config` at the lane's directory would find no
+    context here either, which is what the first run against real Machines hit.
+    """
+    directory = Path(machine["context"]["config_dir"]) / "vzfork-contexts"
+    if MODE == "fork_context_unresolvable":
+        # Named by `vz status`, never written for the client: the shape of a
+        # context that exists as a record and not as something addressable.
+        return
     directory.mkdir(parents=True, exist_ok=True)
     holder = share_with or machine
     (directory / (machine["context"]["name"] + ".json")).write_text(json.dumps({
         "engine_id": machine["context"]["engine_id"],
+        "name": machine["context"]["name"],
+        "serving": MODE != "fork_engine_never_ready",
         "disk": str(disk_path(holder)),
         "events": str(RUNTIME / "events" / (machine["context"]["engine_id"] + ".log"))}))
     (RUNTIME / "events").mkdir(parents=True, exist_ok=True)
@@ -3270,8 +3328,12 @@ def mint(state, name, fork_origin=None, parent=None):
         mac = parent["mac"]
     if fork_origin and MODE == "fork_other_subnet":
         address = fabric(state["environment_id"], machine_id, "-elsewhere")[0]
+    # The private config directory is per Machine and lives under that Machine's
+    # own runtime store, exactly as `ManagedMachineDockerConfig` puts it, and
+    # deliberately NOT under VZ_DOCKER_CONFIG.
     context = {"name": "vz-" + suffix, "endpoint": "unix:///tmp/vzfork-" + suffix + ".sock",
-               "engine_id": "eng_" + suffix}
+               "engine_id": "eng_" + suffix,
+               "config_dir": str(RUNTIME / "topology-machines" / suffix / "data" / "docker-client")}
     if fork_origin and MODE == "fork_shared_context":
         context = dict(parent["context"])
     guest = str(RUNTIME / "guest" / machine_id)
@@ -3409,7 +3471,9 @@ def status_document(state):
                  "health": "supervised", "incarnation_id": row["incarnation_id"],
                  "incarnation_generation": 1,
                  "docker_context": dict(row["context"]),
-                 "docker_context_availability": "persisted_ready_not_live_probed"}
+                 "docker_context_availability":
+                     "persisted_unavailable" if MODE == "fork_context_unavailable"
+                     else "persisted_ready_not_live_probed"}
         if row.get("fork"):
             entry["fork"] = dict(row["fork"])
         machines.append(entry)

@@ -102,6 +102,12 @@ class SubCheck:
         self.failures = []
         self.evidence = []
         self.not_implemented = None
+        # Readiness loops this sub-check ran, in the lane-result schema's own
+        # shape. The gate contract requires a readiness loop to poll a
+        # DOCUMENTED condition within a deadline and never to be counted as a
+        # test retry, and this is where a run says which one it polled and how
+        # many samples it took. Empty for a sub-check that waits on nothing.
+        self.readiness_polls = []
 
     def ok(self, text: str) -> None:
         self.assertions.append(text)
@@ -130,7 +136,8 @@ class SubCheck:
             assertions.append(f"not_implemented: {self.not_implemented}")
         assertions.extend(f"FAILED: {text}" for text in self.failures)
         return {"id": self.id, "status": self.status, "started_unix_ns": self.started, "ended_unix_ns": self.ended or now_ns(),
-                "assertions": assertions, "evidence": sorted(set(self.evidence)), "readiness_polls": []}
+                "assertions": assertions, "evidence": sorted(set(self.evidence)),
+                "readiness_polls": list(self.readiness_polls)}
 
 
 class CheckContext:
@@ -8391,10 +8398,22 @@ MAX_FORK_LABEL_LENGTH = 64
 # duration: the fork must reach ready in at most half the cold Up's wall time.
 FORK_SPEEDUP_MIN = 2.0
 # "The volume's free space falls by a small fraction of the parent's allocated
-# size." The window spans the whole `vz up --fork-from`, so it also carries the
-# fork's own boot writes, which is why the bound is a quarter and not the 28 KB
-# a bare `clonefile` costs.
-FORK_FREE_SPACE_FRACTION = 0.25
+# size."
+#
+# Half, not the quarter this started at, and the reason is worth stating because
+# it is the difference between a bound that means something and one that fails
+# for reasons unrelated to the claim. The window spans a whole `vz up
+# --fork-from` -- a VM boot -- on a volume shared with everything else on the
+# host, and `f_bavail` on APFS moves in both directions while writeback and
+# asynchronous reclamation settle. Measured across 41 fixture runs, ambient
+# movement reached ±25 MB in windows that should have cost kilobytes.
+#
+# What the criterion actually needs to separate is a clone from a DEEP COPY, and
+# those differ by the parent's entire allocated size. A bound at half of it
+# clears the noise floor by a wide margin in both directions: a deep copy costs
+# 100% and is caught, a clone costs a rounding error and passes. Tightening this
+# to a quarter buys no discrimination and buys flakiness.
+FORK_FREE_SPACE_FRACTION = 0.5
 # APFS reports a clone's inode as fully allocated because it shares its parent's
 # blocks. Asserted so that nobody "fixes" the free-space measurement above into
 # a per-file one, which would read a perfect copy-on-write clone as a deep copy.
@@ -8403,6 +8422,20 @@ FORK_CLONE_ALLOCATION_FRACTION = 0.9
 # The identity a fork must hold on its own, in the order `fork_identity` reports.
 FORK_IDENTITY_FIELDS = ("machine_id", "incarnation_id", "docker context name",
                         "docker context endpoint", "docker engine_id")
+# The one `docker_context_availability` value that says the runtime believes the
+# context is usable. It is a persisted projection and says so in its own name,
+# so it gates the live probe rather than replacing it.
+DOCKER_CONTEXT_READY = "persisted_ready_not_live_probed"
+# config/vz-0.4-e2e-contract.json's `poll.docker.engine_ready`: "docker
+# --context <machine context> version returns the server version", deadline 120,
+# interval 1. Named here rather than restated so the two cannot drift.
+DOCKER_READY_POLL = "poll.docker.engine_ready"
+FORK_ENGINE_READY_DEADLINE = 120
+FORK_ENGINE_READY_INTERVAL = 1
+# A failed Docker invocation reports its whole message. The first run against
+# real Machines was diagnosed from a 200-byte slice that ended mid-path, inside
+# the very path that was the answer.
+DOCKER_DETAIL_LIMIT = 800
 
 
 def _fork_label_char(character: str) -> bool:
@@ -8470,7 +8503,16 @@ def volume_free_bytes(path: Path) -> int:
     VOLUME lost. Measured 2026-09-09: an 80 GiB disk with 32.9 GiB allocated
     cloned for a 28 KB free-space delta while the clone's `st_blocks` matched
     its parent's exactly.
+
+    Flushed first, because `f_bavail` on APFS is not a settled number: freeing a
+    tree is asynchronous and pending metadata is not yet charged, so a sample
+    taken while either is in flight measures the previous operation's tail
+    rather than this one's cost. The first run of this check against real
+    Machines read deltas between -82 MB and +146 MB across windows that should
+    have cost kilobytes, in both directions, which is the signature of exactly
+    that.
     """
+    os.sync()
     stats = os.statvfs(path)
     return stats.f_bavail * stats.f_frsize
 
@@ -8555,12 +8597,114 @@ def fork_receipt(ctx: CheckContext, label: str):
     return next((receipt for receipt in reversed(ctx.recorder.receipts) if receipt.label == label), None)
 
 
-def fork_docker(ctx: CheckContext, check: SubCheck, label: str, instance: dict, context: str, argv: list,
+def fork_docker(ctx: CheckContext, check: SubCheck, label: str, instance: dict, context: dict, argv: list,
                 *, timeout: int = 120):
-    """The Mac's own Docker client, aimed at one Machine's private engine."""
-    return ctx.run_tool(check, label, [ctx.docker_client, "--config", str(instance["env"]["VZ_DOCKER_CONFIG"]),
-                                       "--context", context, *argv],
+    """The Mac's own Docker client, aimed at one Machine's private engine.
+
+    `--config` is the Machine's OWN `docker_context.config_dir` and never the
+    lane's `VZ_DOCKER_CONFIG`. The two are different directories on purpose:
+    vz reads `VZ_DOCKER_CONFIG` only to find the host's CLI PLUGINS, then mints
+    a private, Machine-owned config under that Machine's runtime store and
+    writes the context into it -- `vzr1-...-machine_runtime_store-<id>/data/
+    docker-client/contexts/meta/<sha256(name)>/meta.json`. Pointing the client
+    at the lane's directory finds no context at all, which is the shape of
+    "context not found" even though `vz status` just named it.
+    """
+    return ctx.run_tool(check, label, [ctx.docker_client, "--config", str(context.get("config_dir")),
+                                       "--context", str(context.get("name")), *argv],
                         cwd=instance["project"], env=instance["env"], timeout=timeout)
+
+
+def fork_docker_detail(receipt, context: dict) -> str:
+    """Everything a failed Docker invocation needs to be diagnosed in one line.
+
+    The whole stderr, not a 200-byte slice: the first run against real Machines
+    failed on an unresolvable context and the slice cut the message off inside
+    the path it could not open, which was most of the diagnostic. The config
+    directory and context name are named too, because "context not found" says
+    nothing about WHICH directory was searched.
+    """
+    stderr = receipt.stderr.decode("utf-8", "replace").strip()
+    return (f"exit {receipt.exit_code}, --config {context.get('config_dir')!r} "
+            f"--context {context.get('name')!r}, stderr {stderr[:DOCKER_DETAIL_LIMIT]!r}")
+
+
+def fork_docker_context(machine: dict) -> dict:
+    """One Machine's Docker context descriptor, or `{}`."""
+    return machine.get("docker_context") or {}
+
+
+def fork_engine_usable(ctx: CheckContext, check: SubCheck, label: str, instance: dict, machine: dict,
+                       who: str) -> bool:
+    """Prove one Machine's Docker engine is addressable BEFORE anything needs it.
+
+    Ordered so the first thing to fail is the smallest true statement.
+
+    1. The descriptor is complete. `config_dir` is the field that matters and
+       the one a caller is most likely to substitute for the lane's own
+       `VZ_DOCKER_CONFIG`; asserting it here is what turns that mistake into one
+       line instead of an unresolvable context three steps later.
+    2. `docker_context_availability` is the runtime's own persisted projection.
+       It is explicitly NOT a live probe, so it is necessary and not sufficient
+       -- but a Machine that does not even claim a usable context cannot have
+       one, and saying so costs nothing.
+    3. The CLIENT resolves the context out of that directory. This is a pure
+       client-side read: it does not touch the engine, so it separates "the
+       context is not where I looked" from "the engine is not answering".
+    4. Only then, the engine itself, polled on the contract's own documented
+       condition `poll.docker.engine_ready` -- `docker version` returning a
+       server version -- within its declared deadline. `vz status` reports
+       `persisted_ready_not_live_probed`, which by its own name is not evidence
+       that an Engine is listening, so this check has to establish that itself
+       rather than infer it.
+    """
+    context = fork_docker_context(machine)
+    fields = {name: context.get(name) for name in ("name", "endpoint", "config_dir", "engine_id")}
+    if not check.check(all(isinstance(value, str) and value for value in fields.values()),
+                       f"{who}'s Docker context descriptor is complete ({fields})"):
+        return False
+    if not check.check(str(fields["config_dir"]).startswith("/"),
+                       f"{who}'s Docker context names an absolute private config directory "
+                       f"({fields['config_dir']!r}); this is the Machine's own store and never the "
+                       f"lane's VZ_DOCKER_CONFIG ({instance['env']['VZ_DOCKER_CONFIG']!r})"):
+        return False
+    availability = machine.get("docker_context_availability")
+    if not check.check(availability == DOCKER_CONTEXT_READY,
+                       f"{who} reports its Docker context as {DOCKER_CONTEXT_READY!r} "
+                       f"(observed {availability!r})"):
+        return False
+    resolved = fork_docker(ctx, check, label + "-context", instance, context,
+                           ["context", "inspect", "--format", "{{.Name}}"])
+    named = resolved.stdout.decode("utf-8", "replace").strip()
+    if not check.check(resolved.exit_code == 0 and named == fields["name"],
+                       f"the Docker client resolves {who}'s context out of its own config directory "
+                       f"(observed {named!r}, expected {fields['name']!r}; "
+                       f"{fork_docker_detail(resolved, context)})"):
+        return False
+    # poll.docker.engine_ready, as config/vz-0.4-e2e-contract.json declares it:
+    # "docker --context <machine context> version returns the server version".
+    # A readiness loop, not a retry: the invocation is the same every time and
+    # nothing is re-attempted after it is satisfied.
+    deadline = time.monotonic() + FORK_ENGINE_READY_DEADLINE
+    samples, version = 0, ""
+    while True:
+        samples += 1
+        probed = fork_docker(ctx, check, f"{label}-version-{samples}", instance, context,
+                             ["version", "--format", "{{.Server.Version}}"])
+        version = probed.stdout.decode("utf-8", "replace").strip()
+        if probed.exit_code == 0 and version:
+            break
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(FORK_ENGINE_READY_INTERVAL)
+    check.readiness_polls.append({"id": DOCKER_READY_POLL, "samples": samples,
+                                  "deadline_seconds": FORK_ENGINE_READY_DEADLINE,
+                                  "satisfied": bool(version)})
+    return check.check(bool(version),
+                       f"{who}'s Docker engine answers `docker version` with a server version "
+                       f"(observed {version!r} after {samples} sample(s) of {DOCKER_READY_POLL}, "
+                       f"deadline {FORK_ENGINE_READY_DEADLINE}s; "
+                       f"{fork_docker_detail(probed, context)})")
 
 
 def fork_image_ids(receipt) -> set:
@@ -8676,7 +8820,14 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     if not check.check(all(parent_identity),
                        f"the parent reports every identity a fork must not share ({parent_identity})"):
         return check.finish()
-    parent_context = parent_identity[2]
+    parent_context = fork_docker_context(parent_row)
+    # BEFORE anything is warmed, and before a single byte is staged: an engine
+    # that cannot be addressed makes every clause below fail somewhere further
+    # in, describing a symptom rather than the cause. This is the whole
+    # difference between a five-line diagnosis and a confusing one, and the
+    # setup is the most expensive part of this check to reach.
+    if not fork_engine_usable(ctx, check, "fk-p-engine", parent, parent_row, "the parent"):
+        return check.finish()
     parent_token = "vzfork-p-" + uuid.uuid4().hex[:12]
     if not fork_sentinel_write(ctx, check, "fk-p-warm", parent, FORK_PARENT, parent_token):
         return check.finish()
@@ -8700,15 +8851,16 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     imported = fork_docker(ctx, check, "fk-p-import", parent, parent_context,
                            ["image", "import", str(tarball), FORK_IMAGE_TAG])
     check.check(imported.exit_code == 0,
-                f"the warm image was imported into the parent's own engine (exit {imported.exit_code}, "
-                f"{imported.stderr[:200]!r})")
+                f"the warm image was imported into the parent's own engine "
+                f"({fork_docker_detail(imported, parent_context)})")
     if check.status != "PASS":
         return check.finish()
     named = fork_docker(ctx, check, "fk-p-image-id", parent, parent_context,
                         ["image", "inspect", "--format", "{{.Id}}", FORK_IMAGE_TAG])
     parent_image = named.stdout.decode("utf-8", "replace").strip()
     check.check(named.exit_code == 0 and parent_image.startswith("sha256:"),
-                f"the parent's engine resolves {FORK_IMAGE_TAG} to an image digest (observed {parent_image!r})")
+                f"the parent's engine resolves {FORK_IMAGE_TAG} to an image digest (observed "
+                f"{parent_image!r}; {fork_docker_detail(named, parent_context)})")
     listed = fork_docker(ctx, check, "fk-p-images", parent, parent_context,
                          ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"])
     parent_images = fork_image_ids(listed)
@@ -8738,13 +8890,12 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     cold_seconds = cold_up.elapsed_ns / 1e9
     check.ok(f"cold up of the same definition: {cold_seconds:.3f}s, "
              f"{cold_free_before - cold_free_after} bytes of volume free space")
-    # Removed before the fork is taken: a second Environment booting inside the
-    # free-space window would be charged to the clone.
-    removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
-                      cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)
-    check.check(removed.exit_code == 0, f"the cold control Environment was deleted again (exit {removed.exit_code})")
-    if check.status != "PASS":
-        return check.finish()
+    # The cold control is deliberately left RUNNING until after the fork has
+    # been measured. Deleting it first was the obvious order and the wrong one:
+    # freeing a Machine's tree is asynchronous on APFS, so its reclamation lands
+    # inside the fork's free-space window and swamps a clone that costs
+    # kilobytes. An idle booted Machine writes far less than a tree being
+    # reclaimed, so leaving it up is the quieter of the two.
 
     # ── the fork, addressed by a name computed before it existed ─────────────
     branched = ctx.run_tool(check, "fk-p-branch", [GIT, "checkout", "--quiet", "-b", FORK_BRANCH],
@@ -8774,9 +8925,10 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     free_after = volume_free_bytes(runtime)
     disks_after = docker_data_disks(runtime)
     fork_seconds = forked.elapsed_ns / 1e9
-    detail = fork_error(forked)[1] if forked.exit_code != 0 else ""
+    code, detail = fork_error(forked) if forked.exit_code != 0 else (None, "")
     check.check(forked.exit_code == 0,
-                f"`vz up --fork-from {FORK_PARENT}` exit {forked.exit_code} (expected 0){detail[:200]}")
+                f"`vz up --fork-from {FORK_PARENT}` exit {forked.exit_code} (expected 0)"
+                + (f"; code {code!r}, message {detail[:DOCKER_DETAIL_LIMIT]!r}" if detail else ""))
     if check.status != "PASS":
         return check.finish()
 
@@ -8799,10 +8951,22 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
                 f"measurement (fork {fork_allocated}, parent {parent_allocated}, floor "
                 f"{int(parent_allocated * FORK_CLONE_ALLOCATION_FRACTION)})")
     budget = int(parent_allocated * FORK_FREE_SPACE_FRACTION)
+    if free_delta < 0:
+        # The volume GAINED space, so unrelated reclamation outweighed whatever
+        # the fork cost. That is still evidence against a deep copy -- one
+        # cannot cost less than nothing -- but it is not a measurement of the
+        # clone, and the difference is worth recording rather than smuggling
+        # into a pass.
+        check.ok(f"the volume GAINED {-free_delta} bytes across the fork: no deep copy could, but "
+                 f"this window was dominated by unrelated reclamation rather than by the clone")
     check.check(free_delta <= budget,
                 f"the volume lost {free_delta} bytes across the fork, at most {budget} "
                 f"({FORK_FREE_SPACE_FRACTION:g} of the parent's {parent_allocated} allocated bytes): "
                 f"copy-on-write, not a deep copy")
+    # Now that the clone has been measured, the control is no longer needed.
+    removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                      cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)
+    check.check(removed.exit_code == 0, f"the cold control Environment was deleted again (exit {removed.exit_code})")
     check.check(fork_seconds * FORK_SPEEDUP_MIN <= cold_seconds,
                 f"the fork reached ready in {fork_seconds:.3f}s against {cold_seconds:.3f}s for a cold up of the "
                 f"same definition in this run, a {cold_seconds / fork_seconds if fork_seconds else 0:.2f}x "
@@ -8867,14 +9031,22 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
                 f"the fork derived its own MAC (fork {ports[address]['mac']}, parent {ports[FORK_PARENT]['mac']})")
 
     # ── the warm state the fork exists for ──────────────────────────────────
-    fork_context = forked_identity[2]
+    fork_context = fork_docker_context(fork_row)
+    # The fork's engine is a fresh dockerd over the cloned disk, so it too has
+    # to be answering before its image store means anything: an engine that has
+    # not finished starting reports an EMPTY store, which is indistinguishable
+    # from a fork that inherited nothing. That is the warm-state claim, so it
+    # must not be decided by a race.
+    if not fork_engine_usable(ctx, check, "fk-fork-engine", parent, fork_row, "the fork"):
+        return check.finish()
     inherited = fork_docker(ctx, check, "fk-fork-images", parent, fork_context,
                             ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"])
     fork_images = fork_image_ids(inherited)
     absent = sorted(parent_images - fork_images)
     check.check(inherited.exit_code == 0 and not absent,
                 f"the fork's image store answers for every digest its parent held "
-                f"(parent {sorted(parent_images)}, fork {sorted(fork_images)}, missing {absent})")
+                f"(parent {sorted(parent_images)}, fork {sorted(fork_images)}, missing {absent}; "
+                f"{fork_docker_detail(inherited, fork_context)})")
     resolved = fork_docker(ctx, check, "fk-fork-image-id", parent, fork_context,
                            ["image", "inspect", "--format", "{{.Id}}", FORK_IMAGE_TAG])
     check.check(resolved.exit_code == 0 and
@@ -8889,20 +9061,20 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     pulls = [line for line in events.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
     check.check(events.exit_code == 0 and len(pulls) == 0,
                 f"the fork's engine records {len(pulls)} image pull(s) since it started, expected 0 "
-                f"({pulls[:5]})")
+                f"({pulls[:5]}; {fork_docker_detail(events, fork_context)})")
     # Two engines, not one answering twice: something created on the parent
     # AFTER the clone must not be visible to the fork.
     volume_name = "vzfork-parent-only-" + uuid.uuid4().hex[:12]
     created = fork_docker(ctx, check, "fk-p-volume", parent, parent_context, ["volume", "create", volume_name])
     check.check(created.exit_code == 0, f"a volume was created on the parent's engine after the fork "
-                f"(exit {created.exit_code})")
+                f"({fork_docker_detail(created, parent_context)})")
     for name, context, expected in ((FORK_PARENT, parent_context, True), (address, fork_context, False)):
         volumes = fork_docker(ctx, check, "fk-volumes-" + ("parent" if expected else "fork"), parent, context,
                               ["volume", "ls", "--format", "{{.Name}}"])
         present = volume_name in volumes.stdout.decode("utf-8", "replace").split()
         check.check(volumes.exit_code == 0 and present == expected,
                     f"{name}'s engine {'holds' if expected else 'does not hold'} the post-fork volume "
-                    f"{volume_name} (observed present={present})")
+                    f"{volume_name} (observed present={present}; {fork_docker_detail(volumes, context)})")
 
     # ── the parent is still serving, and unchanged ──────────────────────────
     reread = fork_sentinel_read(ctx, check, "fk-p-after", parent, FORK_PARENT)
@@ -8930,8 +9102,10 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     second = f"{FORK_PARENT}@{FORK_SECOND_LABEL}"
     twin = ctx.run(check, "fk-fork2-up", ["--json", "up", "--fork-from", FORK_PARENT, "--as", second],
                    cwd=parent["project"], env=parent["env"], timeout=UP_TIMEOUT)
-    check.check(twin.exit_code == 0, f"`vz up --fork-from {FORK_PARENT} --as {second}` exit {twin.exit_code} "
-                f"(expected 0){fork_error(twin)[1][:200] if twin.exit_code else ''}")
+    twin_code, twin_detail = fork_error(twin) if twin.exit_code != 0 else (None, "")
+    check.check(twin.exit_code == 0,
+                f"`vz up --fork-from {FORK_PARENT} --as {second}` exit {twin.exit_code} (expected 0)"
+                + (f"; code {twin_code!r}, message {twin_detail[:DOCKER_DETAIL_LIMIT]!r}" if twin_detail else ""))
     if check.status != "PASS":
         return check.finish()
     three = fork_machines(read_status(ctx, check, "fk-after-twin", project=parent["project"], env=parent["env"]))

@@ -3138,6 +3138,7 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         self.mode_file = self.tmp / "mode"
         self.release = support.build_fork_release(self.tmp / "release", mode_file=self.mode_file)
         self.docker = self.release / "bin" / "docker-fork-stand-in"
+        self.contract = contract_module.load_contract()
         self.runs = 0
 
     def fork(self, mode: str = "") -> dict:
@@ -3271,6 +3272,79 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         self.assertEqual(len(checks.fork_label_from_branch("a" * 200)), checks.MAX_FORK_LABEL_LENGTH)
         for empty in ("", "///", "---"):
             self.assertIsNone(checks.fork_label_from_branch(empty), empty)
+
+    # -- the Docker engine is proved addressable before anything needs it -----------------
+    def test_the_client_is_aimed_at_the_machines_own_private_config_directory(self):
+        """The bug the first real-Machine run found.
+
+        vz reads `VZ_DOCKER_CONFIG` only to locate the host's CLI plugins, then
+        mints a private Machine-owned config under that Machine's runtime store
+        and writes the context there. Pointing `--config` at the lane's
+        directory finds no context at all -- and `vz status` has already named
+        one, so the failure reads as a runtime fault rather than as the check
+        searching the wrong directory.
+        """
+        import re
+
+        scenario = self.fork()
+        assertions = "\n".join(scenario["assertions"])
+        self.assertIn("names an absolute private config directory", assertions)
+        # Not merely absolute: the two directories must actually differ, or the
+        # assertion would pass for a check that made this same mistake.
+        line = next(a for a in scenario["assertions"] if "private config directory" in a)
+        used = re.search(r"directory \('([^']+)'\)", line)
+        lane = re.search(r"VZ_DOCKER_CONFIG \('([^']+)'\)", line)
+        self.assertIsNotNone(used, line)
+        self.assertIsNotNone(lane, line)
+        self.assertNotEqual(used.group(1), lane.group(1))
+        self.assertTrue(used.group(1).endswith("docker-client"), used.group(1))
+
+    def test_a_context_the_client_cannot_resolve_fails_before_anything_is_staged(self):
+        """And it fails in the setup, which is the point: no tarball, no import."""
+        scenario = self.fork("fork_context_unresolvable")
+        failures = self.assert_broken(
+            scenario, "the Docker client resolves the parent's context out of its own config directory",
+            "fork_context_unresolvable")
+        assertions = "\n".join(scenario["assertions"])
+        self.assertNotIn("a filesystem tarball for the warm image was written", assertions)
+        self.assertNotIn("the warm image was imported", assertions)
+        # The whole message, not a slice that ends inside the path.
+        self.assertTrue(any("--config" in line and "--context" in line for line in failures), failures)
+
+    def test_a_context_the_runtime_itself_calls_unusable_fails(self):
+        self.broken("fork_context_unavailable",
+                    "reports its Docker context as 'persisted_ready_not_live_probed'")
+
+    def test_an_engine_that_never_answers_expires_the_documented_readiness_poll(self):
+        """`persisted_ready_not_live_probed` says in its own name that it is not
+        a live probe, so the check has to establish liveness itself."""
+        with mock.patch.object(checks, "FORK_ENGINE_READY_DEADLINE", 2), \
+                mock.patch.object(checks, "FORK_ENGINE_READY_INTERVAL", 0):
+            scenario = self.fork("fork_engine_never_ready")
+        self.assert_broken(scenario, "answers `docker version` with a server version",
+                           "fork_engine_never_ready")
+        polls = scenario["readiness_polls"]
+        self.assertEqual([p["id"] for p in polls], [checks.DOCKER_READY_POLL], polls)
+        self.assertFalse(polls[0]["satisfied"], polls)
+        self.assertGreaterEqual(polls[0]["samples"], 1)
+
+    def test_the_readiness_poll_is_recorded_in_the_shape_the_lane_result_declares(self):
+        """A readiness loop is evidence, not a retry: it names the contract's
+        own condition id, its deadline, and how many samples it took."""
+        scenario = self.fork()
+        polls = scenario["readiness_polls"]
+        # One per engine: the parent's, then the fork's.
+        self.assertEqual([p["id"] for p in polls], [checks.DOCKER_READY_POLL] * 2, polls)
+        for poll in polls:
+            self.assertTrue(poll["satisfied"], poll)
+            self.assertEqual(poll["deadline_seconds"], checks.FORK_ENGINE_READY_DEADLINE)
+            self.assertGreaterEqual(poll["samples"], 1)
+        declared = {row["id"]: row for row in self.contract["readiness_polls"]}
+        self.assertIn(checks.DOCKER_READY_POLL, declared)
+        self.assertEqual(declared[checks.DOCKER_READY_POLL]["deadline_seconds"],
+                         checks.FORK_ENGINE_READY_DEADLINE)
+        self.assertEqual(scenario["status"], "FAIL")
+        self.assertEqual(self.failures(scenario), [], scenario["assertions"])
 
     def test_a_lane_with_no_docker_client_reports_the_criterion_unproved(self):
         """The shape the lane fixture produces, and it must never look like a pass."""
