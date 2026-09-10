@@ -261,6 +261,21 @@ required E2E scenario and retained evidence:
     `definition_not_found` and zero mutation; after schema/API-only bootstrap it
     creates `default`, and new-worktree/multi-instance binding rules match the
     contract without guessing or adoption.
+23. **Machine forking for parallel worktrees:** a warm Developer Linux Machine
+    is forked inside its Environment. The fork holds a distinct identity, its own
+    derived fabric address, and its own Docker context, while its parent keeps
+    serving with its identities and sentinel bytes unchanged. The fork inherits
+    the parent's warm state: its Docker image store answers for the parent's
+    image digests with a pull count of zero. Performance is part of the claim,
+    because a fork that costs a cold boot has no value -- the fork reaches ready
+    substantially faster than a cold `up` of the same definition measured in the
+    same run, and host allocated-size growth is a fraction of the parent's
+    logical disk, which is what makes copy-on-write observable rather than
+    assumed. Forks are owned resources: `vz delete` reclaims one completely and
+    `vz up` does not prune the others. Two forks of one parent are mutually
+    isolated and individually addressable by their labels; an ambiguous
+    `--machine` fails closed listing them. See
+    [11-worktree-parallelism.md](11-worktree-parallelism.md).
 22. **Definition reconciliation:** changing a mutable ProjectDefinition field
     produces a deterministic plan and reconciles each selected Environment
     without changing its stable identity. Immutable/unsafe changes fail before

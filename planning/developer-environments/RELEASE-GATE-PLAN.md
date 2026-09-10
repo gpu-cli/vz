@@ -239,6 +239,7 @@ Top-level scenario IDs, one per acceptance criterion:
 | 20 | `gate.network.exhaustive_denial_matrix` | topology | persisted-recovery/post-wake |
 | 21 | `gate.cli.legacy_removal_and_bootstrap` | topology | clean-provision |
 | 22 | `gate.definition.reconciliation_fencing` | topology | persisted-recovery/pre-sleep |
+| 23 | `gate.fork.machine_fork_for_parallel_worktrees` | topology | clean-provision |
 
 Plus the 63 `docker.*` IDs from `docker_compatibility_contract.REQUIRED_IDS`
 assigned to `linux-docker` with each scenario's own `phase`. Total required

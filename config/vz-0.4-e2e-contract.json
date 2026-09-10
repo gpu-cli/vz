@@ -224,6 +224,7 @@
     {"id": "gate.migration.install_upgrade_rollback_uninstall", "criterion": 19, "lane": "topology", "phase": "clean-provision", "title": "v0.3.20 install, 0.4 upgrade with every barrier injected, rollback and uninstall"},
     {"id": "gate.network.exhaustive_denial_matrix", "criterion": 20, "lane": "topology", "phase": "persisted-recovery/post-wake", "title": "Exhaustive source×destination×protocol×port denial matrix"},
     {"id": "gate.cli.legacy_removal_and_bootstrap", "criterion": 21, "lane": "topology", "phase": "clean-provision", "title": "Legacy CLI removal with actionable errors; bare vz and bootstrap behave as contracted"},
+    {"id": "gate.fork.machine_fork_for_parallel_worktrees", "criterion": 23, "lane": "topology", "phase": "clean-provision", "title": "Fork a warm Machine in place: distinct identity, inherited image store, measured against a cold up, parent unaffected"},
     {"id": "gate.definition.reconciliation_fencing", "criterion": 22, "lane": "topology", "phase": "persisted-recovery/pre-sleep", "title": "Definition reconciliation fencing against stale and concurrent writers"}
   ]
 }

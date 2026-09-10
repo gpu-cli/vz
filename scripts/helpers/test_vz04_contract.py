@@ -18,14 +18,15 @@ class ContractTests(unittest.TestCase):
         cls.contract = contract_module.load_contract()
         cls.docker = contract_module.load_docker_contract()
 
-    def test_required_inventory_is_84_unique_ids(self):
+    def test_required_inventory_is_85_unique_ids(self):
         rows = contract_module.required_scenarios(self.contract, self.docker)
-        # 84, not 85: criterion 9 (seeded network faults) was withdrawn from
-        # 0.4 and criterion 8 reduced to unconditional isolation. See
-        # GOAL-0.4.0.md, where the number 9 is left vacant on purpose.
-        self.assertEqual(len(rows), 84)
-        self.assertEqual(len({row["id"] for row in rows}), 84)
-        self.assertEqual(sum(row["id"].startswith("gate.") for row in rows), 21)
+        # 85: criterion 9 (seeded network faults) was withdrawn and criterion 8
+        # reduced to unconditional isolation, then criterion 23 (Machine forking
+        # for parallel worktrees) was accepted into 0.4. See GOAL-0.4.0.md, where
+        # the number 9 is left vacant on purpose rather than reused.
+        self.assertEqual(len(rows), 85)
+        self.assertEqual(len({row["id"] for row in rows}), 85)
+        self.assertEqual(sum(row["id"].startswith("gate.") for row in rows), 22)
         self.assertEqual({row["id"] for row in rows if row["id"].startswith("docker.")}, set(docker_contract.REQUIRED_IDS))
         self.assertTrue(all(row["lane"] == "linux-docker" for row in rows if row["id"].startswith("docker.")))
         self.assertTrue(all(row["phase"] in common.LANE_PHASES for row in rows))
@@ -37,6 +38,7 @@ class ContractTests(unittest.TestCase):
         # is one shorter. Indexing from the end says "the plan's final row"
         # rather than restating a length this test does not own.
         self.assertEqual(ids[-1], "gate.definition.reconciliation_fencing")
+        self.assertIn("gate.fork.machine_fork_for_parallel_worktrees", ids)
         self.assertNotIn("gate.faults.measured_network_faults", ids)
         self.assertIn("gate.lifecycle.recovery_including_sleep_wake", ids)
         by_id = {s["id"]: s for s in self.contract["scenarios"]}

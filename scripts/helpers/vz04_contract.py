@@ -62,7 +62,7 @@ def required_scenarios(contract: dict, docker: dict) -> list:
     # missing -- so a scenario quietly dropped is still caught.
     WITHDRAWN = {9}
     criteria = sorted(scenario["criterion"] for scenario in contract["scenarios"])
-    expected = [n for n in range(1, 23) if n not in WITHDRAWN]
+    expected = [n for n in range(1, 24) if n not in WITHDRAWN]
     require(criteria == expected,
             f"contract must map every acceptance criterion in {expected} exactly once "
             f"(withdrawn: {sorted(WITHDRAWN)})")

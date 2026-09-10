@@ -924,7 +924,7 @@
     },
     "scenarios": {
       "type": "array",
-      "minItems": 21, "maxItems": 21,
+      "minItems": 22, "maxItems": 22,
       "items": {
         "type": "object",
         "additionalProperties": false,
@@ -943,7 +943,7 @@
           "criterion": {
             "type": "integer",
             "minimum": 1,
-            "maximum": 22
+            "maximum": 23
           },
           "lane": {
             "enum": [
