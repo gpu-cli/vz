@@ -2834,3 +2834,744 @@ def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path
     (root / "bin/vz").write_text(AGENT_EXEC_CLI.replace("__MODE_FILE__", json.dumps(str(mode_file))))
     (root / "bin/vz").chmod(0o755)
     return seal_fake_release(root)
+
+
+# ---------------------------------------------------------------- criterion 23
+#
+# The stand-ins criterion 23's check needs, and the deliberately wrong ones that
+# make each of its assertions falsifiable offline.
+#
+# Forking is physical: a disk is cloned copy-on-write, a Docker image store
+# arrives with it, and the cost of both is read off the VOLUME rather than off
+# the file. None of that can be modelled by a shell script that prints a status
+# document, so this stand-in does the real filesystem work — it writes a real
+# 32 MiB Machine disk, clones it with `cp -c` (clonefile(2)), and keeps each
+# engine's image and volume list INSIDE that disk's header, so a fork inherits
+# its parent's images for the same reason the product does: the bytes came with
+# the disk.
+#
+# That is what makes the wrong modes worth having. `fork_deep_copy` clones with
+# `cp` instead of `cp -c` and nothing else changes: same file, same size, same
+# per-file allocated size, same image store — and the check must still catch it,
+# because the volume lost 32 MiB. `fork_sparse_stub` is its mirror: a disk that
+# costs nothing and contains nothing, which a free-space measurement alone would
+# happily accept.
+#
+# One mode breaks exactly one claim:
+#   fork_label_ignored      the default label is the raw branch, not the
+#                           normalised one the check computed in advance
+#   fork_lineage_absent     the fork reports no `fork` object
+#   fork_parent_lineage     the declared Machine reports one
+#   fork_shared_machine_id  the fork carries its parent's machine_id
+#   fork_shared_incarnation the fork carries its parent's incarnation_id
+#   fork_shared_context     the fork carries its parent's Docker context,
+#                           endpoint and engine_id
+#   fork_reincarnates_parent  the fork re-mints the PARENT's incarnation
+#   fork_not_ready          the fork never reaches ready
+#   fork_mints_endpoint     the fork republishes its parent's declared endpoint
+#   fork_same_address       the fork answers on its parent's fabric address
+#   fork_same_mac           the fork carries its parent's MAC
+#   fork_other_subnet       the fork lands on a different /24
+#   fork_no_seed            the fork gets no Docker data disk at all
+#   fork_stub_disk          the fork's disk is smaller than its parent's
+#   fork_sparse_stub        the fork's disk is the parent's size but allocates
+#                           nothing, so it cannot hold the parent's bytes
+#   fork_deep_copy          the clone is a byte copy, so the volume pays for it
+#   fork_slow               the fork costs a cold boot
+#   fork_cold_image_store   the fork's image store comes up empty
+#   fork_pulls              the fork's engine pulled the images it holds
+#   fork_shared_engine      parent and fork are one engine wearing two names
+#   fork_wipes_parent_sentinel  the fork takes the parent's Machine-local state
+#   fork_pruned_by_up       reconcile removes the Machines it does not declare
+#   fork_reidentified_by_up reconcile keeps the fork but re-mints its identity
+#   fork_shared_guest       two forks share one guest, so their state is one
+#   fork_exec_falls_back    ambiguous `exec` picks the first Machine and runs
+#   fork_ambiguous_unlisted ambiguous `exec` refuses without naming candidates
+#   fork_delete_declared    `delete --machine <declared>` is honoured
+#   fork_delete_blanket     `delete --machine` refuses without resolving, so an
+#                           unknown label answers exactly like a known fork
+#   fork_delete_generic     the fork refusal carries no code and names nothing
+#   fork_delete_reclaims    the clause that is not implemented yet, implemented:
+#                           the check must then PASS it instead of reporting it
+#   fork_delete_leaks       `delete --machine` reports success and leaves the
+#                           fork's disk behind
+#   fork_env_delete_leaks   deleting the Environment leaves a Machine disk
+
+# One Machine disk, big enough that a byte copy of it is unmistakable against
+# the noise of a `statvfs` window and small enough to write in milliseconds.
+FORK_DISK_BYTES = 32 * 1024 * 1024
+# The disk's first block is its engine's image and volume list. Rewritten in
+# place, so recording an image does not change what the file allocates.
+FORK_DISK_HEADER = 4096
+
+FORK_BUSYBOX = r'''#!/bin/sh
+# Stand-in for the guest BusyBox, for criterion 23 only.
+#
+# The fork check's scripts are rewritten by the `vz` stand-in so that /proc,
+# /sys and /run point into the Machine's own guest tree before they run, which
+# leaves exactly one applet that cannot be a file read: `ip`, whose output is
+# generated per Machine and staged beside that tree. Everything else is the
+# host's own tool, because a Machine-local file read is what the check is
+# actually making a claim about.
+applet=$1
+shift
+case "$applet" in
+  ip) cat "$VZ_FORK_GUEST/ip-addr.txt"; exit 0 ;;
+  sh) exec /bin/sh "$@" ;;
+  *) exec "$applet" "$@" ;;
+esac
+'''
+
+FORK_DOCKER = r'''#!/usr/bin/env python3
+"""UNIT-TEST-ONLY `docker` stand-in whose state lives on the Machine's disk.
+
+The point of the fork is that a Docker image store arrives WITH the cloned
+disk, so this stand-in keeps each engine's images and volumes in the first
+block of that disk's image file and reads them back from wherever `--context`
+points. A fork therefore inherits its parent's images because the bytes were
+copied, not because anything told it to, and an engine that shared its parent's
+disk would be caught by the same read.
+"""
+import json
+import hashlib
+import os
+from pathlib import Path
+import sys
+
+
+def fail(message):
+    sys.stderr.write("docker stand-in: %s\n" % message)
+    raise SystemExit(1)
+
+
+def parse(argv):
+    config, context, rest = None, None, []
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--config" and index + 1 < len(argv):
+            config = argv[index + 1]
+            index += 2
+        elif item == "--context" and index + 1 < len(argv):
+            context = argv[index + 1]
+            index += 2
+        else:
+            rest = argv[index:]
+            break
+    return config, context, rest
+
+
+def engine(config, context):
+    path = Path(config) / "vzfork-contexts" / (context + ".json")
+    if not path.is_file():
+        fail("context %r is not known to this client config" % context)
+    return json.loads(path.read_text())
+
+
+def read_disk(entry):
+    disk = Path(entry["disk"])
+    if not disk.is_file():
+        fail("engine %s has no data disk at %s" % (entry["engine_id"], disk))
+    with open(disk, "rb") as stream:
+        header = stream.read(__HEADER__)
+    text = header.split(b"\0", 1)[0].decode("utf-8").strip()
+    return json.loads(text) if text else {"images": {}, "volumes": []}
+
+
+def write_disk(entry, state):
+    disk = Path(entry["disk"])
+    payload = json.dumps(state, sort_keys=True).encode("utf-8")
+    if len(payload) >= __HEADER__:
+        fail("engine state outgrew the disk header")
+    with open(disk, "r+b") as stream:
+        stream.write(payload + b"\0" * (__HEADER__ - len(payload)))
+
+
+def events(entry):
+    path = Path(entry["events"])
+    if not path.is_file():
+        return []
+    return [line.split(" ", 2) for line in path.read_text().splitlines() if line.strip()]
+
+
+def main(argv):
+    config, context, rest = parse(argv)
+    if config is None or context is None:
+        fail("every invocation is scoped by --config and --context")
+    entry = engine(config, context)
+    if rest[:2] == ["image", "import"]:
+        source, tag = rest[2], rest[3]
+        digest = "sha256:" + hashlib.sha256(Path(source).read_bytes()).hexdigest()
+        state = read_disk(entry)
+        state.setdefault("images", {})[tag] = digest
+        write_disk(entry, state)
+        sys.stdout.write(digest + "\n")
+        return 0
+    if rest[:2] == ["image", "inspect"]:
+        tag = rest[-1]
+        digest = read_disk(entry).get("images", {}).get(tag)
+        if digest is None:
+            sys.stderr.write("Error: No such image: %s\n" % tag)
+            return 1
+        sys.stdout.write(digest + "\n")
+        return 0
+    if rest[:2] == ["image", "ls"]:
+        for digest in sorted(set(read_disk(entry).get("images", {}).values())):
+            sys.stdout.write(digest + "\n")
+        return 0
+    if rest[:1] == ["events"]:
+        wanted = [item.split("=", 1)[1] for item in rest if item.startswith("event=")]
+        for row in events(entry):
+            if len(row) >= 3 and row[1] in wanted:
+                sys.stdout.write(row[2] + "\n")
+        return 0
+    if rest[:2] == ["volume", "create"]:
+        state = read_disk(entry)
+        state.setdefault("volumes", [])
+        if rest[2] not in state["volumes"]:
+            state["volumes"].append(rest[2])
+        write_disk(entry, state)
+        sys.stdout.write(rest[2] + "\n")
+        return 0
+    if rest[:2] == ["volume", "ls"]:
+        for name in read_disk(entry).get("volumes", []):
+            sys.stdout.write(name + "\n")
+        return 0
+    fail("unsupported invocation %r" % (rest,))
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+'''
+
+FORK_VZ = r'''#!/usr/bin/env python3
+"""UNIT-TEST-ONLY `vz` stand-in with Machine-fork semantics.
+
+Real filesystem work, because criterion 23's claims are physical: a 32 MiB
+Machine disk per Machine, cloned with `cp -c` so the volume pays metadata
+rather than bytes, one guest tree per Machine so Machine-local state is
+genuinely per Machine, and a derived fabric identity per (Environment, Machine)
+so a fork lands on its own address of its parent's subnet by construction.
+"""
+import hashlib
+import json
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+import time
+
+MODE_FILE = Path(__MODE_FILE__)
+MODE = MODE_FILE.read_text().strip() if MODE_FILE.is_file() else ""
+HERE = Path(sys.argv[0]).resolve().parent
+RUNTIME = Path(os.environ["VZ_RUNTIME_DATA_DIR"])
+TOPOLOGY = RUNTIME / "topology.json"
+DOCKER_CONFIG = Path(os.environ["VZ_DOCKER_CONFIG"])
+DISK_BYTES = __DISK_BYTES__
+HEADER = __HEADER__
+COLD_SECONDS = 0.4
+FORK_SECONDS = 0.02
+MAX_LABEL = 64
+
+
+def refuse(code, message):
+    sys.stderr.write(json.dumps({"schema_version": 1,
+                                 "error": {"code": code, "message": message}}) + "\n")
+    raise SystemExit(1)
+
+
+def digest(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def label_from_branch(branch):
+    label = ""
+    for character in branch:
+        if character.isascii() and (character.isalnum() or character in "._-"):
+            label += character
+        elif not label.endswith("-"):
+            label += "-"
+        if len(label) >= MAX_LABEL:
+            break
+    start, end = 0, len(label)
+    while start < end and not (label[start].isascii() and label[start].isalnum()):
+        start += 1
+    while end > start and not (label[end - 1].isascii() and label[end - 1].isalnum()):
+        end -= 1
+    return label[start:end][:MAX_LABEL]
+
+
+def parse(argv):
+    options = {"json": False, "verb": None, "tail": [], "fork_from": None, "fork_as": None,
+               "machine": None, "environment": None}
+    index = 0
+    while index < len(argv):
+        item = argv[index]
+        if item == "--":
+            options["tail"] = argv[index + 1:]
+            break
+        if item == "--json":
+            options["json"] = True
+        elif item in ("--fork-from", "--as", "--machine", "--environment", "--timeout",
+                      "--request-id", "--idempotency-key") and index + 1 < len(argv):
+            key = {"--fork-from": "fork_from", "--as": "fork_as", "--machine": "machine",
+                   "--environment": "environment"}.get(item)
+            if key:
+                options[key] = argv[index + 1]
+            index += 1
+        elif item in ("up", "status", "exec", "stop", "delete") and options["verb"] is None:
+            options["verb"] = item
+        index += 1
+    return options
+
+
+def load():
+    if not TOPOLOGY.is_file():
+        refuse("daemon_unavailable",
+               "no compatible runtime daemon is listening on the configured socket")
+    return json.loads(TOPOLOGY.read_text())
+
+
+def save(state):
+    TOPOLOGY.write_text(json.dumps(state, indent=1, sort_keys=True))
+
+
+def fabric(environment_id, machine_id, subnet_salt=""):
+    net = int(digest(environment_id + subnet_salt)[:8], 16)
+    host = int(digest(machine_id)[:8], 16)
+    octet_a, octet_b = net // 256 % 254 + 1, net % 254 + 1
+    octet_c = host % 200 + 2
+    return ("10.%d.%d.%d" % (octet_a, octet_b, octet_c),
+            "02:00:00:%02x:%02x:%02x" % (octet_a, octet_b, octet_c),
+            "192.168.64.%d" % (host % 200 + 20))
+
+
+def stage_guest(machine):
+    """One Machine's own /proc, /sys and /run, as files the check's scripts read."""
+    guest = Path(machine["guest"])
+    (guest / "run").mkdir(parents=True, exist_ok=True)
+    (guest / "proc" / "net").mkdir(parents=True, exist_ok=True)
+    interface = guest / "sys" / "class" / "net" / "enp0s5" / "statistics"
+    interface.mkdir(parents=True, exist_ok=True)
+    (guest / "proc" / "cmdline").write_text(
+        "console=hvc0 vz.net.0=%s,%s/24\n" % (machine["mac"], machine["address"]))
+    (guest / "proc" / "net" / "arp").write_text(
+        "IP address       HW type     Flags       HW address            Mask     Device\n")
+    (interface.parent / "address").write_text(machine["mac"] + "\n")
+    (interface.parent / "operstate").write_text("up\n")
+    (interface.parent / "carrier").write_text("1\n")
+    for counter in ("rx_packets", "tx_packets"):
+        (interface / counter).write_text("0\n")
+    (guest / "ip-addr.txt").write_text(
+        "2: eth0    inet %s/24 brd 192.168.64.255 scope global eth0\n"
+        "3: enp0s5    inet %s/24 brd 10.255.255.255 scope global enp0s5\n"
+        % (machine["nat"], machine["address"]))
+
+
+def store_root(machine):
+    """One Machine's private runtime store.
+
+    Keyed by the Machine's NAME rather than its id, only so that
+    `fork_shared_machine_id` -- which hands a fork its parent's identity -- still
+    produces two stores to compare. Keying it on the id would make that mode
+    collide on the disk path and fail for a reason that is about the fixture
+    rather than about the claim it exists to break.
+    """
+    return RUNTIME / "store" / digest(machine["name"])[:16]
+
+
+def disk_path(machine):
+    return (store_root(machine) / "data" / "docker-machines"
+            / digest(machine["stack_id"]) / "data.img")
+
+
+def create_disk(machine):
+    """A Machine disk with real bytes, so cloning it is measurable."""
+    path = disk_path(machine)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chunk = os.urandom(1024 * 1024)
+    with open(path, "wb") as stream:
+        stream.write(b"\0" * HEADER)
+        written = HEADER
+        while written < DISK_BYTES:
+            stream.write(chunk[:min(len(chunk), DISK_BYTES - written)])
+            written += len(chunk)
+    write_engine_state(machine, {"images": {}, "volumes": []})
+
+
+def read_engine_state(machine):
+    with open(disk_path(machine), "rb") as stream:
+        header = stream.read(HEADER)
+    text = header.split(b"\0", 1)[0].decode("utf-8").strip()
+    return json.loads(text) if text else {"images": {}, "volumes": []}
+
+
+def write_engine_state(machine, state):
+    payload = json.dumps(state, sort_keys=True).encode("utf-8")
+    with open(disk_path(machine), "r+b") as stream:
+        stream.write(payload + b"\0" * (HEADER - len(payload)))
+
+
+def clone_disk(parent, machine):
+    """Copy-on-write, unless a mode says otherwise."""
+    source, destination = disk_path(parent), disk_path(machine)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if MODE == "fork_no_seed":
+        return
+    if MODE == "fork_stub_disk":
+        with open(destination, "wb") as stream:
+            stream.write(b"\0" * HEADER)
+        return
+    if MODE == "fork_sparse_stub":
+        with open(destination, "wb") as stream:
+            stream.write(b"\0" * HEADER)
+            stream.truncate(DISK_BYTES)
+        return
+    argv = ["/bin/cp", "-c", str(source), str(destination)]
+    if MODE == "fork_deep_copy":
+        argv = ["/bin/cp", str(source), str(destination)]
+    subprocess.run(argv, check=True)
+    if MODE == "fork_cold_image_store":
+        write_engine_state(machine, {"images": {}, "volumes": []})
+
+
+def publish_context(machine, share_with=None):
+    directory = DOCKER_CONFIG / "vzfork-contexts"
+    directory.mkdir(parents=True, exist_ok=True)
+    holder = share_with or machine
+    (directory / (machine["context"]["name"] + ".json")).write_text(json.dumps({
+        "engine_id": machine["context"]["engine_id"],
+        "disk": str(disk_path(holder)),
+        "events": str(RUNTIME / "events" / (machine["context"]["engine_id"] + ".log"))}))
+    (RUNTIME / "events").mkdir(parents=True, exist_ok=True)
+
+
+def mint(state, name, fork_origin=None, parent=None):
+    suffix = digest(state["environment_id"] + name)[:16]
+    machine_id = "mch_" + suffix
+    if fork_origin and MODE == "fork_shared_machine_id":
+        machine_id = parent["machine_id"]
+    incarnation = "inc_" + digest(machine_id + str(time.time_ns()))[:16]
+    if fork_origin and MODE == "fork_shared_incarnation":
+        incarnation = parent["incarnation_id"]
+    address, mac, nat = fabric(state["environment_id"], machine_id)
+    if fork_origin and MODE == "fork_same_address":
+        address = fabric(state["environment_id"], parent["machine_id"])[0]
+    if fork_origin and MODE == "fork_same_mac":
+        mac = parent["mac"]
+    if fork_origin and MODE == "fork_other_subnet":
+        address = fabric(state["environment_id"], machine_id, "-elsewhere")[0]
+    context = {"name": "vz-" + suffix, "endpoint": "unix:///tmp/vzfork-" + suffix + ".sock",
+               "engine_id": "eng_" + suffix}
+    if fork_origin and MODE == "fork_shared_context":
+        context = dict(parent["context"])
+    guest = str(RUNTIME / "guest" / machine_id)
+    return {"name": name, "machine_id": machine_id, "incarnation_id": incarnation,
+            "context": context, "address": address, "mac": mac, "nat": nat,
+            "state": "creating" if (fork_origin and MODE == "fork_not_ready") else "ready",
+            "fork": fork_origin, "guest": guest,
+            "stack_id": "stk_" + digest(state["project_id"] + state["environment_id"] + machine_id)[:24]}
+
+
+def create(options):
+    definition = json.loads(Path("vz.json").read_text())
+    declared = definition["environment"]["machines"][0]
+    project_id = definition["project_id"]
+    state = {"project_id": project_id, "environment_id": "env_" + digest(project_id)[:16],
+             "definition_digest": "sha256:" + digest(json.dumps(definition, sort_keys=True)),
+             "networks": definition["environment"].get("networks") or [],
+             "endpoints": definition["environment"].get("endpoints") or [], "machines": []}
+    machine = mint(state, declared["name"])
+    state["machines"].append(machine)
+    RUNTIME.mkdir(parents=True, exist_ok=True)
+    stage_guest(machine)
+    create_disk(machine)
+    publish_context(machine)
+    save(state)
+    time.sleep(COLD_SECONDS)
+    return 0
+
+
+def do_fork(state, options):
+    parents = [row for row in state["machines"]
+               if row["name"] == options["fork_from"] or row["machine_id"] == options["fork_from"]]
+    if not parents:
+        refuse("not_found", "no Machine named `%s` to fork from" % options["fork_from"])
+    parent = parents[0]
+    # `fork_parent_lineage` gives the DECLARED Machine a bogus lineage record so
+    # that the "a declared Machine reports none" assertion can fail. It must not
+    # also make this Machine unforkable, or that one mode would break two
+    # unrelated claims and stop saying which one it caught.
+    if parent.get("fork") and parent["fork"].get("label") != "self":
+        refuse("unsupported_operation",
+               "a fork is seeded from a declared Machine, never from another fork")
+    if options["fork_as"]:
+        if "@" not in options["fork_as"]:
+            refuse("validation_error", "`--as` names a fork address `<machine>@<label>`")
+        machine_name, _, label = options["fork_as"].partition("@")
+        if machine_name != parent["name"]:
+            refuse("validation_error", "`--as %s` does not name a fork of `%s`"
+                   % (options["fork_as"], parent["name"]))
+    else:
+        head = subprocess.run(["/usr/bin/git", "symbolic-ref", "--quiet", "--short", "HEAD"],
+                              capture_output=True, text=True, check=False)
+        branch = head.stdout.strip()
+        if not branch:
+            refuse("validation_error", "this worktree has no checked-out branch to name the fork after")
+        label = branch if MODE == "fork_label_ignored" else label_from_branch(branch)
+    name = "%s@%s" % (parent["name"], label)
+    if any(row["name"] == name for row in state["machines"]):
+        time.sleep(FORK_SECONDS)
+        return 0
+    origin = None if MODE == "fork_lineage_absent" else {
+        "parent_machine_id": parent["machine_id"], "parent_name": parent["name"], "label": label}
+    machine = mint(state, name, fork_origin=origin or {"parent_machine_id": parent["machine_id"],
+                                                       "parent_name": parent["name"], "label": label},
+                   parent=parent)
+    machine["fork"] = origin
+    state["machines"].append(machine)
+    if MODE == "fork_parent_lineage":
+        parent["fork"] = {"parent_machine_id": parent["machine_id"],
+                          "parent_name": parent["name"], "label": "self"}
+    if MODE == "fork_reincarnates_parent":
+        parent["incarnation_id"] = "inc_" + digest(parent["machine_id"] + str(time.time_ns()))[:16]
+    if MODE == "fork_wipes_parent_sentinel":
+        shutil.rmtree(Path(parent["guest"]) / "run", ignore_errors=True)
+        (Path(parent["guest"]) / "run").mkdir(parents=True, exist_ok=True)
+    if MODE == "fork_mints_endpoint":
+        for endpoint in list(state["endpoints"]):
+            state["endpoints"].append(dict(endpoint, machine=machine["name"]))
+    stage_guest(machine)
+    if MODE == "fork_shared_guest":
+        # Only the mutable tree, so this mode breaks the isolation claim and
+        # leaves the fabric identity it stages above alone.
+        run = Path(machine["guest"]) / "run"
+        shutil.rmtree(run, ignore_errors=True)
+        run.symlink_to(Path(parent["guest"]) / "run")
+    clone_disk(parent, machine)
+    publish_context(machine, share_with=parent if MODE == "fork_shared_engine" else None)
+    if MODE == "fork_pulls":
+        log = RUNTIME / "events" / (machine["context"]["engine_id"] + ".log")
+        log.parent.mkdir(parents=True, exist_ok=True)
+        state_on_disk = read_engine_state(machine) if disk_path(machine).is_file() else {"images": {}}
+        for image in sorted(set(state_on_disk.get("images", {}).values())):
+            log.write_text("%d pull %s\n" % (int(time.time()), image))
+    save(state)
+    time.sleep(COLD_SECONDS if MODE == "fork_slow" else FORK_SECONDS)
+    return 0
+
+
+def reconcile(state):
+    if MODE == "fork_pruned_by_up":
+        for machine in [row for row in state["machines"] if row.get("fork")]:
+            shutil.rmtree(store_root(machine), ignore_errors=True)
+        state["machines"] = [row for row in state["machines"] if not row.get("fork")]
+    elif MODE == "fork_reidentified_by_up":
+        for machine in state["machines"]:
+            if machine.get("fork"):
+                machine["machine_id"] = "mch_" + digest(machine["name"] + str(time.time_ns()))[:16]
+    save(state)
+    time.sleep(FORK_SECONDS)
+    return 0
+
+
+def do_up(options):
+    if not TOPOLOGY.is_file():
+        if options["fork_from"]:
+            refuse("not_found", "a fork needs an Environment to fork inside; run `vz up` once first")
+        code = create(options)
+    else:
+        state = load()
+        code = do_fork(state, options) if options["fork_from"] else reconcile(state)
+    sys.stdout.write(json.dumps({"schema_version": 1, "progress": {"completion": {}}}) + "\n")
+    return code
+
+
+def status_document(state):
+    network = (state["networks"] or [{}])[0]
+    network_id = "net_" + digest(state["environment_id"] + (network.get("name") or ""))[:16]
+    machines = []
+    for row in state["machines"]:
+        entry = {"name": row["name"], "machine_id": row["machine_id"], "state": row["state"],
+                 "profile": "developer",
+                 "target": {"os": "linux", "arch": "aarch64", "image": "vz-linux"},
+                 "requested_capabilities": {"capabilities": ["posix_exec"]},
+                 "negotiated_capabilities": {"capabilities": ["posix_exec"]},
+                 "health": "supervised", "incarnation_id": row["incarnation_id"],
+                 "incarnation_generation": 1,
+                 "docker_context": dict(row["context"]),
+                 "docker_context_availability": "persisted_ready_not_live_probed"}
+        if row.get("fork"):
+            entry["fork"] = dict(row["fork"])
+        machines.append(entry)
+    endpoints = []
+    for endpoint in state["endpoints"]:
+        holder = next((row for row in state["machines"] if row["name"] == endpoint["machine"]), None)
+        if holder is None:
+            continue
+        endpoints.append({"name": endpoint["name"], "machine_id": holder["machine_id"],
+                          "network_id": network_id, "protocol": endpoint["protocol"],
+                          "port": endpoint["port"]})
+    return {"schema_version": 1, "request_id": "req-" + digest(state["environment_id"])[:16],
+            "topology_state_source": "persisted", "definition_path": str(Path.cwd() / "vz.json"),
+            "project_id": state["project_id"],
+            "persisted_definition_digest": state["definition_digest"],
+            "environments": [{"environment_id": state["environment_id"], "name": "default",
+                              "state": "ready", "lifecycle_generation": 1, "machines": machines,
+                              "networks": ([{"network_id": network_id, "name": network.get("name"),
+                                             "kind": network.get("kind")}] if network else []),
+                              "network_attachments": [
+                                  {"machine_id": row["machine_id"], "network_id": network_id}
+                                  for row in state["machines"]],
+                              "endpoints": endpoints}]}
+
+
+def do_status(options):
+    state = load()
+    if options["json"]:
+        sys.stdout.write(json.dumps(status_document(state), indent=1) + "\n")
+    else:
+        sys.stdout.write("Environment %s (default) ready\n" % state["environment_id"])
+    return 0
+
+
+def do_exec(options):
+    state = load()
+    rows = state["machines"]
+    selector = options["machine"]
+    if selector is None:
+        if len(rows) > 1 and MODE != "fork_exec_falls_back":
+            listed = ", ".join("%s (%s)" % (row["name"], row["machine_id"]) for row in rows)
+            if MODE == "fork_ambiguous_unlisted":
+                refuse("validation_error", "Machine selection is ambiguous; specify --machine")
+            refuse("validation_error",
+                   "Machine selection is ambiguous; specify --machine (candidates: %s)" % listed)
+        machine = rows[0]
+    else:
+        matched = [row for row in rows
+                   if row["name"] == selector or row["machine_id"] == selector]
+        if not matched:
+            refuse("not_found", "no Machine matches the selected Environment and Machine selectors")
+        if len(matched) > 1:
+            refuse("validation_error", "Machine selection is ambiguous; specify --machine")
+        machine = matched[0]
+    guest = Path(machine["guest"])
+    for relative in ("run", "proc", "sys"):
+        (guest / relative).mkdir(parents=True, exist_ok=True)
+    shim = str(HERE / "busybox-fork-shim")
+    rewritten = []
+    for item in options["tail"]:
+        item = item.replace("/bin/busybox", shim)
+        for relative in ("/run/", "/proc/", "/sys/"):
+            item = item.replace(relative, str(guest) + relative)
+        rewritten.append(item)
+    environment = dict(os.environ, VZ_FORK_GUEST=str(guest))
+    completed = subprocess.run(rewritten, capture_output=True, env=environment, check=False)
+    sys.stdout.buffer.write(completed.stdout)
+    sys.stderr.buffer.write(completed.stderr)
+    return completed.returncode
+
+
+def do_delete(options):
+    state = load()
+    selector = options["machine"]
+    if selector is not None:
+        if "@" not in selector:
+            if MODE == "fork_delete_declared":
+                state["machines"] = [row for row in state["machines"] if row["name"] != selector]
+                save(state)
+                sys.stdout.write(json.dumps({"schema_version": 1, "deleted": [selector]}) + "\n")
+                return 0
+            refuse("invalid_selector",
+                   "`%s` names a declared Machine; only a fork `<machine>@<label>` can be deleted "
+                   "on its own" % selector)
+        if MODE == "fork_delete_blanket":
+            refuse("unsupported_operation", "reclaiming one fork is not implemented")
+        machine = next((row for row in state["machines"] if row["name"] == selector), None)
+        if machine is None:
+            refuse("not_found", "no Machine `%s` in Environment `%s`; `vz status` lists forks with "
+                   "their labels" % (selector, state["environment_id"]))
+        if not machine.get("fork"):
+            refuse("unsupported_operation", "Machine `%s` is declared by the project definition; "
+                   "only a fork can be deleted on its own" % machine["name"])
+        if MODE in ("fork_delete_reclaims", "fork_delete_leaks"):
+            state["machines"] = [row for row in state["machines"] if row["name"] != selector]
+            if MODE != "fork_delete_leaks":
+                shutil.rmtree(store_root(machine), ignore_errors=True)
+            save(state)
+            sys.stdout.write(json.dumps({"schema_version": 1, "deleted": [selector]}) + "\n")
+            return 0
+        if MODE == "fork_delete_generic":
+            refuse("internal_error", "delete failed")
+        refuse("unsupported_operation",
+               "reclaiming fork `%s` on its own is not implemented: every runtime teardown "
+               "primitive is fenced on a persisted Environment-wide lifecycle operation, so a "
+               "fork-scoped Delete needs a scoped lifecycle operation that does not exist yet. "
+               "`vz delete` reclaims the whole Environment, forks included." % machine["name"])
+    keep = None
+    if MODE == "fork_env_delete_leaks" and state["machines"]:
+        keep = state["machines"][0]["machine_id"]
+    TOPOLOGY.unlink()
+    for machine in state["machines"]:
+        if machine["machine_id"] != keep:
+            shutil.rmtree(store_root(machine), ignore_errors=True)
+    shutil.rmtree(RUNTIME / "guest", ignore_errors=True)
+    shutil.rmtree(DOCKER_CONFIG / "vzfork-contexts", ignore_errors=True)
+    sys.stdout.write(json.dumps({"schema_version": 1, "deleted": ["default"]}) + "\n")
+    return 0
+
+
+def main(argv):
+    options = parse(argv)
+    if options["environment"] not in (None, "default"):
+        refuse("environment_not_found",
+               "no Environment named %s in this project" % options["environment"])
+    if options["verb"] == "up":
+        return do_up(options)
+    if options["verb"] == "status":
+        return do_status(options)
+    if options["verb"] == "exec":
+        return do_exec(options)
+    if options["verb"] == "delete":
+        return do_delete(options)
+    if options["verb"] == "stop":
+        sys.stdout.write(json.dumps({"schema_version": 1, "stopped": ["default"]}) + "\n")
+        return 0
+    refuse("definition_not_found", "no vz.json project definition found at or above %s" % Path.cwd())
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv[1:]))
+'''
+
+
+def build_fork_release(root: Path, *, mode_file: Path) -> Path:
+    """A release directory whose `vz` and `docker` model criterion 23.
+
+    Not a signed candidate: these tests call the check directly rather than
+    through lane admission, because the claim under test is what the check
+    asserts about a runtime, not how the lane admits a release.
+    """
+    binaries = root / "bin"
+    binaries.mkdir(mode=0o700, parents=True)
+    substitutions = {"__MODE_FILE__": json.dumps(str(mode_file)),
+                     "__DISK_BYTES__": str(FORK_DISK_BYTES),
+                     "__HEADER__": str(FORK_DISK_HEADER)}
+    for name, text in (("vz", FORK_VZ), ("docker-fork-stand-in", FORK_DOCKER)):
+        for token, value in substitutions.items():
+            text = text.replace(token, value)
+        path = binaries / name
+        path.write_text(text)
+        path.chmod(0o755)
+    (binaries / "busybox-fork-shim").write_text(FORK_BUSYBOX)
+    (binaries / "busybox-fork-shim").chmod(0o755)
+    # `ctx.isolated(provision=True)` points VZ at this as the daemon it may
+    # spawn; the stand-in CLI never spawns one, so it only has to exist.
+    (binaries / "vz-runtimed").write_text("#!/bin/sh\nexit 0\n")
+    (binaries / "vz-runtimed").chmod(0o755)
+    (root / "machine-target-catalog.json").write_bytes(
+        json.dumps(CATALOG, indent=2, sort_keys=True).encode() + b"\n")
+    return root
