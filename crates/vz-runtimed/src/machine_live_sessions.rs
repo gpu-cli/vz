@@ -693,9 +693,20 @@ impl MachineLiveSessions {
                 machine_id: Some(machine.machine_id.clone()),
             };
             lease.require_owner(&owner).map_err(error)?;
-            let fresh = environment.lifecycle_generation == 0
-                && machine.incarnation.is_none()
-                && machine.runtime_identity.is_none();
+            // "Never started" is a fact about this Machine, and the two
+            // identity fields are the whole of it: activation persists both
+            // before a Machine can be considered active, so a Machine that ever
+            // ran carries them across a daemon restart and is still caught
+            // below.
+            //
+            // This used to also require `environment.lifecycle_generation == 0`,
+            // which was an accurate proxy only while the sole way to hold a
+            // never-started Machine was an Environment that had never run.
+            // Forking broke that: `fork_machine_in_environment` mints a
+            // never-started Machine into a settled Environment at any
+            // generation, so an Environment-wide counter answered a per-Machine
+            // question and refused every fork's first Up.
+            let fresh = machine.incarnation.is_none() && machine.runtime_identity.is_none();
             let Some(session) = sessions.machines.get(&machine.machine_id) else {
                 if non_dispatched.contains(&machine.machine_id) {
                     continue;
@@ -2058,6 +2069,67 @@ mod tests {
             updated_at: 1,
             completed_at: None,
         }
+    }
+
+    /// A fork's first Up: a never-started Machine inside an Environment that has
+    /// already run, which is the only shape `--fork-from` ever produces.
+    #[tokio::test]
+    async fn up_admits_a_never_started_machine_in_an_environment_that_has_already_run() {
+        let (mut environment, _stop, _delete) = delete_fixture();
+        // The parent came up: generation is past zero and the Environment is
+        // Ready. The fork is minted Creating with neither identity field, which
+        // is exactly what `plan_machine_fork` produces.
+        environment.state = EnvironmentState::Ready;
+        environment.lifecycle_generation = 4;
+        environment.machines[0].state = MachineState::Creating;
+        environment.machines[0].incarnation = None;
+        environment.machines[0].runtime_identity = None;
+        let sessions = MachineLiveSessions::default();
+        let controller = EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&environment.project_id, &environment.environment_id)
+            .await
+            .unwrap();
+        // No live session exists for it, because it has never been booted.
+        // Before this was scoped to the Machine, the Environment's own
+        // generation made it "previously active" and every fork's first Up was
+        // refused with `state_conflict`.
+        let activations = sessions
+            .activations_for_up(&lease, &environment, &Default::default())
+            .expect("a never-started Machine needs no prior activation to reconstruct");
+        assert!(activations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn up_still_refuses_a_machine_that_ran_and_lost_its_session() {
+        // The exemption is only for Machines that never started. One that did
+        // carries both identity fields across a daemon restart, and an Up that
+        // cannot find its session must still refuse rather than boot a second
+        // VM over a running one.
+        let (mut environment, _stop, _delete) = delete_fixture();
+        environment.state = EnvironmentState::Ready;
+        environment.lifecycle_generation = 4;
+        environment.machines[0].state = MachineState::Ready;
+        environment.machines[0].runtime_identity =
+            Some(vz_runtime_contract::MachineRuntimeIdentity {
+                schema_version: TOPOLOGY_SCHEMA_VERSION,
+                opaque_id: "vm-was-running".into(),
+            });
+        let sessions = MachineLiveSessions::default();
+        let controller = EnvironmentRuntimeController::default();
+        let lease = controller
+            .acquire(&environment.project_id, &environment.environment_id)
+            .await
+            .unwrap();
+        let error = sessions
+            .activations_for_up(&lease, &environment, &Default::default())
+            .expect_err("a Machine that ran has no business being treated as fresh");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown previously active Machine"),
+            "{error}"
+        );
     }
 
     fn delete_fixture() -> (
