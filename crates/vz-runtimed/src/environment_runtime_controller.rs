@@ -416,6 +416,23 @@ impl EnvironmentControllerLease {
             .into_iter()
             .map(|store| store.ok_or_else(|| conflict("a Machine was never admitted a store")))
             .collect::<Result<Vec<_>, _>>()?;
+        // A fork has no declaration to find: it is absent from `vz.json` by
+        // definition, and its name is `<parent>@<label>`, which no spec carries.
+        // Its artifacts are its PARENT's -- it was seeded from that Machine's
+        // disk and shares its target, profile and resources -- so the spec to
+        // load is looked up under the parent's name, reached through the
+        // lineage rather than by trimming the label off a string.
+        let declared_name = |machine: &vz_runtime_contract::MachineInstance| {
+            let Some(origin) = machine.fork.as_ref() else {
+                return Ok(machine.name.clone());
+            };
+            admitted
+                .machines
+                .iter()
+                .find(|candidate| candidate.machine_id == origin.parent_machine_id)
+                .map(|parent| parent.name.clone())
+                .ok_or_else(|| conflict("a fork's parent is absent from its own Environment"))
+        };
         let mut pins = Vec::new();
         let mut native_pins = Vec::new();
         for (store, machine) in stores.iter().zip(&admitted.machines) {
@@ -440,12 +457,13 @@ impl EnvironmentControllerLease {
                     )
                     .await?
                 } else {
+                    let wanted = declared_name(machine)?;
                     let spec = project
                         .definition
                         .environment
                         .machines
                         .iter()
-                        .find(|s| s.name == machine.name)
+                        .find(|s| s.name == wanted)
                         .ok_or_else(|| conflict("missing native Machine specification"))?;
                     crate::native_macos::artifacts::load(Arc::clone(store), resolver.host(), spec)?
                 };
@@ -463,12 +481,13 @@ impl EnvironmentControllerLease {
                 )
                 .await?
             } else {
+                let wanted = declared_name(machine)?;
                 let spec = project
                     .definition
                     .environment
                     .machines
                     .iter()
-                    .find(|spec| spec.name == machine.name)
+                    .find(|spec| spec.name == wanted)
                     .ok_or_else(|| conflict("persisted Machine specification is missing"))?;
                 load_machine_artifacts(Arc::clone(store), resolver.host(), spec).await?
             };
