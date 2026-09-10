@@ -4,7 +4,7 @@
 
 use super::*;
 use crate::environment_switch::plan::plan_environment_fabric;
-use crate::environment_switch::{Disposition, HEADER_LEN, MacAddress, PortId};
+use crate::environment_switch::{Disposition, HEADER_LEN, MacAddress};
 use crate::{RuntimeDaemon, RuntimedConfig};
 use std::sync::Arc;
 use vz_runtime_contract::{
@@ -327,7 +327,18 @@ async fn a_planned_membership_is_a_fabric_two_machines_actually_reach_each_other
         fabric.forward(network.ports[1].port, &frame),
         Disposition::Drop(_)
     ));
-    assert!(switch.ports().contains_key(&PortId(0)));
+    // Exactly the ports the plan named, by identity rather than by a number
+    // this test happens to know: a port's number is its attachment's host
+    // offset, so hardcoding 0 encoded the old positional scheme and would break
+    // again the next time numbering changed.
+    assert_eq!(
+        switch.ports().keys().copied().collect::<BTreeSet<_>>(),
+        network
+            .ports
+            .iter()
+            .map(|port| port.port)
+            .collect::<BTreeSet<_>>()
+    );
     switch.shutdown().await.unwrap();
 }
 

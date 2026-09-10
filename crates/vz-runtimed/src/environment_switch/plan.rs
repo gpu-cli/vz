@@ -462,7 +462,7 @@ pub fn plan_environment_fabric(
         }
         let mut taken = BTreeSet::new();
         let mut ports = Vec::with_capacity(attachments.len());
-        for (index, attachment) in attachments.iter().enumerate() {
+        for attachment in &attachments {
             let offset = assign_host_offset(
                 environment.environment_id.as_str(),
                 network.network_id.as_str(),
@@ -476,10 +476,26 @@ pub fn plan_environment_fabric(
                 attached: attachments.len(),
             })?;
             ports.push(FabricPort {
-                // Port numbers are dense and ordered rather than derived: they
-                // are private to one switch's forwarding table and never leave
-                // this process, so nothing outside needs them to be stable.
-                port: PortId(u32::try_from(index).unwrap_or(u32::MAX)),
+                // A port's number IS its address's host offset, and both are
+                // derived from the attachment.
+                //
+                // This used to be the enumeration index, on the stated grounds
+                // that port numbers are private to one switch's forwarding table
+                // and so nothing needs them to be stable. That was true while a
+                // switch fixed its membership at construction and a plan was
+                // computed once per fabric. It stopped being true when a switch
+                // gained the ability to accept a port while running: a Machine
+                // added to an Environment shifts every index after it, so the
+                // next Up renumbers ports that are already attached. Measured on
+                // hardware -- forking a one-Machine Environment tried to give the
+                // fork port 0, which its parent was already holding.
+                //
+                // The offset is the natural identity because it is already
+                // per-attachment, already unique within the network, and already
+                // the thing the Machine's address is built from, so a port and an
+                // address can never disagree about which attachment they belong
+                // to.
+                port: PortId(offset),
                 attachment_id: attachment.attachment_id.clone(),
                 machine_id: attachment.machine_id.clone(),
                 mac: MacAddress::derive(
@@ -512,12 +528,13 @@ pub fn plan_environment_fabric(
                 }
             }
         }
-        // The edge's port number comes after every Machine's, so a network
-        // that gains or loses an edge does not renumber a Machine's port, and
-        // its address is `GATEWAY_OFFSET`, which `assign_host_offset` never
-        // hands out on any network whether or not that network has an edge.
+        // The edge follows the same rule as every other port: its number is its
+        // address's host offset, `GATEWAY_OFFSET`, which `assign_host_offset`
+        // never hands out on any network whether or not that network has an
+        // edge. Previously it was "one past the last Machine's", which meant a
+        // network that gained a Machine renumbered its edge.
         let gateway = (network.kind == NetworkKind::SimulatedPublic).then(|| FabricGateway {
-            port: PortId(u32::try_from(ports.len()).unwrap_or(u32::MAX)),
+            port: PortId(GATEWAY_OFFSET),
             mac: MacAddress::derive_gateway(
                 environment.environment_id.as_str(),
                 network.network_id.as_str(),

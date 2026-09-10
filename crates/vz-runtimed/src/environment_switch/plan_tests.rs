@@ -460,12 +460,16 @@ fn a_simulated_public_network_plans_an_edge_and_a_private_one_does_not() {
         assert_ne!(port.address, edge.address);
         assert_ne!(port.mac, edge.mac);
     }
-    // A member of the switch like any other station, numbered after every
-    // Machine so no Machine's port number moved.
+    // A member of the switch like any other station, and numbered the same way
+    // every station is: by its address's host offset. It used to be numbered
+    // after the last Machine, which meant a network that GAINED a Machine
+    // renumbered its edge -- invisible while a switch was built once and fatal
+    // once a switch can be added to while running.
     assert_eq!(network.members().len(), network.ports.len() + 1);
-    assert_eq!(
-        edge.port,
-        PortId(u32::try_from(network.ports.len()).unwrap())
+    assert_eq!(edge.port, PortId(GATEWAY_OFFSET));
+    assert!(
+        !network.ports.iter().any(|port| port.port == edge.port),
+        "no Machine may hold the edge's number"
     );
     assert!(edge.mac.is_locally_administered() && !edge.mac.is_group());
 
@@ -895,4 +899,53 @@ fn resolution_depends_only_on_persisted_records_and_not_on_declaration_order() {
 fn an_environment_that_declares_no_endpoint_resolves_no_name() {
     let plan = plan_environment_fabric(&pair_on_one_network()).unwrap();
     assert!(resolved(&plan).is_empty());
+}
+
+#[test]
+fn adding_a_machine_never_renumbers_or_readdresses_the_ones_already_there() {
+    // The property a fork depends on. Its parent is already running and holding
+    // a port on a switch that keeps forwarding, so if planning again with one
+    // more attachment moved the parent's port number, the fork would be handed a
+    // number the parent already holds -- which is exactly what happened on
+    // hardware while port numbers were the enumeration index.
+    // The newcomer's attachment id must sort BEFORE the one already there.
+    // Attachments are planned in attachment-id order, and a fork's id is minted
+    // fresh, so it lands anywhere in that order -- including first. A test whose
+    // newcomer sorts last cannot fail under positional numbering, because the
+    // Machine already there keeps index 0 either way. That was this test's first
+    // draft and it passed against the very bug it is here to catch.
+    let before = plan_environment_fabric(&environment(
+        vec![machine(2)],
+        vec![network(1, NetworkKind::Private, Some("10.42.0.0/24"))],
+        vec![attachment(2, 2, 1)],
+    ))
+    .unwrap();
+    let after = plan_environment_fabric(&environment(
+        vec![machine(1), machine(2)],
+        vec![network(1, NetworkKind::Private, Some("10.42.0.0/24"))],
+        vec![attachment(1, 1, 1), attachment(2, 2, 1)],
+    ))
+    .unwrap();
+
+    let parent_before = &before.networks[0].ports[0];
+    let parent_after = after.networks[0]
+        .ports
+        .iter()
+        .find(|port| port.machine_id == parent_before.machine_id)
+        .expect("the Machine that was already there is still planned");
+    assert_eq!(
+        (parent_after.port, parent_after.address, parent_after.mac),
+        (parent_before.port, parent_before.address, parent_before.mac),
+        "a Machine that was already attached keeps its port number, address and MAC"
+    );
+
+    // And the newcomer is given something nobody holds.
+    let joined = after.networks[0]
+        .ports
+        .iter()
+        .find(|port| port.machine_id != parent_before.machine_id)
+        .expect("the added Machine is planned a port");
+    assert_ne!(joined.port, parent_before.port);
+    assert_ne!(joined.address, parent_before.address);
+    assert_ne!(joined.mac, parent_before.mac);
 }
