@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 use vz_linux::{KernelBundleArtifactIdentity, KernelProfile, verify_kernel_bundle_read_only};
+use vz_runtime_contract::capability_matrix;
 use vz_runtime_contract::{
     Architecture, EnvironmentSpec, HostSpec, MachineBackend, MachineCapability, MachineProfile,
     MachineSpec, NetworkKind, NetworkSpec, OperatingSystem, ProjectDefinition,
@@ -332,16 +333,22 @@ impl ResolvedMachineConfiguration {
                 "persisted MachineSpec differs from the current definition",
             ));
         }
-        if machine
-            .requested_capabilities
-            .contains(MachineCapability::WindowsConsole)
-            || machine
-                .requested_capabilities
-                .contains(MachineCapability::Gui)
-        {
-            return Err(invalid(
-                "persisted Linux target requests an unsupported GUI or Windows console",
-            ));
+        // The checked-in capability matrix decides this, not a hand-kept list
+        // of the two capabilities that were obviously wrong. A persisted
+        // configuration that requests anything this host × target × profile
+        // does not advertise is stale or forged either way.
+        if let Some(unadvertised) = capability_matrix::first_unadvertised(
+            host,
+            machine.target.os,
+            machine.profile,
+            &machine.requested_capabilities,
+        ) {
+            return Err(invalid(&format!(
+                "persisted Linux target requests `{}`, which {} marks {} for this host, target and profile",
+                unadvertised.capability,
+                capability_matrix::MATRIX_PATH,
+                unadvertised.status,
+            )));
         }
         let expected_profile = kernel_profile(machine.profile);
         if self.kernel_profile != expected_profile {
@@ -607,16 +614,21 @@ impl MachineTargetResolver {
                 "no adapter for the requested host/target/architecture pair",
             ));
         }
-        if machine
-            .requested_capabilities
-            .contains(MachineCapability::WindowsConsole)
-            || machine
-                .requested_capabilities
-                .contains(MachineCapability::Gui)
-        {
-            return Err(unsupported(
-                "this Linux appliance has no Windows console or GUI adapter",
-            ));
+        // Selection answers to the checked-in capability matrix, so a Machine
+        // can never be admitted onto an adapter for a capability the matrix
+        // does not advertise for its host × target × profile.
+        if let Some(unadvertised) = capability_matrix::first_unadvertised(
+            self.host,
+            machine.target.os,
+            machine.profile,
+            &machine.requested_capabilities,
+        ) {
+            return Err(unsupported(&format!(
+                "this Linux appliance has no adapter for `{}`, which {} marks {} for this host, target and profile",
+                unadvertised.capability,
+                capability_matrix::MATRIX_PATH,
+                unadvertised.status,
+            )));
         }
         normalized_resources(machine).map_err(unsupported)?;
         let digest = machine

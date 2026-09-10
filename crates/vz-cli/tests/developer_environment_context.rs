@@ -1,14 +1,14 @@
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::{Arc, Barrier};
 
 use tempfile::TempDir;
 use vz_cli::developer_environment_context::{
-    ProcessTopologySelectors, VZ_ENVIRONMENT_ID, VZ_MACHINE_ID, discover_existing_git_workspace,
-    discover_git_workspace,
+    GitWorkspace, ProcessTopologySelectors, VZ_ENVIRONMENT_ID, VZ_MACHINE_ID,
+    discover_existing_git_workspace, resolve_git_workspace,
 };
 use vz_runtime_contract::{
     Architecture, CapabilitySet, EnvironmentSelectionContext, EnvironmentSelectionSource,
@@ -37,7 +37,7 @@ fn read_only_workspace_discovery_does_not_create_a_token() {
 #[test]
 fn read_only_workspace_discovery_preserves_existing_token() {
     let fixture = GitFixture::new();
-    let expected = discover_git_workspace(&fixture.repo).unwrap();
+    let expected = bind_git_workspace(&fixture.repo).unwrap();
     let token_path = expected.git_dir.join("vz/workspace-id");
     let before = std::fs::metadata(&token_path).unwrap().modified().unwrap();
     let token = std::fs::read(&token_path).unwrap();
@@ -55,7 +55,7 @@ fn read_only_workspace_discovery_preserves_existing_token() {
 #[test]
 fn read_only_workspace_discovery_rejects_corruption_without_replacing_it() {
     let fixture = GitFixture::new();
-    let expected = discover_git_workspace(&fixture.repo).unwrap();
+    let expected = bind_git_workspace(&fixture.repo).unwrap();
     let token_path = expected.git_dir.join("vz/workspace-id");
     std::fs::write(&token_path, "corrupt token").unwrap();
     assert!(discover_existing_git_workspace(&fixture.repo).is_err());
@@ -208,7 +208,7 @@ fn project_state(workspace_key: &str, path_hint: &Path) -> ProjectState {
 fn real_linked_worktree_move_preserves_selection_and_new_worktree_does_not_adopt() {
     let fixture = GitFixture::new();
     let first_path = fixture.add_worktree("first");
-    let first = discover_git_workspace(&first_path).unwrap();
+    let first = bind_git_workspace(&first_path).unwrap();
     assert!(first.git_dir.is_absolute());
     assert_eq!(
         std::fs::read_to_string(first.git_dir.join("vz/workspace-id")).unwrap(),
@@ -220,7 +220,7 @@ fn real_linked_worktree_move_preserves_selection_and_new_worktree_does_not_adopt
     store.save_project_state(&state).unwrap();
 
     let moved_path = fixture.move_worktree(&first_path, "moved");
-    let moved = discover_git_workspace(&moved_path.join(".")).unwrap();
+    let moved = bind_git_workspace(&moved_path.join(".")).unwrap();
     assert_eq!(moved.git_dir, first.git_dir);
     assert_eq!(moved.workspace_key, first.workspace_key);
     assert_ne!(moved.path_hint, first.path_hint);
@@ -239,7 +239,7 @@ fn real_linked_worktree_move_preserves_selection_and_new_worktree_does_not_adopt
     );
 
     let second_path = fixture.add_worktree("second");
-    let second = discover_git_workspace(&second_path).unwrap();
+    let second = bind_git_workspace(&second_path).unwrap();
     assert_ne!(second.git_dir, moved.git_dir);
     assert_ne!(second.workspace_key, moved.workspace_key);
     let before = store
@@ -267,8 +267,14 @@ fn real_linked_worktree_move_preserves_selection_and_new_worktree_does_not_adopt
     );
 }
 
+/// Concurrent first binders pick exactly one winner, and it stands.
+///
+/// Resolution no longer publishes, so contenders each mint their own key and
+/// only the no-clobber publish arbitrates. What must hold is that the worktree
+/// ends up carrying exactly one token, that token belongs to a caller that was
+/// told it won, and no loser clobbered it.
 #[test]
-fn concurrent_first_discovery_converges_on_one_token() {
+fn concurrent_first_binding_leaves_exactly_one_winner() {
     let fixture = GitFixture::new();
     let worktree = fixture.add_worktree("concurrent");
     let barrier = Arc::new(Barrier::new(9));
@@ -277,34 +283,129 @@ fn concurrent_first_discovery_converges_on_one_token() {
             let worktree = worktree.clone();
             let barrier = barrier.clone();
             std::thread::spawn(move || {
+                let pending = resolve_git_workspace(&worktree).unwrap();
+                let key = pending.workspace().workspace_key.clone();
+                let git_dir = pending.workspace().git_dir.clone();
                 barrier.wait();
-                discover_git_workspace(&worktree).unwrap()
+                (key, git_dir, pending.commit().is_ok())
             })
         })
         .collect();
     barrier.wait();
 
-    let discovered: Vec<_> = handles
+    let outcomes: Vec<_> = handles
         .into_iter()
         .map(|handle| handle.join().unwrap())
         .collect();
+    let winners: BTreeSet<_> = outcomes
+        .iter()
+        .filter(|(_, _, committed)| *committed)
+        .map(|(key, _, _)| key.clone())
+        .collect();
+    assert_eq!(winners.len(), 1);
+    let persisted = std::fs::read_to_string(outcomes[0].1.join("vz/workspace-id")).unwrap();
+    assert_eq!(Some(&persisted), winners.iter().next());
+}
+
+/// Resolving a never-bound worktree mints an identity and writes nothing.
+///
+/// This is the property a refused `vz up` depends on: the runtime is handed a
+/// workspace key it may refuse, and the worktree it was refused in is byte
+/// identical afterwards.
+#[test]
+fn resolving_an_unbound_worktree_mints_without_touching_it() {
+    let fixture = GitFixture::new();
+    let worktree = fixture.add_worktree("unbound");
+    let before = inventory(&worktree);
+
+    let pending = resolve_git_workspace(&worktree).unwrap();
+    assert!(!pending.is_bound());
+    assert!(pending.workspace().workspace_key.starts_with("wsp_"));
+    assert_eq!(inventory(&worktree), before);
+
+    pending.commit().unwrap();
+    assert!(pending.is_bound() || inventory(&worktree) != before);
     assert_eq!(
-        discovered
-            .iter()
-            .map(|workspace| workspace.workspace_key.as_str())
-            .collect::<BTreeSet<_>>()
-            .len(),
-        1
+        std::fs::read_to_string(pending.workspace().git_dir.join("vz/workspace-id")).unwrap(),
+        pending.workspace().workspace_key
     );
-    let persisted = std::fs::read_to_string(discovered[0].git_dir.join("vz/workspace-id")).unwrap();
-    assert_eq!(persisted, discovered[0].workspace_key);
+}
+
+/// Resolving an already-bound worktree returns its token and writes nothing.
+#[test]
+fn resolving_a_bound_worktree_reuses_its_token_without_touching_it() {
+    let fixture = GitFixture::new();
+    let worktree = fixture.add_worktree("bound");
+    let bound = bind_git_workspace(&worktree).unwrap();
+    let before = inventory(&worktree);
+
+    let pending = resolve_git_workspace(&worktree).unwrap();
+    assert!(pending.is_bound());
+    assert_eq!(pending.workspace(), &bound);
+    assert_eq!(inventory(&worktree), before);
+
+    pending.commit().unwrap();
+    assert_eq!(inventory(&worktree), before);
+}
+
+/// Bind a worktree the way a successful `vz up` does: resolve, then publish.
+fn bind_git_workspace(cwd: &Path) -> anyhow::Result<GitWorkspace> {
+    let pending = resolve_git_workspace(cwd)?;
+    pending.commit()?;
+    Ok(pending.workspace().clone())
+}
+
+/// Every path under `root`, including the private Git metadata, with file
+/// contents, so any appearance, disappearance or edit is a difference.
+fn inventory(root: &Path) -> BTreeMap<PathBuf, Option<Vec<u8>>> {
+    fn walk(root: &Path, at: &Path, into: &mut BTreeMap<PathBuf, Option<Vec<u8>>>) {
+        let mut entries: Vec<_> = std::fs::read_dir(at)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        entries.sort();
+        for path in entries {
+            let relative = path.strip_prefix(root).unwrap().to_path_buf();
+            let metadata = std::fs::symlink_metadata(&path).unwrap();
+            if metadata.is_dir() {
+                into.insert(relative, None);
+                walk(root, &path, into);
+            } else if metadata.is_symlink() {
+                into.insert(
+                    relative,
+                    Some(
+                        std::fs::read_link(&path)
+                            .unwrap()
+                            .into_os_string()
+                            .into_encoded_bytes(),
+                    ),
+                );
+            } else {
+                into.insert(relative, Some(std::fs::read(&path).unwrap()));
+            }
+        }
+    }
+    let mut into = BTreeMap::new();
+    walk(root, root, &mut into);
+    // A linked worktree keeps its private Git directory outside the checkout.
+    let git_dir = resolve_git_workspace(root)
+        .map(|pending| pending.workspace().git_dir.clone())
+        .unwrap();
+    if git_dir.is_dir() && !git_dir.starts_with(root) {
+        let mut private = BTreeMap::new();
+        walk(&git_dir, &git_dir, &mut private);
+        for (path, contents) in private {
+            into.insert(Path::new("<git-dir>").join(path), contents);
+        }
+    }
+    into
 }
 
 #[test]
 fn composition_retains_process_environment_id_above_workspace_binding() {
     let fixture = GitFixture::new();
     let worktree = fixture.add_worktree("selection-composition");
-    let workspace = discover_git_workspace(&worktree).unwrap();
+    let workspace = bind_git_workspace(&worktree).unwrap();
     let mut state = project_state(&workspace.workspace_key, &workspace.path_hint);
     let process_environment = state
         .definition
@@ -334,15 +435,21 @@ fn composition_retains_process_environment_id_above_workspace_binding() {
 }
 
 #[test]
-fn discovery_rejects_non_git_directories_and_invalid_persisted_tokens() {
+fn resolution_rejects_non_git_directories_and_invalid_persisted_tokens() {
     let outside = tempfile::tempdir().unwrap();
-    assert!(discover_git_workspace(outside.path()).is_err());
+    assert!(resolve_git_workspace(outside.path()).is_err());
 
     let fixture = GitFixture::new();
     let worktree = fixture.add_worktree("invalid-token");
-    let discovered = discover_git_workspace(&worktree).unwrap();
+    let discovered = bind_git_workspace(&worktree).unwrap();
     std::fs::write(discovered.git_dir.join("vz/workspace-id"), "not valid").unwrap();
-    assert!(discover_git_workspace(&worktree).is_err());
+    // A corrupt token fails closed; it is never treated as an unbound worktree
+    // and replaced with a freshly minted identity.
+    assert!(resolve_git_workspace(&worktree).is_err());
+    assert_eq!(
+        std::fs::read_to_string(discovered.git_dir.join("vz/workspace-id")).unwrap(),
+        "not valid"
+    );
 }
 
 #[test]
