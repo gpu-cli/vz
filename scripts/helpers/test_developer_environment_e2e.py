@@ -3247,11 +3247,21 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         self.assertLess(lost, int(parent_allocated) // 2)
 
     def test_the_label_rule_is_the_one_the_runtime_contract_publishes(self):
-        """Ported, not asked for: the check must be able to disagree with the runtime."""
-        self.assertEqual(checks.fork_label_from_branch("feat/third-environment"), "feat-third-environment")
+        """Ported, not asked for: the check must be able to disagree with the runtime.
+
+        The table is `a_branch_normalises_into_a_label_by_a_rule_an_agent_can_
+        apply_itself` in vz-runtime-contract's own tests, verbatim, so a change
+        to either side shows up as a disagreement between them rather than as
+        two rules that quietly diverged.
+        """
+        for branch, expected in (("feat-x", "feat-x"),
+                                 ("feat/third-environment", "feat-third-environment"),
+                                 ("james/gpu-mesh", "james-gpu-mesh"),
+                                 ("release/1.2.3", "release-1.2.3"),
+                                 ("--weird--", "weird")):
+            self.assertEqual(checks.fork_label_from_branch(branch), expected, branch)
+            self.assertTrue(checks.is_valid_fork_label(expected), expected)
         self.assertEqual(checks.fork_label_from_branch("main"), "main")
-        self.assertEqual(checks.fork_label_from_branch("release/1.2.x"), "release-1.2.x")
-        self.assertEqual(checks.fork_label_from_branch("-leading/and/trailing-"), "leading-and-trailing")
         self.assertEqual(len(checks.fork_label_from_branch("a" * 200)), checks.MAX_FORK_LABEL_LENGTH)
         for empty in ("", "///", "---"):
             self.assertIsNone(checks.fork_label_from_branch(empty), empty)

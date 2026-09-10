@@ -8932,6 +8932,16 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
         check.check(resolved_exec.exit_code == 0 and AMBIGUOUS_SENTINEL.encode() in resolved_exec.stdout,
                     f"`vz exec --machine {name}` resolves to exactly one Machine and runs "
                     f"(exit {resolved_exec.exit_code})")
+    # And which one, settled by the token round above rather than restated here:
+    # `--machine machine-0` read back the PARENT's token while this worktree was
+    # on `feat/third-environment` and both of its forks existed. The design's
+    # naming section says "`vz exec --machine backend` inside a worktree resolves
+    # to that worktree's fork"; it does not, and this check asserts the
+    # behaviour the resolver actually has -- exact machine_id or exact name --
+    # because that is the one an agent can rely on today.
+    check.ok(f"`--machine {FORK_PARENT}` resolves to the declared Machine and not to this worktree's "
+             f"fork {address!r}: exact-name resolution has no worktree dimension, and the token round "
+             f"above is the evidence")
 
     # ── reclaiming one fork: resolved, then refused ─────────────────────────
     #
