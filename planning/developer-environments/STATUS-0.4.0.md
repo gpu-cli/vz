@@ -120,7 +120,32 @@ instructive than the fixes.
 
 ### Still open
 
-1. **A fork's Docker disk is cloned from a live filesystem** (P0, `vz-5v8.7`).
+1. **`vz up --fork-from` works, and criterion 23 is one assertion from passing**
+   (`vz-5v8.8`). Twelve refusals were found by running the installed binary on
+   real Machines, and eleven are fixed. What the last hardware run proves, all
+   of it on real VMs: the fork boots and joins a fabric its parent is already
+   forwarding on; it holds its own machine_id, incarnation, fabric address, MAC,
+   Docker context and — after a defect found and fixed in this run — its own
+   Docker **engine id**; its image store answers for **every digest its parent
+   held** with **zero image pulls**; a volume created on the parent after the
+   fork is absent from it; the parent's sentinel is byte-identical afterwards;
+   reconcile leaves the fork alone; the fork survives a plain `vz up` keeping
+   its lineage; a second fork with an explicit `--as` succeeds; `vz exec`
+   without `--machine` refuses and names all three candidates.
+
+   And the claim the criterion exists for: **the fork's disk shares its parent's
+   physical blocks, 9 of 9 sampled offsets.** Copy-on-write, measured directly
+   rather than inferred, for the first time.
+
+   The one remaining failure is `FORK_SPEEDUP_MIN`, and it is an assumption
+   rather than a defect: the fork reached ready in 55.6 s against 41.3 s cold,
+   0.74x where 2x is required. A fork's Up clones, boots and replays a journal,
+   while the cold control is the same bare definition that pulls no images — so
+   the fork pays more and saves nothing *measurable against that baseline*. The
+   bound was NOT lowered to make it pass; the write-up asks for a cold control
+   that reaches the warm state the fork inherits.
+
+2. **A fork's Docker disk is cloned from a live filesystem** (P0, `vz-5v8.7`).
    The eleventh and last refusal, and the one that matters: the fork now
    **boots**, joins the running fabric, holds its own identity and address, and
    is then refused inside the guest — `Docker filesystem is not positively
@@ -140,28 +165,28 @@ instructive than the fixes.
    repair and recorded-error refusal untouched. *The only thing still blocking
    criterion 23.*
 
-2. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
+3. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
    change before admission -- `project definition drift`. No plan, no durable
    claim, and a mutable change gets the same code as an immutable one. Neither
    of criterion 22's normative sub-documents has an implementation subject:
    `admit_reconcile_round`, `ReconcileInputSnapshot` and `effective_digest` exist
    nowhere in `crates/`. *Blocks criterion 22 entirely.*
 
-3. **Legacy sandbox migration fabricates negotiated capabilities** (P1) for eight
+4. **Legacy sandbox migration fabricates negotiated capabilities** (P1) for eight
    capabilities, four of which the matrix marks PLANNED. Same false claim as the
    capability fix above, on a different surface -- and it bears on criterion 19's
    "legacy records do not acquire Docker defaults", which PASSES on hardware
    today, so its check does not cover it.
 
-4. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`** (P1). See
+5. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`** (P1). See
    the next section: this one defect produced two false product findings in a
    single night.
 
-5. **No `SecretBinding` exists** (P1) -- not in the project schema, not in
+6. **No `SecretBinding` exists** (P1) -- not in the project schema, not in
    `vz-runtime-contract`. The gate check is written and waiting.
    *Blocks criterion 18's secrets clause.*
 
-6. **A minted-but-never-booted fork cannot be reclaimed** (P2, `vz-5v8.5`).
+7. **A minted-but-never-booted fork cannot be reclaimed** (P2, `vz-5v8.5`).
    Mechanism now confirmed and it is the same one as the eight above:
    `prepare_delete_absence` has two never-started branches and both are keyed on
    the Environment (`lifecycle_generation == 0`, `prior.generation == 1`). A fork
@@ -172,7 +197,7 @@ instructive than the fixes.
    delete governs reclaiming real resources and wants its own hardware evidence,
    which the Up path's does not provide.
 
-7. **A stuck scoped operation has no supersede path** (P2). It blocks every new
+8. **A stuck scoped operation has no supersede path** (P2). It blocks every new
    lifecycle operation on its Environment until replayed with its own request and
    idempotency IDs, which the CLI prints on every run.
 
