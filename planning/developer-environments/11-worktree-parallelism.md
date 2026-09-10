@@ -136,12 +136,29 @@ Forks are addressed as `<machine>@<label>`, where the label is caller-supplied
 at fork time and defaults to the checked-out branch of the worktree that created
 it.
 
-- `vz exec --machine backend` inside a worktree resolves to that worktree's fork.
-- `vz exec --machine backend@feat-y` reaches another worktree's fork explicitly.
-- `vz status` lists forks with their labels, so an agent can discover what exists.
+- `vz exec --machine backend@feat-x` reaches that fork explicitly, from anywhere.
+- `vz exec --machine backend` reaches the DECLARED Machine called `backend`, not
+  a fork of it -- see below.
+- `vz status` lists forks with their labels and their parents, so an agent can
+  discover what exists.
 
-Ambiguity fails closed, listing candidates -- the existing behaviour, and exactly
-what an agent needs in order to correct itself. Labels are caller-supplied rather
+**A bare `--machine backend` does not resolve to the current worktree's fork.**
+This document originally claimed it did. It does not, and it cannot without a
+change nobody has argued for: the resolver matches an exact machine id or an
+exact name, there is no worktree dimension in it, and `backend` is the exact
+name of the declared Machine. So a bare selector reaches the parent. An agent
+addressing a fork names the fork.
+
+That is the better behaviour anyway. A selector whose meaning depends on which
+directory the caller happens to be in is precisely what an agent driving many
+worktrees cannot reason about, and the label rule already lets it compute the
+full address before the fork exists.
+
+Ambiguity therefore never arises from a fork's name: names are unique within an
+Environment, so `--machine <anything>` resolves to exactly one Machine or to
+none. What does fail closed is selection with NO `--machine` when more than one
+Machine exists, and it lists every candidate with its identity -- which is what
+an agent needs in order to correct itself. Labels are caller-supplied rather
 than ordinal because ordinals shift as forks come and go, and an agent must be
 able to predict the name it will target.
 
@@ -157,7 +174,11 @@ vz exec   --machine backend@feat-x -- cargo test
 vz delete --machine backend@feat-x
 ```
 
-`delete` already provides the discard half, which is the half that matters.
+The discard half is NOT free: see the correction above. `vz delete --machine`
+resolves a fork and then refuses, because every runtime teardown primitive is
+fenced on an Environment-wide lifecycle operation. Reclaiming one fork needs a
+machine-scoped lifecycle operation, which is tracked separately and which
+criterion 23 cannot pass without.
 
 ## Performance is part of the contract, not an afterthought
 

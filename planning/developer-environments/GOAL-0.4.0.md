@@ -294,8 +294,11 @@ required E2E scenario and retained evidence:
     reclaims one completely and `vz up` does not prune the others, because a
     fork is a runtime object the definition does not declare and reconcile
     leaves it alone. Two forks of one parent are mutually
-    isolated and individually addressable by their labels; an ambiguous
-    `--machine` fails closed listing them. See
+    isolated and individually addressable by their labels. Selection without a
+    `--machine` fails closed listing every candidate with its identity; a
+    `--machine` naming a fork is never ambiguous, because a fork's name IS
+    `<machine>@<label>` and names are unique within an Environment, so the
+    selector resolves to exactly one Machine or to none. See
     [11-worktree-parallelism.md](11-worktree-parallelism.md).
 
 ## Strict E2E release gate
