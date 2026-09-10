@@ -8496,8 +8496,44 @@ def fork_definition(release_dir: Path) -> dict:
     return definition
 
 
-def first_physical_extent(path: Path) -> int:
-    """Device offset of the first physical extent backing `path`.
+def shared_physical_extents(parent: Path, fork: Path, samples: int = 9) -> tuple:
+    """How many sampled offsets the two files back with the same physical blocks.
+
+    Returns `(shared, sampled, detail)`.
+
+    Sampling rather than one offset, because the FIRST extent is the one a fork
+    is guaranteed to have rewritten: the superblock and journal live at the start
+    of the filesystem, and preparing a forked disk replays that journal and drops
+    the inherited engine id, which copy-on-write splits precisely those blocks.
+    Measured 2026-09-10 -- a genuine clone reported a different first extent from
+    its parent for exactly that reason.
+
+    A clone shares every block it has not since rewritten; a deep copy shares
+    none, anywhere. So the question is not whether one chosen offset matches but
+    how much of the file is still shared, which is also what makes the answer
+    robust to a fork that has begun to diverge.
+    """
+    # The disk paths reach this check as strings, which is how every other
+    # measurement here consumes them.
+    parent, fork = Path(parent), Path(fork)
+    size = parent.stat().st_size
+    shared, detail = 0, []
+    for index in range(samples):
+        offset = (size // (samples + 1)) * (index + 1)
+        left, right = physical_extent_at(parent, offset), physical_extent_at(fork, offset)
+        # `None` is "this file has nothing at that offset", which a stub shorter
+        # than its parent produces at every offset past its end. Two files that
+        # both answer nothing share nothing: comparing them as equal would let a
+        # disk holding NO blocks pass the assertion that it shares its parent's.
+        agreed = left is not None and right is not None and left == right
+        if agreed:
+            shared += 1
+        detail.append(f"{offset}:{'=' if agreed else f'{left}!={right}'}")
+    return shared, samples, " ".join(detail)
+
+
+def physical_extent_at(path: Path, offset: int):
+    """Device offset of the physical extent backing `path` at `offset`, or None.
 
     The DIRECT observation of copy-on-write, where `volume_free_bytes` is an
     indirect one: two files that share blocks report the same offset, and a file
@@ -8512,11 +8548,23 @@ def first_physical_extent(path: Path) -> int:
     different one. Mirrors `vz_macos_provision::clone::first_physical_extent`,
     which is the same call for the same reason on the product side.
     """
-    fd = os.open(path, os.O_RDONLY)
+    if offset >= Path(path).stat().st_size:
+        return None
+    fd = os.open(Path(path), os.O_RDONLY)
     try:
-        buffer = struct.pack("=Iqq", 0, 0, 0)
-        _flags, _contiguous, offset = struct.unpack("=Iqq", fcntl.fcntl(fd, 65, buffer))
-        return offset
+        # F_LOG2PHYS_EXT takes the logical offset as INPUT in the same field it
+        # returns the device offset in, unlike plain F_LOG2PHYS which reads the
+        # file position. Zeroing the struct and seeking instead only ever asked
+        # about offset 0, which is the one offset a forked disk is guaranteed to
+        # have rewritten.
+        buffer = struct.pack("=Iqq", 0, 0, offset)
+        try:
+            _flags, _contiguous, device_offset = struct.unpack("=Iqq", fcntl.fcntl(fd, 65, buffer))
+        except OSError:
+            # A hole, or an offset the filesystem will not map. Either way there
+            # are no blocks here to share.
+            return None
+        return device_offset
     finally:
         os.close(fd)
 
@@ -8986,10 +9034,13 @@ def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
     # boot wrote into the same window. That says nothing about the clone. Two
     # files either share physical blocks or they do not, and that is decidable
     # exactly, so it is recorded as the finding and the delta is kept as context.
-    parent_extent, fork_extent = first_physical_extent(parent_disk), first_physical_extent(fork_disk)
-    check.check(parent_extent == fork_extent,
-                f"the fork's disk shares its parent's physical blocks (both at device offset "
-                f"{parent_extent}): copy-on-write, not a deep copy")
+    shared, sampled, extents = shared_physical_extents(parent_disk, fork_disk)
+    check.check(shared * 2 > sampled,
+                f"the fork's disk still shares most of its parent's physical blocks "
+                f"({shared} of {sampled} sampled offsets): copy-on-write, not a deep copy. "
+                f"A deep copy shares none anywhere; the offsets a fork has rewritten since the "
+                f"clone -- its journal and its own engine id, both at the start -- are expected "
+                f"to differ [{extents}]")
     check.ok(f"the volume moved {free_delta} bytes across the fork window, which spans the fork's own boot "
              f"and is therefore context rather than the measurement (parent allocated {parent_allocated})")
     # Now that the clone has been measured, the control is no longer needed.

@@ -3279,8 +3279,10 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         # delta. The delta's only window spans the fork's own VM boot, so on
         # hardware it measured a 42 MB parent as costing 109 MB; it is recorded
         # as context and asserts nothing.
-        shared = re.search(r"shares its parent's physical blocks \(both at device offset (\d+)\)", assertions)
+        shared = re.search(r"shares most of its parent's physical blocks \((\d+) of (\d+) sampled offsets\)",
+                           assertions)
         self.assertIsNotNone(shared, scenario["assertions"])
+        self.assertGreater(int(shared.group(1)) * 2, int(shared.group(2)))
         self.assertIn("bytes across the fork window", assertions)
         # And the trap that made a per-file measurement useless is still stated:
         # a copy-on-write clone reports its parent's allocated size, so anything

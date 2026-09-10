@@ -89,7 +89,7 @@ pub fn volume_free_bytes(path: &Path) -> Result<u64> {
     Ok(stats.f_frsize.saturating_mul(stats.f_bavail as u64))
 }
 
-/// Device offset of the first physical extent backing `path`.
+/// Device offset of the physical extent backing `path` at `offset`.
 ///
 /// The direct observation of copy-on-write, where [`volume_free_bytes`] is an
 /// indirect one. Two files that share blocks report the same offset; a file
@@ -103,7 +103,7 @@ pub fn volume_free_bytes(path: &Path) -> Result<u64> {
 /// and failed inside a parallel test suite whose neighbours moved more bytes
 /// during the window than the file under test. This function is unaffected by
 /// anything outside the two files.
-pub fn first_physical_extent(path: &Path) -> Result<u64> {
+pub fn physical_extent_at(path: &Path, offset: u64) -> Result<u64> {
     use std::os::unix::io::AsRawFd;
 
     // `struct log2phys` from <sys/fcntl.h>. `repr(C)` reproduces the padding
@@ -117,10 +117,14 @@ pub fn first_physical_extent(path: &Path) -> Result<u64> {
     const F_LOG2PHYS_EXT: i32 = 65;
 
     let file = std::fs::File::open(path)?;
+    // F_LOG2PHYS_EXT takes the logical offset as INPUT in the same field it
+    // returns the device offset in, unlike plain F_LOG2PHYS which reads the
+    // file position. Asking only about offset 0 would ask about the one region a
+    // forked disk is guaranteed to have rewritten -- its superblock and journal.
     let mut mapping = Log2Phys {
         flags: 0,
         contigbytes: 0,
-        devoffset: 0,
+        devoffset: offset as i64,
     };
     // SAFETY: F_LOG2PHYS_EXT takes a pointer to one `struct log2phys`, which
     // `mapping` is: correctly sized, aligned, fully initialised, and exclusively

@@ -145,8 +145,8 @@ fn seeding_a_fork_clones_the_docker_disk_for_free_space_metadata_not_bytes() {
     // offset and a streamed byte copy of the same file reports a different one.
     let destination = docker_data_disk_path(&fork_store, "stack-forked");
     assert_eq!(
-        vz_macos_provision::clone::first_physical_extent(&destination).unwrap(),
-        vz_macos_provision::clone::first_physical_extent(&source).unwrap(),
+        vz_macos_provision::clone::physical_extent_at(&destination, 0).unwrap(),
+        vz_macos_provision::clone::physical_extent_at(&source, 0).unwrap(),
         "the fork's disk does not share its parent's physical blocks: it consumed \
          {consumed} bytes of volume free space, which is a deep copy, not a fork"
     );
@@ -162,8 +162,8 @@ fn seeding_a_fork_clones_the_docker_disk_for_free_space_metadata_not_bytes() {
         writer.sync_all().unwrap();
     }
     assert_ne!(
-        vz_macos_provision::clone::first_physical_extent(&control).unwrap(),
-        vz_macos_provision::clone::first_physical_extent(&source).unwrap(),
+        vz_macos_provision::clone::physical_extent_at(&control, 0).unwrap(),
+        vz_macos_provision::clone::physical_extent_at(&source, 0).unwrap(),
         "a streamed byte copy shares its source's blocks; this measurement cannot \
          tell a clone from a copy and proves nothing"
     );
