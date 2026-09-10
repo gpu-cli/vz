@@ -62,6 +62,7 @@ CRITERION_12 = "gate.agent.deterministic_workers"
 CRITERION_18 = "gate.secrets.snapshots_scoped_redacted"
 CRITERION_20 = "gate.network.exhaustive_denial_matrix"
 CRITERION_22 = "gate.definition.reconciliation_fencing"
+CRITERION_23 = "gate.fork.machine_fork_for_parallel_worktrees"
 HANDOFF_SENTINEL = "state-handoff-sentinel.txt"
 # Run one named sub-check instead of the phase's whole set. A single-claim test
 # otherwise runs every other criterion's checks to assert one thing, which is
@@ -598,7 +599,7 @@ class Lane:
                                            "buildx": self.options.get("buildx-plugin")})
         subchecks = {CRITERION_21: [], CRITERION_15: [], CRITERION_1: [], CRITERION_5: [],
                      CRITERION_2: [], CRITERION_6: [], CRITERION_7: [], CRITERION_17: [],
-                     CRITERION_19: []}
+                     CRITERION_19: [], CRITERION_23: []}
         crash = None
         started = now_ns()
         # One table, so `--only` selects from exactly the set that would
@@ -620,7 +621,8 @@ class Lane:
             ("host_import_export_boundaries", CRITERION_7, checks.check_host_import_export_boundaries),
             ("mixed_profile_topology_status", CRITERION_2, checks.check_mixed_profile_topology_status),
             ("workspace_storage_policy", CRITERION_17, checks.check_workspace_projection_policy),
-            ("install_upgrade_rollback_uninstall", CRITERION_19, checks.check_migration_install_upgrade_rollback_uninstall)
+            ("install_upgrade_rollback_uninstall", CRITERION_19, checks.check_migration_install_upgrade_rollback_uninstall),
+            ("machine_fork", CRITERION_23, checks.check_machine_fork)
         ]
         # A comma-separated set, because some claims are only meaningful beside a
         # control: "this mode broke X and left Y passing" needs both to have run.

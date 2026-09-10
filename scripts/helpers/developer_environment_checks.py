@@ -8323,3 +8323,704 @@ def check_cross_environment_isolation(ctx: CheckContext, top: str, established: 
             check_cross_environment_read(ctx, top, established),
             check_cross_environment_control(ctx, top, established),
             check_cross_environment_events(ctx, top, established)]
+
+
+# ─────────────────────────────────────────────────────────────── criterion 23
+#
+# gate.fork.machine_fork_for_parallel_worktrees — one warm Developer Linux
+# Machine is forked in place, twice, and every clause of the criterion is read
+# off a value the runtime produced rather than off the fact that a command
+# exited 0. See planning/developer-environments/11-worktree-parallelism.md.
+#
+# The one clause that cannot pass is `vz delete --machine`: it resolves the fork
+# and then refuses, because every runtime teardown primitive is fenced on a
+# persisted Environment-wide lifecycle operation whose structure check requires
+# one Machine step per Machine in the Environment. The clause is written and run
+# in full, and the runtime's own refusal is quoted into `not_implemented`.
+
+FORK_PARENT = "machine-0"
+# The branch the default label is derived from, chosen because it exercises the
+# published rule rather than an identity mapping: `/` is outside the label
+# charset, so a runtime that passed the branch through unchanged would produce a
+# different name than the one this check computed before the fork existed.
+FORK_BRANCH = "feat/third-environment"
+FORK_SECOND_LABEL = "feat-y"
+FORK_SENTINEL_PATH = "/run/vz-fork-sentinel"
+FORK_IMAGE_TAG = "vz-fork-warm:1"
+# Longest caller-supplied fork label; mirrors MAX_FORK_LABEL_LENGTH in
+# vz-runtime-contract/src/types/machine_fork.rs.
+MAX_FORK_LABEL_LENGTH = 64
+# "Substantially faster than a cold `up` of the same definition." Both numbers
+# are measured in this run, so the bound is a ratio and never a remembered
+# duration: the fork must reach ready in at most half the cold Up's wall time.
+FORK_SPEEDUP_MIN = 2.0
+# "The volume's free space falls by a small fraction of the parent's allocated
+# size." The window spans the whole `vz up --fork-from`, so it also carries the
+# fork's own boot writes, which is why the bound is a quarter and not the 28 KB
+# a bare `clonefile` costs.
+FORK_FREE_SPACE_FRACTION = 0.25
+# APFS reports a clone's inode as fully allocated because it shares its parent's
+# blocks. Asserted so that nobody "fixes" the free-space measurement above into
+# a per-file one, which would read a perfect copy-on-write clone as a deep copy.
+# Not equality: the fork boots after the clone and writes to its own disk.
+FORK_CLONE_ALLOCATION_FRACTION = 0.9
+# The identity a fork must hold on its own, in the order `fork_identity` reports.
+FORK_IDENTITY_FIELDS = ("machine_id", "incarnation_id", "docker context name",
+                        "docker context endpoint", "docker engine_id")
+
+
+def _fork_label_char(character: str) -> bool:
+    return character.isascii() and (character.isalnum() or character in "._-")
+
+
+def is_valid_fork_label(value: str) -> bool:
+    """Mirrors `is_valid_fork_label` in vz-runtime-contract."""
+    return bool(value) and len(value) <= MAX_FORK_LABEL_LENGTH \
+        and value[0].isascii() and value[0].isalnum() \
+        and all(_fork_label_char(character) for character in value)
+
+
+def fork_label_from_branch(branch: str):
+    """A worktree branch normalised into a fork label, or None.
+
+    A total published rule rather than a lookup, so an agent — and this check —
+    can compute the address a fork will answer to before the fork exists. Ported
+    from `fork_label_from_branch` in vz-runtime-contract, and the port is the
+    point: a check that asked the runtime for the label could not catch a
+    runtime that chose a different one.
+    """
+    label = ""
+    for character in branch:
+        if _fork_label_char(character):
+            label += character
+        elif not label.endswith("-"):
+            label += "-"
+        if len(label) >= MAX_FORK_LABEL_LENGTH:
+            break
+    start, end = 0, len(label)
+    while start < end and not (label[start].isascii() and label[start].isalnum()):
+        start += 1
+    while end > start and not (label[end - 1].isascii() and label[end - 1].isalnum()):
+        end -= 1
+    trimmed = label[start:end][:MAX_FORK_LABEL_LENGTH]
+    return trimmed if is_valid_fork_label(trimmed) else None
+
+
+def fork_definition(release_dir: Path) -> dict:
+    """One Developer Linux Machine on one declared private network.
+
+    A network is declared because the criterion requires the fork to hold "its
+    own derived fabric address": with no network there is no address to compare,
+    and the strongest identity claim would go unproved. The endpoint is declared
+    for the opposite reason — a fork mints none — so the Environment must still
+    report exactly the one its definition declares after two forks exist.
+    """
+    definition = minimal_definition(release_dir)
+    environment = definition["environment"]
+    machine = environment["machines"][0]
+    machine["networks"] = [PRIVATE_NETWORK]
+    environment["networks"] = [{"schema_version": 1, "name": PRIVATE_NETWORK, "kind": "private"}]
+    environment["endpoints"] = [{"schema_version": 1, "name": "probe", "machine": machine["name"],
+                                 "network": PRIVATE_NETWORK, "protocol": "tcp", "port": PRIVATE_PORT}]
+    return definition
+
+
+def volume_free_bytes(path: Path) -> int:
+    """Free space on the volume holding `path`, in bytes.
+
+    `statvfs`, never a per-file size: APFS reports a clone and its parent as
+    fully allocated because they reference the same blocks, so the only
+    observable that tells a copy-on-write clone from a deep copy is how much the
+    VOLUME lost. Measured 2026-09-09: an 80 GiB disk with 32.9 GiB allocated
+    cloned for a 28 KB free-space delta while the clone's `st_blocks` matched
+    its parent's exactly.
+    """
+    stats = os.statvfs(path)
+    return stats.f_bavail * stats.f_frsize
+
+
+def docker_data_disks(runtime: Path) -> dict:
+    """`{path: (logical_bytes, allocated_bytes)}` for every Machine Docker disk.
+
+    A Developer Linux Machine has no root disk — it boots kernel plus initramfs
+    — so its Docker data disk under the Machine runtime store IS its warm state,
+    and it is the one file a fork copies. The registry lays them out by
+    `sha256(stack_id)`, which this check deliberately does not derive: the
+    fork's disk is identified as the one that was not there before, which is a
+    fact about the filesystem rather than about a path convention.
+    """
+    disks = {}
+    for path in sorted(Path(runtime).glob("**/docker-machines/*/data.img")):
+        try:
+            info = path.stat()
+        except OSError:
+            continue
+        disks[str(path)] = (info.st_size, info.st_blocks * 512)
+    return disks
+
+
+def fork_machines(payload) -> dict:
+    """`{machine name: machine}` for the one Environment `payload` reports."""
+    environments = (payload or {}).get("environments") or []
+    if len(environments) != 1:
+        return {}
+    return {machine.get("name"): machine for machine in environments[0].get("machines") or []
+            if machine.get("name")}
+
+
+def fork_identity(machine: dict) -> tuple:
+    """The five identities a fork holds on its own, in FORK_IDENTITY_FIELDS order."""
+    context = machine.get("docker_context") or {}
+    return (machine.get("machine_id"), machine.get("incarnation_id"), context.get("name"),
+            context.get("endpoint"), context.get("engine_id"))
+
+
+def fork_sentinel_write(ctx: CheckContext, check: SubCheck, label: str, instance: dict, machine: str,
+                        token: str) -> bool:
+    """Write one Machine's own token into its initramfs, and read it straight back.
+
+    Machine-scoped rather than `sentinel_write`'s Environment-scoped form,
+    because the whole point here is which Machine answered. `/run` is on the
+    initramfs and not on the Docker data disk the fork copies, so a token
+    written into one Machine is that Machine's alone — which is what makes the
+    isolation claim below falsifiable rather than a restatement of the naming.
+    """
+    row = ctx.run(check, label,
+                  ["exec", "--environment", "default", "--machine", machine, "--", "/bin/busybox", "sh", "-c",
+                   f"printf %s {token} > {FORK_SENTINEL_PATH}; cat {FORK_SENTINEL_PATH}"],
+                  cwd=instance["project"], env=instance["env"], timeout=120)
+    return check.check(row.exit_code == 0 and row.stdout.strip() == token.encode(),
+                       f"{machine}: its own sentinel token was written and read back "
+                       f"(exit {row.exit_code}, observed {row.stdout[:80]!r})")
+
+
+def fork_sentinel_read(ctx: CheckContext, check: SubCheck, label: str, instance: dict, machine: str):
+    """Whatever one Machine holds at the fork sentinel path, plus a terminator.
+
+    The terminator distinguishes an empty file from an absent one, which is the
+    difference between "this Machine was never written to" and "the read went
+    nowhere".
+    """
+    return ctx.run(check, label,
+                   ["exec", "--environment", "default", "--machine", machine, "--", "/bin/busybox", "sh", "-c",
+                    f"cat {FORK_SENTINEL_PATH} 2>/dev/null; printf END"],
+                   cwd=instance["project"], env=instance["env"], timeout=120)
+
+
+def fork_receipt(ctx: CheckContext, label: str):
+    """The recorded receipt one invocation was filed under, for its wall time.
+
+    `provision` asserts its own Up and does not hand the receipt back, and the
+    criterion's performance clause needs the cold Up's duration measured in this
+    same run rather than remembered. Every label this check looks up is already
+    lowercase alphanumerics and dashes, which `Recorder.label_for` leaves
+    unchanged, so the recorded label is the one that was asked for.
+    """
+    return next((receipt for receipt in reversed(ctx.recorder.receipts) if receipt.label == label), None)
+
+
+def fork_docker(ctx: CheckContext, check: SubCheck, label: str, instance: dict, context: str, argv: list,
+                *, timeout: int = 120):
+    """The Mac's own Docker client, aimed at one Machine's private engine."""
+    return ctx.run_tool(check, label, [ctx.docker_client, "--config", str(instance["env"]["VZ_DOCKER_CONFIG"]),
+                                       "--context", context, *argv],
+                        cwd=instance["project"], env=instance["env"], timeout=timeout)
+
+
+def fork_image_ids(receipt) -> set:
+    """Every image id one `docker image ls --no-trunc` listing reported."""
+    return {line.strip() for line in receipt.stdout.decode("utf-8", "replace").splitlines()
+            if line.strip().startswith("sha256:")}
+
+
+def fork_error(receipt) -> tuple:
+    """`(code, message)` from a structured CLI refusal, or `(None, raw stderr)`."""
+    text = receipt.stderr.decode("utf-8", "replace")
+    lines = [line for line in text.splitlines() if line.strip()]
+    try:
+        payload = json.loads(lines[-1]) if lines else {}
+    except (json.JSONDecodeError, IndexError):
+        return None, text
+    error = payload.get("error") if isinstance(payload, dict) else None
+    if not isinstance(error, dict):
+        return None, text
+    return error.get("code"), error.get("message") or text
+
+
+def check_machine_fork(ctx: CheckContext, top: str) -> SubCheck:
+    """Criterion 23: fork a warm Developer Linux Machine inside its Environment.
+
+    The order is the order the claims depend on each other, so the first thing
+    to fail names the clause that broke rather than the whole feature.
+
+    *Warm* first, and physically: the parent is given a Docker image the host
+    imported from a tarball, so the disk the fork copies actually holds
+    something and `parent allocated size` is not a number near zero that every
+    later bound would satisfy trivially.
+
+    *A cold Up of the same definition* is measured next and then deleted again,
+    so the comparison the criterion demands is against a duration observed in
+    this run and the fork's free-space window is not polluted by a second
+    Environment's boot.
+
+    *The address is computed before it exists.* The parent worktree is moved
+    onto `feat/third-environment` and the fork is taken with no `--as` at all,
+    so the name the runtime chooses is compared against the one this check
+    derived from the published normalisation rule. A runtime that resolved the
+    label some other way produces a different name and fails here.
+
+    *Cost* is read off the volume, never off the file. APFS reports a clone's
+    inode as fully allocated because it shares its parent's blocks, so both are
+    asserted: the fork's disk reports its parent's allocated size, AND the
+    volume lost a small fraction of it. The first without the second would pass
+    for a deep copy; the second without the first invites someone to "fix" the
+    measurement into the per-file one that cannot tell them apart.
+
+    *Identity, address and engine* are each compared as values against the
+    parent's, and the parent's own five identities and sentinel bytes are
+    compared before and after — the shape criterion 11 uses for a neighbouring
+    Environment.
+
+    *Inherited warm state* is a value comparison too: the image ids the parent
+    held must all be answerable by the fork's own engine, with that engine
+    reporting zero image pulls, and a volume created on the parent AFTER the
+    fork must be absent from the fork — otherwise "two engines" and "one engine
+    answering twice" are indistinguishable.
+
+    *Reconcile leaves forks alone*, *two forks are mutually isolated and
+    individually addressable*, and *ambiguous selection fails closed listing the
+    candidates* close the criterion. `vz delete --machine` is written and run in
+    full and reports the runtime's own refusal, which is the honest outcome
+    while the machine-scoped lifecycle operation it needs does not exist.
+    """
+    check = SubCheck(top, "machine_fork")
+    if not ctx.docker_client or ctx.docker_client == "none":
+        # The criterion's warm-state clause is a claim about a Docker image
+        # store, and a Developer Machine cannot reach ready without a client in
+        # any case, so with none there is nothing to fork and nothing was
+        # attempted. Reported the way criterion 5 reports a host with no
+        # registered macOS template: a statement about this run's inputs, which
+        # is FAIL and can never be mistaken for a pass.
+        check.not_implemented = ("criterion 23 forks a warm Machine and reads its inherited Docker image "
+                                 "store; this lane was given no Docker client (--docker none), so no "
+                                 "Developer Machine could reach ready and no clause was attempted")
+        return check.finish()
+    try:
+        definition = fork_definition(ctx.release_dir)
+    except (StopIteration, KeyError, OSError) as error:
+        check.fail(f"cannot derive a Developer target from the release machine-target-catalog: {error}")
+        return check.finish()
+    schema_path = ctx.repo_root / PROJECT_DEFINITION_SCHEMA
+    if not schema_path.is_file():
+        check.fail(f"project definition schema absent: {PROJECT_DEFINITION_SCHEMA}")
+        return check.finish()
+    problems = sorted(Draft202012Validator(load_json(schema_path)).iter_errors(definition),
+                      key=lambda e: list(map(str, e.absolute_path)))
+    check.check(not problems, "the forkable one-Machine definition validates against the authoring schema"
+                if not problems else f"definition invalid: {problems[0].message[:200]}")
+    if problems:
+        return check.finish()
+
+    # ── the parent, warmed ────────────────────────────────────────────────────
+    parent = provision(ctx, check, "fk-p", definition)
+    if parent.get("unsupported"):
+        check.not_implemented = ("declared networks and endpoints are not applied by this runtime: " +
+                                 parent["unsupported"][:300])
+        return check.finish()
+    if check.status != "PASS" or not parent["status"]:
+        return check.finish()
+    runtime = ctx.state.isolate_runtime("fk-p")
+    before_machines = fork_machines(parent["status"])
+    if not check.check(sorted(before_machines) == [FORK_PARENT],
+                       f"the Environment holds exactly its one declared Machine before the fork "
+                       f"(observed {sorted(before_machines)}, declared [{FORK_PARENT!r}])"):
+        return check.finish()
+    parent_row = before_machines[FORK_PARENT]
+    parent_identity = fork_identity(parent_row)
+    if not check.check(all(parent_identity),
+                       f"the parent reports every identity a fork must not share ({parent_identity})"):
+        return check.finish()
+    parent_context = parent_identity[2]
+    parent_token = "vzfork-p-" + uuid.uuid4().hex[:12]
+    if not fork_sentinel_write(ctx, check, "fk-p-warm", parent, FORK_PARENT, parent_token):
+        return check.finish()
+
+    # An image the parent's engine holds and no registry does: imported from a
+    # host tarball, so "the fork did not pull it" is true because a pull was
+    # never possible, and the digest comparison below is against a value this
+    # run minted rather than against a public image that could be anywhere.
+    marker = ctx.evidence_dir / "fork-warm-marker"
+    write_exclusive(marker, ("vz fork warm state " + uuid.uuid4().hex + "\n").encode())
+    check.evidence.append("fork-warm-marker")
+    tarball = ctx.evidence_dir / "fork-warm-image.tar"
+    packed = ctx.run_tool(check, "fk-warm-tar", ["/usr/bin/tar", "-cf", str(tarball), "-C",
+                                                 str(ctx.evidence_dir), "fork-warm-marker"],
+                          cwd=parent["project"], env=parent["env"])
+    check.check(packed.exit_code == 0 and tarball.is_file(),
+                f"a filesystem tarball for the warm image was written (exit {packed.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+    check.evidence.append("fork-warm-image.tar")
+    imported = fork_docker(ctx, check, "fk-p-import", parent, parent_context,
+                           ["image", "import", str(tarball), FORK_IMAGE_TAG])
+    check.check(imported.exit_code == 0,
+                f"the warm image was imported into the parent's own engine (exit {imported.exit_code}, "
+                f"{imported.stderr[:200]!r})")
+    if check.status != "PASS":
+        return check.finish()
+    named = fork_docker(ctx, check, "fk-p-image-id", parent, parent_context,
+                        ["image", "inspect", "--format", "{{.Id}}", FORK_IMAGE_TAG])
+    parent_image = named.stdout.decode("utf-8", "replace").strip()
+    check.check(named.exit_code == 0 and parent_image.startswith("sha256:"),
+                f"the parent's engine resolves {FORK_IMAGE_TAG} to an image digest (observed {parent_image!r})")
+    listed = fork_docker(ctx, check, "fk-p-images", parent, parent_context,
+                         ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"])
+    parent_images = fork_image_ids(listed)
+    check.check(listed.exit_code == 0 and parent_image in parent_images,
+                f"the parent's image store holds {len(parent_images)} digest(s) including the imported one "
+                f"({sorted(parent_images)})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── the control: a cold Up of the same definition, in this same run ───────
+    cold_definition = copy.deepcopy(definition)
+    cold_definition["project_id"] = "prj_" + uuid.uuid4().hex
+    # Recorded, not asserted: the parent Environment is live inside this window,
+    # so the number carries the noise a one-Machine bound must not. It is what a
+    # first run on real Machines needs in order to judge whether the bound below
+    # is the right one, and revising that bound is a product decision rather
+    # than a repair to the measurement.
+    cold_free_before = volume_free_bytes(ctx.state.socket_root)
+    cold = provision(ctx, check, "fk-c", cold_definition)
+    cold_free_after = volume_free_bytes(ctx.state.socket_root)
+    if check.status != "PASS" or not cold["status"]:
+        return check.finish()
+    cold_up = fork_receipt(ctx, "fk-c-up")
+    if not check.check(cold_up is not None and cold_up.elapsed_ns,
+                       "the cold Up's wall time was recorded in this run"):
+        return check.finish()
+    cold_seconds = cold_up.elapsed_ns / 1e9
+    check.ok(f"cold up of the same definition: {cold_seconds:.3f}s, "
+             f"{cold_free_before - cold_free_after} bytes of volume free space")
+    # Removed before the fork is taken: a second Environment booting inside the
+    # free-space window would be charged to the clone.
+    removed = ctx.run(check, "fk-c-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                      cwd=cold["project"], env=cold["env"], timeout=DELETE_TIMEOUT)
+    check.check(removed.exit_code == 0, f"the cold control Environment was deleted again (exit {removed.exit_code})")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── the fork, addressed by a name computed before it existed ─────────────
+    branched = ctx.run_tool(check, "fk-p-branch", [GIT, "checkout", "--quiet", "-b", FORK_BRANCH],
+                            cwd=parent["project"], env=parent["env"])
+    check.check(branched.exit_code == 0, f"the parent worktree moved onto {FORK_BRANCH} (exit {branched.exit_code})")
+    head = ctx.run_tool(check, "fk-p-head", [GIT, "symbolic-ref", "--quiet", "--short", "HEAD"],
+                        cwd=parent["project"], env=parent["env"])
+    observed_branch = head.stdout.decode("utf-8", "replace").strip()
+    check.check(observed_branch == FORK_BRANCH,
+                f"the worktree the fork will be named after is on {FORK_BRANCH!r} (observed {observed_branch!r})")
+    if check.status != "PASS":
+        return check.finish()
+    label = fork_label_from_branch(FORK_BRANCH)
+    address = f"{FORK_PARENT}@{label}"
+    check.ok(f"the published label rule maps branch {FORK_BRANCH!r} to {address!r} before any fork exists")
+
+    disks_before = docker_data_disks(runtime)
+    if not check.check(len(disks_before) == 1,
+                       f"the parent holds exactly one Docker data disk to be cloned "
+                       f"(observed {sorted(disks_before)})"):
+        return check.finish()
+    parent_disk = next(iter(disks_before))
+    free_before = volume_free_bytes(runtime)
+    # No `--as`: the default label is the clause under test.
+    forked = ctx.run(check, "fk-fork-up", ["--json", "up", "--fork-from", FORK_PARENT],
+                     cwd=parent["project"], env=parent["env"], timeout=UP_TIMEOUT)
+    free_after = volume_free_bytes(runtime)
+    disks_after = docker_data_disks(runtime)
+    fork_seconds = forked.elapsed_ns / 1e9
+    detail = fork_error(forked)[1] if forked.exit_code != 0 else ""
+    check.check(forked.exit_code == 0,
+                f"`vz up --fork-from {FORK_PARENT}` exit {forked.exit_code} (expected 0){detail[:200]}")
+    if check.status != "PASS":
+        return check.finish()
+
+    # ── cost: the volume, and the trap in reading the file instead ───────────
+    minted = sorted(set(disks_after) - set(disks_before))
+    check.check(len(minted) == 1,
+                f"exactly one new Docker data disk appeared for the fork (observed {len(minted)}: {minted})")
+    if len(minted) != 1:
+        return check.finish()
+    fork_disk = minted[0]
+    parent_logical, parent_allocated = disks_after[parent_disk]
+    fork_logical, fork_allocated = disks_after[fork_disk]
+    free_delta = free_before - free_after
+    check.ok(f"parent disk {parent_disk}: {parent_logical} bytes logical, {parent_allocated} allocated")
+    check.ok(f"fork disk {fork_disk}: {fork_logical} bytes logical, {fork_allocated} allocated")
+    check.check(fork_logical == parent_logical,
+                f"the fork's disk carries its parent's logical size (fork {fork_logical}, parent {parent_logical})")
+    check.check(parent_allocated > 0 and fork_allocated >= parent_allocated * FORK_CLONE_ALLOCATION_FRACTION,
+                f"the fork's disk reports its parent's allocated size, which is why per-file size cannot be the "
+                f"measurement (fork {fork_allocated}, parent {parent_allocated}, floor "
+                f"{int(parent_allocated * FORK_CLONE_ALLOCATION_FRACTION)})")
+    budget = int(parent_allocated * FORK_FREE_SPACE_FRACTION)
+    check.check(free_delta <= budget,
+                f"the volume lost {free_delta} bytes across the fork, at most {budget} "
+                f"({FORK_FREE_SPACE_FRACTION:g} of the parent's {parent_allocated} allocated bytes): "
+                f"copy-on-write, not a deep copy")
+    check.check(fork_seconds * FORK_SPEEDUP_MIN <= cold_seconds,
+                f"the fork reached ready in {fork_seconds:.3f}s against {cold_seconds:.3f}s for a cold up of the "
+                f"same definition in this run, a {cold_seconds / fork_seconds if fork_seconds else 0:.2f}x "
+                f"speed-up (required at least {FORK_SPEEDUP_MIN:g}x)")
+
+    # ── identity, lineage and the parent left alone ──────────────────────────
+    after = read_status(ctx, check, "fk-after-fork", project=parent["project"], env=parent["env"])
+    machines = fork_machines(after)
+    check.check(sorted(machines) == sorted([FORK_PARENT, address]),
+                f"the Environment now holds its declared Machine and the fork it computed the name of "
+                f"(observed {sorted(machines)}, expected {sorted([FORK_PARENT, address])})")
+    if address not in machines:
+        return check.finish()
+    fork_row = machines[address]
+    origin = fork_row.get("fork")
+    expected_origin = {"parent_machine_id": parent_identity[0], "parent_name": FORK_PARENT, "label": label}
+    check.check(origin == expected_origin,
+                f"the fork reports its lineage (observed {origin}, expected {expected_origin})")
+    check.check("fork" not in machines[FORK_PARENT],
+                f"the declared Machine reports no lineage at all (observed {machines[FORK_PARENT].get('fork')!r})")
+    forked_identity = fork_identity(fork_row)
+    for field, mine, theirs in zip(FORK_IDENTITY_FIELDS, forked_identity, parent_identity):
+        check.check(mine and mine != theirs,
+                    f"the fork's {field} is its own (fork {mine!r}, parent {theirs!r})")
+    check.check(fork_identity(machines[FORK_PARENT]) == parent_identity,
+                f"the parent kept all five of its identities across the fork "
+                f"(before {parent_identity}, after {fork_identity(machines[FORK_PARENT])})")
+    check.check(fork_row.get("state") == "ready" and machines[FORK_PARENT].get("state") == "ready",
+                f"both Machines are ready (fork {fork_row.get('state')!r}, parent "
+                f"{machines[FORK_PARENT].get('state')!r})")
+    # A fork mints no endpoints, no host exports and no host imports: those names
+    # are Environment-unique and a host export owns a host port.
+    endpoints = (after or {}).get("environments", [{}])[0].get("endpoints") or []
+    declared_endpoint = definition["environment"]["endpoints"][0]
+    check.check([(e.get("name"), e.get("machine_id")) for e in endpoints] ==
+                [(declared_endpoint["name"], parent_identity[0])],
+                f"the Environment still publishes exactly its one declared endpoint, on the parent "
+                f"(observed {[(e.get('name'), e.get('machine_id')) for e in endpoints]})")
+
+    # ── the fork's own derived fabric address ───────────────────────────────
+    ports = {}
+    for name, tag in ((FORK_PARENT, "parent"), (address, "fork")):
+        probed = machine_exec(ctx, check, "fk-port-" + tag, parent, name, FABRIC_PROBE)
+        state = FabricState(probed)
+        port = state.port()
+        if not check.check(probed.exit_code == 0 and port is not None,
+                           f"{name} carries the one fabric address the host derived ({state.evidence()})"):
+            return check.finish()
+        check.check(port["mac"] == state.declared[0][0],
+                    f"{name}'s fabric NIC {port['name']} carries the MAC the host planned "
+                    f"(cmdline {state.declared[0][0]}, interface {port['mac']})")
+        check.check(port["operstate"] == "up" and port["carrier"] == "1",
+                    f"{name}'s fabric NIC {port['name']} is up with carrier (operstate "
+                    f"{port['operstate']}, carrier {port['carrier']})")
+        ports[name] = port
+    parent_address, fork_address = ports[FORK_PARENT]["address"], ports[address]["address"]
+    check.check(parent_address != fork_address,
+                f"the fork derived its own fabric address (fork {fork_address}, parent {parent_address})")
+    check.check(parent_address.rsplit(".", 1)[0] == fork_address.rsplit(".", 1)[0],
+                f"the fork is a sibling on the parent's subnet (fork {fork_address}, parent {parent_address})")
+    check.check(ports[FORK_PARENT]["mac"] != ports[address]["mac"],
+                f"the fork derived its own MAC (fork {ports[address]['mac']}, parent {ports[FORK_PARENT]['mac']})")
+
+    # ── the warm state the fork exists for ──────────────────────────────────
+    fork_context = forked_identity[2]
+    inherited = fork_docker(ctx, check, "fk-fork-images", parent, fork_context,
+                            ["image", "ls", "--all", "--no-trunc", "--format", "{{.ID}}"])
+    fork_images = fork_image_ids(inherited)
+    absent = sorted(parent_images - fork_images)
+    check.check(inherited.exit_code == 0 and not absent,
+                f"the fork's image store answers for every digest its parent held "
+                f"(parent {sorted(parent_images)}, fork {sorted(fork_images)}, missing {absent})")
+    resolved = fork_docker(ctx, check, "fk-fork-image-id", parent, fork_context,
+                           ["image", "inspect", "--format", "{{.Id}}", FORK_IMAGE_TAG])
+    check.check(resolved.exit_code == 0 and
+                resolved.stdout.decode("utf-8", "replace").strip() == parent_image,
+                f"the fork resolves {FORK_IMAGE_TAG} to the parent's digest without being told about it "
+                f"(observed {resolved.stdout[:120]!r}, expected {parent_image})")
+    # The engine's own record of what it fetched, since it started: the fork
+    # holds these images because they arrived on the disk, not because it pulled.
+    events = fork_docker(ctx, check, "fk-fork-pulls", parent, fork_context,
+                         ["events", "--since", "1", "--until", str(int(time.time()) + 1),
+                          "--filter", "type=image", "--filter", "event=pull", "--format", "{{.Actor.ID}}"])
+    pulls = [line for line in events.stdout.decode("utf-8", "replace").splitlines() if line.strip()]
+    check.check(events.exit_code == 0 and len(pulls) == 0,
+                f"the fork's engine records {len(pulls)} image pull(s) since it started, expected 0 "
+                f"({pulls[:5]})")
+    # Two engines, not one answering twice: something created on the parent
+    # AFTER the clone must not be visible to the fork.
+    volume_name = "vzfork-parent-only-" + uuid.uuid4().hex[:12]
+    created = fork_docker(ctx, check, "fk-p-volume", parent, parent_context, ["volume", "create", volume_name])
+    check.check(created.exit_code == 0, f"a volume was created on the parent's engine after the fork "
+                f"(exit {created.exit_code})")
+    for name, context, expected in ((FORK_PARENT, parent_context, True), (address, fork_context, False)):
+        volumes = fork_docker(ctx, check, "fk-volumes-" + ("parent" if expected else "fork"), parent, context,
+                              ["volume", "ls", "--format", "{{.Name}}"])
+        present = volume_name in volumes.stdout.decode("utf-8", "replace").split()
+        check.check(volumes.exit_code == 0 and present == expected,
+                    f"{name}'s engine {'holds' if expected else 'does not hold'} the post-fork volume "
+                    f"{volume_name} (observed present={present})")
+
+    # ── the parent is still serving, and unchanged ──────────────────────────
+    reread = fork_sentinel_read(ctx, check, "fk-p-after", parent, FORK_PARENT)
+    check.check(reread.exit_code == 0 and reread.stdout.strip() == (parent_token + "END").encode(),
+                f"the parent returns byte-identical sentinel data after the fork "
+                f"(observed {reread.stdout[:80]!r}, expected {(parent_token + 'END').encode()!r})")
+
+    # ── `vz up` does not prune a fork ───────────────────────────────────────
+    reconciled = ctx.run(check, "fk-reconcile-up", ["--json", "up"], cwd=parent["project"], env=parent["env"],
+                         timeout=UP_TIMEOUT)
+    check.check(reconciled.exit_code == 0, f"a plain `vz up` over an Environment holding a fork succeeds "
+                f"(exit {reconciled.exit_code})")
+    settled = fork_machines(read_status(ctx, check, "fk-after-reconcile", project=parent["project"],
+                                        env=parent["env"]))
+    check.check(sorted(settled) == sorted([FORK_PARENT, address]),
+                f"reconcile left the fork the definition does not declare (observed {sorted(settled)})")
+    if address in settled:
+        check.check(settled[address].get("machine_id") == forked_identity[0] and
+                    settled[address].get("fork") == expected_origin,
+                    f"the fork kept its identity and lineage across an up (observed "
+                    f"{settled[address].get('machine_id')!r}/{settled[address].get('fork')}, expected "
+                    f"{forked_identity[0]!r}/{expected_origin})")
+
+    # ── two forks: mutually isolated, individually addressable ──────────────
+    second = f"{FORK_PARENT}@{FORK_SECOND_LABEL}"
+    twin = ctx.run(check, "fk-fork2-up", ["--json", "up", "--fork-from", FORK_PARENT, "--as", second],
+                   cwd=parent["project"], env=parent["env"], timeout=UP_TIMEOUT)
+    check.check(twin.exit_code == 0, f"`vz up --fork-from {FORK_PARENT} --as {second}` exit {twin.exit_code} "
+                f"(expected 0){fork_error(twin)[1][:200] if twin.exit_code else ''}")
+    if check.status != "PASS":
+        return check.finish()
+    three = fork_machines(read_status(ctx, check, "fk-after-twin", project=parent["project"], env=parent["env"]))
+    check.check(sorted(three) == sorted([FORK_PARENT, address, second]),
+                f"the Environment holds the parent and both forks (observed {sorted(three)})")
+    if second not in three:
+        return check.finish()
+    check.check(len({fork_identity(three[name])[0] for name in (FORK_PARENT, address, second)}) == 3,
+                f"all three Machines hold distinct identities (observed "
+                f"{[fork_identity(three[name])[0] for name in (FORK_PARENT, address, second)]})")
+    tokens = {name: "vzfork-" + uuid.uuid4().hex[:12] for name in (FORK_PARENT, address, second)}
+    for index, (name, token) in enumerate(sorted(tokens.items())):
+        if not fork_sentinel_write(ctx, check, f"fk-token-{index}", parent, name, token):
+            return check.finish()
+    for index, (name, token) in enumerate(sorted(tokens.items())):
+        row = fork_sentinel_read(ctx, check, f"fk-token-back-{index}", parent, name)
+        check.check(row.exit_code == 0 and row.stdout.strip() == (token + "END").encode(),
+                    f"{name} reads back its own token and no sibling's (observed {row.stdout[:80]!r}, "
+                    f"expected {(token + 'END').encode()!r})")
+
+    # ── ambiguous selection fails closed, listing every candidate ───────────
+    #
+    # Proved in both directions: the ambiguous form must refuse AND run nothing,
+    # and the labelled form must succeed, or "fails closed" is indistinguishable
+    # from "exec is broken". `--machine <parent>` is deliberately included: a
+    # fork's name is `<parent>@<label>`, and `UNIQUE(environment_id, name)` makes
+    # exact-name resolution unambiguous by construction, so the parent's own
+    # selector must still resolve to the parent and not become ambiguous.
+    #
+    # Recorded because it contradicts the criterion as written: criterion 23 says
+    # "an ambiguous `--machine` fails closed listing them", and `--machine`
+    # cannot be ambiguous across a parent and its forks. `machine_exec`'s
+    # resolver matches an exact `machine_id` or an exact `name`, and a fork's
+    # name is `<parent>@<label>`, so the three selectors below name three
+    # different Machines and never a set. The ambiguity the runtime does fail
+    # closed on is a selection with NO `--machine` at all, which is what is
+    # exercised here.
+    check.ok("`--machine` cannot be ambiguous across a parent and its forks: resolution is by exact "
+             "machine_id or exact name and a fork's name is `<parent>@<label>`, so the ambiguity "
+             "proved below is the one that exists -- a selection with no --machine at all")
+    ambiguous = ctx.run(check, "fk-exec-ambiguous",
+                        ["--json", "exec", "--environment", "default", "--", "/bin/busybox", "sh", "-c",
+                         f"/bin/busybox echo {AMBIGUOUS_SENTINEL}"],
+                        cwd=parent["project"], env=parent["env"], timeout=120)
+    refusal = fork_error(ambiguous)[1]
+    check.check(ambiguous.exit_code != 0 and AMBIGUOUS_SENTINEL.encode() not in ambiguous.stdout,
+                f"`vz exec` without --machine refuses and runs nothing (exit {ambiguous.exit_code}, "
+                f"stdout {ambiguous.stdout[:80]!r})")
+    candidates = [f"{name} ({fork_identity(three[name])[0]})" for name in sorted(three)]
+    missing = [candidate for candidate in candidates if candidate not in refusal]
+    check.check("ambiguous" in refusal and not missing,
+                f"the refusal says the selection is ambiguous and names every candidate with its identity "
+                f"(missing {missing}, message {refusal[:300]!r})")
+    for name in sorted(three):
+        resolved_exec = machine_exec(ctx, check, "fk-exec-" + str(sorted(three).index(name)), parent, name,
+                                     f"/bin/busybox echo {AMBIGUOUS_SENTINEL}")
+        check.check(resolved_exec.exit_code == 0 and AMBIGUOUS_SENTINEL.encode() in resolved_exec.stdout,
+                    f"`vz exec --machine {name}` resolves to exactly one Machine and runs "
+                    f"(exit {resolved_exec.exit_code})")
+    # And which one, settled by the token round above rather than restated here:
+    # `--machine machine-0` read back the PARENT's token while this worktree was
+    # on `feat/third-environment` and both of its forks existed. The design's
+    # naming section says "`vz exec --machine backend` inside a worktree resolves
+    # to that worktree's fork"; it does not, and this check asserts the
+    # behaviour the resolver actually has -- exact machine_id or exact name --
+    # because that is the one an agent can rely on today.
+    check.ok(f"`--machine {FORK_PARENT}` resolves to the declared Machine and not to this worktree's "
+             f"fork {address!r}: exact-name resolution has no worktree dimension, and the token round "
+             f"above is the evidence")
+
+    # ── reclaiming one fork: resolved, then refused ─────────────────────────
+    #
+    # Written and run in full. The three answers below differ from each other,
+    # which is what proves `--machine` was RESOLVED before it was refused: a
+    # blanket refusal would answer all three identically.
+    declared = ctx.run(check, "fk-delete-declared",
+                       ["--json", "delete", "--environment", "default", "--machine", FORK_PARENT,
+                        "--timeout", "120"],
+                       cwd=parent["project"], env=parent["env"], timeout=DELETE_TIMEOUT)
+    code, message = fork_error(declared)
+    check.check(declared.exit_code != 0 and code in ("invalid_selector", "unsupported_operation") and
+                FORK_PARENT in message,
+                f"deleting the declared Machine on its own is refused, naming it (exit {declared.exit_code}, "
+                f"code {code!r}, message {message[:200]!r})")
+    unknown = f"{FORK_PARENT}@no-such-label"
+    absent_fork = ctx.run(check, "fk-delete-unknown",
+                          ["--json", "delete", "--environment", "default", "--machine", unknown,
+                           "--timeout", "120"],
+                          cwd=parent["project"], env=parent["env"], timeout=DELETE_TIMEOUT)
+    code, message = fork_error(absent_fork)
+    check.check(absent_fork.exit_code != 0 and code == "not_found" and unknown in message,
+                f"deleting a fork that does not exist is a not_found naming the selector (exit "
+                f"{absent_fork.exit_code}, code {code!r}, message {message[:200]!r})")
+    reclaimed = ctx.run(check, "fk-delete-fork",
+                        ["--json", "delete", "--environment", "default", "--machine", second, "--timeout", "120"],
+                        cwd=parent["project"], env=parent["env"], timeout=DELETE_TIMEOUT)
+    code, message = fork_error(reclaimed)
+    unimplemented = ""
+    if reclaimed.exit_code == 0:
+        # The clause the criterion actually asks for. If it ever passes, the
+        # reclamation has to be proved rather than announced.
+        gone = fork_machines(read_status(ctx, check, "fk-after-reclaim", project=parent["project"],
+                                         env=parent["env"]))
+        check.check(sorted(gone) == sorted([FORK_PARENT, address]),
+                    f"`vz delete --machine {second}` reclaimed exactly that fork (observed {sorted(gone)})")
+        check.check(len(docker_data_disks(runtime)) == 2,
+                    f"the reclaimed fork's Docker data disk is gone (observed "
+                    f"{sorted(docker_data_disks(runtime))})")
+    else:
+        check.check(code == "unsupported_operation" and second in message,
+                    f"`vz delete --machine {second}` resolved the fork and refused for a stated reason "
+                    f"(exit {reclaimed.exit_code}, code {code!r}, message {message[:300]!r})")
+        unimplemented = (f"`vz delete --machine {second}` resolves the fork and then refuses: " +
+                         message[:400])
+
+    # Cleanup last, and only when nothing above failed: a failed run's
+    # Environment is the evidence. Deleting the Environment reclaims both forks,
+    # which is what the runtime offers while a Machine-scoped one does not exist.
+    if not check.failures:
+        final = ctx.run(check, "fk-p-delete", ["--json", "delete", "--environment", "default", "--timeout", "120"],
+                        cwd=parent["project"], env=parent["env"], timeout=DELETE_TIMEOUT)
+        check.check(final.exit_code == 0,
+                    f"the Environment, forks included, was deleted afterwards (exit {final.exit_code})")
+        left = docker_data_disks(runtime)
+        check.check(not left, f"no Machine Docker data disk survived the delete (observed {sorted(left)})")
+    if unimplemented:
+        check.not_implemented = unimplemented
+    return check.finish()

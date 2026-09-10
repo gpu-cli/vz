@@ -82,9 +82,16 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 #
 # `grpc_api_live_agreement` is deliberately absent from this set: the release
 # now ships vz-runtime-probe, so criterion 15's typed channel is exercised.
+#
+# `machine_fork` forks a warm Developer Linux Machine and reads the Docker image
+# store the fork inherited, and this fixture passes `--docker none` -- no
+# Developer Machine reaches ready without a client, so nothing is attempted and
+# the check says so rather than grading a criterion it never exercised. Its
+# whole surface is proved against a stand-in that DOES fork, in
+# `CriterionTwentyThreeTests`, where every assertion has a mode that breaks it.
 NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall",
                    "mixed_profile_topology_status", "public_like_ingress",
-                   "host_import_export_boundaries"}
+                   "host_import_export_boundaries", "machine_fork"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -3091,3 +3098,329 @@ class _CrossReceipt:
     def __init__(self, stdout: bytes, stderr: bytes = b""):
         self.stdout = stdout
         self.stderr = stderr
+
+
+TOP23 = e2e.CRITERION_23
+FORK_SLUG = "machine_fork"
+
+
+class CriterionTwentyThreeTests(unittest.TestCase):
+    """Criterion 23's one sub-check, with every claim broken on purpose.
+
+    These call the check directly against a stand-in release that DOES fork a
+    Machine, because the lane's own `FAKE_VZ` models neither forking nor Docker
+    and the fixture passes `--docker none`, so against it the check reports
+    `not_implemented` and proves nothing.
+
+    The stand-in does real filesystem work rather than printing a status
+    document: a 32 MiB Machine disk per Machine, cloned with `cp -c`
+    (clonefile(2)), with each engine's image and volume list living in that
+    disk's first block. That is what makes the cost claims falsifiable offline
+    — `fork_deep_copy` changes nothing a per-file measurement could see and the
+    check must still catch it, and `fork_sparse_stub` is its mirror, a clone
+    that costs nothing because it contains nothing.
+
+    The last test is the important one: against a conformant runtime this check
+    still reports FAIL, because `vz delete --machine` resolves the fork and then
+    refuses. `fork_delete_reclaims` is the same run with that one clause
+    implemented, and the check must then PASS.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-c23-", dir="/private/tmp"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.mode_file = self.tmp / "mode"
+        self.release = support.build_fork_release(self.tmp / "release", mode_file=self.mode_file)
+        self.docker = self.release / "bin" / "docker-fork-stand-in"
+        self.runs = 0
+
+    def fork(self, mode: str = "") -> dict:
+        """Run the whole sub-check once under `mode`; return its scenario."""
+        self.mode_file.write_text(mode)
+        self.runs += 1
+        evidence = self.tmp / f"evidence-{self.runs}"
+        evidence.mkdir()
+        # One lane state per run: `ctx.isolated` creates its isolate exclusively,
+        # so two runs sharing a state root would collide on the second `fk-p`
+        # rather than on anything this check claims.
+        state = recorder.LaneState(self.tmp / f"state-{self.runs}", self.release / "bin")
+        state.create()
+        self.addCleanup(shutil.rmtree, state.socket_root, ignore_errors=True)
+        ctx = checks.CheckContext(repo_root=common.REPO_ROOT, release_dir=self.release, state=state,
+                                  recorder=recorder.Recorder(evidence, RUN_ID), evidence_dir=evidence,
+                                  cli_removal={}, docker_client=str(self.docker))
+        return checks.check_machine_fork(ctx, TOP23).scenario()
+
+    @staticmethod
+    def failures(scenario) -> list:
+        return [line for line in scenario["assertions"] if line.startswith("FAILED: ")]
+
+    @staticmethod
+    def unproved(scenario) -> list:
+        return [line for line in scenario["assertions"] if line.startswith("not_implemented:")]
+
+    def assert_broken(self, scenario, needle, mode):
+        """FAIL for a stated reason, not for want of having run."""
+        self.assertEqual(scenario["status"], "FAIL", (mode, scenario["assertions"]))
+        failures = self.failures(scenario)
+        self.assertTrue(any(needle in line for line in failures), (mode, needle, failures))
+        return failures
+
+    def broken(self, mode, needle):
+        return self.assert_broken(self.fork(mode), needle, mode)
+
+    # -- the conformant runtime ----------------------------------------------------------
+    def test_a_conformant_runtime_proves_every_clause_but_the_one_that_is_not_built(self):
+        scenario = self.fork()
+        self.assertEqual(self.failures(scenario), [], scenario["assertions"])
+        # It still FAILs, and for exactly one stated reason.
+        self.assertEqual(scenario["status"], "FAIL")
+        gaps = self.unproved(scenario)
+        self.assertEqual(len(gaps), 1, scenario["assertions"])
+        self.assertIn("resolves the fork and then refuses", gaps[0])
+        self.assertIn("machine-0@feat-y", gaps[0])
+        self.assertTrue(scenario["evidence"])
+        assertions = "\n".join(scenario["assertions"])
+        for needle in (
+            "the forkable one-Machine definition validates",
+            "the published label rule maps branch 'feat/third-environment' to "
+            "'machine-0@feat-third-environment' before any fork exists",
+            "the Environment now holds its declared Machine and the fork it computed the name of",
+            "the fork reports its lineage",
+            "the declared Machine reports no lineage at all",
+            "the fork's machine_id is its own",
+            "the fork's incarnation_id is its own",
+            "the fork's docker context name is its own",
+            "the fork's docker context endpoint is its own",
+            "the fork's docker engine_id is its own",
+            "the parent kept all five of its identities across the fork",
+            "the Environment still publishes exactly its one declared endpoint, on the parent",
+            "the fork derived its own fabric address",
+            "the fork is a sibling on the parent's subnet",
+            "the fork derived its own MAC",
+            "exactly one new Docker data disk appeared for the fork",
+            "the fork's disk carries its parent's logical size",
+            "the fork's disk reports its parent's allocated size",
+            "copy-on-write, not a deep copy",
+            "the fork reached ready in",
+            "the fork's image store answers for every digest its parent held",
+            "the fork resolves vz-fork-warm:1 to the parent's digest without being told about it",
+            "image pull(s) since it started, expected 0",
+            "does not hold the post-fork volume",
+            "the parent returns byte-identical sentinel data after the fork",
+            "reconcile left the fork the definition does not declare",
+            "the fork kept its identity and lineage across an up",
+            "the Environment holds the parent and both forks",
+            "reads back its own token and no sibling's",
+            "refuses and runs nothing",
+            "names every candidate with its identity",
+            "resolves to exactly one Machine and runs",
+            "deleting the declared Machine on its own is refused, naming it",
+            "deleting a fork that does not exist is a not_found naming the selector",
+            "resolved the fork and refused for a stated reason",
+            "the Environment, forks included, was deleted afterwards",
+            "no Machine Docker data disk survived the delete",
+        ):
+            self.assertIn(needle, assertions, needle)
+
+    def test_the_measured_numbers_are_reported_not_merely_bounded(self):
+        """The two performance numbers and the free-space delta are in evidence."""
+        import re
+
+        scenario = self.fork()
+        assertions = "\n".join(scenario["assertions"])
+        speed = re.search(r"the fork reached ready in ([0-9.]+)s against ([0-9.]+)s", assertions)
+        self.assertIsNotNone(speed, scenario["assertions"])
+        forked, cold = float(speed.group(1)), float(speed.group(2))
+        self.assertGreater(cold, forked * checks.FORK_SPEEDUP_MIN)
+        volume = re.search(r"the volume lost (-?\d+) bytes across the fork, at most (\d+)", assertions)
+        self.assertIsNotNone(volume, scenario["assertions"])
+        lost, budget = int(volume.group(1)), int(volume.group(2))
+        self.assertLessEqual(lost, budget)
+        # The trap the criterion was rewritten for: a copy-on-write clone reports
+        # its parent's allocated size, so the volume is the only thing that can
+        # tell it from a deep copy.
+        allocations = re.findall(r"disk .*: (\d+) bytes logical, (\d+) allocated", assertions)
+        self.assertEqual(len(allocations), 2, scenario["assertions"])
+        (_pl, parent_allocated), (_fl, fork_allocated) = allocations
+        self.assertGreaterEqual(int(fork_allocated), int(parent_allocated) * 0.9)
+        self.assertLess(lost, int(parent_allocated) // 2)
+
+    def test_the_label_rule_is_the_one_the_runtime_contract_publishes(self):
+        """Ported, not asked for: the check must be able to disagree with the runtime.
+
+        The table is `a_branch_normalises_into_a_label_by_a_rule_an_agent_can_
+        apply_itself` in vz-runtime-contract's own tests, verbatim, so a change
+        to either side shows up as a disagreement between them rather than as
+        two rules that quietly diverged.
+        """
+        for branch, expected in (("feat-x", "feat-x"),
+                                 ("feat/third-environment", "feat-third-environment"),
+                                 ("james/gpu-mesh", "james-gpu-mesh"),
+                                 ("release/1.2.3", "release-1.2.3"),
+                                 ("--weird--", "weird")):
+            self.assertEqual(checks.fork_label_from_branch(branch), expected, branch)
+            self.assertTrue(checks.is_valid_fork_label(expected), expected)
+        self.assertEqual(checks.fork_label_from_branch("main"), "main")
+        self.assertEqual(len(checks.fork_label_from_branch("a" * 200)), checks.MAX_FORK_LABEL_LENGTH)
+        for empty in ("", "///", "---"):
+            self.assertIsNone(checks.fork_label_from_branch(empty), empty)
+
+    def test_a_lane_with_no_docker_client_reports_the_criterion_unproved(self):
+        """The shape the lane fixture produces, and it must never look like a pass."""
+        self.mode_file.write_text("")
+        self.runs += 1
+        evidence = self.tmp / f"evidence-nodocker-{self.runs}"
+        evidence.mkdir()
+        state = recorder.LaneState(self.tmp / f"state-nodocker-{self.runs}", self.release / "bin")
+        state.create()
+        self.addCleanup(shutil.rmtree, state.socket_root, ignore_errors=True)
+        ctx = checks.CheckContext(repo_root=common.REPO_ROOT, release_dir=self.release, state=state,
+                                  recorder=recorder.Recorder(evidence, RUN_ID), evidence_dir=evidence,
+                                  cli_removal={}, docker_client="none")
+        scenario = checks.check_machine_fork(ctx, TOP23).scenario()
+        self.assertEqual(scenario["status"], "FAIL")
+        self.assertEqual(self.failures(scenario), [])
+        self.assertEqual(len(self.unproved(scenario)), 1, scenario["assertions"])
+        self.assertIn("no clause was attempted", self.unproved(scenario)[0])
+
+    # -- naming and lineage --------------------------------------------------------------
+    def test_a_default_label_that_is_not_the_published_normalisation_fails(self):
+        """The whole value of the rule is that an agent can compute the name."""
+        self.broken("fork_label_ignored", "the Environment now holds its declared Machine and the fork")
+
+    def test_a_fork_that_reports_no_lineage_fails(self):
+        self.broken("fork_lineage_absent", "the fork reports its lineage")
+
+    def test_a_declared_machine_that_reports_lineage_fails(self):
+        self.broken("fork_parent_lineage", "the declared Machine reports no lineage at all")
+
+    # -- identity ------------------------------------------------------------------------
+    def test_a_fork_carrying_its_parents_machine_id_fails(self):
+        self.broken("fork_shared_machine_id", "the fork's machine_id is its own")
+
+    def test_a_fork_carrying_its_parents_incarnation_fails(self):
+        self.broken("fork_shared_incarnation", "the fork's incarnation_id is its own")
+
+    def test_a_fork_bound_to_its_parents_docker_context_fails(self):
+        """A context pointing at a fork's engine while naming the parent's
+        incarnation is precisely the confusion this release must not ship."""
+        failures = self.broken("fork_shared_context", "the fork's docker context name is its own")
+        self.assertTrue(any("docker engine_id is its own" in line for line in failures), failures)
+
+    def test_a_fork_that_re_mints_its_parents_incarnation_fails(self):
+        self.broken("fork_reincarnates_parent", "the parent kept all five of its identities")
+
+    def test_a_fork_that_never_reaches_ready_fails(self):
+        self.broken("fork_not_ready", "both Machines are ready")
+
+    def test_a_fork_that_republishes_its_parents_endpoint_fails(self):
+        """Endpoint names are Environment-unique and a host export owns a host
+        port, so a fork mints none."""
+        self.broken("fork_mints_endpoint", "still publishes exactly its one declared endpoint")
+
+    # -- the derived fabric address ------------------------------------------------------
+    def test_a_fork_answering_on_its_parents_address_fails(self):
+        self.broken("fork_same_address", "the fork derived its own fabric address")
+
+    def test_a_fork_carrying_its_parents_mac_fails(self):
+        self.broken("fork_same_mac", "the fork derived its own MAC")
+
+    def test_a_fork_on_a_different_subnet_fails(self):
+        """Siblings on one fabric is the claim; a different /24 is not it."""
+        self.broken("fork_other_subnet", "the fork is a sibling on the parent's subnet")
+
+    # -- cost ----------------------------------------------------------------------------
+    def test_a_fork_with_no_seeded_disk_fails(self):
+        self.broken("fork_no_seed", "exactly one new Docker data disk appeared")
+
+    def test_a_disk_smaller_than_its_parents_fails(self):
+        self.broken("fork_stub_disk", "the fork's disk carries its parent's logical size")
+
+    def test_a_sparse_stub_that_costs_nothing_because_it_holds_nothing_fails(self):
+        """Free space alone would accept this, which is why the per-file
+        allocated size is asserted beside it."""
+        failures = self.broken("fork_sparse_stub", "reports its parent's allocated size")
+        self.assertFalse(any("copy-on-write, not a deep copy" in line for line in failures), failures)
+
+    def test_a_deep_copy_fails_even_though_every_per_file_measurement_agrees(self):
+        """The trap the criterion was rewritten for. Same path, same logical
+        size, same per-file allocated size, same image store -- and 32 MiB of
+        volume gone."""
+        failures = self.broken("fork_deep_copy", "copy-on-write, not a deep copy")
+        self.assertFalse(any("logical size" in line or "allocated size" in line for line in failures),
+                         failures)
+
+    def test_a_fork_that_costs_a_cold_boot_fails(self):
+        self.broken("fork_slow", "the fork reached ready in")
+
+    # -- the warm state the fork exists for ----------------------------------------------
+    def test_a_fork_whose_image_store_comes_up_empty_fails(self):
+        failures = self.broken("fork_cold_image_store", "answers for every digest its parent held")
+        self.assertTrue(any("to the parent's digest without being told" in line for line in failures),
+                        failures)
+
+    def test_a_fork_that_pulled_the_images_it_holds_fails(self):
+        """Present is not inherited: an engine that fetched them from a registry
+        proves nothing about the disk."""
+        self.broken("fork_pulls", "image pull(s) since it started, expected 0")
+
+    def test_one_engine_wearing_two_names_fails(self):
+        """Something created on the parent AFTER the clone must not be visible
+        to the fork, or 'two engines' and 'one engine answered twice' are the
+        same observation."""
+        self.broken("fork_shared_engine", "does not hold the post-fork volume")
+
+    def test_a_fork_that_takes_its_parents_machine_local_state_fails(self):
+        self.broken("fork_wipes_parent_sentinel", "byte-identical sentinel data after the fork")
+
+    # -- reconcile ------------------------------------------------------------------------
+    def test_an_up_that_prunes_the_machines_the_definition_does_not_declare_fails(self):
+        self.broken("fork_pruned_by_up", "reconcile left the fork the definition does not declare")
+
+    def test_an_up_that_re_mints_a_forks_identity_fails(self):
+        self.broken("fork_reidentified_by_up", "the fork kept its identity and lineage across an up")
+
+    # -- two forks -------------------------------------------------------------------------
+    def test_two_forks_sharing_one_guest_fail(self):
+        self.broken("fork_shared_guest", "reads back its own token and no sibling's")
+
+    def test_an_ambiguous_selection_that_picks_the_first_machine_and_runs_fails(self):
+        self.broken("fork_exec_falls_back", "refuses and runs nothing")
+
+    def test_an_ambiguous_refusal_that_names_no_candidate_fails(self):
+        """An agent that cannot read the candidates cannot correct itself."""
+        failures = self.broken("fork_ambiguous_unlisted", "names every candidate with its identity")
+        self.assertFalse(any("refuses and runs nothing" in line for line in failures), failures)
+
+    # -- reclaiming one fork ---------------------------------------------------------------
+    def test_deleting_a_declared_machine_on_its_own_must_be_refused(self):
+        """Subtracting a declared Machine would leave the Environment unable to
+        instantiate its own vz.json."""
+        self.broken("fork_delete_declared", "deleting the declared Machine on its own is refused")
+
+    def test_a_blanket_refusal_that_never_resolved_the_selector_fails(self):
+        """The three answers must differ, or nothing was resolved and the
+        refusal says nothing about the fork it was aimed at."""
+        self.broken("fork_delete_blanket", "deleting a fork that does not exist is a not_found")
+
+    def test_a_refusal_that_names_neither_a_code_nor_the_fork_fails(self):
+        self.broken("fork_delete_generic", "resolved the fork and refused for a stated reason")
+
+    def test_the_clause_passes_the_day_the_machine_scoped_lifecycle_operation_lands(self):
+        """The same run with `vz delete --machine` implemented: the check must
+        then prove the reclamation and stop reporting the gap, which is what
+        keeps `not_implemented` from being a permanent exemption."""
+        scenario = self.fork("fork_delete_reclaims")
+        self.assertEqual(self.failures(scenario), [], scenario["assertions"])
+        self.assertEqual(self.unproved(scenario), [], scenario["assertions"])
+        self.assertEqual(scenario["status"], "PASS")
+        assertions = "\n".join(scenario["assertions"])
+        self.assertIn("reclaimed exactly that fork", assertions)
+        self.assertIn("Docker data disk is gone", assertions)
+
+    def test_a_reclamation_that_reports_success_and_leaks_the_disk_fails(self):
+        self.broken("fork_delete_leaks", "Docker data disk is gone")
+
+    def test_an_environment_delete_that_leaves_a_machine_disk_fails(self):
+        self.broken("fork_env_delete_leaks", "no Machine Docker data disk survived the delete")
