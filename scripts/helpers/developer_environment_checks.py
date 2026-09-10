@@ -7722,3 +7722,569 @@ def check_deterministic_agent_workers(ctx: CheckContext, top: str, established: 
             "skipped. Every other clause above did run. Register a template with vz-macos-setup "
             "(planning/developer-environments/macos-local-setup.md); this check never provisions one.")
     return check.finish()
+
+
+# --------------------------------------------------------------------- criterion 8
+#
+# `gate.isolation.cross_environment_isolation`: the three Environments the
+# pre-sleep phase leaves running cannot resolve, route to, read, control, or
+# receive events from one another.
+#
+# The subjects are deliberately not provisioned here.
+# `establish_recovery_environments` already brought up three mutually foreign
+# Environments -- own project, own project id, own state database, own daemon
+# socket, own runtime directory -- and left them running for the post-wake
+# phase. Isolation proved between three Environments built for the isolation
+# test alone would be a weaker claim than isolation between the ones the rest of
+# the gate already depends on, so this addresses those.
+#
+# Every claim compares against the OTHER Environment's own recorded identity.
+# The record written before the checkpoint is what "belongs to rec-b" means, so
+# a runtime that handed rec-a one of rec-b's identities fails here instead of
+# passing on a field that merely looked well-formed. Nothing below asserts that
+# a field is present, or that a command "worked".
+#
+# One sub-check per verb of the criterion:
+#   cross_environment_resolution  A's resolver view answers for nothing of B's
+#   cross_environment_routing     A cannot reach B's Machine at B's literal
+#                                 address, while reaching its own listener
+#   cross_environment_read        A's control plane reports A's Machines only,
+#                                 and names no path under B's roots
+#   cross_environment_control     a lifecycle verb aimed at B through A's
+#                                 selector fails closed and B is unchanged
+#   cross_environment_events      a stream held open on A carries A's own event
+#                                 and nothing of B's
+
+CROSS_PROBE_PORT = 8080
+CROSS_SERVE_ROOT = "/www"
+CROSS_INDEX = CROSS_SERVE_ROOT + "/index.html"
+CROSS_CONTROL_MARKER = CROSS_SERVE_ROOT + "/vz-cross-control-marker"
+CROSS_EVENT_LOG = CROSS_SERVE_ROOT + "/vz-cross-events"
+# Written by the observer only after it has already emptied the stream into its
+# stdout, so a caller that sees it knows the bytes are in the pipe. Waiting on
+# this rather than on a clock is what stops the release racing the observer's
+# own exit and reading an empty stream.
+CROSS_OBSERVED = CROSS_SERVE_ROOT + "/vz-cross-observed"
+CROSS_WGET_TIMEOUT = 5
+CROSS_LISTENER_ATTEMPTS = 10
+CROSS_LISTENER_INTERVAL = 1.0
+# The two files that are a Machine's whole view of who can be named. Read as
+# bytes and searched for the other Environments' identities: a resolver view
+# that names another Environment's Machine has already answered for it, whatever
+# a lookup would then return.
+CROSS_RESOLVER_FILES = ("/etc/resolv.conf", "/etc/hosts")
+CROSS_RESOLVER_PROBE = ("for f in " + " ".join(CROSS_RESOLVER_FILES) + "; do "
+                        'printf "=== %s\\n" "$f"; /bin/busybox cat "$f" 2>/dev/null; done')
+CROSS_ADDRESS_PROBE = ('/bin/busybox ip -o -4 addr show | '
+                       '/bin/busybox awk \'$2!="lo"{split($4, a, "/"); print "ADDR", $2, a[1]}\'')
+# The codes a 0.4 lifecycle verb may fail closed with when its selector names an
+# Environment this project does not have. Declared rather than "any non-empty
+# code", so a runtime that began refusing with `internal_error` -- a crash
+# rather than a refusal -- is a failure here and not a pass.
+CROSS_FAIL_CLOSED_CODES = frozenset({"environment_not_found", "machine_not_found", "invalid_selector",
+                                     "validation_error", "not_found"})
+# The held observer's bounded life. It ends itself as soon as its own
+# Environment's event arrives, so its stdout is flushed by a normal exit rather
+# than left in a buffer a signal would discard.
+CROSS_WATCH_POLLS = 80
+CROSS_WATCH_INTERVAL = "0.25"
+CROSS_READY_POLLS = 40
+
+
+def cross_subjects(ctx: CheckContext, check: SubCheck, established: dict):
+    """The Environments pre-sleep established, addressed again. None on failure.
+
+    Nothing is created: a subject that did not survive is this check's finding.
+    """
+    entries = established.get("environments") or []
+    if not check.check(len(entries) >= 2,
+                       f"the pre-sleep record names at least two Environments to hold apart "
+                       f"(expected >= 2, observed {len(entries)})"):
+        return None
+    subjects = []
+    for entry in entries:
+        machines = entry.get("machines") or []
+        if not check.check(len(machines) >= 1,
+                           f"{entry.get('isolate')!r}: the record names at least one Machine "
+                           f"(expected >= 1, observed {len(machines)})"):
+            return None
+        try:
+            instance = ctx.reattach(entry["isolate"])
+        except (ReattachError, KeyError) as error:
+            check.fail(str(error))
+            return None
+        subjects.append({"name": entry["isolate"], "entry": entry, "instance": instance,
+                         "machine": machines[0].get("name")})
+    return subjects
+
+
+def cross_identities(entry: dict) -> dict:
+    """One Environment's identities, by kind, exactly as pre-sleep recorded them.
+
+    The declared names are deliberately excluded: every Environment here is
+    named `default` and every Machine `machine-0`, so a claim made about those
+    would be a claim about a collision the definitions arranged on purpose.
+    """
+    machines = entry.get("machines") or []
+    return {"project": {entry.get("project_id")} - {None},
+            "environment": {entry.get("environment_id")} - {None},
+            "machine": {m.get("machine_id") for m in machines} - {None},
+            "incarnation": {m.get("incarnation_id") for m in machines} - {None},
+            "context": {m.get("docker_context") for m in machines} - {None}}
+
+
+def cross_tokens(entry: dict) -> list:
+    """Every identity string that belongs to one Environment, sorted."""
+    identities = cross_identities(entry)
+    return sorted({value for kind in identities for value in identities[kind] if value})
+
+
+def cross_roots(instance: dict) -> list:
+    """Every host path that belongs to one Environment's isolate."""
+    env = instance["env"]
+    return sorted({str(instance["root"]), str(instance["state"]), str(instance["project"]),
+                   str(instance["runtime"]), env["VZ_RUNTIME_STATE_DB"], env["VZ_RUNTIME_DAEMON_SOCKET"]})
+
+
+def cross_pairs(subjects: list) -> list:
+    """Every ordered pair of distinct Environments: isolation is directional."""
+    return [(a, b) for a in subjects for b in subjects if a is not b]
+
+
+def check_cross_environment_resolution(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """No Environment's resolver view answers for anything of another's.
+
+    What can be disproved here is bounded by what these Environments declare.
+    They declare no network and no endpoint, so none of them publishes a name
+    and none is given an environment-local resolver: there is no name declared
+    in rec-b for rec-a's resolver to be asked about. The clause that CAN be
+    settled is settled -- every Machine's whole resolver view is read and
+    searched for every identity of every other Environment, and a lookup of
+    another Environment's identity must not answer -- and the unreachable half
+    is reported in the runtime's own words rather than claimed.
+    """
+    check = SubCheck(top, "cross_environment_resolution")
+    subjects = cross_subjects(ctx, check, established)
+    if subjects is None:
+        return check.finish()
+    views, replies = {}, {}
+    for subject in subjects:
+        row = machine_exec(ctx, check, "iso-resolv-" + subject["name"], subject["instance"],
+                           subject["machine"], CROSS_RESOLVER_PROBE)
+        if not check.check(row.exit_code == 0,
+                           f"{subject['name']}: its Machine's resolver view is readable "
+                           f"(expected exit 0, observed {row.exit_code})"):
+            return check.finish()
+        views[subject["name"]] = row.stdout.decode("utf-8", "replace")
+    for a, b in cross_pairs(subjects):
+        tokens = cross_tokens(b["entry"])
+        found = [token for token in tokens if token in views[a["name"]]]
+        check.check(not found,
+                    f"{a['name']}'s resolver view names none of {b['name']}'s {len(tokens)} identities "
+                    f"(expected [], observed {found})")
+    # A lookup, not only a file read: a resolver that answered for another
+    # Environment without saying so in either file would still be answering.
+    for a, b in cross_pairs(subjects):
+        target = b["entry"].get("environment_id") or ""
+        row = machine_exec(ctx, check, f"iso-lookup-{a['name']}-{b['name']}", a["instance"], a["machine"],
+                           f'/bin/busybox nslookup {target} 2>&1; printf ":%s" $?')
+        text = row.stdout.decode("utf-8", "replace")
+        replies[(a["name"], b["name"])] = text
+        check.check(not text.rstrip().endswith(":0"),
+                    f"{a['name']}'s resolver refuses to answer for {b['name']}'s Environment id "
+                    f"{target!r} (expected a non-zero nslookup exit, observed {text.rstrip()[-24:]!r})")
+    if check.status == "PASS":
+        quoted = " | ".join(sorted({" ".join(text.split())[:120] for text in replies.values()}))
+        check.not_implemented = (
+            "criterion 8's resolve clause also requires that A's DNS view not answer for a name "
+            "DECLARED in B, and the Environments this phase establishes declare no networks and no "
+            "endpoints, so no Environment publishes a name and none is given an environment-local "
+            "resolver to ask. The Machines answered: " + quoted[:300] +
+            ". What is proved above -- that no Environment's resolver view names any identity of "
+            "another, and that a lookup of another's Environment id does not answer -- is necessary "
+            "but not the whole clause, so the clause is not claimed.")
+    return check.finish()
+
+
+def cross_serve_script(token: str) -> str:
+    """A listener held open for exactly as long as its invocation is."""
+    return (f"/bin/busybox mkdir -p {CROSS_SERVE_ROOT}; printf %s {token} > {CROSS_INDEX}; "
+            f"/bin/busybox httpd -f -p {CROSS_PROBE_PORT} -h {CROSS_SERVE_ROOT}")
+
+
+def cross_fetch_script(address: str) -> str:
+    """Fetch by literal address, and report the client's own exit code.
+
+    The address and never a name, so a failure is a routing fact rather than an
+    unresolved hostname -- the same reason `check_private_topology_paths` fetches
+    by address across Environments.
+    """
+    return (f"/bin/busybox wget -T {CROSS_WGET_TIMEOUT} -q -O - "
+            f"http://{address}:{CROSS_PROBE_PORT}/; printf ':%s' $?")
+
+
+def cross_addresses(receipt) -> list:
+    """[(interface, address), ...] the Machine's own kernel reported."""
+    rows = []
+    for line in receipt.stdout.decode("ascii", "replace").splitlines():
+        parts = line.split()
+        if parts[:1] == ["ADDR"] and len(parts) == 3:
+            rows.append((parts[1], parts[2]))
+    return rows
+
+
+def check_cross_environment_routing(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """No Machine reaches another Environment's Machine at its literal address.
+
+    Ordered so the first failure names the broken link. Each Machine's own
+    addresses are read from its own kernel first; each Machine then answers its
+    OWN listener over loopback, which settles that its HTTP client and server
+    work at all; only then is a Machine asked to reach a peer that belongs to a
+    different Environment, by literal address, in both directions. Without the
+    loopback control a missing applet and a refused route print identically.
+    """
+    check = SubCheck(top, "cross_environment_routing")
+    subjects = cross_subjects(ctx, check, established)
+    if subjects is None:
+        return check.finish()
+    for subject in subjects:
+        probed = machine_exec(ctx, check, "iso-addr-" + subject["name"], subject["instance"],
+                              subject["machine"], CROSS_ADDRESS_PROBE)
+        subject["addresses"] = cross_addresses(probed)
+        check.check(probed.exit_code == 0 and len(subject["addresses"]) >= 1,
+                    f"{subject['name']}'s Machine holds at least one non-loopback address to be aimed at "
+                    f"(expected exit 0 and >= 1 address, observed {probed.exit_code} and "
+                    f"{subject['addresses']})")
+        subject["token"] = "vziso-" + uuid.uuid4().hex[:16]
+    if check.status != "PASS":
+        return check.finish()
+    held = []
+    try:
+        for subject in subjects:
+            held.append(hold_machine_exec(ctx, check, "iso-serve-" + subject["name"], subject["instance"],
+                                          subject["machine"], cross_serve_script(subject["token"])))
+        for subject in subjects:
+            # The Machine's own loopback, so this never leaves the Machine: it
+            # fails only if nothing is bound or the client does not work.
+            for attempt in range(1, CROSS_LISTENER_ATTEMPTS + 1):
+                local = machine_exec(ctx, check, "iso-serve-local-" + subject["name"], subject["instance"],
+                                     subject["machine"], cross_fetch_script("127.0.0.1"))
+                if local.stdout.strip() == (subject["token"] + ":0").encode():
+                    break
+                time.sleep(CROSS_LISTENER_INTERVAL)
+            check.check(local.stdout.strip() == (subject["token"] + ":0").encode(),
+                        f"{subject['name']}'s Machine answers its own listener after {attempt} attempt(s) "
+                        f"(expected {(subject['token'] + ':0')!r}, observed {local.stdout.strip()!r})")
+        if check.status != "PASS":
+            return check.finish()
+        for a, b in cross_pairs(subjects):
+            for interface, address in b["addresses"]:
+                reached = machine_exec(ctx, check, f"iso-route-{a['name']}-{b['name']}-{interface}",
+                                       a["instance"], a["machine"], cross_fetch_script(address))
+                observed = reached.stdout.strip()
+                check.check(b["token"].encode() not in observed,
+                            f"{a['name']}'s Machine did not read {b['name']}'s served token at "
+                            f"{b['name']}'s literal address {address} on {interface} "
+                            f"(expected {b['token']!r} absent, observed {observed[:80]!r})")
+                check.check(not observed.endswith(b":0"),
+                            f"{a['name']}'s Machine failed to connect to {b['name']}'s literal address "
+                            f"{address} on {interface} (expected a non-zero wget exit, observed "
+                            f"{observed[-16:]!r})")
+    finally:
+        for holder in held:
+            released = ctx.release(check, holder)
+            check.check(released.exit_code is not None,
+                        f"the held listener {holder.label} was released (expected an exit code, "
+                        f"observed {released.exit_code})")
+    return check.finish()
+
+
+def cross_reported_identities(payload: dict) -> dict:
+    """Every identity one `vz status` payload reports, by kind."""
+    reported = {"project": {payload.get("project_id")} - {None},
+                "environment": set(), "machine": set(), "incarnation": set(), "context": set()}
+    for environment in payload.get("environments") or []:
+        if environment.get("environment_id"):
+            reported["environment"].add(environment["environment_id"])
+        for machine in environment.get("machines") or []:
+            for kind, value in (("machine", machine.get("machine_id")),
+                                ("incarnation", machine.get("incarnation_id")),
+                                ("context", (machine.get("docker_context") or {}).get("name"))):
+                if value:
+                    reported[kind].add(value)
+    return reported
+
+
+def check_cross_environment_read(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """A's control plane reports A's own Environment and nothing of anyone else's.
+
+    Two separate claims. First the positive one: every identity `vz status`
+    reports for A is exactly the set pre-sleep recorded for A -- not a superset,
+    which is what a leaked sibling would make it. Then the negative one: none of
+    the other Environments' identities appears anywhere in A's payload, and
+    neither does any host path under another Environment's isolate -- its state
+    root, state database, project, runtime directory or daemon socket.
+    """
+    check = SubCheck(top, "cross_environment_read")
+    subjects = cross_subjects(ctx, check, established)
+    if subjects is None:
+        return check.finish()
+    for subject in subjects:
+        row = ctx.run(check, "iso-read-" + subject["name"], ["--json", "status"],
+                      cwd=subject["instance"]["project"], env=subject["instance"]["env"], timeout=60)
+        if not check.check(row.exit_code == 0,
+                           f"{subject['name']}: vz --json status (expected exit 0, observed "
+                           f"{row.exit_code})"):
+            return check.finish()
+        subject["raw"] = row.stdout.decode("utf-8", "replace")
+        try:
+            subject["payload"] = json.loads(subject["raw"])
+        except json.JSONDecodeError as error:
+            check.fail(f"{subject['name']}: status is not a JSON document: {error}")
+            return check.finish()
+    for subject in subjects:
+        payload, recorded = subject["payload"], cross_identities(subject["entry"])
+        reported = cross_reported_identities(payload)
+        for kind in sorted(recorded):
+            check.check(reported[kind] == recorded[kind],
+                        f"{subject['name']}: status reports exactly its own {kind} identities "
+                        f"(expected {sorted(recorded[kind])}, observed {sorted(reported[kind])})")
+        expected_path = str(subject["instance"]["project"] / "vz.json")
+        check.check(payload.get("definition_path") == expected_path,
+                    f"{subject['name']}: status names its own definition (expected {expected_path!r}, "
+                    f"observed {payload.get('definition_path')!r})")
+    # Deliberately not short-circuited on the comparison above. The two claims
+    # are independent -- "A reports exactly its own" and "A reports nothing of
+    # B's" catch different leaks -- and a return here would leave the second one
+    # unreachable whenever the first fired, which is how an assertion stops
+    # being able to fail.
+    for a, b in cross_pairs(subjects):
+        tokens = cross_tokens(b["entry"])
+        found = [token for token in tokens if token in a["raw"]]
+        check.check(not found,
+                    f"{a['name']}'s status payload carries none of {b['name']}'s {len(tokens)} identities "
+                    f"(expected [], observed {found})")
+        roots = cross_roots(b["instance"])
+        leaked = [root for root in roots if root in a["raw"]]
+        check.check(not leaked,
+                    f"{a['name']}'s daemon exposes no path under {b['name']}'s isolate -- state root, "
+                    f"state database, project, runtime directory or daemon socket "
+                    f"(expected [], observed {leaked})")
+        overlap = sorted(set(cross_roots(a["instance"])) & set(roots))
+        check.check(not overlap,
+                    f"{a['name']} and {b['name']} share no state root, database or socket path "
+                    f"(expected [], observed {overlap})")
+    return check.finish()
+
+
+def cross_error_code(receipt):
+    """The `error.code` of the last JSON line a refusal wrote to stderr, or None."""
+    lines = [line for line in receipt.stderr.decode("utf-8", "replace").splitlines() if line.strip()]
+    if not lines:
+        return None
+    try:
+        document = json.loads(lines[-1])
+    except json.JSONDecodeError:
+        return None
+    error = document.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = error.get("code")
+    return code if isinstance(code, str) else None
+
+
+def cross_marker_read(ctx: CheckContext, check: SubCheck, label: str, subject: dict):
+    """Whatever a foreign lifecycle verb managed to write into this Machine."""
+    return machine_exec(ctx, check, label, subject["instance"], subject["machine"],
+                        f"/bin/busybox cat {CROSS_CONTROL_MARKER} 2>/dev/null; printf END")
+
+
+def check_cross_environment_control(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """A lifecycle verb aimed at B through A's selector fails closed, B unchanged.
+
+    The Environment is named by the identity that unambiguously names B -- its
+    Environment id -- and not by its declared name, because every Environment
+    here is named `default` and `--environment default` from A addresses A. Two
+    of the five public verbs are aimed at it: `exec`, which would run a command
+    on B's Machine, and `stop`, which would end B's lifecycle. Both must refuse
+    with a structured error carrying a declared code, and B must afterwards
+    report the identities it had, keep its Environment state, return its
+    sentinel byte-identical, and hold no marker the refused command would have
+    written.
+    """
+    check = SubCheck(top, "cross_environment_control")
+    subjects = cross_subjects(ctx, check, established)
+    if subjects is None:
+        return check.finish()
+    for a, b in cross_pairs(subjects):
+        target = b["entry"].get("environment_id") or ""
+        probe = "vzctl-" + uuid.uuid4().hex[:16]
+        before = read_status(ctx, check, f"iso-ctl-before-{a['name']}-{b['name']}",
+                             project=b["instance"]["project"], env=b["instance"]["env"])
+        if not check.check(bool(before),
+                           f"{b['name']} reports a readable status before {a['name']} aims a verb at it "
+                           f"(expected a JSON payload, observed {before!r})"):
+            return check.finish()
+        script = (f"/bin/busybox mkdir -p {CROSS_SERVE_ROOT}; "
+                  f"printf %s {probe} > {CROSS_CONTROL_MARKER}")
+        attempts = (("exec", ["--json", "exec", "--environment", target, "--machine", b["machine"],
+                              "--", "/bin/busybox", "sh", "-c", script]),
+                    ("stop", ["--json", "stop", "--environment", target, "--timeout", "60"]))
+        for verb, argv in attempts:
+            refused = ctx.run(check, f"iso-ctl-{verb}-{a['name']}-{b['name']}", argv,
+                              cwd=a["instance"]["project"], env=a["instance"]["env"], timeout=120)
+            check.check(refused.exit_code not in (0, None),
+                        f"{a['name']}: vz {verb} --environment {target} ({b['name']}'s Environment id) "
+                        f"is refused (expected a non-zero exit, observed {refused.exit_code})")
+            code = cross_error_code(refused)
+            check.check(code in CROSS_FAIL_CLOSED_CODES,
+                        f"{a['name']}: that {verb} refusal is a structured error with a declared code "
+                        f"(expected one of {sorted(CROSS_FAIL_CLOSED_CODES)}, observed {code!r})")
+        after = read_status(ctx, check, f"iso-ctl-after-{a['name']}-{b['name']}",
+                            project=b["instance"]["project"], env=b["instance"]["env"])
+        if not check.check(bool(after),
+                           f"{b['name']} still reports a readable status afterwards "
+                           f"(expected a JSON payload, observed {after!r})"):
+            return check.finish()
+        for kind in sorted(cross_identities(b["entry"])):
+            was, now = cross_reported_identities(before)[kind], cross_reported_identities(after)[kind]
+            check.check(now == was,
+                        f"{b['name']}'s {kind} identities are unchanged by {a['name']}'s attempt "
+                        f"(expected {sorted(was)}, observed {sorted(now)})")
+        was_states = [e.get("state") for e in (before.get("environments") or [])]
+        now_states = [e.get("state") for e in (after.get("environments") or [])]
+        check.check(now_states == was_states,
+                    f"{b['name']}'s Environment state is unchanged by {a['name']}'s attempt "
+                    f"(expected {was_states}, observed {now_states})")
+        sentinel = sentinel_read(ctx, check, f"iso-ctl-sentinel-{a['name']}-{b['name']}", b["instance"])
+        expected = (b["entry"]["token"] + "END").encode()
+        check.check(sentinel.exit_code == 0 and sentinel.stdout.strip() == expected,
+                    f"{b['name']}'s Machine-local sentinel is byte-identical afterwards "
+                    f"(expected {expected!r}, observed {sentinel.stdout.strip()!r})")
+        marker = cross_marker_read(ctx, check, f"iso-ctl-marker-{a['name']}-{b['name']}", b)
+        check.check(marker.stdout.strip() == b"END",
+                    f"{a['name']}'s refused command wrote nothing into {b['name']}'s Machine "
+                    f"(expected b'END', observed {marker.stdout.strip()!r})")
+        if check.status != "PASS":
+            return check.finish()
+    return check.finish()
+
+
+def cross_watch_script(token: str) -> str:
+    """A held observer of one Machine's own event log.
+
+    It ends itself as soon as its OWN Environment's event arrives and then
+    prints everything the log accumulated, so its stdout is flushed by a normal
+    exit rather than left in a buffer a signal would discard, and exit 0 means
+    the observer genuinely saw its Environment's event rather than timing out.
+    """
+    return (f"/bin/busybox mkdir -p {CROSS_SERVE_ROOT}; : > {CROSS_EVENT_LOG}; "
+            f"/bin/busybox rm -f {CROSS_OBSERVED}; "
+            f'n=0; while [ "$n" -lt {CROSS_WATCH_POLLS} ]; do n=$((n+1)); '
+            f"if /bin/busybox grep -q {token} {CROSS_EVENT_LOG} 2>/dev/null; then "
+            f"/bin/busybox cat {CROSS_EVENT_LOG}; printf %s {token} > {CROSS_OBSERVED}; exit 0; fi; "
+            f"/bin/busybox sleep {CROSS_WATCH_INTERVAL}; done; "
+            f"/bin/busybox cat {CROSS_EVENT_LOG} 2>/dev/null; exit 3")
+
+
+def cross_ready_script() -> str:
+    """Wait for the observer to be watching, on a condition and not a clock."""
+    return (f'n=0; while [ "$n" -lt {CROSS_READY_POLLS} ]; do n=$((n+1)); '
+            f"[ -f {CROSS_EVENT_LOG} ] && exit 0; "
+            f"/bin/busybox sleep {CROSS_WATCH_INTERVAL}; done; exit 1")
+
+
+def cross_observed_script(token: str) -> str:
+    """Wait for the observer to have emptied its stream, on a condition."""
+    return (f'n=0; while [ "$n" -lt {CROSS_WATCH_POLLS} ]; do n=$((n+1)); '
+            f"if [ -f {CROSS_OBSERVED} ]; then /bin/busybox cat {CROSS_OBSERVED}; exit 0; fi; "
+            f"/bin/busybox sleep {CROSS_WATCH_INTERVAL}; done; printf ABSENT; exit 1")
+
+
+def cross_emit_script(token: str) -> str:
+    return (f"/bin/busybox mkdir -p {CROSS_SERVE_ROOT}; "
+            f"printf 'EVENT %s\\n' {token} >> {CROSS_EVENT_LOG}")
+
+
+def check_cross_environment_events(ctx: CheckContext, top: str, established: dict) -> SubCheck:
+    """A stream held open on A carries A's own event and nothing of B's.
+
+    A stream that carried nothing at all would satisfy "silent about B" without
+    saying anything, so the observer is required to end on its OWN Environment's
+    event: exit 0 is the proof that the stream was live and would have carried
+    an event had one reached it. The foreign events are generated first, and the
+    observer is confirmed to be watching before they are -- otherwise "B's event
+    did not appear" could just mean nobody was looking yet. Each foreign event is
+    also read back in the Environment that produced it, so a leak and an event
+    that was never generated cannot be confused.
+    """
+    check = SubCheck(top, "cross_environment_events")
+    subjects = cross_subjects(ctx, check, established)
+    if subjects is None:
+        return check.finish()
+    watcher, others = subjects[0], subjects[1:]
+    own = "vzown-" + uuid.uuid4().hex[:16]
+    for other in others:
+        other["event"] = "vzfgn-" + uuid.uuid4().hex[:16]
+    held = hold_machine_exec(ctx, check, "iso-watch-" + watcher["name"], watcher["instance"],
+                             watcher["machine"], cross_watch_script(own), timeout=180)
+    try:
+        ready = machine_exec(ctx, check, "iso-watch-ready-" + watcher["name"], watcher["instance"],
+                             watcher["machine"], cross_ready_script())
+        if not check.check(ready.exit_code == 0,
+                           f"{watcher['name']}'s observer is watching before any event is generated "
+                           f"(expected exit 0, observed {ready.exit_code})"):
+            return check.finish()
+        for other in others:
+            emitted = machine_exec(ctx, check, "iso-emit-" + other["name"], other["instance"],
+                                   other["machine"], cross_emit_script(other["event"]))
+            check.check(emitted.exit_code == 0,
+                        f"{other['name']}'s Machine generated an observable event "
+                        f"(expected exit 0, observed {emitted.exit_code})")
+            seen = machine_exec(ctx, check, "iso-emit-own-" + other["name"], other["instance"],
+                                other["machine"],
+                                f"/bin/busybox cat {CROSS_EVENT_LOG} 2>/dev/null; printf END")
+            check.check(other["event"].encode() in seen.stdout,
+                        f"{other['name']}'s own event log carries the event it generated "
+                        f"(expected {other['event']!r} present, observed {seen.stdout[-80:]!r})")
+        if check.status != "PASS":
+            return check.finish()
+        emitted = machine_exec(ctx, check, "iso-emit-" + watcher["name"], watcher["instance"],
+                               watcher["machine"], cross_emit_script(own))
+        check.check(emitted.exit_code == 0,
+                    f"{watcher['name']}'s Machine generated its own event "
+                    f"(expected exit 0, observed {emitted.exit_code})")
+        # The observer writes this only after emptying the stream into its
+        # stdout, so waiting for it is what makes the release read a complete
+        # stream instead of racing the observer's own exit.
+        settled = machine_exec(ctx, check, "iso-watch-settled-" + watcher["name"], watcher["instance"],
+                               watcher["machine"], cross_observed_script(own))
+        check.check(settled.stdout.strip() == own.encode(),
+                    f"{watcher['name']}'s observer reported that it had emptied its stream "
+                    f"(expected {own!r}, observed {settled.stdout.strip()!r})")
+    finally:
+        released = ctx.release(check, held)
+    stream = released.stdout.decode("utf-8", "replace")
+    check.check(released.exit_code == 0,
+                f"{watcher['name']}'s stream was live and ended on its own Environment's event "
+                f"(expected exit 0, observed {released.exit_code})")
+    check.check(own in stream,
+                f"{watcher['name']}'s stream carried its own event (expected {own!r} present, "
+                f"observed {stream[-120:]!r})")
+    if check.status != "PASS":
+        return check.finish()
+    for other in others:
+        carried = [token for token in [other["event"], *cross_tokens(other["entry"])] if token in stream]
+        check.check(not carried,
+                    f"{watcher['name']}'s stream carried no event and no identity belonging to "
+                    f"{other['name']} (expected [], observed {carried})")
+    return check.finish()
+
+
+def check_cross_environment_isolation(ctx: CheckContext, top: str, established: dict) -> list:
+    """Criterion 8's five verbs, one sub-check each, over the pre-sleep record."""
+    return [check_cross_environment_resolution(ctx, top, established),
+            check_cross_environment_routing(ctx, top, established),
+            check_cross_environment_read(ctx, top, established),
+            check_cross_environment_control(ctx, top, established),
+            check_cross_environment_events(ctx, top, established)]
