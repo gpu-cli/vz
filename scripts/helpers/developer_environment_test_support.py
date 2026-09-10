@@ -168,11 +168,19 @@ if [ -n "$verb" ]; then
     exit 0
   fi
   if [ "$verb" = up ] && [ -f vz.json ]; then
-    # This Up applies `offline` egress only, exactly as the installed one does:
-    # a non-offline Machine needs the per-Environment gateway that is not built
-    # yet. Modelled here so a check that depends on the refusal sees it.
-    if grep -q '"egress": *"\(allowed\|restricted\)"' vz.json; then
-      printf '{"error":{"code":"unsupported_operation","message":"Machine declares a non-offline egress policy, whose adapter is not implemented; this Up applies `offline` only and performs no admission"},"schema_version":1}\n' >&2
+    # `offline` and `allowed` are both applied, exactly as the installed one
+    # does: `offline` attaches no external NIC and `allowed` attaches Apple's
+    # NAT, decided in `external_nic_required`. This fake used to refuse every
+    # non-offline policy because the installed Up did; that refusal is gone,
+    # and a fake that kept it would make criterion 7's enabled-egress clause
+    # look unexercisable when it is not.
+    #
+    # `restricted` is still refused, and by the SCHEMA rather than here: the
+    # project definition spells `offline` and `allowed` only, so a CIDR or
+    # domain policy has no way to be written down. That is the honest state of
+    # criterion 20's two blank cells.
+    if grep -q '"egress": *"restricted"' vz.json; then
+      printf '{"error":{"code":"unsupported_operation","message":"Machine declares a `restricted` egress policy, which the project definition schema does not spell; `offline` and `allowed` are the two it does"},"schema_version":1}\n' >&2
       exit 1
     fi
     pid=$(grep -o '"project_id"[^,]*' vz.json | head -1 | sed 's/.*"\([^"]*\)"$/\1/')
@@ -779,6 +787,12 @@ honestly. This writes the two tables the stand-in needs:
                               keyed by the Machine that was granted it, because
                               a grant belongs to one Machine and to no other.
   <state>/exports             "<host_port> <machine_port>" per declared export.
+  <state>/egress-<machine>    written only for a Machine that declared
+                              `allowed`, because that is the only Machine the
+                              runtime gives an external NIC. Its ABSENCE is
+                              what `offline` means, exactly as in the runtime:
+                              not a filter over a shared gateway, but no
+                              attachment at all.
 """
 import json
 import sys
@@ -798,6 +812,10 @@ rows = [f"{entry.get('host_port')} {entry['machine_port']}"
 if rows:
     with open(f"{state}/exports", "w") as handle:
         handle.write("\n".join(rows) + "\n")
+for machine in environment.get("machines", []):
+    if machine.get("egress") == "allowed":
+        with open(f"{state}/egress-{machine['name']}", "w") as handle:
+            handle.write("allowed\n")
 '''
 
 
@@ -1490,6 +1508,24 @@ case "$applet" in
       cat "$(cut -d' ' -f3- < "$state/httpd-$machine")/index.html"
       exit 0
     fi
+    # An address on the public Internet. This is the only destination whose
+    # answer is decided by the Machine's declared egress, and it is decided the
+    # way the runtime decides it: `allowed` attaches an external NIC and
+    # `offline` attaches none, so the same probe from two Machines of ONE
+    # Environment answers differently. Modelled rather than really dialled,
+    # because a fake that depended on the build host's own connectivity would
+    # report a flaky network as a policy result.
+    #
+    # Only these two addresses are modelled, and deliberately: LAN and
+    # control-plane destinations are separate cells with their own denials, and
+    # folding them in here would make one rule stand for three.
+    case "$target" in
+      1.1.1.1|8.8.8.8)
+        [ -f "$state/egress-$machine" ] || exit 1
+        printf 'vz04-internet-reachable\n'
+        exit 0
+        ;;
+    esac
     # `cross_environment_route` is criterion 8's deliberately wrong stand-in for
     # a merged route domain: an address belonging to ANOTHER Environment's
     # Machine is reachable and its listener answers. It never serves the
@@ -2898,8 +2934,9 @@ def build_agent_fake_release(root: Path, *, mode_file: Path, snapshot_file: Path
 #   fork_delete_blanket     `delete --machine` refuses without resolving, so an
 #                           unknown label answers exactly like a known fork
 #   fork_delete_generic     the fork refusal carries no code and names nothing
-#   fork_delete_reclaims    the clause that is not implemented yet, implemented:
-#                           the check must then PASS it instead of reporting it
+#   fork_delete_reclaims    a spelling of the default, kept so the test that
+#                           named it still reads: reclaiming one fork IS the
+#                           default answer now
 #   fork_delete_leaks       `delete --machine` reports success and leaves the
 #                           fork's disk behind
 #   fork_env_delete_leaks   deleting the Environment leaves a Machine disk
@@ -3567,20 +3604,24 @@ def do_delete(options):
         if not machine.get("fork"):
             refuse("unsupported_operation", "Machine `%s` is declared by the project definition; "
                    "only a fork can be deleted on its own" % machine["name"])
-        if MODE in ("fork_delete_reclaims", "fork_delete_leaks"):
-            state["machines"] = [row for row in state["machines"] if row["name"] != selector]
-            if MODE != "fork_delete_leaks":
-                shutil.rmtree(store_root(machine), ignore_errors=True)
-            save(state)
-            sys.stdout.write(json.dumps({"schema_version": 1, "deleted": [selector]}) + "\n")
-            return 0
         if MODE == "fork_delete_generic":
             refuse("internal_error", "delete failed")
-        refuse("unsupported_operation",
-               "reclaiming fork `%s` on its own is not implemented: every runtime teardown "
-               "primitive is fenced on a persisted Environment-wide lifecycle operation, so a "
-               "fork-scoped Delete needs a scoped lifecycle operation that does not exist yet. "
-               "`vz delete` reclaims the whole Environment, forks included." % machine["name"])
+        # Reclaiming one fork is the DEFAULT answer now, not a mode. The
+        # Machine-scoped lifecycle operation landed in 94ea34c9 and is proved
+        # on hardware: `vz delete --machine machine-0@feat-y` removes exactly
+        # that fork and its Docker data disk, with the parent and the sibling
+        # fork still present. A fake that kept refusing would make criterion
+        # 23's delete clause look unimplemented when it is not.
+        #
+        # `fork_delete_leaks` is still a mode, because "removed the rows and
+        # left the store behind" is the failure the check has to be able to
+        # catch, and it is not something the real runtime does.
+        state["machines"] = [row for row in state["machines"] if row["name"] != selector]
+        if MODE != "fork_delete_leaks":
+            shutil.rmtree(store_root(machine), ignore_errors=True)
+        save(state)
+        sys.stdout.write(json.dumps({"schema_version": 1, "deleted": [selector]}) + "\n")
+        return 0
     keep = None
     if MODE == "fork_env_delete_leaks" and state["machines"]:
         keep = state["machines"][0]["machine_id"]

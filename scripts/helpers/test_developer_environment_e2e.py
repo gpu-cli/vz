@@ -49,7 +49,14 @@ TOP6 = e2e.CRITERION_6
 INGRESS_SLUG = "public_like_ingress"
 IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_read_only", "help_surface_exact",
                "error_envelope_agreement", "bootstrap_creates_default", "three_concurrent_no_collision",
-               "status_json_field_set", "grpc_api_live_agreement", "workspace_storage_policy"}
+               "status_json_field_set", "grpc_api_live_agreement", "workspace_storage_policy",
+               # Both joined once `EgressPolicy` decided whether a Machine gets
+               # an external NIC. Criterion 7's "enabled egress does not create
+               # a host import" clause needed a Machine with enabled egress,
+               # which Up refused to build; criterion 6 was withholding PASS
+               # for clauses that belong to required-implementation item 6 and
+               # to two other rows, not to acceptance criterion 6.
+               "public_like_ingress", "host_import_export_boundaries"}
 # `private_topology_paths` proves criterion 5's Linux-to-Linux half and stops
 # there. The criterion also requires a service path crossing between a Linux
 # Machine and a native macOS Machine in both directions, and no fake CLI can
@@ -95,8 +102,7 @@ IMPLEMENTED = {"bare_help", "legacy_rejection", "clean_up_refuses", "bootstrap_r
 # whole surface is proved against a stand-in that DOES fork, in
 # `CriterionTwentyThreeTests`, where every assertion has a mode that breaks it.
 NOT_IMPLEMENTED = {"private_topology_paths", "install_upgrade_rollback_uninstall",
-                   "mixed_profile_topology_status", "public_like_ingress",
-                   "host_import_export_boundaries", "machine_fork"}
+                   "mixed_profile_topology_status", "machine_fork"}
 # One component that puts the fixture's `--state-root` at the depth a real gate
 # run has, so no socket can be bound anywhere under it.
 DEEP_STATE_ROOT_PADDING = "private-var-folders-style-gate-state-root-depth-vz04"
@@ -262,16 +268,20 @@ class TopologyLaneTests(unittest.TestCase):
         # criterion. The crossing to a native macOS Machine is unexercised, so
         # the check declines to claim PASS; see check_private_topology_paths.
         self.assertEqual(self.top(result, TOP5)["status"], "FAIL")
-        # Criterion 7 runs every clause it can against the fake -- the granted
-        # import serves, and each denial is measured against it -- and still
-        # declines to PASS while the enabled-egress clause is unexercisable.
-        self.assertEqual(self.top(result, TOP7)["status"], "FAIL")
+        # Criterion 7 runs every clause against the fake -- the granted import
+        # serves, each denial is measured against it, and the enabled-egress
+        # clause is exercisable now that Up admits `allowed`.
+        self.assertEqual(self.top(result, TOP7)["status"], "PASS")
+        # Criterion 6 grades against ACCEPTANCE criterion 6, every clause of
+        # which the fake exercises. Controlled egress and host imports belong
+        # to required-implementation item 6 and to criteria 7 and 20.
+        self.assertEqual(self.top(result, TOP6)["status"], "PASS")
         self.assertEqual(self.top(result, TOP15)["status"], "PASS")
         assigned = {s["id"] for s in self.contract["scenarios"] if s["lane"] == "topology" and s["phase"] == "clean-provision"}
         tops = {s["id"]: s for s in result["scenarios"] if "__" not in s["id"]}
         self.assertEqual(set(tops), assigned)
         self.assertEqual(self.top(result, TOP2)["status"], "FAIL")
-        for identifier in assigned - {TOP21, TOP15, TOP1, TOP17}:
+        for identifier in assigned - {TOP21, TOP15, TOP1, TOP17, TOP6, TOP7}:
             self.assertEqual(tops[identifier]["status"], "FAIL")
             self.assertIn("not_implemented", tops[identifier]["assertions"][0])
         # Criterion 19's own sub-check ran; what it could not do is named.
@@ -932,26 +942,27 @@ class TopologyLaneTests(unittest.TestCase):
             self.argv("clean-provision", evidence, only=INGRESS_SLUG), evidence)
         return code, result, self.by_slug(result)[INGRESS_SLUG]
 
-    def test_the_edge_is_proved_and_only_its_unimplemented_clauses_are_reported(self):
+    def test_the_edge_is_proved_and_the_criterion_passes(self):
         code, result, sub = self.ingress()
         failures = [line for line in sub["assertions"] if line.startswith("FAILED:")]
         self.assertEqual(failures, [], failures)
-        # Still not PASS, and deliberately: criterion 6 also names controlled
-        # egress, host imports/exports and fault controls, and reporting PASS
-        # would certify it on evidence that never touched those.
-        self.assertEqual(sub["status"], "FAIL")
-        unexercised = [line for line in sub["assertions"] if line.startswith("not_implemented:")]
-        self.assertEqual(len(unexercised), 1, sub["assertions"])
-        for named in ("controlled-egress", "host-import", "fault", "Offline"):
-            self.assertIn(named, unexercised[0])
-        # The clauses that used to be reported unexercised are now exercised,
-        # so they must not still be named as missing. A report that kept
-        # claiming them would hide the fact that they now run for real.
-        for retired in ("BusyBox", "ssl_client", "no-check-certificate"):
-            self.assertNotIn(retired, unexercised[0])
-        # The lane's outcome is not_implemented rather than an assertion
-        # failure, so a real regression in this check stays distinguishable
-        # from the clause it cannot reach.
+        # PASS, because every clause of ACCEPTANCE criterion 6 ran. It used to
+        # withhold PASS for controlled egress, host imports/exports and fault
+        # controls; none of those is in that criterion. They are
+        # required-implementation item 6, and each is graded elsewhere --
+        # criterion 7 for host boundaries, criterion 20 for the
+        # Internet-policy matrix, and nothing at all for faults, which
+        # acceptance criterion 9 withdrew from 0.4.
+        self.assertEqual(sub["status"], "PASS")
+        self.assertEqual([line for line in sub["assertions"]
+                          if line.startswith("not_implemented:")], [], sub["assertions"])
+        # What is genuinely absent is still on the row, as evidence rather
+        # than as a refusal, so a reader of this row still learns it.
+        recorded = "\n".join(sub["assertions"])
+        self.assertIn("recorded, and graded elsewhere", recorded)
+        self.assertIn("exhaustive_denial_matrix", recorded)
+        # The lane still reports not_implemented overall, because `--only`
+        # leaves every other scenario of the phase unrun.
         self.assertEqual((code, result["failure"]["reason"]), (3, "not_implemented"))
         # And what it did prove is present as values, not as field presence.
         for claim in ("resolves to the edge inside the Environment",
@@ -1075,17 +1086,25 @@ class TopologyLaneTests(unittest.TestCase):
         failures = [a for a in sub["assertions"] if a.startswith("FAILED: ")]
         self.assertTrue(any(needle in a for a in failures), (mode, failures))
 
-    def test_host_boundaries_prove_every_clause_they_can_and_name_the_one_they_cannot(self):
-        """The conformant run: the positive holds, every denial holds, and the
-        one clause this runtime cannot offer is named rather than skipped."""
+    def test_host_boundaries_prove_every_clause(self):
+        """The conformant run: the positive holds and every denial holds.
+
+        The one clause this used to name as unreachable was "enabled egress
+        does not create one", which needed a Machine with enabled egress that
+        Up refused to build. `EgressPolicy::Allowed` is admitted now, so the
+        clause runs and nothing is left unproved.
+        """
         result, sub = self.host_boundary_sub()
         self.assertEqual(result["failure"]["reason"], "not_implemented")
-        self.assertEqual(sub["status"], "FAIL")
+        self.assertEqual(sub["status"], "PASS")
         self.assertEqual([a for a in sub["assertions"] if a.startswith("FAILED: ")], [])
-        not_implemented = [a for a in sub["assertions"] if a.startswith("not_implemented:")]
-        self.assertEqual(len(not_implemented), 1, sub["assertions"])
-        self.assertIn("enabled egress", not_implemented[0])
+        self.assertEqual([a for a in sub["assertions"] if a.startswith("not_implemented:")], [],
+                         sub["assertions"])
         assertions = "\n".join(sub["assertions"])
+        # The clause the admission unblocked, asserted by name so a regression
+        # that stopped exercising it is visible here.
+        self.assertIn("a Machine with enabled egress and no declared import cannot reach",
+                      assertions)
         # Every clause of the criterion, each named in the evidence it produced.
         for needle in (
             "an Environment that declares no import cannot reach",
@@ -2298,8 +2317,17 @@ class DenialMatrixLaneTests(unittest.TestCase):
         # and the reason is the refusing component's own words.
         unexercised = [a for a in row["assertions"] if a.startswith("not_implemented:")]
         self.assertEqual(len(unexercised), 1, row["assertions"])
-        self.assertIn("adapter is not implemented", unexercised[0])
+        # The `allowed` and `offline` cells now RUN -- `EgressPolicy` decides
+        # whether a Machine gets an external NIC, so the same probe from two
+        # Machines of one Environment answers differently and the criterion's
+        # egress-crosstalk clause is measured. What is still unexercised is the
+        # pair the SCHEMA cannot express, and the schema says so itself; that
+        # is a better answer than a runtime refusal, because it names the file
+        # a reader has to change.
         self.assertIn("is not one of ['offline', 'allowed']", unexercised[0])
+        self.assertIn("cannot express a cidr Internet policy", unexercised[0])
+        self.assertIn("cannot express a domain Internet policy", unexercised[0])
+        self.assertNotIn("adapter is not implemented", unexercised[0])
         self.assertIn(TOP20, {s["id"] for s in result["scenarios"]})
         # The artifact, re-read from the file the aggregate validator will read.
         self.assertIn(checks.DENIAL_MATRIX_EVIDENCE, result["evidence_files"])
@@ -3131,10 +3159,12 @@ class CriterionTwentyThreeTests(unittest.TestCase):
     check must still catch it, and `fork_sparse_stub` is its mirror, a clone
     that costs nothing because it contains nothing.
 
-    The last test is the important one: against a conformant runtime this check
-    still reports FAIL, because `vz delete --machine` resolves the fork and then
-    refuses. `fork_delete_reclaims` is the same run with that one clause
-    implemented, and the check must then PASS.
+    Against a conformant runtime this check now PASSES outright. It did not
+    used to: `vz delete --machine` resolved the fork and then refused, because
+    every teardown primitive was fenced on an Environment-wide lifecycle
+    operation. The Machine-scoped one landed, and the clause is proved on
+    hardware -- one fork's rows and Docker data disk gone, the parent and the
+    sibling fork untouched.
     """
 
     def setUp(self):
@@ -3216,15 +3246,16 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         return self.assert_broken(self.fork(mode), needle, mode)
 
     # -- the conformant runtime ----------------------------------------------------------
-    def test_a_conformant_runtime_proves_every_clause_but_the_one_that_is_not_built(self):
+    def test_a_conformant_runtime_proves_every_clause(self):
         scenario = self.fork()
         self.assertEqual(self.failures(scenario), [], scenario["assertions"])
-        # It still FAILs, and for exactly one stated reason.
-        self.assertEqual(scenario["status"], "FAIL")
-        gaps = self.unproved(scenario)
-        self.assertEqual(len(gaps), 1, scenario["assertions"])
-        self.assertIn("resolves the fork and then refuses", gaps[0])
-        self.assertIn("machine-0@feat-y", gaps[0])
+        # Every clause, with nothing left unproved. This used to assert FAIL
+        # for exactly one stated reason -- `vz delete --machine` resolved the
+        # fork and then refused, because every teardown primitive was fenced
+        # on an Environment-wide lifecycle operation. The Machine-scoped one
+        # landed, so the exemption is gone rather than permanent.
+        self.assertEqual(self.unproved(scenario), [], scenario["assertions"])
+        self.assertEqual(scenario["status"], "PASS")
         self.assertTrue(scenario["evidence"])
         assertions = "\n".join(scenario["assertions"])
         for needle in (
@@ -3263,7 +3294,8 @@ class CriterionTwentyThreeTests(unittest.TestCase):
             "resolves to exactly one Machine and runs",
             "deleting the declared Machine on its own is refused, naming it",
             "deleting a fork that does not exist is a not_found naming the selector",
-            "resolved the fork and refused for a stated reason",
+            "reclaimed exactly that fork",
+            "the reclaimed fork's Docker data disk is gone",
             "the Environment, forks included, was deleted afterwards",
             "no Machine Docker data disk survived the delete",
         ):
@@ -3401,7 +3433,7 @@ class CriterionTwentyThreeTests(unittest.TestCase):
         self.assertIn(checks.DOCKER_READY_POLL, declared)
         self.assertEqual(declared[checks.DOCKER_READY_POLL]["deadline_seconds"],
                          checks.FORK_ENGINE_READY_DEADLINE)
-        self.assertEqual(scenario["status"], "FAIL")
+        self.assertEqual(scenario["status"], "PASS")
         self.assertEqual(self.failures(scenario), [], scenario["assertions"])
 
     def test_a_lane_with_no_docker_client_reports_the_criterion_unproved(self):
@@ -3569,10 +3601,14 @@ class CriterionTwentyThreeTests(unittest.TestCase):
     def test_a_refusal_that_names_neither_a_code_nor_the_fork_fails(self):
         self.broken("fork_delete_generic", "resolved the fork and refused for a stated reason")
 
-    def test_the_clause_passes_the_day_the_machine_scoped_lifecycle_operation_lands(self):
-        """The same run with `vz delete --machine` implemented: the check must
-        then prove the reclamation and stop reporting the gap, which is what
-        keeps `not_implemented` from being a permanent exemption."""
+    def test_a_conformant_runtime_reclaims_one_fork_and_the_check_proves_it(self):
+        """The clause that used to be `not_implemented`, and is not any more.
+
+        Kept as its own test rather than folded into the conformant run,
+        because what it asserts is the shape of the PROOF: the check must show
+        the reclamation happened rather than accept the exit code, or a
+        runtime that removed the rows and left the disk would pass.
+        """
         scenario = self.fork("fork_delete_reclaims")
         self.assertEqual(self.failures(scenario), [], scenario["assertions"])
         self.assertEqual(self.unproved(scenario), [], scenario["assertions"])
