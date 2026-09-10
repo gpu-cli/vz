@@ -68,11 +68,15 @@ cannot pass. None of them is a harness gap.
    half does not work. *Blocks criterion 5's crossing and criterion 12's
    cooperating Linux-to-macOS pair.*
 
-4. **Guests resolve through public DNS.** `resolv.conf` comes up as
-   `[1.1.1.1, 8.8.8.8]` instead of the Environment's declared gateway. Resolution
-   is not broken -- it works, through the wrong resolver, which is the shape that
-   passes a smoke test and fails the criterion. *Blocks criterion 6's split-DNS
-   clause and half of criterion 8's resolve clause.*
+4. *Closed.* **Guests resolved through public DNS.** `resolv.conf` came up as
+   `[1.1.1.1, 8.8.8.8]` instead of the Environment's declared gateway. The
+   per-Environment edge and its `vz.dns.N` kernel argument closed it; re-measured
+   against `0.4.0-rc3` on 2026-09-10, every Machine on the public-like network
+   came up with its Environment's resolver and nothing else, the declared `.test`
+   name resolved to the edge, an undeclared name did not resolve, and neither
+   Environment's name resolved in the other. See "What criterion 6 now proves"
+   below. Criterion 8's resolve clause still reports `not_implemented`, but for
+   a different reason, recorded there.
 
 5. **A refused `vz up` mutates the worktree**, minting `.git/vz/workspace-id`.
    Fail-before-mutation is stated for definition changes and for bootstrap, and
@@ -109,6 +113,44 @@ cannot pass. None of them is a harness gap.
     port is not silently shared, which is the half that matters, but stderr is
     empty -- no envelope, no machine-readable code, so an agent cannot tell a
     collision from any other refusal.
+
+## What criterion 6 now proves
+
+Measured 2026-09-10 by running the sub-check alone
+(`developer_environment_e2e.py --only public_like_ingress`) against `0.4.0-rc3`,
+whose guest bundles were built from source rather than reused. Every clause the
+criterion names ran from inside real Machines and passed:
+
+| Clause | Observed |
+|---|---|
+| environment-local split DNS | `resolv.conf ['10.150.7.1']` on both Machines, equal to the `vz.dns.0` the host derived and wrote to each kernel cmdline, and equal to each Machine's declared route |
+| the resolver is the edge, not the Machine | resolver `10.150.7.1`; Machine addresses `10.150.7.87` and `10.150.7.58` |
+| a `.test` hostname | `api.one.test` resolved to `10.150.7.1`, the edge, and never to the origin Machine behind it |
+| the resolver was genuinely asked | no `/etc/hosts` entry for the published name on either Machine |
+| the view is split, not shared | an undeclared name did not resolve; `api.one.test` did not resolve in the second Environment and `api.two.test` did not resolve in the first |
+| TLS | `TLSv1_3`, status 200, verified against the Environment's own published authority and refused (exit 7, `UnknownIssuer`) against both the image's public CA bundle and the other Environment's authority |
+| routed ingress | the response carried the token the declared origin Machine wrote, on its declared port |
+| NAT | the origin's own `REMOTE_ADDR` was the edge; spoken to directly by its sibling the same origin reported the caller |
+| nothing on the host LAN | no attributable host LAN or wildcard listener; the edge address bound nowhere on the host |
+
+The sub-check still grades `not_implemented`, and names why: it did not exercise
+controlled egress (`EgressPolicy` admits only `Offline`), host import/export, or
+network faults. Those are separate criteria; none of them is a DNS gap.
+
+The wildcard `*:53` listener that appears while Machines run is macOS's own DNS
+proxy for the shared vmnet NAT segment, not a vz socket. The listener sweep now
+records it as unattributable rather than charging it to vz.
+
+Criterion 8's resolve clause is still `not_implemented`, and its own words say
+why: the Environments its phase establishes declare no networks and no
+endpoints, so none of them publishes a name and none is given a resolver to ask.
+That is now a harness gap, not a product one -- criterion 6 proves the product
+answers exactly this question for two Environments that *do* declare. Closing it
+means giving `establish_recovery_environments` a declared network and endpoint.
+Note the one product constraint on doing so: a native macOS Machine on a
+`simulated_public` network is refused at plan time (`UnresolvedPublicMachine`),
+because the native addressing channel installs an address and a route but has no
+resolver step, so those Environments must stay all-Linux until it does.
 
 ## What the gate will not tell you yet
 
