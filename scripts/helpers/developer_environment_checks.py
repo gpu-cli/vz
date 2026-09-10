@@ -54,6 +54,8 @@ import uuid
 
 from jsonschema import Draft202012Validator
 
+import frozen_tree
+
 from developer_environment_recorder import (ENDPOINT_NAME_BYTES, SOCKET_PATH_LIMIT, LaneState, Recorder, inventory,
                                             inventory_diff, processes_referencing, write_inventory)
 from vz04_common import digest_file, load_json, now_ns, read_regular, write_exclusive
@@ -2145,13 +2147,18 @@ def _legacy_artifact(ctx: CheckContext, check: SubCheck, pinned_digest: str, url
         # already failed, so this stays a failure and does not become a gap.
         check.ok("the pinned v0.3.20 daemon was not consulted: earlier assertions in this check already failed")
         return None
-    staged = os.environ.get(LEGACY_ARTIFACT_ENV) or str(ctx.repo_root / LEGACY_ARTIFACT_CACHE)
+    # The cache is gitignored, so it exists in the working checkout and never in
+    # a frozen tree -- resolving it against `ctx.repo_root` would look inside the
+    # freeze and always miss, and the staging instruction below would name a
+    # directory that disappears when the run ends.
+    cache_root = frozen_tree.live_root(ctx.repo_root)
+    staged = os.environ.get(LEGACY_ARTIFACT_ENV) or str(cache_root / LEGACY_ARTIFACT_CACHE)
     path = Path(staged)
     if not path.is_file():
         check.not_implemented = (
             "criterion 19 requires the restored store to be usable by v0.3.20 itself, and the pinned v0.3.20 daemon "
             f"was not staged, so the restored store was never opened by v0.3.20. Stage it once with: "
-            f"curl -sSfL --create-dirs -o {ctx.repo_root / LEGACY_ARTIFACT_CACHE} {url} "
+            f"curl -sSfL --create-dirs -o {cache_root / LEGACY_ARTIFACT_CACHE} {url} "
             f"(sha256 {pinned_digest}), or point {LEGACY_ARTIFACT_ENV} at a copy. Every other clause of this "
             "check ran; see its assertions.")
         return None

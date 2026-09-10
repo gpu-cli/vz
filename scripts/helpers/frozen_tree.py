@@ -196,6 +196,22 @@ def record(root) -> dict:
     return dict(value)
 
 
+def live_root(root) -> Path:
+    """The working checkout behind `root`, which is `root` unless it is frozen.
+
+    Machine state is not source and is not carried into a frozen tree: `freeze`
+    copies tracked files only, so anything ignored -- a downloaded artifact
+    cache, for one -- exists in the checkout and nowhere else. A lane that
+    resolves such a path against its own root looks for it inside the frozen
+    tree and never finds it, and the operator's instruction to stage it in the
+    repository is then quietly wrong.
+
+    So a cache is resolved here and source is resolved against the root. The two
+    are the same directory whenever the lane is not frozen.
+    """
+    return Path(record(root)["live_root"])
+
+
 class FrozenTree:
     """A private git worktree holding the checkout's bytes for one run."""
 

@@ -302,5 +302,58 @@ class EntryPointTests(unittest.TestCase):
         self.assertEqual(sorted(schema["properties"]["source_tree"]["properties"]), sorted(subject.unknown("/x")))
 
 
+class LiveRootTests(unittest.TestCase):
+    """Machine state is resolved against the checkout, source against the tree.
+
+    `freeze` copies TRACKED files only, so anything ignored -- criterion 19's
+    downloaded v0.3.20 daemon, for one -- exists in the checkout and nowhere
+    else. A lane that resolved such a path against its own root would look for
+    it inside the frozen tree, never find it, and then print an instruction
+    telling the operator to stage it in a directory that vanishes when the run
+    ends.
+    """
+
+    def test_an_unfrozen_root_is_its_own_live_root(self):
+        with tempfile.TemporaryDirectory(prefix="vzfrz-live-") as tmp:
+            root = Path(tmp).resolve()
+            self.assertEqual(subject.live_root(root), root)
+
+    def test_a_frozen_root_names_the_checkout_it_was_frozen_from(self):
+        with tempfile.TemporaryDirectory(prefix="vzfrz-live-") as tmp:
+            root = Path(tmp).resolve()
+            (root / ".git").mkdir()
+            marker = root / subject.MARKER
+            marker.write_text(json.dumps({"frozen": True, "root": str(root),
+                                          "live_root": "/Users/somebody/checkout"}))
+            subject._records.clear()
+            try:
+                self.assertEqual(subject.live_root(root), Path("/Users/somebody/checkout"))
+            finally:
+                subject._records.clear()
+
+    def test_an_ignored_file_is_not_carried_into_a_frozen_tree(self):
+        """The premise the whole helper rests on, asserted rather than assumed."""
+        with tempfile.TemporaryDirectory(prefix="vzfrz-live-") as tmp:
+            checkout = Path(tmp).resolve() / "repo"
+            checkout.mkdir()
+            git(checkout, "init", "-q")
+            git(checkout, "config", "user.email", "t@example.com")
+            git(checkout, "config", "user.name", "t")
+            (checkout / ".gitignore").write_text(".cache/\n")
+            (checkout / "tracked.txt").write_text("source\n")
+            git(checkout, "add", "-A")
+            git(checkout, "commit", "-qm", "base")
+            cache = checkout / ".cache" / "artifact"
+            cache.parent.mkdir()
+            cache.write_text("machine state\n")
+            frozen = subject.freeze(checkout)
+            try:
+                self.assertTrue((frozen.path / "tracked.txt").is_file())
+                self.assertFalse((frozen.path / ".cache" / "artifact").exists())
+                self.assertEqual(subject.live_root(frozen.path), checkout)
+            finally:
+                frozen.release()
+
+
 if __name__ == "__main__":
     unittest.main()
