@@ -1,0 +1,109 @@
+{
+  "schema_version": 1,
+  "kind": "vz-0.4-agent-schedule",
+  "title": "Criterion 12 deterministic agent schedule",
+  "normative_source": "planning/developer-environments/GOAL-0.4.0.md#strict-e2e-release-gate",
+  "workers": [
+    {"id": "iso_a", "role": "isolated", "binding": "isolate-a"},
+    {"id": "iso_b", "role": "isolated", "binding": "isolate-b"},
+    {"id": "iso_c", "role": "isolated", "binding": "isolate-c"},
+    {"id": "twin_a", "role": "twin", "binding": "twin-a"},
+    {"id": "twin_b", "role": "twin", "binding": "twin-b"},
+    {"id": "writer_rw", "role": "writer", "binding": "writer-rw"},
+    {"id": "writer_ro", "role": "writer", "binding": "writer-ro"},
+    {"id": "coop_linux", "role": "cooperating", "binding": "coop-linux"},
+    {"id": "coop_macos", "role": "cooperating", "binding": "coop-macos"}
+  ],
+  "programs": {
+    "emit": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\""],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\""]
+    },
+    "emit_then_exit": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; exit {exit_status}"],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; exit {exit_status}"]
+    },
+    "emit_then_sleep": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; /bin/busybox sleep {seconds}"],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; /bin/sleep {seconds}"]
+    },
+    "emit_then_write": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; printf %s \"$VZ_AGENT_TOKEN\" > {path}"],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; printf %s \"$VZ_AGENT_TOKEN\" > {path}"]
+    },
+    "serve_token": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; /bin/busybox mkdir -p /www; printf %s \"$VZ_AGENT_TOKEN\" > /www/index.html; /bin/busybox httpd -f -p {port} -h /www"],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; mkdir -p /tmp/vz-agent-www; printf %s \"$VZ_AGENT_TOKEN\" > /tmp/vz-agent-www/index.html; while true; do /usr/bin/nc -l {port} < /tmp/vz-agent-www/index.html; done"]
+    },
+    "fetch_token": {
+      "linux": ["/bin/busybox", "sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; /bin/busybox wget -T 5 -q -O - http://{peer}:{port}/"],
+      "macos": ["/bin/sh", "-c", "printf 'AGENT %s %s\\n' \"$VZ_AGENT_REQUEST\" \"$VZ_AGENT_TOKEN\"; /usr/bin/curl -s --max-time 5 http://{peer}:{port}/"]
+    }
+  },
+  "rounds": [
+    {
+      "index": 0,
+      "name": "isolated_fanout",
+      "note": "Three workers, three separate Environments, released from one barrier so the three executions overlap.",
+      "steps": [
+        {"id": "s0_iso_a", "worker": "iso_a", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}},
+        {"id": "s0_iso_b", "worker": "iso_b", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}},
+        {"id": "s0_iso_c", "worker": "iso_c", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}}
+      ]
+    },
+    {
+      "index": 1,
+      "name": "isolated_exit_status",
+      "note": "Three concurrent executions, three different exit statuses. A runtime that keyed exit status by Machine or reported the last terminal receipt would hand two of these the wrong number.",
+      "steps": [
+        {"id": "s1_iso_a", "worker": "iso_a", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}},
+        {"id": "s1_iso_b", "worker": "iso_b", "program": "emit_then_exit", "channel": "json", "params": {"exit_status": "7"}, "expect": {"kind": "exit", "code": 7}},
+        {"id": "s1_iso_c", "worker": "iso_c", "program": "emit_then_exit", "channel": "json", "params": {"exit_status": "3"}, "expect": {"kind": "exit", "code": 3}}
+      ]
+    },
+    {
+      "index": 2,
+      "name": "twin_crosstalk",
+      "note": "Two workers, ONE Environment and ONE Machine, identical command text, released together. Only the request id tells them apart, so any runtime keying output, receipts or guest environment by anything looser misattributes one of them.",
+      "steps": [
+        {"id": "s2_twin_a", "worker": "twin_a", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}},
+        {"id": "s2_twin_b", "worker": "twin_b", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}}
+      ]
+    },
+    {
+      "index": 3,
+      "name": "twin_cancellation",
+      "note": "One of two concurrent executions on one Machine is cancelled by its own deadline; the other must run to completion. Cancellation that reached the Machine rather than the request would take both.",
+      "steps": [
+        {"id": "s3_twin_a", "worker": "twin_a", "program": "emit_then_sleep", "channel": "json", "params": {"seconds": "600"}, "timeout_seconds": 2, "wall_timeout_seconds": 15, "expect": {"kind": "cancelled"}},
+        {"id": "s3_twin_b", "worker": "twin_b", "program": "emit", "channel": "json", "expect": {"kind": "exit", "code": 0}}
+      ]
+    },
+    {
+      "index": 4,
+      "name": "twin_pty",
+      "note": "The same worker again, this time over an interactive terminal the driver allocates. A PTY has no record stream, so the terminal transcript itself has to carry this request's identity and no other's.",
+      "steps": [
+        {"id": "s4_twin_a", "worker": "twin_a", "program": "emit", "channel": "pty", "expect": {"kind": "exit", "code": 0}}
+      ]
+    },
+    {
+      "index": 5,
+      "name": "writer_policy",
+      "note": "Two concurrent writers in one Environment: one holding a read_write workspace projection, one holding a read_only projection. The refusal is the observation, so the read_only worker's own receipt must carry it.",
+      "steps": [
+        {"id": "s5_writer_rw", "worker": "writer_rw", "program": "emit_then_write", "channel": "json", "expect": {"kind": "exit", "code": 0}},
+        {"id": "s5_writer_ro", "worker": "writer_ro", "program": "emit_then_write", "channel": "json", "expect": {"kind": "nonzero"}}
+      ]
+    },
+    {
+      "index": 6,
+      "name": "cooperating_pair",
+      "note": "One Environment holding a Linux Machine and a native macOS Machine. The Linux worker holds the declared cross-target service path open; the macOS worker is released only once the runtime has reported that execution ready, and must read the Linux worker's own token across the declared path.",
+      "steps": [
+        {"id": "s6_coop_serve", "worker": "coop_linux", "program": "serve_token", "channel": "json", "hold": true, "expect": {"kind": "held"}},
+        {"id": "s6_coop_fetch", "worker": "coop_macos", "program": "fetch_token", "channel": "json", "await_ready": "s6_coop_serve", "attempts": 10, "interval_seconds": 1.0, "expect": {"kind": "exit", "code": 0}}
+      ]
+    }
+  ]
+}

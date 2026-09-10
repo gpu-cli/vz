@@ -1344,3 +1344,378 @@ class PeerAddressTests(unittest.TestCase):
         """The clause it serves is `origin peer == edge` and `!= client`."""
         self.assertNotEqual(checks.peer_address("[::ffff:10.31.71.1]"),
                             checks.peer_address("[::ffff:10.31.71.200]"))
+
+
+import base64  # noqa: E402 - appended beside criterion 12's tests, not in the shared import block
+
+TOP12 = e2e.CRITERION_12
+AGENT_SLUG = "deterministic_agent_workers"
+
+
+class CriterionTwelveAgentWorkerTests(unittest.TestCase):
+    """`gate.agent.deterministic_workers`, against a CLI that speaks the exec
+    record stream.
+
+    Every test here runs the whole `persisted-recovery/pre-sleep` phase, so the
+    sub-check is exercised through the path the gate runs it through rather than
+    called directly with arguments a caller chose. The stand-in release is the
+    ordinary one wrapped by `developer_environment_test_support.AGENT_EXEC_CLI`:
+    everything but a request-identified `exec` is the same sh stand-in every
+    other check runs against, and the identities its record stream reports are
+    derived from the same persisted topology `vz status` reads.
+
+    Each falsifying test names the ONE thing its mode breaks. A mode that broke
+    several claims at once would leave it unclear which assertion caught it,
+    which is how `BUSYBOX_SHIM`'s three inert modes survived: they set nothing,
+    so the check passed in every mode.
+    """
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="vztl-", dir="/private/tmp"))
+        self.mode_file = self.tmp / "mode"
+        self.release = support.build_agent_fake_release(self.tmp / "release", mode_file=self.mode_file)
+        self.state_root = self.tmp / DEEP_STATE_ROOT_PADDING / "state"
+        self.contract = contract_module.load_contract()
+        self.lane = contract_module.lane_by_name(self.contract)["topology"]
+        self.counter = 0
+        self.socket_root = recorder.socket_root_for(self.state_root)
+        self.addCleanup(shutil.rmtree, self.socket_root, ignore_errors=True)
+        # pre-sleep leaves its daemons running on purpose; the lane's own
+        # stopper is used so this cleans up exactly what the lane started.
+        self.addCleanup(self.stop_lane_daemons)
+        unstaged = mock.patch.dict(os.environ, {checks.LEGACY_ARTIFACT_ENV: str(self.tmp / "unstaged-v0320")})
+        unstaged.start()
+        self.addCleanup(unstaged.stop)
+
+    def tearDown(self):
+        fixtures.make_writable(self.release)
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def stop_lane_daemons(self):
+        state = e2e.LaneState(self.state_root, self.release / "bin")
+        if not state.root.exists():
+            return
+        try:
+            e2e.stop_daemons(state)
+        except e2e.CleanupError:
+            pass
+
+    def set_mode(self, mode: str):
+        self.mode_file.write_text(mode)
+
+    def evidence(self) -> Path:
+        self.counter += 1
+        path = self.tmp / f"evidence-{self.counter}"
+        path.mkdir()
+        return path
+
+    def argv(self, phase: str, evidence: Path) -> list:
+        ctx = lanes.LaneContext(run_id=RUN_ID, release_dir=self.release, release_dir_sha256=DIGEST,
+                                state_root=self.state_root,
+                                contract_path=common.REPO_ROOT / common.CONFIG_FILES["e2e_contract"],
+                                contract_sha256=DIGEST, candidate_tuple_sha256=DIGEST, fixture_sha256=DIGEST,
+                                clients={})
+        return lanes.lane_argv(self.lane, ctx, phase, evidence, None)
+
+    def agent(self, mode: str = ""):
+        """Run pre-sleep and return `(exit code, result, the sub-check)`."""
+        self.set_mode(mode)
+        evidence = self.evidence()
+        code = e2e.main(self.argv("persisted-recovery/pre-sleep", evidence),
+                        codesign_verifier=fixtures.fake_codesign_verifier)
+        result = common.load_json(evidence / "lane-result.json")
+        self.assertEqual(schema.validate("lane-result", result), [], result.get("failure"))
+        for relative in result["evidence_files"]:
+            self.assertTrue((evidence / relative).is_file(), relative)
+        sub = next(s for s in result["scenarios"] if s["id"] == f"{TOP12}__{AGENT_SLUG}")
+        return code, result, sub
+
+    def failures(self, sub: dict) -> list:
+        return [line for line in sub["assertions"] if line.startswith("FAILED:")]
+
+    def assertStated(self, sub: dict, needle: str):
+        self.assertTrue(any(needle in line and not line.startswith("FAILED:") for line in sub["assertions"]),
+                        (needle, sub["assertions"]))
+
+    def assertFailed(self, sub: dict, needle: str):
+        failures = self.failures(sub)
+        self.assertTrue(any(needle in line for line in failures), (needle, failures))
+
+    def tamper(self, mode: str):
+        """Run pre-sleep with a driver that breaks one transcript property.
+
+        The properties below belong to the DRIVER -- which steps ran, in what
+        order, against which binding, whether a round's steps overlapped -- so
+        no CLI stand-in can falsify them. An assertion nothing can falsify is
+        an assertion that is not being made, which is what these prove is not
+        the case here.
+        """
+        driver = support.build_tamper_driver(self.tmp / "tamper-driver.py", mode_file=self.mode_file)
+        with mock.patch.object(checks, "AGENT_DRIVER", str(driver)):
+            return self.agent(mode)
+
+    def with_schedule(self, mutate):
+        """Run pre-sleep against a mutated copy of the checked-in schedule."""
+        schedule = common.load_json(common.REPO_ROOT / "tests/fixtures/vz-0.4/agent-driver/schedule.json")
+        mutate(schedule)
+        path = self.tmp / "mutated-schedule.json"
+        path.write_text(json.dumps(schedule, indent=1, sort_keys=True) + "\n")
+        with mock.patch.object(checks, "AGENT_SCHEDULE", str(path)):
+            return self.agent()
+
+    # -- the schedule itself ------------------------------------------------------------
+    def test_the_checked_in_schedule_is_the_shape_the_criterion_names(self):
+        """Read off the checked-in file, not off the check's expectations."""
+        schedule = common.load_json(common.REPO_ROOT / checks.AGENT_SCHEDULE)
+        roles = {}
+        for worker in schedule["workers"]:
+            roles.setdefault(worker["role"], []).append(worker["binding"])
+        self.assertGreaterEqual(len(set(roles["isolated"])), 3, roles)
+        self.assertEqual(sorted(set(roles["cooperating"])), ["coop-linux", "coop-macos"])
+        # The twin pair is the misattribution probe: two workers whose bindings
+        # the plan points at ONE Environment and ONE Machine, with identical
+        # command text. Without it nothing here could tell a runtime that keyed
+        # artifacts by Machine from one that keyed them by request.
+        self.assertEqual(sorted(set(roles["twin"])), ["twin-a", "twin-b"])
+        twin_steps = [row for round_row in schedule["rounds"] for row in round_row["steps"]
+                      if row["worker"] in ("twin_a", "twin_b")]
+        crosstalk = [row for row in twin_steps if row["id"].startswith("s2_")]
+        self.assertEqual(len(crosstalk), 2, crosstalk)
+        self.assertEqual(len({row["program"] for row in crosstalk}), 1, crosstalk)
+        # Every program is spelled for both targets, because the cooperating
+        # pair spans a Linux Machine and a native macOS one.
+        for name, program in schedule["programs"].items():
+            self.assertEqual(sorted(program), ["linux", "macos"], name)
+        # One cancelled execution, one PTY execution, one refused write.
+        every = [row for round_row in schedule["rounds"] for row in round_row["steps"]]
+        self.assertEqual([row["id"] for row in every if row["expect"]["kind"] == "cancelled"],
+                         [checks.AGENT_CANCELLED_STEP])
+        self.assertEqual([row["id"] for row in every if row.get("channel") == "pty"], [checks.AGENT_PTY_STEP])
+        self.assertEqual([row["id"] for row in every if row["expect"]["kind"] == "nonzero"],
+                         [checks.AGENT_WRITE_REFUSED_STEP])
+        self.assertEqual(sorted(row["expect"].get("code") for row in every
+                                if row["expect"]["kind"] == "exit" and row["id"].startswith("s1_")),
+                         checks.AGENT_EXIT_STATUSES)
+
+    def test_an_absent_driver_or_schedule_is_reported(self):
+        with mock.patch.object(checks, "AGENT_SCHEDULE", str(self.tmp / "no-such-schedule.json")):
+            _code, _result, sub = self.agent()
+        self.assertFailed(sub, "the checked-in agent schedule is present")
+
+    def test_a_schedule_of_the_wrong_kind_fails(self):
+        _code, _result, sub = self.with_schedule(lambda s: s.update(kind="vz-0.4-something-else"))
+        self.assertFailed(sub, "the schedule declares kind 'vz-0.4-agent-schedule'")
+
+    def test_a_schedule_with_two_isolated_workers_fails(self):
+        def drop(schedule):
+            schedule["workers"] = [w for w in schedule["workers"] if w["binding"] != "isolate-c"]
+
+        _code, _result, sub = self.with_schedule(drop)
+        self.assertFailed(sub, "at least three isolated workers on separate Environments")
+
+    def test_a_schedule_with_one_cooperating_worker_fails(self):
+        def drop(schedule):
+            schedule["workers"] = [w for w in schedule["workers"] if w["binding"] != "coop-macos"]
+
+        _code, _result, sub = self.with_schedule(drop)
+        self.assertFailed(sub, "the schedule runs two cooperating workers")
+
+    def test_a_schedule_that_repeats_a_step_id_fails(self):
+        def repeat(schedule):
+            schedule["rounds"][1]["steps"][0]["id"] = schedule["rounds"][0]["steps"][0]["id"]
+
+        _code, _result, sub = self.with_schedule(repeat)
+        self.assertFailed(sub, "every declared step id is unique")
+
+    # -- the conformant run -------------------------------------------------------------
+    def test_the_conformant_runtime_proves_every_clause_it_can(self):
+        code, result, sub = self.agent()
+        self.assertEqual(self.failures(sub), [], sub["assertions"])
+        # Still not PASS, and deliberately: the criterion also names a native
+        # macOS Machine, and this release registers no macOS target.
+        self.assertEqual((code, result["failure"]["reason"]), (3, "not_implemented"))
+        self.assertTrue(any(a.startswith("not_implemented: criterion 12 also requires two cooperating workers")
+                            for a in sub["assertions"]), sub["assertions"])
+        self.assertStated(sub, "the driver ran the checked-in schedule")
+        self.assertStated(sub, "the driver ran exactly the declared steps in the declared order")
+        self.assertStated(sub, "the three isolated workers address three distinct Environments")
+        self.assertStated(sub, "three concurrent executions reported three different exit statuses")
+        self.assertStated(sub, "those receipts name one distinct Environment each")
+        self.assertStated(sub, "the twin workers' receipts name ONE Environment and ONE Machine")
+        self.assertStated(sub, "and are told apart only by their request ids")
+        self.assertStated(sub, "the execution sharing that Machine ran to completion")
+        self.assertStated(sub, "the cancellation is attributed to the request that asked for it")
+        self.assertStated(sub, "the PTY step ran on a terminal the driver allocated")
+        self.assertStated(sub, "the terminal transcript carries its own request and token")
+        self.assertStated(sub, "the worker holding a read_only projection is refused its write")
+        self.assertStated(sub, "the worker holding a read_write projection is admitted its write")
+        self.assertStated(sub, "the admitted write reached the host worktree")
+        self.assertStated(sub, "the read_only source is byte-identical after the refused write")
+        self.assertStated(sub, "every execution carries its own execution id")
+        # Every step made the four per-step attribution claims by name.
+        for step in ("s0_iso_a", "s1_iso_b", "s2_twin_a", "s3_twin_b", "s5_writer_ro"):
+            self.assertStated(sub, f"{step}: all ")
+            self.assertStated(sub, f"{step}: the guest reported the request and token THIS execution carried")
+            self.assertStated(sub, f"{step}: carries no other worker's identity")
+        for name in ("isolated_fanout", "isolated_exit_status", "twin_crosstalk", "twin_cancellation",
+                     "writer_policy"):
+            self.assertStated(sub, f"round '{name}' released")
+        # The Environments this check made are its own and are removed again;
+        # the three the establishing check left are what post-wake must find.
+        self.assertStated(sub, "agent-ws: deleted (exit 0)")
+        record = common.load_json(self.state_root / "topology" / e2e.RECOVERY_RECORD)
+        self.assertEqual([entry["isolate"] for entry in record["environments"]], list(e2e.RECOVERY_ISOLATES))
+        self.assertIn("agent-transcript.json", sub["evidence"])
+        self.assertIn("agent-plan.json", sub["evidence"])
+
+    # -- attribution: the runtime reports the wrong Environment, Machine or request -----
+    def test_one_environment_id_for_every_execution_fails(self):
+        _code, _result, sub = self.agent("agent_scope_one_environment")
+        self.assertFailed(sub, "misattributed records: execution_ready.scope.environment_id")
+        self.assertFailed(sub, "those receipts name one distinct Environment each")
+
+    def test_a_machine_id_that_varies_per_request_fails(self):
+        _code, _result, sub = self.agent("agent_scope_machine")
+        self.assertFailed(sub, "scope.machine_id")
+        self.assertFailed(sub, "the twin workers' receipts name ONE Environment and ONE Machine")
+
+    def test_a_request_id_keyed_by_machine_fails(self):
+        """The defect the twin round exists to catch.
+
+        Two concurrent executions on one Machine with identical command text
+        collapse into one identity, and everything about them still looks
+        internally consistent: the scope is well formed, the receipt is filed,
+        the exit status is right. Only comparing the request id against the one
+        the worker asked for catches it.
+        """
+        _code, _result, sub = self.agent("agent_scope_request")
+        self.assertFailed(sub, "scope.request_id")
+        self.assertFailed(sub, "the runtime opened exactly this request")
+        self.assertFailed(sub, "and are told apart only by their request ids")
+
+    def test_guest_environment_from_another_execution_fails(self):
+        _code, _result, sub = self.agent("agent_env_constant")
+        self.assertFailed(sub, "the guest reported the request and token THIS execution carried")
+
+    def test_a_terminal_transcript_from_another_execution_fails(self):
+        _code, _result, sub = self.agent("agent_pty_constant")
+        self.assertFailed(sub, "the terminal transcript carries its own request and token")
+
+    def test_another_workers_token_in_the_stream_fails(self):
+        _code, _result, sub = self.agent("agent_cross_token")
+        self.assertFailed(sub, "carries another worker's identity")
+
+    def test_a_receipt_exit_status_that_is_always_zero_fails(self):
+        _code, _result, sub = self.agent("agent_exit_status_zero")
+        self.assertFailed(sub, "exit status 7")
+        self.assertFailed(sub, "three concurrent executions reported three different exit statuses")
+
+    # -- cancellation --------------------------------------------------------------------
+    def test_a_cancellation_filed_as_a_clean_completion_fails(self):
+        _code, _result, sub = self.agent("agent_cancel_unreported")
+        self.assertFailed(sub, "its own deadline cancelled it and the runtime proved no live work remained")
+
+    def test_a_deadline_that_takes_every_execution_on_the_machine_fails(self):
+        _code, _result, sub = self.agent("agent_cancel_machine_wide")
+        self.assertFailed(sub, "the execution sharing that Machine ran to completion while its peer was cancelled")
+
+    # -- receipts ------------------------------------------------------------------------
+    def test_one_execution_without_a_terminal_receipt_fails(self):
+        _code, _result, sub = self.agent("agent_receipt_dropped")
+        self.assertFailed(sub, f"{checks.AGENT_WRITE_REFUSED_STEP}: the runtime filed a terminal receipt")
+
+    def test_a_runtime_that_files_no_receipts_at_all_is_reported_not_implemented(self):
+        """`not_implemented` is honest; a vacuous PASS is not.
+
+        A runtime with no receipt records has no attribution surface at all, and
+        this must say so in the runtime's own output rather than reporting a
+        dozen comparisons that failed for one reason.
+        """
+        _code, _result, sub = self.agent("agent_receipt_missing")
+        self.assertEqual(self.failures(sub), [], sub["assertions"])
+        self.assertTrue(any(a.startswith("not_implemented: this runtime's `vz --json exec` filed no "
+                                         "execution_receipt record") for a in sub["assertions"]),
+                        sub["assertions"])
+
+    # -- workspace writer policy ---------------------------------------------------------
+    def test_a_read_only_projection_materialised_writable_fails(self):
+        _code, _result, sub = self.agent("agent_writer_leaks")
+        self.assertFailed(sub, "the worker holding a read_only projection is refused its write")
+        self.assertFailed(sub, "the read_only source is byte-identical after the refused write")
+
+    def test_a_read_write_projection_materialised_private_fails(self):
+        _code, _result, sub = self.agent("agent_writer_private")
+        self.assertFailed(sub, "the admitted write reached the host worktree with that worker's own bytes")
+
+    # -- the driver's own claims ---------------------------------------------------------
+    def test_a_transcript_naming_a_different_schedule_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_digest")
+        self.assertFailed(sub, "the driver ran the checked-in schedule")
+
+    def test_a_transcript_whose_steps_are_reordered_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_order")
+        self.assertFailed(sub, "the driver ran exactly the declared steps in the declared order")
+
+    def test_an_invocation_sent_to_another_machine_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_argv")
+        self.assertFailed(sub, "the invocation named --machine")
+
+    def test_a_step_run_outside_its_workers_project_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_cwd")
+        self.assertFailed(sub, "ran in its own worker's project")
+
+    def test_two_steps_sharing_one_request_identity_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_identity")
+        self.assertFailed(sub, "every step carries its own request identity")
+
+    def test_two_executions_sharing_one_execution_id_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_execution_id")
+        self.assertFailed(sub, "every execution carries its own execution id")
+
+    def test_a_round_whose_steps_did_not_overlap_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_overlap")
+        self.assertFailed(sub, "round 'isolated_fanout' released")
+
+    def test_a_pty_step_that_never_had_a_terminal_fails(self):
+        _code, _result, sub = self.tamper("agent_tamper_terminal")
+        self.assertFailed(sub, "the PTY step ran on a terminal the driver allocated")
+
+
+class AgentTranscriptReadingTests(unittest.TestCase):
+    """The comparators criterion 12's check makes its claims with."""
+
+    def test_overlap_is_max_start_before_min_end(self):
+        overlapping = [{"started_unix_ns": 10, "ended_unix_ns": 40}, {"started_unix_ns": 20, "ended_unix_ns": 50}]
+        self.assertTrue(checks.agent_overlapped(overlapping))
+        # One step that finished before the next started is a barrier that did
+        # not hold, whatever the wall-clock distance between them.
+        sequential = [{"started_unix_ns": 10, "ended_unix_ns": 20}, {"started_unix_ns": 21, "ended_unix_ns": 30}]
+        self.assertFalse(checks.agent_overlapped(sequential))
+        self.assertFalse(checks.agent_overlapped([{"started_unix_ns": None, "ended_unix_ns": 30}]))
+
+    def test_the_emitted_pair_is_read_through_a_terminal_line_discipline(self):
+        row = {"guest": {"stdout": base64.b64encode(b"AGENT req-1 tok-1\r\n").decode("ascii")}}
+        self.assertEqual(checks.agent_emitted(row), ("req-1", "tok-1"))
+        self.assertIsNone(checks.agent_emitted({"guest": {"stdout": base64.b64encode(b"nothing\n").decode()}}))
+
+    def test_a_scope_mismatch_names_the_field_and_both_values(self):
+        expected = {"request_id": "req-1", "idempotency_key": "idem-1", "environment_id": "env_1",
+                    "machine_id": "mch_1"}
+        row = {"records": [{"record_type": "execution_ready", "scope": dict(expected, machine_id="mch_2")}]}
+        self.assertEqual(checks.agent_scope_mismatches(row, expected),
+                         ["execution_ready.scope.machine_id expected 'mch_1' observed 'mch_2'"])
+        self.assertEqual(checks.agent_scope_mismatches({"records": [{"record_type": "execution_ready",
+                                                                     "scope": dict(expected)}]}, expected), [])
+        # A record that carries no scope contributes nothing here. The record
+        # that has none in the real stream is `request_started`, whose request
+        # id is compared by its own assertion instead.
+        self.assertEqual(checks.agent_scope_mismatches({"records": [{"record_type": "request_started"}]},
+                                                       expected), [])
+
+    def test_only_the_declared_crossing_may_carry_another_workers_token(self):
+        row = {"records": [], "guest": {"stdout": base64.b64encode(b"tok-other\n").decode("ascii")},
+               "stderr_b64": "", "raw_b64": ""}
+        others = {"s6_coop_serve": {"request_id": "req-other", "idempotency_key": "idem-other",
+                                    "token": "tok-other"}}
+        self.assertEqual(checks.agent_foreign(row, others), ["s6_coop_serve.token 'tok-other'"])
+        self.assertEqual(checks.agent_foreign(row, others, {"tok-other"}), [])

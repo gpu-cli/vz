@@ -182,6 +182,7 @@
   "fixtures": {
     "root": "tests/fixtures/vz-0.4",
     "required_dirs": [
+      "tests/fixtures/vz-0.4/agent-driver",
       "tests/fixtures/vz-0.4/docker",
       "tests/fixtures/vz-0.4/docker-container-io",
       "tests/fixtures/vz-0.4/docker-parallel",
