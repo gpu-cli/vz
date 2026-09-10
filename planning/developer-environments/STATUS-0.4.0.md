@@ -39,118 +39,100 @@ with evidence blaming the Environment rather than the daemons nobody stopped.
 
 ## What is in the way, in the order it blocks things
 
-Each of these is a filed issue, and each is the reason a specific criterion
-cannot pass. None of them is a harness gap.
+Rewritten 2026-09-10 after a night of product work. Five defects below were
+fixed; four things previously listed here turned out not to be product defects
+at all, and that is recorded in the next section because the mistake is more
+instructive than the fixes.
 
-### P0
+### Fixed
 
-1. **There is no reconciliation.** `vz up` refuses *every* ProjectDefinition
-   change before admission -- `project definition drift`, `StackError::InvalidSpec`.
-   No plan is derived, no durable claim is taken, and a mutable field change gets
-   the same code as an immutable one. Neither of criterion 22's two normative
-   sub-documents has an implementation subject at all: `admit_reconcile_round`,
-   `ReconcileInputSnapshot` and `effective_digest` exist nowhere in `crates/`.
-   *Blocks criterion 22 entirely.*
+- **Fork-scoped delete** (`vz delete --machine <machine>@<label>`). Needed a
+  machine-scoped lifecycle operation: ~900 production lines across five crates.
+  The load-bearing choice is that a scoped operation NEVER ATTACHES, because a
+  stable Environment may not retain an `active_operation_id` -- an attaching
+  begin would have forced the Environment to `Deleting` while its other Machines
+  keep serving. Criterion 23's last blocker.
+- **Native macOS Machines received no endpoint name table.** Linux gets
+  `vz.host.{N}` on the kernel cmdline and writes `/etc/hosts`; macOS got only its
+  address. Every Linux sibling could reach a macOS endpoint by name and the macOS
+  Machine could reach none of theirs -- an asymmetry directly under criterion 5's
+  "in both directions".
+- **`vz up`/`stop`/`delete` discarded the error envelope** for every failure
+  decided inside the operation stream under `--json`: nonzero exit, empty stderr.
+  A criterion-15 agreement violation far wider than the host-export port
+  collision that exposed it.
+- **Capability negotiation consulted nothing.** No code read
+  `host-target-capabilities-v0.4.json` at all; the only rejection anywhere was a
+  hand-kept `gui || windows_console` check in two places. There is now a matrix
+  consumer that refuses an unadvertised capability BEFORE admission, naming it
+  and its status.
+- **A refused `vz up` minted and persisted `.git/vz/workspace-id`** before the
+  CLI even connected to the daemon, so EVERY refusal after definition discovery
+  left the artifact -- not only the one the gate exercised. Minting and
+  publishing are now separate, with the publish after admission.
 
-2. **No machine-scoped lifecycle operation.** Every runtime teardown primitive is
-   fenced on a persisted Environment-wide `EnvironmentLifecycleOperation` whose
-   structure check requires one machine step per Machine, so `vz delete --machine`
-   resolves a fork and then refuses. The refusal is deliberate: a partial teardown
-   leaks a host Docker context and a runtime store *while the ownership rows claim
-   reclamation*. *Blocks criterion 23's delete clause.*
+### Still open
 
-### P1
+1. **There is no reconciliation** (P0). `vz up` refuses every ProjectDefinition
+   change before admission -- `project definition drift`. No plan, no durable
+   claim, and a mutable change gets the same code as an immutable one. Neither
+   of criterion 22's normative sub-documents has an implementation subject:
+   `admit_reconcile_round`, `ReconcileInputSnapshot` and `effective_digest` exist
+   nowhere in `crates/`. *Blocks criterion 22 entirely.*
 
-3. **Native macOS Machines take no fabric address.** The declaration is accepted
-   at every layer now and the Environment comes up; the guest just never gets an
-   address on the subnet. A Linux guest reads its address off the kernel cmdline;
-   a macOS guest is given it over the agent channel during readiness, and that
-   half does not work. *Blocks criterion 5's crossing and criterion 12's
-   cooperating Linux-to-macOS pair.*
+2. **Legacy sandbox migration fabricates negotiated capabilities** (P1) for eight
+   capabilities, four of which the matrix marks PLANNED. Same false claim as the
+   capability fix above, on a different surface -- and it bears on criterion 19's
+   "legacy records do not acquire Docker defaults", which PASSES on hardware
+   today, so its check does not cover it.
 
-4. *Closed.* **Guests resolved through public DNS.** `resolv.conf` came up as
-   `[1.1.1.1, 8.8.8.8]` instead of the Environment's declared gateway. The
-   per-Environment edge and its `vz.dns.N` kernel argument closed it; re-measured
-   against `0.4.0-rc3` on 2026-09-10, every Machine on the public-like network
-   came up with its Environment's resolver and nothing else, the declared `.test`
-   name resolved to the edge, an undeclared name did not resolve, and neither
-   Environment's name resolved in the other. See "What criterion 6 now proves"
-   below. Criterion 8's resolve clause still reports `not_implemented`, but for
-   a different reason, recorded there.
+3. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`** (P1). See
+   the next section: this one defect produced two false product findings in a
+   single night.
 
-5. **A refused `vz up` mutates the worktree**, minting `.git/vz/workspace-id`.
-   Fail-before-mutation is stated for definition changes and for bootstrap, and
-   this is the same contract. It leaves a binding artifact a later Up will adopt.
-
-6. **Capability negotiation is a rubber stamp.** `negotiated_capabilities =
-   requested_capabilities.clone()`, so a Machine asking for `snapshot` is granted
-   it while the capability matrix says PLANNED. Every consumer that trusts
-   capability discovery -- help, docs, site copy, status -- inherits the false
-   claim. *Blocks criterion 18's snapshot clause.*
-
-7. **No `SecretBinding` exists** -- not in the project schema, not in
-   `vz-runtime-contract`. The gate check for it is written and waiting: it plants
-   a high-entropy sentinel through the CLI environment, reads it back only as a
-   digest, and sweeps seven artifact groups for the literal bytes.
+4. **No `SecretBinding` exists** (P1) -- not in the project schema, not in
+   `vz-runtime-contract`. The gate check is written and waiting.
    *Blocks criterion 18's secrets clause.*
 
-8. **A host import declared for a stream protocol also passes UDP** to the same
-   guest port. A grant that widens from what was declared is the same class of
-   defect as treating a NAT alias as authorization: the boundary is not where
-   the declaration says it is. Newly visible -- until the guest bundle was
-   rebuilt, criterion 7 failed at `up` and never reached its own claims.
+5. **A minted-but-never-booted fork cannot be reclaimed** (P2), because its
+   ownership lacks the two runtime reservations Up takes. Consistent with the
+   Environment path's behaviour for a partially-provisioned aggregate, so it was
+   left consistent rather than made laxer -- but it is real if
+   `vz up --fork-from` ever fails between minting and reserving.
 
-9. **A guest RPC was added without bumping `AGENT_PROTOCOL_REVISION`.** The
-   handshake that exists to refuse a stale guest passed, and the guest answered
-   `Unimplemented` deep inside `up` instead. The revision is a hand-maintained
-   constant with nothing tying it to the surface it describes. Note the
-   release-grade build path already prevents this by rebuilding both bundles
-   every time; only the `--reuse-guest-bundles` DEV shortcut exposes it.
+6. **A stuck scoped operation has no supersede path** (P2). It blocks every new
+   lifecycle operation on its Environment until replayed with its own request and
+   idempotency IDs, which the CLI prints on every run.
 
-### P2
+## Four findings that were not product defects, and why that matters
 
-10. **A host export port collision is refused without a structured error.** The
-    port is not silently shared, which is the half that matters, but stderr is
-    empty -- no envelope, no machine-readable code, so an agent cannot tell a
-    collision from any other refusal.
+Every product bug filed from gate output on 2026-09-09 was misattributed. The
+fixes above came from agents who ran things; these came from reading failure
+text as diagnosis.
 
-## What criterion 6 now proves
-
-Measured 2026-09-10 by running the sub-check alone
-(`developer_environment_e2e.py --only public_like_ingress`) against `0.4.0-rc3`,
-whose guest bundles were built from source rather than reused. Every clause the
-criterion names ran from inside real Machines and passed:
-
-| Clause | Observed |
+| Filed as | Actually |
 |---|---|
-| environment-local split DNS | `resolv.conf ['10.150.7.1']` on both Machines, equal to the `vz.dns.0` the host derived and wrote to each kernel cmdline, and equal to each Machine's declared route |
-| the resolver is the edge, not the Machine | resolver `10.150.7.1`; Machine addresses `10.150.7.87` and `10.150.7.58` |
-| a `.test` hostname | `api.one.test` resolved to `10.150.7.1`, the edge, and never to the origin Machine behind it |
-| the resolver was genuinely asked | no `/etc/hosts` entry for the published name on either Machine |
-| the view is split, not shared | an undeclared name did not resolve; `api.one.test` did not resolve in the second Environment and `api.two.test` did not resolve in the first |
-| TLS | `TLSv1_3`, status 200, verified against the Environment's own published authority and refused (exit 7, `UnknownIssuer`) against both the image's public CA bundle and the other Environment's authority |
-| routed ingress | the response carried the token the declared origin Machine wrote, on its declared port |
-| NAT | the origin's own `REMOTE_ADDR` was the edge; spoken to directly by its sibling the same origin reported the caller |
-| nothing on the host LAN | no attributable host LAN or wildcard listener; the edge address bound nowhere on the host |
+| Guests resolve through public DNS | A stale guest bundle ignoring a correct `vz.dns` kernel argument |
+| `topology.rs` rubber-stamps capabilities | That file does not exist; the symptom was real, nothing consumed the matrix |
+| A stream grant also passes UDP | `busybox nc -u` without `-z` exits 0 whether the port is refused, unbound or live |
+| macOS Machine takes no fabric address | It holds its derived address; the probe ran `/bin/busybox` on a guest that has none |
 
-The sub-check still grades `not_implemented`, and names why: it did not exercise
-controlled egress (`EgressPolicy` admits only `Offline`), host import/export, or
-network faults. Those are separate criteria; none of them is a DNS gap.
+**The gate says which assertion failed. It does not say why, and the exit code
+often belongs to a different layer than the message.** The macOS one is the
+clearest: `exit 5` was `backend_unavailable` from a probe that never executed,
+wearing the label of an address claim.
 
-The wildcard `*:53` listener that appears while Machines run is macOS's own DNS
-proxy for the shared vmnet NAT segment, not a vz socket. The listener sweep now
-records it as unattributable rather than charging it to vz.
+Two of the four trace to one cause -- `--reuse-guest-bundles`, the DEV shortcut
+that ships a guest agent older than the host expects. The builder's own comment
+says to rebuild every run "so source changes cannot be silently shipped with a
+stale guest executable". The argument is for the shortcut refusing when the
+guest surface has moved, not for retiring it.
 
-Criterion 8's resolve clause is still `not_implemented`, and its own words say
-why: the Environments its phase establishes declare no networks and no
-endpoints, so none of them publishes a name and none is given a resolver to ask.
-That is now a harness gap, not a product one -- criterion 6 proves the product
-answers exactly this question for two Environments that *do* declare. Closing it
-means giving `establish_recovery_environments` a declared network and endpoint.
-Note the one product constraint on doing so: a native macOS Machine on a
-`simulated_public` network is refused at plan time (`UnresolvedPublicMachine`),
-because the native addressing channel installs an address and a route but has no
-resolver step, so those Environments must stay all-Linux until it does.
+The other two were probes that could not fail, which is the same defect the
+harness has now had three times: `BUSYBOX_SHIM` never setting the `mode` it
+branched on, `FAKE_VZ` refusing an unknown `--environment` on one code path
+only, and the `nc` shim returning the denial the check wanted rather than what
+the real tool does.
 
 ## What the gate will not tell you yet
 
