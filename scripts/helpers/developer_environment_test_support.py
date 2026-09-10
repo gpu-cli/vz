@@ -1433,9 +1433,16 @@ case "$applet" in
       "$fabric_iface" "$fabric_addr" "$octet_a" "$octet_b" "$fabric_iface"
     exit 0 ;;
   nc)
-    # Nothing in a Machine serves UDP on an import's guest port: the grant is
-    # for the declared stream protocol and nothing else.
-    exit 1 ;;
+    # Model REAL BusyBox, not the answer the check wants. BusyBox 1.37.0 is built
+    # CONFIG_NC_110_COMPAT=y: without `-z` it never runs `udptest()` and returns
+    # 0 whether the port is refused, unbound or live. This shim returned 1
+    # unconditionally, so criterion 7's wrong-protocol clause passed here and
+    # could not pass on hardware -- a stand-in that models the desired behaviour
+    # instead of the real one makes its check unfalsifiable.
+    case " $* " in
+      *" -z "*) exit 1 ;;
+      *) exit 0 ;;
+    esac ;;
   wget)
     url=""
     while [ $# -gt 0 ]; do case "$1" in http://*) url=$1 ;; esac; shift; done

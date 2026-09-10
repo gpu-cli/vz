@@ -981,8 +981,31 @@ def crossing_definition(release_dir: Path, macos_entry: dict) -> dict:
     return definition
 
 
+# The one native macOS Machine these definitions declare (`crossing_definition`).
+MACOS_MACHINE = "machine-mac"
+
+
 def machine_exec_argv(machine: str, script: str) -> list:
-    return ["exec", "--environment", "default", "--machine", machine, "--", "/bin/busybox", "sh", "-c", script]
+    """`vz exec` argv for one Machine, with an interpreter that Machine HAS.
+
+    Every Machine exec used to render `/bin/busybox sh -c`. A macOS guest has no
+    BusyBox, so every probe aimed at the native Machine failed before running --
+    and failed as `backend_unavailable`, which `ExecCommandError::exit_code` maps
+    to 5. That is where criterion 5's
+
+        FAILED: the macOS Machine holds an address on the Environment's fabric
+                subnet 10.x.y.0/24 (exit 5)
+
+    came from: the message names the address claim, but the exit code belongs to
+    the probe never executing. The Machine did hold the address, and the crossing
+    did carry traffic both ways -- verified by hand against a live Environment.
+
+    Criterion 12's checked-in schedule already knew this and spells each step for
+    both targets (`"macos": ["/bin/sh", "-c", ...]`); this is the same rule, one
+    layer down.
+    """
+    interpreter = ["/bin/sh", "-c"] if machine == MACOS_MACHINE else ["/bin/busybox", "sh", "-c"]
+    return ["exec", "--environment", "default", "--machine", machine, "--", *interpreter, script]
 
 
 def machine_exec(ctx, check, label, instance, machine, script, *, timeout=120):
@@ -4479,8 +4502,17 @@ def check_host_import_export_boundaries(ctx: CheckContext, top: str) -> SubCheck
 
         # An import is a stream grant. The same port addressed as UDP is not the
         # declared protocol and nothing answers it.
+        #
+        # `-z` is load-bearing and this clause was unpassable without it. BusyBox
+        # 1.37.0 is built CONFIG_NC_110_COMPAT=y, so `nc_bloaty.c` runs, and
+        # WITHOUT `-z` it never calls `udptest()` -- it falls into `readwrite()`,
+        # which returns 0 on EOF and on a net read error alike. Measured inside a
+        # real Machine: the bare form printed `:0` on the declared port, `:0` on
+        # an undeclared port with nothing bound at all, and `:0` against a live
+        # UDP service -- three different worlds, one answer. With `-z` the same
+        # three print `:1`, `:1` and `:0`.
         udp = machine_exec(ctx, check, "hb-deny-wrong-protocol", granted, "machine-0",
-                           f"printf probe | /bin/busybox nc -u -w 2 127.0.0.1 {GRANTED_GUEST_PORT}; "
+                           f"printf probe | /bin/busybox nc -z -u -w 2 127.0.0.1 {GRANTED_GUEST_PORT}; "
                            "printf ':%s' $?", timeout=HOST_BOUNDARY_TIMEOUT)
         if b"applet not found" in udp.stderr or udp.exit_code == 127:
             check.not_implemented = (
@@ -6504,7 +6536,11 @@ def matrix_probe_command(cell: MatrixCell) -> str:
     if cell.probe == "tcp":
         return f"/bin/busybox wget -T {WGET_TIMEOUT} -q -O - http://{cell.target}:{cell.port}/"
     if cell.probe == "udp":
-        return f"printf probe | /bin/busybox nc -u -w 2 {cell.target} {cell.port}"
+        # `-z` or the cell is meaningless: BusyBox's nc without it returns 0 for
+        # a refused datagram, an unbound port and a live service alike, so every
+        # udp row of this matrix would read `allow`. See the note in criterion
+        # 7's wrong-protocol clause for the measurements.
+        return f"printf probe | /bin/busybox nc -z -u -w 2 {cell.target} {cell.port}"
     if cell.probe == "icmp":
         return f"/bin/busybox ping -c 1 -W 2 {cell.target}"
     if cell.probe == "dns":

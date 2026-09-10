@@ -277,5 +277,33 @@ class LegacyArtifactStagingTests(unittest.TestCase):
             self.assertIn(str(repo / checks.LEGACY_ARTIFACT_CACHE), check.not_implemented)
 
 
+class MachineExecArgvTests(unittest.TestCase):
+    """A probe must be spelled for the Machine it runs on.
+
+    Every Machine exec used to render `/bin/busybox sh -c`. A macOS guest has no
+    BusyBox, so every probe aimed at the native Machine failed before running,
+    as `backend_unavailable` -> exit 5 -- which read in the lane's output as the
+    address claim failing, when the Machine did hold its address and the
+    crossing did carry traffic both ways.
+    """
+
+    def test_a_linux_machine_runs_through_busybox(self):
+        argv = checks.machine_exec_argv("machine-0", "id")
+        self.assertEqual(argv[-4:], ["/bin/busybox", "sh", "-c", "id"])
+
+    def test_the_native_macos_machine_runs_through_a_shell_it_has(self):
+        argv = checks.machine_exec_argv(checks.MACOS_MACHINE, "id")
+        self.assertEqual(argv[-3:], ["/bin/sh", "-c", "id"])
+        self.assertNotIn("/bin/busybox", argv)
+
+    def test_both_address_the_same_machine_the_same_way(self):
+        """Only the interpreter differs; the selector must not drift with it."""
+        linux = checks.machine_exec_argv("machine-0", "id")
+        native = checks.machine_exec_argv(checks.MACOS_MACHINE, "id")
+        self.assertEqual(linux[:4], ["exec", "--environment", "default", "--machine"])
+        self.assertEqual(native[:4], ["exec", "--environment", "default", "--machine"])
+        self.assertEqual(native[4], checks.MACOS_MACHINE)
+
+
 if __name__ == "__main__":
     unittest.main()
