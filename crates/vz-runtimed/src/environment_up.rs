@@ -711,28 +711,27 @@ fn validate_supported(
             error.to_string(),
         ));
     }
-    // Egress is not applied. `EgressPolicy::Offline` is the only policy this Up
-    // can honour, and the Environment edge does not change that: the edge
-    // translates addresses between a client and an origin that are both inside
-    // one Environment's fabric, and never towards a host outside it. A
-    // non-offline Machine needs a translation towards the host's own network
-    // and a policy deciding which destinations it may reach, and neither
-    // exists. Refusing here rather than admitting a Machine whose declared
-    // reachability is silently absent is the same rule the imports below follow.
-    if let Some(machine) = spec
-        .machines
-        .iter()
-        .find(|machine| machine.egress != EgressPolicy::Offline)
-    {
-        return Err(failure(
-            metadata,
-            MachineErrorCode::UnsupportedOperation,
-            format!(
-                "Machine `{}` declares a non-offline egress policy, whose host-facing translation and destination policy are not implemented; the Environment edge translates only between an Environment's own client and its own declared origin. This Up applies `offline` only and performs no admission",
-                machine.name
-            ),
-        ));
-    }
+    // Egress IS applied, and the two policies the schema spells are now
+    // distinguishable. `offline` attaches no external NIC at all; `allowed`
+    // attaches Apple's user-mode NAT. The decision is made once, in
+    // `MacosRuntimeBackend`'s NIC construction, from the policy carried on
+    // `StackResourceHint::egress`.
+    //
+    // Until this landed the refusal below covered a worse defect than the one
+    // it named. It refused every non-offline policy as unimplemented, which
+    // was true; what it did not say is that `offline` was unimplemented too.
+    // Every Machine took a NAT NIC regardless of what it declared, and because
+    // nothing but `offline` was admitted, nothing ever contradicted the claim.
+    // Measured on hardware before the fix: a Machine declaring nothing
+    // resolved public names, opened TCP to 1.1.1.1:443 and fetched a public
+    // URL. See `vz-8cq`.
+    //
+    // What `allowed` is NOT yet is a destination policy. Apple's NAT is
+    // unrestricted outbound, so an `allowed` Machine reaches whatever the host
+    // can reach; the CIDR and domain policies criterion 6 names have no
+    // spelling in the project schema and no enforcement here. That is DEV, and
+    // it is recorded rather than implied: what this change buys is the
+    // distinction between the two policies, which did not exist at all before.
     for machine in &spec.machines {
         if !matches!(
             machine.target.os,

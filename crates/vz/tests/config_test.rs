@@ -604,3 +604,33 @@ fn file_handle_network_survives_the_config_clone_the_vm_performs() {
     // original is gone; the descriptor it shares is still open.
     assert_eq!(cloned.mac_addresses()[0].len(), 17);
 }
+
+#[test]
+fn a_builder_left_alone_still_defaults_to_one_nat_nic() {
+    // Pinned deliberately, and read from a distance. This default is
+    // permissive, and a caller that leaves `nics` unset gets unrestricted
+    // outbound reachability without saying so anywhere.
+    //
+    // That is what made `EgressPolicy::Offline` a declaration and not a
+    // boundary: the Machine boot path gated its NAT NIC on a runtime-wide flag
+    // instead of the Machine's policy, so every Machine took this default.
+    // Measured on hardware before the fix, a Machine declaring nothing about
+    // networking resolved public names and fetched a public URL.
+    // `vz-oci-macos`'s boot path now always sets `nics`, and
+    // `external_nic_required` decides what goes in it; this test is the other
+    // half of that contract, so changing the default here fails HERE rather
+    // than silently restoring reachability over there.
+    let config = VmConfigBuilder::new()
+        .boot_linux(
+            PathBuf::from("/tmp/kernel"),
+            None::<PathBuf>,
+            "console=hvc0",
+        )
+        .build()
+        .unwrap();
+    assert_eq!(
+        config.mac_addresses().len(),
+        1,
+        "the builder's default is one NIC, and it is a NAT one"
+    );
+}

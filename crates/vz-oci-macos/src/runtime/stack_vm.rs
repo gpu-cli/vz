@@ -1911,7 +1911,7 @@ esac
         // One NIC per declared attachment, after the Machine's own default
         // network. An attachment is a port on an Environment switch, so it is
         // additional to egress, not a replacement for it; egress policy governs
-        // the default NIC and is decided elsewhere.
+        // the default NIC, and it is decided just below.
         let mut boot_attachments = Vec::with_capacity(attachments.len());
         let mut attachment_nics = Vec::with_capacity(attachments.len());
         for attachment in attachments {
@@ -1930,13 +1930,32 @@ esac
         vm_config
             .cmdline
             .push_str(&crate::config::fabric_cmdline_suffix(&boot_attachments));
-        if !self.config.default_network_enabled {
-            vm_config.nics = Some(attachment_nics);
-        } else if !attachment_nics.is_empty() {
-            let mut nics = vec![vz::Nic::nat()];
-            nics.extend(attachment_nics);
-            vm_config.nics = Some(nics);
+        // Egress is what decides whether an external NIC exists at all, and
+        // this is the only place it is decided. `EgressPolicy::Offline` is not
+        // expressed as a filter over a shared gateway address, because it
+        // could not be: every VM on the host shares Apple's NAT segment, and
+        // root inside a Developer Machine can undo any rule set the guest
+        // holds. The only enforcement that survives a hostile guest is not
+        // giving it the attachment, so `offline` attaches nothing.
+        //
+        // `allowed` is Apple's user-mode NAT with unrestricted outbound
+        // reachability. That is DEV, not the finished policy: the criterion
+        // asks for destination policy -- CIDR and domain -- and this NIC has
+        // none. What it does give is the distinction, which did not exist
+        // before: a Machine that declared `offline` no longer silently gets
+        // everything an `allowed` one does. Switch-side NAT with a destination
+        // policy is the next increment (`vz-8cq`).
+        //
+        // A Machine with neither an attachment nor egress gets an empty NIC
+        // list rather than the builder's default, which is a NAT NIC -- the
+        // whole defect this decision exists to close.
+        let external = external_nic_required(resources.egress, self.config.default_network_enabled);
+        let mut nics = Vec::with_capacity(usize::from(external) + attachment_nics.len());
+        if external {
+            nics.push(vz::Nic::nat());
         }
+        nics.extend(attachment_nics);
+        vm_config.nics = Some(nics);
 
         let runtime_identity = vz_runtime_contract::StackRuntimeIdentity::new(stack_id)
             .map_err(OciError::InvalidConfig)?;
@@ -3601,5 +3620,83 @@ esac
         vm.network_teardown(stack_id.to_string(), service_names)
             .await
             .map_err(OciError::from)
+    }
+}
+
+/// Whether this Machine gets an external NIC at all.
+///
+/// The one place a Machine's reachability off its own Environment is decided,
+/// and the reason it is a function rather than three lines inside a 400-line
+/// boot is that it is the whole of `EgressPolicy`'s enforcement. It has to be
+/// readable on its own and testable without a VM.
+///
+/// `Offline` attaches nothing. It is not expressed as a filter over a shared
+/// gateway address, because it could not be: every VM on the host shares
+/// Apple's NAT segment, and root inside a Developer Machine can undo any rule
+/// set the guest holds. Not handing over the attachment is the only
+/// enforcement a hostile guest cannot reverse.
+///
+/// `Allowed` attaches Apple's user-mode NAT, which is unrestricted outbound.
+/// That is DEV rather than the finished policy -- the CIDR and domain
+/// destination policies criterion 6 names are not here -- but the distinction
+/// between the two is real, and before this existed it did not: every Machine
+/// took the NAT NIC whatever it declared.
+///
+/// `default_network_enabled` still wins when it is off, because a runtime
+/// configured with no default network is making a statement about the host and
+/// not about one Machine's declaration.
+fn external_nic_required(
+    egress: vz_runtime_contract::EgressPolicy,
+    default_network_enabled: bool,
+) -> bool {
+    default_network_enabled && matches!(egress, vz_runtime_contract::EgressPolicy::Allowed)
+}
+
+#[cfg(test)]
+mod egress_nic_tests {
+    use super::external_nic_required;
+    use vz_runtime_contract::EgressPolicy;
+
+    #[test]
+    fn an_offline_machine_is_given_no_external_nic_however_the_runtime_is_configured() {
+        assert!(!external_nic_required(EgressPolicy::Offline, true));
+        assert!(!external_nic_required(EgressPolicy::Offline, false));
+    }
+
+    #[test]
+    fn only_a_machine_that_declared_allowed_and_a_runtime_that_permits_it_gets_one() {
+        assert!(external_nic_required(EgressPolicy::Allowed, true));
+        assert!(!external_nic_required(EgressPolicy::Allowed, false));
+    }
+
+    /// The defect this decision closes, stated as the property that broke.
+    ///
+    /// `EgressPolicy::default()` is `Offline`, and a Machine that declares
+    /// nothing about networking takes it. Before this existed, such a Machine
+    /// was measured on hardware resolving public names, opening TCP to
+    /// 1.1.1.1:443 and fetching a public URL, because the boot attached a NAT
+    /// NIC gated only on a runtime-wide flag that nothing ever set.
+    #[test]
+    fn the_default_policy_is_the_one_that_gets_nothing() {
+        assert_eq!(EgressPolicy::default(), EgressPolicy::Offline);
+        assert!(!external_nic_required(EgressPolicy::default(), true));
+    }
+
+    /// The boot path must therefore always SET `nics`, never leave it unset:
+    /// `VmConfigBuilder::new()` defaults to one NAT NIC, so an `offline`
+    /// Machine with no fabric attachment would get exactly what this function
+    /// refused it. That default is pinned by
+    /// `a_builder_left_alone_still_defaults_to_one_nat_nic` in `vz::config`,
+    /// so a change to it fails there rather than silently here.
+    #[test]
+    fn an_offline_machine_with_no_attachment_still_names_an_empty_nic_list() {
+        let attachments: Vec<vz::Nic> = Vec::new();
+        let external = external_nic_required(EgressPolicy::Offline, true);
+        let mut nics = Vec::with_capacity(usize::from(external) + attachments.len());
+        if external {
+            nics.push(vz::Nic::nat());
+        }
+        nics.extend(attachments);
+        assert!(nics.is_empty(), "an offline Machine names no NIC at all");
     }
 }

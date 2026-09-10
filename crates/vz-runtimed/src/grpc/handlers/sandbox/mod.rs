@@ -903,6 +903,9 @@ async fn boot_runtime_sandbox_resources(
 
     let resources = StackResourceHint {
         docker_data_seeded_by_fork: false,
+        // The legacy sandbox surface declares no Machine and so no egress
+        // policy; it keeps the reachability it has always had.
+        egress: vz_runtime_contract::EgressPolicy::Allowed,
         cpus,
         memory_mb,
         volume_mounts,

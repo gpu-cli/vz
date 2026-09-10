@@ -446,6 +446,45 @@ impl RuntimeDaemon {
         };
         let mut first_error = None;
         let mut uncertain = false;
+        // Which declared Machine's egress policy governs this instance.
+        //
+        // A fork is not in the definition -- its name is `<parent>@<label>`,
+        // which no spec carries -- so its policy is its parent's, reached
+        // through the lineage rather than by trimming a label off a string.
+        // That is the same rule `EnvironmentRuntimeController::declared_name`
+        // applies to a fork's store and configuration, and for the same
+        // reason: a fork inherits what its parent declared.
+        //
+        // An instance whose spec cannot be found is an error and never a
+        // default. The permissive default is exactly the defect this closure
+        // exists to close, so "we could not tell" must not resolve to
+        // "everything".
+        let declared_egress = |machine: &vz_runtime_contract::MachineInstance|
+            -> Result<vz_runtime_contract::EgressPolicy, MachineError> {
+            let declared = match machine.fork.as_ref() {
+                None => machine.name.as_str(),
+                Some(origin) => environment
+                    .machines
+                    .iter()
+                    .find(|candidate| candidate.machine_id == origin.parent_machine_id)
+                    .map(|parent| parent.name.as_str())
+                    .ok_or_else(|| {
+                        backend_error("a fork's parent is absent from its own Environment".into())
+                    })?,
+            };
+            request
+                .definition
+                .environment
+                .machines
+                .iter()
+                .find(|spec| spec.name == declared)
+                .map(|spec| spec.egress)
+                .ok_or_else(|| {
+                    backend_error(format!(
+                        "Machine `{declared}` is not declared by this definition, so no egress policy governs it"
+                    ))
+                })
+        };
         for step in operation.machine_steps.clone() {
             if step.status == LifecycleStepStatus::Succeeded {
                 continue;
@@ -520,6 +559,7 @@ impl RuntimeDaemon {
                         && machine.runtime_identity.is_none();
                     let (activation,start_error)=match entry.boot_or_inspect_machine(&reservation,export_ports,attachments,StackResourceHint {
                         docker_data_seeded_by_fork: seeded_by_fork,
+                        egress: declared_egress(machine)?,
                         cpus:Some(cpus),memory_mb:Some(memory_mb),
                         volume_mounts,
                         block_volumes,

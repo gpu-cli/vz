@@ -1705,6 +1705,15 @@ pub struct StackResourceHint {
     /// Used for persistent named volumes: the image contains an ext4
     /// filesystem mounted at `/run/vz-oci/volumes` inside the guest VM.
     pub disk_image_path: Option<PathBuf>,
+    /// Whether this Machine may reach anything outside its Environment.
+    ///
+    /// This is what decides whether a NAT NIC is attached at all, so it is the
+    /// field that makes `EgressPolicy::Offline` mean something. It is a policy
+    /// rather than a bool because the boot path must be able to tell "declared
+    /// offline" from "declared allowed" and never from "unset": a hint that
+    /// defaulted to permissive would reintroduce exactly the silent
+    /// unrestricted reachability this field exists to remove.
+    pub egress: crate::EgressPolicy,
     /// Declared Environment-owned block volumes, in declaration order.
     ///
     /// Each becomes one further VirtioBlock device after the private Docker

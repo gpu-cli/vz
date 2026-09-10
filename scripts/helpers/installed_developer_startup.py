@@ -407,6 +407,15 @@ class Harness:
                       "environment": {"schema_version": 1, "machines": [
                           {"schema_version": 1, "name": f"machine-{index}", "profile": profile,
                            "target": {"os": "linux", "arch": "aarch64", "image": entry["image"], "digest": entry["digest"]},
+                           # Declared, because it is now enforced. A Developer
+                           # Machine in this lane pulls
+                           # `docker.io/library/python@sha256:...` from inside
+                           # itself, and `offline` -- the default -- no longer
+                           # silently hands out an external NIC anyway. A
+                           # Hardened Machine runs no Docker and pulls nothing,
+                           # so it stays offline and the two are visibly
+                           # different.
+                           **({"egress": "allowed"} if profile == "developer" else {}),
                            "resources": {"cpus": 2, "memory_mb": 4096 if profile == "developer" else 1024}}
                           for index in range(count)]}}
         document(project / "vz.json", definition)

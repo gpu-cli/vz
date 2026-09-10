@@ -130,44 +130,73 @@ async fn concurrent_exact_retries_and_disconnected_observer_keep_one_durable_adm
 }
 
 #[tokio::test]
-async fn declared_egress_rejects_before_project_creation() {
-    // A declarable record with no adapter behind it. Admitting one would start
-    // a Machine that silently lacks the boundary its definition asks for, so Up
-    // must refuse and create no project.
+async fn a_declared_allowed_egress_is_admitted_and_persisted() {
+    // Egress used to be in the "declarable record with no adapter" list, and
+    // the refusal was honest about `allowed` and silent about the worse half:
+    // `offline` had no adapter either. Every Machine took a NAT NIC gated on a
+    // runtime-wide flag that nothing set, so the one policy the runtime
+    // admitted was the one it did not implement. Measured on hardware before
+    // the fix, a Machine declaring nothing resolved public names and fetched a
+    // public URL (`vz-8cq`).
     //
-    // Host EXPORTS and IMPORTS are no longer in this list. An export is carried
-    // by `start_port_forwarding`'s loopback-only listener; an import by the
-    // per-Machine vsock terminator and the guest agent's loopback listeners,
-    // with a per-declaration credential. `authorize_ownership` accounts for
-    // both, and the admitted cases are asserted by
-    // `a_fixed_port_host_export_is_admitted_and_persisted` and
-    // `a_declared_host_import_is_admitted_and_persisted` below. What remains
-    // refused about either is only the shape no surface can serve, which the
-    // `..._cannot_serve_is_refused_for_its_own_named_reason` tests cover one
-    // case at a time.
-    for mutate in [(|request: &mut EnvironmentUpRequest| {
-        request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
-    }) as fn(&mut EnvironmentUpRequest)]
-    {
-        let (_root, daemon, mut request, metadata) = fixture();
-        mutate(&mut request);
-        assert_eq!(
-            daemon
-                .up_environment(request.clone(), metadata)
-                .await
-                .unwrap_err()
-                .code,
-            MachineErrorCode::UnsupportedOperation
-        );
-        assert!(
-            daemon
-                .with_state_store(
-                    |store| store.load_project_state(request.definition.project_id.as_str())
-                )
-                .unwrap()
-                .is_none()
-        );
-    }
+    // Both policies are now decided in one place, from the policy this Up
+    // carries to the boot on `StackResourceHint::egress`. So the declaration
+    // must be ADMITTED and persisted, which is what this asserts; that the two
+    // policies then differ is
+    // `vz_oci_macos::runtime::stack_vm::egress_nic_tests`.
+    let (_root, daemon, mut request, metadata) = fixture();
+    request.definition.environment.machines[0].egress = EgressPolicy::Allowed;
+    let completion = terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    // The Up does not succeed in this fixture; it must not fail at admission.
+    assert!(completion.error.is_some());
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("a declared egress policy is now admitted, so its project exists");
+    let environment = &project.environments[0];
+    assert_eq!(
+        environment.egress.len(),
+        1,
+        "instantiation mints one EgressInstance per non-offline Machine"
+    );
+    assert_eq!(environment.egress[0].policy, EgressPolicy::Allowed);
+    assert_eq!(
+        environment.egress[0].machine_id,
+        environment.machines[0].machine_id
+    );
+}
+
+#[tokio::test]
+async fn an_offline_machine_is_admitted_and_mints_no_egress_instance_at_all() {
+    // The default, and the control for the test above: `offline` is not a
+    // record with a permissive value, it is the absence of the record. An
+    // Environment that minted one for every Machine would make "which Machines
+    // may reach out" a question about a field's contents rather than about
+    // which rows exist.
+    let (_root, daemon, request, metadata) = fixture();
+    assert_eq!(
+        request.definition.environment.machines[0].egress,
+        EgressPolicy::Offline,
+        "the fixture declares nothing, so it takes the default"
+    );
+    terminal(
+        daemon
+            .up_environment(request.clone(), metadata)
+            .await
+            .unwrap(),
+    )
+    .await;
+    let project = daemon
+        .with_state_store(|store| store.load_project_state(request.definition.project_id.as_str()))
+        .unwrap()
+        .expect("an offline Machine is admitted");
+    assert!(project.environments[0].egress.is_empty());
 }
 
 /// Declare one host import on a Developer Linux Machine.

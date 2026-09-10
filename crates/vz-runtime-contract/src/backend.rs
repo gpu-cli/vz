@@ -433,6 +433,12 @@ impl<B: RuntimeBackend> WorkspaceRuntimeManager<B> {
     ) -> Result<(), RuntimeError> {
         let resources = StackResourceHint {
             docker_data_seeded_by_fork: false,
+            // A sandbox is not a Developer Environment Machine and no
+            // declared egress policy governs it, so it keeps the
+            // reachability it has always had. Named rather than left to
+            // a default, because the default is what makes `offline`
+            // mean something for the Machines that DO declare it.
+            egress: crate::EgressPolicy::Allowed,
             cpus: spec.cpus,
             memory_mb: spec.memory_mb,
             volume_mounts: Vec::new(),
