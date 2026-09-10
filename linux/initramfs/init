@@ -227,24 +227,59 @@ fi
 # the MAC is exactly what the host configured the NIC with. Matching on it also
 # means eth0 is untouched: eth0 is the default NAT NIC and its address is never
 # a fabric port's.
+# How long to wait for a fabric NIC to appear in sysfs, in whole seconds.
+#
+# virtio-net devices are probed ASYNCHRONOUSLY, so a scan that runs before the
+# probe completes finds nothing -- and this configuration is reboot-only, so
+# "nothing" is permanent. The Machine then boots, starts its guest agent, and
+# reports ready with no fabric NIC at all: the address is on the cmdline and
+# there is no interface to put it on.
+#
+# Measured: two of two full topology-lane runs hit exactly that, while the same
+# check passed twice standalone. The difference is host load, which is what
+# moves a device probe past a single unwaited scan.
+#
+# Whole seconds because fractional `sleep` is a BusyBox build option this image
+# does not guarantee, and the applet list in linux/Makefile promises only
+# `sleep` itself. The budget is generous because the cost of exhausting it is a
+# refused boot and the cost of being too short is a Machine that silently has
+# no network.
+VZ_FABRIC_NIC_WAIT_SECONDS=20
+
+# The interface whose MAC is `$1`, waited for rather than sampled.
+#
+# Prints the interface name and returns 0, or prints nothing and returns 1 once
+# the budget is spent. The FIRST scan happens before any sleep, so a healthy
+# boot -- where the device is already there -- pays nothing and uses no applet
+# beyond `cat`.
+find_fabric_nic() {
+  ffn_mac="$1"
+  ffn_waited=0
+  while : ; do
+    # The host lowercases the MAC before it reaches the cmdline and sysfs is
+    # lowercase by kernel convention, so both sides compare without a case fold
+    # and without depending on a `tr` applet being compiled into this BusyBox.
+    for ffn_path in /sys/class/net/*; do
+      [ -r "$ffn_path/address" ] || continue
+      ffn_found=$(/bin/busybox cat "$ffn_path/address" 2>/dev/null)
+      if [ "$ffn_found" = "$ffn_mac" ]; then
+        echo "${ffn_path##*/}"
+        return 0
+      fi
+    done
+    [ "$ffn_waited" -lt "$VZ_FABRIC_NIC_WAIT_SECONDS" ] || return 1
+    /bin/busybox sleep 1
+    ffn_waited=$((ffn_waited + 1))
+  done
+}
+
 configure_fabric_nic() {
   cfn_mac="$1"
   cfn_cidr="$2"
   cfn_gateway="$3"
-  cfn_iface=""
-  # The host lowercases the MAC before it reaches the cmdline and sysfs is
-  # lowercase by kernel convention, so both sides compare without a case fold
-  # and without depending on a `tr` applet being compiled into this BusyBox.
-  for cfn_path in /sys/class/net/*; do
-    [ -r "$cfn_path/address" ] || continue
-    cfn_found=$(/bin/busybox cat "$cfn_path/address" 2>/dev/null)
-    if [ "$cfn_found" = "$cfn_mac" ]; then
-      cfn_iface="${cfn_path##*/}"
-      break
-    fi
-  done
+  cfn_iface=$(find_fabric_nic "$cfn_mac")
   if [ -z "$cfn_iface" ]; then
-    echo "[vz-init] no interface has address $cfn_mac; fabric port left unconfigured"
+    echo "[vz-init] no interface has address $cfn_mac after ${VZ_FABRIC_NIC_WAIT_SECONDS}s; fabric port left unconfigured"
     return 1
   fi
   /bin/busybox ip address add "$cfn_cidr" dev "$cfn_iface" || return 1

@@ -1105,4 +1105,120 @@ mod tests {
             "the port that did match must still be configured"
         );
     }
+
+    /// The defect that cost two full topology-lane runs (`vz-9x6`).
+    ///
+    /// virtio-net devices are probed asynchronously. The block used to scan
+    /// `/sys/class/net` exactly once, so a device that had not finished
+    /// probing was simply not there -- and because this configuration is
+    /// reboot-only, not there meant never. The Machine went on to boot, start
+    /// its guest agent and report READY with no fabric NIC at all: the address
+    /// on its cmdline and no interface to hold it.
+    ///
+    /// It only reproduces under load, which is why it passed standalone twice
+    /// and failed in a full lane twice. This test makes the race
+    /// deterministic instead: the interface does not exist when the block
+    /// starts, and a `sleep` that creates it stands in for the probe
+    /// completing. A single-scan implementation reports "no interface has
+    /// address" and configures nothing.
+    #[test]
+    fn a_fabric_nic_that_finishes_probing_late_is_waited_for_and_then_configured() {
+        let root = tempfile::Builder::new()
+            .prefix("vz-fabric-init-late-")
+            .tempdir()
+            .expect("temp root");
+        let root = root.path();
+        fs::create_dir_all(root.join("net")).expect("fake sysfs");
+        fs::write(
+            root.join("cmdline"),
+            "vz.net.0=02:aa:bb:cc:dd:07,10.9.2.4/24\n",
+        )
+        .expect("fake cmdline");
+
+        // `sleep` is the probe: the first call creates the device, so the
+        // first scan misses it and the second finds it. That is exactly the
+        // ordering the guest hits, with the kernel doing the creating.
+        let log = root.join("ip.log");
+        let busybox = root.join("busybox");
+        fs::write(
+            &busybox,
+            format!(
+                "#!/bin/sh\napplet=\"$1\"; shift\ncase \"$applet\" in\n\
+                 cat) exec /bin/cat \"$@\" ;;\n\
+                 sleep) mkdir -p {net}/eth1 && printf '02:aa:bb:cc:dd:07\\n' > {net}/eth1/address ;;\n\
+                 ip) echo \"ip $*\" >> {log} ;;\n\
+                 *) exit 127 ;;\nesac\n",
+                net = root.join("net").display(),
+                log = log.display()
+            ),
+        )
+        .expect("write busybox stub");
+        fs::set_permissions(
+            &busybox,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .expect("make busybox stub executable");
+
+        let script = root.join("fabric.sh");
+        fs::write(&script, relocated_fabric_block(root, &busybox)).expect("write harness script");
+        let output = std::process::Command::new("/bin/sh")
+            .arg(&script)
+            .output()
+            .expect("run the guest fabric block");
+        assert!(output.status.success());
+
+        let console = fs::read_to_string(root.join("console")).unwrap_or_default();
+        assert!(
+            !console.contains("no interface has address"),
+            "a NIC that arrives late must be waited for, not reported absent: {console}"
+        );
+        assert_eq!(
+            fs::read_to_string(&log)
+                .unwrap_or_default()
+                .lines()
+                .collect::<Vec<_>>(),
+            vec![
+                "ip address add 10.9.2.4/24 dev eth1",
+                "ip link set dev eth1 up",
+            ],
+            "the late NIC must end up configured exactly as a prompt one does"
+        );
+    }
+
+    /// And the wait is bounded: a MAC no interface will ever have still gives
+    /// up and says so, rather than hanging the boot forever.
+    ///
+    /// Asserted through the console message, which now names the budget, so a
+    /// reader of a guest console can tell "waited and gave up" from "never
+    /// looked".
+    #[test]
+    fn the_wait_for_a_fabric_nic_is_bounded_and_says_how_long_it_waited() {
+        let source = initramfs_init_source();
+        let (_, block) = source
+            .split_once(
+                "# --- BEGIN vz.net fabric ports (extracted verbatim by vz-linux tests) ---",
+            )
+            .expect("the begin marker");
+        let (block, _) = block
+            .split_once("# --- END vz.net fabric ports ---")
+            .expect("the end marker");
+        assert!(
+            block.contains("VZ_FABRIC_NIC_WAIT_SECONDS="),
+            "the budget must be a named constant a reader can find"
+        );
+        assert!(
+            block.contains("after ${VZ_FABRIC_NIC_WAIT_SECONDS}s"),
+            "the refusal must say how long it waited, or it reads like a single scan"
+        );
+        // The loop must test the budget before sleeping, so the budget is a
+        // bound on the WAIT and not one sleep longer than it claims.
+        let sleep_at = block.find("sleep 1").expect("the wait sleeps");
+        let guard_at = block
+            .find("-lt \"$VZ_FABRIC_NIC_WAIT_SECONDS\"")
+            .expect("the wait is bounded");
+        assert!(
+            guard_at < sleep_at,
+            "the bound must be checked before sleeping"
+        );
+    }
 }
